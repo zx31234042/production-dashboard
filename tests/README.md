@@ -102,18 +102,26 @@
 
 > 约定：测试文件与源码文件**同名**（如 `mockData.test.js`），新增文件后在本表登记。
 
-### 已落地的四个自检脚本（2026-09-18）
+### 已落地的五个自检脚本（2026-09-18）
 
 | 脚本 | 运行 | 覆盖 |
 | --- | --- | --- |
 | `tests/contract-check.js` | `node tests/contract-check.js`（零依赖，退出码 0 = 全通过，1 = 有失败） | A 附录 2 的 13 字段 ↔ `src/config/fieldMap.js`；B 上位机报文键 ↔ `fieldMap.samplePayload` ↔ `src/services/mockUpperSource.js` ↔ `tools/mock-upper`；C `src/services/api.js` 的缺字段/非数值容错、冻结判定、字段名与参数可配置；D 13 字段上报报文、两种回执风格、失败补传；E `?source=upper` 逐帧取数链路；F 数据冻结后界面判据 `state.device.link`、`Api.getStatus()` 是否被消费；G 当班统计非负、维保累计不倒退、待办与自检可闭环；H 公告/检修录入是否原样拼进 HTML；I 交付 `.docx` 的 ZIP 条目名（OPC）；J 源码/样式头部版本号与需求清单附录 2 项数一致性；K 现状快照（稼动率口径、台账行数）；L 常量集中化（JS 内联色值是否与 `variables.css` 重复、维保与耗材预警阈值是否跟随 `board.config`）。 |
-| `tests/ui-check.js` | `node tests/ui-check.js`（零依赖） | U1 布局与视觉规范：UI-01 三段式比例、UI-02 4K 舞台、UI-03 色彩变量、UI-04 字号（逐角色对照）；U2 需求条款：FR-1 十项头部字段、FR-2 五模式/时长/阶段/映射、FR-3 工单 8 项·数值格式·表格列数·超阈值判定·五态可达、FR-4 十五项指标与"开工 ≤ 计划"口径、FR-9 八个标签页；U3 空态（UI-11、FR-3.17）；U4 每秒整屏重绘的副作用（不得写表单 value、不得注册监听）。判据用假 DOM 跑真实 `render()`，不启浏览器。 |
+| `tests/ui-check.js` | `node tests/ui-check.js`（零依赖；内存粗筛建议加 `--expose-gc`） | U1 布局与视觉规范：UI-01 三段式比例、UI-02 4K 舞台、UI-03 色彩变量、UI-04 字号（逐角色对照）；U2 需求条款：FR-1 十项头部字段、FR-2 五模式/时长/阶段/映射、FR-3 工单 8 项·数值格式·表格列数·超阈值判定·五态可达、FR-4 十五项指标与"开工 ≤ 计划"口径、FR-9 八个标签页；U3 空态（UI-11、FR-3.17）；U4 每秒整屏重绘的副作用（不得写表单 value、不得注册监听）；U5 性能微基准（单次 tick+全量重绘耗时、连续 2000 次后的堆增长）。判据用假 DOM 跑真实 `render()`，不启浏览器。 |
 | `tests/tools-check.js` | `node tests/tools-check.js`（零依赖，会临时占用 18901～18906 端口） | T1 `mock-upper` 的 `/health`、`/realtime`、`/sample`、404 与报文自洽；T2 `--push` 与 `--once --push` 推送；T3 `mock-mes` 两种回执风格、`--fail-rate`、`/log`、`DELETE /log`；T4 派工下发 `POST /dispatch` 与 `--dispatch-every`；T5 端口冲突行为；T6 两个工具的命令行开关与各自 README 逐条一致。子进程以真实进程启动，观测全部走 HTTP 回环。 |
 | `tests/browser-check.js` | `node tests/browser-check.js`（**需浏览器权限，见下节**） | B1 页面加载·无红色报错·首屏要素；B2 `?tab=`/`?curve=none`/`?link=off`/`?unlock=1`/`?source=upper`；B3 键盘 `D` 降级；B4 八个标签逐页切换且头部常显；B5 3840×2160 / 1920×1080 / 1366×768 无滚动条；B6 无操作 3 分钟自动回首页（虚拟时间快进）；B7 截图落到 `tests/._verify/`。 |
+| `tests/docs-check.js` | `node tests/docs-check.js`（零依赖；会调用本机 PowerShell 5.1 跑 `tools/` 下两个转换脚本） | D1/D1b 文档转换工具的真实能力（四级标题·表格·列表·引用·代码块·行内格式·分隔线·图片嵌入·`{w=60}`·图注·缺图容错·`._docx_build` 清理·OPC 部件名）；D2 提交信息格式（PROJECT_RULES 6.1/6.2）；D3 项目记录（快照/工作日志）与仓库现状一致性；D4 对外文档（`输出文件/`）与实现一致性；D5 规范条款抽查（UTF-8 BOM·无 Tab·无第三方库与外链·甲方原件不入库·需求版本归档·9.8 变更表·md↔docx 同源）。 |
+| `tests/stress-check.js` | `node tests/stress-check.js`（**长跑，默认 8 小时；需浏览器权限**） | S1 页面持续存活（时钟推进·无未捕获异常·无 console.error）；S2 JS 堆是否无界增长；S3 DOM/标签数/激活面板是否漂移；S4 跨班次时的班次名·统计·曲线固化·待补传队列变化；S5 每小时把 8 个页面轮巡一遍并切两次断连。环境变量：`DSH_STRESS_HOURS`（默认 8）、`DSH_STRESS_INTERVAL_MIN`（默认 10）、`DSH_STRESS_SIZE`（默认 3840x2160）、`DSH_STRESS_EDGE`。产物：`tests/._verify/stress-<时间戳>.csv / .log / -summary.json` 与首末截图。 |
 
 > 上表 6.3～6.6、6.8～6.10 与 6.2 的**代码侧**已由 `contract-check.js` 覆盖，浏览器内的视觉与交互由 `browser-check.js` 覆盖。
 >
-> 脚本的**断言失败即待修缺陷**。当前结果：`contract-check` 31 通过 / 21 失败，`ui-check` 27 通过 / 6 失败，`tools-check` 24 通过 / 0 失败，`browser-check` 18 通过 / 1 失败。失败项对应：`?source=upper` 取帧链缺陷与每秒 mock tick 覆盖报文、数据冻结不降级、当班统计为负、累计运行倒退、未闭环计数恒为 1、自检写死、用户输入未转义、docx 部件名用反斜杠、源码与样式表版本滞后、附录 2 声明 12 与实际 13、状态色与阈值重复写死、UI-04 字号不达标（指标名 52px、辅助说明 32～36px）、公告/待办空态缺失、无工单空态缺失、单任务五态不可达。修完对应源码后重跑应转全绿；`contract-check` 的 K 段若失败，说明占位口径已变，需同步确认界面说明。
+> 脚本的**断言失败即待修缺陷**。当前结果（合计 137 通过 / 33 失败）：`contract-check` 31 通过 / 21 失败，`ui-check` 28 通过 / 6 失败（加 `--expose-gc` 为 29 / 6），`tools-check` 24 通过 / 0 失败，`browser-check` 18 通过 / 1 失败，`docs-check` 36 通过 / 5 失败。
+>
+> 失败项对应：`?source=upper` 取帧链缺陷与每秒 mock tick 覆盖报文、数据冻结不降级、当班统计为负、累计运行倒退、未闭环计数恒为 1、自检写死、用户输入未转义、docx 部件名用反斜杠（交付件与工具打包处都要改）、源码与样式表版本滞后、附录 2 声明 12 与实际 13、状态色与阈值重复写死、UI-04 字号不达标（指标名 52px、辅助说明 32～36px）、公告/待办空态缺失、无工单空态缺失、单任务五态不可达、提交信息不符 `类型: 说明` 格式（`review`、`代码审查`；两条说明超 30 字）、`当前状态快照.md` 的"最新提交"哈希过期、`PROJECT_RULES.md` 9.8 表重复登记 v1.8。修完对应源码/文档后重跑应转全绿；`contract-check` 的 K 段若失败，说明占位口径已变，需同步确认界面说明。
+>
+> 性能微基准（U5）实测：单次 tick + 10 个组件全量重绘约 **0.1 ms**（约 1 万次/秒），相对 1 秒刷新周期余量极大；连续 2000 次刷新在强制 GC 后堆增长 < 20 MB，未发现明显泄漏迹象。
+>
+> **长时间运行（整班次/7×24）用 `tests/stress-check.js` 单独跑**：默认 8 小时、每 10 分钟采样一次，判据与产物见上表；首轮冒烟（3.7 分钟）实测堆 9.5 MB、DOM 690 节点全程零漂移、无红色报错。
 
 ---
 

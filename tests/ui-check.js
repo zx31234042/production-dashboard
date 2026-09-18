@@ -472,6 +472,56 @@ async function main() {
     );
   }
 
+  /* ===== U5 性能微基准（NFR-01：1 秒刷新周期） ===== */
+  section('U5 单次刷新耗时与内存微基准（NFR-01）');
+  {
+    const M = W.MockData;
+    const s = M.state;
+    const renders = [
+      () => W.Components.HeaderBar.render(s),
+      () => W.Components.TabsBar.renderLinkStatus(s),
+      () => W.Components.DeviceStatusPanel.render(s),
+      () => W.Components.TaskPanel.render(s),
+      () => W.Components.ShiftPanel.render(s),
+      () => W.Components.StatsPanel.render(s),
+      () => W.Components.AlarmPanel.render(s),
+      () => W.Components.MaintPanel.render(s),
+      () => W.Components.NoticePanel.render(s),
+      () => W.Components.SettingPanel.render(s)
+    ];
+    const cycle = t => {
+      M.tick(new Date(t));
+      for (const r of renders) r();
+    };
+    for (let i = 0; i < 50; i++) { cycle(Date.now() + i * 1000); ui.out.length = 0; }   // 预热
+
+    const N = 2000;
+    const base = new Date('2026-09-18T08:00:00').getTime();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const t0 = process.hrtime.bigint();
+    for (let i = 0; i < N; i++) {
+      cycle(base + i * 1000);
+      ui.out.length = 0;                 // 丢弃捕获记录，避免把"记录增长"误判成内存泄漏
+    }
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6 / N;
+    const heapAfter = process.memoryUsage().heapUsed;
+    const growthMb = (heapAfter - heapBefore) / 1024 / 1024;
+
+    check('单次 tick + 10 个组件全量重绘耗时 < 200 ms（1 秒周期内绰绰有余）', ms < 200,
+      `${ms.toFixed(2)} ms/次（模拟 ${N} 次，每次 tick 并重绘全部组件）`);
+    /* 堆增长只有在能强制 GC 时才有意义：否则量到的是"尚未回收的临时对象"而非泄漏 */
+    if (typeof global.gc !== 'function') {
+      skip('连续刷新后的堆增长（内存泄漏粗筛）',
+        `未启用 --expose-gc，本次量到 ${growthMb.toFixed(1)} MB 属未回收临时对象；需要精确结论时用 node --expose-gc tests/ui-check.js`);
+    } else {
+      global.gc();
+      const settled = (process.memoryUsage().heapUsed - heapBefore) / 1024 / 1024;
+      check('连续 2000 次刷新后堆增长 < 20 MB（强制 GC 后）', settled < 20,
+        `堆增长 ${settled.toFixed(2)} MB`);
+    }
+    console.log(`        参考：${(1000 / Math.max(ms, 0.001)).toFixed(0)} 次/秒的处理能力上限`);
+  }
+
   /* ---------------- 汇总 ---------------- */
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 ${skipped} 项`);
