@@ -116,7 +116,7 @@
 
 > 上表 6.3～6.6、6.8～6.10 与 6.2 的**代码侧**已由 `contract-check.js` 覆盖，浏览器内的视觉与交互由 `browser-check.js` 覆盖。
 >
-> 脚本的**断言失败即待修缺陷**。当前结果（合计 152 通过 / 39 失败）：`contract-check` 31 通过 / 21 失败，`ui-check` 28 通过 / 12 失败（加 `--expose-gc` 为 29 / 12），`tools-check` 24 通过 / 0 失败，`browser-check` 18 通过 / 1 失败，`docs-check` 36 通过 / 5 失败，`screenshot-diff` 15 通过 / 0 失败。
+> 脚本的**断言失败即待修缺陷**。当前结果（合计 **155 通过 / 37 失败 / 1 跳过**）：`contract-check` 31 通过 / 21 失败，`ui-check` 28 通过 / 12 失败（加 `--expose-gc` 为 29 / 12；另有 1 项在无 GC 时跳过），`tools-check` 24 通过 / 0 失败，`browser-check` 18 通过 / 1 失败，`docs-check` **39 通过 / 3 失败**，`screenshot-diff` 15 通过 / 0 失败。
 >
 > **提交信息偏差登记（2026-09-18，处置决定：不改写历史）**：历史上两条提交 `c269c4c 代码审查`、`f9152ee review` 不符合 PROJECT_RULES 6.1/6.2（缺 `类型: ` 前缀，且用了英文）。决定**保留原样**，理由：第六章明确 Git 提交与推送由项目负责人手动执行，改写历史属其职权；且仓库已做过一次强制推送，再改写会让既有引用与备份全部失效。防复发由本脚本 D2 段门禁保证（新增不合规提交即报 FAIL）。若负责人决定改写，可自行执行 `git rebase -i HEAD~2`（两条都改 `reword`）后 `git push --force-with-lease`。
 >

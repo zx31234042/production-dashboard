@@ -250,7 +250,14 @@ async function main() {
   const snapshot = readText('项目记录/当前状态快照.md');
   const head = gitOutput(['rev-parse', '--short', 'HEAD'], 'git-head.txt').trim();
   const claimedHead = (snapshot.match(/最新提交\s*`?([0-9a-f]{7,40})`?/) || [])[1];
-  check('快照记录的"最新提交"等于当前 HEAD', claimedHead === head, `快照写 ${claimedHead || '（未写）'}，实际 HEAD=${head}`);
+  /* 快照里写死哈希有个自相矛盾：提交快照本身就会让哈希过期。
+     因此规范做法是"以 git log -1 为准"的版本无关表述；若仍写死哈希，则必须等于当前 HEAD。 */
+  const versionAgnostic = /最新提交以\s*`git log -1`\s*为准/.test(snapshot);
+  check(
+    '快照的"最新提交"采用版本无关表述或等于当前 HEAD',
+    versionAgnostic || claimedHead === head,
+    versionAgnostic ? '' : `快照写 ${claimedHead || '（未写）'}，实际 HEAD=${head}（建议改为"以 git log -1 为准"）`
+  );
 
   const rulesVersion = (readText('PROJECT_RULES.md').match(/\|\s*版本\s*\|\s*v([\d.]+)/) || [])[1];
   const snapshotRules = (snapshot.match(/代码与结构规范\s*\|\s*\*\*v([\d.]+)\*\*/) || [])[1];
