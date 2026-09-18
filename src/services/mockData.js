@@ -115,7 +115,7 @@ window.MockData = (function () {
     device: { name: CFG.deviceName, code: CFG.equipCode, link: 'online', mes: 'online' },
     clock: { date: '', week: '', time: '' },
     shift: {},
-    status: { mode: '测试运行', stage: '拍摄中', online: '在线正常', depth: 12.68, speed: 5.00 },
+    status: { mode: '测试运行', stage: '准备', online: '在线正常', depth: 12.68, speed: 5.00 },
     task: {
       procOrderNo: 'MES20260917001', productCode: 'CP-2026-A17', productName: '水下振动测试件',
       batchNo: 'PC20260917-03', drawingNo: 'SJ-4471-02', orderNo: 'DD20260916-118',
@@ -285,15 +285,16 @@ window.MockData = (function () {
     state.status.depth = t.real.depth;
     state.status.speed = t.real.speed;
 
-    /* ---- 当前工单进度与单任务结果 ---- */
+    /* ---- 当前工单进度、运行阶段与单任务结果 ----
+       运行阶段按需求 FR-2.5（C-44）简化为 4 阶段：准备 → 运行 → 判定 → 完成
+       切换阈值与单任务节拍 CFG.cycleSec 对齐：准备 5% / 运行 85% / 判定 97% / 完成收尾 */
     const unitSec = elapsed % CFG.cycleSec;
     t.progress = unitSec / CFG.cycleSec;
     t.unitIndex = Math.floor(elapsed / CFG.cycleSec) + 1;
-    if (unitSec < 8)            { t.result = '待测试'; state.status.stage = '上料对位'; }
-    else if (t.progress < 0.35) { t.result = '测试中'; state.status.stage = '下潜'; }
-    else if (t.progress < 0.75) { t.result = '测试中'; state.status.stage = '拍摄中'; }
-    else if (t.progress < 0.95) { t.result = '测试中'; state.status.stage = '上浮'; }
-    else                        { t.result = '测试中'; state.status.stage = '结果判定'; }
+    if (unitSec < 8)            { t.result = '待测试'; state.status.stage = '准备'; }
+    else if (t.progress < 0.85) { t.result = '测试中'; state.status.stage = '运行'; }
+    else if (t.progress < 0.97) { t.result = '测试中'; state.status.stage = '判定'; }
+    else                        { t.result = '测试中'; state.status.stage = '完成'; }
     t.lastResult = t.unitIndex % 23 === 0 ? '待复检' : (t.unitIndex % 31 === 0 ? '不合格' : '合格');
 
     /* ---- 运行模式 ---- */
