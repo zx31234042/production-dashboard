@@ -7,6 +7,8 @@
 
 ## 一、每次改动后必须做的验证（手工）
 
+> 下面 1～5 项里可自动完成的部分已脚本化：第 1 项（控制台报错）、第 3 项（分辨率无滚动条）、第 4 项（特殊状态与参数）由 `tests/browser-check.js` 覆盖；第 2 项（逐页切换）也由它覆盖。方法与权限要求见第四节，剩余仍需人工判断的部分（配色观感、动效、截图比对）保留在本节。
+
 ### 1. 打开页面查报错
 
 1. 双击根目录 `index.html`（或把 `index.html` 拖进浏览器）；
@@ -100,12 +102,42 @@
 
 > 约定：测试文件与源码文件**同名**（如 `mockData.test.js`），新增文件后在本表登记。
 
-### 已落地：契约与适配层自检（2026-09-18）
+### 已落地的四个自检脚本（2026-09-18）
 
 | 脚本 | 运行 | 覆盖 |
 | --- | --- | --- |
-| `tests/contract-check.js` | `node tests/contract-check.js`（零依赖，退出码 0 = 全通过，1 = 有失败） | A 附录 2 的 13 字段 ↔ `src/config/fieldMap.js`；B 上位机报文键 ↔ `fieldMap.samplePayload` ↔ `src/services/mockUpperSource.js` ↔ `tools/mock-upper`；C `src/services/api.js` 的缺字段/非数值容错、冻结判定、字段名与参数可配置；D 13 字段上报报文、两种回执风格、失败补传；E `?source=upper` 逐帧取数链路；F 数据冻结后界面判据 `state.device.link`、`Api.getStatus()` 是否被消费；G 当班统计非负、维保累计不倒退、待办与自检可闭环；H 公告/检修录入是否原样拼进 HTML；I 交付 `.docx` 的 ZIP 条目名（OPC）；J 源码头部版本号与需求清单附录 2 项数一致性；K 现状快照（稼动率口径、台账行数）。 |
+| `tests/contract-check.js` | `node tests/contract-check.js`（零依赖，退出码 0 = 全通过，1 = 有失败） | A 附录 2 的 13 字段 ↔ `src/config/fieldMap.js`；B 上位机报文键 ↔ `fieldMap.samplePayload` ↔ `src/services/mockUpperSource.js` ↔ `tools/mock-upper`；C `src/services/api.js` 的缺字段/非数值容错、冻结判定、字段名与参数可配置；D 13 字段上报报文、两种回执风格、失败补传；E `?source=upper` 逐帧取数链路；F 数据冻结后界面判据 `state.device.link`、`Api.getStatus()` 是否被消费；G 当班统计非负、维保累计不倒退、待办与自检可闭环；H 公告/检修录入是否原样拼进 HTML；I 交付 `.docx` 的 ZIP 条目名（OPC）；J 源码/样式头部版本号与需求清单附录 2 项数一致性；K 现状快照（稼动率口径、台账行数）；L 常量集中化（JS 内联色值是否与 `variables.css` 重复、维保与耗材预警阈值是否跟随 `board.config`）。 |
+| `tests/ui-check.js` | `node tests/ui-check.js`（零依赖） | U1 布局与视觉规范：UI-01 三段式比例、UI-02 4K 舞台、UI-03 色彩变量、UI-04 字号（逐角色对照）；U2 需求条款：FR-1 十项头部字段、FR-2 五模式/时长/阶段/映射、FR-3 工单 8 项·数值格式·表格列数·超阈值判定·五态可达、FR-4 十五项指标与"开工 ≤ 计划"口径、FR-9 八个标签页；U3 空态（UI-11、FR-3.17）；U4 每秒整屏重绘的副作用（不得写表单 value、不得注册监听）。判据用假 DOM 跑真实 `render()`，不启浏览器。 |
+| `tests/tools-check.js` | `node tests/tools-check.js`（零依赖，会临时占用 18901～18906 端口） | T1 `mock-upper` 的 `/health`、`/realtime`、`/sample`、404 与报文自洽；T2 `--push` 与 `--once --push` 推送；T3 `mock-mes` 两种回执风格、`--fail-rate`、`/log`、`DELETE /log`；T4 派工下发 `POST /dispatch` 与 `--dispatch-every`；T5 端口冲突行为；T6 两个工具的命令行开关与各自 README 逐条一致。子进程以真实进程启动，观测全部走 HTTP 回环。 |
+| `tests/browser-check.js` | `node tests/browser-check.js`（**需浏览器权限，见下节**） | B1 页面加载·无红色报错·首屏要素；B2 `?tab=`/`?curve=none`/`?link=off`/`?unlock=1`/`?source=upper`；B3 键盘 `D` 降级；B4 八个标签逐页切换且头部常显；B5 3840×2160 / 1920×1080 / 1366×768 无滚动条；B6 无操作 3 分钟自动回首页（虚拟时间快进）；B7 截图落到 `tests/._verify/`。 |
 
-> 上表 6.3～6.6、6.8～6.10 与 6.2 的**代码侧**已由该脚本覆盖；仍需人工做的是浏览器内的视觉确认（6.1 及各页渲染、分辨率缩放、截图一致性）。
+> 上表 6.3～6.6、6.8～6.10 与 6.2 的**代码侧**已由 `contract-check.js` 覆盖，浏览器内的视觉与交互由 `browser-check.js` 覆盖。
 >
-> 脚本的**断言失败即待修缺陷**：首轮 31 项通过、18 项失败（F/G/H/I/J 段的失败对应「数据冻结不降级」「当班统计为负」「累计运行倒退」「未闭环计数恒为 1」「自检写死」「用户输入未转义」「docx 部件名用反斜杠」「文件头版本滞后」「附录 2 声明 12 与实际 13」）。修完对应源码后重跑应转全绿；改口径的 K 段若失败，说明占位口径已变，需同步确认界面说明。
+> 脚本的**断言失败即待修缺陷**。当前结果：`contract-check` 31 通过 / 21 失败，`ui-check` 27 通过 / 6 失败，`tools-check` 24 通过 / 0 失败，`browser-check` 18 通过 / 1 失败。失败项对应：`?source=upper` 取帧链缺陷与每秒 mock tick 覆盖报文、数据冻结不降级、当班统计为负、累计运行倒退、未闭环计数恒为 1、自检写死、用户输入未转义、docx 部件名用反斜杠、源码与样式表版本滞后、附录 2 声明 12 与实际 13、状态色与阈值重复写死、UI-04 字号不达标（指标名 52px、辅助说明 32～36px）、公告/待办空态缺失、无工单空态缺失、单任务五态不可达。修完对应源码后重跑应转全绿；`contract-check` 的 K 段若失败，说明占位口径已变，需同步确认界面说明。
+
+---
+
+## 四、浏览器验证怎么做（无头 Edge + CDP）
+
+`tests/browser-check.js` 不引入任何 npm 依赖，用本机已安装的 **Microsoft Edge** 无头模式 + **Chrome DevTools Protocol** 驱动真实页面：
+
+| 环节 | 做法 |
+| --- | --- |
+| 启动浏览器 | `msedge --headless=new --disable-gpu --remote-debugging-port=18920 --user-data-dir=<临时目录> about:blank`，路径自动探测 `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`，可用环境变量 `MSEDGE_PATH` 覆盖 |
+| 连接协议 | 从 `http://127.0.0.1:18920/json/list` 取页面 target 的 WebSocket 地址，用 **Node ≥22 内置的全局 `WebSocket`** 直连 CDP，自带极简客户端（`send/on`），不装 `puppeteer`/`playwright` |
+| 断言方式 | `Runtime.evaluate` 在页面里取真实 DOM/计算样式（如 `getComputedStyle`、`scrollWidth`、`classList`），再用本脚本的 `check()` 判定 |
+| 报错采集 | 同时开 `Runtime.enable` / `Log.enable`，把 `console.error`、未捕获异常、浏览器 error 日志收进 `consoleErrors`，对应"控制台无红色报错" |
+| 页面截图 | 用 Edge 命令行 `--screenshot=<png> --window-size=3840,2160`（CDP 的 `captureScreenshot` 在 4K 下会挂住，已改为命令行并加 60 秒超时）；产物落在 **`tests/._verify/`**，该目录已被 `.gitignore` 忽略，不会进版本管理 |
+| 环境变量 | `MSEDGE_PATH` 指定浏览器可执行文件；`DSH_EDGE_PORT` 指定调试端口（默认 18920） |
+
+**权限要求（重要）：** Chromium 启动时必须创建 mojo 命名管道，受限沙箱（dsh 的 `workspace-write`）会以
+`FATAL:mojo/platform_channel.cc: Check failed: 拒绝访问 (0x5)` 直接启动失败。因此本脚本要在**可创建命名管道的权限下**运行：
+
+- 在 dsh 会话里：让助手以 `danger-full-access` 运行该命令（会弹一次批准）；
+- 或在普通 PowerShell / 计划任务里直接 `node tests\browser-check.js`。
+
+脚本在起不来时会整体记 `[SKIP]` 并退出码 0，不会误报成缺陷。
+
+**新增一个浏览器场景**只需三步（参考 B2 段）：`await openPage('?参数')` → `await evaluate('页面内表达式')` → `check('断言名', 条件, '实测值')`。
+
+**本脚本不覆盖**（仍需人工或后续补充）：动效/闪烁等主观项（UI-09/UI-18）、报警弹窗（UI-13，Demo 已声明未实现）、长时间稳定性与内存（需长时间观测）、截图与最新界面的逐像素比对（需先确定基准图管理方式）。

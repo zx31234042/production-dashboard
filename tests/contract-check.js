@@ -12,6 +12,7 @@
          I. 交付物 .docx 的 ZIP/OPC 条目名结构
          J. 文档与源码的版本号、附录 2 项数一致性
          K. 现状快照（非缺陷）：口径占位项，变了就提醒重新确认
+         L. 常量集中化：颜色字面量、维保/耗材阈值是否走配置（PROJECT_RULES 五章）
    依赖：仅 Node 内置模块；不联网（只连本机回环端口）、不启动浏览器。
    运行：node tests/contract-check.js
    退出码：0 = 全部通过；1 = 有断言失败（失败项即待修缺陷）。
@@ -154,6 +155,7 @@ function createIsolatedHarness(options) {
   const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
   run(LOAD_ORDER[0]);
   if (options && typeof options.planQty === 'number') sandbox.window.BoardConfig.production.planQty = options.planQty;
+  if (options && typeof options.mutate === 'function') options.mutate(sandbox.window);
   LOAD_ORDER.slice(1).forEach(run);
   sandbox.__at = iso => vm.runInContext(`new Date(${JSON.stringify(iso)})`, sandbox);
   return sandbox;
@@ -686,14 +688,18 @@ async function main() {
     check('能定位需求文档当前基线版本', base !== null, '需求文档/ 下没找到 -Vx.y.md');
     if (base) {
       const offenders = [];
-      for (const f of walkFiles(path.join(ROOT, 'src'), '.js')) {
+      const versionSources = [
+        ...walkFiles(path.join(ROOT, 'src'), '.js'),
+        ...walkFiles(path.join(ROOT, 'src'), '.css')   // 样式表头部同样会引用需求清单版本
+      ];
+      for (const f of versionSources) {
         const head = fs.readFileSync(f, 'utf8').split('\n').slice(0, 25).join('\n');
         for (const m of head.matchAll(/需求清单\s*V(\d+\.\d+)/g)) {
           if (m[1] !== base.raw) offenders.push(`${path.relative(ROOT, f)} 写 V${m[1]}`);
         }
       }
       check(
-        `源码头部引用的需求清单版本应等于基线 V${base.raw}`,
+        `源码/样式头部引用的需求清单版本应等于基线 V${base.raw}`,
         offenders.length === 0,
         offenders.join('；')
       );
@@ -745,6 +751,45 @@ async function main() {
       '异常台账仍为固定 5 条（演示占位，不接收新报警）',
       ledger.length === 5,
       `实际 ${ledger.length} 条；演示键 A 只切换当前故障卡`
+    );
+  }
+
+  /* ===== L. 常量集中化：颜色与阈值不得散落各处（PROJECT_RULES 五章·魔法数字） ===== */
+  section('L. 常量集中化（颜色 / 阈值）');
+  {
+    const cssHex = new Set([...readText('src/styles/variables.css').matchAll(/#[0-9A-Fa-f]{6}/g)].map(m => m[0].toUpperCase()));
+    const dup = new Map();
+    for (const f of walkFiles(path.join(ROOT, 'src'), '.js')) {
+      for (const m of fs.readFileSync(f, 'utf8').matchAll(/#[0-9A-Fa-f]{6}/g)) {
+        const hex = m[0].toUpperCase();
+        if (!cssHex.has(hex)) continue;
+        if (!dup.has(hex)) dup.set(hex, new Set());
+        dup.get(hex).add(path.relative(ROOT, f));
+      }
+    }
+    check(
+      'JS 内联色值不应与 variables.css 重复维护',
+      dup.size === 0,
+      [...dup].map(([hex, files]) => `${hex} 同时写死在 ${[...files].join('、')}`).join('；') +
+      '（PROJECT_RULES 五章要求颜色集中到 CSS 变量或 JS 的 CFG 常量）'
+    );
+
+    const h2 = createIsolatedHarness({ mutate: w => { w.BoardConfig.maintenance.warnDays = 1; } });
+    h2.window.MockData.tick(h2.__at('2026-09-18T10:00:00'));
+    const maintWarn = h2.window.MockData.state.warnings.find(w => w.title.includes('维保'));
+    check(
+      '维保到期预警阈值应跟随 board.config.maintenance.warnDays',
+      maintWarn.lv !== 'warn',
+      `warnDays=1、距下次维保 ${h2.window.MockData.state.maint.daysLeft} 天，仍判为 "${maintWarn.lv}"（阈值 14 硬编码在 mockData.js）`
+    );
+
+    const h3 = createIsolatedHarness({ mutate: w => { w.BoardConfig.maintenance.consumables[0].threshold = 9999; } });
+    h3.window.MockData.tick(h3.__at('2026-09-18T10:00:00'));
+    const lampWarn = h3.window.MockData.state.warnings.find(w => w.title.includes('耗材'));
+    check(
+      '耗材更换预警阈值应跟随 board.config.maintenance.consumables[].threshold',
+      lampWarn.lv !== 'warn',
+      `threshold=9999、实际点亮时长远低于阈值，仍判为 "${lampWarn.lv}"（780 基准与 800 阈值硬编码在 mockData.js）`
     );
   }
 
