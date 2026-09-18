@@ -5,7 +5,7 @@
 
 - 设计基准：**3840 × 2160 @30Hz**（独立 75 寸电视），1920×1080 等分辨率下整体等比缩放
 - 纯静态前端：**无构建、无第三方库、无 CDN、无外网依赖**（内网隔离环境要求）
-- 版本标识：界面右下角显示 `v0.3.0-demo`
+- 版本标识：界面右下角显示 `v0.4.0-demo`
 
 ---
 
@@ -29,16 +29,25 @@ production-dashboard/
 ├── src/                          # 前端源码
 │   ├── assets/screenshots/       # 交付文档用的界面截图
 │   ├── components/               # 可复用界面片段（一个文件一个组件）
+│   ├── config/                   # 可调参数集中地
+│   │   ├── board.config.js       #   数据源、班次、统计口径、维保、接口地址
+│   │   └── fieldMap.js           #   三方字段映射（看板 ↔ 上位机 ↔ 附录 2）
 │   ├── pages/Dashboard.js        # 页面装配：标签切换、统一渲染
-│   ├── services/                 # 数据层：mockData.js（现在）/ api.js（后期）
+│   ├── services/                 # 数据层
+│   │   ├── api.js                #   接口适配层（IF-D 取数、IF-B 上报与补传）
+│   │   ├── mockData.js           #   模拟数据源（默认）
+│   │   └── mockUpperSource.js    #   内置模拟上位机（?source=upper）
 │   ├── styles/                   # variables.css（变量）+ global.css（布局与组件）
 │   ├── utils/                    # dom.js（元素操作）+ format.js（格式化与数值）
 │   └── main.js                   # 入口：启动、定时刷新、演示快捷键
 ├── tests/                        # 手工验证清单（后期放自动化测试）
 ├── 来源文件/                      # 甲方原件（只读）
 ├── 需求文档/                      # 需求清单最新版；历史版本在 历史文件\
-├── 输出文件/甲方/                  # 交付给甲方的成品文档
-├── tools/                        # Markdown→Word 转换脚本与说明
+├── 输出文件/甲方/                  # 交付给甲方的成品文档（另有 MES方\、上位机方\）
+├── tools/                        # 文档转换脚本 + 联调模拟工具
+│   ├── md2docx.ps1 / md2docx-img.ps1
+│   ├── mock-upper/               #   模拟上位机（IF-D 自测 / 可发给上位机方参考）
+│   └── mock-mes/                 #   模拟 MES（上报回执、失败补传、派工下发自测）
 ├── reference/                    # 来源文件文本提取件（比对用）
 ├── index.html                    # 页面入口
 ├── PROJECT_RULES.md              # 代码与结构规范（改代码前先看）
@@ -48,10 +57,29 @@ production-dashboard/
 ### 源码加载顺序
 
 ```
-utils（dom、format） → services（api、mockData） → components（12 个） → pages（Dashboard） → main.js
+config（board.config、fieldMap） → utils（dom、format） → services（api、mockData、mockUpperSource）
+  → components（11 个） → pages（Dashboard） → main.js
 ```
 
 被依赖的先加载；新增文件时同步在 `index.html` 里补一行 `<script>`，并在 `PROJECT_RULES.md` 9.1 登记。
+
+### 数据源切换
+
+| 模式 | 启动方式 | 说明 |
+| --- | --- | --- |
+| **mock**（默认） | 直接打开 `index.html` | 全部数据由 `services/mockData.js` 生成，用于界面评审 |
+| **upper** | 地址栏加 `?source=upper` | 由"上位机报文"经 `services/api.js` 适配层写入，**走与真实接口完全相同的链路**，用于联调前自测 |
+
+真实环境切换只需改 `src/config/board.config.js` 的 `dataSource`，并把 `upper.url`、`mes.baseUrl` 填上。
+
+### 联调模拟工具
+
+| 工具 | 用途 | 启动 |
+| --- | --- | --- |
+| `tools/mock-upper/` | 模拟设备 PC 上位机，提供符合契约的实时数据 | 双击 `start.cmd`，或 `node tools/mock-upper/mock-upper.js --port 8801` |
+| `tools/mock-mes/` | 模拟 MES 端：接收上报、返回回执（可切风格/注异常）、下发派工 | 双击 `start.cmd`，或 `node tools/mock-mes/mock-mes.js --receipt status` |
+
+两者的详细参数见各自目录下的 `README.md`；字段契约以 `src/config/fieldMap.js` 为准。
 
 ---
 

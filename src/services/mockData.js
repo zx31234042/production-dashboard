@@ -13,34 +13,46 @@
 window.MockData = (function () {
   'use strict';
 
-  /* ---------------- 基础参数（可由配置覆盖） ---------------- */
+  /* ---------------- 基础参数：优先取 config/board.config.js，未加载时用默认值 ----------------
+     这样"班次时间(Q-10)""统计参数(Q-11)""维保参数(Q-13)"答复后只需改配置文件。 */
+  const BC = window.BoardConfig || {};
+  const BCshift = BC.shift || {};
+  const BCprod = BC.production || {};
+  const BCmaint = BC.maintenance || {};
+  const BCdev = BC.device || {};
+
   const CFG = {
-    deviceName: '水池高速摄像检验设备',
-    equipCode: 'SX-UNDERWATER-001',      // 整套系统 1 个编号（覆盖 19 台相机）
-    team: '检验一班',
-    operator: '张伟', operatorId: 'A1027',
-    leader: '李建国', leaderId: 'A1003',
-    planQty: 180,          // 当班计划测试总数
-    cycleSec: 160,         // 单台测试节拍（秒）
-    runRate: 0.79,         // 有效运行占比 → 稼动率
-    firstPassRate: 0.932,  // 一次性测试合格率
-    queueDepth: 72,        // 设备侧待测试排队量
-    maintLast: '2026-08-28',
-    maintCycleDays: 30,
-    unlockPassword: '8888' // 演示密码
+    deviceName: BCdev.name || '水池高速摄像检验设备',
+    equipCode: BCdev.equipCode || 'SX-UNDERWATER-001',   // 整套系统 1 个编号（覆盖 19 台相机）
+    team: (BCshift.roster && BCshift.roster.team) || '检验一班',
+    operator: (BCshift.roster && BCshift.roster.operator) || '张伟',
+    operatorId: (BCshift.roster && BCshift.roster.operatorId) || 'A1027',
+    leader: (BCshift.roster && BCshift.roster.leader) || '李建国',
+    leaderId: (BCshift.roster && BCshift.roster.leaderId) || 'A1003',
+    planQty: BCprod.planQty || 180,              // 当班计划测试总数（Q-11）
+    cycleSec: BCprod.cycleSec || 160,            // 单台测试节拍（秒）
+    runRate: BCprod.runRate || 0.79,             // 有效运行占比 → 稼动率（Q-11）
+    firstPassRate: BCprod.firstPassRate || 0.932,// 一次性测试合格率（Q-11）
+    queueDepth: BCprod.queueDepth || 72,         // 设备侧待测试排队量
+    maintLast: BCmaint.lastDate || '2026-08-28', // 上次维保日期（Q-13）
+    maintCycleDays: BCmaint.cycleDays || 30,     // 固定维保周期（Q-13）
+    unlockPassword: '8888'                       // 演示密码（正式实现由服务端校验，NFR-14）
   };
 
-  const SHIFTS = [
-    { name: '晚班', start: 0,  end: 8  },
-    { name: '早班', start: 8,  end: 16 },
-    { name: '中班', start: 16, end: 24 }
-  ];
+  /* 班次定义来自配置（Q-10）；未配置时用默认三段班 */
+  const SHIFTS = (BCshift.list && BCshift.list.length)
+    ? BCshift.list
+    : [
+        { name: '晚班', start: 0,  end: 8  },
+        { name: '早班', start: 8,  end: 16 },
+        { name: '中班', start: 16, end: 24 }
+      ];
 
   /* 设备参数（相机侧）：实际帧率量程 0～1200 fps，此处按 SHS-201 典型工况取 400 fps */
   const DEVICE_NOMINAL = { fps: 400, gain: 2.5, shutter: 500 };
 
   /* 任务曲线：按任务完成更新，每个任务按 1 s 采样，采样点数与节拍一致 */
-  const CURVE_SAMPLES = 160;
+  const CURVE_SAMPLES = (BC.curve && BC.curve.samples) || CFG.cycleSec || 160;
 
   /* 生成"上一次任务"的完整曲线（仅用于演示：模拟上位机已整合完成的历史任务数据） */
   function synthCurve(unitIndex) {
@@ -66,13 +78,16 @@ window.MockData = (function () {
     };
   }
 
-  const ALARM_POOL = [
-    { code: 'E-2071', type: '相机通信中断', desc: '高速相机 GigE 链路瞬时丢包，已自动重连' },
-    { code: 'E-3115', type: '深度测量异常', desc: '航行器深度数据跳变超过 0.5 m，已复核并重新标定' },
-    { code: 'E-1042', type: '水池液位偏低', desc: '液位低于测试下限，请补充水量' },
-    { code: 'W-2210', type: '快门参数超限', desc: '快门设定值超出工艺窗口上限' },
-    { code: 'E-4520', type: '上位机数据传输异常', desc: '实时测量数据上传中断超过 5 秒' }
-  ];
+  /* 故障代码字典来自配置（Q-12）；未配置时用内置示例 */
+  const ALARM_POOL = (BC.faultDict && BC.faultDict.length)
+    ? BC.faultDict.map(f => ({ code: f.code, type: f.type, desc: f.desc, level: f.level }))
+    : [
+        { code: 'E-2071', type: '相机通信中断', desc: '高速相机 GigE 链路瞬时丢包，已自动重连' },
+        { code: 'E-3115', type: '深度测量异常', desc: '航行器深度数据跳变超过 0.5 m，已复核并重新标定' },
+        { code: 'E-1042', type: '水池液位偏低', desc: '液位低于测试下限，请补充水量' },
+        { code: 'W-2210', type: '快门参数超限', desc: '快门设定值超出工艺窗口上限' },
+        { code: 'E-4520', type: '上位机数据传输异常', desc: '实时测量数据上传中断超过 5 秒' }
+      ];
 
   const MAINT_RECORDS = [
     { time: '2026-08-28 09:20', content: '更换水下光源密封圈、清洁镜头', owner: '李建国', state: '已验收' },

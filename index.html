@@ -383,7 +383,7 @@
   <footer id="board-footer">
     <nav id="board-tabs"></nav>
     <div id="board-status">
-      <div><span>版本</span><b class="mono">v0.3.0-demo</b></div>
+      <div><span>版本</span><b class="mono">v0.4.0-demo</b></div>
       <div><span>最后刷新</span><b class="mono" id="sbRefresh">00:00:00</b></div>
       <div><span>上位机链路</span><b class="mono ok" id="sbHeartbeat">正常</b></div>
       <div><span>MES 链路</span><b class="mono ok" id="sbMes">正常</b></div>
@@ -392,12 +392,15 @@
 
 </div>
 
-<!-- 加载顺序：utils → services → components → pages → main
+<!-- 加载顺序：config → utils → services → components → pages → main
      （被依赖的先加载；不使用 ES module，保证双击 index.html 即可打开） -->
+<script src="src/config/board.config.js"></script>
+<script src="src/config/fieldMap.js"></script>
 <script src="src/utils/dom.js"></script>
 <script src="src/utils/format.js"></script>
 <script src="src/services/api.js"></script>
 <script src="src/services/mockData.js"></script>
+<script src="src/services/mockUpperSource.js"></script>
 <script src="src/components/HeaderBar.js"></script>
 <script src="src/components/TabsBar.js"></script>
 <script src="src/components/CurveChart.js"></script>
