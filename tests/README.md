@@ -82,15 +82,17 @@
 
 ## 二、改动后的收尾动作
 
+- [ ] 先跑零依赖自检：`node tests\contract-check.js`、`node tests\ui-check.js`、`node tests\docs-check.js`（改动越界时加 `tools-check.js`）；改了界面再加 `browser-check.js`
+- [ ] 改了界面 → 用 `node tests\screenshot-diff.js` 与 `tests\screenshots-baseline\` 比对，差异 ≤5% 视为通过
 - [ ] 重新截图：按 8 个页面 + 2 个特殊状态，覆盖 `src/assets/screenshots/` 下的同名文件；
 - [ ] 重新生成交付文档：`输出文件\甲方\` 下的说明文档（命令见 `tools\Markdown转Word工具说明.md`）；
 - [ ] 若改了需求：`需求文档\` 升版本号，旧版移入 `历史文件\`。
 
 ---
 
-## 三、后期自动化测试（待建设）
+## 三、自动化测试（已落地自检 + 待补单元用例）
 
-引入测试工具后，建议按下面的顺序补充，脚本一律放在本目录：
+零依赖自检脚本已落地（见下小节）；本节这张表是**仍需补充的单元级用例**，脚本一律放在本目录：
 
 | 优先级 | 测试对象 | 说明 |
 | --- | --- | --- |
@@ -111,7 +113,7 @@
 | `tests/tools-check.js` | `node tests/tools-check.js`（零依赖，会临时占用 18901～18906 端口） | T1 `mock-upper` 的 `/health`、`/realtime`、`/sample`、404 与报文自洽；T2 `--push` 与 `--once --push` 推送；T3 `mock-mes` 两种回执风格、`--fail-rate`、`/log`、`DELETE /log`；T4 派工下发 `POST /dispatch` 与 `--dispatch-every`；T5 端口冲突行为；T6 两个工具的命令行开关与各自 README 逐条一致。子进程以真实进程启动，观测全部走 HTTP 回环。 |
 | `tests/browser-check.js` | `node tests/browser-check.js`（**需浏览器权限，见下节**） | B1 页面加载·无红色报错·首屏要素；B2 `?tab=`/`?curve=none`/`?link=off`/`?unlock=1`/`?source=upper`；B3 键盘 `D` 降级；B4 八个标签逐页切换且头部常显；B5 3840×2160 / 1920×1080 / 1366×768 无滚动条；B6 无操作 3 分钟自动回首页（虚拟时间快进）；B7 截图落到 `tests/._verify/`。 |
 | `tests/docs-check.js` | `node tests/docs-check.js`（零依赖；会调用本机 PowerShell 5.1 跑 `tools/` 下两个转换脚本） | D1/D1b 文档转换工具的真实能力（四级标题·表格·列表·引用·代码块·行内格式·分隔线·图片嵌入·`{w=60}`·图注·缺图容错·`._docx_build` 清理·OPC 部件名）；D2 提交信息格式（PROJECT_RULES 6.1/6.2）；D3 项目记录（快照/工作日志）与仓库现状一致性；D4 对外文档（`输出文件/`）与实现一致性；D5 规范条款抽查（UTF-8 BOM·无 Tab·无第三方库与外链·甲方原件不入库·需求版本归档·9.8 变更表·md↔docx 同源）。 |
-| `tests/stress-check.js` | `node tests/stress-check.js`（**长跑，默认 8 小时；需浏览器权限**） | S1 页面持续存活（时钟推进·无未捕获异常·无 console.error）；S2 JS 堆是否无界增长；S3 DOM/标签数/激活面板是否漂移；S4 跨班次时的班次名·统计·曲线固化·待补传队列变化；S5 每小时把 8 个页面轮巡一遍并切两次断连。环境变量：`DSH_STRESS_HOURS`（默认 8）、`DSH_STRESS_INTERVAL_MIN`（默认 10）、`DSH_STRESS_SIZE`（默认 3840x2160）、`DSH_STRESS_EDGE`。产物：`tests/._verify/stress-<时间戳>.csv / .log / -summary.json` 与首末截图。 |
+| `tests/stress-check.js` | `node tests/stress-check.js`（**长跑，默认 8 小时；需浏览器权限**） | S1 页面持续存活（时钟推进·无未捕获异常·无 console.error）；S2 JS 堆是否无界增长；S3 DOM/标签数/激活面板是否漂移；S4 跨班次时的班次名·统计·曲线固化·待补传队列变化；S5 每小时把 8 个页面轮巡一遍并切两次断连。环境变量：`DSH_STRESS_HOURS`（默认 8）、`DSH_STRESS_INTERVAL_MIN`（默认 10）、`DSH_STRESS_SIZE`（默认 3840x2160）、`DSH_STRESS_EDGE`。产物：`tests/._verify/stress-<时间戳>.csv / .log / -summary.json` 与首末截图。**跑之前的前置条件（电源/休眠/注销/待重启）见第五节。** |
 | `tests/screenshot-diff.js` + `tests/screenshots-baseline/` | `node tests/screenshot-diff.js`（零依赖，自实现 PNG 解码） | 界面视觉回归：把候选截图与 `tests/screenshots-baseline/` 里的 10 张基准逐像素比对，**不同像素占比 ≤ 5%** 判定通过；先做"基准 vs 基准"自比（必须 0.00%）验证工具链路，再比候选（`--candidate` 指定目录，默认 `tests/._verify`）；`--tolerance`/`--channel` 可调阈值与单通道容差，`--self` 只做自比。基准图的命名、捕获参数、确定性固定画面的做法与更新流程见 `tests/screenshots-baseline/README.md`（该目录**由代码项目成员维护**）。 |
 
 > 上表 6.3～6.6、6.8～6.10 与 6.2 的**代码侧**已由 `contract-check.js` 覆盖，浏览器内的视觉与交互由 `browser-check.js` 覆盖。
@@ -153,4 +155,47 @@
 
 **新增一个浏览器场景**只需三步（参考 B2 段）：`await openPage('?参数')` → `await evaluate('页面内表达式')` → `check('断言名', 条件, '实测值')`。
 
-**本脚本不覆盖**（仍需人工或后续补充）：动效/闪烁等主观项（UI-09/UI-18）、报警弹窗（UI-13，Demo 已声明未实现）、长时间稳定性与内存（需长时间观测）、截图与最新界面的逐像素比对（需先确定基准图管理方式）。
+**本脚本不覆盖**（仍需人工或后续补充）：动效/闪烁等主观项（UI-09/UI-18）、报警弹窗（UI-13，Demo 已声明未实现）、长时间稳定性与内存（见第五节）、截图与最新界面的逐像素比对（见 `tests/screenshots-baseline/README.md`）。
+
+---
+
+## 五、长时间运行（整班次 / 7×24）怎么做
+
+`tests/stress-check.js` 用与第四节同一套无头 Edge + CDP 工具链，把看板连续挂 8 小时（默认，覆盖一个整班次），
+每 10 分钟采样一次、每小时轮巡 8 个页面并切两次断连。跑之前请按 5.1 逐条确认。
+
+### 5.1 跑之前必须确认的（2026-09-19 在本机实测的结论，换机器要重查）
+
+| 检查项 | 命令 | 本机实测 | 要求 |
+| --- | --- | --- | --- |
+| 系统睡眠 | `powercfg /q SCHEME_CURRENT SUB_SLEEP STANDBYIDLE` | AC/DC = **0（永不）** | 必须为 0；否则整段长跑会被挂起 |
+| 休眠 | `powercfg /q SCHEME_CURRENT SUB_SLEEP HIBERNATEIDLE` | AC/DC = **0（永不）** | 同上 |
+| 无人参与睡眠（隐藏项） | `powercfg /q SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0` | 未配置 | 主睡眠为 0 时无影响 |
+| 关闭显示器 | `powercfg /q SCHEME_CURRENT SUB_VIDEO VIDEOIDLE` | AC 900 s | 无影响（无头浏览器不需要屏幕，不终止进程） |
+| 关闭硬盘 | `powercfg /q SCHEME_CURRENT SUB_DISK DISKIDLE` | AC 1200 s | 无影响（磁盘可唤醒） |
+| 电池（是否笔记本） | `Get-CimInstance Win32_Battery` | 无（台式机） | 笔记本必须同时确认 DC 值 |
+| 关机/重启/睡眠计划任务 | `Get-ScheduledTask` 过滤 `shutdown` / `/r` / `SetSuspendState` | 无 | 必须无 |
+| Windows Update 待重启 | `Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'`；`Get-Service wuauserv` | False；已停止（手动） | 无待重启标记、避免自动重启 |
+| 磁盘空间 | `[System.IO.DriveInfo]::GetDrives()` | C 117 GB / D 247 GB 可用 | 留几十 MB 即可（只写 CSV/日志/少量截图） |
+
+> `powercfg /req`（查看当前有无程序阻止睡眠）**需要管理员权限**；主睡眠已为 0 时不必查。
+
+### 5.2 跑的时候不能做的事
+
+- **不要注销账号**：长跑进程挂在当前登录会话下，注销会终止整棵进程树。**锁屏不影响**——脚本启动 Edge 时带了
+  `--disable-background-timer-throttling`、`--disable-renderer-backgrounding`、`--disable-backgrounding-occluded-windows`，
+  锁屏/遮挡都不会让页面定时器被降频。
+- 不要手动关机/重启（含"更新并重启"），也不要在跑的过程中改电源计划。
+
+### 5.3 结果怎么读，以及它和验收指标的关系
+
+- 明细与结论：`tests/._verify/stress-<时间戳>.csv`（每 10 分钟一行）、`stress-<时间戳>.log`（进度，可随时 tail）、
+  `stress-<时间戳>-summary.json`（7 项判据汇总）、`-start.png` / `-end.png`（首末截图）。任一项判据失败即退出码 1。
+- 7 项判据：采样成功率、时钟持续推进、标签按钮恒为 8、激活面板恒为 1、无未捕获异常与 `console.error`、
+  堆增长（≤2 倍且 <100 MB）、DOM 增长（≤50%）。
+- **8 小时 ≠ 验收要求**：NFR-05 要求 **≥72 小时内存压力测试**（常驻 ≤1.2 GB、峰值 ≤1.8 GB），NFR-06 要求
+  **连续 30 天**无泄漏/无卡顿/无重启；这两条必须在**目标硬件**上按**系统级口径**（整机内存/CPU，而非进程工作集）复测。
+  本脚本只做开发期的"整班次筛查"。
+- 2026-09-19 首轮 8 小时实测观察（供参考，非结论）：页面 **JS 堆 9.5 MB 零增长、DOM 690 节点零漂移、零红色报错**；
+  但浏览器进程组的**工作集合计约 2 GB**（21 个进程，含共享页重复计数，不等于整机占用）——这是 NFR-05 的**风险提示**，
+  需要在目标机上用系统级口径复核。
