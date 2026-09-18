@@ -136,7 +136,8 @@ function loadUi(componentRels) {
       }
       return [];
     },
-    getElementById: () => null
+    getElementById: () => null,
+    querySelector: () => null
   };
   vm.createContext(sandbox);
   const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
@@ -520,6 +521,68 @@ async function main() {
         `堆增长 ${settled.toFixed(2)} MB`);
     }
     console.log(`        参考：${(1000 / Math.max(ms, 0.001)).toFixed(0)} 次/秒的处理能力上限`);
+  }
+
+  /* ===== U6 需求条款余项：FR-5～FR-9 与 NFR-11（本轮新增） ===== */
+  section('U6 需求条款余项（FR-5～FR-9 / NFR-11/15）');
+  {
+    const mainSrc = readText('src/main.js');
+    const dashSrc = readText('src/pages/Dashboard.js');
+    const setSrc = readText('src/components/SettingPanel.js');
+    const mockSrc = readText('src/services/mockData.js');
+    const allSrc = [mainSrc, dashSrc, setSrc, mockSrc].join('\n');
+
+    check(
+      'FR-8.2 解锁状态超时（建议 5 分钟）自动锁定',
+      /setUnlocked\(\s*false\s*\)/.test(allSrc) && /(5\s*\*\s*60|300000|5\s*\*\s*60\s*\*\s*1000)/.test(allSrc),
+      '只有手动「锁定」按钮会置 false，没有"解锁后 5 分钟自动锁定"的计时'
+    );
+
+    check(
+      'FR-8.7 / NFR-15 解锁后的写操作留痕（真实操作日志）',
+      /(opLog|operationLog|auditLog|state\.logs|操作日志\s*[:：]?\s*\[)/.test(allSrc) === true &&
+        /push\(\s*\{[^}]*(action|op|操作)/.test(allSrc),
+      '录入/发布只把"已记录操作日志"写进提示文案，state 里没有任何日志容器或追加动作'
+    );
+
+    const cssAll = readText('src/styles/global.css') + readText('src/styles/variables.css');
+    check(
+      'FR-9.7 大屏交互屏蔽（文本选中 / 右键菜单）',
+      /user-select\s*:\s*none/.test(cssAll) && /contextmenu/.test(allSrc),
+      '样式里没有 user-select:none，JS 也没有拦截 contextmenu（Alt+Tab/Win 属 kiosk 启动参数，见 README）'
+    );
+
+    check(
+      'FR-8.6 设置页提供关键参数配置入口（设备编号 / 上位机地址 / MES 地址）',
+      /id="[^"]*(equipCode|upperUrl|mesUrl|cfgEquip|cfgUpper|cfgMes)[^"]*"/i.test(html),
+      'index.html 里没有设备编号/上位机地址/MES 地址的输入控件，这些参数只能改 board.config.js'
+    );
+
+    check(
+      'FR-5.6 多条并发报警排队展示、不互相覆盖',
+      /alarm\.queue|alarmQueue|pendingAlarms/.test(mockSrc),
+      '只有单个 state.alarm.active（新报警直接覆盖）+ 每 150 s 自动轮换；台账也不接收新报警'
+    );
+
+    /* NFR-11：单一组件异常不应导致整屏白屏（行为验证） */
+    const originalRender = W.Components.StatsPanel.render;
+    W.Components.StatsPanel.render = () => { throw new Error('注入的组件故障'); };
+    ui.out.length = 0;
+    let propagated = null;
+    try {
+      W.Pages.Dashboard.renderAll(W.MockData.state);
+    } catch (e) {
+      propagated = e.message;
+    }
+    W.Components.StatsPanel.render = originalRender;
+    const afterFailure = ['ntTodoList', 'mtCycleList', 'setSelfCheckList'].filter(id => lastHtml(ui.out, id) !== null);
+    check(
+      'NFR-11 单一组件异常不导致整屏刷新中断',
+      propagated === null && afterFailure.length === 3,
+      propagated
+        ? `StatsPanel 抛错后异常直接冒出 renderAll：${propagated}（其后的组件都不会再渲染）`
+        : `未中断，但其后组件未渲染：${afterFailure.join('、') || '（无）'}`
+    );
   }
 
   /* ---------------- 汇总 ---------------- */
