@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>水池高速摄像生产管理看板 · Demo</title>
+<link rel="stylesheet" href="src/styles/variables.css">
+<link rel="stylesheet" href="src/styles/global.css">
+</head>
+<body>
+<div id="stage">
+
+  <!-- ============ 固定头部区（FR-1，不随标签切换） ============ -->
+  <header id="board-header">
+    <div class="hdr-left">
+      <div class="device-name" id="hdrDeviceName">水池高速摄像检验设备</div>
+      <div class="device-meta">
+        <span class="device-code" id="hdrDeviceCode">SX-UNDERWATER-001</span>
+        <span class="chip chip-ok" id="hdrLinkBadge">上位机在线</span>
+      </div>
+    </div>
+
+    <div class="hdr-center">
+      <div class="date-line">
+        <span id="hdrDate">2026-09-17</span>
+        <span class="weekday" id="hdrWeek">星期四</span>
+      </div>
+      <div class="clock" id="hdrClock">00:00:00</div>
+    </div>
+
+    <div class="hdr-right">
+      <div class="shift-row">
+        <span class="shift-badge" id="hdrShift">中班</span>
+        <span class="shift-time" id="hdrShiftTime">16:00 - 24:00</span>
+      </div>
+      <div class="staff-row">
+        <span class="staff"><i>班组</i><b id="hdrTeam">检验一班</b></span>
+        <span class="staff"><i>操作员</i><b id="hdrOperator">张伟</b></span>
+        <span class="staff"><i>班组长</i><b id="hdrLeader">李建国</b></span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ============ 信息展示区（8 个标签页，内容由 src/components 渲染） ============ -->
+  <main id="board-main">
+
+    <!-- ---------- 1 设备状态（FR-2） ---------- -->
+    <section class="tab-panel active" id="panel-status">
+      <div class="card hero-card" id="statusHero">
+        <div class="hero-band" id="stModeBand"></div>
+        <div class="card-title">设备运行模式</div>
+        <div class="hero-mode" id="stMode">测试运行</div>
+        <div class="hero-stage">
+          <span class="label">运行阶段</span>
+          <span class="value" id="stStage">拍摄中</span>
+        </div>
+        <div class="link-block">
+          <div class="link-head">
+            <span class="link-dot" id="stLinkDot"></span>
+            <span class="link-text" id="stLinkText">在线正常</span>
+          </div>
+          <div class="link-note" id="stLinkNote">上位机心跳正常 · 数据延迟 0.4 s</div>
+        </div>
+        <div class="legend" id="stLegend"></div>
+      </div>
+
+      <!-- 主要实测数据（FR-3.9～3.11 / C-31：深度与速度为主要展示对象） -->
+      <div class="card params-card">
+        <div class="card-title">实测主参数<span class="title-note">相机系统测量</span></div>
+        <div class="tile-grid cols-2 primary">
+          <div class="tile primary">
+            <div class="tile-label">航行器深度</div>
+            <div class="tile-value hero mono"><span id="stDepth">12.68</span><span class="unit">m</span></div>
+            <div class="tile-note" id="stDepthNote">水下深度实测值</div>
+          </div>
+          <div class="tile primary">
+            <div class="tile-label">航行速度</div>
+            <div class="tile-value hero mono"><span id="stSpeed">5.00</span><span class="unit">m/s</span></div>
+            <div class="tile-note" id="stSpeedNote">X-Y 平面合成速度</div>
+          </div>
+        </div>
+        <div class="tile-grid cols-3 sub">
+          <div class="tile"><div class="tile-label">水平速度 vx</div><div class="tile-value sm mono"><span id="stVx">4.90</span><span class="unit">m/s</span></div></div>
+          <div class="tile"><div class="tile-label">垂直速度 vy</div><div class="tile-value sm mono"><span id="stVy">0.10</span><span class="unit">m/s</span></div></div>
+          <div class="tile"><div class="tile-label">实时运行时长</div><div class="tile-value sm mono" id="stRunTime">00:00:00</div></div>
+        </div>
+        <!-- 设备参数：次要展示（FR-3.16 / C-31） -->
+        <div class="device-strip">
+          <span class="strip-title">设备参数（次要）</span>
+          <span class="strip-item">实际帧率<b class="mono" id="stFps">400</b>fps</span>
+          <span class="strip-item">相机增益<b class="mono" id="stGain">2.5</b></span>
+          <span class="strip-item">快门<b class="mono" id="stShutter">500</b></span>
+        </div>
+      </div>
+
+      <div class="card chart-card chart-depth">
+        <div class="card-title">航行器深度曲线<span class="title-note">按任务完成更新</span></div>
+        <div class="chart-wrap">
+          <svg class="chart" id="stDepthChart" viewBox="0 0 800 240" preserveAspectRatio="none"></svg>
+          <div class="chart-empty">
+            <span class="empty-title">暂无已完成任务数据</span>
+            <span class="empty-note">完成一次测试任务后自动绘制完整曲线</span>
+          </div>
+        </div>
+        <div class="chart-foot">
+          <span id="stDepthTask">—</span>
+          <b class="mono" id="stDepthRange">—</b>
+        </div>
+      </div>
+
+      <div class="card chart-card chart-speed">
+        <div class="card-title">航行速度曲线<span class="title-note">按任务完成更新</span></div>
+        <div class="chart-wrap">
+          <svg class="chart" id="stSpeedChart" viewBox="0 0 800 240" preserveAspectRatio="none"></svg>
+          <div class="chart-empty">
+            <span class="empty-title">暂无已完成任务数据</span>
+            <span class="empty-note">完成一次测试任务后自动绘制完整曲线</span>
+          </div>
+        </div>
+        <div class="chart-foot">
+          <span id="stSpeedTask">—</span>
+          <b class="mono" id="stSpeedRange">—</b>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- 2 任务数据（FR-3） ---------- -->
+    <section class="tab-panel" id="panel-task">
+      <div class="card">
+        <div class="card-title">当前工单信息</div>
+        <div class="kv-list fill" id="tkOrderList"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">实时实测数据<span class="title-note">主要</span></div>
+        <div class="tile-grid cols-2 primary">
+          <div class="tile primary">
+            <div class="tile-label">航行器深度</div>
+            <div class="tile-value hero mono"><span id="tkDepth">12.68</span><span class="unit">m</span></div>
+          </div>
+          <div class="tile primary">
+            <div class="tile-label">航行速度</div>
+            <div class="tile-value hero mono"><span id="tkSpeed">5.00</span><span class="unit">m/s</span></div>
+          </div>
+        </div>
+        <div class="tile-grid cols-2 sub">
+          <div class="tile"><div class="tile-label">水平速度 vx</div><div class="tile-value sm mono"><span id="tkVx">4.90</span><span class="unit">m/s</span></div></div>
+          <div class="tile"><div class="tile-label">垂直速度 vy</div><div class="tile-value sm mono"><span id="tkVy">0.10</span><span class="unit">m/s</span></div></div>
+        </div>
+        <div class="progress-block mt-24">
+          <div class="progress-head"><span>测试实时进度</span><span class="mono" id="tkProgressPct">0.0%</span></div>
+          <div class="progress-track"><div class="progress-fill" id="tkProgressBar"></div></div>
+          <div class="progress-foot"><span id="tkProgressText">已完成 0 / 0 件</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">单任务测试结果</div>
+        <div class="result-block">
+          <div class="result-value" id="tkResult">测试中</div>
+          <div class="result-note" id="tkResultNote">—</div>
+        </div>
+        <div class="task-flow">
+          <span class="flow-step" data-step="待测试">待测试</span>
+          <span class="flow-step" data-step="测试中">测试中</span>
+          <span class="flow-step" data-step="合格">合格</span>
+          <span class="flow-step" data-step="不合格">不合格</span>
+          <span class="flow-step" data-step="待复检">待复检</span>
+        </div>
+
+        <div class="card-title sm mt-24">设备参数与设定阈值<span class="title-note">次要（FR-3.5～3.8、3.16）</span></div>
+        <table class="data-table compact fill" id="tkCompareTable">
+          <thead><tr><th>参数</th><th>设定值</th><th>实际值</th><th>偏差</th><th>状态</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------- 3 班次信息 ---------- -->
+    <section class="tab-panel" id="panel-shift">
+      <div class="card span-2">
+        <div class="card-title">生产班次时段</div>
+        <div class="shift-list" id="shShiftList"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">当班人员</div>
+        <div class="kv-list fill" id="shStaffList"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">当班时间进度</div>
+        <div class="progress-block">
+          <div class="progress-head"><span>班次已进行</span><span class="mono" id="shProgressPct">0%</span></div>
+          <div class="progress-track"><div class="progress-fill accent" id="shProgressBar"></div></div>
+        </div>
+        <div class="tile-grid cols-2 mt-24">
+          <div class="tile"><div class="tile-label">班次开始</div><div class="tile-value sm mono" id="shStart">16:00</div></div>
+          <div class="tile"><div class="tile-label">班次结束</div><div class="tile-value sm mono" id="shEnd">24:00</div></div>
+          <div class="tile"><div class="tile-label">已进行时长</div><div class="tile-value sm mono" id="shElapsed">00:00:00</div></div>
+          <div class="tile"><div class="tile-label">剩余时长</div><div class="tile-value sm mono" id="shRemaining">00:00:00</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- 4 生产统计（FR-4） ---------- -->
+    <section class="tab-panel" id="panel-stats">
+      <div class="card">
+        <div class="card-title">当班任务统计</div>
+        <div class="tile-grid cols-3">
+          <div class="tile"><div class="tile-label">计划测试总数</div><div class="tile-value mono" id="sPlan">0</div></div>
+          <div class="tile"><div class="tile-label">实际开工总数</div><div class="tile-value mono" id="sStarted">0</div></div>
+          <div class="tile"><div class="tile-label">未开工数量</div><div class="tile-value mono muted" id="sNotStarted">0</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">任务完成统计</div>
+        <div class="tile-grid cols-3">
+          <div class="tile"><div class="tile-label">已完成测试数</div><div class="tile-value mono ok" id="sDone">0</div></div>
+          <div class="tile"><div class="tile-label">测试中数量</div><div class="tile-value mono accent" id="sDoing">0</div></div>
+          <div class="tile"><div class="tile-label">待测试数量</div><div class="tile-value mono muted" id="sTodo">0</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">质量质检统计</div>
+        <div class="tile-grid cols-4">
+          <div class="tile"><div class="tile-label">合格数</div><div class="tile-value mono ok" id="sQualified">0</div></div>
+          <div class="tile"><div class="tile-label">不合格数</div><div class="tile-value mono err" id="sUnqualified">0</div></div>
+          <div class="tile"><div class="tile-label">复检数</div><div class="tile-value mono warn" id="sRecheck">0</div></div>
+          <div class="tile"><div class="tile-label">一次性合格率</div><div class="tile-value mono" id="sFpy">0.0%</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">设备效率统计</div>
+        <div class="tile-grid cols-5">
+          <div class="tile"><div class="tile-label">有效运行时长</div><div class="tile-value sm mono" id="sRunTime">00:00:00</div></div>
+          <div class="tile"><div class="tile-label">待机时长</div><div class="tile-value sm mono" id="sIdleTime">00:00:00</div></div>
+          <div class="tile"><div class="tile-label">平均测试时长</div><div class="tile-value sm mono" id="sAvgTime">0:00</div></div>
+          <div class="tile"><div class="tile-label">产能达成率</div><div class="tile-value sm mono" id="sCapacity">0.0%</div></div>
+          <div class="tile"><div class="tile-label">设备稼动率</div><div class="tile-value sm mono" id="sOee">0.0%</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ---------- 5 设备异常（FR-5） ---------- -->
+    <section class="tab-panel" id="panel-alarm">
+      <div class="card alarm-card" id="alarmCard">
+        <div class="card-title">实时故障报警</div>
+        <div class="alarm-code mono" id="alCode">—</div>
+        <div class="alarm-type" id="alType">当前无故障</div>
+        <div class="kv-list compact" id="alDetail"></div>
+        <div class="alarm-state" id="alState">正常</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">预防性预警</div>
+        <div class="list fill" id="alWarningList"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">当班异常台账<span class="title-note">最新 5 条</span></div>
+        <table class="data-table compact fill" id="alTable">
+          <thead><tr><th>发生时间</th><th>代码</th><th>故障简述</th><th>闭环状态</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------- 6 维保台账（FR-6） ---------- -->
+    <section class="tab-panel" id="panel-maint">
+      <div class="card">
+        <div class="card-title">维保周期信息</div>
+        <div class="kv-list fill" id="mtCycleList"></div>
+        <div class="progress-block mt-24">
+          <div class="progress-head"><span>距下次维保</span><span class="mono" id="mtDaysLeft">0 天</span></div>
+          <div class="progress-track"><div class="progress-fill warn" id="mtProgressBar"></div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">设备累计运行</div>
+        <div class="tile-grid cols-1">
+          <div class="tile"><div class="tile-label">当日累计运行</div><div class="tile-value mono" id="mtTodayRun">00:00:00</div></div>
+          <div class="tile"><div class="tile-label">本月累计运行</div><div class="tile-value mono" id="mtMonthRun">0 h</div></div>
+          <div class="tile"><div class="tile-label">年度累计运行</div><div class="tile-value mono" id="mtYearRun">0 h</div></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">近期检修维保记录</div>
+        <table class="data-table compact fill" id="mtTable">
+          <thead><tr><th>检修时间</th><th>检修内容</th><th>责任人</th><th>验收状态</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ---------- 7 公告备注（FR-7） ---------- -->
+    <section class="tab-panel" id="panel-notice">
+      <div class="card">
+        <div class="card-title">车间公告通知</div>
+        <div class="list fill" id="ntNoticeList"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">测试工艺提示</div>
+        <div class="list fill" id="ntTipList"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">待办事项提醒</div>
+        <div class="list todo fill" id="ntTodoList"></div>
+      </div>
+    </section>
+
+    <!-- ---------- 8 操作设置（FR-8） ---------- -->
+    <section class="tab-panel" id="panel-setting">
+      <div class="card">
+        <div class="card-title">看板输入解锁</div>
+        <div class="lock-state">
+          <span class="lock-dot" id="setLockDot"></span>
+          <span id="setLockText">当前已锁定</span>
+        </div>
+        <div class="pwd-row">
+          <input type="password" id="setPwd" class="pwd-input" inputmode="numeric" placeholder="请输入解锁密码" maxlength="8">
+          <button class="btn primary" id="setUnlockBtn">解 锁</button>
+          <button class="btn" id="setLockBtn">锁 定</button>
+        </div>
+        <div class="pwd-msg" id="setMsg">演示密码：8888</div>
+        <div class="hint">解锁后可录入维保信息、修改公告信息与系统时间</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">系统时间设置</div>
+        <div class="kv-list fill" id="setTimeList"></div>
+        <div class="btn-row mt-24">
+          <button class="btn" id="setSyncBtn" disabled>立即同步 NTP</button>
+          <button class="btn" id="setManualBtn" disabled>手工设置时间</button>
+        </div>
+        <div class="hint">按 ENV-18/FR-8.3：以 NTP 同步优先，手工修改作为兜底（需解锁）</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">系统状态自检</div>
+        <div class="list fill" id="setSelfCheckList"></div>
+      </div>
+
+      <div class="card entry-card">
+        <div class="card-title">维保信息录入 / 公告信息发布<span class="title-note">需解锁（FR-6.11、FR-7.12）</span></div>
+        <div class="entry-grid">
+          <div class="entry-form">
+            <div class="form-title">维保信息录入</div>
+            <div class="form-row"><span class="form-label">检修内容</span>
+              <input class="form-input" id="maintContent" placeholder="如：更换水下光源密封圈" disabled></div>
+            <div class="form-row"><span class="form-label">责任人</span>
+              <input class="form-input" id="maintOwner" placeholder="责任人姓名" disabled></div>
+            <div class="form-row"><span class="form-label">验收状态</span>
+              <select class="form-input" id="maintState" disabled>
+                <option>待验收</option><option>已验收</option><option>不通过</option>
+              </select></div>
+            <button class="btn primary" id="maintSave" disabled>保存维保记录</button>
+          </div>
+          <div class="entry-form">
+            <div class="form-title">公告信息发布</div>
+            <div class="form-row"><span class="form-label">公告类型</span>
+              <select class="form-input" id="noticeType" disabled>
+                <option>生产调整</option><option>工艺变更</option><option>临时管控</option><option>车间公示</option>
+              </select></div>
+            <div class="form-row"><span class="form-label">公告内容</span>
+              <textarea class="form-input" id="noticeText" rows="2" placeholder="输入公告内容" disabled></textarea></div>
+            <button class="btn primary" id="noticeSave" disabled>发布公告</button>
+          </div>
+          <div class="entry-note" id="entryMsg">当前已锁定：请先在左侧输入解锁密码（演示密码 8888）</div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ============ 底部标签栏（FR-9） ============ -->
+  <footer id="board-footer">
+    <nav id="board-tabs"></nav>
+    <div id="board-status">
+      <div><span>版本</span><b class="mono">v0.3.0-demo</b></div>
+      <div><span>最后刷新</span><b class="mono" id="sbRefresh">00:00:00</b></div>
+      <div><span>上位机链路</span><b class="mono ok" id="sbHeartbeat">正常</b></div>
+      <div><span>MES 链路</span><b class="mono ok" id="sbMes">正常</b></div>
+    </div>
+  </footer>
+
+</div>
+
+<!-- 加载顺序：utils → services → components → pages → main
+     （被依赖的先加载；不使用 ES module，保证双击 index.html 即可打开） -->
+<script src="src/utils/dom.js"></script>
+<script src="src/utils/format.js"></script>
+<script src="src/services/api.js"></script>
+<script src="src/services/mockData.js"></script>
+<script src="src/components/HeaderBar.js"></script>
+<script src="src/components/TabsBar.js"></script>
+<script src="src/components/CurveChart.js"></script>
+<script src="src/components/DeviceStatusPanel.js"></script>
+<script src="src/components/TaskPanel.js"></script>
+<script src="src/components/ShiftPanel.js"></script>
+<script src="src/components/StatsPanel.js"></script>
+<script src="src/components/AlarmPanel.js"></script>
+<script src="src/components/MaintPanel.js"></script>
+<script src="src/components/NoticePanel.js"></script>
+<script src="src/components/SettingPanel.js"></script>
+<script src="src/pages/Dashboard.js"></script>
+<script src="src/main.js"></script>
+</body>
+</html>

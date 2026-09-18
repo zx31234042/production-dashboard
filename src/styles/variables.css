@@ -1,0 +1,23 @@
+﻿/* ==========================================================================
+   看板样式 · 设计变量
+   设计基准：3840 × 2160 @30Hz（75 寸电视 4K）
+   依据：需求清单 V1.24 — UI-03（色彩规范）、UI-04（字号规范）、ENV 系列
+   说明：颜色、字体等可调参数集中在本文件；布局与组件样式见 global.css
+   ========================================================================== */
+:root {
+  --bg:        #0B1A2B;
+  --bg-deep:   #050E18;
+  --panel:     #122740;
+  --panel-2:   #0F2136;
+  --line:      #1E3A5C;
+  --line-soft: #17304C;
+  --text:      #E8F1FA;
+  --muted:     #8FA9C4;
+  --accent:    #38A3E0;
+  --ok:        #00B050;
+  --warn:      #FFC000;
+  --err:       #FF0000;
+  --idle:      #808080;
+  --font: "Microsoft YaHei", "微软雅黑", "Source Han Sans SC", sans-serif;
+  --mono: "Consolas", "Cascadia Mono", "Courier New", monospace;
+}
