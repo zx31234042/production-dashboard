@@ -179,7 +179,7 @@
 | 引号 | JS 用单引号 `'文本'`；HTML 属性用双引号；PowerShell 用双引号（需要变量展开时） |
 | 魔法数字 | 颜色、尺寸、阈值集中到 CSS 变量或 JS 的 `CFG` 常量，不要散落在各处 |
 | 第三方库 | **本项目不引入第三方库、不使用 CDN**（看板为内网隔离环境，NFR-25） |
-| **改文件用哪个工具** | **不要用 PowerShell 文本命令（`Set-Content` / `Out-File` / `-replace` 重写）修改源码与文档** —— PS 5.1 的 `-Encoding utf8` 会**加 BOM**，且把中文按 ANSI 重新编码会产生 `缁熶竴` 这类**不可逆**乱码（2026-09-19 实际写坏过 `tests\db-check.js`，只能整文件重写）。改文件请用编辑器/工具接口写入 UTF-8（无 BOM）；确要用命令行处理，走 Node 或 `[System.IO.File]::WriteAllText(..., UTF8Encoding($false))` |
+| **改文件用哪个工具** | **不要用 PowerShell 文本命令（`Set-Content` / `Out-File` / `-replace` 重写）修改源码与文档** —— PS 5.1 的 `-Encoding utf8` 会**加 BOM**，且把中文按 ANSI 重新编码会产生 `缁熶竴` 这类**不可逆**乱码（2026-09-19 实际写坏过 `tests\db-check.js`，只能整文件重写）。<br>**正向做法（P3-6：只给禁令会让人按字面得出矛盾结论，故列出该怎么做）**：<br>· `.js` / `.css` / `.html` / `.json` / `.md` → **UTF-8 无 BOM**（换行按第七章：`.md` 用 CRLF、`tests\*.js` 用 LF）<br>· `.ps1` → **UTF-8 带 BOM**（见第七章，子项关系：BOM 要求只针对 `.ps1`）<br>· Node 侧写文件用 `fs.writeFileSync(p, s, 'utf8')`（**不会**加 BOM）<br>· 非要用 PowerShell 写，用 `[System.IO.File]::WriteAllText($p, $s, [System.Text.UTF8Encoding]::new($false))`（`.ps1` 则把 `$false` 换成 `$true`）<br>· 改完跑 `node tests\files-check.js` 验编码（乱码/BOM/Tab 一次查完） |
 | 中文 | 界面文案、注释、文档一律中文；代码标识符用英文 |
 
 ---
@@ -602,7 +602,8 @@ production-dashboard/
    - **不引入任何测试框架**（Jest/Mocha/Vitest 一律禁用，内置 `node:test` 亦不用）；测试沿用**自写 `check()` 脚本 + 统一 runner** `tests\run-all.js` 的风格与口径；
    - **环境与目录隔离**：`DSH_ENV=dev｜test｜prod`，测试**只允许**写 `tests\._verify\data\test`（已被忽略）；**测试进程发现 `DSH_ENV=prod` 必须立即报错退出**；
    - **一个用例一个库**：临时库用 `mkdtemp` 创建、跑完删除，**不得共用**；
-   - **时间来源统一走 `clock` 包装**，业务代码**不得**直接 `new Date()`（否则班次边界用例不可重复）；
+   - **时间来源统一走 `clock` 包装**，业务代码**不得**直接 `new Date()`（否则班次边界用例不可重复）。
+     **适用范围（P3-7 界定，与门禁一致）**：`server\` 与 `platform\` 下的代码 —— **允许"可注入 + 缺省兜底"写法**（`options.now || new Date()`、形参默认值 `d = new Date()`、三元 `clock ? clock.now() : new Date()`），**禁止**的是"没有注入出口、直接取当前时间参与逻辑"；`platform\clock.js` 作为时间来源本身**豁免**；`tests\` 脚本不受此条约束（它们本来就该钉死时间）。已由 `docs-cross-check` 静态断言守着。
    - **业务代码不得硬编码路径**，统一走 `platform\paths.js`；
    - 受限环境下跑不了的脚本（`browser-check`/`overlap-check`/`stress-check`）在 `run-all` 中**必须显式跳过并说明原因**，**不得静默当成通过**。
    - **退出码契约（2026-09-19 v1.22 新增，落地上一条）**：测试脚本一律以 `0` 通过 / `1` 有断言失败 / `2` 脚本自身异常 / **`3` 本环境跑不了、整脚本显式跳过** 结束；**"跑不了"必须退 3，不得退 0**（退 0 会被 runner 当成"跑过了"）。统一出口是 `tests\env.js` 的 `skipSuite()`（内部即退 3），脚本内**不要手写**这几个数字。

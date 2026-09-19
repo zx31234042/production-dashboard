@@ -117,7 +117,7 @@ config（board.config、fieldMap） → utils（dom、format） → services（a
 
 ---
 
-## 五、已覆盖的需求
+## 五、Demo 已实现的需求（覆盖证据见 `tests\README.md` 第三节）
 
 | 需求 | 体现 |
 | --- | --- |

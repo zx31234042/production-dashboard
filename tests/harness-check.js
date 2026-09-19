@@ -203,8 +203,16 @@ t.section('五、临时区与清理');
 {
   const dir = harness.makeTempDir('cleanup-probe');
   t.check('makeTempDir 落在 ._verify/tmp 之内（D16）', env.isInsideVerify(dir), path.relative(env.paths.root, dir));
-  t.check('临时目录名唯一（同进程连续两次不冲突）',
-    harness.makeTempDir('u') !== harness.makeTempDir('u'), '');
+  /* P3-14：唯一性探测过去**故意建两个目录且不回收** —— 每跑一次留 2 个空目录
+     （评审期间从 12 累积到 18）。这里改为**建完立刻删**，并断言目录数不增长。 */
+  const tmpCount = () => (fs.existsSync(env.paths.tempRoot) ? fs.readdirSync(env.paths.tempRoot).length : 0);
+  const beforeCount = tmpCount();
+  const u1 = harness.makeTempDir('u');
+  const u2 = harness.makeTempDir('u');
+  t.check('临时目录名唯一（同进程连续两次不冲突）', u1 !== u2, `${path.basename(u1)} ≠ ${path.basename(u2)}`);
+  for (const d of [u1, u2]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* 忽略 */ } }
+  t.check('P3-14：唯一性探测不残留目录（本节建完即删，目录数不增长）',
+    tmpCount() === beforeCount, `探测前 ${beforeCount} → 探测后 ${tmpCount()}`);
   fs.rmSync(dir, { recursive: true, force: true });
 
   const stale = harness.cleanup(false);

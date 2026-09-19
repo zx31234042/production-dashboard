@@ -182,6 +182,58 @@ function main() {
   t.check('ADR-0002 D11：server\\ 与 platform\\ 的代码里没有盘符路径与平台专有命令（断言落地）',
     platformHits.length === 0, platformHits.slice(0, 5).join('、'));
 
+  /* ADR-0003 D17 承诺的"业务代码不得直接 new Date()"断言（P3-7：承诺已有、门禁一直没落地）。
+     判据（先查实情再定，避免自造规则）：**允许"可注入 + 缺省兜底"写法** —— 形如
+     `options.now || new Date()`、`d = new Date()`、`clock ? clock.now() : new Date()`；
+     **禁止**的是"没有注入出口、直接用当前时间参与逻辑"（那会让用例不可重复）。
+     `platform\clock.js` 是时间来源本身，**豁免**。 */
+  /**
+   * 逐行返回"去掉注释后"的代码行（P3-7 需要：注释里会写"禁止 new Date()"这类说明，
+   * 首版把这些注释行判成了违规）。只做**行级轻量处理**：识别 `//` 与成对的 `/* … *\/`，
+   * 足够用于静态扫描，不追求完整 JS 词法分析。
+   */
+  const stripComments = (src) => {
+    const out = [];
+    let inBlock = false;
+    for (const raw of src.split(/\r?\n/)) {
+      let line = raw;
+      if (inBlock) {
+        const end = line.indexOf('*/');
+        if (end < 0) { out.push(''); continue; }
+        line = line.slice(end + 2);
+        inBlock = false;
+      }
+      const open = line.indexOf('/*');
+      if (open >= 0 && line.indexOf('*/', open) < 0) { inBlock = true; line = line.slice(0, open); }
+      const slash = line.indexOf('//');
+      if (slash >= 0) line = line.slice(0, slash);
+      out.push(line);
+    }
+    return out;
+  };
+
+  const clockHits = [];
+  for (const dir of ['server', 'platform']) {
+    for (const f of walkJs(path.join(ROOT, dir))) {
+      const rel = path.relative(ROOT, f);
+      if (rel === path.join('platform', 'clock.js')) continue;
+      stripComments(fs.readFileSync(f, 'utf8')).forEach((line, i) => {
+        if (!/new Date\(\s*\)/.test(line)) return;
+        /* 精确判据（首版 `=\s*new Date()` 过宽，把 `const now = new Date();` 也当成了形参默认值 ——
+           反证时发现该写法**没能被抓出**，故收紧为其后必须紧跟逗号或右括号）：
+           · 缺省兜底：`X || new Date()`
+           · 形参默认值：`param = new Date()` 或 `param = new Date(),`
+           · 三元兜底：`cond ? new Date()` 或 `: new Date()` */
+        const injectable = /\|\|\s*new Date\(\s*\)/.test(line) ||
+          /\(\s*\w+\s*=\s*new Date\(\s*\)\s*[,)]/.test(line) ||
+          /[?:]\s*new Date\(\s*\)/.test(line);
+        if (!injectable) clockHits.push(`${rel}:${i + 1}`);
+      });
+    }
+  }
+  t.check('ADR-0003 D17：业务代码的 `new Date()` 都留有注入出口（不是直接取当前时间算逻辑）',
+    clockHits.length === 0, clockHits.slice(0, 5).join('、'));
+
   /* ---------------- 七、字段语义（易错项） ---------------- */
   t.section('七、字段语义（易错项）');
   t.check('架构文档写明 depth＝航行器深度、cameraDepth＝相机自身深度',

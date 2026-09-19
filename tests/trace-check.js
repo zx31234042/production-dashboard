@@ -329,7 +329,8 @@ function main() {
   }
 
   console.log('\n=== 汇总 ===');
-  console.log(`通过 ${passed} 项，失败 ${failures.length} 项`);
+  /* 冻结格式（规范 9.5-5）：三字段齐全，`run-all` 与 tests\README 都解析这一行 */
+  console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 0 项`);
   if (failures.length) {
     console.log('\n失败清单：');
     failures.forEach((f, i) => console.log(`  ${i + 1}. ${f.name}${f.detail ? ' —— ' + f.detail : ''}`));
