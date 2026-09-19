@@ -36,17 +36,18 @@ const MAP = [
 
   /* FR-2 设备实时运行状态 */
   ['FR-2.1,FR-2.3,FR-2.5,FR-2.8', 'covered-direct', 'ui-check.js', 'FR-2.1 设备状态页列出 5 种运行模式色标'],
-  ['FR-2.2', 'covered-indirect', 'ui-check.js', 'UI-04 字号：'],
+  ['FR-2.2', 'manual', '', '状态→颜色映射（绿/黄/红/灰）须人工核对观感；原证据为"UI-04 字号"，与颜色标识无关（2026-09-19 改判）'],
   ['FR-2.4,FR-2.7', 'covered-indirect', 'ui-check.js', 'UI-08 深度与速度数值格式统一'],
   ['FR-2.6', 'covered-direct', 'browser-check.js', '?link=off 进入降级态'],
 
   /* FR-3 实时测试任务数据 */
   ['FR-3.1,FR-3.2,FR-3.3,FR-3.4', 'covered-indirect', 'ui-check.js', '当前工单信息渲染 8 项'],
-  ['FR-3.5,FR-3.6,FR-3.7,FR-3.8,FR-3.16', 'covered-indirect', 'ui-check.js', '超阈值判定：帧率超标、增益临近'],
+  ['FR-3.5,FR-3.6,FR-3.7,FR-3.8', 'covered-indirect', 'ui-check.js', '超阈值判定：帧率超标、增益临近'],
+  ['FR-3.16', 'covered-direct', 'copy-check.js', '设备参数次要展示区用词：实时帧率 / 相机增益 / 快门速度 / 相机水下深度'],
   ['FR-3.9,FR-3.10,FR-3.11,FR-3.12', 'covered-indirect', 'ui-check.js', '深度与速度数值格式统一'],
   ['FR-3.13', 'covered-indirect', 'ui-check.js', '单任务五态在模拟数据中可达'],
   ['FR-3.14', 'covered-direct', 'ui-check.js', 'FR-3.14 超阈值判定'],
-  ['FR-3.15', 'covered-indirect', 'contract-check.js', '?source=upper 端到端链路'],
+  ['FR-3.15', 'backend-phase', '', '曲线"按任务完成刷新一次"需服务端固化流程（DR-19）+ 任务完成事件，纯前端 Demo 只有一个节拍，无法验证刷新时机'],
   ['FR-3.17', 'covered-indirect', 'ui-check.js', '无在测工单时应显示'],
 
   /* FR-4 当班生产统计
@@ -58,17 +59,22 @@ const MAP = [
   ['FR-4.16', 'covered-direct', 'logic-check.js', '班次边界自动切换与跨零点归属（FR-4.16）'],
   ['FR-4.17', 'subjective', '', '数值变化增速高亮属动效，需人工评估'],
 
-  /* FR-5 设备异常与预警 */
-  ['FR-5.1,FR-5.2,FR-5.3,FR-5.4', 'covered-indirect', 'ui-check.js', '无故障时故障卡显示占位文案'],
+  /* FR-5 设备异常与预警
+     2026-09-19（P2-9～12）：这批证据原为"无故障时占位文案"（**断言的是反面**）与"现状快照/常量集中化"
+     （与条款无关）。已在 ui-check 的 U3b 段补**有故障、有台账**的真实断言，证据改指它们。 */
+  ['FR-5.1,FR-5.2,FR-5.3,FR-5.4', 'covered-direct', 'ui-check.js', 'FR-5.1 报警卡显示报警编号与类型'],
   ['FR-5.5,FR-5.7', 'declared-gap', '', 'README 已知限制 3：报警以卡片+横幅呈现，未实现弹窗动画'],
-  ['FR-5.6', 'covered-indirect', 'ui-check.js', 'FR-5.6 多条并发报警排队展示'],
-  ['FR-5.8,FR-5.9,FR-5.10,FR-5.11', 'covered-indirect', 'ui-check.js', 'FR-3.14 预警区与设备参数判定联动'],
-  ['FR-5.12,FR-5.13', 'covered-indirect', 'contract-check.js', '现状快照'],
-  ['FR-5.14', 'covered-indirect', 'contract-check.js', '常量集中化'],
+  ['FR-5.6', 'covered-direct', 'ui-check.js', 'FR-5.6 多条并发报警时排队说明与队列列表都渲染'],
+  ['FR-5.8,FR-5.9,FR-5.10,FR-5.11', 'covered-direct', 'ui-check.js', 'FR-5.8～5.11 预防性预警区按字典渲染标题与详情'],
+  ['FR-5.12,FR-5.13,FR-5.14', 'covered-direct', 'ui-check.js', 'FR-5.12/FR-5.13/FR-5.14 当班异常台账按行渲染'],
 
-  /* FR-6 维保台账 */
-  ['FR-6.1,FR-6.2,FR-6.3,FR-6.7,FR-6.8,FR-6.9,FR-6.10', 'covered-indirect', 'ui-check.js', '15 个指标全部由 StatsPanel 写入'],
-  ['FR-6.4,FR-6.5,FR-6.6', 'covered-indirect', 'contract-check.js', '维保累计：本月累计运行不得在交班时变小'],
+  /* FR-6 维保台账
+     2026-09-19（P2-11）：原 7+2 条共用"15 个指标全部由 StatsPanel 写入"—— 那条断言只遍历生产统计的
+     15 个 s* 元素，与维保台账/进度条/检修表**毫无关系**。已补 MaintPanel 的真实断言（U3b 段）。 */
+  ['FR-6.1,FR-6.2,FR-6.3', 'covered-direct', 'ui-check.js', 'FR-6.1/FR-6.2 维保周期台账渲染出三行'],
+  ['FR-6.4,FR-6.5,FR-6.6', 'covered-direct', 'ui-check.js', 'FR-6.4/FR-6.5/FR-6.6 距离下次维保天数渲染为'],
+  ['FR-6.7,FR-6.8,FR-6.9', 'covered-direct', 'ui-check.js', 'FR-6.7/FR-6.8/FR-6.9 三项累计运行都有**真实格式值**'],
+  ['FR-6.10', 'covered-direct', 'ui-check.js', 'FR-6.10 检修记录表按行渲染'],
   ['FR-6.11', 'covered-direct', 'browser-check.js', '?unlock=1 启动即解锁'],
   ['FR-6.12', 'backend-phase', '', '累计运行与实际数据对账需真实数据源'],
 
@@ -92,7 +98,7 @@ const MAP = [
   ['FR-9.5', 'declared-gap', '', 'P2：标签轮播未实现，路线图技术债 E3 已登记'],
   ['FR-9.6', 'covered-indirect', 'ui-check.js', '单次 tick + 10 个组件全量重绘耗时'],
   ['FR-9.7', 'covered-indirect', 'ui-check.js', 'FR-9.7 大屏交互屏蔽'],
-  ['FR-9.8', 'covered-indirect', 'ui-check.js', 'UI-04 字号：'],
+  ['FR-9.8', 'covered-indirect', 'ui-check.js', 'UI-04 字号：'],   /* 大屏远距离可读性：字号下限断言是直接证据；有线键鼠支持另见 ENV-13（属硬件） */
 
   /* FR-10 历史查询与报表（已声明不在 Demo 范围） */
   ['FR-10.*', 'out-of-scope', '', 'README：未包含历史查询与报表导出（P1，需后端）'],
@@ -100,7 +106,7 @@ const MAP = [
   /* UI 界面需求 */
   ['UI-01,UI-02,UI-03,UI-04', 'covered-direct', 'ui-check.js', 'UI-03 色彩规范'],
   ['UI-05', 'subjective', '', '颜色+文字+图标三重编码需人工观感确认'],
-  ['UI-06,UI-07', 'covered-indirect', 'ui-check.js', '15 个指标全部由 StatsPanel 写入'],
+  ['UI-06,UI-07', 'covered-direct', 'ui-check.js', 'FR-6.1/FR-6.2 维保周期台账渲染出三行'],
   ['UI-08', 'covered-direct', 'ui-check.js', 'UI-08 深度与速度数值格式统一'],
   ['UI-09,UI-18', 'subjective', '', '动效与防烧屏需人工评估'],
   ['UI-10', 'covered-direct', 'browser-check.js', '?link=off 进入降级态'],
@@ -141,8 +147,14 @@ const MAP = [
   ['DR-19', 'covered-indirect', 'db-check.js', '六、任务曲线按件固化（DR-18 / DR-19）'],
   ['DR-16', 'backend-phase', '', '时间格式已落库为文本列，但尚无独立断言核对格式统一（待服务层写时间时补）'],
 
-  /* ENV 运行环境与显示约束 —— 2026-09-19 补齐归属（此前整段被正则漏掉） */
-  ['ENV-01,ENV-02,ENV-03,ENV-04', 'covered-direct', 'ui-check.js', 'UI-04 字号：'],
+  /* ENV 运行环境与显示约束 —— 2026-09-19 补齐归属（此前整段被正则漏掉）
+     2026-09-19（P2-9）：这四条原来**全部**指向 ui-check 的"UI-04 字号："—— 其中只有 ENV-03 沾边，
+     ENV-01/02/04 在目标脚本里根本查不到对应断言。现按子项分开：ENV-03 记 covered（字号有真断言），
+     ENV-01 的 4K 舞台有断言但 30Hz 刷新率要真机，ENV-02/04 改 manual（需真机与人工观感）。 */
+  ['ENV-01', 'manual', '', '4K 舞台尺寸已有断言（ui-check U1），但 30Hz 刷新能力须真机实测（ENV-06 同因）'],
+  ['ENV-02', 'manual', '', '16:9 与"无滚动条"需在目标机实际分辨率下人工确认（browser-check 有 3 分辨率断言但本环境不可运行）'],
+  ['ENV-03', 'covered-direct', 'ui-check.js', 'UI-04 字号：'],
+  ['ENV-04', 'manual', '', '高对比/防反光须在 75 寸屏现场观感确认，属主观项'],
   ['ENV-05', 'subjective', '', '防烧屏/残影需在 75 寸屏长期观察，属主观项'],
   ['ENV-06,ENV-10', 'manual', '', 'HDMI ≥1.4 与 4K@30Hz 输出能力须现场用同规格电视实测'],
   ['ENV-07', 'manual', '', '独立专用电视为现场硬件配置，非软件可验'],
@@ -259,6 +271,29 @@ function main() {
   }
   check('证据指向的脚本都存在', badScript.length === 0, badScript.join('；'));
   check('证据指向的断言确实存在于该脚本', badEvidence.length === 0, badEvidence.slice(0, 6).join('；'));
+
+  /* 2b) 证据"共用度"提示（P2-9～12 的辅助，**不判失败**）
+     为何不判失败：一条断言被多条条款共用**很多时候是正当的** —— 例如
+     `IF-B.8`（上报报文 13 字段）与 `IF-D.1/D.2…`（报文键映射）本就指向同一份字段清单；
+     `UI-06/UI-07`（进度条/图表）与 `FR-6.1～6.3`（维保周期台账）指向同一次面板渲染也正确。
+     故这里只**列出**高共用度的证据供人工复核，并把判据写清楚：
+     **"证据是否对题"属语义判断，无法用文本规则可靠判定；能机械化的是"证据脚本存在"
+     与"证据文本确实在该脚本里"（上两条），其余靠评审。** */
+  const evidenceUsers = new Map();
+  for (const [pattern, status, script, evidence] of MAP) {
+    if (!script || !evidence) continue;
+    const key = `${script} ← ${evidence}`;
+    if (!evidenceUsers.has(key)) evidenceUsers.set(key, []);
+    evidenceUsers.get(key).push(...expand(pattern, universe));
+  }
+  const shared = [...evidenceUsers].filter(([, ids]) => ids.length >= 5)
+    .map(([key, ids]) => `${key} → ${ids.length} 条`);
+  if (shared.length) {
+    console.log(`  [提示] ${shared.length} 条证据被 ≥5 条条款共用（需人工复核是否对题，不计失败）：`);
+    for (const s of shared.slice(0, 5)) console.log(`         · ${s}`);
+  } else {
+    console.log('  [提示] 没有证据被 ≥5 条条款共用');
+  }
 
   /* 3) 覆盖统计 */
   console.log('\n=== 三、覆盖统计（按状态）===');

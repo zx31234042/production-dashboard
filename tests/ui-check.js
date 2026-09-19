@@ -440,6 +440,113 @@ async function main() {
     check('UI-11 无故障时故障卡显示占位文案', /无故障|正常/.test(t), `alType = ${JSON.stringify(t)}`);
   }
 
+  /* ===== U3b 报警/维保面板的**有内容**渲染（FR-5.1～5.4 / FR-6.x / UI-06）
+     立案原因（R-2026-09-19-02 的 P2-9～12）：这 9 条条款此前都挂在"15 个指标由 StatsPanel 写入"
+     或"无故障占位文案"上 —— 前者与维保台账/进度条无关，后者断言的是**反面**。
+     故在此补真实断言（有故障、有台账），再把追溯表的证据指向它们。 ===== */
+  section('U3b 报警与维保面板的有内容渲染（FR-5.1～5.4 / FR-6.1～6.10 / UI-06/07）');
+  {
+    /* 有故障时：报警卡必须给出编号、类型、描述、故障字典与闭环状态（FR-5.1～5.4） */
+    ui.out.length = 0;
+    const activeAlarm = {
+      code: 'AL-2026-0919-01', type: '上位机断连', level: '严重',
+      desc: '与设备上位机通信中断超过 5 s', state: '未处理',
+      time: '2026-09-19 09:00:00', action: '检查网线并重启上位机'
+    };
+    W.Components.AlarmPanel.render({
+      alarm: {
+        active: activeAlarm, queue: [activeAlarm],
+        ledger: [{ time: '2026-09-19 09:00:00', code: activeAlarm.code, desc: activeAlarm.desc, state: '未处理' }]
+      },
+      warnings: []
+    });
+    const alCode = String(lastText(ui.out, 'alCode') || '');
+    const alType = String(lastText(ui.out, 'alType') || '');
+    const alDetail = String(lastHtml(ui.out, 'alDetail') || '');
+    const alState = String(lastText(ui.out, 'alState') || '');
+    check('FR-5.1 报警卡显示报警编号与类型（有故障时不再显示占位）',
+      alCode === activeAlarm.code && alType === activeAlarm.type,
+      `alCode=${JSON.stringify(alCode)} alType=${JSON.stringify(alType)}`);
+    check('FR-5.2/FR-5.3 报警卡给出故障描述与处理信息（发生时间/等级/处理人/处理措施）',
+      alDetail.includes(activeAlarm.desc) && alDetail.includes('故障发生时间') &&
+      alDetail.includes('等级') && alDetail.includes('处理措施') && alDetail.includes(activeAlarm.action),
+      `alDetail 长度 ${alDetail.length}`);
+    check('FR-5.4 报警卡显示闭环状态（未处理时应如实呈现）',
+      /闭环状态：未处理/.test(alState), `alState=${JSON.stringify(alState)}`);
+    check('FR-5.6 多条并发报警时排队说明与队列列表都渲染（不覆盖、不丢失）',
+      (() => {
+        ui.out.length = 0;
+        const q = [
+          activeAlarm,
+          { code: 'A2', type: 't2', level: '一般', desc: 'd2', state: '未处理', time: '09:01' },
+          { code: 'A3', type: 't3', level: '提示', desc: 'd3', state: '已闭环', time: '09:02' }
+        ];
+        W.Components.AlarmPanel.render({ alarm: { active: activeAlarm, queue: q, ledger: [] }, warnings: [] });
+        const note = String(lastText(ui.out, 'alQueueNote') || '');
+        const list = String(lastHtml(ui.out, 'alQueueList') || '');
+        return /3 条未闭环/.test(note) && list.includes('A2') && list.includes('A3');
+      })(), '队首留卡片、其余两条进队列列表');
+    check('FR-5.8～5.11 预防性预警区按字典渲染标题与详情（联动设备参数判定）',
+      (() => {
+        ui.out.length = 0;
+        W.Components.AlarmPanel.render({
+          alarm: { active: null, queue: [], ledger: [] },
+          warnings: [{ lv: 'warn', title: '帧率接近上限', detail: '当前 950/1000 fps' }]
+        });
+        const list = String(lastHtml(ui.out, 'alWarningList') || '');
+        return list.includes('帧率接近上限') && list.includes('950/1000');
+      })(), '');
+    check('FR-5.12/FR-5.13/FR-5.14 当班异常台账按行渲染（时间/编号/描述/闭环状态）',
+      (() => {
+        ui.out.length = 0;
+        W.Components.AlarmPanel.render({
+          alarm: {
+            active: null, queue: [],
+            ledger: [
+              { time: '2026-09-19 09:00:00', code: 'AL-1', desc: '断连', state: '已闭环' },
+              { time: '2026-09-19 09:30:00', code: 'AL-2', desc: '帧率超限', state: '未处理' }
+            ]
+          },
+          warnings: []
+        });
+        const tbody = String(lastHtml(ui.out, 'alTable tbody') || '');
+        return (tbody.match(/<tr>/g) || []).length === 2 && tbody.includes('AL-1') &&
+          tbody.includes('AL-2') && tbody.includes('已闭环') && tbody.includes('未处理');
+      })(), '台账条目不得覆盖或丢失');
+
+    /* 维保台账：周期行、进度条百分比、累计运行三项、检修记录表（FR-6.1～6.10 / UI-06/07）
+       注：假 DOM 把 `$('mtTable').querySelector('tbody').innerHTML = …` 记为 id 为
+       `mtTable tbody` 的 html 记录（见本文件 `o.querySelector` 的实现），故按该 id 取。 */
+    ui.out.length = 0;
+    W.Components.MaintPanel.render(W.MockData.state);
+    const styleOf = (id, prop) => {
+      const hits = ui.out.filter(r => r.kind === 'style' && r.id === id && r.prop === prop);
+      return hits.length ? hits[hits.length - 1].value : null;
+    };
+    const cycle = String(lastHtml(ui.out, 'mtCycleList') || '');
+    const bar = String(styleOf('mtProgressBar', 'width') || '');
+    const today = String(lastText(ui.out, 'mtTodayRun') || '');
+    const month = String(lastText(ui.out, 'mtMonthRun') || '');
+    const year = String(lastText(ui.out, 'mtYearRun') || '');
+    const days = String(lastText(ui.out, 'mtDaysLeft') || '');
+    const tbody = String(lastHtml(ui.out, 'mtTable tbody') || '');
+    check('FR-6.1/FR-6.2 维保周期台账渲染出三行（上次维保/计划下次/固定周期）',
+      (cycle.match(/kv-row/g) || []).length === 3 &&
+      cycle.includes('上次维保时间') && cycle.includes('计划下次维保') && cycle.includes('固定维保周期'),
+      `周期行数 ${(cycle.match(/kv-row/g) || []).length}`);
+    check('FR-6.3 维保进度条按已用比例设置宽度（0～100%）',
+      /^\d+(\.\d+)?%$/.test(bar) && Number.parseFloat(bar) >= 0 && Number.parseFloat(bar) <= 100,
+      `width=${bar}`);
+    check('FR-6.4/FR-6.5/FR-6.6 距离下次维保天数渲染为「N 天」',
+      /^\d+\s*天$/.test(days), `mtDaysLeft=${JSON.stringify(days)}`);
+    check('FR-6.7/FR-6.8/FR-6.9 三项累计运行都有**真实格式值**（不是占位破折号）',
+      [today, month, year].every(v => v.length > 0 && v !== '—' && v !== ''),
+      `当班=${today} 本月=${month} 本年=${year}`);
+    check('FR-6.10 检修记录表按行渲染（时间/内容/责任人/状态四列）',
+      tbody.includes('<tr>') && ['mono', 'ok', 'warn'].some(c => tbody.includes(c)),
+      `tbody 片段数 ${(tbody.match(/<tr>/g) || []).length}`);
+  }
+
   /* ===== U4 每秒整屏重绘的副作用 ===== */
   section('U4 每秒 renderAll 的副作用（NFR-01）');
   {
