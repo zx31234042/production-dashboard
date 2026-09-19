@@ -1,0 +1,22 @@
+{
+  "note": "元素重叠白名单（tests/overlap-check.js 读取）。allow 里的选择器组合被视为合法重叠，不再计入候选；candidates 是自动检测出的待确认项，人工看图确认后把对应条目的 a/b 复制进 allow 并补 reason。",
+  "rule": "父子/祖先-后代重叠自动跳过；不可见元素跳过；重叠面积占较小元素 ≤5% 视为可忽略；其余按选择器组合聚合。",
+  "allow": [
+    {
+      "a": ".card",
+      "b": ".degraded-banner",
+      "reason": "UI-10 降级横幅为覆盖层，属设计（2026-09-19 人工看图确认合法）"
+    }
+  ],
+  "candidates": [
+    {
+      "a": ".card",
+      "b": ".degraded-banner",
+      "worstPct": 100,
+      "where": "1920×1080 断连降级（?link=off），共 1 处；3840×2160 / 1366×768 未出现",
+      "screenshot": "tests/._verify/overlaps/_card_degraded_banner.png",
+      "assessment": "降级横幅为底部覆盖层（UI-10「与上位机断连时受影响数据区显示数据已冻结 + 最后更新时间」），覆盖在曲线卡片之上属设计内行为",
+      "suggestion": "建议移入 allow：{ \"a\": \".card\", \"b\": \".degraded-banner\", \"reason\": \"UI-10 降级横幅为覆盖层，属设计\" }"
+    }
+  ]
+}

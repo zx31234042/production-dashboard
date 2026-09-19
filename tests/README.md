@@ -60,6 +60,12 @@
 - 数值格式统一：深度/速度 2 位小数、帧率整型、时间 `yyyy-MM-dd HH:mm:ss`；
 - 修改需求后，界面文案与需求清单条款一致。
 
+> **本节 1～5 项的自动化情况（2026-09-19 更新）**：
+> ①红色报错、②逐页点击、④特殊状态（含键盘 `D`/`A`、`?curve`/`?link`/`?unlock`/`?tab`）→ `browser-check` 全覆盖；
+> ③三分辨率"无滚动条" → `browser-check` 已覆盖；**"无元素重叠" → `overlap-check`（26 次页面加载，自动跳过父子与不可见元素）**；
+> ⑤"无乱码" → `browser-check` 的编码与乱码特征断言已覆盖；"数值格式" → `ui-check` 的 UI-08；**"文案与需求一致" → `copy-check`（19 条映射、100+ 字符串已断言，另 3 条映射待确认）**。
+> 仍属人工的：配色/动效的观感、75 寸实屏远距离可读性、UI-13 报警弹窗（未实现）。
+
 ### 6. 数据源与接口链路（2026-09-18 新增）
 
 | 序号 | 验证项 | 操作 | 期望结果 |
@@ -114,17 +120,25 @@
 | `tests/browser-check.js` | `node tests/browser-check.js`（**需浏览器权限，见下节**） | B1 页面加载·无红色报错·首屏要素；B2 `?tab=`/`?curve=none`/`?link=off`/`?unlock=1`/`?source=upper`；B3 键盘 `D` 降级；B4 八个标签逐页切换且头部常显；B5 3840×2160 / 1920×1080 / 1366×768 无滚动条；B6 无操作 3 分钟自动回首页（虚拟时间快进）；B7 截图落到 `tests/._verify/`。 |
 | `tests/docs-check.js` | `node tests/docs-check.js`（零依赖；会调用本机 PowerShell 5.1 跑 `tools/` 下两个转换脚本） | D1/D1b 文档转换工具的真实能力（四级标题·表格·列表·引用·代码块·行内格式·分隔线·图片嵌入·`{w=60}`·图注·缺图容错·`._docx_build` 清理·OPC 部件名）；D2 提交信息格式（PROJECT_RULES 6.1/6.2）；D3 项目记录（快照/工作日志）与仓库现状一致性；D4 对外文档（`输出文件/`）与实现一致性；D5 规范条款抽查（UTF-8 BOM·无 Tab·无第三方库与外链·甲方原件不入库·需求版本归档·9.8 变更表·md↔docx 同源）。 |
 | `tests/stress-check.js` | `node tests/stress-check.js`（**长跑，默认 8 小时；需浏览器权限**） | S1 页面持续存活（时钟推进·无未捕获异常·无 console.error）；S2 JS 堆是否无界增长；S3 DOM/标签数/激活面板是否漂移；S4 跨班次时的班次名·统计·曲线固化·待补传队列变化；S5 每小时把 8 个页面轮巡一遍并切两次断连。环境变量：`DSH_STRESS_HOURS`（默认 8）、`DSH_STRESS_INTERVAL_MIN`（默认 10）、`DSH_STRESS_SIZE`（默认 3840x2160）、`DSH_STRESS_EDGE`。产物：`tests/._verify/stress-<时间戳>.csv / .log / -summary.json` 与首末截图。**跑之前的前置条件（电源/休眠/注销/待重启）见第五节。** |
-| `tests/screenshot-diff.js` + `tests/screenshots-baseline/` | `node tests/screenshot-diff.js`（零依赖，自实现 PNG 解码） | 界面视觉回归：把候选截图与 `tests/screenshots-baseline/` 里的 10 张基准逐像素比对，**不同像素占比 ≤ 5%** 判定通过；先做"基准 vs 基准"自比（必须 0.00%）验证工具链路，再比候选（`--candidate` 指定目录，默认 `tests/._verify`）；`--tolerance`/`--channel` 可调阈值与单通道容差，`--self` 只做自比。基准图的命名、捕获参数、确定性固定画面的做法与更新流程见 `tests/screenshots-baseline/README.md`（该目录**由代码项目成员维护**）。 |
+| `tests/screenshot-diff.js` + `tests/screenshots-baseline/` | `node tests/screenshot-diff.js`（零依赖，自实现 PNG 解码） | 界面视觉回归：把候选截图与 `tests/screenshots-baseline/` 里的 10 张基准逐像素比对，**不同像素占比 ≤ 5%** 判定通过；先做"基准 vs 基准"自比（11 项，必须 0.00%）验证工具链路，再按同名比候选（`--candidate` 指定目录，默认 `tests/._verify/captures`；有候选时共 21 项）；`--tolerance`/`--channel` 可调阈值与单通道容差，`--self` 只做自比。基准图的命名、捕获参数、确定性做法与更新流程见 `tests/screenshots-baseline/README.md`（该目录**由代码项目成员维护**）。 |
+| `tests/capture-baseline.js` | `node tests/capture-baseline.js`（**需浏览器权限**；`--out <目录>`、`--update`、`--size 1920x1080`） | 基准图的**确定性捕获**：无头 Edge + CDP，页面加载前注入"固定时间（2026-09-18 10:00）+ 种子化 `Math.random` + 冻结 `setInterval/setTimeout`"，使每次捕获逐像素一致——实测两遍独立捕获 **10/10 张差异 0.00%、最大通道差 0**，5% 阈值因此真正严格。默认拍 8 标签页 + 2 特殊状态共 10 张到 `tests/._verify/captures`；`--update` 覆盖基准目录（人工看图确认后使用）。 |
+| `tests/trace-check.js` | `node tests/trace-check.js`（零依赖；`--list` 打印全部条款归属） | **需求追溯**：内嵌「需求条款 → 承接证据」追溯表，校验①每条条款都有归属（不允许含糊）②证据脚本存在③证据断言确实在该脚本里；输出可追溯覆盖率（当前 **123 / 236 = 52.1%**，其中直接断言 36 条、间接验证 87 条）与 fix-pending / backend-phase / declared-gap / manual / subjective / out-of-scope 分类。 |
+| `tests/copy-check.js` | `node tests/copy-check.js`（零依赖，源码级文案核对） | **界面文案 ↔ 需求条款**：21 条已确认映射（运行模式 5 种、阶段 4 种、联网三态、结果五态、统计 15 项指标名、四类预警、闭环四态、台账/检修表头、公告与提示标签、待办三项、解锁文案、NTP 按钮、自检七项、八个标签名、页脚四要素、空态文案、头部人员标签、日期/星期格式、累计运行命名…共 100+ 个字符串）逐条断言；另 1 条（FR-3.16 设备参数用词）登记为审查报告 P3-20 待改，不参与断言。 |
+| `tests/overlap-check.js` | `node tests/overlap-check.js`（**需浏览器权限**；`--min 5`、`--shots 3`） | **元素重叠检测**：3 种分辨率 × 8 页 + 2 特殊状态（26 次页面加载）取各主要容器的视觉矩形做相交检测，自动跳过父子包含与不可见元素、忽略 ≤5% 重叠，按选择器组合聚合；命中 `tests/overlap-whitelist.json` 的 `allow` 规则即通过。当前实测：**0 类未白名单化**（`.card × .degraded-banner` 经人工确认属 UI-10 降级覆盖层，已入白名单）。 |
 
 > 上表 6.3～6.6、6.8～6.10 与 6.2 的**代码侧**已由 `contract-check.js` 覆盖，浏览器内的视觉与交互由 `browser-check.js` 覆盖。
 >
-> 脚本的**断言失败即待修缺陷**。当前结果（合计 **155 通过 / 37 失败 / 1 跳过**）：`contract-check` 31 通过 / 21 失败，`ui-check` 28 通过 / 12 失败（加 `--expose-gc` 为 29 / 12；另有 1 项在无 GC 时跳过），`tools-check` 24 通过 / 0 失败，`browser-check` 18 通过 / 1 失败，`docs-check` **39 通过 / 3 失败**，`screenshot-diff` 15 通过 / 0 失败。
+> 脚本的**断言失败即待修缺陷**。当前结果（合计 **179 通过 / 37 失败 / 1 跳过（217 项断言）**，含 11 个脚本）：`contract-check` 31/21，`ui-check` 28/12（+1 跳过；加 `--expose-gc` 为 29/12），`tools-check` 24/0，`browser-check` **21/1**，`docs-check` **39/3**，`trace-check` 4/0，`copy-check` **21/0**（另 1 条 FR-3.16 用词差异登记待改），`screenshot-diff` 11/0（有确定性捕获候选时 21/0）；`stress-check` 另有 7 项长跑判据；`overlap-check` 0 类未白名单化（`.card × .degraded-banner` 已确认属 UI-10 降级覆盖层）。
+>
+> 本节数字为**权威值**：`项目记录/` 与审查报告里的门禁数字均以此为准，改动脚本后请同步更新这里。
+>
+> **需求追溯覆盖率（`trace-check`）**：236 条需求条款全部有归属，其中**可追溯覆盖 123 条（52.1%）**——直接断言 36 条、间接验证 87 条；其余分类为 `backend-phase` 72 条（数据库/服务端/真实接口/目标硬件）、`fix-pending` 17 条（已确认缺陷）、`declared-gap` 8 条、`out-of-scope` 7 条、`manual` 5 条、`subjective` 4 条。按类别：FR 86/110、UI 12/19、IF 18/46、NFR 7/27、DR 0/19、DEP 0/15。要提升覆盖率，主要靠补 `manual`/`subjective` 项与后端阶段落地，而不是再加断言。
 >
 > **提交信息偏差登记（2026-09-18，处置决定：不改写历史）**：历史上两条提交 `c269c4c 代码审查`、`f9152ee review` 不符合 PROJECT_RULES 6.1/6.2（缺 `类型: ` 前缀，且用了英文）。决定**保留原样**，理由：第六章明确 Git 提交与推送由项目负责人手动执行，改写历史属其职权；且仓库已做过一次强制推送，再改写会让既有引用与备份全部失效。防复发由本脚本 D2 段门禁保证（新增不合规提交即报 FAIL）。若负责人决定改写，可自行执行 `git rebase -i HEAD~2`（两条都改 `reword`）后 `git push --force-with-lease`。
 >
 > 失败项对应：`?source=upper` 取帧链缺陷与每秒 mock tick 覆盖报文、数据冻结不降级、当班统计为负、累计运行倒退、未闭环计数恒为 1、自检写死、用户输入未转义、docx 部件名用反斜杠（交付件与工具打包处都要改）、源码与样式表版本滞后、附录 2 声明 12 与实际 13、状态色与阈值重复写死、UI-04 字号不达标（指标名 52px、辅助说明 32～36px）、公告/待办空态缺失、无工单空态缺失、单任务五态不可达、解锁不超时（FR-8.2）、写操作无真实留痕（FR-8.7/NFR-15）、未屏蔽文本选中与右键（FR-9.7）、设置页无关键参数入口（FR-8.6）、并发报警无排队（FR-5.6）、单组件异常会中断整屏（NFR-11）、提交信息不符 `类型: 说明` 格式、`当前状态快照.md` 的"最新提交"过期（该文档另有多处记录漂移，见工作日志核对结论）、`PROJECT_RULES.md` 9.8 表重复登记 v1.8。修完对应源码/文档后重跑应转全绿；`contract-check` 的 K 段若失败，说明占位口径已变，需同步确认界面说明。
 >
-> 界面视觉回归（`screenshot-diff`）实测：现有 4 张即时截图与 09-18 交付基准的差异为 **设备状态 3.54%、断连降级 3.34%、生产统计 0.77%、曲线空态 0.49%**，均 ≤ 5% → 说明交付截图与当前界面仍然一致（差异主要来自时钟/数值/曲线等动态区域）。注意：基准图尚未做"固定时间 + 固定随机"的确定性重拍，见 `tests/screenshots-baseline/README.md` 第三节。
+> **界面视觉回归（`screenshot-diff` + `capture-baseline`）**：基准图已改为**确定性捕获**（10 张，1920×1080，固定时间 + 种子随机 + 冻结定时器）。确定性验证：连续两遍独立捕获 **10/10 张差异 0.00%、最大通道差 0**；基准与捕获互比 **21/21 通过**——5% 阈值现在真正严格。作为对照，改版前用"即时截图（4K、时钟在走）"比 09-18 交付截图得出的差异为 3.54% / 3.34% / 0.77% / 0.49%（均 ≤5%），说明交付截图与当时界面一致；该口径已不再用于回归判定（不同口径互比会被 `screenshot-diff` 判为尺寸/内容不一致，属预期）。基准目录 10 张合计约 2.9 MB（原 4K 交付副本约 7.5 MB）。
 >
 > 性能微基准（U5）实测：单次 tick + 10 个组件全量重绘约 **0.1 ms**（约 1 万次/秒），相对 1 秒刷新周期余量极大；连续 2000 次刷新在强制 GC 后堆增长 < 20 MB，未发现明显泄漏迹象。
 >

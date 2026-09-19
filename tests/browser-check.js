@@ -258,6 +258,30 @@ async function main() {
   check('主要实测数据已渲染（航行器深度）', /^\d+\.\d{2}$/.test(globals.depth), `stDepth=${globals.depth}`);
   check('8 个面板容器都存在', globals.panels === true);
 
+  /* 编码与乱码：整屏可见文本不得出现替换字符或典型 GBK↔UTF-8 误解码序列（tests/README 第一节 5） */
+  const encoding = await evaluate(`(() => {
+    const text = [document.title, (document.getElementById('stage')||{}).innerText || ''].join('\\n');
+    const bad = [
+      ['替换字符 U+FFFD', /\\uFFFD/],
+      ['典型乱码「锟斤拷」', /锟斤拷/],
+      ['典型乱码「ï¿½」', /ï¿½/],
+      ['UTF-8 被按 Latin-1 解码（â€／Ã 后跟控制区）', /(?:â€|Ã[\\u0080-\\u00BF]|æ[\\u0080-\\u00BF]|å[\\u0080-\\u00BF]|ç[\\u0080-\\u00BF])/],
+      ['GBK 误解码特征字', /[鏉鐢閫氳涓洪個]/]
+    ].filter(([, re]) => re.test(text)).map(([name]) => name);
+    return {
+      charset: document.characterSet,
+      bad,
+      hasChinese: /设备运行模式|航行器深度/.test(text),
+      length: text.length
+    };
+  })()`);
+  check('页面编码为 UTF-8 且中文字符正常渲染',
+    encoding.charset === 'UTF-8' && encoding.hasChinese,
+    `characterSet=${encoding.charset} 含预期中文=${encoding.hasChinese} 文本长度=${encoding.length}`);
+  check('整屏可见文本无乱码特征（替换字符 / GBK 误解码序列）',
+    encoding.bad.length === 0,
+    encoding.bad.join('、'));
+
   /* ===== B2 参数化启动 ===== */
   section('B2 参数化启动（tests/README 第一节 4）');
   await openPage('?tab=3', 1800);
@@ -341,6 +365,28 @@ async function main() {
   check('按 D 进入「故障锁定 + 降级横幅」（UI-10）',
     afterD.banner && afterD.mode === '故障锁定',
     `横幅=${afterD.banner} 运行模式=${afterD.mode}`);
+
+  /* 键盘 A：切到下一条故障报警（FR-5.1～5.4；mockData.injectAlarm 让 activeAlarmIndex+1） */
+  const alarmBefore = await evaluate(`(() => {
+    const a = (window.MockData.state.alarm || {}).active || {};
+    return { code: a.code || '', type: a.type || '', mark: (a.time || '') + '|' + (a.state || '') };
+  })()`);
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, text: 'a' });
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65 });
+  await sleep(1600);
+  const alarmAfter = await evaluate(`(() => {
+    const a = (window.MockData.state.alarm || {}).active || {};
+    return {
+      code: a.code || '', type: a.type || '',
+      domCode: (document.getElementById('alCode')||{}).textContent || '',
+      domType: (document.getElementById('alType')||{}).textContent || ''
+    };
+  })()`);
+  check('按 A 切换到下一条故障报警（DOM 与 state 同步变化）',
+    alarmBefore.code !== alarmAfter.code &&
+      alarmAfter.domCode === alarmAfter.code && alarmAfter.domType === alarmAfter.type,
+    `state：${alarmBefore.code}/${alarmBefore.type} → ${alarmAfter.code}/${alarmAfter.type}；` +
+    `DOM：${alarmAfter.domCode}/${alarmAfter.domType}`);
 
   /* ===== B4 逐页切换 ===== */
   section('B4 逐页点击切换（FR-9.1～9.3）');

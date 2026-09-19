@@ -29,7 +29,10 @@ function arg(name, fallback) {
 }
 
 const BASELINE = path.resolve(ROOT, String(arg('baseline', path.join('tests', 'screenshots-baseline'))));
-const CANDIDATE = path.resolve(ROOT, String(arg('candidate', path.join('tests', '._verify'))));
+/* 候选目录默认指向确定性捕获的输出目录（tests\capture-baseline.js 的 --out）；
+   注意：基准图是"固定时间+种子随机+冻结定时器"的确定性捕获（1920×1080），
+   拿即时截图（4K、时钟与数值在变）来比会被判为尺寸/内容不一致，属预期行为。 */
+const CANDIDATE = path.resolve(ROOT, String(arg('candidate', path.join('tests', '._verify', 'captures'))));
 const TOLERANCE = Number(arg('tolerance', 0.05));       // 不同像素占比上限
 const CHANNEL_TOL = Number(arg('channel', 8));          // 单通道容差（0~255）
 const SELF_ONLY = arg('self', false) === true;
@@ -144,21 +147,8 @@ function listPngs(dir) {
   return fs.readdirSync(dir).filter(n => n.toLowerCase().endsWith('.png')).sort();
 }
 
-/* 候选别名：browser-check.js 等工具产出的临时文件名 → 基准文件名 */
-const ALIASES = {
-  'default.png': '01-设备状态-任务曲线.png',
-  'tab-stats.png': '04-生产统计.png',
-  'curve-none.png': '09-曲线初始空态.png',
-  'link-off.png': '10-上位机断链降级.png'
-};
-/* 容错：基准里可能写"断连"也可能写"断链"，取实际存在的那个 */
+/* 候选按基准同名配对；不再做"别名映射"，避免把不同口径（4K 即时截图 vs 1080p 确定性基准）拿来比 */
 function resolveBaseline(name, baseFiles) {
-  const mapped = ALIASES[name];
-  if (mapped && baseFiles.includes(mapped)) return mapped;
-  if (mapped) {
-    const loose = baseFiles.find(f => f.replace(/断链/g, '断连') === mapped.replace(/断链/g, '断连'));
-    if (loose) return loose;
-  }
   return baseFiles.includes(name) ? name : null;
 }
 
