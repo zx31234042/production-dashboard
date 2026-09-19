@@ -51,6 +51,7 @@ production-dashboard/
 ├── reference/                    # 来源文件文本提取件（比对用）
 ├── index.html                    # 页面入口
 ├── PROJECT_RULES.md              # 代码与结构规范（改代码前先看）
+├── 项目架构与技术栈.md            # 架构与技术栈说明（系统整体长什么样、谁负责什么）
 └── README.md                     # 本文件
 ```
 
@@ -153,6 +154,8 @@ config（board.config、fieldMap） → utils（dom、format） → services（a
 
 ## 七、改代码前请看
 
+- **`项目架构与技术栈.md`**：系统整体长什么样、各层谁负责什么、技术栈与 10 条贯穿性约束（**先看这份建立全局认识**）；
 - **`PROJECT_RULES.md`**：目录与命名规范、注释要求、提交信息格式、改动前自查清单；
 - **`tests/README.md`**：每次改动后必须做的验证步骤；
+- **`项目记录\ADR\`**：进程模型、运行时、依赖、存储、推送为什么这么选（决策历史）；
 - **`tools/Markdown转Word工具说明.md`**：把 `.md` 文档转成 Word 的命令（改了文档要重新生成）。
