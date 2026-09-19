@@ -45,7 +45,6 @@ function createClock(options = {}) {
   const offsetMs = Number(options.offsetMs || 0);
 
   let current = new Date(seed.getTime());
-  const realBase = Date.now();
 
   const api = {
     mode,
@@ -54,7 +53,10 @@ function createClock(options = {}) {
     /** 当前"现在" */
     now() {
       if (mode === 'real') return new Date();
-      if (mode === 'offset') return new Date(Date.now() - realBase + seed.getTime() + offsetMs);
+      /* offset 的正确语义是"真实时间 + 固定偏移"，**不叠加** seed
+         （早期实现写成 Date.now() - realBase + seed + offsetMs，结果时钟会随真实时间漂移，
+           已由 tests/harness-check.js 的 offset 用例抓出） */
+      if (mode === 'offset') return new Date(Date.now() + offsetMs);
       return new Date(current.getTime());
     },
 
