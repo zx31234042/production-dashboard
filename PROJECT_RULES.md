@@ -411,7 +411,13 @@ production-dashboard/
 │   └── ._verify/                 # 自检产物（截图/捕获/日志/长跑 CSV/临时数据库），已被 .gitignore 忽略
 ├── server/                       # 看板服务端（Node 24 LTS；ADR-0001/0002）
 │   ├── db/                       #   schema.sql（DR-01～DR-19 的 13 张表）+ index.js（连接/初始化）+ maintain.js（备份/保留）
-│   └── repo/                     #   仓储层：只写 SQL，不做业务判断（measure.js 实测数据 / curve.js 任务曲线）
+│   ├── repo/                     #   仓储层：只写 SQL，不做业务判断（measure.js 实测数据 / curve.js 任务曲线）
+│   └── services/                 #   业务层（shift.js 班次边界 / stats.js 当班统计 FR-4；判定/MES/推送待补）
+├── platform/                     # 平台适配层（ADR-0002 D11：业务代码禁出现平台字样）
+│   ├── paths.js                  #   三环境数据目录（DSH_ENV，业务不得硬编码路径）
+│   ├── clock.js                  #   可注入时钟（业务代码禁止直接 new Date()）
+│   ├── log.js                    #   零依赖日志（分级/按日滚动/保留天数，NFR-21）
+│   └── id.js                     #   uploadId 与本地 id
 ├── 来源文件/                      # 甲方原件（只读，不进版本管理）
 ├── 需求文档/                      # 需求清单最新版
 │   └── 历史文件/                  # 旧版本归档

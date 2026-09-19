@@ -46,11 +46,13 @@ const MAP = [
   ['FR-3.15', 'covered-indirect', 'contract-check.js', '?source=upper 端到端链路'],
   ['FR-3.17', 'covered-indirect', 'ui-check.js', '无在测工单时应显示'],
 
-  /* FR-4 当班生产统计 */
-  ['FR-4.1,FR-4.4,FR-4.5,FR-4.6,FR-4.7,FR-4.8,FR-4.9,FR-4.10,FR-4.11,FR-4.12,FR-4.13,FR-4.14,FR-4.15', 'covered-indirect', 'ui-check.js', '15 个指标全部由 StatsPanel 写入'],
+  /* FR-4 当班生产统计
+     2026-09-19：服务层 services/stats.js 落地后，15 项指标改为由逻辑层断言逐项承接
+     （此前只靠"StatsPanel 写入 15 个指标"的界面断言间接覆盖）。 */
+  ['FR-4.1,FR-4.4,FR-4.5,FR-4.6,FR-4.7,FR-4.8,FR-4.9,FR-4.10,FR-4.11,FR-4.12,FR-4.13,FR-4.14,FR-4.15', 'covered-indirect', 'logic-check.js', '三、15 项当班指标'],
   ['FR-4.2', 'covered-direct', 'ui-check.js', 'FR-4.2/4.3 实际开工数不得超过计划总数'],
-  ['FR-4.3', 'covered-indirect', 'ui-check.js', 'FR-4.2/4.3 实际开工数不得超过计划总数'],
-  ['FR-4.16', 'covered-direct', 'contract-check.js', '维保累计：本月累计运行不得在交班时变小'],
+  ['FR-4.3', 'covered-indirect', 'logic-check.js', '开工数超过计划时，未开工封顶为 0（不出现负数）'],
+  ['FR-4.16', 'covered-direct', 'logic-check.js', '班次边界自动切换与跨零点归属（FR-4.16）'],
   ['FR-4.17', 'subjective', '', '数值变化增速高亮属动效，需人工评估'],
 
   /* FR-5 设备异常与预警 */
@@ -132,7 +134,7 @@ const MAP = [
   ['DR-13', 'covered-indirect', 'db-check.js', '三、写入与去重键（DR-13）'],
   ['DR-14', 'covered-indirect', 'db-check.js', '八、数据保留策略（DR-14）'],
   ['DR-15', 'covered-indirect', 'db-check.js', '七、备份与校验（DR-15 / DEP-08）'],
-  ['DR-17', 'covered-indirect', 'db-check.js', '重开后行数不变且去重键仍生效'],
+  ['DR-17', 'covered-indirect', 'logic-check.js', '累计运行持久化：重启不倒退、跨班次不清零（DR-17）'],
   ['DR-19', 'covered-indirect', 'db-check.js', '六、任务曲线按件固化（DR-18 / DR-19）'],
   ['DR-16', 'backend-phase', '', '时间格式已落库为文本列，但尚无独立断言核对格式统一（待服务层写时间时补）'],
 

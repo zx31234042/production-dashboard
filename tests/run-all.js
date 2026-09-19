@@ -55,6 +55,7 @@ const SUITES = [
   { name: 'docs-cross-check', desc: '跨文档一致性', needBrowser: false, slow: false },
   { name: 'files-check', desc: '编码与文件卫生', needBrowser: false, slow: false },
   { name: 'harness-check', desc: '夹具自检（时钟/样本/注入/服务启停）', needBrowser: false, slow: false },
+  { name: 'logic-check', desc: '当班统计与班次边界（FR-4 / DR-17）', needBrowser: false, slow: false },
   { name: 'db-check', desc: '本地库结构与仓储层', needBrowser: false, slow: false },
   { name: 'trace-check', desc: '需求追溯', needBrowser: false, slow: false },
   { name: 'copy-check', desc: '界面文案与需求条款对照', needBrowser: false, slow: false },

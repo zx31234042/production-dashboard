@@ -10,10 +10,12 @@
      - mes              ← Q-23 MES 接口契约（地址/回执风格/字段名见 fieldMap.js）
    依赖：无（需最先加载）
    ========================================================================== */
-window.BoardConfig = (function () {
+/* 服务端（Node）与浏览器共用本文件：浏览器挂到 window，Node 挂到 module.exports。
+   单一真源很重要 —— 班次口径/统计公式/判定容差若各存一份，前后端必然算出两套结果。 */
+const BOARD_CONFIG = (function () {
   'use strict';
 
-  return {
+  const CFG = {
     /* ---------------- 数据源 ---------------- */
     /* 'mock'  = 用内置模拟数据驱动（默认，评审演示用）
        'upper' = 用"上位机报文 + 适配层"驱动（联调前自测用；?source=upper 可临时切换） */
@@ -123,4 +125,11 @@ window.BoardConfig = (function () {
       keepLast: 1       // 页面展示保留的最近任务数（正式实现按 DR-18 落库后可扩大）
     }
   };
+
+  /* 服务端（Node）也要用同一份配置 —— 班次口径、统计公式、判定容差必须**单一真源**，
+     否则前后端会各算一套（这正是"配置集中地"的初衷，见规范 9.6）。
+     故本文件同时支持两种加载方式：浏览器全局 window.BoardConfig ／ Node 的 module.exports。 */
+  if (typeof window !== 'undefined') window.BoardConfig = CFG;
+  if (typeof module !== 'undefined' && module.exports) module.exports = CFG;
+  return CFG;
 })();
