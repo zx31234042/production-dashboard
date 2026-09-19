@@ -125,10 +125,27 @@
 | `tests/trace-check.js` | `node tests/trace-check.js`（零依赖；`--list` 打印全部条款归属） | **需求追溯**：内嵌「需求条款 → 承接证据」追溯表，校验①每条条款都有归属（不允许含糊）②证据脚本存在③证据断言确实在该脚本里；输出可追溯覆盖率（当前 **140 / 236 = 59.3%**，其中直接断言 36 条、间接验证 104 条）与 fix-pending / backend-phase / declared-gap / manual / subjective / out-of-scope 分类。 |
 | `tests/copy-check.js` | `node tests/copy-check.js`（零依赖，源码级文案核对） | **界面文案 ↔ 需求条款**：22 条已确认映射（运行模式 5 种、阶段 4 种、联网三态、结果五态、统计 15 项指标名、四类预警、闭环四态、台账/检修表头、公告与提示标签、待办三项、解锁文案、NTP 按钮、自检七项、八个标签名、页脚四要素、空态文案、头部人员标签、日期/星期格式、累计运行命名…共 100+ 个字符串）逐条断言；FR-3.16 设备参数用词（实时帧率/相机增益/快门速度/相机水下深度）已于 2026-09-19 修复并升为断言，现无"登记待改"条目。 |
 | `tests/overlap-check.js` | `node tests/overlap-check.js`（**需浏览器权限**；`--min 5`、`--shots 3`） | **元素重叠检测**：3 种分辨率 × 8 页 + 2 特殊状态（26 次页面加载）取各主要容器的视觉矩形做相交检测，自动跳过父子包含与不可见元素、忽略 ≤5% 重叠，按选择器组合聚合；命中 `tests/overlap-whitelist.json` 的 `allow` 规则即通过。当前实测：**0 类未白名单化**（`.card × .degraded-banner` 经人工确认属 UI-10 降级覆盖层，已入白名单）。 |
+| `tests/docs-cross-check.js` | `node tests/docs-cross-check.js`（零依赖，纯文本读取） | **跨文档一致性（43 项）**：①版本号（架构文档/快照/工作日志 ↔ `PROJECT_RULES` 头部与需求基线）②跨文档核心数字（13 字段、38 万行/秒、0.34 GB/年及其推算前提）③**需求编号可追溯**（架构文档引用的每个编号都必须在需求清单里存在）④目录描述与实际仓库（标"待建"的 `server\`/`platform\` 必须不存在；新文档必须已登记）⑤技术栈断言 ↔ ADR（Node 24 / SSE / 不落库 / 零依赖 / 平台适配层 / WebView2）⑥与规范 9.5 四条约束一致 ⑦字段语义（`depth` ≠ `cameraDepth`）⑧进度标注与实际状态 ⑨**测试侧边界**（夹具层不得 require 业务代码、临时区必须在 `._verify` 内、harness 必须提供一用例一库）。**立项依据**：一次同类检查曾抓出 3 处真缺陷，其中 2 处单看任何一份文档都发现不了（ADR-0003 D18）。 |
+| `tests/preflight.js` | `node tests/preflight.js`（零依赖） | **环境体检（10 项 + 1 跳过）**：Node 版本下限（≥24）、`node:sqlite` + WAL、临时库互相隔离、全局 `fetch`、`AbortSignal.timeout`、`node:net`、临时区可写、测试数据目录位于 `._verify` 内（D16）、磁盘余量、空闲端口分配、Edge 可用性、**子进程管道能力**（受限环境为 EPERM → 记为**跳过**并进警告，不伪装成失败）。目的：把"环境问题"与"代码问题"分开报。 |
+| `tests/run-all.js` | `node tests/run-all.js`（`--fast` 跳过耗时/浏览器类；`--tap` 安静模式；`--only a,b`；`--list`；`--no-preflight`） | **统一 runner（ADR-0003 D15）**：一条命令跑完所有门禁并按脚本汇总，**任一失败即非零退出**。**三种输出模式**：①有管道 → 捕获输出并解析断言级合计；②无管道 + 安静模式 → 输出落 `tests\._verify\run-all\<脚本>.log`，主控台只留结果行（文件路径会列出，不隐藏信息）；③无管道 + 非安静 → `stdio=inherit` 直通。**注意**：受限沙箱禁止子进程管道（EPERM），此时**只按退出码判定**、**不断言级合计**，且绝不把无法解析当成失败。 |
+
+**测试基建（夹具层，不属门禁脚本）**
+
+| 文件 | 作用 |
+| --- | --- |
+| `tests/env.js` | 测试环境常量与校验：`MIN_NODE_MAJOR=24`（不达标直接退出码 2）、`DSH_ENV` 解析、路径集（`tempRoot`/`testData`/`captures`/`baseline`）、`ensureDir`、`isInsideVerify`、过期临时目录清理。**业务代码不得引用本文件**（业务走 `platform/paths.js`）。 |
+| `tests/lib/assert.js` | 公共断言与汇总：`createRunner()` 提供 `section/check/skip/info/finish`，**汇总行固定为 `通过 N 项，失败 N 项，跳过 N 项`**（runner 与门禁数字机制都解析这一行，**不可改格式**）；`runMain()` 提供异常兜底（退出码 2）。 |
+| `tests/lib/harness.js` | 夹具：`makeTempDir`/`makeTempDb`（**一用例一库**，WAL，跑完删；`reopen()` 供"重启不丢数据"用例）/`allocPort`/`startService`（stdio **落文件而非管道**）/`injectFailure`（错误注入，验 IF-B.9 补传与 IF-D.9 降级）/`cleanup`。 |
+| `tests/lib/fixture.js` | 确定性样本：固定种子 `SEED=20260919` 的 PRNG；设备/工单/测试标准；`makeFrame`（**自洽**：`speed=√(vx²+vy²)`，且 `cameraDepth ≠ depth`）/`makeFrames`/`makeCurve`（含 `minValue`/`maxValue`/`intervalSec`/`durationSec`）/`makeSnapshot`；`REPORT_FIELDS`＝附录 2 的 13 项。 |
+| `tests/lib/clock.js` | **可注入时钟**：`fixed`（测试推荐）/`real`/`offset` 三种模式，`now/at/advanceMs/advanceSec/advanceMin/reset/source/snapshot`；另导出班次边界时刻常量 `BOUNDARIES`（交班前后、跨零点、跨月、跨年）。**用途**：班次边界（FR-4.16）与累计运行用例若不注入时钟就只能"看运气跑"。 |
 
 > 上表 6.3～6.6、6.8～6.10 与 6.2 的**代码侧**已由 `contract-check.js` 覆盖，浏览器内的视觉与交互由 `browser-check.js` 覆盖。
 >
-> 脚本的**断言失败即待修缺陷**。当前结果（合计 **233 通过 / 2 失败 / 1 跳过（236 项断言）**，含 11 个脚本）：`contract-check` **58/0**，`ui-check` 40/0（+1 跳过；加 `--expose-gc` 为 41/0），`tools-check` 24/0，`browser-check` 22/0，`docs-check` **42/2**（**2 项＝D2 提交信息的两条断言；其失败清单现已含 3 条已登记偏差，按 6.4 决定长期保留**），`trace-check` 4/0（`fix-pending` 0 条），`copy-check` 22/0（登记待改 0 条），`screenshot-diff` **21/0**；`stress-check` 另有 7 项长跑判据（本轮未复跑，上一轮 7/7）；`overlap-check` 0 类未白名单化（`.card × .degraded-banner` 已确认属 UI-10 降级覆盖层）。
+> 脚本的**断言失败即待修缺陷**。当前结果（**离线可跑部分**：8 个脚本，合计 **254 通过 / 2 失败 / 2 跳过（258 项断言）**）：`contract-check` **58/0**，`ui-check` 40/0（+1 跳过；加 `--expose-gc` 为 41/0），`tools-check` 24/0，`docs-check` **42/2**（**2 项＝D2 提交信息的两条断言；其失败清单现已含 3 条已登记偏差，按 6.4 决定长期保留**），**`docs-cross-check` 43/0（本轮新增）**，`trace-check` 4/0（`fix-pending` 0 条），`copy-check` 22/0（登记待改 0 条），`screenshot-diff` **21/0**。
+>
+> **需环境权限、本轮未复跑**：`browser-check` 22/0、`overlap-check` 0 类未白名单化、`stress-check` 7 项长跑判据（沿上一轮证据）。合计口径因此与上一轮不同：本轮把新增的 `docs-cross-check` 计入，脚本总数由 11 → **15**（含 `docs-cross-check` / `preflight` / `run-all` / `env.js`；夹具层在 `tests/lib/`，不计入脚本数）。
+>
+> **统一 runner（本轮新增）**：`node tests\run-all.js` 一条命令跑全部；`--fast` 跳过耗时/浏览器类并转安静模式。**受限沙箱注意**：本环境禁止子进程管道（EPERM），runner 会自动降级为"按退出码判定、采集不到断言级合计、输出落文件"，**这是环境限制而非脚本失败**。
 >
 > **需求清单 V1.28 勘误轮（2026-09-19 第三轮）**：`contract-check` 新增 J 段「正文「N 个字段」声明 ↔ 附录 2 字段表一致」防回潮断言（57 → **58** 项），需求清单同时补齐 V1.27 遗漏的正文 7 处项数表述。
 >
