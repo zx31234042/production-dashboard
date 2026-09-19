@@ -11,7 +11,9 @@
          node tests/screenshot-diff.js --baseline <目录> --candidate <目录>
          node tests/screenshot-diff.js --tolerance 0.05 --channel 8     # 阈值与通道容差
          node tests/screenshot-diff.js --self                           # 只做自比（验证工具）
-   退出码：0 = 全部通过；1 = 有图超过阈值或缺图；2 = 脚本自身异常。
+   退出码：0 = 全部通过；1 = 有图超过阈值、或缺图/候选为空；2 = 脚本自身异常。
+   注意（P1-3 修复后）：候选目录空或不存在**不再算通过** —— 会以"候选张数/可配对张数"断言失败退 1。
+         只有 `--self` 是例外（只验工具自身，不要求候选目录）。
    ========================================================================== */
 'use strict';
 
@@ -179,6 +181,14 @@ function main() {
 
   console.log('\n=== 候选比对 ===');
   const candFiles = listPngs(CANDIDATE);
+  /* P1-3：候选目录空/不存在时，过去只跑"基准自比"就 finish() → 11 项全 PASS、退出码 0，
+     视觉回归形同虚设却报绿。现在把"候选可配对张数"本身当断言：
+     候选为空、或同名配对后缺图，一律 FAIL（不是通过）。 */
+  check(`候选目录可访问且含候选图`, candFiles.length > 0,
+    `候选目录 ${path.relative(ROOT, CANDIDATE)} 里没有 PNG（${candFiles.length} 张）—— 没比对任何东西，不能算通过`);
+  check(`候选图张数与基准一致（${baseFiles.length} 张）`, candFiles.length === baseFiles.length,
+    `候选 ${candFiles.length} 张 vs 基准 ${baseFiles.length} 张`);
+
   const pairs = [];
   for (const n of candFiles) {
     const base = resolveBaseline(n, baseFiles);
@@ -186,7 +196,8 @@ function main() {
   }
   if (!pairs.length) {
     console.log(`  候选目录里没有能与基准配对的图（候选 ${candFiles.length} 张：${candFiles.join('、') || '（空）'}）`);
-    console.log('  说明：候选图需与基准同名，或用 ALIASES 里登记过的别名（见 tests/screenshots-baseline/README.md）。');
+    console.log('  说明：候选图需与基准同名（见 tests/screenshots-baseline/README.md）。');
+    check('候选图能与基准同名配对', false, '配对成功 0 张');
     finish();
     return;
   }
@@ -209,12 +220,16 @@ function main() {
   if (notCompared.length) {
     console.log(`  未比对（候选目录缺图）：${notCompared.join('、')}`);
   }
+  /* 报告建议的"候选缺一张即 FAIL"：把缺图本身当断言，而不是只打印一行提示 */
+  check('每张基准图都有同名候选图参与比对', notCompared.length === 0,
+    notCompared.length ? `缺 ${notCompared.length} 张：${notCompared.join('、')}` : '');
   finish();
 }
 
 function finish() {
   console.log('\n=== 汇总 ===');
-  console.log(`通过 ${passed} 项，失败 ${failures.length} 项`);
+  /* 冻结格式（规范 9.5-5 第 5 条）：三字段齐全，`run-all` 与 tests\README 都解析这一行 */
+  console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 0 项`);
   if (failures.length) {
     console.log('\n失败清单：');
     failures.forEach((f, i) => console.log(`  ${i + 1}. ${f.name}${f.detail ? ' —— ' + f.detail : ''}`));

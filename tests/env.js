@@ -41,6 +41,19 @@ function assertRuntime() {
   }
 }
 
+/* ---------------- 退出码契约（规范 9.5-5 第 6 条：跑不了必须显式跳过） ----------------
+   0 = 全部断言通过（允许 0 项"跳过"的断言，如 ui-check 的需浏览器单项）
+   1 = 有断言失败
+   2 = 脚本自身异常（环境不满足导致的运行时错误、未捕获异常）
+   3 = **本环境跑不了**，整脚本显式跳过 —— runner 据此归类为"跳过"，绝不计入通过
+   为什么单独给 3：SKIP 场景过去以 0 退出，runner 只能靠子进程输出文本猜，
+   而受限沙箱下输出可能拿不到（管道 EPERM），于是一个断言都没跑的脚本被记成 PASS。
+   现有脚本**只用**这三个函数发退出码，不要在脚本里手写 process.exit(0/1/2/3)。 */
+const EXIT_PASS = 0;
+const EXIT_FAIL = 1;
+const EXIT_ERROR = 2;
+const EXIT_ENV_SKIP = 3;
+
 /* ---------------- 环境与路径 ---------------- */
 const ENV_NAME = process.env.DSH_ENV || 'dev';                 // dev | test | prod
 const ROOT = path.resolve(__dirname, '..');                    // 仓库根目录
@@ -100,8 +113,43 @@ function describe() {
   ].join(' ｜ ');
 }
 
+/* ---------------- 统一结论输出（规范 9.5-5 第 5、6 条） ---------------- */
+
+/**
+ * 打印"整脚本因环境不满足而跳过"，并以 EXIT_ENV_SKIP(3) 退出。
+ * 输出格式与各脚本内的单项 skip 一致（`[SKIP] 名称 —— 原因`），
+ * runner 优先据此归类；**不得**再退 0（那等于把跑不了的说成通过）。
+ * @param {string} name   被跳过的东西（通常是"无头 Edge 启动与 CDP 连接"）
+ * @param {string} reason 具体原因，必须写清是环境限制
+ * @returns {never}
+ */
+function skipSuite(name, reason) {
+  console.log(`  [SKIP] ${name} —— ${reason}`);
+  console.log('\n=== 汇总 ===');
+  console.log('通过 0 项，失败 0 项，跳过 1 项');
+  console.log(`（整脚本跳过：${reason}）`);
+  process.exit(EXIT_ENV_SKIP);
+}
+
+/**
+ * 统一结论行。跳过数为 0 时**不写**"跳过"字段 —— 6.1 的冻结格式是
+ * "通过 N 项，失败 N 项，跳过 N 项"，但 ui-check 等脚本已有历史口径，
+ * 故此处仅在**真正有跳过**时补出该字段，避免把 0 跳过写成噪音。
+ * @param {{passed:number, failed:number, skipped:number}} result
+ */
+function reportSummary(result) {
+  const skipped = Number(result.skipped) || 0;
+  const tail = skipped > 0 ? `，跳过 ${skipped} 项` : '';
+  console.log('\n=== 汇总 ===');
+  console.log(`通过 ${Number(result.passed) || 0} 项，失败 ${Number(result.failed) || 0} 项${tail}`);
+}
+
 module.exports = {
   MIN_NODE_MAJOR,
+  EXIT_PASS,
+  EXIT_FAIL,
+  EXIT_ERROR,
+  EXIT_ENV_SKIP,
   ENV_NAME,
   paths,
   isTest: ENV_NAME === 'test',
@@ -112,5 +160,7 @@ module.exports = {
   ensureDir,
   isInsideVerify,
   cleanupStaleTemp,
-  describe
+  describe,
+  skipSuite,
+  reportSummary
 };

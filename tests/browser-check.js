@@ -23,6 +23,17 @@ const os = require('node:os');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
+const env = require('./env');
+
+/* 浏览器类脚本一律不得在 prod 环境下跑（ADR-0003 D16）；本脚本额外守一条值域门 */
+if (env.isProd) {
+  console.error('\n[环境不满足] DSH_ENV=prod：browser-check 拒绝在**生产环境**下运行（ADR-0003 D16）。');
+  process.exit(env.EXIT_ERROR);
+}
+if (env.ENV_NAME !== 'dev' && env.ENV_NAME !== 'test') {
+  console.error(`\n[环境不满足] DSH_ENV 取值非法：${env.ENV_NAME}（只允许 dev | test；prod 禁止运行测试）。`);
+  process.exit(env.EXIT_ERROR);
+}
 
 const ROOT = path.resolve(__dirname, '..');
 const PAGE = pathToFileURL(path.join(ROOT, 'index.html')).href;
@@ -219,10 +230,8 @@ async function main() {
   const exe = await launchEdge();
   if (!exe) {
     section('浏览器自检');
-    skip('无头 Edge 启动与 CDP 连接', '未找到 msedge.exe，或沙箱不允许创建命名管道（mojo platform_channel 拒绝访问）');
-    console.log('\n=== 汇总 ===');
-    console.log(`通过 ${passed} 项，失败 0 项，跳过 ${skipped} 项`);
-    process.exit(0);
+    /* 整脚本跳过：必须退 3（不是 0），否则 runner 会把"一个断言都没跑"记成 PASS（规范 9.5-5 第 6 条） */
+    env.skipSuite('无头 Edge 启动与 CDP 连接', '未找到 msedge.exe，或沙箱不允许创建命名管道（mojo platform_channel 拒绝访问）');
   }
   console.log(`浏览器：${exe}`);
 

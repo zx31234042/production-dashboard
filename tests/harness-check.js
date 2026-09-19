@@ -256,6 +256,57 @@ t.section('六、断言器自身（它坏了上面全部门禁都不可信）');
   t.check('全过时以退出码 0 结束', code === 0, `实测退出码 ${code}`);
 }
 
+/* ---------------- 七、runner 结论规则与"假通过"防线 ---------------- */
+t.section('七、runner 结论规则（P1-2/P1-3：跑不了就不能算通过）');
+{
+  /* P1-2 的要害：旧 runner 在"无管道 + 非安静"下 `out` 恒为空 → isEnvSkip('') 为 false →
+     "脚本打了 SKIP 且退出码 0"被判 passed，三个浏览器类脚本一个断言都没跑却计入 PASS。
+     classify 是纯函数，这里直接对它回归，不依赖环境有没有管道。 */
+  const runAll = require('./run-all');
+  t.check('classify 把"退出码 0 且一条断言都没跑"判为未核实（**不是通过**）',
+    runAll.classify(0, null, '').status === 'unverified',
+    `实测 ${runAll.classify(0, null, '').status} —— 这正是 P1-2 的假通过口子`);
+  t.check('classify 对"退出码 0 + 只有跳过项"同样判为未核实',
+    runAll.classify(0, runAll.parseSummary('通过 0 项，失败 0 项，跳过 1 项'), '').status === 'unverified',
+    '浏览器起不来时应为跳过/未核实，不能记绿');
+  t.check('classify 把退出码 3 判为跳过（脚本显式声明本环境跑不了）',
+    runAll.classify(3, null, '').status === 'skipped');
+  t.check('classify 把退出码 2 判为异常、退出码 1 判为失败',
+    runAll.classify(2, null, '').status === 'error' && runAll.classify(1, null, '').status === 'failed');
+  t.check('classify 只在"跑到过断言且无失败"时才判通过',
+    runAll.classify(0, runAll.parseSummary('通过 3 项，失败 0 项，跳过 0 项'), '').status === 'passed' &&
+    runAll.classify(0, runAll.parseSummary('通过 3 项，失败 1 项，跳过 0 项'), '').status !== 'passed');
+  t.check('runner 的汇总行解析要求三字段齐全',
+    runAll.parseSummary('通过 1 项，失败 0 项').skipped === 0 &&
+    runAll.parseSummary('通过 1 项，失败 0 项，跳过 2 项').skipped === 2);
+  t.check('runner 在无管道时也走"落文件捕获"而非 inherit（两种模式不至于两套账）',
+    /stdio:\s*\['ignore', fd, fd\]/.test(fs.readFileSync(path.join(env.paths.tests, 'run-all.js'), 'utf8')),
+    '旧实现无管道 + 非安静时用 stdio:inherit，输出拿不到就把 SKIP 记成了 PASS');
+  t.check('env 提供环境跳过的统一出口（skipSuite）并以 3 退出',
+    typeof env.skipSuite === 'function' && env.EXIT_ENV_SKIP === 3);
+
+  /* P1-3：候选目录为空/不存在时必须失败。空目录无需 PNG 解码能力，秒级可跑。 */
+  const runScript = (args) => {
+    const { spawnSync } = require('node:child_process');
+    const log = path.join(env.ensureDir(env.paths.tempRoot), `screenshot-diff-probe-${process.pid}.log`);
+    const fd = fs.openSync(log, 'w');
+    const r = spawnSync(process.execPath, [path.join(env.paths.tests, 'screenshot-diff.js'), ...args],
+      { cwd: env.paths.root, stdio: ['ignore', fd, fd], timeout: 60000 });
+    fs.closeSync(fd);
+    let out = '';
+    try { out = fs.readFileSync(log, 'utf8'); } catch { /* 忽略 */ }
+    try { fs.rmSync(log, { force: true }); } catch { /* 忽略 */ }
+    return { code: r.status, out };
+  };
+  const bad = runScript(['--candidate', path.join(env.paths.verify, 'nonexistent-xyz')]);
+  t.check('screenshot-diff：候选目录不存在时**非 0 退出**（P1-3）',
+    bad.code === 1, `实测退出码 ${bad.code}（修复前是 0，即"空候选也算通过"）`);
+  t.check('screenshot-diff：空候选的失败原因写明"候选 0 张"',
+    /候选目录 .* 里没有 PNG（0 张）/.test(bad.out) && /候选 0 张 vs 基准 10 张/.test(bad.out), '');
+  t.check('screenshot-diff：汇总行三字段齐全（供 runner 解析）',
+    /通过 \d+ 项，失败 \d+ 项，跳过 \d+ 项/.test(bad.out), '');
+}
+
 t.finish();
 }
 

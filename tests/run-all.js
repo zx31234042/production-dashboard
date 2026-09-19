@@ -84,58 +84,106 @@ function isEnvSkip(out) {
   return /\[SKIP\]/.test(out) && /未找到 msedge|命名管道|不允许创建命名管道|SKIP：/.test(out);
 }
 
+/**
+ * 结论分类（**纯函数**，不碰文件系统与子进程）—— 便于 `harness-check` 直接对该规则做回归。
+ * 输入子进程退出码与捕获到的输出，输出状态与理由。
+ *
+ * 规则（按优先级）：
+ *   ① 退出码 3 → skipped：脚本显式声明"本环境跑不了"（env.EXIT_ENV_SKIP）
+ *   ② 退出码 2 → error  ：脚本自身异常
+ *   ③ 非 0 且输出里有 SKIP 文本特征 → skipped
+ *   ④ 其余非 0 → failed（**输出拿不到时也是 failed**，不许因"没证据"就记跳过）
+ *   ⑤ 退出码 0 但无汇总行 → unverified
+ *   ⑥ 退出码 0 但汇总行说"失败 > 0" → failed（退出码与结论不一致，按严处理）
+ *   ⑦ 退出码 0 但通过 0 项（一条断言都没跑 / 只有跳过项）→ **unverified**
+ *   ⑧ 退出码 0 且跑到过断言、无失败 → passed
+ *
+ * ⑤⑦ 是 P1-2 的要害：旧实现把 ⑤⑦ 记成 passed，于是在无管道环境下
+ * "一个断言都没跑"的浏览器类脚本被算进"14 通过"。宁可报"未核实"，也不能报通过。
+ *
+ * @param {number|null} exitCode 子进程退出码（null 表示 spawn 自身失败）
+ * @param {{passed:number,failed:number,skipped:number}|null} summary 解析出的汇总行
+ * @param {string} out 子进程输出全文
+ * @returns {{status:string, detail:string}}
+ */
+function classify(exitCode, summary, out) {
+  const text = String(out || '');
+  if (exitCode === env.EXIT_ENV_SKIP) {
+    return { status: 'skipped', detail: '本环境跑不了（脚本显式跳过，退出码 3）' };
+  }
+  if (exitCode === env.EXIT_ERROR) {
+    return { status: 'error', detail: '脚本以退出码 2 终止（异常）' };
+  }
+  if (exitCode !== 0 && isEnvSkip(text)) {
+    return { status: 'skipped', detail: '环境不满足（脚本自行 SKIP）' };
+  }
+  if (exitCode !== 0) {
+    /* 注意：**不许**因为"输出为空/拿不到"就当成跳过 —— 那正是 P1-2 的错法。
+       拿不到证据时只能按失败处理（宁可为严，不可假绿）。 */
+    return { status: 'failed', detail: `退出码 ${exitCode}` };
+  }
+  if (!summary) {
+    return { status: 'unverified', detail: '退出码 0，但未产出可解析的汇总行 —— 结论未核实，不计入通过' };
+  }
+  /* **先看失败数**：退出码 0 但汇总行写着"失败 > 0"是不可信的组合，按失败处理（别放过） */
+  if (summary.failed > 0) {
+    return { status: 'failed', detail: `汇总行报告失败 ${summary.failed} 项，但退出码为 0（退出码与结论不一致）` };
+  }
+  if (summary.passed + summary.skipped === 0) {
+    return { status: 'unverified', detail: '退出码 0，但一条断言都没跑 —— 不是通过（脚本应改用 env.skipSuite 退 3）' };
+  }
+  /* 跑到过断言，但**通过数为 0**（只有跳过项）：不是"通过"，而是本环境没验到东西 */
+  if (summary.passed === 0) {
+    return { status: 'unverified', detail: `退出码 0，但通过 0 项、跳过 ${summary.skipped} 项 —— 本环境没验到任何断言，不计入通过` };
+  }
+  return { status: 'passed', detail: '' };
+}
+
+/**
+ * 跑一个门禁脚本。
+ *
+ * **输出捕获策略（2026-09-19 修订，修 P1-2）**：无论有没有管道，一律把子进程 stdout/stderr
+ * **落进 `tests\._verify\run-all\<脚本>-<pid>.log`**，再回读解析。
+ * 旧实现是"有管道才捕获，无管道 + 非安静就 stdio:inherit"，于是同一环境出现两套账：
+ * 无管道时 `out` 恒为空 → 三个浏览器类脚本"一个断言都没跑"却被判 PASS，
+ * `--fast` 与默认模式的"通过数"还不一致。现在两种模式口径统一，且日志留痕可事后复核。
+ *
+ * **状态判定**：退出码是权威信号（0 通过 / 1 失败 / 2 异常 / 3 整脚本跳过，见 `env.js` 退出码契约）；
+ * 文本 SKIP 特征仅作兜底。退出码 0 但**没解析出汇总行**或**一条断言都没跑**时，
+ * 一律标为"未核实"（不是通过）—— 跑不了就要说跑不了，不能静默记绿（规范 9.5-5 第 6 条）。
+ */
 function runScript(suite, pipesOk, quiet) {
   const file = path.join(env.paths.tests, suite.name + '.js');
   const started = Date.now();
+
+  const logDir = env.ensureDir(path.join(env.paths.verify, 'run-all'));
+  const logFile = path.join(logDir, `${suite.name}-${process.pid}.log`);
+  if (fs.existsSync(logFile)) { try { fs.rmSync(logFile, { force: true }); } catch { /* 忽略 */ } }
+
   const opts = {
     cwd: env.paths.root,
     timeout: suite.slow ? 12 * 3600 * 1000 : 10 * 60 * 1000,
     env: { ...process.env, DSH_ENV: env.isProd ? 'test' : env.ENV_NAME }
   };
-  /* 三种输出模式：
-     ① 有管道   —— 捕获输出并解析断言汇总（最优）
-     ② 无管道 + 安静 —— 输出重定向到日志文件，主控台只留结果行（输出仍可事后查阅）
-     ③ 无管道 + 非安静 —— stdio=inherit 直通（实时看得见，但主控台会很长）
-     注意：受限沙箱禁止管道，此时**绝不能**把无法解析当成失败。 */
-  let logFile = null;
-  let fd = null;
-  let stdioOpt;
-  if (pipesOk) {
-    stdioOpt = { ...opts, encoding: 'utf8' };
-  } else if (quiet) {
-    const dir = env.ensureDir(path.join(env.paths.verify, 'run-all'));
-    logFile = path.join(dir, `${suite.name}-${process.pid}.log`);
-    fd = fs.openSync(logFile, 'a');
-    stdioOpt = { ...opts, stdio: ['ignore', fd, fd] };
-  } else {
-    stdioOpt = { ...opts, stdio: 'inherit' };
-  }
 
-  const res = spawnSync(process.execPath, [file], stdioOpt);
+  const fd = fs.openSync(logFile, 'a');
+  const res = spawnSync(process.execPath, [file], { ...opts, stdio: ['ignore', fd, fd] });
+  try { fs.closeSync(fd); } catch { /* 忽略 */ }
   const ms = Date.now() - started;
-  if (fd !== null) { try { fs.closeSync(fd); } catch { /* 忽略 */ } }
 
   let out = '';
-  if (pipesOk) out = `${res.stdout || ''}${res.stderr || ''}`;
-  else if (logFile) { try { out = fs.readFileSync(logFile, 'utf8'); } catch { out = ''; } }
+  try { out = fs.readFileSync(logFile, 'utf8'); } catch { out = ''; }
+
+  /* 非安静模式：把捕获到的输出回放到主控台，保持"看得见明细"的旧体验 */
+  if (!quiet && out) process.stdout.write(out);
 
   const summary = parseSummary(out);
 
-  /* 管道不可用时，输出不可解析属于**预期**，不得据此判失败；仅退出码 2 视为异常 */
   if (res.error && res.error.code !== 'EPERM') {
-    return { status: 'error', detail: res.error.code || res.error.message, ms, out, summary, logFile };
+    return { status: 'error', detail: res.error.code || res.error.message, ms, out, summary, logFile, exit: null };
   }
-  if (res.status === 2) {
-    return { status: 'error', detail: '脚本以退出码 2 终止（异常）', ms, out, summary, logFile };
-  }
-  if (res.status !== 0 && isEnvSkip(out)) {
-    return { status: 'skipped', detail: '环境不满足（脚本自行 SKIP）', ms, out, summary, logFile };
-  }
-  if (res.status !== 0) {
-    return { status: 'failed', detail: `退出码 ${res.status}`, ms, out, summary, logFile };
-  }
-  /* 退出码 0 但脚本内部有跳过项：算通过，跳过数一并带出 */
-  return { status: 'passed', detail: '', ms, out, summary, logFile };
+  const verdict = classify(res.status, summary, out);
+  return { ...verdict, ms, out, summary, logFile, exit: res.status };
 }
 
 function main() {
@@ -165,70 +213,59 @@ function main() {
   console.log(`  ${env.describe()}`);
   console.log(`  共 ${suites.length} 个脚本${hasFlag('--fast') ? '（--fast：已跳过浏览器类与长跑）' : ''}\n`);
 
-  /* 管道能力探测：决定能否"捕获"子进程输出（注：安静模式下输出落文件，仍可解析出断言数） */
+  /* 管道能力探测：只影响"是否回放子进程输出到主控台"的观感。注意 **不能** 再让它影响结论 ——
+     本 runner 现在无论有没有管道都把输出落文件后解析（见 runScript），所以两种环境不会出现两套账。 */
   const pipes = probePipes();
   const quiet = hasFlag('--tap') || hasFlag('--fast');
-  if (!pipes.ok) {
+  if (!pipes.ok && !quiet) {
     console.log('  ⚠ 本环境禁止子进程管道（EPERM）—— 环境限制，不是脚本失败。');
-    if (quiet) {
-      console.log('     安静模式：各脚本输出落 tests\\._verify\\run-all\\*.log，仍可解析断言数；');
-      console.log('     需要逐条明细时直接看那些日志文件（下方会列出路径）。\n');
-    } else {
-      console.log('     非安静模式：改走 stdio 直通，主控台会完整打印各脚本输出，末尾只按退出码汇总。');
-      console.log('     想用安静模式（输出落文件、主控台精简）请加 --tap 或 --fast。\n');
-    }
+    console.log('     各脚本输出仍会落 tests\\._verify\\run-all\\*.log 并解析出断言数，');
+    console.log('     主控台照旧回放明细；想只看结论行请加 --tap 或 --fast。\n');
   }
 
-  /* 体检（默认先跑；仅在自身退出码非 0 时提示，不阻断）。安静模式下同样落文件，避免刷屏 */
+  /* 体检（默认先跑；仅在自身退出码非 0 时提示，不阻断）。
+     与门禁脚本同样走"落文件后解析"，不再分管道/安静两套分支。 */
   if (!hasFlag('--no-preflight')) {
     const preFile = path.join(env.paths.tests, 'preflight.js');
-    const preOpts = { cwd: env.paths.root, timeout: 3 * 60 * 1000 };
-    let preLog = null;
-    let preStdio;
-    if (pipes.ok) {
-      preStdio = { ...preOpts, encoding: 'utf8' };
-    } else if (quiet) {
-      const dir = env.ensureDir(path.join(env.paths.verify, 'run-all'));
-      preLog = path.join(dir, `preflight-${process.pid}.log`);
-      const fd = fs.openSync(preLog, 'a');
-      preStdio = { ...preOpts, stdio: ['ignore', fd, fd] };
-    } else {
-      preStdio = { ...preOpts, stdio: 'inherit' };
-    }
-    const pre = spawnSync(process.execPath, [preFile], preStdio);
-    const preOut = pipes.ok ? `${pre.stdout || ''}${pre.stderr || ''}`
-      : (preLog ? (() => { try { return fs.readFileSync(preLog, 'utf8'); } catch { return ''; } })() : '');
+    const preLog = path.join(env.ensureDir(path.join(env.paths.verify, 'run-all')), `preflight-${process.pid}.log`);
+    if (fs.existsSync(preLog)) { try { fs.rmSync(preLog, { force: true }); } catch { /* 忽略 */ } }
+    const fd = fs.openSync(preLog, 'a');
+    const pre = spawnSync(process.execPath, [preFile], {
+      cwd: env.paths.root, timeout: 3 * 60 * 1000, stdio: ['ignore', fd, fd]
+    });
+    try { fs.closeSync(fd); } catch { /* 忽略 */ }
+    let preOut = '';
+    try { preOut = fs.readFileSync(preLog, 'utf8'); } catch { preOut = ''; }
+    if (!quiet && preOut) process.stdout.write(preOut);
     const preSum = parseSummary(preOut);
     if (pre.status === 0 && preSum) {
       console.log(`  [体检] 通过 ${preSum.passed} 项（跳过 ${preSum.skipped} 项）`);
     } else if (pre.status === 0) {
-      console.log('  [体检] 关键项通过（断言数未采集）');
+      console.log('  [体检] 关键项通过（未产出可解析的汇总行）');
     } else {
       console.log('  [体检] 未通过 —— 请先排查环境问题，再解读下面的脚本结果');
       if (preOut) console.log(preOut.split('\n').filter(l => /\[FAIL\]|失败清单|^\s+\d+\./.test(l)).slice(0, 6).map(l => '    ' + l).join('\n'));
     }
-    if (preLog) console.log(`     体检日志：${path.relative(env.paths.root, preLog)}`);
+    console.log(`     体检日志：${path.relative(env.paths.root, preLog)}`);
     console.log('');
   }
 
   const results = [];
   for (const s of suites) {
-    if (pipes.ok) process.stdout.write(`  运行 ${s.name.padEnd(20)} … `);
-    else if (quiet) process.stdout.write(`  运行 ${s.name.padEnd(20)} … `);
+    if (quiet) process.stdout.write(`  运行 ${s.name.padEnd(20)} … `);
     else console.log(`\n  ── 运行 ${s.name}（${s.desc}）──`);
     const r = runScript(s, pipes.ok, quiet);
     results.push({ suite: s, ...r });
-    const mark = { passed: '通过', failed: '失败', skipped: '跳过', error: '异常' }[r.status];
+    const mark = { passed: '通过', failed: '失败', skipped: '跳过', error: '异常', unverified: '未核实' }[r.status];
     const sum = r.summary ? `（通过 ${r.summary.passed} / 失败 ${r.summary.failed} / 跳过 ${r.summary.skipped}）` : '';
-    if (pipes.ok || quiet) console.log(`${mark} ${(r.ms / 1000).toFixed(1)}s ${sum}${r.detail ? ' ' + r.detail : ''}`);
-    else console.log(`  → ${mark}（${(r.ms / 1000).toFixed(1)}s${r.detail ? '，' + r.detail : ''}）`);
+    console.log(`${mark} ${(r.ms / 1000).toFixed(1)}s ${sum}${r.detail ? ' ' + r.detail : ''}`);
   }
 
   /* 安静模式：把各脚本日志路径列出来，保证输出仍可查阅（不隐藏信息） */
-  if (!pipes.ok && quiet) {
+  if (quiet) {
     const logs = results.filter(r => r.logFile).map(r => r.logFile);
     if (logs.length) {
-      console.log('\n  子进程输出已落文件（本环境无管道，故不逐条打印；需要时直接看这些文件）：');
+      console.log('\n  子进程输出已落文件（安静模式不逐条回放；需要明细时直接看这些文件）：');
       for (const p of logs) console.log(`    ${path.relative(env.paths.root, p)}`);
     }
   }
@@ -236,6 +273,8 @@ function main() {
   /* ---------------- 汇总 ---------------- */
   const failed = results.filter(r => r.status === 'failed' || r.status === 'error');
   const skipped = results.filter(r => r.status === 'skipped');
+  const unverified = results.filter(r => r.status === 'unverified');
+  const passedScripts = results.filter(r => r.status === 'passed');
   const agg = results.reduce((a, r) => {
     if (r.summary) { a.passed += r.summary.passed; a.failed += r.summary.failed; a.skipped += r.summary.skipped; }
     return a;
@@ -244,22 +283,30 @@ function main() {
   console.log('\n=== 各脚本结果 ===');
   for (const r of results) {
     const sum = r.summary ? `${r.summary.passed} / ${r.summary.failed} / ${r.summary.skipped}` : '— / — / —';
-    const mark = { passed: 'PASS', failed: 'FAIL', skipped: 'SKIP', error: 'ERR ' }[r.status];
+    const mark = { passed: 'PASS', failed: 'FAIL', skipped: 'SKIP', error: 'ERR ', unverified: '??? ' }[r.status];
     console.log(`  ${mark}  ${r.suite.name.padEnd(20)} ${sum.padStart(12)}   ${r.suite.desc}`);
   }
 
   console.log('\n=== 合计 ===');
   if (agg.passed + agg.failed + agg.skipped > 0) {
     console.log(`  断言：通过 ${agg.passed} / 失败 ${agg.failed} / 跳过 ${agg.skipped}`);
-    if (!pipes.ok) console.log('        （本环境无管道，数字由安静模式的日志文件解析得出）');
+    console.log('        （数字由各脚本输出落文件后解析得出；逐条明细见下表日志路径）');
   } else {
-    console.log(`  断言：**本次未采集**（原因：${quiet ? '各脚本日志里未找到可解析的汇总行' : '非安静模式 + 无管道，输出已直通到主控台'}）`);
-    console.log('        ⇒ 想拿到断言级合计：加 --tap / --fast，或在有管道权限的环境运行；');
+    console.log('  断言：**本次未采集**（各脚本输出里都没有可解析的汇总行）');
     console.log('        ⇒ 各脚本的权威数字见 tests\\README.md 第三节。');
   }
-  console.log(`  脚本：${results.length - failed.length - skipped.length} 通过 / ${failed.length} 失败 / ${skipped.length} 跳过`);
+  console.log(`  脚本：${passedScripts.length} 通过 / ${failed.length} 失败 / ${skipped.length} 跳过${unverified.length ? ` / ${unverified.length} 未核实` : ''}`);
   if (skipped.length) {
     console.log(`  跳过脚本（环境不满足，**不是通过**）：${skipped.map(r => r.suite.name).join(', ')}`);
+  }
+  if (unverified.length) {
+    console.log(`  未核实脚本（退出码 0 但拿不出"跑过断言"的证据，**不是通过**）：${unverified.map(r => r.suite.name).join(', ')}`);
+  }
+
+  /* 不通过时的理由：保留"未核实"与"跳过"的区别，便于定位 */
+  if (unverified.length) {
+    console.log('\n未核实明细：');
+    for (const r of unverified) console.log(`  ── ${r.suite.name}：${r.detail}`);
   }
 
   if (failed.length) {
@@ -270,6 +317,12 @@ function main() {
       console.log(lines.map(l => '  ' + l).join('\n') || '  （无失败行可解析，请单独运行该脚本）');
     }
     console.log('\n提示：单独复跑某个脚本：node tests\\<名称>.js');
+    console.log(`\n本次各脚本输出已落盘：${path.relative(env.paths.root, path.join(env.paths.verify, 'run-all'))}\\`);
+    process.exit(1);
+  }
+
+  if (unverified.length) {
+    console.log('\n提示：未核实项说明脚本没给出可核实的结论（通常是不该退 0 却退了 0），须先修脚本。');
     process.exit(1);
   }
 
@@ -280,9 +333,15 @@ function main() {
   process.exit(0);
 }
 
-try {
-  main();
-} catch (err) {
-  console.error('\nrunner 异常终止：' + (err && err.stack ? err.stack : err));
-  process.exit(2);
+/* 被 require 时**不执行**：`harness-check` 要直接引用 classify/parseSummary 做规则回归，
+   不能因为 require 一下就把 15 个门禁全跑一遍。 */
+module.exports = { classify, parseSummary, isEnvSkip, SUITES };
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (err) {
+    console.error('\nrunner 异常终止：' + (err && err.stack ? err.stack : err));
+    process.exit(2);
+  }
 }

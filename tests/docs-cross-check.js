@@ -191,6 +191,38 @@ function main() {
   t.check('harness 的 stdio 采用落文件而非管道（受限环境管道会 EPERM）',
     /stdio:\s*\['ignore', fd, fd\]/.test(harnessSrc));
 
+  /* P1-1 防回潮：platform/paths.js 的 ROOT 少退一层会把数据目录写到仓库外（曾复现）。
+     这里在进程内换 DSH_ENV 重新加载该模块来实测三套目录，不靠"读源码猜"。 */
+  const loadPathsUnder = (envName) => {
+    const prev = process.env.DSH_ENV;
+    process.env.DSH_ENV = envName;
+    const abs = require.resolve('../platform/paths');
+    delete require.cache[abs];
+    try {
+      return require(abs);
+    } finally {
+      if (prev === undefined) delete process.env.DSH_ENV; else process.env.DSH_ENV = prev;
+      delete require.cache[abs];
+    }
+  };
+  const pDev = loadPathsUnder('dev');
+  const pTest = loadPathsUnder('test');
+  t.check('platform/paths 的 ROOT 指向仓库根（含 PROJECT_RULES.md / index.html / tests）',
+    ['PROJECT_RULES.md', 'index.html', 'tests'].every(m => fs.existsSync(path.join(pDev.ROOT, m))),
+    `实测 ROOT=${pDev.ROOT}`);
+  t.check('platform/paths 的 dev 数据目录落在仓库根之内（ADR-0002 D11）',
+    pDev.isInside(pDev.ROOT, pDev.paths.dataRoot),
+    `dev dataRoot=${pDev.paths.dataRoot}`);
+  t.check('platform/paths 的 test 数据目录落在 tests\\._verify 之内（ADR-0003 D16）',
+    pTest.isInside(path.join(pTest.ROOT, 'tests', '._verify'), pTest.paths.dataRoot),
+    `test dataRoot=${pTest.paths.dataRoot}`);
+  t.check('platform/paths 拒绝把 test 数据根覆盖到 ._verify 之外',
+    (() => {
+      try { pTest.overrideDataRoot(path.join(pTest.ROOT, 'data', 'test')); return false; }
+      catch { return true; }
+    })(),
+    '越界覆盖必须抛错，否则测试会写进真实数据目录');
+
   t.finish();
 }
 
