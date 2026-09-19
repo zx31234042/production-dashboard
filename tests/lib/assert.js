@@ -27,6 +27,7 @@ function createRunner(title, options = {}) {
   let skipped = 0;
   const failures = [];   // { name, detail }
   const skips = [];      // { name, reason }
+  const unmet = [];      // { name, detail } 前提不成立（ADR-0004 D20）
 
   const head = (kind, name, extra) => console.log(`  [${kind}] ${name}${extra ? ' —— ' + extra : ''}`);
 
@@ -58,6 +59,31 @@ function createRunner(title, options = {}) {
       return this;
     },
 
+    /**
+     * **前提**（ADR-0004 D20）：声明"该段用例成立所依赖的数据/环境状态"。
+     *
+     * 为什么不写成 `check`：前提塌掉时，普通断言给出的是一条与"实现错误"**无法区分**的 FAIL，
+     * 于是要么被误当实现 bug 排查，要么被顺手放宽期望 —— 后者会悄悄变成恒真断言。
+     *
+     * 判据（务必守住）：**前提只描述"数据/环境必须处于某状态"，
+     * 不得描述"被测函数的返回值"** —— 后者属于断言，写这里就等于把被测对象当前提。
+     *
+     * 语义：成立 → 不计数（不是断言）；不成立 → 汇总单列"前提不成立 N 项"并**使退出码非 0**。
+     * 与 `skip` 的区别：`skip` 是"环境不满足、本用例不适用"（不算失败）；
+     * `requires` 是"**该用例的前提假设被破坏**"（算失败，必须查）。
+     *
+     * @returns {boolean} 是否成立 —— 调用方据此决定要不要进入该段（惯例：`if (!t.requires(...)) return;`）
+     */
+    requires(name, ok, detail) {
+      if (ok) {
+        if (verbose) console.log(`  [OK]   前提成立：${name}`);
+      } else {
+        unmet.push({ name, detail });
+        head('UNMET', `前提不成立：${name}`, detail);
+      }
+      return Boolean(ok);
+    },
+
     /** 跳过（不算通过也不算失败；会在汇总里单列原因） */
     skip(name, reason) {
       skipped++;
@@ -68,18 +94,25 @@ function createRunner(title, options = {}) {
 
     /* ---------------- 状态读取（供夹具或上层组合使用） ---------------- */
     get counts() {
-      return { passed, failed: failures.length, skipped, total: passed + failures.length + skipped };
+      return { passed, failed: failures.length, skipped, unmet: unmet.length,
+        total: passed + failures.length + skipped };
     },
     get failures() { return failures.slice(); },
     get skips() { return skips.slice(); },
+    get unmetRequirements() { return unmet.slice(); },
 
     /**
-     * 打印汇总并按退出码结束进程（与现有脚本一致：0 全过 / 1 有失败）。
-     * 跳过项会在汇总后列出，**但不影响退出码** —— 与既有脚本行为一致。
+     * 打印汇总并按退出码结束进程。
+     * 退出码：0 全过 / 1 有断言失败**或前提不成立**（规范 9.5-5：没有证据不等于通过）。
+     * 前提不成立单独成段列出，便于一眼区分"前提塌了"与"实现错了"。
      */
     finish() {
       console.log('\n=== 汇总 ===');
       console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 ${skipped} 项`);
+      if (unmet.length) {
+        console.log('\n前提不成立（**不是通过**，须先查前提假设或数据准备）：');
+        unmet.forEach((u, i) => console.log(`  ${i + 1}. ${u.name}${u.detail ? ' —— ' + u.detail : ''}`));
+      }
       if (failures.length) {
         console.log('\n失败清单：');
         failures.forEach((f, i) => console.log(`  ${i + 1}. ${f.name}${f.detail ? ' —— ' + f.detail : ''}`));
@@ -88,7 +121,7 @@ function createRunner(title, options = {}) {
         console.log('\n跳过清单（不计入失败）：');
         skips.forEach((s, i) => console.log(`  ${i + 1}. ${s.name}${s.reason ? ' —— ' + s.reason : ''}`));
       }
-      process.exit(failures.length ? 1 : 0);
+      process.exit(failures.length || unmet.length ? 1 : 0);
     }
   };
 }

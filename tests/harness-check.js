@@ -254,6 +254,57 @@ t.section('六、断言器自身（它坏了上面全部门禁都不可信）');
   console.log = origLog;
   process.exit = origExit;
   t.check('全过时以退出码 0 结束', code === 0, `实测退出码 ${code}`);
+
+  /* ADR-0004 D20：requires 的语义自证 —— 前提与断言必须是**两件事**，
+     且"前提不成立"必须使退出码非 0（否则前提塌了会被当成"这段没验到但没事"）。 */
+  const sub3 = createRunner('子 runner 探针 3');
+  const spy3 = [];
+  console.log = (...a) => spy3.push(a.join(' '));
+  process.exit = (c) => { code = c; throw new Error('__EXIT__'); };
+  const okReturn = sub3.requires('数据已就绪', true, '');
+  sub3.check('真实断言', true);
+  const badReturn = sub3.requires('数据已就绪', false, '实测 0 行');
+  try { sub3.finish(); } catch { /* 被拦截 */ }
+  console.log = origLog;
+  process.exit = origExit;
+  const out3 = spy3.join('\n');
+  t.check('requires 成立时返回 true、不成立时返回 false（调用方可据此决定是否进入该段）',
+    okReturn === true && badReturn === false, `实测 ${okReturn} / ${badReturn}`);
+  t.check('requires **不计入断言数**（通过数与"真实断言"一致，不因前提而虚增）',
+    /通过 1 项，失败 0 项，跳过 0 项/.test(out3), '前提不是断言');
+  t.check('前提不成立时**单独成段**列出，不混进失败清单',
+    /前提不成立（\*\*不是通过\*\*/.test(out3) && /前提不成立：数据已就绪/.test(out3) && !/失败清单/.test(out3),
+    '一眼分清"前提塌了"与"实现错了"');
+  t.check('前提不成立时以退出码 1 结束（不是 0，也不是 skip）',
+    code === 1, `实测退出码 ${code}`);
+
+  const sub4 = createRunner('子 runner 探针 4');
+  const spy4 = [];
+  console.log = (...a) => spy4.push(a.join(' '));
+  process.exit = (c) => { code = c; throw new Error('__EXIT__'); };
+  sub4.requires('前提成立', true);
+  sub4.check('全过', true);
+  try { sub4.finish(); } catch { /* 被拦截 */ }
+  console.log = origLog;
+  process.exit = origExit;
+  t.check('前提成立时不影响结论：仍以退出码 0 结束、且不出现"前提不成立"段',
+    code === 0 && !/前提不成立/.test(spy4.join('\n')), `实测退出码 ${code}`);
+  t.check('requires 与 skip 语义分明（skip 不计失败、requires 计失败）',
+    (() => {
+      const s5 = createRunner('子 runner 探针 5');
+      console.log = () => {};
+      process.exit = (c) => { code = c; throw new Error('__EXIT__'); };
+      s5.skip('环境不满足', '本环境跑不了');
+      try { s5.finish(); } catch { /* 被拦截 */ }
+      const skipCode = code;
+      const s6 = createRunner('子 runner 探针 6');
+      s6.requires('前提被破坏', false);
+      try { s6.finish(); } catch { /* 被拦截 */ }
+      const reqCode = code;
+      console.log = origLog;
+      process.exit = origExit;
+      return skipCode === 0 && reqCode === 1;
+    })(), 'skip→0，requires→1');
 }
 
 /* ---------------- 七、runner 结论规则与"假通过"防线 ---------------- */
@@ -347,6 +398,63 @@ t.section('八、platform/log.js 的保留策略（P2-7：keepDays 过去只赋�
     createLogger({ dir: logDir, clock: { now: () => new Date(fixedNow.getTime()) }, console: false })
       .prune().keepDays === 30, '');
   try { fs.rmSync(logDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+}
+
+/* ---------------- 九、防回潮断言的定点变异（ADR-0004 D22） ----------------
+   一条"声称能挡住旧缺陷"的断言，如果按**旧实现**跑也通过，那它就是无效的 —— 而从输出上
+   完全看不出来。这里把旧实现片段**内联**进来（不依赖外部文件，避免暗桩随实现漂移而失效），
+   逐条确认"按旧写法必然违反现有断言"。
+
+   范围纪律（ADR-0004 D22）：**只对防回潮断言做定点变异，不做全量变异测试**。
+   凡其旧行为需要真实文件系统/子进程才能复现的（如 P1-3 的空候选、P2-6 的连接泄漏），
+   已在修复轮以**反向实测**验证并留痕于 R-2026-09-19-02 的处置记录，此处不重复构造。 */
+t.section('九、防回潮断言的定点变异（旧实现必须被现有断言挡下）');
+{
+  /* ① P1-1：ROOT 少退一层 —— 旧写法把数据目录算到仓库外 */
+  const ROOT = env.paths.root;
+  const path = require('node:path');
+  const oldRoot = path.resolve(ROOT, 'platform', '..', '..');   // 等价于旧的 resolve(__dirname,'..','..')
+  const newRoot = path.resolve(ROOT, 'platform', '..');         // 等价于现在的 resolve(__dirname,'..')
+  const insideRepo = base => {
+    const rel = path.relative(ROOT, path.join(base, 'data', 'dev'));
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  };
+  t.check('变异①：若 ROOT 退回 resolve(__dirname,\'..\',\'..\')，dev 数据目录将落到仓库外 —— 被 P1-1 断言挡下',
+    insideRepo(newRoot) === true && insideRepo(oldRoot) === false,
+    `新 root 在仓库内=${insideRepo(newRoot)}，旧 root 在仓库内=${insideRepo(oldRoot)}`);
+
+  /* ② P1-2：旧 classify 的行为等价物 —— "退出码 0 且零断言" 必须被判未核实 */
+  const runAll2 = require('./run-all');
+  const legacyClassify = () => ({ status: 'passed' });   // 旧实现对退出码 0 一律判通过
+  t.check('变异②：若 classify 退回"退出码 0 即通过"，零断言场景会被误判 —— 被 P1-2 断言挡下',
+    runAll2.classify(0, null, '').status === 'unverified' && legacyClassify().status === 'passed',
+    '旧行为：零断言 → passed（这正是"14 通过"的来源）');
+
+  /* ③ P2-1：旧 cutoff 计算 —— days=null 时 cutoff=now（全删）、days=NaN 时产出非法文本 */
+  const fmtNow = (d) => {
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+      `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+  };
+  const CUTOFF_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+  const oldCutoff = (days, now) => fmtNow(new Date(now.getTime() - days * 24 * 3600 * 1000));
+  const now = new Date('2026-09-19T12:00:00');
+  t.check('变异③：旧 cutoff 算法在 days=null/NaN 下分别产出"now"与非法文本 —— 被 P2-1 的格式断言挡下',
+    CUTOFF_RE.test(oldCutoff(365, now)) &&
+    oldCutoff(null, now) === '2026-09-19 12:00:00' &&
+    !CUTOFF_RE.test(oldCutoff(NaN, now)),
+    `null→${oldCutoff(null, now)}；NaN→${oldCutoff(NaN, now)}`);
+
+  /* ④ P2-2：旧剪枝算式 —— 不传 keep 时 slice(NaN)≡slice(0)，一份不剩 */
+  const oldKept = (keep, total) => Math.min(keep, total);
+  const legacySlice = keep => [1, 2, 3, 4, 5].slice(Math.max(0, keep)).length;   // 旧写法：删掉的数量
+  t.check('变异④：旧剪枝在 keep 缺省时 slice(NaN)≡slice(0)，会删光全部 —— 被 P2-2 断言挡下',
+    legacySlice(undefined) === 5 && legacySlice(2) === 3 &&
+    Number.isNaN(oldKept(undefined, 5)),
+    `keep=undefined → 删除 ${legacySlice(undefined)}/5 份，kept 报 ${oldKept(undefined, 5)}`);
+  t.check('变异④-补：新算式在同样输入下保留全部（BACKUP_KEEP），且 kept 为真实剩余数',
+    legacySlice(30) === 0 && !Number.isNaN(oldKept(30, 5)),
+    `keep=30 → 删除 ${legacySlice(30)}/5 份`);
 }
 
 t.finish();

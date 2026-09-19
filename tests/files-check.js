@@ -156,4 +156,137 @@ for (const f of jsFiles) {
 t.check(`全部 ${jsFiles.length} 个 .js 文件可被 node 解析`,
   brokenJs.length === 0, brokenJs.slice(0, 5).join('、'));
 
+/* ---------------- 七、静态防空洞断言（ADR-0004 D23） ----------------
+   立案原因（ADR-0004）：修复轮里出现过"把前提写成普通断言"导致的**空洞断言**风险 ——
+   一旦前提不再成立，那条断言要么恒假、要么被顺手放宽成恒真，而**两者从输出上都看不出来**。
+   这里做静态检查：把 `check()` 的**第二个实参**（判定表达式）抽出来，
+   只报"注定恒真/恒假"的形态 —— 确证的算 FAIL，仅可疑的只提示（避免制造假失败）。
+
+   边界（务必守住）：像 `x === 0`、`x === ''` 这种**单侧字面量比较是合法边界断言**，
+   不得报；只有**两侧都是字面量**、或整个判定就是字面量 `true/false` 时才可疑。 */
+
+/** 从位置 i 开始，取出以 open 开头、到配对括号结束的完整片段 */
+function sliceBalanced(src, i, open = '(', close = ')') {
+  if (src[i] !== open) return null;
+  let depth = 0;
+  for (let k = i; k < src.length; k++) {
+    const c = src[k];
+    if (c === open) depth++;
+    else if (c === close) { depth--; if (depth === 0) return src.slice(i, k + 1); }
+    else if (c === "'" || c === '"' || c === '`') {           // 跳过字符串字面量
+      const q = c;
+      k++;
+      while (k < src.length && src[k] !== q) { if (src[k] === '\\') k++; k++; }
+    }
+  }
+  return null;
+}
+
+/** 在顶层逗号处切分实参列表 */
+function splitArgs(argSrc) {
+  const inner = argSrc.slice(1, -1);
+  const parts = [];
+  let depth = 0;
+  let cur = '';
+  for (let k = 0; k < inner.length; k++) {
+    const c = inner[k];
+    if ('([{'.includes(c)) depth++;
+    if (')]}'.includes(c)) depth--;
+    if (c === ',' && depth === 0) { parts.push(cur); cur = ''; continue; }
+    if (c === "'" || c === '"' || c === '`') {
+      const q = c;
+      cur += c; k++;
+      while (k < inner.length && inner[k] !== q) { cur += inner[k]; if (inner[k] === '\\') { k++; cur += inner[k]; } k++; }
+      cur += q;
+      continue;
+    }
+    cur += c;
+  }
+  if (cur.trim()) parts.push(cur);
+  return parts.map(s => s.trim());
+}
+
+/** 去掉字符串与模板串（模板串里的 ${...} 视为**非字面量**，替换为 NAME 标记） */
+function stripStrings(src) {
+  let out = '';
+  for (let k = 0; k < src.length; k++) {
+    const c = src[k];
+    if (c === "'" || c === '"') {
+      k++;
+      while (k < src.length && src[k] !== c) { if (src[k] === '\\') k++; k++; }
+      out += ' LIT ';
+      continue;
+    }
+    if (c === '`') {
+      k++;
+      let hasSub = false;
+      while (k < src.length && src[k] !== '`') {
+        if (src[k] === '\\') { k++; k++; continue; }
+        if (src[k] === '$' && src[k + 1] === '{') { hasSub = true; let d = 1; k += 2; while (k < src.length && d > 0) { if (src[k] === '{') d++; if (src[k] === '}') d--; k++; } k--; }
+        k++;
+      }
+      out += hasSub ? ' NAME ' : ' LIT ';   // 含插值的模板串不是字面量
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+/** 判定表达式是否"注定恒真/恒假"：两侧都是字面量，或整段就是字面量 */
+function isVacuous(expr, hasReason) {
+  if (!expr) return null;
+  const e = stripStrings(expr).replace(/\s+/g, ' ').trim();
+  /* 裸 `true`：与任何实现无关地恒真 —— 最典型的空洞断言 */
+  if (e === 'true' || e === '!false') return `判定恒为 true（与任何实现无关）`;
+  /* 裸 `false`：**带原因**时是"无条件判失败"的正当写法（如"空候选必须失败"），
+     带原因说明作者是故意的；不带任何原因才是疑似空占位。 */
+  if (e === 'false' || e === '!true') {
+    return hasReason ? null : '判定恒为 false 且未给出原因（疑似未完成的占位断言）';
+  }
+  /* 两侧都是字面量。
+     不报**单侧**字面量 —— `x === 0`、`ok === false`、`count < 10` 都是合法边界断言，
+     误报会制造假失败（ADR-0004 D23 明确要求区分"确证"与"可疑"）。
+     会报的是"两侧都恒定"的式子，如 `1 + 1 === 2`（算术常量折叠后仍是常量比较）。 */
+  const LIT = "(?:true|false|null|undefined|NaN|LIT|\\d+(?:\\.\\d+)?|(?:\\d+(?:\\.\\d+)?\\s*[+\\-*/]\\s*)+\\d+(?:\\.\\d+)?)";
+  const cmp = new RegExp(`^${LIT}\\s*(===|!==|==|!=|<=|>=|<|>)\\s*${LIT}$`);
+  if (cmp.test(e)) return `两侧都是字面量：${e}`;
+  /* 与字面量 true/false 做逻辑运算：该侧恒定，等价于削弱（甚至取消）这条断言 */
+  if (/^(?:true|false)\s*(?:&&|\|\|)/.test(e) || /(?:&&|\|\|)\s*(?:true|false)$/.test(e)) {
+    return `与字面量做逻辑运算：${e}`;
+  }
+  return null;
+}
+
+const vacuous = [];
+const suspicious = [];
+for (const f of jsFiles) {
+  const rel = path.relative(ROOT, f);
+  if (rel === path.join('tests', 'files-check.js')) continue;   // 本文件含"字面量样例"，跳过
+  const src = fs.readFileSync(f, 'utf8');
+  const lines = src.split('\n');
+  let idx = -1;
+  while ((idx = src.indexOf('check(', idx + 1)) >= 0) {
+    /* 排除定义处与方法名后缀（如 `.check(`）以外的误命中：要求前一个非空白字符不是字母数字 */
+    const prev = src.slice(0, idx).trimEnd().slice(-1);
+    if (/[\w$.]/.test(prev)) continue;
+    const argSrc = sliceBalanced(src, idx + 'check'.length);
+    if (!argSrc) continue;
+    const lineNo = src.slice(0, idx).split('\n').length;
+    let args;
+    try { args = splitArgs(argSrc); } catch { continue; }
+    if (args.length < 2) continue;                    // 形态异常（如跨文件拼接），交给语法/运行门禁
+    const reason = isVacuous(args[1], args.length >= 3 && args[2] !== "''" && args[2] !== '""');
+    if (reason) vacuous.push(`${rel}:${lineNo} —— ${reason}`);
+    /* 仅提示：判定里出现 `=== true` / `!== false` 这类冗余写法（不是错，但易掩盖意图） */
+    if (/===\s*true\b|!==\s*false\b/.test(args[1])) suspicious.push(`${rel}:${lineNo}`);
+  }
+  void lines;
+}
+t.check('没有"注定恒真/恒假"的断言（两侧字面量比较、判定即 true/false、占位未删）',
+  vacuous.length === 0, vacuous.slice(0, 5).join('；'));
+if (suspicious.length) {
+  t.info(`提示（非失败）：${suspicious.length} 处断言使用 \`=== true\` / \`!== false\` 冗余写法：${suspicious.slice(0, 5).join('、')}`);
+}
+
 t.finish();
