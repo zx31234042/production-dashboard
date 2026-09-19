@@ -40,7 +40,7 @@ production-dashboard/
 │   ├── styles/                   # variables.css（变量）+ global.css（布局与组件）
 │   ├── utils/                    # dom.js（元素操作）+ format.js（格式化与数值）
 │   └── main.js                   # 入口：启动、定时刷新、演示快捷键
-├── tests/                        # 手工验证清单（后期放自动化测试）
+├── tests/                        # 零依赖自检脚本（11 个）与界面基准图；手工验证清单见 tests/README.md
 ├── 来源文件/                      # 甲方原件（只读）
 ├── 需求文档/                      # 需求清单最新版；历史版本在 历史文件\
 ├── 输出文件/甲方/                  # 交付给甲方的成品文档（另有 MES方\、上位机方\）

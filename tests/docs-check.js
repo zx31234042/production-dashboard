@@ -304,6 +304,21 @@ async function main() {
   check('工具说明称的截图张数等于实际截图数量', claimedShots === shots.length,
     `说明写 ${claimedShots} 张，实际 ${shots.length} 张`);
 
+  /* 陈述与实际一致性：tests\ 已有脚本后，文档不得再称"未引入自动化测试"（2026-09-19 曾出现该漂移） */
+  const staleClaims = [];
+  for (const f of ['tests/README.md', 'README.md', 'PROJECT_RULES.md']) {
+    const t = readText(f);
+    for (const re of [/尚未引入[^\n]{0,20}测试/, /未引入[^\n]{0,20}自动化/, /手工验证清单（后期放自动化测试）/, /后期引入测试工具后/, /仅[有存]手工验证清单/]) {
+      const m = t.match(re);
+      if (m) staleClaims.push(`${f}：「${m[0].slice(0, 22)}」`);
+    }
+  }
+  check(
+    `文档不再声称"未引入自动化测试"（实际已有 ${testScripts.length} 个零依赖脚本）`,
+    staleClaims.length === 0,
+    staleClaims.join('；')
+  );
+
   /* ===== D4 对外文档与实现一致性 ===== */
   section('D4 对外文档与实现一致性');
   const fieldMapSrc = readText('src/config/fieldMap.js');
