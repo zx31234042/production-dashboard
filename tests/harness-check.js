@@ -218,6 +218,18 @@ t.section('五、临时区与清理');
   t.check('临时区根目录无散落库文件', stray.length === 0, stray.join('、'));
   t.check('os.tmpdir 与项目临时区是两处（夹具不会误用系统临时目录做落库）',
     path.resolve(env.tmpdir) !== path.resolve(env.paths.tempRoot), env.tmpdir);
+
+  /* P2-16：cleanup 不能只"被断言存在"，要验**行为** —— 真造一个残留目录，force 清空后必须消失。
+     同时确认 run-all 的收尾真会调它（否则又是"测存在 ≠ 在用"）。 */
+  const leftover = harness.makeTempDir('leftover-must-be-swept');
+  fs.writeFileSync(path.join(leftover, 'junk.txt'), 'x', 'utf8');
+  const swept = harness.cleanup(true);
+  t.check('cleanup(true) 真能清空临时区（行为断言，不只是"函数存在"）',
+    !fs.existsSync(leftover) && swept.removed === 'all',
+    `残留目录仍在=${fs.existsSync(leftover)}，返回=${JSON.stringify(swept)}`);
+  t.check('run-all 收尾真的调用了 cleanup（P2-16："测存在 ≠ 在用"）',
+    /cleanup\(false\)/.test(fs.readFileSync(path.join(env.paths.tests, 'run-all.js'), 'utf8')),
+    'run-all 全绿收尾处应调用一次 cleanup(false)');
 }
 
 /* ---------------- 六、断言器自身 ---------------- */
@@ -455,6 +467,71 @@ t.section('九、防回潮断言的定点变异（旧实现必须被现有断言
   t.check('变异④-补：新算式在同样输入下保留全部（BACKUP_KEEP），且 kept 为真实剩余数',
     legacySlice(30) === 0 && !Number.isNaN(oldKept(30, 5)),
     `keep=30 → 删除 ${legacySlice(30)}/5 份`);
+}
+
+/* ---------------- 十、权威数字校验的定点回归（P2-22 + ADR-0004 D22） ----------------
+   机制：`run-all` 收尾会拿"本轮实跑合计"比对 `tests\README.md` 第三节的权威数字。
+   这类"断言别人的数字"的机制最容易写成恒真 —— 这里用**临时改写 README 权威行**的方式
+   逐个场景验证它真会拦住漂移，README 始终会被还原（含异常路径）。
+   踩过的坑：首版探针用 `/合计\s*\*\*\d+\s*通过/` 改写，而 README 实际写作 `合计 470 通过`
+   （**没有加粗**），于是替换静默失效、三轮验证结果全部不可信 —— 故这里用容错正则
+   `/合计\s*\*{0,2}\s*\d+\s*通过/`，并在改完后**回读确认**。 */
+t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTotals）');
+{
+  const runAll3 = require('./run-all');
+  const offline = runAll3.SUITES.filter(s => !s.needBrowser).map(s => s.name);
+  const mkR = (name, passed, failed) => ({ suite: { name, needBrowser: false },
+    status: failed ? 'failed' : 'passed', summary: { passed, failed, skipped: 0 } });
+  const resultsOf = (docsFailed) => {
+    const base = { 'contract-check': 58, 'ui-check': 40, 'tools-check': 24, 'files-check': 11,
+      'harness-check': 73, 'logic-check': 52, 'db-check': 46, 'platform-check': 21,
+      'trace-check': 4, 'copy-check': 22, 'screenshot-diff': 24, 'docs-cross-check': 53 };
+    return offline.map(n => n === 'docs-check'
+      ? mkR('docs-check', docsFailed ? 42 : 44, docsFailed ? 2 : 0)
+      : mkR(n, base[n] || 0, 0));
+  };
+  const sumOf = rs => rs.reduce((a, r) => a + r.summary.passed, 0);
+  const readmePath = path.join(env.paths.tests, 'README.md');
+  const original = fs.readFileSync(readmePath, 'utf8');
+  const authIndex = () => original.split(/\r?\n/).findIndex(l => l.includes('离线可跑部分'));
+  const setStated = (n) => {
+    const lines = original.split(/\r?\n/);
+    lines[authIndex()] = lines[authIndex()].replace(/合计\s*\*{0,2}\s*\d+\s*通过/, `合计 ${n} 通过`);
+    fs.writeFileSync(readmePath, lines.join('\r\n'), 'utf8');
+    /* 回读确认：替换必须真的生效，否则下面的判定全都白验（首版就栽在这里） */
+    const now = fs.readFileSync(readmePath, 'utf8').split(/\r?\n/)[authIndex()];
+    return /合计\s*\*{0,2}\s*(\d+)\s*通过/.test(now) && Number(RegExp.$1) === n;
+  };
+  try {
+    const withDev = resultsOf(true);      // docs-check 带 2 项已登记偏差
+    const greenRun = resultsOf(false);    // 全绿
+    t.check('改盘辅助生效（能真的把权威行改成目标数字）', setStated(sumOf(withDev)), `目标 ${sumOf(withDev)}`);
+    t.check('权威数字校验：与实跑一致时判通过（现状口径）',
+      runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev).ok === true, '');
+    setStated(sumOf(withDev) - 2);
+    t.check('权威数字校验：写成"真实通过数"（偏差修掉后应达到的值）也接受',
+      runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev).ok === true, '');
+    setStated(sumOf(withDev) + 1);
+    t.check('权威数字校验：**不接受中间值**（曾一度把 471 这类数字放过）',
+      runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev).ok === false, '');
+    setStated(999);
+    t.check('权威数字校验：权威区写错即判不通过（真会拦住漂移）',
+      runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev).ok === false, '');
+    setStated(sumOf(withDev));
+    const otherFail = withDev.map(r => r.suite.name === 'db-check' ? mkR('db-check', 40, 6) : r);
+    t.check('权威数字校验：其他脚本失败时先报它们，而不是纠结数字',
+      runAll3.verifyAuthorityTotals({ passed: sumOf(otherFail) }, otherFail).ok === false, '');
+    /* 漏列脚本：从权威行删掉 platform-check 的点名 */
+    const lines = original.split(/\r?\n/);
+    lines[authIndex()] = lines[authIndex()].replace(/`platform-check` \*\*21\/0\*\*，/, '');
+    fs.writeFileSync(readmePath, lines.join('\r\n'), 'utf8');
+    t.check('权威数字校验：权威区漏列某个离线门禁即判不通过（新增脚本别忘登记）',
+      runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev).ok === false, '');
+  } finally {
+    fs.writeFileSync(readmePath, original, 'utf8');
+  }
+  t.check('回归结束后 README 已被还原（不留改写痕迹）',
+    fs.readFileSync(readmePath, 'utf8') === original, '');
 }
 
 t.finish();

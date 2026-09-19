@@ -289,4 +289,24 @@ if (suspicious.length) {
   t.info(`提示（非失败）：${suspicious.length} 处断言使用 \`=== true\` / \`!== false\` 冗余写法：${suspicious.slice(0, 5).join('、')}`);
 }
 
+/* ---------------- 八、每个门禁脚本都必须校验运行时环境（P2-13，D16） ----------------
+   立案原因：`env.assertRuntime()` 原本只被 6 个脚本调用 —— `DSH_ENV=prod node tests\ui-check.js`
+   照跑并"通过 40 项"退出码 0，等于 D16"测试进程绝不允许指向生产数据目录"在 8 个脚本里失效。
+   这条静态断言把"每个 tests\*.js 都要校验"钉住，避免以后新增脚本又漏掉。
+   **豁免**：`env.js` 自身（它实现校验）、`preflight.js`（它**故意**把环境问题报成检查项，
+   而不是自己先退 2 —— 理由写在该文件第一节注释里）。
+   **范围**：只看 `tests\` **直下**的入口脚本；`tests\lib\` 下的夹具层是被 require 的模块
+   （由宿主脚本负责校验），逐个要求它们自校验既无意义也会造成假失败。 */
+const noRuntimeCheck = [];
+for (const f of jsFiles) {
+  const rel = path.relative(ROOT, f);
+  const dir = path.dirname(rel);
+  if (dir !== 'tests') continue;                       // 只查 tests\ 直下
+  const base = path.basename(rel);
+  if (base === 'env.js' || base === 'preflight.js') continue;
+  if (!/assertRuntime\(\)/.test(fs.readFileSync(f, 'utf8'))) noRuntimeCheck.push(rel);
+}
+t.check('每个 tests\\*.js 入口脚本都调用 env.assertRuntime()（D16 的 prod 拒绝不漏脚本）',
+  noRuntimeCheck.length === 0, noRuntimeCheck.join('、'));
+
 t.finish();

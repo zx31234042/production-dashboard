@@ -27,6 +27,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { execFileSync } = require('node:child_process');
 
+const env = require('./env');
+env.assertRuntime();
+
 const ROOT = path.resolve(__dirname, '..');
 
 /* ---------------- 极简断言框架 ---------------- */

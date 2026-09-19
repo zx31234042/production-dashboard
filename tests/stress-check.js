@@ -29,15 +29,8 @@ const { spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const env = require('./env');
 
-/* 浏览器类脚本一律不得在 prod 环境下跑（ADR-0003 D16）；本脚本额外守一条值域门 */
-if (env.isProd) {
-  console.error('\n[环境不满足] DSH_ENV=prod：stress-check 拒绝在**生产环境**下运行（ADR-0003 D16）。');
-  process.exit(env.EXIT_ERROR);
-}
-if (env.ENV_NAME !== 'dev' && env.ENV_NAME !== 'test') {
-  console.error(`\n[环境不满足] DSH_ENV 取值非法：${env.ENV_NAME}（只允许 dev | test；prod 禁止运行测试）。`);
-  process.exit(env.EXIT_ERROR);
-}
+/* D16 硬要求：Node 版本下限 + 拒绝在 prod 下运行（统一出口，见 tests/env.js） */
+env.assertRuntime();
 
 const ROOT = path.resolve(__dirname, '..');
 const PAGE = pathToFileURL(path.join(ROOT, 'index.html')).href;

@@ -247,6 +247,80 @@ function main() {
     })(),
     '越界覆盖必须抛错，否则测试会写进真实数据目录');
 
+  /* ---------------- 十、权威门禁数字的机器校验（P2-22，ADR-0004 D19） ----------------
+     症状：`tests\README.md` 自称"本节为权威值"，却**没有任何断言检查它** —— 12 个脚本里
+     没有一条比对过扫描文件数/覆盖率分类，所以数字漂移永远不会被拦下（本轮已修掉两处旧漂移：
+     文本文件数 89→98→99、ENV 覆盖率 4/20→6/20）。这里补三层校验。 */
+  t.section('十、权威门禁数字的机器校验（P2-22）');
+
+  const numeric = require('./lib/numeric');
+  const readmeSrc = read('tests/README.md');
+  const { spawnSync } = require('node:child_process');
+
+  /** 实跑一个门禁脚本（输出落文件后回读；受限环境禁管道，故不用 pipe） */
+  const probe = (script) => {
+    const log = path.join(env.ensureDir(env.paths.tempRoot), `docs-cross-${script}-${process.pid}.log`);
+    const fd = fs.openSync(log, 'w');
+    const r = spawnSync(process.execPath, [path.join(ROOT, 'tests', script + '.js')],
+      { cwd: ROOT, stdio: ['ignore', fd, fd], timeout: 300000 });
+    try { fs.closeSync(fd); } catch { /* 忽略 */ }
+    let out = '';
+    try { out = fs.readFileSync(log, 'utf8'); } catch { out = ''; }
+    try { fs.rmSync(log, { force: true }); } catch { /* 忽略 */ }
+    return { code: r.status, out };
+  };
+
+  /** 说明：`run-totals.json` 是 runner 落盘的实跑账，**本脚本不读它** ——
+   *  "权威值 vs 实跑合计"的比对本脚本做不了（suite 成员按定义读不到本轮最终账），
+   *  已移到 `run-all` 收尾执行（它是唯一持有最终账、且不会自递归的地方）。 */
+
+  /* ① 结构完整性：权威区点名的每个脚本都必须真实存在 */
+  const authLine = (readmeSrc.split('\n').find(l => l.includes('离线可跑部分')) || '');
+  const named = [...new Set([...authLine.matchAll(/`([a-z0-9-]+)`/g)].map(m => m[1])
+    .filter(n => n.endsWith('-check') || n === 'screenshot-diff'))];
+  const unknownNamed = named.filter(n => !fs.existsSync(path.join(ROOT, 'tests', n + '.js')));
+  t.check('权威区点名的脚本都真实存在',
+    named.length >= 12 && unknownNamed.length === 0,
+    unknownNamed.length ? `不存在：${unknownNamed.join('、')}` : `点名 ${named.length} 个`);
+
+  /* ② "权威值 vs 实跑合计"**不在这里做** —— 本脚本是 suite 成员，按定义读不到"本轮最终账"
+     （它自己还没跑完），任何 forecast/占位都会算错。该比对交给 **run-all 收尾**：
+     它是唯一持有最终实跑账的地方，且不会自递归。此处只做**文件级**的权威值校验（③）。
+     历史教训：首版在此处"再跑一遍 run-all"→ 自递归超时；第二版用 forecast 占位 → 数字算错。 */
+  const sumListed = numeric.sumScriptCounts(authLine);
+  const statedTotal = numeric.matchNumber(authLine, /合计\s*\*{0,2}\s*(\d+)\s*通过/);
+  t.check('权威区列出的各脚本数字之和 ≤ 声明合计（防重复计数/写错数）',
+    sumListed > 0 && statedTotal !== null && sumListed <= statedTotal,
+    `列出的和=${sumListed}，合计=${statedTotal}`);
+
+  /* ③ 与实跑对齐：权威区关于"扫描文件数 / 覆盖率分类"的数字必须等于对应脚本的真实输出 */
+  const fcRun = probe('files-check');
+  const fcScanned = numeric.matchNumber(fcRun.out, /扫描\s*\*{0,2}(\d+)\*{0,2}\s*个文本文件/);
+  const fcStated = numeric.matchNumber(readmeSrc, /扫描\s*\*\*(\d+)\*\*\s*个文本文件/);
+  t.check('权威区"扫描 N 个文本文件"＝ files-check 实跑值',
+    fcScanned !== null && fcStated === fcScanned, `README=${fcStated}，实跑=${fcScanned}`);
+
+  const trRun = probe('trace-check');
+  /* README 的写法是 `按类别：…、**ENV 4/20**`；trace-check 输出是 `ENV 6 / 20`。
+     两处的加粗与空格都不同，故用容错正则（这两个坑都实际踩过）。 */
+  const readmeEnv = (readmeSrc.match(/ENV\s*\*{0,2}\s*(\d+)\s*\/\s*(\d+)/) || []).slice(1).map(Number);
+  const traceEnv = (trRun.out.match(/ENV\s*(\d+)\s*\/\s*(\d+)/) || []).slice(1).map(Number);
+  t.check('权威区的 ENV 覆盖率分类＝ trace-check 实跑值',
+    readmeEnv.length === 2 && traceEnv.length === 2 &&
+    readmeEnv[0] === traceEnv[0] && readmeEnv[1] === traceEnv[1],
+    `README=ENV ${readmeEnv.join('/')}，实跑=ENV ${traceEnv.join('/')}`);
+
+  /* README 写法：`可追溯覆盖 164 条（64.1%）`；不写"164/256"那种形式，故按"条"取分子 */
+  const readmeCov = [
+    numeric.matchNumber(readmeSrc, /可追溯覆盖\s*(\d+)\s*条/),
+    numeric.matchNumber(readmeSrc, /(\d+)\s*条\*\*需求条款/)
+  ];
+  const traceCov = (trRun.out.match(/可追溯覆盖[^\d]*(\d+)\s*\/\s*(\d+)/) || []).slice(1).map(Number);
+  t.check('权威区的可追溯覆盖率＝ trace-check 实跑值（分子与条款总数都比）',
+    readmeCov[0] !== null && readmeCov[1] !== null && traceCov.length === 2 &&
+    readmeCov[0] === traceCov[0] && readmeCov[1] === traceCov[1],
+    `README=${readmeCov.join(' / ')}，实跑=${traceCov.join(' / ')}`);
+
   t.finish();
 }
 

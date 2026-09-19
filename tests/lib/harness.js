@@ -245,11 +245,6 @@ function injectFailure(fn, opts = {}) {
   return wrapped;
 }
 
-/** 把某个函数的执行挂起 ms 毫秒（验超时/断连检测） */
-function stall(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 /* ---------------- 收尾 ---------------- */
 
 /** 清理测试临时区（默认只清 24 小时前的；传 force=true 清空全部） */
@@ -261,12 +256,15 @@ function cleanup(force = false) {
   return env.cleanupStaleTemp();
 }
 
+/* 注：`stall(ms)`（挂起执行以验超时/断连）已于 2026-09-19 删除 ——
+   它从加进来起就**零引用**，属"交付了却从未被验证"的死代码（R-2026-09-19-02 的 P2-16）。
+   需要挂起时直接 `await new Promise(r => setTimeout(r, ms))`，不必留一个没人用的导出。 */
+
 module.exports = {
   makeTempDir,
   makeTempDb,
   allocPort,
   startService,
   injectFailure,
-  stall,
   cleanup
 };

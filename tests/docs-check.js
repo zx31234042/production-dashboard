@@ -21,6 +21,9 @@ const path = require('node:path');
 const zlib = require('node:zlib');
 const { execFileSync } = require('node:child_process');
 
+const env = require('./env');
+env.assertRuntime();
+
 const ROOT = path.resolve(__dirname, '..');
 const TMP = path.join(ROOT, 'tests', '._verify');
 

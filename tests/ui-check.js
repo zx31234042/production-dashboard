@@ -17,6 +17,9 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
+const env = require('./env');
+env.assertRuntime();
+
 const ROOT = path.resolve(__dirname, '..');
 
 /* ---------------- 断言框架 ---------------- */

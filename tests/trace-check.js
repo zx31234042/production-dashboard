@@ -22,6 +22,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+const env = require('./env');
+env.assertRuntime();
+
 const ROOT = path.resolve(__dirname, '..');
 const TESTS = path.join(ROOT, 'tests');
 const LIST = process.argv.includes('--list');

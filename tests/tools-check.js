@@ -21,6 +21,9 @@ const path = require('node:path');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
 
+const env = require('./env');
+env.assertRuntime();
+
 const ROOT = path.resolve(__dirname, '..');
 const UPPER = path.join(ROOT, 'tools', 'mock-upper', 'mock-upper.js');
 const MES = path.join(ROOT, 'tools', 'mock-mes', 'mock-mes.js');

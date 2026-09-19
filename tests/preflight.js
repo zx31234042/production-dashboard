@@ -32,6 +32,12 @@ async function main() {
     env.nodeMajor() >= env.MIN_NODE_MAJOR,
     `当前 ${process.version}`
   );
+  /* 注意：本脚本**故意不调用 env.assertRuntime()** —— 它是"跑门禁之前的体检"，
+     职责是把"环境问题"**报成检查项**（好让人知道缺什么），而不是自己先退 2。
+     故 D16 的 prod 拒绝在此以断言形式表达（preflight 自身免于"必须调 assertRuntime"的静态断言）。 */
+  t.check('DSH_ENV 合法且不是 prod（D16：测试进程不得指向生产数据目录）',
+    env.ENV_NAME !== 'prod' && ['dev', 'test'].includes(env.ENV_NAME),
+    `DSH_ENV=${env.ENV_NAME}`);
 
   let sqliteOk = false;
   try {

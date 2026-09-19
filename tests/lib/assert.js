@@ -126,23 +126,8 @@ function createRunner(title, options = {}) {
   };
 }
 
-/**
- * 带异常兜底的 main 包装：脚本抛异常时以退出码 2 结束，并把堆栈打出来。
- * 与现有脚本尾部的 try/catch 约定一致。
- */
-function runMain(fn) {
-  try {
-    const r = fn();
-    if (r && typeof r.then === 'function') {
-      r.catch(err => {
-        console.error('\n脚本异常终止：' + (err && err.stack ? err.stack : err));
-        process.exit(2);
-      });
-    }
-  } catch (err) {
-    console.error('\n脚本异常终止：' + (err && err.stack ? err.stack : err));
-    process.exit(2);
-  }
-}
+/* 注：`runMain(fn)`（带异常兜底的 main 包装，异常退 2）已于 2026-09-19 删除 ——
+   12 个脚本各自在尾部写了 try/catch，它从加进来起就**零引用**
+   （R-2026-09-19-02 的 P2-16："交付了却从未被验证"）。留着只会让后来者以为它会生效。 */
 
-module.exports = { createRunner, runMain };
+module.exports = { createRunner };

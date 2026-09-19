@@ -24,6 +24,9 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 
+const env = require('./env');
+env.assertRuntime();
+
 const ROOT = path.resolve(__dirname, '..');
 const PAGE = pathToFileURL(path.join(ROOT, 'index.html')).href;
 const BASELINE = path.join(ROOT, 'tests', 'screenshots-baseline');
