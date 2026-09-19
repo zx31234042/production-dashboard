@@ -56,21 +56,38 @@ window.Pages.Dashboard = (function () {
   function init(state) {
     window.Components.TabsBar.build(TABS, HOME_TAB, switchTab);
     window.Components.SettingPanel.bind(state, resetIdleTimer);
+    window.Components.AlarmPanel.bind(state, resetIdleTimer);
     resetIdleTimer();
   }
 
+  /* 整屏渲染的组件顺序（NFR-11：任一组件异常只跳过该组件，不影响其余组件） */
+  const RENDER_ORDER = [
+    ['HeaderBar', 'render'],
+    ['TabsBar', 'renderLinkStatus'],
+    ['DeviceStatusPanel', 'render'],
+    ['TaskPanel', 'render'],
+    ['ShiftPanel', 'render'],
+    ['StatsPanel', 'render'],
+    ['AlarmPanel', 'render'],
+    ['MaintPanel', 'render'],
+    ['NoticePanel', 'render'],
+    ['SettingPanel', 'render']
+  ];
+
   function renderAll(state) {
-    window.Components.HeaderBar.render(state);
-    window.Components.TabsBar.renderLinkStatus(state);
-    window.Components.DeviceStatusPanel.render(state);
-    window.Components.TaskPanel.render(state);
-    window.Components.ShiftPanel.render(state);
-    window.Components.StatsPanel.render(state);
-    window.Components.AlarmPanel.render(state);
-    window.Components.MaintPanel.render(state);
-    window.Components.NoticePanel.render(state);
-    window.Components.SettingPanel.render(state);
-    renderDegraded(state);
+    RENDER_ORDER.forEach(([name, method]) => {
+      try {
+        window.Components[name][method](state);
+      } catch (err) {
+        /* 单组件故障降级：记录后继续渲染后续组件，保持整屏可用（NFR-11） */
+        console.error(`[看板] 组件 ${name}.${method} 渲染异常，已跳过：`, err);
+      }
+    });
+    try {
+      renderDegraded(state);
+    } catch (err) {
+      console.error('[看板] 降级提示渲染异常，已跳过：', err);
+    }
   }
 
   return { TABS, HOME_TAB, init, renderAll, switchTab, resetIdleTimer };

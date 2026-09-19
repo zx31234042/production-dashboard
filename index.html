@@ -86,9 +86,10 @@
         <!-- 设备参数：次要展示（FR-3.16 / C-31） -->
         <div class="device-strip">
           <span class="strip-title">设备参数（次要）</span>
-          <span class="strip-item">实际帧率<b class="mono" id="stFps">400</b>fps</span>
+          <span class="strip-item">实时帧率<b class="mono" id="stFps">400</b>fps</span>
           <span class="strip-item">相机增益<b class="mono" id="stGain">2.5</b></span>
-          <span class="strip-item">快门<b class="mono" id="stShutter">500</b></span>
+          <span class="strip-item">快门速度<b class="mono" id="stShutter">500</b></span>
+          <span class="strip-item">相机水下深度<b class="mono" id="stCamDepth">12.00</b>m</span>
         </div>
       </div>
 
@@ -252,6 +253,18 @@
         <div class="alarm-type" id="alType">当前无故障</div>
         <div class="kv-list compact" id="alDetail"></div>
         <div class="alarm-state" id="alState">正常</div>
+
+        <!-- 闭环状态本机录入（FR-5.4 / 5.11）：不需要解锁，属现场处置动作 -->
+        <div class="btn-row mt-24">
+          <button class="btn" id="alHandleBtn" disabled>标记处理中</button>
+          <button class="btn primary" id="alCloseBtn" disabled>确认闭环</button>
+        </div>
+
+        <!-- 并发报警队列（FR-5.6）：多条报警按发生时间排队展示，新报警不覆盖旧报警 -->
+        <div class="queue-block">
+          <div class="queue-head">并发报警队列<span class="mono" id="alQueueNote">—</span></div>
+          <div class="list" id="alQueueList"></div>
+        </div>
       </div>
 
       <div class="card">
@@ -348,7 +361,7 @@
       </div>
 
       <div class="card entry-card">
-        <div class="card-title">维保信息录入 / 公告信息发布<span class="title-note">需解锁（FR-6.11、FR-7.12）</span></div>
+        <div class="card-title">录入 / 发布 / 参数配置<span class="title-note">需解锁（FR-6.11、FR-7.12、FR-8.6）</span></div>
         <div class="entry-grid">
           <div class="entry-form">
             <div class="form-title">维保信息录入</div>
@@ -372,8 +385,27 @@
               <textarea class="form-input" id="noticeText" rows="2" placeholder="输入公告内容" disabled></textarea></div>
             <button class="btn primary" id="noticeSave" disabled>发布公告</button>
           </div>
+          <div class="entry-form">
+            <div class="form-title">关键参数配置（FR-8.6）</div>
+            <div class="form-row"><span class="form-label">设备编号</span>
+              <input class="form-input" id="cfgEquipCode" placeholder="如：SX-UNDERWATER-001" disabled></div>
+            <div class="form-row"><span class="form-label">上位机地址</span>
+              <input class="form-input" id="cfgUpperUrl" placeholder="如：http://10.10.2.31:8080/api/realtime" disabled></div>
+            <div class="form-row"><span class="form-label">MES 接口地址</span>
+              <input class="form-input" id="cfgMesUrl" placeholder="如：http://10.10.x.x:8080/mes" disabled></div>
+            <div class="form-row"><span class="form-label">预警阈值（天）</span>
+              <input class="form-input" id="cfgWarnDays" inputmode="numeric" placeholder="默认 14" disabled></div>
+            <button class="btn primary" id="cfgSaveBtn" disabled>保存参数</button>
+          </div>
           <div class="entry-note" id="entryMsg">当前已锁定：请先在左侧输入解锁密码（演示密码 8888）</div>
         </div>
+      </div>
+
+      <!-- 操作日志（FR-8.7 / NFR-15）：解锁后的写操作全程留痕 -->
+      <div class="card log-card">
+        <div class="card-title">操作日志（留痕）<span class="title-note">FR-8.7 / NFR-15 · 最近 20 条</span></div>
+        <div class="list" id="setOpLogList"></div>
+        <div class="hint" id="cfgMsg">地址类参数保存后刷新页面生效；班次时间与其余阈值见 src/config/board.config.js</div>
       </div>
     </section>
 

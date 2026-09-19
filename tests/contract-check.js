@@ -278,14 +278,14 @@ async function startMockMes({ port, receipt, failRate }) {
 
 /* ---------------- 自检主体 ---------------- */
 async function main() {
-  /* ===== A. 附录 2 契约：需求清单 V1.26 §6.4 字段表 ↔ fieldMap.boardToReport ===== */
+  /* ===== A. 附录 2 契约：需求清单 V1.27 §6.4 字段表 ↔ fieldMap.boardToReport ===== */
   section('A. 附录 2 上报字段契约（IF-B.8 / IF-C.1）');
   const APPENDIX2 = [
     'equipCode', 'procOrderNo', 'frameRate', 'gain', 'shutter', 'cameraDepth', 'depth',
     'speed', 'velocity_x', 'velocity_y', 'collectTime', 'testStatus', 'uploadId'
   ];
   const reportKeys = Object.keys(MAP.boardToReport);
-  check('附录 2（需求清单 V1.26 §6.4 表）共 13 个字段', APPENDIX2.length === 13, `实际 ${APPENDIX2.length}`);
+  check('附录 2（需求清单 V1.27 §6.4 表）共 13 个字段', APPENDIX2.length === 13, `实际 ${APPENDIX2.length}`);
   check(
     'fieldMap.boardToReport 的字段名与附录 2 完全一致',
     reportKeys.length === APPENDIX2.length && reportKeys.every(k => APPENDIX2.includes(k)),
@@ -470,18 +470,26 @@ async function main() {
 
   /* ===== E. ?source=upper 链路：内置模拟上位机的取帧顺序（6.2） ===== */
   section('E. ?source=upper 端到端链路（tests/README 6.2）');
-  /* services/api.js 的 startUpper() 里是这样取帧的：
-       let s = null;  s = window.MockUpperSource.next(s);  const payload = s.payload;
-     而 mockUpperSource.next() 声明的契约是"传入上一帧的 inner、返回 {payload, inner}"。
-     两者必须一致，否则第二帧起内部状态被写坏。 */
+  /* services/api.js 的 startUpper() 必须按 mockUpperSource 声明的契约取帧：
+       const frame = window.MockUpperSource.next(inner);  inner = frame.inner;  const payload = frame.payload;
+     三者缺一不可，否则第二帧起内部状态被写坏（审查报告 P1-1①）。 */
   const numericFields = ['depth', 'speed', 'velocity_x', 'velocity_y', 'frameRate', 'gain',
                          'shutter', 'cameraDepth', 'progress', 'unitIndex'];
+  const apiSrc = readText('src/services/api.js');
+  const mainSrc = readText('src/main.js');
+  check('取帧链：api.js 传上一帧 inner 并用返回值里的 inner 递推',
+    /MockUpperSource\.next\(\s*inner\s*\)/.test(apiSrc) && /inner\s*=\s*frame\.inner/.test(apiSrc),
+    'api.js 未按"传 inner、取 frame.inner"递推，第二帧起数值会变 NaN');
+  check('数据源互斥：upper 模式不得再跑 mockData.tick()',
+    /if\s*\(\s*sourceKind\s*===\s*'none'\s*\)\s*M\.tick\(/.test(mainSrc),
+    'main.js 仍无条件 tick，报文数据会被模拟数据每秒覆盖（P1-1②）');
 
-  let chain = null;
+  let inner = null;
   const frames = [];
   for (let i = 0; i < 3; i++) {
-    chain = UpperSource.next(chain);
-    frames.push(chain.payload);
+    const frame = UpperSource.next(inner);
+    inner = frame.inner;
+    frames.push(frame.payload);
   }
   const nanOnFrame2 = numericFields.filter(k => Number.isNaN(frames[1][k]));
   check(
@@ -496,16 +504,18 @@ async function main() {
   );
 
   const state5 = cloneState();
-  let s5 = null;
+  let inner5 = null;
+  let lastFrame = null;
   let lastApply = null;
   for (let i = 0; i < 3; i++) {
-    s5 = UpperSource.next(s5);
-    lastApply = Api.applyUpperPayload(state5, s5.payload, new Date());
+    lastFrame = UpperSource.next(inner5);
+    inner5 = lastFrame.inner;
+    lastApply = Api.applyUpperPayload(state5, lastFrame.payload, new Date());
   }
   check(
     '经适配层后：数值保持逐帧更新（不因 NaN 被当成缺字段而冻结）',
-    state5.task.real.depth === s5.payload.depth,
-    `state.depth=${state5.task.real.depth}，报文 depth=${s5.payload.depth}，被丢弃字段数=${lastApply.missing.length}`
+    state5.task.real.depth === lastFrame.payload.depth,
+    `state.depth=${state5.task.real.depth}，报文 depth=${lastFrame.payload.depth}，被丢弃字段数=${lastApply.missing.length}`
   );
   check(
     '经适配层后：运行模式不被写成非法值',
@@ -517,20 +527,33 @@ async function main() {
   section('F. IF-D 降级接线（IF-D.9 / FR-2.6）');
   {
     const h = createIsolatedHarness({});
+    h.window.BoardConfig.dataSource = 'upper';   // 降级同步只在 upper 模式生效（mock 模式的 device.link 由演示键 D 控制）
     const st = h.window.MockData.state;
     h.window.Api.applyUpperPayload(st, h.window.FieldMap.samplePayload, h.__at('2026-09-18T15:10:27'));
+    const fresh = h.window.Api.syncLinkState(st, h.__at('2026-09-18T15:10:28'));
+    check('数据新鲜时链路判据为在线', fresh === 'online', `syncLinkState=${fresh} state.device.link=${st.device.link}`);
     const stale = h.window.Api.isUpperStale(h.__at('2026-09-18T15:10:40'));   // 13 s 无新数据（staleMs=5000）
     check('前置条件：适配层能判定数据已冻结', stale === true);
+    const offline = h.window.Api.syncLinkState(st, h.__at('2026-09-18T15:10:40'));
     check(
-      '数据冻结时界面判据 state.device.link 应转为断连',
-      st.device.link !== 'online',
-      `isUpperStale=${stale}，但 state.device.link=${JSON.stringify(st.device.link)}；` +
-      'HeaderBar/DeviceStatusPanel/TabsBar/Dashboard 的在线判断只读该字段，适配层从不写它'
+      '数据冻结时界面判据 state.device.link 转为断连',
+      offline === 'offline' && st.device.link === 'offline',
+      `isUpperStale=${stale}，syncLinkState=${offline}，state.device.link=${JSON.stringify(st.device.link)}`
+    );
+    check(
+      '接线：main.js 每帧调用 Api.syncLinkState（否则降级不会生效）',
+      /Api\.syncLinkState\s*\(/.test(readText('src/main.js')),
+      'src/main.js 未调用 syncLinkState，数据冻结不会触发界面降级'
+    );
+    check(
+      '接线：main.js 调用 Api.flushPending（IF-B.9 补传必须被触发）',
+      /Api\.flushPending\s*\(/.test(readText('src/main.js')),
+      'src/main.js 未调用 flushPending，失败报文只进队列、永不补传（P1-2）'
     );
     check(
       'Api.getStatus() 的结果应被界面消费',
       /getStatus\s*\(/.test(readText('src/main.js')) || /getStatus\s*\(/.test(readText('src/pages/Dashboard.js')) ||
-      /getStatus\s*\(/.test(readText('src/components/DeviceStatusPanel.js')),
+      /getStatus\s*\(/.test(readText('src/services/mockData.js')),
       'src 内除 api.js 自身外没有调用方，"数据冻结/待补传"状态无法呈现'
     );
   }
@@ -745,12 +768,17 @@ async function main() {
       oee.every(v => Math.abs(v - expect) < 1e-9),
       `实测 oee=${oee.join(' / ')}%，runRate*100=${expect}%（若已改为真实口径，请同步更新界面说明）`
     );
-    h.window.MockData.tick(h.__at('2026-09-18T13:00:00'));
-    const ledger = h.window.MockData.state.alarm.ledger;
+    /* P3-12 修复后：当班异常台账不再是固定 5 条——自动闭环的报警会转入台账（保留上限 8 条）。
+       本项由"固定 5 条"快照改为"确实接收新闭环报警"的行为断言。 */
+    const h2 = createIsolatedHarness({});
+    h2.window.MockData.tick(h2.__at('2026-09-18T10:00:00'));   // 首帧：5 条演示台账 + 当前 1 条未闭环报警
+    const first = h2.window.MockData.state.alarm.ledger.length;
+    h2.window.MockData.tick(h2.__at('2026-09-18T10:03:00'));   // 180 s 后：该报警自动闭环并转入台账
+    const after = h2.window.MockData.state.alarm.ledger.length;
     check(
-      '异常台账仍为固定 5 条（演示占位，不接收新报警）',
-      ledger.length === 5,
-      `实际 ${ledger.length} 条；演示键 A 只切换当前故障卡`
+      '当班异常台账接收新闭环报警（不再固定 5 条，上限 8 条）',
+      first === 5 && after > first && after <= 8,
+      `首帧 ${first} 条 → 3 分钟后 ${after} 条（闭环报警应入账，且不超过 8 条）`
     );
   }
 

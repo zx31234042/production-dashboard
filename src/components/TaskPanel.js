@@ -9,16 +9,37 @@ window.Components.TaskPanel = (function () {
 
   const { setText, setHTML, setStyle, $ } = window.Dom;
 
-  /* 设备参数的允许偏差（用于"正常 / 临近 / 超标"判定） */
-  const TOLERANCE = {
+  /* 设备参数的允许偏差（用于"正常 / 临近 / 超标"判定）：取自 board.config.params.tolerance，
+     未配置时用同值兜底，保证单独打开组件也不报错（P3-4：魔法数字集中到配置） */
+  const TOLERANCE = ((window.BoardConfig || {}).params || {}).tolerance || {
     depth:   { unit: 'm',   warn: 0.10, err: 0.20, digits: 2 },
     gain:    { unit: '',    warn: 0.15, err: 0.30, digits: 1 },
     fps:     { unit: 'fps', warn: 1,    err: 2,    digits: 0 },
     shutter: { unit: '',    warn: 5,    err: 10,   digits: 0 }
   };
 
+  /* FR-3.17：无在测工单时给出「等待工单」空态，不得抛异常、不得留空白 */
+  function renderWaiting() {
+    setHTML('tkOrderList', '<div class="kv-row is-empty"><span class="k">工单</span>' +
+      '<span class="v empty-note">等待工单（上位机尚未派工）</span></div>');
+    ['tkDepth', 'tkSpeed', 'tkVx', 'tkVy'].forEach(id => setText(id, '—'));
+    const tbody = $('tkCompareTable').querySelector('tbody');
+    tbody.innerHTML = '<tr class="is-empty"><td colspan="5" class="empty-note">' +
+      '等待工单，暂无设备参数与阈值对比</td></tr>';
+    setText('tkProgressPct', '0.0%');
+    setStyle('tkProgressBar', 'width', '0%');
+    setHTML('tkProgressText', '等待工单：当前无在测工单，收到派工后自动刷新');
+    setText('tkResult', '等待工单');
+    setStyle('tkResult', 'color', 'var(--idle)');
+    setText('tkResultNote', '等待工单 · 无单任务判定结果');
+    document.querySelectorAll('.flow-step').forEach(el => el.classList.toggle('on', false));
+  }
+
   function render(state) {
     const t = state.task;
+
+    /* 无在测工单：给出空态占位并结束本次渲染 */
+    if (!t || !t.procOrderNo || !t.real || !t.std) { renderWaiting(); return; }
 
     /* 当前工单信息（IF-A 派工 / IF-D 转发的字段） */
     setHTML('tkOrderList', [
@@ -72,10 +93,10 @@ window.Components.TaskPanel = (function () {
     setStyle('tkProgressBar', 'width', pct.toFixed(1) + '%');
     setText('tkProgressText', `当前第 ${t.unitIndex} 件 · 当班已完成 ${state.stats.done} / ${state.stats.plan} 件`);
 
-    /* 单任务测试结果（五态流转） */
-    const colors = { '合格': '#00B050', '不合格': '#FF0000', '待复检': '#FFC000', '待测试': '#8FA9C4' };
+    /* 单任务测试结果（五态流转）；色值引用 styles/variables.css 的 CSS 变量（UI-03） */
+    const colors = { '合格': 'var(--ok)', '不合格': 'var(--err)', '待复检': 'var(--warn)', '待测试': 'var(--idle)' };
     setText('tkResult', t.result);
-    setStyle('tkResult', 'color', colors[t.result] || '#38A3E0');
+    setStyle('tkResult', 'color', colors[t.result] || 'var(--accent)');
     setText('tkResultNote', `上一件判定结果：${t.lastResult} · 节拍 ${window.MockData.CFG.cycleSec}s/件`);
     document.querySelectorAll('.flow-step').forEach(el =>
       el.classList.toggle('on', el.dataset.step === t.result));

@@ -73,3 +73,17 @@ node tests\screenshot-diff.js --baseline tests\._verify\captures-a --candidate t
 
 > 阈值固定为 **5%**（不同像素占比）；单通道容差 ±8（抗 PNG 编码与抗锯齿的微小抖动）。
 > 改了阈值要同步改本文件与提交说明，避免"悄悄放宽标准"。
+
+## 五、交付截图（`src\assets\screenshots\`）怎么重拍
+
+交付用截图是 **3840×2160**，与基准图同源同口径，只是视口尺寸不同——用同一个脚本换个参数即可：
+
+```bat
+node tests\capture-baseline.js --size 3840x2160 --out src\assets\screenshots
+```
+
+顺序要求：**先重拍交付截图，再重新生成引用这些图片的 `.docx`**（《前端界面 Demo 说明》用
+`tools\md2docx-img.ps1` 嵌入图片，图片换了不重生成 Word 就还是旧图）。
+
+> 本目录（1080p 基准图）由**代码项目成员**维护；`src\assets\screenshots\`（4K 交付截图）属交付物，
+> 改了界面两者都要重拍，并在提交说明里写明。

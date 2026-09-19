@@ -6,31 +6,37 @@ window.Components = window.Components || {};
 window.Components.ShiftPanel = (function () {
   'use strict';
 
-  const { setText, setHTML, setStyle, $ } = window.Dom;
+  const { setText, setHTML, setStyle } = window.Dom;
+  const { pad } = window.Format;
 
-  const ORDER = [
-    { name: '早班', range: '08:00 - 16:00', key: '早班' },
-    { name: '中班', range: '16:00 - 24:00', key: '中班' },
-    { name: '晚班', range: '00:00 - 08:00', key: '晚班' }
-  ];
-  const SEQ = ['晚班', '早班', '中班'];
+  /* 班次列表来自配置（state.shift.list ← board.config.shift.list），不在组件里写死；
+     展示顺序按开始时刻升序，start=0 的班次视为当日时序末尾（00:00 属"次日 0 点"段） */
+  function shiftRows(list) {
+    return (list || []).map(s => ({
+      key: s.name,
+      sort: s.start === 0 ? 24 : s.start,
+      range: `${pad(s.start)}:00 - ${s.end === 24 ? '24:00' : pad(s.end) + ':00'}`
+    })).sort((a, b) => a.sort - b.sort);
+  }
 
-  /** 判断某个班次是否已经过去（用于显示"已结束 / 未开始"） */
-  function isPassed(key, current) {
-    return SEQ.indexOf(key) < SEQ.indexOf(current);
+  /** 判断某个班次是否已经过去（按配置顺序＝当日时序） */
+  function isPassed(key, current, seq) {
+    return seq.indexOf(key) < seq.indexOf(current);
   }
 
   function render(state) {
     const sh = state.shift;
+    const rows = shiftRows(sh.list);
+    const seq = (sh.list || []).map(s => s.name);
 
     /* 班次时段：标注已结束 / 进行中 / 未开始并显示进度 */
-    setHTML('shShiftList', ORDER.map(o => {
+    setHTML('shShiftList', rows.map(o => {
       const on = o.key === sh.name;
-      const passed = isPassed(o.key, sh.name);
+      const passed = isPassed(o.key, sh.name, seq);
       const stateText = on ? '进行中' : (passed ? '已结束' : '未开始');
       const pct = on ? sh.pct : (passed ? 100 : 0);
       return `<div class="shift-item${on ? ' on' : ''}">
-        <span class="shift-name">${o.name}</span>
+        <span class="shift-name">${o.key}</span>
         <span class="shift-range mono">${o.range}</span>
         <span class="shift-state ${on ? 'accent' : 'muted'}">${stateText}</span>
         <span class="bar"><i style="width:${pct.toFixed(1)}%"></i></span>

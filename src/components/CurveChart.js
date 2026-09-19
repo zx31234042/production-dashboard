@@ -13,14 +13,16 @@ window.Components.CurveChart = (function () {
   /* 记录每个图表上次绘制的曲线对象，用于判断是否需要重绘 */
   const rendered = {};
 
-  /** 绘制坐标网格框架（空态与有数据时都会先画框架） */
+  /** 绘制坐标网格框架（空态与有数据时都会先画框架）
+      颜色一律取自 styles/variables.css 的 CSS 变量，避免色值在 JS 里重复维护 */
   function drawFrame() {
     const W = 800, H = 240, PAD_T = 16, PAD_B = 16;
     let frame = '';
     for (let i = 0; i <= 4; i++) {
       const y = PAD_T + (H - PAD_T - PAD_B) * (i / 4);
       frame += `<line x1="0" y1="${y.toFixed(1)}" x2="${W}" y2="${y.toFixed(1)}" ` +
-               `stroke="#1E3A5C" stroke-width="1" stroke-dasharray="8 10" vector-effect="non-scaling-stroke"/>`;
+               `style="stroke:var(--grid);stroke-width:1;stroke-dasharray:8 10" ` +
+               `vector-effect="non-scaling-stroke"/>`;
     }
     return { frame, W, H, PAD_T, PAD_B };
   }
@@ -42,12 +44,13 @@ window.Components.CurveChart = (function () {
 
     svg.innerHTML =
       `<defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">` +
-      `<stop offset="0%" stop-color="${color}" stop-opacity="0.34"/>` +
-      `<stop offset="100%" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>` +
+      `<stop offset="0%" style="stop-color:${color};stop-opacity:0.34"/>` +
+      `<stop offset="100%" style="stop-color:${color};stop-opacity:0"/></linearGradient></defs>` +
       frame +
       `<polygon points="${area}" fill="url(#${gid})"/>` +
-      `<polyline points="${pts}" fill="none" stroke="${color}" stroke-width="4" ` +
-      `stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>`;
+      `<polyline points="${pts}" ` +
+      `style="fill:none;stroke:${color};stroke-width:4;stroke-linejoin:round;stroke-linecap:round" ` +
+      `vector-effect="non-scaling-stroke"/>`;
     return curve;
   }
 
@@ -57,7 +60,7 @@ window.Components.CurveChart = (function () {
    * @param {string} taskId  图下"件号/采样点/时长"元素 id
    * @param {string} rangeId 图下"量程"元素 id
    * @param {object} curve   曲线对象（state.curve.depth / state.curve.speed）
-   * @param {string} color   主色
+   * @param {string} color   主色（CSS 变量引用，如 var(--accent)；色值只在 variables.css 维护）
    * @param {string} gid     渐变 id
    * @param {string} unit    单位（m / m/s）
    */

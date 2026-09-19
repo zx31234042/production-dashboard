@@ -6,7 +6,7 @@ window.Components = window.Components || {};
 window.Components.HeaderBar = (function () {
   'use strict';
 
-  const { setText, setClass, $ } = window.Dom;
+  const { setText, setClass } = window.Dom;
 
   /** 渲染头部区（每帧调用） */
   function render(state) {
@@ -21,10 +21,9 @@ window.Components.HeaderBar = (function () {
     setText('hdrOperator', state.shift.operator);
     setText('hdrLeader', state.shift.leader);
 
-    // 上位机联网状态标识（FR-2.6）
+    // 上位机联网状态标识（FR-2.6）：走 Dom 封装，值未变化时不触发重排
     const online = state.device.link === 'online';
-    const badge = $('hdrLinkBadge');
-    badge.textContent = online ? '上位机在线' : '上位机断连';
+    setText('hdrLinkBadge', online ? '上位机在线' : '上位机断连');
     setClass('hdrLinkBadge', 'chip ' + (online ? 'chip-ok' : 'chip-err'));
   }
 

@@ -138,6 +138,17 @@ window.Api = (function () {
     return ((now ? now.getTime() : Date.now()) - lastUpperAt) > CFG.upper.staleMs;
   }
 
+  /**
+   * 把"数据冻结 / 取数失败"同步到界面判据 state.device.link（IF-D.9 / FR-2.6）
+   * 仅在 upper 模式生效：mock 模式的 device.link 由演示键 D 控制，不能被覆盖。
+   * @returns {string} 同步后的链路状态
+   */
+  function syncLinkState(state, now) {
+    if (!state || CFG.dataSource !== 'upper') return state ? state.device.link : 'online';
+    state.device.link = (isUpperStale(now) || state.upperValid === false) ? 'offline' : 'online';
+    return state.device.link;
+  }
+
   /* ---------------- 数据源接入 ---------------- */
 
   /**
@@ -150,11 +161,14 @@ window.Api = (function () {
     const src = CFG.dataSource;
 
     if (src === 'upper' && window.MockUpperSource) {
-      /* 联调前自测：用前端内置的"模拟上位机"产生符合契约的报文，走同一条适配链路 */
-      let s = null;
+      /* 联调前自测：用前端内置的"模拟上位机"产生符合契约的报文，走同一条适配链路。
+         MockUpperSource.next() 的契约是"传上一帧的 inner、返回 {payload, inner}"，
+         必须持有 inner 递推，否则第二帧起内部状态被写坏、数值全为 NaN（审查报告 P1-1①）。 */
+      let inner = null;
       upperTimer = setInterval(() => {
-        s = window.MockUpperSource.next(s);
-        const payload = s.payload;
+        const frame = window.MockUpperSource.next(inner);
+        inner = frame.inner;
+        const payload = frame.payload;
         const v = validatePayload(payload);
         if (!v.ok) { console.warn('[Api] 报文校验未通过：' + v.reason); return; }
         const r = applyUpperPayload(state, payload, new Date());
@@ -279,14 +293,16 @@ window.Api = (function () {
     if (pending.length > 5000) pending.shift();   // 防止无限增长
   }
 
-  /** 补传：按指数退避重试待传队列（IF-B.9） */
+  /** 补传：按指数退避重试待传队列（IF-B.9）；退避次数受 CFG.mes.retry.max 约束，报文不丢弃 */
   async function flushPending() {
     if (!CFG.mes.baseUrl || pending.length === 0) return { sent: 0, left: pending.length };
     const now = Date.now();
     const rest = [];
     let sent = 0;
     for (const item of pending) {
-      const delay = CFG.mes.retry.baseDelayMs * Math.pow(2, item.tries);
+      /* 退避轮次封顶：超过 retry.max 后按最大间隔继续重试，仍保留在队列里（保证不丢数） */
+      const cappedTries = Math.min(item.tries, CFG.mes.retry.max);
+      const delay = CFG.mes.retry.baseDelayMs * Math.pow(2, cappedTries);
       if (now - item.at < delay) { rest.push(item); continue; }
       const r = await uploadReport(item.payload, 'report', 'receiveReport');
       if (r.ok) { sent++; } else { item.tries++; item.at = now; rest.push(item); }
@@ -311,7 +327,7 @@ window.Api = (function () {
     /* 配置与映射（只读引用，便于排查） */
     CFG, MAP,
     /* IF-D */
-    applyUpperPayload, validatePayload, isUpperStale, startUpper, stopUpper,
+    applyUpperPayload, validatePayload, isUpperStale, syncLinkState, startUpper, stopUpper,
     /* IF-B */
     buildReportPayload, buildUrl, uploadReport, flushPending, nextUploadId, isReceiptOk,
     /* 状态 */

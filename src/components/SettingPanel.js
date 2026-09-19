@@ -1,13 +1,20 @@
 /* ==========================================================================
    组件：操作设置页（components/SettingPanel.js）
-   需求：FR-8 密码解锁、系统时间设置、系统自检
-         FR-6.11 维保录入、FR-7.12 公告发布（解锁后可用）、FR-8.7 操作留痕
+   需求：FR-8 密码解锁（含 5 分钟自动锁定）、系统时间设置、系统自检、关键参数配置
+         FR-6.11 维保录入、FR-7.12 公告发布（解锁后可用）
+         FR-8.7 / NFR-15 解锁后的写操作全程留痕（操作日志）
    ========================================================================== */
 window.Components = window.Components || {};
 window.Components.SettingPanel = (function () {
   'use strict';
 
   const { setText, setHTML, setClass, $ } = window.Dom;
+  const { esc } = window.Format;
+  const CFG = window.BoardConfig;
+
+  /* FR-8.2：解锁后超过该时长自动回到锁定状态（演示取 5 分钟） */
+  const AUTO_LOCK_MS = 5 * 60 * 1000;
+  let autoLockTimer = null;
 
   /* ---------------- 渲染 ---------------- */
   function render(state) {
@@ -22,6 +29,10 @@ window.Components.SettingPanel = (function () {
     /* 维保录入 / 公告发布：解锁后才可编辑（FR-6.11、FR-7.12） */
     ['maintContent', 'maintOwner', 'maintState', 'maintSave',
      'noticeType', 'noticeText', 'noticeSave'].forEach(id => { $(id).disabled = !unlocked; });
+
+    /* 关键参数配置：解锁后才可编辑（FR-8.6）；此处只切禁用态，不写 value（避免秒级刷新清空输入） */
+    ['cfgEquipCode', 'cfgUpperUrl', 'cfgMesUrl', 'cfgWarnDays', 'cfgSaveBtn']
+      .forEach(id => { $(id).disabled = !unlocked; });
 
     const em = $('entryMsg');
     if (!em.dataset.sticky) {
@@ -43,6 +54,16 @@ window.Components.SettingPanel = (function () {
     setHTML('setSelfCheckList', state.selfCheck.map(c =>
       `<div class="list-item lv-${c.lv}"><span class="body">${c.name}</span>` +
       `<span class="meta ${c.lv}">${c.state}</span></div>`).join(''));
+
+    /* 操作日志（FR-8.7 / NFR-15）：解锁后的写操作全程留痕；展示取最近 20 条、时间倒序 */
+    const logs = (state.opLog || []).slice().reverse();
+    setHTML('setOpLogList', logs.length
+      ? logs.map(o =>
+          `<div class="list-item lv-info"><span class="body"><b class="mono">${esc(o.time)}</b> ${esc(o.action)}` +
+          (o.detail ? `<br>${esc(o.detail)}` : '') + `</span>` +
+          `<span class="meta mono">${esc(o.operator)}</span></div>`).join('')
+      : '<div class="list-item lv-info is-empty"><span class="body empty-note">' +
+        '暂无操作日志（解锁后的维保录入 / 公告发布 / 参数修改都会留痕）</span></div>');
   }
 
   /* ---------------- 交互绑定 ---------------- */
@@ -64,13 +85,32 @@ window.Components.SettingPanel = (function () {
       setTimeout(() => { delete entryMsg.dataset.sticky; render(state); }, 4000);
     }
 
+    /* FR-8.2：解锁后启动自动锁定计时；超时或手动锁定时清除 */
+    function armAutoLock() {
+      if (autoLockTimer) clearTimeout(autoLockTimer);
+      autoLockTimer = setTimeout(() => {
+        autoLockTimer = null;
+        if (!state.unlocked) return;
+        M.setUnlocked(false);
+        M.pushLog('自动锁定', '解锁后超过 5 分钟，系统自动回到锁定状态');
+        msg.textContent = '解锁已超过 5 分钟，系统已自动锁定';
+        msg.className = 'pwd-msg';
+        render(state);
+      }, AUTO_LOCK_MS);
+    }
+    function clearAutoLock() {
+      if (autoLockTimer) { clearTimeout(autoLockTimer); autoLockTimer = null; }
+    }
+
     function tryUnlock() {
       // 演示实现：真实系统须由服务端校验口令（NFR-14），不得在前端存放明文
       if (input.value === M.CFG.unlockPassword) {
         M.setUnlocked(true);
-        msg.textContent = '解锁成功，维保录入与公告修改已开放';
+        M.pushLog('解锁', '输入解锁口令成功（演示实现，正式系统由服务端校验）');
+        msg.textContent = '解锁成功，维保录入与公告修改已开放（5 分钟无操作自动锁定）';
         msg.className = 'pwd-msg ok';
         input.value = '';
+        armAutoLock();
       } else {
         msg.textContent = '密码错误，请重新输入（演示密码：8888）';
         msg.className = 'pwd-msg err';
@@ -79,10 +119,18 @@ window.Components.SettingPanel = (function () {
       onActivity();
     }
 
+    /* 关键参数配置：把配置文件当前值载入输入框（只在绑定时写一次，避免秒级刷新覆盖用户输入） */
+    $('cfgEquipCode').value = M.CFG.equipCode;
+    $('cfgUpperUrl').value = CFG.upper.url || '';
+    $('cfgMesUrl').value = CFG.mes.baseUrl || '';
+    $('cfgWarnDays').value = String(M.CFG.maintWarnDays);
+
     $('setUnlockBtn').addEventListener('click', tryUnlock);
     input.addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock(); onActivity(); });
 
     $('setLockBtn').addEventListener('click', () => {
+      clearAutoLock();
+      if (state.unlocked) M.pushLog('手动锁定', '操作人手动锁定看板输入');
       M.setUnlocked(false);
       msg.textContent = '已锁定';
       msg.className = 'pwd-msg';
@@ -90,7 +138,11 @@ window.Components.SettingPanel = (function () {
       onActivity();
     });
 
-    $('setSyncBtn').addEventListener('click', () => { msg.textContent = 'NTP 同步完成（模拟）'; msg.className = 'pwd-msg ok'; });
+    $('setSyncBtn').addEventListener('click', () => {
+      msg.textContent = 'NTP 同步完成（模拟）';
+      msg.className = 'pwd-msg ok';
+      M.pushLog('时间同步', '手动触发 NTP 同步（模拟）');
+    });
     $('setManualBtn').addEventListener('click', () => { msg.textContent = '演示版本不支持修改系统时间'; msg.className = 'pwd-msg'; });
 
     /* 维保录入（FR-6.11）：演示仅写入前端内存，真实系统须落库 + 留痕 */
@@ -98,14 +150,15 @@ window.Components.SettingPanel = (function () {
       if (!state.unlocked) return;
       const content = $('maintContent').value.trim();
       if (!content) { flashEntry('请填写检修内容后再保存', true); return; }
+      const owner = $('maintOwner').value.trim() || '—';
+      const mstate = $('maintState').value;
       state.maint.records.unshift({
         time: `${state.clock.date} ${state.clock.time.slice(0, 5)}`,
-        content,
-        owner: $('maintOwner').value.trim() || '—',
-        state: $('maintState').value
+        content, owner, state: mstate
       });
       state.maint.records = state.maint.records.slice(0, 6);
       $('maintContent').value = ''; $('maintOwner').value = '';
+      M.pushLog('维保录入', `检修内容：${content}；责任人：${owner}；验收状态：${mstate}`);
       window.Components.MaintPanel.render(state);
       flashEntry('维保记录已保存并记录操作日志（演示）', false);
       onActivity();
@@ -116,15 +169,47 @@ window.Components.SettingPanel = (function () {
       if (!state.unlocked) return;
       const text = $('noticeText').value.trim();
       if (!text) { flashEntry('请填写公告内容后再发布', true); return; }
-      const d = new Date();
-      state.notices.notices.unshift({
-        tag: $('noticeType').value, text, lv: 'info',
-        time: `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-      });
+      const type = $('noticeType').value;
+      /* 复用 state.clock（每秒刷新），不再手工拼 HH:MM（P3-7） */
+      const hhmm = state.clock.time.slice(0, 5);
+      state.notices.notices.unshift({ tag: type, text, lv: 'info', time: hhmm });
       state.notices.notices = state.notices.notices.slice(0, 6);
       $('noticeText').value = '';
+      M.pushLog('公告发布', `公告类型：${type}；内容：${text}`);
       window.Components.NoticePanel.render(state);
       flashEntry('公告已发布并记录操作日志（演示）', false);
+      onActivity();
+    });
+
+    /* 关键参数配置保存（FR-8.6）：写入配置与运行时参数，并记录操作日志 */
+    $('cfgSaveBtn').addEventListener('click', () => {
+      if (!state.unlocked) return;
+      const code = $('cfgEquipCode').value.trim();
+      const upperUrl = $('cfgUpperUrl').value.trim();
+      const mesUrl = $('cfgMesUrl').value.trim();
+      const warnDays = Number($('cfgWarnDays').value.trim());
+      const changed = [];
+      if (code && code !== M.CFG.equipCode) {
+        M.CFG.equipCode = code; CFG.device.equipCode = code; state.device.code = code;
+        changed.push(`设备编号=${code}`);
+      }
+      if (upperUrl !== (CFG.upper.url || '')) {
+        CFG.upper.url = upperUrl;
+        changed.push(`上位机地址=${upperUrl || '（已清空）'}`);
+      }
+      if (mesUrl !== (CFG.mes.baseUrl || '')) {
+        CFG.mes.baseUrl = mesUrl;
+        changed.push(`MES 地址=${mesUrl || '（已清空）'}`);
+      }
+      if (Number.isFinite(warnDays) && warnDays > 0 && warnDays !== M.CFG.maintWarnDays) {
+        M.CFG.maintWarnDays = warnDays;
+        state.maint.warnDays = warnDays;
+        changed.push(`维保预警阈值=${warnDays} 天`);
+      }
+      if (!changed.length) { flashEntry('参数未发生变化，无需保存', true); onActivity(); return; }
+      M.pushLog('参数配置', changed.join('；'));
+      flashEntry('参数已保存并记录操作日志：' + changed.join('；') + '（地址类参数刷新页面后生效）', false);
+      render(state);
       onActivity();
     });
   }

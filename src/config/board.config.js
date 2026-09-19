@@ -1,7 +1,7 @@
 /* ==========================================================================
    看板运行配置（config/board.config.js）
    作用：把所有"会随外部答复变化"的参数集中到这里，答复到达时只改本文件，不动业务代码。
-   对应待确认事项（需求清单 V1.26 第 12 章）：
+   对应待确认事项（需求清单 V1.27 第 12 章）：
      - shift            ← Q-10 班次定义
      - production       ← Q-11 统计公式与产能参数
      - faultDict        ← Q-12 故障代码字典（结构与示例；内容待补全）
@@ -104,6 +104,17 @@ window.BoardConfig = (function () {
       /* 回执风格：'status' = {status,msg,data}（接口定义）；'code' = {code,msg,uploadId}（附录 2） */
       responseStyle: 'status',
       retry: { max: 5, baseDelayMs: 1000 }   // 失败重试：指数退避（IF-B.9）
+    },
+
+    /* ---------------- 设备参数判定容差（FR-3.5～3.8、FR-3.16） ----------------
+       用于把"设定值 vs 实测值"的偏差判为 正常 / 临近 / 超标；答复到达后只改这里 */
+    params: {
+      tolerance: {
+        depth:   { unit: 'm',   warn: 0.10, err: 0.20, digits: 2 },
+        gain:    { unit: '',    warn: 0.15, err: 0.30, digits: 1 },
+        fps:     { unit: 'fps', warn: 1,    err: 2,    digits: 0 },
+        shutter: { unit: '',    warn: 5,    err: 10,   digits: 0 }
+      }
     },
 
     /* ---------------- 任务曲线（FR-3.15、UI-19） ---------------- */

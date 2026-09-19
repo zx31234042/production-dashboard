@@ -31,5 +31,14 @@ window.Format = (function () {
   /** 保留 2 位小数 */
   const round2 = v => Math.round(v * 100) / 100;
 
-  return { pad, clock, hm, duration, hours, clamp, round1, round2 };
+  /** HTML 转义：凡"用户输入"（公告正文、检修内容、责任人、操作日志摘要等）
+      拼进 innerHTML 之前必须先过这里（FR-7.12 / FR-6.11 界面渲染安全、NFR-13 防注入） */
+  const esc = v => String(v === null || v === undefined ? '' : v)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  return { pad, clock, hm, duration, hours, clamp, round1, round2, esc };
 })();

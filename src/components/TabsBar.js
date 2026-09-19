@@ -8,6 +8,9 @@ window.Components.TabsBar = (function () {
 
   const { setText, setClass, $ } = window.Dom;
 
+  /* 记录是否已绑定点击委托，避免重复调用 build() 时叠加监听（P3-8） */
+  let bound = false;
+
   /**
    * 生成标签按钮并绑定点击
    * @param {Array}  tabs      标签定义 [{ id, label }]
@@ -19,6 +22,8 @@ window.Components.TabsBar = (function () {
     nav.innerHTML = tabs.map((t, i) =>
       `<button class="tab-btn${i === homeIndex ? ' active' : ''}" data-idx="${i}">${t.label}</button>`
     ).join('');
+    if (bound) return;
+    bound = true;
     nav.addEventListener('click', e => {
       const btn = e.target.closest('.tab-btn');
       if (!btn) return;

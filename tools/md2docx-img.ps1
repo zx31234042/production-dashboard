@@ -8,6 +8,7 @@
 
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+Add-Type -AssemblyName System.IO.Compression          # ZipArchive / ZipArchiveMode 所在程序集（FileSystem 只是其包装）
 Add-Type -AssemblyName System.Drawing
 
 function Esc([string]$s) {
@@ -331,8 +332,32 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText((Join-Path $build "docProps\core.xml"), $coreXml, $utf8)
 [System.IO.File]::WriteAllText((Join-Path $build "docProps\app.xml"), $appXml, $utf8)
 
-if (Test-Path $outFull) { Remove-Item $outFull -Force }
-[System.IO.Compression.ZipFile]::CreateFromDirectory($build, $outFull, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+# 打包为 OPC 合规的 docx：部件名必须用正斜杠。
+# 注意：.NET Framework 的 ZipFile::CreateFromDirectory 在 Windows 上会写成反斜杠（不合规），
+#       因此这里手工建条目，并把 [Content_Types].xml / _rels/.rels 放在最前面。
+function New-DocxPackage([string]$SourceDir, [string]$TargetPath) {
+  $root = (Resolve-Path -LiteralPath $SourceDir).Path      # 统一成绝对路径，避免相对路径截断出错
+  $target = if ([System.IO.Path]::IsPathRooted($TargetPath)) { $TargetPath }
+            else { Join-Path (Get-Location).Path $TargetPath }
+  if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
+  $zip = [System.IO.Compression.ZipFile]::Open($target, [System.IO.Compression.ZipArchiveMode]::Create)
+  try {
+    $all = @(Get-ChildItem -Path $root -Recurse -File | ForEach-Object {
+      $_.FullName.Substring($root.Length + 1).Replace('\', '/')
+    })
+    $head = @('[Content_Types].xml', '_rels/.rels')
+    $names = @($head | Where-Object { $all -contains $_ }) + @($all | Where-Object { $head -notcontains $_ })
+    foreach ($name in $names) {
+      $entry = $zip.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
+      $stream = $entry.Open()
+      try {
+        $bytes = [System.IO.File]::ReadAllBytes((Join-Path $root $name.Replace('/', '\')))
+        $stream.Write($bytes, 0, $bytes.Length)
+      } finally { $stream.Dispose() }
+    }
+  } finally { $zip.Dispose() }
+}
+New-DocxPackage $build $outFull
 Remove-Item $build -Recurse -Force
 
 $fi = Get-Item $outFull

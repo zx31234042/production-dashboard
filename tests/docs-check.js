@@ -288,10 +288,14 @@ async function main() {
   check('需求清单声明的未关闭事项数等于 §12.2 表内行数', claimedOpen === openItems.length,
     `声明 ${claimedOpen} 项，表内 ${openItems.length} 行`);
 
-  const legacyClaim = snapshot.includes('前端 Demo 已同步至 V1.25');
-  const legacyFact = reqText.includes('前端 Demo 已同步至 V1.25');
-  check('快照 §5.3 记录的"V1.26 第 14 章仍写 V1.25"与实际一致', legacyClaim === legacyFact,
-    `快照称${legacyClaim ? '存在' : '不存在'}该表述，需求清单里${legacyFact ? '确有' : '没有'}`);
+  /* 2026-09-19 审查报告 ⑨：需求清单第 14 章的"已同步至 V1.25"残留已在 V1.27 改为版本无关表述；
+     这里由"记录一致性"改为"残留已清除"的正向断言，防止旧表述再次回潮。 */
+  const legacyGone = !reqText.includes('前端 Demo 已同步至 V1.25');
+  check('需求清单第 14 章已改为版本无关表述（旧「已同步至 V1.25」残留已清除）', legacyGone,
+    legacyGone ? '' : '需求清单正文仍写着「前端 Demo 已同步至 V1.25」');
+  const snapshotClaimsLegacy = snapshot.includes('前端 Demo 已同步至 V1.25');
+  check('快照不再声称该残留仍存在（V1.27 已修复）', !snapshotClaimsLegacy,
+    snapshotClaimsLegacy ? '快照 §5.3 仍记录该残留' : '');
 
   const testScripts = fs.readdirSync(path.join(ROOT, 'tests')).filter(n => n.endsWith('.js'));
   const testsReadme = readText('tests/README.md');

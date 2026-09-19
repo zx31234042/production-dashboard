@@ -1,5 +1,5 @@
 /* ==========================================================================
-   模拟数据源（services/mockData.js）— 按需求清单 V1.24 口径编写
+   模拟数据源（services/mockData.js）— 按需求清单 V1.27 口径编写
    作用：产生并逐秒推进看板所需的全部数据；界面组件只读取本文件输出的 state
    依赖：utils/format.js（需先加载）
    口径说明：
@@ -20,6 +20,8 @@ window.MockData = (function () {
   const BCprod = BC.production || {};
   const BCmaint = BC.maintenance || {};
   const BCdev = BC.device || {};
+  /* 耗材清单（Q-13）：第 1 项为水下光源，其 threshold 即更换阈值 */
+  const BClamp = (BCmaint.consumables && BCmaint.consumables[0]) || {};
 
   const CFG = {
     deviceName: BCdev.name || '水池高速摄像检验设备',
@@ -36,6 +38,9 @@ window.MockData = (function () {
     queueDepth: BCprod.queueDepth || 72,         // 设备侧待测试排队量
     maintLast: BCmaint.lastDate || '2026-08-28', // 上次维保日期（Q-13）
     maintCycleDays: BCmaint.cycleDays || 30,     // 固定维保周期（Q-13）
+    maintWarnDays: BCmaint.warnDays || 14,       // 维保到期预警提前天数（Q-13，APP 6）
+    lampBaseline: 780,                           // 水下光源"上次更换后"累计点亮时长（h，演示基准）
+    lampThreshold: BClamp.threshold || 800,      // 水下光源更换阈值（h，Q-13 耗材清单第 1 项）
     unlockPassword: '8888'                       // 演示密码（正式实现由服务端校验，NFR-14）
   };
 
@@ -53,6 +58,14 @@ window.MockData = (function () {
 
   /* 任务曲线：按任务完成更新，每个任务按 1 s 采样，采样点数与节拍一致 */
   const CURVE_SAMPLES = (BC.curve && BC.curve.samples) || CFG.cycleSec || 160;
+
+  /* 单任务判定结果（FR-3.13 五态：待测试 / 测试中 / 合格 / 不合格 / 待复检）
+     演示口径：绝大多数合格，每 31 件出现 1 件不合格、每 23 件出现 1 件待复检 */
+  function verdictOf(unitIndex) {
+    if (unitIndex % 23 === 0) return '待复检';
+    if (unitIndex % 31 === 0) return '不合格';
+    return '合格';
+  }
 
   /* 生成"上一次任务"的完整曲线（仅用于演示：模拟上位机已整合完成的历史任务数据） */
   function synthCurve(unitIndex) {
@@ -73,20 +86,21 @@ window.MockData = (function () {
     const v = values.slice();
     return {
       taskNo: '', unitIndex, values: v,
-      durationSec: v.length, sampleCount: v.length,
+      /* 采样间隔 = 节拍 / 采样点数（默认 1 s/点）；时长由采样数与间隔推导，避免与 sampleCount 混同 */
+      durationSec: v.length * (CFG.cycleSec / CURVE_SAMPLES), sampleCount: v.length,
       lo: Math.min.apply(null, v), hi: Math.max.apply(null, v)
     };
   }
 
   /* 故障代码字典来自配置（Q-12）；未配置时用内置示例 */
   const ALARM_POOL = (BC.faultDict && BC.faultDict.length)
-    ? BC.faultDict.map(f => ({ code: f.code, type: f.type, desc: f.desc, level: f.level }))
+    ? BC.faultDict.map(f => ({ code: f.code, type: f.type, desc: f.desc, level: f.level, action: f.action }))
     : [
-        { code: 'E-2071', type: '相机通信中断', desc: '高速相机 GigE 链路瞬时丢包，已自动重连' },
-        { code: 'E-3115', type: '深度测量异常', desc: '航行器深度数据跳变超过 0.5 m，已复核并重新标定' },
-        { code: 'E-1042', type: '水池液位偏低', desc: '液位低于测试下限，请补充水量' },
-        { code: 'W-2210', type: '快门参数超限', desc: '快门设定值超出工艺窗口上限' },
-        { code: 'E-4520', type: '上位机数据传输异常', desc: '实时测量数据上传中断超过 5 秒' }
+        { code: 'E-2071', type: '相机通信中断', desc: '高速相机 GigE 链路瞬时丢包，已自动重连', level: '严重', action: '复核图像完整性' },
+        { code: 'E-3115', type: '深度测量异常', desc: '航行器深度数据跳变超过 0.5 m，已复核并重新标定', level: '严重', action: '重新标定后复检' },
+        { code: 'E-1042', type: '水池液位偏低', desc: '液位低于测试下限，请补充水量', level: '一般', action: '补充水量' },
+        { code: 'W-2210', type: '快门参数超限', desc: '快门设定值超出工艺窗口上限', level: '预警', action: '核对工艺参数' },
+        { code: 'E-4520', type: '上位机数据传输异常', desc: '实时测量数据上传中断超过 5 秒', level: '严重', action: '检查链路与上位机状态' }
       ];
 
   const MAINT_RECORDS = [
@@ -129,8 +143,8 @@ window.MockData = (function () {
     cfg: CFG,
     device: { name: CFG.deviceName, code: CFG.equipCode, link: 'online', mes: 'online' },
     clock: { date: '', week: '', time: '' },
-    shift: {},
-    status: { mode: '测试运行', stage: '准备', online: '在线正常', depth: 12.68, speed: 5.00 },
+    shift: { list: SHIFTS },
+    status: { mode: '测试运行', stage: '准备', online: '在线正常' },   // 深度/速度只由 task.real 维护，避免双份
     task: {
       procOrderNo: 'MES20260917001', productCode: 'CP-2026-A17', productName: '水下振动测试件',
       batchNo: 'PC20260917-03', drawingNo: 'SJ-4471-02', orderNo: 'DD20260916-118',
@@ -138,16 +152,19 @@ window.MockData = (function () {
       std:  { depth: 12.50, gain: DEVICE_NOMINAL.gain, fps: DEVICE_NOMINAL.fps, shutter: DEVICE_NOMINAL.shutter },
       /* 实时实测：航行器深度与速度为实测主体；相机参数为设备参数 */
       real: { depth: 12.68, speed: 5.00, vx: 4.90, vy: 0.10,
-              fps: DEVICE_NOMINAL.fps, gain: DEVICE_NOMINAL.gain, shutter: DEVICE_NOMINAL.shutter },
+              fps: DEVICE_NOMINAL.fps, gain: DEVICE_NOMINAL.gain, shutter: DEVICE_NOMINAL.shutter,
+              cameraDepth: 12.00 },   // 相机自身水下深度（FR-3.16 / IF-D.1，与航行器深度 depth 严格区分）
       fpsRaw: DEVICE_NOMINAL.fps, gainRaw: DEVICE_NOMINAL.gain, shutterRaw: DEVICE_NOMINAL.shutter,
       unitIndex: 1, progress: 0, result: '测试中', lastResult: '合格', planQty: CFG.planQty
     },
     stats: {},
-    alarm: { active: null, ledger: [] },
+    alarm: { active: null, queue: [], ledger: [] },
     warnings: [],
-    maint: { last: CFG.maintLast, next: '', cycle: CFG.maintCycleDays, daysLeft: 0, todayRun: 0, monthRun: 0, yearRun: 0, records: MAINT_RECORDS },
+    maint: { last: CFG.maintLast, next: '', cycle: CFG.maintCycleDays, warnDays: CFG.maintWarnDays,
+             daysLeft: 0, todayRun: 0, monthRun: 0, yearRun: 0, records: MAINT_RECORDS },
     notices: { notices: NOTICES, tips: TIPS, todo: [] },
     selfCheck: [],
+    opLog: [],                       // 操作日志（FR-8.7 / NFR-15）
     /* 曲线：curve 为"上一次已完成任务"的完整曲线；curveTick 为当前任务的采样缓冲 */
     curve: { depth: null, speed: null },
     curveTick: { unitIndex: -1, depth: [], speed: [] },
@@ -165,7 +182,7 @@ window.MockData = (function () {
     const recheck = Math.round(unqualified * 0.6);
     const dispatched = Math.min(P, done + testing + recheck + CFG.queueDepth);
     const pending = Math.max(0, dispatched - done - testing - recheck);
-    const started = done + testing + recheck;
+    const started = Math.min(P, done + testing + recheck);   // 开工数封顶于计划数，避免"未开工"为负（FR-4.3）
     const runSec = elapsed * CFG.runRate;
     const idleSec = elapsed - runSec;
     const avgTest = done > 0 ? runSec / done : 0;
@@ -181,27 +198,36 @@ window.MockData = (function () {
     };
   }
 
-  /* ---------------- 累计运行时长 ---------------- */
-  function accumulateRun(now, todayRun) {
-    const dayOfMonth = now.getDate();
-    const startOfYear = new Date(now.getFullYear(), 0, 1);
-    const dayOfYear = Math.floor((now - startOfYear) / 86400000) + 1;
+  /* ---------------- 累计运行时长 ----------------
+     口径：当日 / 本月 / 年度 = "自该周期起点到此刻的时长 × 有效运行占比"。
+     这样跨零点、跨月、跨年自然归零（FR-6.4～6.6），且累计值随时间单调不减，
+     不会出现"交班后本月累计变小"（审查报告 P2-2）。 */
+  function accumulateRun(now, runRate) {
+    const secSince = start => Math.max(0, (now - start) / 1000) * runRate;
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const yearStart = new Date(now.getFullYear(), 0, 1);
     return {
-      today: todayRun,
-      month: (dayOfMonth - 1) * 6.2 * 3600 + todayRun,
-      year: (dayOfYear - 1) * 6.1 * 3600 + todayRun
+      today: secSince(dayStart),
+      month: secSince(monthStart),
+      year: secSince(yearStart)
     };
   }
 
-  /* ---------------- 自检项（含 MES 链路，C-29） ---------------- */
+  /* ---------------- 自检项（含 MES 链路，C-29） ----------------
+     队列长度与回执风格取自适配层实时状态，不再写死（审查报告 P2-4）。 */
   function buildSelfCheck() {
     const online = state.device.link === 'online';
     const mes = state.device.mes === 'online';
+    const api = (window.Api && typeof window.Api.getStatus === 'function') ? window.Api.getStatus() : null;
+    const pendingCount = api ? api.pendingCount : 0;
+    const style = api ? api.responseStyle : 'status';
+    const receiptText = style === 'code' ? 'code=200' : 'status=1';
     return [
       { name: '看板主机网络', state: '正常', lv: 'ok' },
       { name: 'PC 上位机连接', state: online ? '在线正常' : '离线断连', lv: online ? 'ok' : 'err' },
-      { name: 'MES 接口连通性', state: mes ? '正常（最近回执 code=200）' : '异常', lv: mes ? 'ok' : 'err' },
-      { name: 'MES 上报队列', state: '待补传 0 条', lv: 'ok' },
+      { name: 'MES 接口连通性', state: mes ? `正常（最近回执 ${receiptText}）` : '异常', lv: mes ? 'ok' : 'err' },
+      { name: 'MES 上报队列', state: `待补传 ${pendingCount} 条`, lv: pendingCount > 0 ? 'warn' : 'ok' },
       { name: '本地数据库', state: '正常（SQLite 12.4 MB）', lv: 'ok' },
       { name: '磁盘空间', state: '剩余 78.2 GB / 512 GB', lv: 'ok' },
       { name: 'NTP 时间同步', state: '已同步（偏差 32 ms）', lv: 'ok' }
@@ -216,17 +242,17 @@ window.MockData = (function () {
     const fpsDev = Math.abs(t.real.fps - t.std.fps);
     const fpsPct = t.std.fps > 0 ? (fpsDev / t.std.fps) * 100 : 0;
     out.push(fpsPct >= 0.5
-      ? { title: '参数阈值临近预警', detail: `实际帧率偏差 ${fpsPct.toFixed(2)}%（设定 ${t.std.fps} fps / 实际 ${t.real.fps} fps）`, lv: 'warn' }
-      : { title: '参数阈值临近预警', detail: `实际帧率偏差 ${fpsPct.toFixed(2)}%，处于允许范围`, lv: 'ok' });
-    /* 2) 维保到期 */
-    out.push(m.daysLeft <= 14
+      ? { title: '参数阈值临近预警', detail: `实时帧率偏差 ${fpsPct.toFixed(2)}%（设定 ${t.std.fps} fps / 实时 ${t.real.fps} fps）`, lv: 'warn' }
+      : { title: '参数阈值临近预警', detail: `实时帧率偏差 ${fpsPct.toFixed(2)}%，处于允许范围`, lv: 'ok' });
+    /* 2) 维保到期（阈值取配置 maintenance.warnDays，不在代码里写死） */
+    out.push(m.daysLeft <= CFG.maintWarnDays
       ? { title: '设备维保到期预警', detail: `距计划维保还有 ${m.daysLeft} 天（${m.next}）`, lv: 'warn' }
       : { title: '设备维保到期预警', detail: `距计划维保还有 ${m.daysLeft} 天`, lv: 'ok' });
-    /* 3) 耗材更换 */
-    const lamp = 780 + Math.floor(state.stats.done || 0);
-    out.push(lamp > 800
-      ? { title: '耗材更换预警', detail: `水下光源累计点亮 ${lamp} h，建议更换（阈值 800 h）`, lv: 'warn' }
-      : { title: '耗材更换预警', detail: `光源累计点亮 ${lamp} h，未达更换阈值`, lv: 'ok' });
+    /* 3) 耗材更换（阈值取配置 maintenance.consumables[0].threshold） */
+    const lamp = CFG.lampBaseline + Math.floor(state.stats.done || 0);
+    out.push(lamp > CFG.lampThreshold
+      ? { title: '耗材更换预警', detail: `水下光源累计点亮 ${lamp} h，建议更换（阈值 ${CFG.lampThreshold} h）`, lv: 'warn' }
+      : { title: '耗材更换预警', detail: `光源累计点亮 ${lamp} h，未达更换阈值（${CFG.lampThreshold} h）`, lv: 'ok' });
     /* 4) 工单超时 */
     const overdue = state.stats.pending > 80;
     out.push(overdue
@@ -254,6 +280,65 @@ window.MockData = (function () {
   let activeAlarmIndex = 0;
   let alarmStartedAt = null;
 
+  /* 并发报警队列（FR-5.6）：多条报警按"发生时间倒序"排队展示，新报警不覆盖旧报警。
+     - 队列中的每条都会继续保留，直到闭环（演示口径：发生 2 分钟后自动闭环，也可在界面手工闭环）
+     - state.alarm.active 恒为队首（当前展示的那条），其余在"并发报警队列"中列出
+     - 闭环的报警转入"当班异常台账"，因此队列为空时故障卡显示"当班无故障报警" */
+  const ALARM_QUEUE_MAX = 12;
+  const ALARM_LEDGER_MAX = 8;       // 当班异常台账保留条数（演示）
+  const ALARM_CLOSE_SEC = 120;      // 单条报警自动闭环时长（演示）；须小于 150 s 的轮换间隔，否则"无故障"空态永不可达
+  const ALARM_HANDLE_SEC = 60;      // 转为"处理中"的时长（演示）
+  let alarmSeq = 0;
+
+  /** 把一条报警写入当班异常台账（最新在前，最多 ALARM_LEDGER_MAX 条） */
+  function pushLedger(alarm) {
+    state.alarm.ledger.unshift({
+      time: alarm.time, code: alarm.code, desc: alarm.type || alarm.desc, state: '已闭环'
+    });
+    state.alarm.ledger = state.alarm.ledger.slice(0, ALARM_LEDGER_MAX);
+  }
+
+  function raiseAlarm(now, def) {
+    state.alarm.queue.unshift({
+      code: def.code, type: def.type, desc: def.desc, level: def.level || '一般', action: def.action || '',
+      time: new Date(now).toTimeString().slice(0, 8),
+      bornAt: now.getTime(), seq: ++alarmSeq, state: '未处理'
+    });
+    state.alarm.queue = state.alarm.queue.slice(0, ALARM_QUEUE_MAX);
+    syncAlarmQueue();
+  }
+
+  /* 推进队列中各条报警的闭环状态；自动闭环的条目转入当班台账（不覆盖、不丢失） */
+  function ageAlarmQueue(now) {
+    let closed = 0;
+    state.alarm.queue.forEach(q => {
+      const age = (now.getTime() - q.bornAt) / 1000;
+      q.state = age >= ALARM_CLOSE_SEC ? '已闭环' : (age >= ALARM_HANDLE_SEC ? '处理中' : '未处理');
+    });
+    state.alarm.queue = state.alarm.queue.filter(q => {
+      if (q.state !== '已闭环') return true;
+      pushLedger(q);
+      closed++;
+      return false;
+    });
+    syncAlarmQueue();
+    return closed;
+  }
+
+  /** 手工闭环当前展示的报警（界面按钮）：从队列移除并写入台账 */
+  function closeActiveAlarm() {
+    const a = state.alarm.queue.shift();
+    if (!a) return null;
+    a.state = '已闭环';
+    pushLedger(a);
+    syncAlarmQueue();
+    return a;
+  }
+
+  function syncAlarmQueue() {
+    state.alarm.active = state.alarm.queue[0] || null;
+  }
+
   function tick(now) {
     now = now || new Date();
 
@@ -270,6 +355,7 @@ window.MockData = (function () {
     const sh = shiftOf(now);
     const elapsed = clamp((now - sh.start) / 1000, 0, sh.total);
     state.shift = {
+      list: SHIFTS,                       // 供班次页按配置渲染（P3-1），每次 tick 一并带上
       name: sh.def.name,
       range: `${pad(sh.def.start)}:00 - ${pad(sh.def.end === 24 ? 0 : sh.def.end)}:00`,
       start: `${pad(sh.def.start)}:00`,
@@ -296,21 +382,20 @@ window.MockData = (function () {
     t.real.gain = round1(t.gainRaw);
     t.shutterRaw = clamp(t.shutterRaw + (Math.random() - 0.5) * 6, 488, 512);
     t.real.shutter = Math.round(t.shutterRaw);
-
-    state.status.depth = t.real.depth;
-    state.status.speed = t.real.speed;
+    t.real.cameraDepth = clamp(round2(t.real.cameraDepth + (Math.random() - 0.5) * 0.04), 11.80, 12.20);
 
     /* ---- 当前工单进度、运行阶段与单任务结果 ----
        运行阶段按需求 FR-2.5（C-44）简化为 4 阶段：准备 → 运行 → 判定 → 完成
-       切换阈值与单任务节拍 CFG.cycleSec 对齐：准备 5% / 运行 85% / 判定 97% / 完成收尾 */
+       切换阈值与单任务节拍 CFG.cycleSec 对齐：准备 5% / 运行 85% / 判定 95% / 完成收尾 5% */
     const unitSec = elapsed % CFG.cycleSec;
     t.progress = unitSec / CFG.cycleSec;
     t.unitIndex = Math.floor(elapsed / CFG.cycleSec) + 1;
+    /* 判定收尾窗口取节拍末 5%（≥8 s），保证"完成"阶段的判定结果在 1 s 刷新下可见 */
     if (unitSec < 8)            { t.result = '待测试'; state.status.stage = '准备'; }
     else if (t.progress < 0.85) { t.result = '测试中'; state.status.stage = '运行'; }
-    else if (t.progress < 0.97) { t.result = '测试中'; state.status.stage = '判定'; }
-    else                        { t.result = '测试中'; state.status.stage = '完成'; }
-    t.lastResult = t.unitIndex % 23 === 0 ? '待复检' : (t.unitIndex % 31 === 0 ? '不合格' : '合格');
+    else if (t.progress < 0.95) { t.result = '测试中'; state.status.stage = '判定'; }
+    else                        { t.result = verdictOf(t.unitIndex); state.status.stage = '完成'; }
+    t.lastResult = verdictOf(Math.max(1, t.unitIndex - 1));
 
     /* ---- 运行模式 ---- */
     state.status.mode = unitSec < 3 ? '待机' : '测试运行';
@@ -341,36 +426,36 @@ window.MockData = (function () {
     const nextD = new Date(lastD.getTime() + CFG.maintCycleDays * 86400000);
     state.maint.next = `${nextD.getFullYear()}-${pad(nextD.getMonth() + 1)}-${pad(nextD.getDate())}`;
     state.maint.daysLeft = Math.max(0, Math.ceil((nextD - now) / 86400000));
-    const acc = accumulateRun(now, state.stats.runSec);
+    const acc = accumulateRun(now, CFG.runRate);
     state.maint.todayRun = acc.today;
     state.maint.monthRun = acc.month;
     state.maint.yearRun = acc.year;
 
-    /* ---- 异常与预警 ---- */
-    if (alarmStartedAt === null) alarmStartedAt = now.getTime();
+    /* ---- 异常与预警（FR-5：实时报警 + 并发排队 + 当班台账） ---- */
+    if (state.alarm.ledger.length === 0) state.alarm.ledger = buildLedger(now);   // 台账首次填充演示记录
+    if (alarmStartedAt === null) {
+      alarmStartedAt = now.getTime();
+      raiseAlarm(now, ALARM_POOL[activeAlarmIndex]);
+    }
     const alarmAge = (now.getTime() - alarmStartedAt) / 1000;
     if (alarmAge > 150) {
       activeAlarmIndex = (activeAlarmIndex + 1) % ALARM_POOL.length;
       alarmStartedAt = now.getTime();
+      raiseAlarm(now, ALARM_POOL[activeAlarmIndex]);
+      ageAlarmQueue(now);        // 新报警入队时统一老化一次，闭环条目转入台账
     }
-    const a = ALARM_POOL[activeAlarmIndex];
-    state.alarm.active = {
-      code: a.code, type: a.type, desc: a.desc,
-      time: new Date(alarmStartedAt).toTimeString().slice(0, 8),
-      state: alarmAge > 90 ? '处理中' : '未处理'
-    };
-    state.alarm.ledger = buildLedger(now);
+    ageAlarmQueue(now);
     state.warnings = buildWarnings();
 
     /* ---- 待办 ---- */
-    const lampHours = 780 + state.stats.done;
+    const lampHours = CFG.lampBaseline + state.stats.done;
     const warnCount = state.warnings.filter(w => w.lv === 'warn' || w.lv === 'err').length;
     state.notices.todo = [
       { name: '待复检任务', value: state.stats.recheck, unit: '件', lv: 'warn' },
-      { name: '待维保作业', value: state.maint.daysLeft <= 14 ? 1 : 0, unit: '项', lv: 'warn' },
-      { name: '未闭环异常', value: state.alarm.active.state === '已闭环' ? 0 : 1, unit: '条', lv: 'err' },
+      { name: '待维保作业', value: state.maint.daysLeft <= CFG.maintWarnDays ? 1 : 0, unit: '项', lv: 'warn' },
+      { name: '未闭环异常', value: state.alarm.ledger.filter(r => r.state !== '已闭环').length, unit: '条', lv: 'err' },
       { name: '设备侧待测队列', value: state.stats.pending, unit: '件', lv: 'info' },
-      { name: '耗材临近更换', value: lampHours > 800 ? 1 : 0, unit: '项', lv: 'warn' },
+      { name: '耗材临近更换', value: lampHours > CFG.lampThreshold ? 1 : 0, unit: '项', lv: 'warn' },
       { name: '参数/工单预警', value: warnCount, unit: '项', lv: 'info' }
     ];
 
@@ -384,11 +469,25 @@ window.MockData = (function () {
     return state.device.link;
   }
 
-  /* 演示用：立即触发一次新报警 */
-  function injectAlarm() {
+  /* 演示用：立即触发一次新报警（FR-5.1）；新报警进入队首，旧报警保留在队列中 */
+  function injectAlarm(now) {
     activeAlarmIndex = (activeAlarmIndex + 1) % ALARM_POOL.length;
-    alarmStartedAt = Date.now();
+    alarmStartedAt = (now ? now.getTime() : Date.now());
+    raiseAlarm(new Date(alarmStartedAt), ALARM_POOL[activeAlarmIndex]);
     return ALARM_POOL[activeAlarmIndex];
+  }
+  /** 追加一条操作日志（FR-8.7 / NFR-15：解锁后的写操作全程留痕）
+      内存中保留最近 20 条（正式实现按 DR-18 落库）；展示时按时间倒序取用 */
+  function pushLog(action, detail, operator) {
+    state.opLog.push({
+      time: state.clock.time || '--:--:--',
+      date: state.clock.date || '',
+      action,
+      detail: detail || '',
+      operator: operator || CFG.operator
+    });
+    if (state.opLog.length > 20) state.opLog.shift();
+    return state.opLog[state.opLog.length - 1];
   }
 
   function setUnlocked(v) { state.unlocked = v; return state.unlocked; }
@@ -408,5 +507,5 @@ window.MockData = (function () {
     state.curveTick.unitIndex = -1;   // 由首次 tick 按当前任务初始化
   })();
 
-  return { state, tick, toggleLink, injectAlarm, setUnlocked, clearCurve, CFG, DEVICE_NOMINAL };
+  return { state, tick, toggleLink, injectAlarm, setUnlocked, pushLog, closeActiveAlarm, clearCurve, CFG, DEVICE_NOMINAL };
 })();
