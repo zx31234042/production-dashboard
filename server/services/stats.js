@@ -40,7 +40,9 @@ function pct(a, b) {
  *   @param {Array}    input.measures  当班采集时刻串（用于推导有效运行/待机时长；可为空）
  *   @param {object}   input.cycle     { sec } 单任务节拍（生产时长推导用），默认 160
  *   @param {object}   input.accum     累计运行上次落库值（DR-17），形如 { daySec, monthSec, yearSec, at }
- *   @param {number}   input.addRunSec 本周期新增运行秒数；缺省取当班已运行秒数
+ *   @param {number}   [input.addRunSec] **本周期增量**秒数（上次核算之后新增的运行时长）。
+ *       缺省即 **0**（不是"当班已运行时长"）—— 见下方 P2-4 说明；调用方必须显式给出增量。
+ *       边界：必须是 0 ≤ addRunSec ≤ runSec 的有限数，越界即抛错（防重复相加导致累计虚高）。
  *   @param {number}   input.planQty   当班计划数；缺省按当班任务条数
  *   @param {string|Date} input.now    当前时刻
  * @returns {object} 15 项指标 + DR-17 累计运行 + 班次信息
@@ -80,7 +82,17 @@ function computeShiftStats(input) {
   const avgTestSec = done > 0 ? Math.round(runSec / done) : 0; // FR-4.13 单台平均测试时长
 
   /* ---------------- 四、累计运行（DR-17：单调不减、跨班次不清零） ---------------- */
-  const addRunSec = input.addRunSec === undefined ? runSec : Number(input.addRunSec) || 0;
+  /* DR-17 累计运行：`addRunSec` 是"**自上次核算以来**的新增运行时长"（增量），
+     而 rollAccum 在同一天是 `daySec + add` —— 两者必须同为增量口径。
+     旧实现缺省取 `runSec`（班次**累计**已运行时长），调用方一旦把上次落库的 accum 传回来，
+     同日就会把"累计值当增量"重复相加，累计运行虚高（复审 P2-4 复现）。
+     故缺省改为 0，并对越界值直接报错而不是悄悄算错。 */
+  const rawAdd = input.addRunSec;
+  const addRunSec = rawAdd === undefined ? 0 : Number(rawAdd);
+  if (!Number.isFinite(addRunSec) || addRunSec < 0 || addRunSec > runSec) {
+    throw new RangeError(
+      `computeShiftStats: addRunSec 必须是 0～${runSec}（本周期增量）的有限数，收到 ${JSON.stringify(rawAdd)}`);
+  }
   const accum = accumulateRunTime(input.accum, addRunSec, now);
 
   return {

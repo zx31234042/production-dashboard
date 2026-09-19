@@ -140,4 +140,20 @@ t.check('PROJECT_RULES 已写明"不要用 PowerShell 文本命令改源码文�
   /PowerShell.{0,30}改.{0,20}(源码|文件)|不要用 PowerShell 文本命令/.test(rules),
   '该约定是 2026-09-19 文件被写坏后的补救措施');
 
+/* ---------------- 六、全部 .js 都能被解析 ----------------
+   立案原因（2026-09-19）：在 JSDoc 块注释里嵌了一个 `/* … *\/` 式注释，其中的 `*\/`
+   提前闭合了外层注释，整个模块变成语法错误。当时**只有恰好 require 到它的用例才会炸**，
+   其它用例照样"看起来正常"。这里对每个 .js 跑一次 `node --check`，
+   让这类自伤立刻暴露，而不依赖"谁碰巧引用了它"。 */
+t.section('六、全部 .js 语法可解析（防"注释把模块写坏"这类自伤）');
+const jsFiles = all.filter(f => f.endsWith('.js'));
+const brokenJs = [];
+for (const f of jsFiles) {
+  const r = require('node:child_process').spawnSync(process.execPath, ['--check', f],
+    { stdio: ['ignore', 'ignore', 'ignore'] });
+  if (r.status !== 0) brokenJs.push(path.relative(ROOT, f));
+}
+t.check(`全部 ${jsFiles.length} 个 .js 文件可被 node 解析`,
+  brokenJs.length === 0, brokenJs.slice(0, 5).join('、'));
+
 t.finish();

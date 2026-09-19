@@ -158,6 +158,30 @@ function main() {
   t.check('规范 9.5 的 package.json 口径与 ADR-0002 零依赖一致（前后端都不建）',
     /前端任何情况下都不建/.test(rules) && rules.includes('目标零 npm 依赖'));
 
+  /* ADR-0002 D11 的断言（P2-8）：承诺过"业务代码不得出现平台字样"却一直没有断言落地。
+     这里静态扫描 server\ 与 platform\ 的 *.js，禁止盘符路径、Windows 可执行名与
+     Windows 服务命令 —— 平台差异必须收敛在 platform\ 薄适配层里。 */
+  const walkJs = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap(e => {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) return walkJs(full);
+    return e.isFile() && e.name.endsWith('.js') ? [full] : [];
+  });
+  const platformHits = [];
+  for (const dir of ['server', 'platform']) {
+    for (const f of walkJs(path.join(ROOT, dir))) {
+      const src = fs.readFileSync(f, 'utf8');
+      const rel = path.relative(ROOT, f);
+      src.split(/\r?\n/).forEach((line, i) => {
+        /* 允许 http:// 这类协议前缀；只拦"盘符 + 反斜杠"的本地路径与平台专有命令/程序名 */
+        const bad = /(?<![:/])[A-Za-z]:\\/.test(line) || /\bmsedge\b/i.test(line) ||
+          /\bsc(\.exe)?\s+create\b/i.test(line) || /\bschtasks\b/i.test(line) || /\bnssm\b/i.test(line);
+        if (bad) platformHits.push(`${rel}:${i + 1}`);
+      });
+    }
+  }
+  t.check('ADR-0002 D11：server\\ 与 platform\\ 的代码里没有盘符路径与平台专有命令（断言落地）',
+    platformHits.length === 0, platformHits.slice(0, 5).join('、'));
+
   /* ---------------- 七、字段语义（易错项） ---------------- */
   t.section('七、字段语义（易错项）');
   t.check('架构文档写明 depth＝航行器深度、cameraDepth＝相机自身深度',

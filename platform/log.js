@@ -30,6 +30,15 @@ function createLogger(options) {
   const keepDays = options.keepDays === undefined ? 30 : options.keepDays;
   const echo = options.console !== false;      // 默认同时打到控制台
 
+  /* P2-7：keepDays 过去**只被赋值、从不生效**（prune() 存在但无人调用），
+     NFR-21"保留 ≥30 天"的后半段等于没落地。这里做两件事：
+       ①入参校验：0/负数/NaN/小数一律拒绝（否则 `mtime < now - 0` 会把**当天日志也删掉**）；
+       ②**创建日志器时就剪一次** —— 服务每次启动都执行，且是 O(1) 次目录扫描，
+         不放在每次 write 上，避免高频落库路径反复 statSync。 */
+  if (!Number.isInteger(keepDays) || keepDays < 1) {
+    throw new TypeError(`createLogger: keepDays 必须是 ≥ 1 的整数（收到 ${JSON.stringify(options.keepDays)}）`);
+  }
+
   const now = () => (clock ? clock.now() : new Date());
   let cachedDate = null;
   let cachedSeq = 0;
@@ -88,9 +97,16 @@ function createLogger(options) {
         if (st.mtimeMs < cutoff) { fs.rmSync(full, { force: true }); removed.push(n); }
         else kept++;
       }
-      return { removed, kept };
+      return { removed, kept, cutoff: new Date(cutoff), keepDays };
     }
   };
+
+  /* 启动即剪一次（NFR-21 落地），并把结果留痕便于运维核对 */
+  const startupPrune = logger.prune();
+  logger.startupPrune = startupPrune;
+  if (startupPrune.removed.length && echo) {
+    console.log(`[日志] 启动清理：按 keepDays=${keepDays} 删除 ${startupPrune.removed.length} 个过期日志`);
+  }
   return logger;
 }
 

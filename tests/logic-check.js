@@ -81,6 +81,43 @@ t.section('二、班次边界自动切换与跨零点归属（FR-4.16）');
   t.check('班次刚开始时 elapsed 为 0，结束时接近总时长',
     shifts.at('2026-09-19T08:00:00').elapsedSec === 0 &&
     shifts.at('2026-09-19T15:59:59').elapsedSec >= 8 * 3600 - 2, '');
+
+  /* P2-3：跨零点规则（end < start）与非法配置 —— 复审实测旧实现里 22→6 这种规则
+     **永远匹配不到**（`hour >= 22 && hour < 6` 恒假），会悄悄落到兜底分支，
+     看板上于是显示错的班次名与时长。这里把"必须匹配"和"非法配置必须拒绝"都钉住。 */
+  const night = createShiftRules([{ name: '夜班', start: 22, end: 6 }]);
+  t.check('跨零点规则 22→6：22:30 与 05:30 都归属该班次（旧实现恒不匹配）',
+    night.at('2026-09-19T22:30:00').name === '夜班' && night.at('2026-09-20T05:30:00').name === '夜班',
+    `22:30→${night.at('2026-09-19T22:30:00').name}，05:30→${night.at('2026-09-20T05:30:00').name}`);
+  t.check('跨零点规则 22→6：总时长 8 小时，且 05:30 的班次归属前一天（开始那天）',
+    night.at('2026-09-19T22:30:00').totalSec === 8 * 3600 &&
+    night.at('2026-09-20T05:30:00').date === '2026-09-19' &&
+    night.at('2026-09-20T05:30:00').startAt === '2026-09-19 22:00:00',
+    `${night.at('2026-09-20T05:30:00').date} 起于 ${night.at('2026-09-20T05:30:00').startAt}`);
+  t.check('跨零点规则的 elapsed/remaining 自洽，且 22:00 起算、05:59:59 接近满班',
+    (() => {
+      const x = night.at('2026-09-20T03:00:00');
+      const s = night.at('2026-09-19T22:00:00');
+      const e = night.at('2026-09-20T05:59:59');
+      return x.elapsedSec + x.remainingSec === x.totalSec && x.elapsedSec === 5 * 3600 &&
+        s.elapsedSec === 0 && e.elapsedSec >= 8 * 3600 - 2;
+    })(), '03:00 已过 5 小时');
+  const badCfgs = [
+    [{ name: 'a', start: 8, end: 8 }],
+    [{ name: 'a', start: -1, end: 8 }],
+    [{ name: 'a', start: 8, end: 25 }],
+    [{ name: 'a', start: 24, end: 8 }],
+    [{ name: 'a', start: 8.5, end: 16 }],
+    [{ name: 'a', start: 8, end: 16 }, { name: 'b', start: 20, end: 4.5 }]
+  ];
+  let badRejected = 0;
+  for (const cfgBad of badCfgs) {
+    try { createShiftRules(cfgBad); } catch { badRejected++; }
+  }
+  t.check('非法班次配置一律拒绝（零长度/越界/非整点），不再静默走兜底',
+    badRejected === badCfgs.length, `${badRejected}/${badCfgs.length} 被拒绝`);
+  t.check('空班次列表仍报错（既有行为不回退）',
+    (() => { try { createShiftRules([]); return false; } catch { return true; } })());
 }
 
 /* ---------------- 三、15 项指标（FR-4.1～4.15） ---------------- */
@@ -118,6 +155,32 @@ t.section('三、15 项当班指标（FR-4.1～4.15）');
     ['planQty', 'startedQty', 'notStartedQty', 'doneQty', 'runningQty', 'waitingQty',
       'passQty', 'failQty', 'retestQty', 'firstPassRate', 'runSec', 'idleSec',
       'avgTestSec', 'capacityRate', 'oee'].every(k => k in r), '');
+
+  /* P2-4：`addRunSec` 必须是"本周期增量" —— 缺省即 0，绝不再默认取"班次已运行时长"。
+     旧实现在把上次落库的 accum 传回来时会把累计值当增量重复相加（复审已复现）。 */
+  const accumBase = { daySec: 3600, monthSec: 7200, yearSec: 10800, at: clock.now() };
+  const noAdd = stats.computeShiftStats({ shift, tasks: list, planQty: 16, now: clock.now(), accum: accumBase });
+  t.check('P2-4：不传 addRunSec 时按增量 0 累加（累计不被重复相加）',
+    noAdd.accumulate.daySec === 3600 && noAdd.accumulate.monthSec === 7200,
+    `daySec=${noAdd.accumulate.daySec}（旧实现会变成 3600+${r.runSec}）`);
+  t.check('P2-4：显式给增量时按增量累加（幂等口径）',
+    (() => {
+      const withAdd = stats.computeShiftStats({ shift, tasks: list, planQty: 16, now: clock.now(), accum: accumBase, addRunSec: 120 });
+      const again = stats.computeShiftStats({ shift, tasks: list, planQty: 16, now: clock.now(), accum: withAdd.accumulate, addRunSec: 0 });
+      return withAdd.accumulate.daySec === 3720 && withAdd.accumulate.monthSec === 7320 &&
+        withAdd.accumulate.yearSec === 10920 &&
+        again.accumulate.daySec === 3720 && again.accumulate.monthSec === 7320 &&
+        again.accumulate.yearSec === 10920;
+    })(), '第二次传回上次结果且增量 0 → 累计原样保留（不重复相加）');
+  t.check('P2-4：addRunSec 越界（负数/超过本班运行时长/NaN/Infinity）一律抛错',
+    (() => {
+      let n = 0;
+      for (const bad of [-1, r.runSec + 1, NaN, Infinity]) {
+        try { stats.computeShiftStats({ shift, tasks: list, planQty: 16, now: clock.now(), accum: accumBase, addRunSec: bad }); }
+        catch { n++; }
+      }
+      return n === 4;
+    })(), '4/4 抛错');
 }
 
 /* ---------------- 四、边界与除零（此前踩过的坑） ---------------- */

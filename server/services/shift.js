@@ -22,6 +22,23 @@ function createShiftRules(list) {
   }));
   if (!rules.length) throw new Error('shift: 班次列表为空，请检查 board.config.shift.list');
 
+  /* 配置校验（P2-3）：非法配置过去是"静默走兜底分支、算出看似合理的班次"，
+     比直接报错危险得多 —— 看板上会显示错的班次名与时长。故此处一律拒绝。 */
+  for (const r of rules) {
+    if (!Number.isInteger(r.start) || !Number.isInteger(r.end)) {
+      throw new TypeError(`shift: 班次「${r.name}」的 start/end 必须是整点（收到 ${r.start}/${r.end}）`);
+    }
+    if (r.start < 0 || r.start >= 24) {
+      throw new RangeError(`shift: 班次「${r.name}」的 start 必须在 0～23（收到 ${r.start}）；次日 0 点用 end=24 表达`);
+    }
+    if (r.end < 1 || r.end > 24) {
+      throw new RangeError(`shift: 班次「${r.name}」的 end 必须在 1～24（收到 ${r.end}）`);
+    }
+    if (r.start === r.end) {
+      throw new RangeError(`shift: 班次「${r.name}」的 start 与 end 相同（${r.start}）—— 零长度班次无意义`);
+    }
+  }
+
   /**
    * 求某时刻所属班次。
    * @returns {{name, start, end, date, startAt, endAt, elapsedSec, totalSec, remainingSec}}
@@ -34,14 +51,23 @@ function createShiftRules(list) {
     const d = toDate(when);
     const hour = d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
 
-    /* 找到包含该时刻的规则（半开区间 [start, end)）；`end=24` 表示次日 0 点 */
-    let rule = rules.find(r => hour >= r.start && hour < r.end);
+    /* 找到包含该时刻的规则（半开区间 [start, end)）；`end=24` 表示次日 0 点。
+       ⚠ P2-3 修复：跨零点规则（end < start，如 22→6）**过去永远匹配不到** ——
+       `hour >= 22 && hour < 6` 恒为假，于是悄悄落到下面的兜底分支。
+       跨零点时应为 `hour >= start || hour < end`（22:00-23:59 与 00:00-05:59 两段）。 */
+    const inRule = (r, h) => (r.end > r.start ? (h >= r.start && h < r.end) : (h >= r.start || h < r.end));
+    let rule = rules.find(r => inRule(r, hour));
     let startDayOffset = 0;
     if (!rule) {
       /* 配置存在缺口时的兜底：取"下一个会开始的班次"，并把开始日回退一天，
          保证 elapsed/total 仍算得出来（正常配置下不会走到这里） */
       const sorted = [...rules].sort((a, b) => a.start - b.start);
       rule = sorted.find(r => r.start > hour) || sorted[0];
+      startDayOffset = -1;
+    } else if (rule.end < rule.start && hour < rule.end) {
+      /* 跨零点规则且当前处于**次日凌晨**那一段（如 22→6 的 03:00）：
+         班次开始于**前一天** 22:00，归属日期随之回退一天（FR-4.16 的实质）。
+         漏这一步会把 05:30 算成"当天 22:00 才开始"，elapsed 变成负数或荒唐值。 */
       startDayOffset = -1;
     }
 

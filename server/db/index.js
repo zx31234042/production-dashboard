@@ -7,8 +7,9 @@
    依赖：node:path、node:fs 与内置 node:sqlite。**不依赖任何第三方包**。
    用法：
      const { openDb, initSchema, flushWal, verifyIntegrity } = require('./db');
-     const { db, path: dbPath } = openDb('D:\\data\\board.db');
-     initSchema(db);
+     // 路径由 platform/paths.js 给（业务代码不得出现盘符或平台字样，ADR-0002 D11）
+     const handle = openDb(require('../../platform/paths').paths.dbFile);
+     initSchema(handle.db);
    ========================================================================== */
 'use strict';
 
@@ -52,12 +53,18 @@ function openDb(dbPath, options = {}) {
   fs.mkdirSync(dir, { recursive: true });
 
   const db = new DatabaseSync(dbPath);
-  const journal = db.prepare(`PRAGMA journal_mode = ${journalMode}`).get();
-  if (foreignKeys) db.prepare('PRAGMA foreign_keys = ON').get();
-  /* 多进程/多连接下避免"database is locked"直接报错（服务与备份任务并存时有用） */
-  if (busyTimeoutMs > 0) db.prepare(`PRAGMA busy_timeout = ${busyTimeoutMs}`).get();
-
-  return { db, path: path.resolve(dbPath), journalMode: journal && journal.journal_mode };
+  /* P2-6：PRAGMA 段若抛错（参数非法、文件只读等），必须**先关连接再抛**。
+     否则 Windows 上文件句柄泄漏 → 文件被锁、临时目录删不掉（复审实测 rmSync 报 EPERM）。 */
+  try {
+    const journal = db.prepare(`PRAGMA journal_mode = ${journalMode}`).get();
+    if (foreignKeys) db.prepare('PRAGMA foreign_keys = ON').get();
+    /* 多进程/多连接下避免"database is locked"直接报错（服务与备份任务并存时有用） */
+    if (busyTimeoutMs > 0) db.prepare(`PRAGMA busy_timeout = ${busyTimeoutMs}`).get();
+    return { db, path: path.resolve(dbPath), journalMode: journal && journal.journal_mode };
+  } catch (err) {
+    try { db.close(); } catch { /* 关闭失败不掩盖原始错误 */ }
+    throw err;
+  }
 }
 
 /** 建表（幂等：schema.sql 全部 IF NOT EXISTS），并写入结构版本 */

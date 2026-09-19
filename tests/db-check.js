@@ -131,6 +131,56 @@ async function main() {
   t.check('批量重复写入全部被去重', dupBatch.inserted === 0 && dupBatch.skipped === 10,
     JSON.stringify(dupBatch));
 
+  /* P2-5：`listSecondSamples` 用 substr(collect_time,1,19) 做 1 s 去重，只在长度恰为 19 时成立。
+     故入库口必须拒绝带毫秒/带 T/带时区等脏格式（否则同一秒被切成多组，曲线采样失真）。 */
+  const dirtyTimes = ['2026-09-19 12:00:00.500', '2026-09-19T12:00:00', '2026/09/19 12:00:00',
+    '2026-09-19 12:00', '', null, 20260919120000];
+  const dirtyBase = fixture.makeFrame({ at: '2026-09-19 13:00:00', i: 500 });
+  let timeRejected = 0;
+  const timeAccepted = [];
+  for (const bad of dirtyTimes) {
+    try {
+      measureRepo.insertFrame(handle.db, { ...dirtyBase, collectTime: bad }, NOW);
+      timeAccepted.push(String(bad));            // 没抛错 = 被收下了，属缺陷
+    } catch { timeRejected++; }
+  }
+  t.check('P2-5：collectTime 非「yyyy-MM-dd HH:mm:ss」一律拒收（含带毫秒/带 T/带斜杠/空/null/数字）',
+    timeRejected === dirtyTimes.length,
+    timeAccepted.length ? `被错误收纳：${timeAccepted.join('、')}` : `${timeRejected}/${dirtyTimes.length} 被拒`);
+  t.check('P2-5：合规格式下 1 s 去重真的生效（同一秒多帧只留该秒最后一条）',
+    (() => {
+      /* 同一秒写 3 帧（不同毫秒信息无法表达，故用同秒不同内容模拟），再插下一秒 */
+      const base = { ...fixture.makeFrame({ at: '2026-09-19 14:00:00', i: 600 }) };
+      measureRepo.insertFrame(handle.db, base, NOW);
+      measureRepo.insertFrame(handle.db, { ...base, speed: 9.9 }, NOW);   // 去重键相同 → 被忽略
+      measureRepo.insertFrame(handle.db, { ...base, collectTime: '2026-09-19 14:00:01', i: 601 }, NOW);
+      const samples = measureRepo.listSecondSamples(handle.db, { procOrderNo: base.procOrderNo })
+        .filter(s => s.second >= '2026-09-19 14:00:00' && s.second <= '2026-09-19 14:00:01');
+      return samples.length === 2 && samples.every(s => String(s.second).length === 19);
+    })(), '两秒 → 两个采样点，且 second 恰为 19 字符');
+
+  /* P2-6：openDb 的 PRAGMA 段抛错时必须**先关连接再抛**。
+     否则文件句柄泄漏 → Windows 上文件被锁、临时目录删不掉（复审实测 rmSync 报 EPERM）。
+     复现方式：写一个**非 SQLite 的坏文件** —— `new DatabaseSync` 会成功，但第一条 PRAGMA
+     就抛 `file is not a database`，正好命中"连接已建立、PRAGMA 失败"这条路径。
+     （注意：非法 journalMode / 负 busy_timeout 都**不会**抛错，SQLite 静默回退，构不成前提。） */
+  {
+    const lockDir = fs.mkdtempSync(path.join(env.paths.tempRoot, 'openDb-lock-'));
+    const lockFile = path.join(lockDir, 'board.db');
+    fs.writeFileSync(lockFile, Buffer.from('这不是一个 SQLite 数据库文件，故意写坏以触发 PRAGMA 失败'.repeat(20)));
+    let threw = false;
+    let detail = '';
+    try {
+      db.openDb(lockFile);
+      detail = '未抛错（前提不成立）';
+    } catch (err) { threw = true; detail = err.message.slice(0, 50); }
+    let removable = false;
+    try { fs.rmSync(lockDir, { recursive: true, force: true }); removable = true; }
+    catch (err) { detail += ` | 删除失败:${err.code}（连接泄漏，文件被锁）`; }
+    t.check('P2-6：openDb 在 PRAGMA 失败时抛错且不泄漏连接（临时文件可删，不锁文件）',
+      threw && removable, detail);
+  }
+
   /* ---------------- 四、事务与回滚 ---------------- */
   t.section('四、事务与回滚');
   const before = measureRepo.countByTask(handle.db, anchor.procOrderNo);
@@ -231,6 +281,98 @@ async function main() {
   t.check('保留策略返回各类删除计数（可审计）',
     typeof ret.deleted.measure_rt === 'number' && 'task_curve' in ret.deleted,
     JSON.stringify(ret.deleted));
+
+  /* ---------------- 八之二、参数脏掉时的"静默删光"防线（P2-1 / P2-2） ----------------
+     复审实测：旧 applyRetention 传 days=null/NaN 会**清空六张表**；旧 pruneBackups 不传 keep
+     会**删光全部备份**且报 kept:NaN。这里逐条验证"非法入参必须抛错**且一行/一份都不删**"。 */
+  const countAll = () => {
+    const tables = ['measure_rt', 'task_curve', 'alarm', 'warning', 'upload_log', 'op_log'];
+    const out = {};
+    for (const tb of tables) out[tb] = handle.db.prepare(`SELECT COUNT(*) AS c FROM ${tb}`).get().c;
+    return out;
+  };
+  const snapBefore = countAll();
+  const snapTotal = Object.values(snapBefore).reduce((a, b) => a + b, 0);
+  t.check('前置：六张被裁剪表里确有数据可删（否则下面"没删"证明不了什么）',
+    snapTotal > 0, JSON.stringify(snapBefore));
+
+  const RET_NOW = new Date('2026-09-19T12:00:00');
+  const badDays = [null, NaN, 0, -1, 1.5, 'abc', Infinity];
+  let threwCount = 0;
+  for (const d of badDays) {
+    try { maintain.applyRetention(handle.db, { days: d, now: RET_NOW }); }
+    catch { threwCount++; }
+  }
+  t.check('applyRetention：days 为 null/NaN/0/负数/小数/字符串/Infinity 时一律抛错（P2-1）',
+    threwCount === badDays.length, `${threwCount}/${badDays.length} 抛错`);
+  t.check('applyRetention：非法入参**一行都没删**（不是"退化为全删"）',
+    JSON.stringify(countAll()) === JSON.stringify(snapBefore), `删除前后：${JSON.stringify(snapBefore)}`);
+  t.check('applyRetention：now 传字符串/非法 Date 一律抛错（避免悄悄按错误基准裁剪）',
+    (() => {
+      let n = 0;
+      for (const bad of ['2026-09-19 12:00:00', new Date('bad')]) {
+        try { maintain.applyRetention(handle.db, { days: 365, now: bad }); } catch { n++; }
+      }
+      return n === 2;
+    })(), '2/2 抛错（注意：now 为 0/空串属**假值**，会走"缺省即当前时间"的兜底，不抛错）');
+  t.check('applyRetention：cutoff 永远是合法日期文本（文本比较下不会误删全部）',
+    /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(
+      maintain.applyRetention(handle.db, { days: 365, now: RET_NOW, dryRun: true }).cutoff));
+  t.check('applyRetention：dryRun 只报数不删除',
+    (() => {
+      const snap = JSON.stringify(countAll());
+      const dr = maintain.applyRetention(handle.db, { days: 365, now: RET_NOW, dryRun: true });
+      return dr.dryRun === true && typeof dr.totalDeleted === 'number' &&
+        JSON.stringify(countAll()) === snap;
+    })());
+  t.check('applyRetention：删除量超过上限时中止（防"参数口径错了就把库清空"）',
+    (() => {
+      /* 前提要自己造：上面的 days=365 已把旧数据清掉，这里必须先插一条"够旧"的行，
+         否则 total=0，maxDelete=0 自然不该抛 —— 断言会假过（首版就踩了这个坑）。 */
+      const oldTime = '2020-01-01 00:00:00';
+      handle.db.prepare(
+        'INSERT INTO op_log (op_time, op_type, content, created_at) VALUES (?, ?, ?, ?)')
+        .run(oldTime, '自检', 'probe:maxDelete', oldTime);
+      const willDelete = maintain.applyRetention(handle.db, { days: 365, now: RET_NOW, dryRun: true }).totalDeleted;
+      if (willDelete < 1) return false;
+      try {
+        maintain.applyRetention(handle.db, { days: 365, now: RET_NOW, maxDelete: 0 });
+        return false;
+      } catch (err) {
+        return err instanceof RangeError;
+      }
+    })(), 'maxDelete=0 且确有可删行时必须抛 RangeError');
+
+  for (let i = 4; i <= 6; i++) {
+    await maintain.backupTo(handle.db, backupDir,
+      { name: maintain.backupName(new Date(2026, 8, 19, 11, 0, i)) });
+  }
+  const backupsBefore = maintain.listBackups(backupDir).length;
+  let pruneThrew = 0;
+  for (const bad of [null, NaN, -1, 1.5, 'abc']) {
+    try { maintain.pruneBackups(backupDir, bad); } catch { pruneThrew++; }
+  }
+  t.check('pruneBackups：keep 为 null/NaN/负数/小数/字符串时一律抛错（P2-2）',
+    pruneThrew === 5, `${pruneThrew}/5 抛错`);
+  t.check('pruneBackups：不传 keep 走缺省 30 份，**不抛错也不删光**（P2-2 的核心）',
+    (() => {
+      const r = maintain.pruneBackups(backupDir);
+      return r.kept === backupsBefore && r.removed.length === 0;
+    })(), `缺省保留 ${backupsBefore} 份`);
+  t.check('pruneBackups：非法入参**一份备份都没删**（不是"一份不剩"）',
+    maintain.listBackups(backupDir).length === backupsBefore,
+    `删除前后 ${backupsBefore} → ${maintain.listBackups(backupDir).length} 份`);
+  t.check('pruneBackups：缺省 keep 走 BACKUP_KEEP 而非删光',
+    (() => {
+      const r = maintain.pruneBackups(backupDir);
+      return r.kept === maintain.listBackups(backupDir).length && r.kept === backupsBefore &&
+        r.removed.length === 0;
+    })(), `缺省保留 ${maintain.listBackups(backupDir).length} 份`);
+  t.check('pruneBackups：kept 返回真实剩余数（不是 NaN/算式推断）',
+    (() => {
+      const r = maintain.pruneBackups(backupDir, 1);
+      return Number.isInteger(r.kept) && r.kept === 1 && r.removed.length === backupsBefore - 1;
+    })(), '');
 
   /* ---------------- 九、清理与残留 ---------------- */
   t.section('九、临时区与残留');

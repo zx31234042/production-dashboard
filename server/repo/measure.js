@@ -7,6 +7,22 @@
    ========================================================================== */
 'use strict';
 
+/* DR-16 时间格式：yyyy-MM-dd HH:mm:ss（恰好 19 字符）
+   P2-5：`listSecondSamples` 用 `substr(collect_time,1,19)` 做 1 s 去重，该做法**只在长度恰为 19 时成立**。
+   上游若给带毫秒（`...12:00:00.500`）或 ISO 带 `T`、带时区的时间，去重与"整秒取最后一条"就都会失真
+   （同一秒被切成多组、MAX(collect_time) 的字典序也可能不再是时间序）。
+   因此把校验放在**入库口**：格式不对直接报错，宁可拒收也不落脏数据。 */
+const COLLECT_TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+
+/** 校验采集时间格式；不合规即抛错并指出实际值（DR-16） */
+function assertCollectTime(value) {
+  if (typeof value !== 'string' || !COLLECT_TIME_RE.test(value)) {
+    throw new TypeError(
+      `measure: collectTime 必须是「yyyy-MM-dd HH:mm:ss」（DR-16，19 字符），收到 ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 /** 行对象 → 语句参数（字段名与 schema 列一一对应；depth 映射到 measure_depth 以免与相机深度混淆） */
 function toParams(row, nowIso) {
   return [
@@ -20,7 +36,7 @@ function toParams(row, nowIso) {
     row.shutter === undefined ? null : row.shutter,
     row.cameraDepth === undefined ? null : row.cameraDepth,
     row.testStatus === undefined ? null : row.testStatus,
-    row.collectTime,
+    assertCollectTime(row.collectTime),
     nowIso
   ];
 }

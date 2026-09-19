@@ -307,6 +307,48 @@ t.section('七、runner 结论规则（P1-2/P1-3：跑不了就不能算通过�
     /通过 \d+ 项，失败 \d+ 项，跳过 \d+ 项/.test(bad.out), '');
 }
 
+/* ---------------- 八、平台日志的保留策略 ---------------- */
+t.section('八、platform/log.js 的保留策略（P2-7：keepDays 过去只赋值不生效）');
+{
+  const { createLogger } = require('../platform/log');
+  const logDir = path.join(env.ensureDir(env.paths.tempRoot), `log-keep-${process.pid}-${Date.now()}`);
+  fs.mkdirSync(logDir, { recursive: true });
+  const fixedNow = new Date('2026-09-19T12:00:00');
+  const mkLog = (name, ageDays) => {
+    const full = path.join(logDir, name);
+    fs.writeFileSync(full, '[x] [INFO] 占位\n', 'utf8');
+    const t = new Date(fixedNow.getTime() - ageDays * 24 * 3600 * 1000);
+    fs.utimesSync(full, t, t);
+    return full;
+  };
+  mkLog('2026-01-01.log', 200);      // 远超保留期
+  mkLog('2026-09-18.log', 1);        // 1 天前，应保留
+  mkLog('2026-09-19.log', 0);        // 当天，必须保留
+
+  const lg = createLogger({ dir: logDir, clock: { now: () => new Date(fixedNow.getTime()) }, console: false, keepDays: 30 });
+  t.check('P2-7：创建日志器即按 keepDays 清理过期日志（NFR-21 落地，不再只赋值）',
+    lg.startupPrune.removed.includes('2026-01-01.log') && lg.startupPrune.removed.length === 1,
+    `删除 ${lg.startupPrune.removed.join('、') || '（无）'}`);
+  t.check('P2-7：保留期内的日志（1 天前与当天）不被误删',
+    fs.existsSync(path.join(logDir, '2026-09-18.log')) && fs.existsSync(path.join(logDir, '2026-09-19.log')) &&
+    lg.startupPrune.kept === 2, `保留 ${lg.startupPrune.kept} 个`);
+  t.check('P2-7：prune() 返回可审计信息（删除清单/保留数/截止时间/保留天数）',
+    Array.isArray(lg.prune().removed) && Number.isInteger(lg.prune().kept) &&
+    lg.prune().cutoff instanceof Date && lg.prune().keepDays === 30, '');
+  t.check('P2-7：keepDays 非法（0/负数/NaN/小数）一律抛错（否则会把当天日志也删掉）',
+    (() => {
+      let n = 0;
+      for (const bad of [0, -1, NaN, 1.5, 'abc']) {
+        try { createLogger({ dir: logDir, console: false, keepDays: bad }); } catch { n++; }
+      }
+      return n === 5;
+    })(), '5/5 抛错');
+  t.check('P2-7：缺省 keepDays 为 30（NFR-21 的"保留 ≥30 天"）',
+    createLogger({ dir: logDir, clock: { now: () => new Date(fixedNow.getTime()) }, console: false })
+      .prune().keepDays === 30, '');
+  try { fs.rmSync(logDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+}
+
 t.finish();
 }
 
