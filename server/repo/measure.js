@@ -49,6 +49,13 @@ const INSERT_SQL =
 
 /**
  * 插入一帧（按 DR-13 去重）。
+ *
+ * 注（P3 表外 code-17）：这里每次调用都 `prepare` 一次（批量路径 `insertFrames` 才 prepare 一次）。
+ * **已实测，不必优化**：单条路径每次 prepare 比复用语句只多 **2.74 µs**
+ * （2000 次实测：4.06 µs vs 1.32 µs/次），而 500 ms 收一帧的节拍下占比约 **0.0005%**；
+ * 引入语句缓存需处理连接生命周期（本模块是无状态函数、只拿传入的 db 句柄），复杂度不划算。
+ * 若日后改成"每帧都落库"或节拍明显变快，再回来复核这个结论。
+ *
  * @returns {{inserted:boolean}} 重复帧返回 inserted=false（**不算错误**，属正常去重）
  */
 function insertFrame(db, row, nowIso) {

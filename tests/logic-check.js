@@ -141,16 +141,26 @@ t.section('三、15 项当班指标（FR-4.1～4.15）');
   t.check('FR-4.8 不合格数', r.failQty === 2, String(r.failQty));
   t.check('FR-4.9 复检数', r.retestQty === 1, String(r.retestQty));
   t.check('FR-4.10 一次性合格率 = 合格 / 已完成 = 80%', r.firstPassRate === 80, `${r.firstPassRate}%`);
-  t.check('FR-4.11 有效运行时长有值且不超过班次进度',
-    r.runSec > 0 && r.runSec <= r.shift.elapsedSec, `${r.runSec}s / 班次 ${r.shift.elapsedSec}s`);
-  t.check('FR-4.12 待机时长 = 班次进度 − 有效运行', r.idleSec === r.shift.elapsedSec - r.runSec,
-    `${r.idleSec}s`);
+  /* ⚠ 2026-09-19 修（P3 表外 code-10）：**原断言是循环的** —— 它们拿被测实现算出的 r.runSec
+     去验同一实现的公式（如 `idleSec === elapsedSec − runSec`），只能证明"内部自洽"，
+     证明不了公式对不对。现改为用**独立已知量**（班次进度 + 用例构造的 tasks/measures）推出期望值。 */
+  const elapsed = shift.elapsedSec;                       // 独立已知：班次已进行时长
+  const runningCount = list.filter(x => x.result === '测试中').length;
+  const measures = [];                                    // 本用例未传 measures
+  const runSecExpected = runningCount > 0
+    ? (measures.length > 2 ? Math.min(elapsed, measures.length - 1) : elapsed)
+    : 0;
+  t.check('FR-4.11 有效运行时长＝在测时按班次进度计（无采集串时等于班次进度）',
+    r.runSec === runSecExpected && r.runSec === elapsed,
+    `实测 runSec=${r.runSec}s，按输入独立推出 ${runSecExpected}s（在测 ${runningCount} 条）`);
+  t.check('FR-4.12 待机时长 = 班次进度 − 有效运行',
+    r.idleSec === elapsed - runSecExpected, `实测 ${r.idleSec}s = ${elapsed} − ${runSecExpected}`);
   t.check('FR-4.13 单台平均测试时长 = 运行 / 完成数',
-    r.avgTestSec === Math.round(r.runSec / 10), `${r.avgTestSec}s`);
+    r.avgTestSec === Math.round(runSecExpected / 10), `实测 ${r.avgTestSec}s（期望 ${Math.round(runSecExpected / 10)}s）`);
   t.check('FR-4.14 产能达成率 = 完成 / 计划', r.capacityRate === Number((10 / 16 * 100).toFixed(1)),
     `${r.capacityRate}%`);
   t.check('FR-4.15 稼动率 = 有效运行 / 班次进度',
-    r.oee === Number((r.runSec / r.shift.elapsedSec * 100).toFixed(1)), `${r.oee}%`);
+    r.oee === Number((runSecExpected / elapsed * 100).toFixed(1)), `实测 ${r.oee}%（期望 ${Number((runSecExpected / elapsed * 100).toFixed(1))}%）`);
   t.check('指标齐全：一次核算同时给出 15 项（不缺项）',
     ['planQty', 'startedQty', 'notStartedQty', 'doneQty', 'runningQty', 'waitingQty',
       'passQty', 'failQty', 'retestQty', 'firstPassRate', 'runSec', 'idleSec',

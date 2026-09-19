@@ -16,8 +16,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-/** 当前表结构版本；**改动 schema.sql 时必须同步 +1**，供后续迁移判断 */
-const SCHEMA_VERSION = '1';
+/** 当前表结构版本；**改动 schema.sql 时必须同步 +1**，供后续迁移判断
+ *  2026-09-19 由 '1' 升到 '2'：`schema_meta` 新增 `schema_fingerprint` 键（P3 表外 code-12）。 */
+const SCHEMA_VERSION = '2';
 
 /** 建表脚本位置（与本文件同目录） */
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
@@ -25,6 +26,11 @@ const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
 /** 读取建表脚本正文 */
 function readSchemaSql() {
   return fs.readFileSync(SCHEMA_FILE, 'utf8');
+}
+
+/** schema.sql 正文指纹（SHA-256 前 16 位）：用于校验"改了 schema 是否同步升版本" */
+function schemaFingerprint() {
+  return require('node:crypto').createHash('sha256').update(readSchemaSql(), 'utf8').digest('hex').slice(0, 16);
 }
 
 /** 取内置 SQLite 实现（Node 22.5+ 存在，Node 24 起免实验标志） */
@@ -57,7 +63,14 @@ function openDb(dbPath, options = {}) {
      否则 Windows 上文件句柄泄漏 → 文件被锁、临时目录删不掉（复审实测 rmSync 报 EPERM）。 */
   try {
     const journal = db.prepare(`PRAGMA journal_mode = ${journalMode}`).get();
-    if (foreignKeys) db.prepare('PRAGMA foreign_keys = ON').get();
+    /* ⚠ 2026-09-19（P3 表外 code-13）：这里原本无条件开 `PRAGMA foreign_keys = ON`，
+       但 `schema.sql` 全文**没有任何 FOREIGN KEY / REFERENCES** —— 该 PRAGMA 是**空操作**，
+       会让人误以为引用完整性已被数据库守着。现改为：**只在 schema 真的声明了外键时才开**
+       （扫描 schema.sql 判断），并在都没声明时保持默认（SQLite 默认即关闭）。
+       为什么不直接补外键：`measure_rt`/`result`/`task_curve` 都是先有采集与判定、再落 task 的
+       异步链路，加外键会把"上游先到"变成硬失败，属**决策级改动**（需 ADR），不在本轮范围。 */
+    const hasForeignKeys = /FOREIGN\s+KEY|REFERENCES/i.test(readSchemaSql());
+    if (foreignKeys && hasForeignKeys) db.prepare('PRAGMA foreign_keys = ON').get();
     /* 多进程/多连接下避免"database is locked"直接报错（服务与备份任务并存时有用） */
     if (busyTimeoutMs > 0) db.prepare(`PRAGMA busy_timeout = ${busyTimeoutMs}`).get();
     return { db, path: path.resolve(dbPath), journalMode: journal && journal.journal_mode };
@@ -67,16 +80,20 @@ function openDb(dbPath, options = {}) {
   }
 }
 
-/** 建表（幂等：schema.sql 全部 IF NOT EXISTS），并写入结构版本 */
+/** 建表（幂等：schema.sql 全部 IF NOT EXISTS），并写入结构版本与 schema 指纹 */
 function initSchema(db, now) {
-  db.exec(readSchemaSql());
+  const sql = readSchemaSql();
+  db.exec(sql);
   const at = now || formatNow();
   const stmt = db.prepare(
     'INSERT INTO schema_meta(key, value, updated_at) VALUES(?, ?, ?) ' +
     'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
   );
   stmt.run('schema_version', SCHEMA_VERSION, at);
-  return { schemaVersion: SCHEMA_VERSION, appliedAt: at };
+  /* 同时落 schema 指纹（P3 表外 code-12）：让"改 schema 必须同步升 SCHEMA_VERSION"
+     这条约定**可被机器校验** —— 见下方 verifySchemaConsistency()。 */
+  stmt.run('schema_fingerprint', schemaFingerprint(), at);
+  return { schemaVersion: SCHEMA_VERSION, fingerprint: schemaFingerprint(), appliedAt: at };
 }
 
 /** 读取结构版本 */
@@ -87,6 +104,43 @@ function getSchemaVersion(db) {
   } catch {
     return null;   // 表还没建
   }
+}
+
+/** 读取库里记录的 schema 指纹（未记录返回 null） */
+function getSchemaFingerprint(db) {
+  try {
+    const row = db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_fingerprint'").get();
+    return row ? row.value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 校验"改 schema.sql 必须同步升 SCHEMA_VERSION"（P3 表外 code-12）。
+ *
+ * 为什么需要：原来只有"写进去的值 == 常量自己"的断言，**证明不了**这条约定被遵守 ——
+ * 有人改了 `schema.sql` 却忘了 +1 时，程序照样自洽、迁移判断却会错。
+ * 做法：`schema_meta` 里同时记**结构版本**与**schema 指纹**（正文 SHA-256 前 16 位）；
+ * 指纹不一致即说明"SQL 改了而版本没跟着变"。
+ *
+ * @returns {{ok:boolean, reason:string, version:string|null, stored:string|null, current:string}}
+ */
+function verifySchemaConsistency(db) {
+  const current = schemaFingerprint();
+  const stored = getSchemaFingerprint(db);
+  const version = getSchemaVersion(db);
+  if (stored === null) {
+    return { ok: false, reason: '库里没有 schema 指纹（旧库或未 initSchema）—— 无法判断版本是否同步', version, stored, current };
+  }
+  if (stored !== current) {
+    return {
+      ok: false,
+      reason: `schema.sql 已改动（指纹 ${stored} → ${current}）但库里的结构版本仍是 ${version} —— 请同步升 SCHEMA_VERSION`,
+      version, stored, current
+    };
+  }
+  return { ok: true, reason: '', version, stored, current };
 }
 
 /**
@@ -155,10 +209,13 @@ module.exports = {
   SCHEMA_VERSION,
   SCHEMA_FILE,
   readSchemaSql,
+  schemaFingerprint,
   loadSqlite,
   openDb,
   initSchema,
   getSchemaVersion,
+  getSchemaFingerprint,
+  verifySchemaConsistency,
   seedInitialData,
   listTables,
   listColumns,

@@ -78,6 +78,19 @@ async function main() {
   t.check('重复初始化是幂等的（可重复执行）',
     db.getSchemaVersion(handle.db) === db.SCHEMA_VERSION, '');
 
+  /* P3 表外 code-12：'改 schema.sql 必须同步升 SCHEMA_VERSION' 这条约定原无断言 ——
+     只比"常量与自己"证明不了它被遵守。库里同时记了 schema 指纹，指纹不一致即说明改了 SQL 没升版本。 */
+  {
+    const fp = db.schemaFingerprint();
+    const vsc = db.verifySchemaConsistency(handle.db);
+    t.check('库内记录了 schema 指纹，且与当前 schema.sql 一致（改了 schema 必须升版本）',
+      db.getSchemaFingerprint(handle.db) === fp && vsc.ok === true,
+      vsc.reason || `fingerprint=${fp}`);
+    t.check('结构版本已随指纹机制升到 2（本次改动自身遵守了这条约定）',
+      db.SCHEMA_VERSION === '2' && db.getSchemaVersion(handle.db) === '2',
+      `SCHEMA_VERSION=${db.SCHEMA_VERSION}`);
+  }
+
   const tables = db.listTables(handle.db);
   const missing = REQUIRED_TABLES.filter(x => !tables.includes(x));
   t.check(`需求要求的 ${REQUIRED_TABLES.length} 张表全部存在`, missing.length === 0,
@@ -242,7 +255,31 @@ async function main() {
     Boolean(latest) && latest.kind === 'depth' && latest.sampleCount === 160,
     latest ? `${latest.kind} ${latest.sampleCount} 点` : 'null');
 
-  /* ---------------- 七、备份（DR-15 / DEP-08） ---------------- */
+  /* ---------------- 六之二、曲线覆盖写的 id 语义（P3 表外 code-11） ---------------- */
+{
+  /* 注意：fixture.makeCurve 的 procOrderNo 取自 fixture 的 task（不受参数影响），
+     故用**不同 unitIndex** 造两条唯一键不同的曲线；同键的两条会互相覆盖，验不出 id 语义。 */
+  const base = fixture.makeCurve({ kind: 'depth' });
+  const cA = { ...base, unitIndex: 10 };   // 用 10/20 避开早前用例已占用的 1/2
+  const cB = { ...base, unitIndex: 20 };
+  /* 前提（D20）：这两个 unitIndex 在本库中尚未被占用，否则"不产生重复行"的断言基准就不成立 */
+  const preA = curveRepo.listByTask(handle.db, base.procOrderNo).filter(x => x.unit_index === 10).length;
+  const preB = curveRepo.listByTask(handle.db, base.procOrderNo).filter(x => x.unit_index === 20).length;
+  t.requires('unitIndex 10/20 在本库中尚未被占用（前提）', preA === 0 && preB === 0,
+    `实测已占用：unit10=${preA} 行、unit20=${preB} 行`);
+  const firstA = curveRepo.saveCurve(handle.db, cA, NOW);
+  const firstB = curveRepo.saveCurve(handle.db, cB, NOW);
+  const againA = curveRepo.saveCurve(handle.db, { ...cA, samples: cA.samples.slice(0, 3) }, NOW);
+  t.check('P3-code-11：覆盖写返回**被覆盖行**的 id（不是上一次插入的 rowid）',
+    firstA.id !== firstB.id && againA.id === firstA.id,
+    `插 unit1→id=${firstA.id}，插 unit2→id=${firstB.id}，再覆盖 unit1→id=${againA.id}（应等于 ${firstA.id}）`);
+  t.check('P3-code-11：覆盖写后不产生重复行且样本已更新',
+    curveRepo.listByTask(handle.db, base.procOrderNo).filter(x => x.unit_index === 10).length === 1 &&
+    curveRepo.getCurve(handle.db, base.procOrderNo, 10, 'depth').samples.length === 3,
+    `unit10 行数=${curveRepo.listByTask(handle.db, base.procOrderNo).filter(x => x.unit_index === 10).length}`);
+}
+
+/* ---------------- 七、备份（DR-15 / DEP-08） ---------------- */
   t.section('七、备份与校验（DR-15 / DEP-08）');
   const backupDir = path.join(env.paths.tempRoot, 'backup-case');
   const bk = await maintain.backupTo(handle.db, backupDir,

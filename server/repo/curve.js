@@ -25,8 +25,9 @@ const INSERT_SQL =
 function saveCurve(db, curve, nowIso) {
   const samples = Array.isArray(curve.samples) ? curve.samples : [];
   const payload = JSON.stringify(samples);
+  const unitIndex = curve.unitIndex === undefined ? 1 : curve.unitIndex;
   const row = db.prepare(INSERT_SQL).run(
-    curve.procOrderNo, curve.unitIndex === undefined ? 1 : curve.unitIndex, curve.kind,
+    curve.procOrderNo, unitIndex, curve.kind,
     payload, samples.length,
     curve.intervalSec === undefined ? 1 : curve.intervalSec,
     curve.durationSec === undefined ? samples.length : curve.durationSec,
@@ -34,8 +35,17 @@ function saveCurve(db, curve, nowIso) {
     curve.maxValue === undefined ? null : curve.maxValue,
     curve.finishedAt, nowIso
   );
+  /* ⚠ 2026-09-19 修（P3 表外 code-11）：`ON CONFLICT DO UPDATE` 走**覆盖**分支时，
+     `lastInsertRowid` **不是**被覆盖行的 id（实测：插 PA→1、插 PB→2、再覆盖 PA→返回 2，
+     而 PA 的实际 id 仍是 1）—— 调用方拿它做关联会指向错误的行。
+     故覆盖后按唯一键回查真实 id；新增分支的回查值与 lastInsertRowid 一致，无额外代价。 */
+  const hit = db.prepare(
+    'SELECT id FROM task_curve WHERE proc_order_no = ? AND unit_index = ? AND kind = ?'
+  ).get(curve.procOrderNo, unitIndex, curve.kind);
+  const id = hit && hit.id !== undefined ? Number(hit.id)
+    : (row.lastInsertRowid === undefined ? null : Number(row.lastInsertRowid));
   return {
-    id: row.lastInsertRowid === undefined ? null : Number(row.lastInsertRowid),
+    id,
     sampleCount: samples.length,
     sizeBytes: Buffer.byteLength(payload, 'utf8')
   };
