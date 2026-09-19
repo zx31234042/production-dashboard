@@ -254,6 +254,24 @@ function baselineRequirementVersion() {
   return { raw: versions[0].raw, file: files.find(n => n.includes('-V' + versions[0].raw)) };
 }
 
+/**
+ * 取需求清单附录 2 字段表的行（供两处断言共用，避免"表头一处、正文另一处"各判各的）
+ * 输入：需求清单全文行数组；输出：{ declared, rows }，declared 为「共 N 项」里的 N
+ */
+function appendix2FieldRows(lines) {
+  const idx = lines.findIndex(l => /附录\s*2/.test(l) && /共\s*\d+\s*项/.test(l));
+  const rows = [];
+  if (idx < 0) return { declared: null, rows };
+  const declared = Number(lines[idx].match(/共\s*(\d+)\s*项/)[1]);
+  for (let i = idx + 1; i < lines.length; i++) {
+    const l = lines[i].trim();
+    if (!l.startsWith('|')) { if (rows.length) break; else continue; }
+    if (/^\|[\s:|-]+\|$/.test(l) || l.includes('字段标识')) continue;
+    rows.push(l);
+  }
+  return { declared, rows };
+}
+
 /* ---------------- 在进程内起"假 MES"（tools/mock-mes） ---------------- */
 /* mock-mes.js 是 CLI：入口处读 process.argv 后立刻监听端口，所以在进程内改 argv 再 require 即可 */
 async function startMockMes({ port, receipt, failRate }) {
@@ -278,14 +296,18 @@ async function startMockMes({ port, receipt, failRate }) {
 
 /* ---------------- 自检主体 ---------------- */
 async function main() {
-  /* ===== A. 附录 2 契约：需求清单 V1.27 §6.4 字段表 ↔ fieldMap.boardToReport ===== */
+  /* ===== A. 附录 2 契约：需求清单 §6.4 字段表 ↔ fieldMap.boardToReport ===== */
   section('A. 附录 2 上报字段契约（IF-B.8 / IF-C.1）');
   const APPENDIX2 = [
     'equipCode', 'procOrderNo', 'frameRate', 'gain', 'shutter', 'cameraDepth', 'depth',
     'speed', 'velocity_x', 'velocity_y', 'collectTime', 'testStatus', 'uploadId'
   ];
   const reportKeys = Object.keys(MAP.boardToReport);
-  check('附录 2（需求清单 V1.27 §6.4 表）共 13 个字段', APPENDIX2.length === 13, `实际 ${APPENDIX2.length}`);
+  check(
+    `附录 2（需求清单 V${(baselineRequirementVersion() || { raw: '?' }).raw} §6.4 表）共 13 个字段`,
+    APPENDIX2.length === 13,
+    `实际 ${APPENDIX2.length}`
+  );
   check(
     'fieldMap.boardToReport 的字段名与附录 2 完全一致',
     reportKeys.length === APPENDIX2.length && reportKeys.every(k => APPENDIX2.includes(k)),
@@ -728,18 +750,7 @@ async function main() {
       );
 
       const lines = readText('需求文档/' + base.file).split('\n');
-      const idx = lines.findIndex(l => /附录\s*2/.test(l) && /共\s*\d+\s*项/.test(l));
-      let declared = null;
-      const rows = [];
-      if (idx >= 0) {
-        declared = Number(lines[idx].match(/共\s*(\d+)\s*项/)[1]);
-        for (let i = idx + 1; i < lines.length; i++) {
-          const l = lines[i].trim();
-          if (!l.startsWith('|')) { if (rows.length) break; else continue; }
-          if (/^\|[\s:|-]+\|$/.test(l) || l.includes('字段标识')) continue;
-          rows.push(l);
-        }
-      }
+      const { declared, rows } = appendix2FieldRows(lines);
       check(
         '需求清单「附录 2 共 N 项」的声明与字段表行数应一致',
         declared !== null && declared === rows.length,
@@ -750,6 +761,26 @@ async function main() {
         rows.length === APPENDIX2.length,
         `字段表 ${rows.length} 行，fieldMap.boardToReport ${APPENDIX2.length} 个`
       );
+      /* 防回潮（V1.28 / C-52）：V1.27 只改了附录 2 表头的项数，正文仍写"12 个字段"，
+         与字段表、IF-C.1、fieldMap 三方不一致。此处只扫「N 个字段」这种带量词的写法，
+         并按行号排除「变更记录」章（历史条目里的旧数字属史实，保留原样）。 */
+      if (rows.length > 0) {
+        const changeLogFrom = lines.findIndex(l => /^###\s*V[\d.]+ → V[\d.]+/.test(l.trim()));
+        const mismatched = [];
+        lines.forEach((l, i) => {
+          if (changeLogFrom >= 0 && i >= changeLogFrom) return;
+          for (const m of l.matchAll(/(\d+)\s*个字段/g)) {
+            if (Number(m[1]) !== rows.length) {
+              mismatched.push(`第 ${i + 1} 行写「${m[1]} 个字段」`);
+            }
+          }
+        });
+        check(
+          `需求清单正文「N 个字段」的声明应与附录 2 字段表一致（均为 ${rows.length}）`,
+          mismatched.length === 0,
+          mismatched.join('；')
+        );
+      }
     }
   }
 
