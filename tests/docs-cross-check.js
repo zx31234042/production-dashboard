@@ -109,9 +109,15 @@ function main() {
   t.section('四、目录描述 与 实际仓库');
   const dirs = fs.readdirSync(ROOT, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name);
   const files = fs.readdirSync(ROOT, { withFileTypes: true }).filter(e => e.isFile()).map(e => e.name);
-  t.check('架构文档标注"待建"的 server/ 当前不存在',
-    !dirs.includes('server') && arch.includes('⬜ 待建'), `实际：${dirs.join(', ')}`);
-  t.check('架构文档标注"待建"的 platform/ 当前不存在', !dirs.includes('platform'));
+  /* server/ 自 2026-09-19 起已真实存在（数据层落地）；platform/ 仍未建。
+     断言写法：只要求"文档描述与实际一致"——若 server/ 不存在，架构文档必须标"待建"。 */
+  const serverExists = dirs.includes('server');
+  const serverDeclaredPending = /server\/\s*#\s*【后端，⬜ 待建】/.test(arch);
+  t.check('server/ 的存在状态与架构文档描述一致',
+    serverExists ? !serverDeclaredPending : serverDeclaredPending,
+    serverExists ? 'server/ 已存在且文档未再标"待建"' : `实际：${dirs.join(', ')}`);
+  t.check('架构文档标注"待建"的 platform/ 当前不存在',
+    !dirs.includes('platform') && arch.includes('⬜ 待建'));
   t.check('架构文档存在于根目录', files.includes('项目架构与技术栈.md'));
   t.check('README 目录树登记了架构文档', readme.includes('项目架构与技术栈.md'));
   t.check('PROJECT_RULES 9.1 登记了架构文档', rules.includes('项目架构与技术栈.md'));

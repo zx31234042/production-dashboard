@@ -69,22 +69,63 @@ function makeTempDb(options = {}) {
     for (const sql of scripts) db.exec(sql);
   }
 
+  /* 跟踪本夹具创建过的**所有**数据库连接。
+     为什么需要：reopen() 会新建连接，旧连接若不显式 close，Windows 上文件仍被占用，
+     导致临时目录删不掉（表现为测试通过但脏文件残留，进而污染版本库风险）。 */
+  const handles = [db];
+
   const handle = {
     dir,
     path: dbPath,
     db,
     journalMode: journal && journal.journal_mode,
-    /** 关闭并从磁盘删除整个临时目录（幂等） */
-    close() {
-      try { db.close(); } catch { /* 已关闭 */ }
-      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 被占用则留给清理任务 */ }
+    /** 用外部连接替换当前句柄（例如测试用 server/db 的 openDb 打开同一文件）。
+     *  **必须走本方法**：直接把 handle.db 赋成新连接会**丢掉夹具自建连接**的跟踪，
+     *  导致它一直不放 → Windows 上临时目录删不掉（曾实际踩到过）。 */
+    adopt(conn) {
+      if (conn !== handle.db) handles.push(conn);
+      handle.db = conn;
+      return conn;
     },
-    /** 关掉再打开同一个文件（用于验证"落库后重启不丢数据"，如 DR-17 累计运行） */
+    /** 当前仍被跟踪的活跃连接数（自检用：应为 1，close 后为 0） */
+    liveConnections() {
+      return handles.length;
+    },
+    /** 关闭**全部**连接并删除整个临时目录（幂等）。
+     *  注意：**不静默吞异常** —— 删不掉时必须能看见原因（Windows 上文件占用会静默失败，
+     *  表现为"测试通过但脏文件残留"，属于要查的问题而不是可忽略的小事）。 */
+    close() {
+      const problems = [];
+      for (const h of handles) {
+        try { h.close(); } catch (e) { problems.push('close: ' + e.message); }
+      }
+      handles.length = 0;
+      try {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 });
+      } catch (e) {
+        problems.push('rm: ' + e.code + ' ' + e.message);
+        /* 逐个文件探测：定位到底哪个文件仍被占用（Windows 上常见于 -wal/-shm 未释放） */
+        try {
+          for (const n of fs.readdirSync(dir)) {
+            try { fs.rmSync(path.join(dir, n), { force: true }); }
+            catch (e2) { problems.push(`占用: ${n} → ${e2.code}`); }
+          }
+          fs.rmSync(dir, { recursive: true, force: true });
+        } catch { /* 已尽可能清理 */ }
+      }
+      handle.closeProblems = problems;
+      return problems;
+    },
+    /** 关掉再打开同一个文件（用于验证"落库后重启不丢数据"，如 DR-17 累计运行）。
+     *  **必须关掉更早的所有连接**，否则 Windows 上文件仍被占用 → 临时目录删不掉；
+     *  且旧句柄被重复 close 会报 "database is not open"。 */
     reopen() {
-      try { db.close(); } catch { /* 忽略 */ }
+      for (const h of handles) { try { h.close(); } catch { /* 已关闭 */ } }
+      handles.length = 0;
       const again = new DatabaseSync(dbPath);
       again.prepare('PRAGMA journal_mode = WAL').get();
       if (options.foreignKeys !== false) again.prepare('PRAGMA foreign_keys = ON').get();
+      handles.push(again);
       handle.db = again;
       return again;
     }

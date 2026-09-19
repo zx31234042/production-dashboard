@@ -53,6 +53,8 @@ const SUITES = [
   { name: 'tools-check', desc: '联调工具进程级行为', needBrowser: false, slow: false },
   { name: 'docs-check', desc: '文档与规范一致性', needBrowser: false, slow: false },
   { name: 'docs-cross-check', desc: '跨文档一致性', needBrowser: false, slow: false },
+  { name: 'files-check', desc: '编码与文件卫生', needBrowser: false, slow: false },
+  { name: 'db-check', desc: '本地库结构与仓储层', needBrowser: false, slow: false },
   { name: 'trace-check', desc: '需求追溯', needBrowser: false, slow: false },
   { name: 'copy-check', desc: '界面文案与需求条款对照', needBrowser: false, slow: false },
   { name: 'screenshot-diff', desc: '界面视觉回归', needBrowser: false, slow: false },

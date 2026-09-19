@@ -116,18 +116,22 @@ function makeFrame(opts = {}) {
 
 /**
  * 造一串测量帧（节拍内按 1 s 采样），供曲线固化与统计用例使用。
- * @param {{count?:number, startAt?:string, stepSec?:number}} [opts]
+ * @param {{count?:number, startAt?:string, stepSec?:number, startIndex?:number}} [opts]
+ *   startIndex 用于与其它批次**错开 collectTime**（否则会被 DR-13 去重键正确拦下）
  */
 function makeFrames(opts = {}) {
   const count = opts.count === undefined ? 160 : opts.count;   // 单任务节拍 160 s（开发假设）
   const stepSec = opts.stepSec === undefined ? 1 : opts.stepSec;
+  const startIndex = opts.startIndex === undefined ? 0 : opts.startIndex;
   const start = new Date((opts.startAt || '2026-09-19 10:00:00').replace(' ', 'T'));
   const out = [];
   for (let i = 0; i < count; i++) {
     const d = new Date(start.getTime() + i * stepSec * 1000);
     const pad = n => String(n).padStart(2, '0');
-    const at = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-    out.push(makeFrame({ i, at }));
+    const at = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    // 帧序号用 startIndex + i，保证"波形随机游走"与时间一一对应，避免不同批次波形完全相同
+    out.push(makeFrame({ i: startIndex + i, at }));
   }
   return out;
 }

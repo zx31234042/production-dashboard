@@ -128,6 +128,8 @@
 | `tests/docs-cross-check.js` | `node tests/docs-cross-check.js`（零依赖，纯文本读取） | **跨文档一致性（43 项）**：①版本号（架构文档/快照/工作日志 ↔ `PROJECT_RULES` 头部与需求基线）②跨文档核心数字（13 字段、38 万行/秒、0.34 GB/年及其推算前提）③**需求编号可追溯**（架构文档引用的每个编号都必须在需求清单里存在）④目录描述与实际仓库（标"待建"的 `server\`/`platform\` 必须不存在；新文档必须已登记）⑤技术栈断言 ↔ ADR（Node 24 / SSE / 不落库 / 零依赖 / 平台适配层 / WebView2）⑥与规范 9.5 四条约束一致 ⑦字段语义（`depth` ≠ `cameraDepth`）⑧进度标注与实际状态 ⑨**测试侧边界**（夹具层不得 require 业务代码、临时区必须在 `._verify` 内、harness 必须提供一用例一库）。**立项依据**：一次同类检查曾抓出 3 处真缺陷，其中 2 处单看任何一份文档都发现不了（ADR-0003 D18）。 |
 | `tests/preflight.js` | `node tests/preflight.js`（零依赖） | **环境体检（10 项 + 1 跳过）**：Node 版本下限（≥24）、`node:sqlite` + WAL、临时库互相隔离、全局 `fetch`、`AbortSignal.timeout`、`node:net`、临时区可写、测试数据目录位于 `._verify` 内（D16）、磁盘余量、空闲端口分配、Edge 可用性、**子进程管道能力**（受限环境为 EPERM → 记为**跳过**并进警告，不伪装成失败）。目的：把"环境问题"与"代码问题"分开报。 |
 | `tests/run-all.js` | `node tests/run-all.js`（`--fast` 跳过耗时/浏览器类；`--tap` 安静模式；`--only a,b`；`--list`；`--no-preflight`） | **统一 runner（ADR-0003 D15）**：一条命令跑完所有门禁并按脚本汇总，**任一失败即非零退出**。**三种输出模式**：①有管道 → 捕获输出并解析断言级合计；②无管道 + 安静模式 → 输出落 `tests\._verify\run-all\<脚本>.log`，主控台只留结果行（文件路径会列出，不隐藏信息）；③无管道 + 非安静 → `stdio=inherit` 直通。**注意**：受限沙箱禁止子进程管道（EPERM），此时**只按退出码判定**、**不断言级合计**，且绝不把无法解析当成失败。 |
+| `tests/files-check.js` | `node tests/files-check.js`（零依赖，扫描 89 个文本文件） | **编码与文件卫生（8 项）**：①**替换符 U+FFFD** 与 **mojibake 双字特征**（PS 5.1 用 `-Encoding utf8` 写文件会产生 `缁熶竴` 这类**不可逆**乱码）②BOM 用法（`tools/*.ps1` **必须**带，其余**必须**不带）③`src/`、`server/`、`tests/`、`index.html`、`tools/` 下无 Tab ④仓库无 `.tmp`/`~$*`/`._*`/`*.db`/副本类临时文件 ⑤散落的 `.db` 不得出现在临时区根目录。**立案原因**：2026-09-19 用 PowerShell 文本命令把 `tests/db-check.js` 写坏且不可逆，只能整文件重写 —— 这种损坏肉眼容易漏，必须机器查。 |
+| `tests/db-check.js` | `node tests/db-check.js`（零依赖；用夹具建**临时库**，不碰真实数据） | **本地库结构与仓储层（31 项，DR-01～DR-19）**：①13 张表齐全、关键列齐全、`schema.sql` 幂等、`integrity_check` 通过、WAL 生效 ②**附录 2 的 13 字段都有落库列**（`uploadId` 落 `upload_log`）且 `camera_depth ≠ measure_depth` ③**去重键**（DR-13）单帧/批量均生效 ④**批量事务某行失败整批回滚** ⑤**重开后不丢数据**且夹具会关掉更早连接（避免文件占用） ⑥**曲线按件固化**（DR-18/19）：JSON 往返无损、量程上下限正确、`durationSec` 语义为秒、重复固化覆盖不新增、`latestCurve` 只按类型取最近一条、无数据返回 `null`（界面据此走空态）⑦**备份**（DR-15）：生成文件、可校验完整、保留 N 份 ⑧**保留策略**（DR-14）：超 1 年删除、未超期保留、返回可审计计数 ⑨临时库清理干净无残留。 |
 
 **测试基建（夹具层，不属门禁脚本）**
 
@@ -141,11 +143,11 @@
 
 > 上表 6.3～6.6、6.8～6.10 与 6.2 的**代码侧**已由 `contract-check.js` 覆盖，浏览器内的视觉与交互由 `browser-check.js` 覆盖。
 >
-> 脚本的**断言失败即待修缺陷**。当前结果（**离线可跑部分**：8 个脚本，合计 **254 通过 / 2 失败 / 2 跳过（258 项断言）**）：`contract-check` **58/0**，`ui-check` 40/0（+1 跳过；加 `--expose-gc` 为 41/0），`tools-check` 24/0，`docs-check` **42/2**（**2 项＝D2 提交信息的两条断言；其失败清单现已含 3 条已登记偏差，按 6.4 决定长期保留**），**`docs-cross-check` 43/0（本轮新增）**，`trace-check` 4/0（`fix-pending` 0 条），`copy-check` 22/0（登记待改 0 条），`screenshot-diff` **21/0**。
+> 脚本的**断言失败即待修缺陷**。当前结果（**离线可跑部分**：10 个脚本，断言合计见下）：`contract-check` **58/0**，`ui-check` 40/0（+1 跳过；加 `--expose-gc` 为 41/0），`tools-check` 24/0，`docs-check` **42/2**（**2 项＝D2 提交信息的两条断言；其失败清单现已含 3 条已登记偏差，按 6.4 决定长期保留**），**`docs-cross-check` 43/0**，**`files-check` 8/0**，**`db-check` 31/0**，`trace-check` 4/0（`fix-pending` 0 条），`copy-check` 22/0（登记待改 0 条），`screenshot-diff` **21/0**。
 >
-> **需环境权限、本轮未复跑**：`browser-check` 22/0、`overlap-check` 0 类未白名单化、`stress-check` 7 项长跑判据（沿上一轮证据）。合计口径因此与上一轮不同：本轮把新增的 `docs-cross-check` 计入，脚本总数由 11 → **15**（含 `docs-cross-check` / `preflight` / `run-all` / `env.js`；夹具层在 `tests/lib/`，不计入脚本数）。
+> **需环境权限、本轮未复跑**：`browser-check` 22/0、`overlap-check` 0 类未白名单化、`stress-check` 7 项长跑判据（沿上一轮证据）。脚本总数已由 11 → **17**（新增 `docs-cross-check` / `files-check` / `db-check` / `preflight` / `run-all` / `env`；夹具层在 `tests/lib/`，不计入脚本数）。
 >
-> **统一 runner（本轮新增）**：`node tests\run-all.js` 一条命令跑全部；`--fast` 跳过耗时/浏览器类并转安静模式。**受限沙箱注意**：本环境禁止子进程管道（EPERM），runner 会自动降级为"按退出码判定、采集不到断言级合计、输出落文件"，**这是环境限制而非脚本失败**。
+> **统一 runner**：`node tests\run-all.js --fast` 一条命令跑完离线门禁并给断言级合计。**受限沙箱注意**：本环境禁止子进程管道（EPERM），runner 会自动降级为"安静模式 + 输出落文件"，仍能解析断言数；**这是环境限制而非脚本失败**。
 >
 > **需求清单 V1.28 勘误轮（2026-09-19 第三轮）**：`contract-check` 新增 J 段「正文「N 个字段」声明 ↔ 附录 2 字段表一致」防回潮断言（57 → **58** 项），需求清单同时补齐 V1.27 遗漏的正文 7 处项数表述。
 >
