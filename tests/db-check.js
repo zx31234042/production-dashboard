@@ -365,9 +365,11 @@ async function main() {
   t.check('pruneBackups：缺省 keep 走 BACKUP_KEEP 而非删光',
     (() => {
       const r = maintain.pruneBackups(backupDir);
-      return r.kept === maintain.listBackups(backupDir).length && r.kept === backupsBefore &&
-        r.removed.length === 0;
-    })(), `缺省保留 ${maintain.listBackups(backupDir).length} 份`);
+      /* 构成性写法：断言"保留份数 ≥ 缺省阈值则一份不删"，而不是把 30 抄进来 */
+      const undereLimit = backupsBefore <= maintain.BACKUP_KEEP;
+      return r.kept === maintain.listBackups(backupDir).length &&
+        r.kept === backupsBefore && r.removed.length === 0 && undereLimit;
+    })(), `缺省保留 ${maintain.listBackups(backupDir).length} 份（BACKUP_KEEP=${maintain.BACKUP_KEEP}）`);
   t.check('pruneBackups：kept 返回真实剩余数（不是 NaN/算式推断）',
     (() => {
       const r = maintain.pruneBackups(backupDir, 1);

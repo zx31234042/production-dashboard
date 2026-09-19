@@ -157,21 +157,32 @@ t.section('三、15 项当班指标（FR-4.1～4.15）');
       'avgTestSec', 'capacityRate', 'oee'].every(k => k in r), '');
 
   /* P2-4：`addRunSec` 必须是"本周期增量" —— 缺省即 0，绝不再默认取"班次已运行时长"。
-     旧实现在把上次落库的 accum 传回来时会把累计值当增量重复相加（复审已复现）。 */
+     旧实现在把上次落库的 accum 传回来时会把累计值当增量重复相加（复审已复现）。
+
+     写法（ADR-0004 D21 的构成性约定）：期望值**不写手算魔数**，一律由"已知正确的量"算出来。
+     这样以后改基数或增量，断言不用跟着改，也不会因为"魔数凑上去"而失真。 */
   const accumBase = { daySec: 3600, monthSec: 7200, yearSec: 10800, at: clock.now() };
+  const addSec = 120;
+  const baseSum = accumBase.daySec + accumBase.monthSec + accumBase.yearSec;
+  const sumOf = a => a.daySec + a.monthSec + a.yearSec;
+
   const noAdd = stats.computeShiftStats({ shift, tasks: list, planQty: 16, now: clock.now(), accum: accumBase });
   t.check('P2-4：不传 addRunSec 时按增量 0 累加（累计不被重复相加）',
-    noAdd.accumulate.daySec === 3600 && noAdd.accumulate.monthSec === 7200,
-    `daySec=${noAdd.accumulate.daySec}（旧实现会变成 3600+${r.runSec}）`);
-  t.check('P2-4：显式给增量时按增量累加（幂等口径）',
+    noAdd.accumulate.daySec === accumBase.daySec &&
+    noAdd.accumulate.monthSec === accumBase.monthSec &&
+    noAdd.accumulate.yearSec === accumBase.yearSec,
+    `三项与传入值逐一致（实测 day=${noAdd.accumulate.daySec}）`);
+
+  t.check('P2-4：显式给增量时三项同步 +addRunSec，且再传回时原样保留（不重复相加）',
     (() => {
-      const withAdd = stats.computeShiftStats({ shift, tasks: list, planQty: 16, now: clock.now(), accum: accumBase, addRunSec: 120 });
+      const withAdd = stats.computeShiftStats({ shift, tasks: list, planQty: 16, now: clock.now(), accum: accumBase, addRunSec: addSec });
       const again = stats.computeShiftStats({ shift, tasks: list, planQty: 16, now: clock.now(), accum: withAdd.accumulate, addRunSec: 0 });
-      return withAdd.accumulate.daySec === 3720 && withAdd.accumulate.monthSec === 7320 &&
-        withAdd.accumulate.yearSec === 10920 &&
-        again.accumulate.daySec === 3720 && again.accumulate.monthSec === 7320 &&
-        again.accumulate.yearSec === 10920;
-    })(), '第二次传回上次结果且增量 0 → 累计原样保留（不重复相加）');
+      /* 日/月/年三项各自"原值 + 增量"，总量随之 +3×增量 —— 全部由已知量推出，无魔数 */
+      const expected = { daySec: accumBase.daySec + addSec, monthSec: accumBase.monthSec + addSec, yearSec: accumBase.yearSec + addSec };
+      const atExpected = a => a.daySec === expected.daySec && a.monthSec === expected.monthSec && a.yearSec === expected.yearSec;
+      return atExpected(withAdd.accumulate) && atExpected(again.accumulate) &&
+        sumOf(withAdd.accumulate) === baseSum + 3 * addSec;
+    })(), `增量 ${addSec}s：三项各自 +${addSec}，两次结果一致`);
   t.check('P2-4：addRunSec 越界（负数/超过本班运行时长/NaN/Infinity）一律抛错',
     (() => {
       let n = 0;
