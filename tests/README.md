@@ -122,7 +122,7 @@
 | `tests/stress-check.js` | `node tests/stress-check.js`（**长跑，默认 8 小时；需浏览器权限**） | S1 页面持续存活（时钟推进·无未捕获异常·无 console.error）；S2 JS 堆是否无界增长；S3 DOM/标签数/激活面板是否漂移；S4 跨班次时的班次名·统计·曲线固化·待补传队列变化；S5 每小时把 8 个页面轮巡一遍并切两次断连。环境变量：`DSH_STRESS_HOURS`（默认 8）、`DSH_STRESS_INTERVAL_MIN`（默认 10）、`DSH_STRESS_SIZE`（默认 3840x2160）、`DSH_STRESS_EDGE`。产物：`tests/._verify/stress-<时间戳>.csv / .log / -summary.json` 与首末截图。**跑之前的前置条件（电源/休眠/注销/待重启）见第五节。** |
 | `tests/screenshot-diff.js` + `tests/screenshots-baseline/` | `node tests/screenshot-diff.js`（零依赖，自实现 PNG 解码） | 界面视觉回归：把候选截图与 `tests/screenshots-baseline/` 里的 10 张基准逐像素比对，**不同像素占比 ≤ 5%** 判定通过；先做"基准 vs 基准"自比（11 项，必须 0.00%）验证工具链路，再按同名比候选（`--candidate` 指定目录，默认 `tests/._verify/captures`；有候选时共 21 项）；`--tolerance`/`--channel` 可调阈值与单通道容差，`--self` 只做自比。基准图的命名、捕获参数、确定性做法与更新流程见 `tests/screenshots-baseline/README.md`（该目录**由代码项目成员维护**）。 |
 | `tests/capture-baseline.js` | `node tests/capture-baseline.js`（**需浏览器权限**；`--out <目录>`、`--update`、`--size 1920x1080`） | 基准图的**确定性捕获**：无头 Edge + CDP，页面加载前注入"固定时间（2026-09-18 10:00）+ 种子化 `Math.random` + 冻结 `setInterval/setTimeout`"，使每次捕获逐像素一致——实测两遍独立捕获 **10/10 张差异 0.00%、最大通道差 0**，5% 阈值因此真正严格。默认拍 8 标签页 + 2 特殊状态共 10 张到 `tests/._verify/captures`；`--update` 覆盖基准目录（人工看图确认后使用）。 |
-| `tests/trace-check.js` | `node tests/trace-check.js`（零依赖；`--list` 打印全部条款归属） | **需求追溯**：内嵌「需求条款 → 承接证据」追溯表，校验①每条条款都有归属（不允许含糊）②证据脚本存在③证据断言确实在该脚本里；输出可追溯覆盖率（当前 **140 / 236 = 59.3%**，其中直接断言 36 条、间接验证 104 条）与 fix-pending / backend-phase / declared-gap / manual / subjective / out-of-scope 分类。 |
+| `tests/trace-check.js` | `node tests/trace-check.js`（零依赖；`--list` 打印全部条款归属） | **需求追溯**：内嵌「需求条款 → 承接证据」追溯表，校验①每条条款都有归属（不允许含糊）②证据脚本存在③证据断言确实在该脚本里；输出可追溯覆盖率（当前 **164 / 256 = 64.1%**，其中直接断言 40 条、间接验证 124 条）与 fix-pending / backend-phase / declared-gap / manual / subjective / out-of-scope 分类。**注意**：条款总数＝表格行口径**含 ENV 系列**（2026-09-19 修正，此前漏 20 条 ENV 导致总数少算成 236）。 |
 | `tests/copy-check.js` | `node tests/copy-check.js`（零依赖，源码级文案核对） | **界面文案 ↔ 需求条款**：22 条已确认映射（运行模式 5 种、阶段 4 种、联网三态、结果五态、统计 15 项指标名、四类预警、闭环四态、台账/检修表头、公告与提示标签、待办三项、解锁文案、NTP 按钮、自检七项、八个标签名、页脚四要素、空态文案、头部人员标签、日期/星期格式、累计运行命名…共 100+ 个字符串）逐条断言；FR-3.16 设备参数用词（实时帧率/相机增益/快门速度/相机水下深度）已于 2026-09-19 修复并升为断言，现无"登记待改"条目。 |
 | `tests/overlap-check.js` | `node tests/overlap-check.js`（**需浏览器权限**；`--min 5`、`--shots 3`） | **元素重叠检测**：3 种分辨率 × 8 页 + 2 特殊状态（26 次页面加载）取各主要容器的视觉矩形做相交检测，自动跳过父子包含与不可见元素、忽略 ≤5% 重叠，按选择器组合聚合；命中 `tests/overlap-whitelist.json` 的 `allow` 规则即通过。当前实测：**0 类未白名单化**（`.card × .degraded-banner` 经人工确认属 UI-10 降级覆盖层，已入白名单）。 |
 | `tests/docs-cross-check.js` | `node tests/docs-cross-check.js`（零依赖，纯文本读取） | **跨文档一致性（43 项）**：①版本号（架构文档/快照/工作日志 ↔ `PROJECT_RULES` 头部与需求基线）②跨文档核心数字（13 字段、38 万行/秒、0.34 GB/年及其推算前提）③**需求编号可追溯**（架构文档引用的每个编号都必须在需求清单里存在）④目录描述与实际仓库（标"待建"的 `server\`/`platform\` 必须不存在；新文档必须已登记）⑤技术栈断言 ↔ ADR（Node 24 / SSE / 不落库 / 零依赖 / 平台适配层 / WebView2）⑥与规范 9.5 四条约束一致 ⑦字段语义（`depth` ≠ `cameraDepth`）⑧进度标注与实际状态 ⑨**测试侧边界**（夹具层不得 require 业务代码、临时区必须在 `._verify` 内、harness 必须提供一用例一库）。**立项依据**：一次同类检查曾抓出 3 处真缺陷，其中 2 处单看任何一份文档都发现不了（ADR-0003 D18）。 |
@@ -158,7 +158,11 @@
 >
 > 本节数字为**权威值**：`项目记录/` 与审查报告里的门禁数字均以此为准，改动脚本后请同步更新这里。
 >
-> **需求追溯覆盖率（`trace-check`）**：236 条需求条款全部有归属，其中**可追溯覆盖 140 条（59.3%）**——直接断言 36 条、间接验证 104 条；其余分类为 `backend-phase` 72 条（数据库/服务端/真实接口/目标硬件）、`declared-gap` 8 条、`out-of-scope` 7 条、`manual` 5 条、`subjective` 4 条。按类别：FR 86/110、UI 12/19、IF 18/46、NFR 7/27、DR 0/19、DEP 0/15。要提升覆盖率，主要靠补 `manual`/`subjective` 项与后端阶段落地，而不是再加断言。
+> **需求追溯覆盖率（`trace-check`）**：**256 条**需求条款全部有归属，其中**可追溯覆盖 164 条（64.1%）**——直接断言 40 条、间接验证 124 条；其余分类为 `backend-phase` 64 条（服务端/真实接口/目标硬件/部署）、`declared-gap` 8 条、`manual` 8 条、`out-of-scope` 7 条、`subjective` 5 条。按类别：FR 97/110、UI 13/19、IF 20/46、**DR 18/19**、NFR 10/27、DEP 0/15、**ENV 4/20**。
+>
+> ⚠️ **2026-09-19 修正了一处"假的全覆盖"**：原正则只认 `FR|UI|DR|NFR|DEP`，**把 §2 的 ENV 系列 20 条整个漏掉**，于是"236 条全部有归属"是**假的**（真实条款数 **256**，20 条 ENV 从未被归属）。同时 DR 段原为整段 `backend-phase`（显示 0/19，尽管 db-check 已在验证落库）；数据层落地后按**有实证承接**逐条改判，DR 由 0 → **18/19**（剩 DR-16 时间格式待服务层写时间时补独立断言）。
+>
+> 要提升覆盖率，主要靠补 `manual`/`subjective` 项与后端阶段落地（服务层实现后可再改判 IF/NFR/DEP 中的若干条），而不是再加断言。
 >
 > **提交信息偏差登记（2026-09-18 起，处置决定：不改写历史，只登记）**：历史上三条提交不符合 PROJECT_RULES 6.1/6.2 ——
 > ① `c269c4c 代码审查`、② `f9152ee review`（缺 `类型: ` 前缀）；③ **`93f27a9`（2026-09-19）把 `文档:` 与 `构建:` 两个类型用逗号接在同一行，主题 59 字（限 30）**。

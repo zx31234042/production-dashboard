@@ -124,8 +124,29 @@ const MAP = [
   ['IF-E.*', 'backend-phase', '', '本地数据库接口，属后端阶段'],
   ['IF-0.*', 'backend-phase', '', '通用传输规范（鉴权/请求方式）待 Q-23 收口'],
 
-  /* DR 数据需求 */
-  ['DR-*', 'backend-phase', '', '数据表与落库属后端阶段（路线图 B1.5）'],
+  /* DR 数据需求 —— 2026-09-19 数据层落地后按"有实证承接"逐条登记（原为整段 backend-phase）
+     证据来自 tests/db-check.js 的章节与断言名；断言文本必须能在该脚本里找到（本脚本会校验）。 */
+  ['DR-01,DR-02,DR-03,DR-05,DR-06,DR-07,DR-08,DR-09,DR-10,DR-12,DR-18', 'covered-indirect', 'db-check.js', '一、建表与结构（DR-01～DR-12、DR-18）'],
+  ['DR-04', 'covered-indirect', 'db-check.js', '相机深度与航行器深度分列存放'],
+  ['DR-11', 'covered-indirect', 'db-check.js', '附录 2 的 13 个上报字段都有落库列（uploadId 落 upload_log）'],
+  ['DR-13', 'covered-indirect', 'db-check.js', '三、写入与去重键（DR-13）'],
+  ['DR-14', 'covered-indirect', 'db-check.js', '八、数据保留策略（DR-14）'],
+  ['DR-15', 'covered-indirect', 'db-check.js', '七、备份与校验（DR-15 / DEP-08）'],
+  ['DR-17', 'covered-indirect', 'db-check.js', '重开后行数不变且去重键仍生效'],
+  ['DR-19', 'covered-indirect', 'db-check.js', '六、任务曲线按件固化（DR-18 / DR-19）'],
+  ['DR-16', 'backend-phase', '', '时间格式已落库为文本列，但尚无独立断言核对格式统一（待服务层写时间时补）'],
+
+  /* ENV 运行环境与显示约束 —— 2026-09-19 补齐归属（此前整段被正则漏掉） */
+  ['ENV-01,ENV-02,ENV-03,ENV-04', 'covered-direct', 'ui-check.js', 'UI-04 字号：'],
+  ['ENV-05', 'subjective', '', '防烧屏/残影需在 75 寸屏长期观察，属主观项'],
+  ['ENV-06,ENV-10', 'manual', '', 'HDMI ≥1.4 与 4K@30Hz 输出能力须现场用同规格电视实测'],
+  ['ENV-07', 'manual', '', '独立专用电视为现场硬件配置，非软件可验'],
+  ['ENV-08,ENV-09,ENV-11,ENV-12,ENV-13,ENV-14,ENV-16', 'backend-phase', '', '主机型号/系统版本/内存/存储/输入设备/运行时许可/缩放：属硬件与部署阶段（Q-26 我方实测）'],
+  ['ENV-15', 'covered-indirect', 'docs-check.js', 'index.html 不引用任何外链资源（NFR-25 内网隔离）'],
+  ['ENV-17', 'backend-phase', '', '禁用休眠/睡眠/屏保/自动更新：部署脚本阶段落实'],
+  ['ENV-18', 'backend-phase', '', 'NTP 同步与 ≤1 s 时钟偏差：需现场网络与上位机/MES 联调实测'],
+  ['ENV-19', 'covered-indirect', 'docs-check.js', 'index.html 不引用任何外链资源（NFR-25 内网隔离）'],
+  ['ENV-20', 'backend-phase', '', '开机自启与自动拉起：属部署脚本（DEP-02/03）'],
 
   /* NFR 非功能需求 */
   ['NFR-01', 'covered-direct', 'ui-check.js', '单次 tick + 10 个组件全量重绘耗时'],
@@ -168,13 +189,15 @@ function check(name, ok, detail) {
   }
 }
 
-/** 需求清单里"表格行"口径的全部条款（与 §0.2 条目数一致） */
+/** 需求清单里"表格行"口径的全部条款（与 §0.2 条目数一致）
+ *  ⚠️ 2026-09-19 修复：原正则**漏掉了 ENV 系列（20 条）** —— 导致"每条条款都有归属"是**假的全覆盖**，
+ *     且条款总数被少算成 236（真实 256）。ENV 是 §2「运行环境与显示约束」的编号，属需求正文的一部分。 */
 function requirementClauses() {
   const file = fs.readdirSync(path.join(ROOT, '需求文档')).find(f => f.endsWith('.md'));
   const lines = fs.readFileSync(path.join(ROOT, '需求文档', file), 'utf8').split('\n');
   const map = new Map();
   for (const l of lines) {
-    const m = l.match(/^\|\s*((?:FR|UI|DR|NFR|DEP)-\d+(?:\.\d+)?|IF-[A-Z0-9]+\.\d+)\s*\|\s*([^|]*)\|/);
+    const m = l.match(/^\|\s*((?:FR|UI|DR|NFR|DEP|ENV)-\d+(?:\.\d+)?|IF-[A-Z0-9]+\.\d+)\s*\|\s*([^|]*)\|/);
     if (m) map.set(m[1], m[2].trim().slice(0, 40));
   }
   return map;
@@ -246,7 +269,7 @@ function main() {
   console.log(`    其中间接验证      ${String(byStatus.get('covered-indirect') || 0).padStart(3)} 条`);
 
   console.log('\n=== 四、按类别（可追溯覆盖 / 该类条款数）===');
-  for (const cat of ['FR', 'UI', 'IF', 'DR', 'NFR', 'DEP']) {
+  for (const cat of ['FR', 'UI', 'IF', 'DR', 'NFR', 'DEP', 'ENV']) {
     const ids = [...owner.keys()].filter(id => id.startsWith(cat + '-'));
     const hit = ids.filter(id => {
       const s = owner.get(id)[1];
