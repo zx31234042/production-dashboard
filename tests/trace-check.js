@@ -81,7 +81,7 @@ const MAP = [
   /* FR-7 公告与备注 */
   ['FR-7.1,FR-7.2,FR-7.3,FR-7.4,FR-7.5,FR-7.6,FR-7.7,FR-7.8,FR-7.9', 'covered-indirect', 'contract-check.js', '公告正文（用户输入）不得原样写入 HTML'],
   ['FR-7.10', 'covered-indirect', 'contract-check.js', '待办"未闭环异常"的判据不得比较一个永不出现的状态值'],
-  ['FR-7.11', 'declared-gap', '', 'P1：公告有效期/优先级/轮播未实现，未登记进已知限制（见审查报告 P3-17）'],
+  ['FR-7.11', 'declared-gap', '', 'README 已知限制 8：本期只做发布与展示，编辑/删除与有效期/轮播留待实施阶段（2026-09-19 已补登记，P3-11）'],
   ['FR-7.12', 'covered-direct', 'contract-check.js', '检修内容/负责人（用户输入）不得原样写入 HTML'],
 
   /* FR-8 系统设置 */
@@ -95,7 +95,7 @@ const MAP = [
   ['FR-9.1,FR-9.3', 'covered-direct', 'browser-check.js', '切换 8 个标签页'],
   ['FR-9.2', 'covered-indirect', 'browser-check.js', '默认首页是「设备状态」'],
   ['FR-9.4', 'covered-direct', 'browser-check.js', '快进 200 秒后自动回到'],
-  ['FR-9.5', 'declared-gap', '', 'P2：标签轮播未实现，路线图技术债 E3 已登记'],
+  ['FR-9.5', 'declared-gap', '', 'README 已知限制 11：标签页未做自动轮播；路线图技术债 E3（2026-09-19 补登记，P3-11）'],
   ['FR-9.6', 'covered-indirect', 'ui-check.js', '单次 tick + 10 个组件全量重绘耗时'],
   ['FR-9.7', 'covered-indirect', 'ui-check.js', 'FR-9.7 大屏交互屏蔽'],
   ['FR-9.8', 'covered-indirect', 'ui-check.js', 'UI-04 字号：'],   /* 大屏远距离可读性：字号下限断言是直接证据；有线键鼠支持另见 ENV-13（属硬件） */
@@ -132,7 +132,10 @@ const MAP = [
   ['IF-D.7', 'backend-phase', '', '传输方式（推送/长连接）待与上位机方确认（Q-21）'],
   ['IF-D.9', 'covered-indirect', 'contract-check.js', '数据冻结时界面判据 state.device.link 转为断连'],
   ['IF-D.10,IF-D.12', 'backend-phase', '', '补发落库与编号传递方式需后端与 Q-21 结论'],
-  ['IF-E.*', 'backend-phase', '', '本地数据库接口，属后端阶段'],
+  ['IF-E.1,IF-E.2', 'backend-phase', '', '本地推送端点（SSE）与本地 Web API，属后端阶段'],
+  /* 2026-09-19（P3-9）：IF-E.3（事务与并发读写）**已有断言**（db-check 的批量事务整批回滚 +
+     WAL 生效 + busy_timeout），不再整段归 backend-phase。 */
+  ['IF-E.3', 'covered-indirect', 'db-check.js', '批量事务中某行失败 → 整批回滚（无部分写入）'],
   ['IF-0.*', 'backend-phase', '', '通用传输规范（鉴权/请求方式）待 Q-23 收口'],
 
   /* DR 数据需求 —— 2026-09-19 数据层落地后按"有实证承接"逐条登记（原为整段 backend-phase）
@@ -145,7 +148,9 @@ const MAP = [
   ['DR-15', 'covered-indirect', 'db-check.js', '七、备份与校验（DR-15 / DEP-08）'],
   ['DR-17', 'covered-indirect', 'logic-check.js', '累计运行持久化：重启不倒退、跨班次不清零（DR-17）'],
   ['DR-19', 'covered-indirect', 'db-check.js', '六、任务曲线按件固化（DR-18 / DR-19）'],
-  ['DR-16', 'backend-phase', '', '时间格式已落库为文本列，但尚无独立断言核对格式统一（待服务层写时间时补）'],
+  /* 2026-09-19（P3-9）：DR-16 的**格式**部分已可断言（`platform/clock.js` 的 fmt + 入库校验），
+     故由 backend-phase 改判；NTP 同步精度仍属现场。 */
+  ['DR-16', 'covered-indirect', 'db-check.js', 'P2-5：collectTime 非「yyyy-MM-dd HH:mm:ss」一律拒收'],
 
   /* ENV 运行环境与显示约束 —— 2026-09-19 补齐归属（此前整段被正则漏掉）
      2026-09-19（P2-9）：这四条原来**全部**指向 ui-check 的"UI-04 字号："—— 其中只有 ENV-03 沾边，
@@ -188,8 +193,17 @@ const MAP = [
   ['NFR-26', 'covered-indirect', 'contract-check.js', '自检「MES 上报队列」应与实际待补传条数一致'],
   ['NFR-27', 'covered-indirect', 'browser-check.js', '页脚显示版本号与最后刷新时刻'],
 
-  /* DEP 部署与运维需求 */
-  ['DEP-*', 'backend-phase', '', '部署脚本、开机自启、防休眠等属部署阶段']
+  /* DEP 部署与运维需求
+     2026-09-19（P3-8）：原整段 `backend-phase` 不准确 —— 其中**文档交付物**与**商务/现场条款**
+     不是"后端阶段"，`DEP-08` 的自动备份更是**已在 maintain.js 实现**（db-check 有断言）。
+     故按性质拆开登记。 */
+  ['DEP-01', 'backend-phase', '', 'Windows 安装包（含运行环境依赖）属部署阶段'],
+  ['DEP-02,DEP-03,DEP-04,DEP-05,DEP-06', 'backend-phase', '', '自启/服务注册/系统配置/固定 IP/端口清单属部署阶段（D12、Q-26）'],
+  ['DEP-07', 'declared-gap', '', '部署手册/运维手册/故障排查手册为**文档交付物**，尚未编写（非后端阶段；见后续路线图）'],
+  /* DEP-08：自动备份与恢复已有实现与断言；"恢复说明"文档部分另计 */
+  ['DEP-08', 'covered-indirect', 'db-check.js', '七、备份与校验（DR-15 / DEP-08）'],
+  ['DEP-09,DEP-10,DEP-11', 'backend-phase', '', '磁盘监控告警、断电恢复、版本回滚属部署与运维阶段'],
+  ['DEP-12,DEP-13,DEP-14,DEP-15', 'declared-gap', '', '现场实施清单 / 技术支持方式 / 质保与响应时效 / 三方联调计划：均属**商务与现场条款**，非软件可验证（现场实施与合同阶段落实）']
 ];
 
 /* ---------------- 断言与工具 ---------------- */
@@ -220,8 +234,30 @@ function requirementClauses() {
   return map;
 }
 
-/** 展开匹配式（精确 ID / 逗号分隔 / 前缀*）到具体条款 */
-function expand(pattern, universe) {
+/**
+ * 条款 → 优先级（P0/P1/P2）。**不假设优先级在第几列** —— 需求里各表结构不同：
+ * FR/UI/NFR 表的末列是优先级，而 DR / IF-C / IF-0 表的末列是"备注/说明"。
+ * 故扫描该行**任意单元格**里的独立 `P0`/`P1`/`P2`；取不到即返回 null
+ * （不计入优先级统计，避免用错值算 AC-01 的分母）。
+ *
+ * 为什么要它（P3-12）：AC-01 要求"P0 条目 100% 实现"，而追溯覆盖率的分母是**全部 256 条**
+ * （含 P1/P2 与 out-of-scope），两个口径不通 —— 直接拿覆盖率当"AC-01 实现完备度"会误判。
+ */
+function requirementPriorities() {
+  const file = fs.readdirSync(path.join(ROOT, '需求文档')).find(f => f.endsWith('.md'));
+  const lines = fs.readFileSync(path.join(ROOT, '需求文档', file), 'utf8').split('\n');
+  const map = new Map();
+  for (const l of lines) {
+    const m = l.match(/^\|\s*((?:FR|UI|DR|NFR|DEP|ENV)-\d+(?:\.\d+)?|IF-[A-Z0-9]+\.\d+)\s*\|/);
+    if (!m) continue;
+    const cells = l.split('|').slice(1, -1).map(c => c.trim());
+    const hit = cells.find(c => /^P[0-2]\b/.test(c));
+    if (hit) map.set(m[1], hit.match(/^(P[0-2])/)[1]);
+  }
+  return map;
+}
+
+/** 展开匹配式（精确 ID / 逗号分隔 / 前缀*）到具体条款 */function expand(pattern, universe) {
   return pattern.split(',').map(s => s.trim()).flatMap(p => {
     if (p.endsWith('*')) {
       const prefix = p.slice(0, -1);
@@ -308,6 +344,22 @@ function main() {
   console.log(`    其中直接断言      ${String(byStatus.get('covered-direct') || 0).padStart(3)} 条`);
   console.log(`    其中间接验证      ${String(byStatus.get('covered-indirect') || 0).padStart(3)} 条`);
 
+  /* 3b) 离线可验证覆盖率（P3-10）
+     症状：`covered-*` 里有若干条证据来自**本环境跑不了的** `browser-check`/`overlap-check`/`stress-check`
+     （受限沙箱禁子进程管道）。把它们与可离线复跑的断言混在一起报"覆盖率"，会高估随时可验证的程度。
+     故**并列**给出"离线可验证"口径 —— 便于在无浏览器权限的环境（含目标机初装）判断可信度。 */
+  const ONLINE_ONLY = new Set(['browser-check.js', 'overlap-check.js', 'stress-check.js']);
+  const onlineOnlyIds = [];
+  for (const [id, [, status, script]] of owner) {
+    if ((status === 'covered-direct' || status === 'covered-indirect') && ONLINE_ONLY.has(script)) {
+      onlineOnlyIds.push(id);
+    }
+  }
+  const offlineCovered = covered - onlineOnlyIds.length;
+  console.log(`  ${'—'.repeat(16)}`);
+  console.log(`  离线可验证覆盖      ${String(offlineCovered).padStart(3)} / ${owner.size} 条  (${(offlineCovered / owner.size * 100).toFixed(1)}%)`);
+  console.log(`    依赖需浏览器权限的脚本 ${String(onlineOnlyIds.length).padStart(3)} 条  ← 本环境不可复跑（browser-check / overlap-check / stress-check）`);
+
   console.log('\n=== 四、按类别（可追溯覆盖 / 该类条款数）===');
   for (const cat of ['FR', 'UI', 'IF', 'DR', 'NFR', 'DEP', 'ENV']) {
     const ids = [...owner.keys()].filter(id => id.startsWith(cat + '-'));
@@ -320,6 +372,36 @@ function main() {
 
   console.log('\n=== 五、待修缺陷对应的条款（fix-pending）===');
   console.log('  ' + [...owner].filter(([, v]) => v[1] === 'fix-pending').map(([id]) => id).join(', '));
+
+  /* 五之二、优先级 × 状态交叉表（P3-12）
+     AC-01 要求"P0 条目 100% 实现" —— 与"可追溯覆盖率"是**两个不同口径**，必须分开报，
+     否则容易把 162/256 误当作"AC-01 的实现完备度"（分子含间接验证、分母含 P1/P2 与 out-of-scope）。 */
+  console.log('\n=== 五之二、优先级 × 状态（AC-01 口径，**不是**可追溯覆盖率）===');
+  const prio = requirementPriorities();
+  const prioOrder = ['P0', 'P1', 'P2'];
+  const byPrio = new Map(prioOrder.map(k => [k, { total: 0, covered: 0, direct: 0 }]));
+  let noPrio = 0;
+  for (const [id, [, status]] of owner) {
+    const pv = prio.get(id);
+    if (!pv || !byPrio.has(pv)) { noPrio++; continue; }
+    const row = byPrio.get(pv);
+    row.total++;
+    if (status === 'covered-direct' || status === 'covered-indirect') {
+      row.covered++;
+      if (status === 'covered-direct') row.direct++;
+    }
+  }
+  for (const k of prioOrder) {
+    const r = byPrio.get(k);
+    const pctTxt = r.total ? `${((r.covered / r.total) * 100).toFixed(1)}%` : '—';
+    console.log(`  ${k}  可追溯覆盖 ${String(r.covered).padStart(3)} / ${String(r.total).padStart(3)}  (${pctTxt})，其中直接断言 ${r.direct} 条`);
+  }
+  if (noPrio) {
+    console.log(`  （另有 ${noPrio} 条条款**在需求里本就没有优先级字段**（DR 表为「编号/数据表/关键字段/说明」四列、`);
+    console.log('    IF-C / IF-0 部分行末列为备注），故不计入上表；AC-01 的"P0 条目"基数仅指**标注了优先级的**那些。）');
+  }
+  const p0 = byPrio.get('P0');
+  console.log(`  **AC-01 提示**：标注为 P0 的共 ${p0.total} 条，可追溯覆盖 ${p0.covered} 条 —— 该比率**不等于**"P0 100% 实现"（分子含间接验证，且部分 P0 依赖后端/硬件/现场）。`);
 
   if (LIST) {
     console.log('\n=== 附：全部条款归属 ===');

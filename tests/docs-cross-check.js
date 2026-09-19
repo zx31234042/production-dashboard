@@ -373,6 +373,32 @@ function main() {
     readmeCov[0] === traceCov[0] && readmeCov[1] === traceCov[1],
     `README=${readmeCov.join(' / ')}，实跑=${traceCov.join(' / ')}`);
 
+  /* 逐项分类数也要比 —— 只比分子/分母会漏掉"分类写错"（本轮我就把 backend-phase 写成 60、
+     declared-gap 写成 12，而实跑是 57/13；当时无断言，靠人工回读才发现）。 */
+  const traceClass = {};
+  for (const m of trRun.out.matchAll(/^\s{2}([a-z-]+)\s+(\d+)\s+条\s+\(/gm)) traceClass[m[1]] = Number(m[2]);
+  const classPair = (name) => {
+    const re = new RegExp('`' + name + '`\\s*(\\d+)\\s*条');
+    const n = numeric.matchNumber(readmeSrc, re);
+    return [name, n, traceClass[name]];
+  };
+  const pairs = ['backend-phase', 'declared-gap', 'manual', 'out-of-scope', 'subjective']
+    .map(classPair).filter(([, , actual]) => actual !== undefined);
+  const mismatched = pairs.filter(([, doc, actual]) => doc !== actual)
+    .map(([name, doc, actual]) => `${name}: README=${doc} 实跑=${actual}`);
+  t.check('权威区的各分类条数＝ trace-check 实跑值（逐项比，不只比总数）',
+    pairs.length >= 4 && mismatched.length === 0,
+    mismatched.length ? mismatched.join('；') : `逐项一致（${pairs.map(([n, d]) => `${n}=${d}`).join('、')}）`);
+
+  /* 离线可验证覆盖率与"依赖不可运行脚本"的条数也要比（P3-10 新增的口径） */
+  const readmeOffline = numeric.matchNumber(readmeSrc, /离线可验证\s*(\d+)\s*条/);
+  const traceOffline = numeric.matchNumber(trRun.out, /离线可验证覆盖\s*(\d+)\s*\//);
+  const readmeOnlineOnly = numeric.matchNumber(readmeSrc, /其余\s*(\d+)\s*条依赖/);
+  const traceOnlineOnly = numeric.matchNumber(trRun.out, /依赖需浏览器权限的脚本\s*(\d+)\s*条/);
+  t.check('权威区的"离线可验证覆盖率"与"依赖浏览器脚本条数"＝ trace-check 实跑值',
+    readmeOffline === traceOffline && readmeOnlineOnly === traceOnlineOnly,
+    `离线 README=${readmeOffline}/实跑=${traceOffline}；依赖 README=${readmeOnlineOnly}/实跑=${traceOnlineOnly}`);
+
   t.finish();
 }
 

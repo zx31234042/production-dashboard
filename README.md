@@ -149,7 +149,9 @@ config（board.config、fieldMap） → utils（dom、format） → services（a
 8. **FR-7.11（公告/提示的编辑与删除）**：本期只做发布与展示，编辑/删除留待实施阶段；
 9. **FR-9.7 的任务栏 / Alt+Tab / Win 键屏蔽**须由 kiosk 启动参数完成（浏览器内只能屏蔽文本选中、
    右键菜单与拖拽），部署参数见 `PROJECT_RULES.md` 与现场部署说明；
-10. 稼动率（OEE）目前按配置常量 `production.runRate` 推导，属 Q-11 口径占位（见 `tests/contract-check.js` K 段）。
+10. 稼动率（OEE）目前按配置常量 `production.runRate` 推导，属 Q-11 口径占位（见 `tests/contract-check.js` K 段）；
+11. **FR-9.5（标签页轮播）本期未实现**：标签页仅支持手动切换（键盘 `1`～`8` / `Q`·`E` / 点击），
+    未做自动轮播；已登记为《后续路线图》技术债 **E3**（2026-09-19 补登记，见审查报告 P3-11）。
 
 ---
 
