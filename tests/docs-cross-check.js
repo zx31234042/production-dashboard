@@ -67,6 +67,10 @@ function main() {
   const logRules = (log.match(/PROJECT_RULES\.md`?\s*\*\*v([\d.]+)\*\*/) || [])[1];
   t.check('工作日志声明的规范版本 = PROJECT_RULES 头部版本',
     logRules === rulesV, `工作日志 v${logRules}`);
+  /* 2026-09-20 补：路线图此前不在覆盖范围内，其"当前基线"曾长期停在 v1.15（实际 v1.24）而门禁全绿 */
+  const roadmapRules = (roadmap.match(/规范\s*\*\*v([\d.]+)\*\*/) || [])[1];
+  t.check('路线图声明的规范版本 = PROJECT_RULES 头部版本',
+    roadmapRules === rulesV, `路线图 v${roadmapRules}`);
 
   /* ---------------- 二、跨文档核心数字 ---------------- */
   t.section('二、跨文档核心数字');
@@ -344,6 +348,22 @@ function main() {
   t.check('权威区列出的各脚本数字之和 ≤ 声明合计（防重复计数/写错数）',
     sumListed > 0 && statedTotal !== null && sumListed <= statedTotal,
     `列出的和=${sumListed}，合计=${statedTotal}`);
+
+  /* ④ 当前状态文档引用的门禁总数 = 权威区声明（2026-09-20 补）
+     立案原因：权威区**自身**有机器校验（①～③），但"别的文档抄这个数有没有跟上"此前无人把关。
+     2026-09-19 收工后 `当前状态快照`／`项目架构与技术栈`／`后续路线图` 三份一起停在 493（权威值 497），
+     一致性门禁全绿 —— 因为一致性门禁只能发现"文档之间互相打架"，发现不了"大家一起旧了"。
+     本断言把权威区当成唯一真源，要求三份"当前状态"文档都引用同一个三元组。 */
+  const authTriple = (authLine.match(/合计\s*\*{0,2}\s*(\d+)\s*通过\s*\/\s*(\d+)\s*失败\s*\/\s*(\d+)\s*跳过/) || []).slice(1);
+  const authStr = authTriple.length === 3
+    ? `${authTriple[0]} 通过 / ${authTriple[1]} 失败 / ${authTriple[2]} 跳过` : null;
+  const currentDocs = [['当前状态快照', snap], ['项目架构与技术栈', arch], ['后续路线图', roadmap]];
+  const staleDocs = currentDocs.filter(([, src]) => !authStr || !src.includes(authStr));
+  t.check('当前状态文档引用的门禁总数 = 权威区声明（防"文档集体滞后"）',
+    authStr !== null && staleDocs.length === 0,
+    authStr === null
+      ? '未能在权威区解析出「X 通过 / Y 失败 / Z 跳过」三元组'
+      : `权威值「${authStr}」未被引用：${staleDocs.map(d => d[0]).join('、')}`);
 
   /* ③ 与实跑对齐：权威区关于"扫描文件数 / 覆盖率分类"的数字必须等于对应脚本的真实输出 */
   const fcRun = probe('files-check');

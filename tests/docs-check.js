@@ -240,7 +240,8 @@ async function main() {
   /* ===== D2 提交信息格式 ===== */
   section('D2 提交信息格式（PROJECT_RULES 6.1/6.2）');
   const subjects = gitOutput(['log', '--pretty=format:%s'], 'git-subjects.txt').split('\n').map(s => s.trim()).filter(Boolean);
-  const TYPES = ['新增', '修改', '修复', '删除', '文档', '样式', '重构', '构建'];
+  /* 类型表必须与 PROJECT_RULES 6.2 一致；D5 段有断言逐项核对（2026-09-20 补上漏掉的「记录」） */
+  const TYPES = ['新增', '修改', '修复', '删除', '文档', '样式', '重构', '构建', '记录'];
   const badSubject = subjects.filter(s => !new RegExp(`^(${TYPES.join('|')}): \\S`).test(s));
   check('每条提交都按「类型: 说明」书写', subjects.length > 0 && badSubject.length === 0,
     badSubject.length ? `不合规：${badSubject.join(' | ')}` : `共 ${subjects.length} 条`);
@@ -368,6 +369,26 @@ async function main() {
 
   /* ===== D5 PROJECT_RULES 条款抽查 ===== */
   section('D5 PROJECT_RULES 条款抽查');
+
+  /* 本脚本的提交类型表必须与规范 6.2 的类型表一致。
+     立案原因（2026-09-20）：规范 6.2 在 2026-09-19 补了「记录」类型，但本脚本的 TYPES 没跟着加，
+     于是"按规范写 `记录: …` 作 Summary"会被本门禁判成不合规 —— 门禁与规范打架，且**没有任何断言发现**。
+     这里从脚本源码自身取出类型表，再与 6.2 的类型表逐项比，任一侧增删类型都会立刻变红。 */
+  const selfSrc = fs.readFileSync(__filename, 'utf8');
+  const selfTypes = [...(((selfSrc.match(/const TYPES = \[([^\]]+)\]/) || [])[1] || '').matchAll(/'([^']+)'/g))].map(m => m[1]);
+  /* 只取 6.2 本节内容（截到下一个 ### 为止），否则会把后面 6.3/6.4/七/九 的表格一起吞进来 */
+  const d62 = (readText('PROJECT_RULES.md').split('### 6.2 类型表')[1] || '').split('\n### ')[0];
+  const specTypes = [...d62.matchAll(/^\|\s*([^\s|]+)\s*\|/gm)]
+    .map(m => m[1])
+    .filter(x => x !== '类型' && !/^-+$/.test(x));
+  const missingInScript = specTypes.filter(x => !selfTypes.includes(x));
+  const extraInScript = selfTypes.filter(x => !specTypes.includes(x));
+  check('本脚本的提交类型表 = PROJECT_RULES 6.2 类型表',
+    selfTypes.length > 0 && specTypes.length > 0 && missingInScript.length === 0 && extraInScript.length === 0,
+    `脚本 ${selfTypes.length} 个 / 规范 ${specTypes.length} 个` +
+    (missingInScript.length ? `；脚本缺：${missingInScript.join('、')}` : '') +
+    (extraInScript.length ? `；脚本多：${extraInScript.join('、')}` : ''));
+
   for (const f of ['tools/md2docx.ps1', 'tools/md2docx-img.ps1']) {
     const b = fs.readFileSync(path.join(ROOT, f));
     const bom = b.length >= 3 && b[0] === 0xEF && b[1] === 0xBB && b[2] === 0xBF;
