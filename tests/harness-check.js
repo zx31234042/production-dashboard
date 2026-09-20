@@ -514,6 +514,15 @@ t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTota
     const withDev = resultsOf(true);      // docs-check 带 2 项已登记偏差
     const greenRun = resultsOf(false);    // 全绿
     t.check('改盘辅助生效（能真的把权威行改成目标数字）', setStated(sumOf(withDev)), `目标 ${sumOf(withDev)}`);
+    /* P3-6 补：比对通过时打印的**口径行**是有契约的 —— 必须同时含"合计 ＝ 实跑"与
+       "含已登记偏差 N 项，真实通过 M"，好让人一眼看出"确实比过了、且把已登记偏差算进去了"，
+       而不是"未核对"（后者正是 P3-6 里被当成正常的那种输出）。 */
+    const okDetail = runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev).detail;
+    const okMatch = okDetail.match(/^权威区合计 (\d+) ＝ 本轮实跑 (\d+)（含已登记偏差 (\d+) 项，真实通过 (\d+)）$/);
+    const okNums = okMatch ? okMatch.slice(1).map(Number) : [];
+    t.check('权威数字校验：通过时打印的口径行是「权威区合计 N ＝ 本轮实跑 N（含已登记偏差 2 项，真实通过 N-2）」，不是"未核对"',
+      okNums.length === 4 && okNums[0] === sumOf(withDev) && okNums[1] === sumOf(withDev) &&
+      okNums[2] === 2 && okNums[3] === sumOf(withDev) - okNums[2], okDetail);
     t.check('权威数字校验：与实跑一致时判通过（现状口径）',
       runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev).ok === true, '');
     setStated(sumOf(withDev) - 2);
@@ -580,6 +589,139 @@ t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTota
       : `调用点下标 ${callAt}，提前退出下标 ${earlyExitAt} —— 调用点必须更小`);
 }
 
+/* ---------------- 十一、已登记偏差的"登记数"必须与本机实算对得上（P3-6） ----------------
+   立案原因：2026-09-20 实际发生两次 —— 新增一个文本文件后 `docs-cross-check` 的"权威区扫描 N 个
+   文本文件 ＝ files-check 实跑值"变红（属常规工作导致的、可预期的机械漂移），而旧的
+   `authorityBlockers` 是**按脚本名**整体豁免 `docs-check`：只要出现任何非 docs-check 的失败，
+   整段权威比对就静默不执行 —— "没比对"与"比对通过"在输出上几乎无法区分（评审 A-2026-09-20-01 P3-6）。
+   修法：豁免依据换成 `run-all.REGISTERED_DEVIATIONS`（条数 + 断言名 + 出处），本段做四件事：
+     ① 常量自身自洽；② 常量 ↔ docs-check 源码 D2 段**静态**对齐（断言名逐字一致）；
+     ③ 常量 ↔ `git log` **实算**的偏差条数对齐（防"数字改大就默默多豁免"）；
+     ④ 真值表 + "未执行比对"必须写明原因与脚本名。 */
+t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁免依据不再是脚本名）');
+{
+  const runAll4 = require('./run-all');
+  const reg = runAll4.REGISTERED_DEVIATIONS && runAll4.REGISTERED_DEVIATIONS['docs-check'];
+  if (t.requires('run-all 导出「已登记偏差」常量（权威比对豁免判据的唯一真源）', Boolean(reg),
+    'run-all.REGISTERED_DEVIATIONS["docs-check"] 缺失 —— 豁免判据无从核对')) {
+
+    t.check('已登记偏差常量自洽：失败断言数 = 登记断言名条数，且出处点名 PROJECT_RULES 6.4 与 docs-check D2 段',
+      reg.assertions.length === reg.failedAssertions && reg.listedItems >= reg.failedAssertions &&
+      /6\.4/.test(reg.source) && /docs-check/.test(reg.source),
+      `断言 ${reg.failedAssertions} 条 / 失败清单 ${reg.listedItems} 条；出处：${reg.source}`);
+
+    /* ② 静态对齐：docs-check 源码 D2 段落里的 `check('…'` 断言名必须与常量逐字一致。
+       这是"常量不是随手写的数字"的机器证据 —— 改断言名或增删 D2 断言而不同步常量，这里立刻红。 */
+    const docsSrc = fs.readFileSync(path.join(env.paths.tests, 'docs-check.js'), 'utf8');
+    const d2Start = docsSrc.indexOf("section('D2 提交信息格式");
+    const d2End = docsSrc.indexOf('/* ===== D3', d2Start);
+    const d2Src = d2Start < 0 || d2End < 0 ? '' : docsSrc.slice(d2Start, d2End);
+    const d2Names = [...d2Src.matchAll(/check\(\s*'([^']+)'/g)].map(m => m[1]);
+    t.check('已登记偏差的断言名 = docs-check D2 段源码里的 check 名（逐字，改一名就等于换了豁免口子）',
+      d2Names.length === reg.failedAssertions && d2Names.every(n => reg.assertions.includes(n)) &&
+      reg.assertions.every(n => d2Names.includes(n)),
+      `D2 段实有 ${d2Names.length} 条：${d2Names.join('、') || '（未解析到，检查 section 标题或 check 写法是否改名）'}`);
+
+    /* ③ 独立实算：按 D2 的两条规则把 `git log` 的主题重新数一遍。
+       规则参数（类型表、字数上限）从 docs-check 源码里读 —— 免得"两处各写一份规则"再次漂移。 */
+    const { execFileSync } = require('node:child_process');
+    const typesSrc = (d2Src.match(/const TYPES = \[([^\]]*)\]/) || [])[1] || '';
+    const types = [...typesSrc.matchAll(/'([^']+)'/g)].map(m => m[1]);
+    const lenLimit = Number((d2Src.match(/\.length\s*>\s*(\d+)\)/) || [])[1]);
+    const gitLog = path.join(env.ensureDir(env.paths.tempRoot), `d2-subjects-${process.pid}.txt`);
+    let subjects = [];
+    try {
+      const fd = fs.openSync(gitLog, 'w');
+      try {
+        execFileSync('git', ['log', '--pretty=format:%s'],
+          { stdio: ['ignore', fd, 'ignore'], cwd: env.paths.root });
+      } finally { fs.closeSync(fd); }
+      subjects = fs.readFileSync(gitLog, 'utf8').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    } catch { subjects = []; }
+    try { fs.rmSync(gitLog, { force: true }); } catch { /* 忽略 */ }
+
+    if (t.requires('能用 git 历史独立复核 D2 偏差条数（git 可读，且规则参数能从 docs-check 源码解析）',
+      subjects.length > 0 && types.length >= 5 && Number.isInteger(lenLimit),
+      `提交 ${subjects.length} 条 / 类型表 ${types.length} 个 / 字数上限 ${lenLimit}`)) {
+      const badPrefix = subjects.filter(s => !new RegExp(`^(${types.join('|')}): \\S`).test(s));
+      const tooLong = subjects.filter(s => s.replace(/^[^:]+:\s*/, '').length > lenLimit);
+      const failedRules = (badPrefix.length ? 1 : 0) + (tooLong.length ? 1 : 0);
+      const listed = badPrefix.length + tooLong.length;
+      t.check('已登记偏差的**失败断言数** = git 历史实算（D2 两条断言各失败一条 → 2）',
+        failedRules === reg.failedAssertions,
+        `实算 ${failedRules} 条失败断言（缺前缀 ${badPrefix.length} 条 / 超 ${lenLimit} 字 ${tooLong.length} 条），常量写 ${reg.failedAssertions}`);
+      t.check('已登记偏差的**失败清单条数** = git 历史实算（9 条缺前缀 + 3 条超字数 → 12）',
+        listed === reg.listedItems,
+        `实算 ${listed} 条 = 缺前缀 ${badPrefix.length} + 超字数 ${tooLong.length}，常量写 ${reg.listedItems}`);
+    }
+
+    /* ④ 真值表：带 summary 与失败清单，覆盖"条数边界"与"换了个断言继续失败"这两种真实场景 */
+    const row = (name, status, failed, out) => ({ suite: { name }, status,
+      summary: failed === null ? null : { passed: 0, failed, skipped: 0 }, out: out || '' });
+    const failList = (...names) => '=== 汇总 ===\r\n通过 0 项，失败 ' + names.length + ' 项，跳过 0 项\r\n' +
+      '\r\n失败清单：\r\n' + names.map((n, i) => `  ${i + 1}. ${n} —— 详情`).join('\r\n') + '\r\n';
+    const a1 = reg.assertions[0], a2 = reg.assertions[1];
+    const cases = [
+      ['docs-check 失败数 = 登记数、断言名全在册 → 不阻止',
+        [row('docs-check', 'failed', reg.failedAssertions, failList(a1, a2))], []],
+      ['docs-check 失败数 > 登记数 → 阻止（不许用旧偏差掩盖新问题）',
+        [row('docs-check', 'failed', reg.failedAssertions + 1, failList(a1, a2, '新加的 D2 断言'))], ['docs-check']],
+      ['docs-check 条数没变但**换了断言**（出现未登记断言名）→ 阻止',
+        [row('docs-check', 'failed', reg.failedAssertions, failList(a1, '新加的 D2 断言'))], ['docs-check']],
+      ['docs-check 有输出却读不到失败清单（拿不出"已登记"的证据）→ 阻止',
+        [row('docs-check', 'failed', reg.failedAssertions, '（脚本中途异常，没有汇总段）')], ['docs-check']],
+      ['docs-check 异常（error）→ 阻止（已登记偏差只认 failed）',
+        [row('docs-check', 'error', null, '')], ['docs-check']],
+      ['docs-check 未核实（unverified）→ 阻止',
+        [row('docs-check', 'unverified', null, '')], ['docs-check']],
+      ['浏览器类脚本整脚本跳过（skipped）→ **不**阻止（本环境跑不了不算失败）',
+        [row('browser-check', 'skipped', 0, '')], []],
+      ['其他脚本失败 → 阻止',
+        [row('db-check', 'failed', 6, '')], ['db-check']],
+      ['已登记的 docs-check + 别的脚本失败 → 只报未登记的那个',
+        [row('docs-check', 'failed', reg.failedAssertions, failList(a1, a2)), row('screenshot-diff', 'failed', 1, '')],
+        ['screenshot-diff']],
+      ['浏览器跳过 + 已登记的 docs-check → 都不阻止',
+        [row('browser-check', 'skipped', 0, ''), row('docs-check', 'failed', reg.failedAssertions, failList(a1, a2))], []]
+    ];
+    const badCases = cases.filter(([, rows, want]) =>
+      JSON.stringify(runAll4.authorityBlockers(rows)) !== JSON.stringify(want));
+    t.check('authorityBlockers 真值表：条数边界 + 未登记断言 + error/unverified 阻止、skipped 不阻止',
+      badCases.length === 0,
+      badCases.length ? badCases.map(([title, rows, want]) =>
+        `${title}：期望 ${JSON.stringify(want)}，实得 ${JSON.stringify(runAll4.authorityBlockers(rows))}`).join('；')
+        : `共 ${cases.length} 个场景逐条通过`);
+
+    /* 反向单列一条：这是 P3-6 的要害 —— "旧偏差掩盖新问题"必须被挡下 */
+    t.check('反向：docs-check 失败数超过登记数时必须出现在 blockers 里（防"用旧偏差掩盖新问题"）',
+      runAll4.authorityBlockers([row('docs-check', 'failed', reg.failedAssertions + 1,
+        failList(a1, a2, '新加的 D2 断言'))]).includes('docs-check'),
+      `登记数 ${reg.failedAssertions}，实跑多 1 条 → 必须阻止比对`);
+
+    /* ⑤ "未执行比对"的两个分支必须写明原因与涉及脚本名（P3-6 的另一半：跳过必须显式） */
+    const offline4 = runAll4.SUITES.filter(s => !s.needBrowser).map(s => s.name);
+    const fullRun = (overrides) => offline4.map(n => overrides[n] || row(n, 'passed', 0, ''));
+    const blocked = runAll4.verifyAuthorityTotals({ passed: 1 }, fullRun({
+      'docs-check': row('docs-check', 'failed', reg.failedAssertions + 1, failList(a1, a2, '新加的 D2 断言')),
+      'db-check': row('db-check', 'failed', 6, '')
+    }));
+    t.check('账目不完整时：比对**未执行**，且详情写明原因与涉及脚本名（不得只留一句"未核对"）',
+      blocked.ok === false && blocked.kind === 'blocked' && /未执行/.test(blocked.detail) &&
+      blocked.detail.includes('docs-check') && blocked.detail.includes('db-check'),
+      blocked.detail);
+
+    const partial = runAll4.verifyAuthorityTotals({ passed: 1 },
+      fullRun({}).filter(r => r.suite.name !== 'copy-check'));
+    t.check('离线门禁没跑全时：比对**未执行**，且详情点名缺失的脚本（--only 跑子集不该被当成漂移）',
+      partial.ok === true && partial.kind === 'skipped' && /未执行/.test(partial.detail) &&
+      partial.detail.includes('copy-check'),
+      partial.detail);
+
+    const ranAll = runAll4.verifyAuthorityTotals({ passed: 1 }, fullRun({}));
+    t.check('账目干净时会**真的**走到比对（mismatch），而不是"未执行" —— 机制可达性的运行时旁证',
+      ranAll.kind === 'mismatch' && !/未执行/.test(ranAll.detail), ranAll.detail);
+  }
+}
 t.finish();
 }
 

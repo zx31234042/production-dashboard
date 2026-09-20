@@ -226,25 +226,121 @@ function writeRunTotals(results) {
 }
 
 /**
+ * **已登记偏差**（P3-6 的判据来源）—— 权威数字比对允许豁免的**唯一**依据。
+ *
+ * 为什么必须有它（2026-09-20，评审 A-2026-09-20-01 P3-6）：旧实现是**按脚本名**整体豁免
+ * （`r.suite.name !== 'docs-check'`），于是 ① `docs-check` 出现**任何**新问题也照样放行 ——
+ * 旧偏差成了新问题的挡箭牌；② 一旦别处有失败脚本，整段权威比对静默不执行，
+ * 而"没比对"与"比对通过"在观感上几乎无法区分（实际因此发生两次：新增一个文本文件让
+ * `docs-cross-check` 的"权威区扫描 N 个文本文件 ＝ files-check 实跑值"机械漂移，
+ * 结果 `run-all` 只打印一句"权威数字未核对"，整个比对被跳过）。
+ *
+ * 现在豁免必须**同时**满足四条（见 `isRegisteredDeviation`）：
+ *   ① 脚本名在册；② 状态是 `failed`（`error` / `unverified` 一律不豁免）；
+ *   ③ 失败断言数 **≤** 登记数（**多于**登记数＝出现新问题 → 阻止比对）；
+ *   ④ 失败清单里的断言名**全部**在登记清单内（多出一条未登记断言 → 阻止比对）。
+ *
+ * **数据来源（唯一真源，不要另起炉灶）**：`PROJECT_RULES.md` 6.4「已登记的历史偏差（不改写，只登记）」
+ * + `tests\docs-check.js` D2 段（PROJECT_RULES 6.1/6.2）的实跑失败清单。6.4 明确要求两个数字分清：
+ *   - **`docs-check` D2 段失败清单实际列出 12 条**（9 条缺 `类型:` 前缀 + 3 条超过 30 字）
+ *     → `listedItems`（= 6.4 本表逐条登记 3 条 + 同类早期 9 条）；
+ *   - **门禁断言数仍是 2 条**（D2 段只有两条 `check`）→ `failedAssertions`。
+ *
+ * **⚠ 数字变化时必须同步本常量**：6.4 增删登记条目、D2 段增删 `check`、失败清单条数变化，
+ * 都要回来改这里；否则门禁会拿**旧数字**去豁免**新问题** —— 那正是 P3-6 要堵的口子。
+ * 一致性由 `tests\harness-check.js` 第十一节独立复核（docs-check 源码静态比对 + `git log` 实算），
+ * 常量写错当场变红，不靠"记得同步"。
+ */
+const REGISTERED_DEVIATIONS = Object.freeze({
+  'docs-check': Object.freeze({
+    /* D2 段失败断言条数（＝汇总行的 failed，也是 README 第三节 `docs-check 43/2` 里的那个 2） */
+    failedAssertions: 2,
+    /* 失败清单里逐条列出的偏差条数（README / 6.4 口径：9 条缺前缀 + 3 条超 30 字） */
+    listedItems: 12,
+    /* 允许失败的两条断言名（与 docs-check D2 段的 check 名逐字一致；改名即视为"换了豁免口子"） */
+    assertions: Object.freeze([
+      '每条提交都按「类型: 说明」书写',
+      '提交说明不超过 30 字（6.1）'
+    ]),
+    /* 登记出处：判据存疑时先读这两处（本常量与它们同源） */
+    source: 'PROJECT_RULES.md 6.4（12 条 = 本表 3 条 + 同类早期 9 条）/ tests\\docs-check.js D2 段（PROJECT_RULES 6.1/6.2）'
+  })
+});
+
+/**
+ * 从脚本输出里取出「失败清单」中的断言名（输出契约见 `lib/assert.js`：`  N. 断言名 —— 详情`）。
+ * 用途：判断 `docs-check` 失败的**是不是那两条已登记断言** —— 只比条数会被"换个断言继续失败"骗过。
+ * 实现要点：从**最后**一个 `=== 汇总 ===` 之后找 `失败清单：`（脚本正文里也可能出现这几个字）；
+ * 解析不出时返回空数组，由调用方按"拿不出证据"处理。
+ * @param {string} out 子进程输出全文
+ * @returns {string[]}
+ */
+function failedAssertionNames(out) {
+  const text = String(out || '');
+  const sumAt = text.lastIndexOf('=== 汇总 ===');
+  const region = sumAt >= 0 ? text.slice(sumAt) : text;
+  const start = region.indexOf('失败清单：');
+  if (start < 0) return [];
+  const names = [];
+  for (const line of region.slice(start).split(/\r?\n/).slice(1)) {
+    const m = line.match(/^\s+\d+\.\s+(.+?)(?:\s+——\s+|$)/);
+    if (!m) {
+      if (!line.trim()) { if (names.length) break; continue; }   /* 空行：清单未开始或已结束 */
+      if (names.length) break;                                   /* 非清单行：清单结束 */
+      continue;
+    }
+    names.push(m[1].trim());
+  }
+  return names;
+}
+
+/**
+ * 这一条结果能否算「已登记偏差」（四条判据见 `REGISTERED_DEVIATIONS` 的注释）。
+ *
+ * 只在**有输出**时才比对失败清单里的断言名：无输出（纯函数真值表用例传的就是无输出的行）
+ * 不算证据、也不据此放行别的东西，条数判据 ③ 始终生效。汇总行缺失（脚本异常早退）时按登记数处理 ——
+ * 那是旧实现也放行的情形，本次不收紧它；但**多于**登记数一定不放行。
+ * @param {{suite:{name:string},status:string,summary?:object,out?:string}} r
+ * @returns {boolean}
+ */
+function isRegisteredDeviation(r) {
+  const name = r.suite && r.suite.name;
+  const reg = name ? REGISTERED_DEVIATIONS[name] : null;
+  if (!reg) return false;
+  if (r.status !== 'failed') return false;
+  const failed = r.summary && Number.isFinite(r.summary.failed) ? r.summary.failed : reg.failedAssertions;
+  if (failed > reg.failedAssertions) return false;
+  const text = String(r.out || '');
+  if (text) {
+    const names = failedAssertionNames(text);
+    if (names.length === 0) return false;                          /* 有输出却读不到失败清单 → 无证据 */
+    if (names.some(n => !reg.assertions.includes(n))) return false; /* 出现未登记断言 → 不算已登记偏差 */
+  }
+  return true;
+}
+
+/**
  * 权威数字比对的**前置条件**（纯函数，供 `harness-check` 做真值表回归）。
  *
- * 只有"除 `docs-check` 外没有任何失败/未核实脚本"时，本轮账目才完整、才能拿去和权威区比。
- * 依据：`docs-check` 的 2 项失败是 `PROJECT_RULES` 6.4 登记在案、**长期保留**的历史提交信息偏差
- * （决定不改写历史，所以它永远是红的），因此它是唯一被允许的失败项；其余任何失败
- * （典型：候选图未抓取导致 `screenshot-diff` 失败）都会让本轮通过数偏低，
- * 此时比对只会报出**误导性的"权威数字漂移"**。
+ * 只有"失败/异常/未核实**全部是已登记偏差**"时，本轮账目才完整、才能拿去和权威区比。
+ * 判据只认 `failed` / `error` / `unverified`：`skipped`（浏览器类脚本在本环境显式退 3）
+ * **不是失败**，按既有口径不影响比对。
  *
- * 判据只认 `failed` / `error` / `unverified`：
- * `skipped`（浏览器类脚本在本环境显式退 3）**不是失败**，按既有口径不影响比对。
+ * **2026-09-20 修 P3-6**：判据从"按脚本名豁免 `docs-check`"改为逐条核对条数与断言名
+ * （`REGISTERED_DEVIATIONS` + `isRegisteredDeviation`）；未登记的失败/异常/未核实一律阻止比对。
  *
- * @param {Array<{suite:{name:string},status:string}>} results
+ * @param {Array<{suite:{name:string},status:string,summary?:object,out?:string}>} results
  * @returns {string[]} 阻止比对的脚本名（空数组＝可以比对）
  */
 function authorityBlockers(results) {
   const BLOCKING = ['failed', 'error', 'unverified'];
-  return results
-    .filter(r => BLOCKING.includes(r.status) && r.suite.name !== 'docs-check')
-    .map(r => r.suite.name);
+  const blockers = [];
+  for (const r of results) {
+    if (!BLOCKING.includes(r.status)) continue;
+    if (isRegisteredDeviation(r)) continue;
+    blockers.push(r.suite && r.suite.name);
+  }
+  return [...new Set(blockers)];
 }
 
 /**
@@ -253,18 +349,31 @@ function authorityBlockers(results) {
  * （suite 成员跑到自己时还看不到后面的脚本），且它不会自递归。
  * 只在**跑全了全部离线门禁**时判定，避免 `--only`/`--fast` 子集造成假失败。
  *
- * **已知偏差容忍**：`docs-check` 的 2 项失败是 6.4 登记在案、长期保留的历史提交信息偏差，
- * 不会去修。故本判定在"仅剩 docs-check 一个失败脚本"时接受两种权威值：
- * ①**含已知偏差的合计**（`agg.passed`，即 README 当前写法）
- * ②**真实通过数**（`agg.passed - 已知偏差数`，即"全绿时应当达到"的值）
+ * **输出契约（2026-09-20 修 P3-6 时钉住）**：任何"**比对未执行**"的分支（`blocked` / `skipped`）
+ * 都必须在 `detail` 里写明**原因 + 涉及脚本名**，由 `main` 原样打印 —— 旧实现只留一句
+ * "本轮账目不完整（…）权威数字未核对"，与"比对通过"在观感上几乎一样，于是缺陷被当成正常
+ * （实际发生两次，见 P3-6）。未执行比对时**不**把 exit code 归因给权威校验
+ * （真正的失败脚本明细才是主因，见 `main` 里的注释）。
+ *
+ * **已登记偏差容忍**：`docs-check` 的 2 项失败是 `PROJECT_RULES` 6.4 登记在案、长期保留的历史提交
+ * 信息偏差，不会去修。故本判定在"剩下的失败全是已登记偏差"时接受两种权威值：
+ * ①**含已登记偏差的合计**（`agg.passed`，即 README 当前写法）
+ * ②**真实通过数**（`agg.passed - 已知偏差数`，即"偏差修掉后应达到"的值）
  * 这样无论那两项偏差将来修掉与否，权威区只要同步过就不会假失败。
+ * 注意：豁免判据**不是**"脚本叫 docs-check"，而是 `REGISTERED_DEVIATIONS[脚本名]` 的条数与断言名。
+ *
+ * @param {{passed:number}} agg 本轮各脚本汇总行里 passed 的合计
+ * @param {Array<{suite:{name:string},status:string,summary?:object,out?:string}>} results 本轮各脚本结果
+ * @returns {{ok:boolean,kind:string,detail:string}}
  */
 function verifyAuthorityTotals(agg, results) {
   const offlineAll = SUITES.filter(s => !s.needBrowser).map(s => s.name);
   const ran = new Set(results.map(r => r.suite.name));
   const missing = offlineAll.filter(n => !ran.has(n));
   if (missing.length) {
-    return { ok: true, kind: 'skipped', detail: `本轮未跑全离线门禁（缺 ${missing.length} 个），跳过权威数字比对` };
+    return { ok: true, kind: 'skipped',
+      detail: `**未执行**：本轮未跑全离线门禁（缺 ${missing.length} 个：${missing.join('、')}）` +
+        ' —— 不拿残缺的账去比权威值（`--only` 跑子集时属正常）' };
   }
   let readme = '';
   try { readme = fs.readFileSync(path.join(env.paths.tests, 'README.md'), 'utf8'); } catch (err) {
@@ -275,15 +384,26 @@ function verifyAuthorityTotals(agg, results) {
   const stated = numeric.matchNumber(line, /合计\s*\*{0,2}\s*(\d+)\s*通过/);
   if (stated === null) return { ok: false, kind: 'broken', detail: '权威区里找不到"合计 N 通过"' };
 
-  /* 前置条件：只允许"除 docs-check 外全绿"这一种情况。
-     2026-09-20 修正判据：原来用 `status !== 'passed'`，把 `skipped`（浏览器类脚本在本环境
-     显式退 3）也算成"失败脚本"。改为只认 failed/error/unverified（见 `authorityBlockers`）。
-     返回值仍是 `ok:false`（既有 `harness-check` 回归断言按此口径），但**带上 kind='blocked'**，
-     由调用方区分"账目不完整"与"权威数字真的漂移"——后者才是要把 exit code 归因给权威校验的那种。 */
+  /* 前置条件：失败/异常/未核实必须**全部是已登记偏差**（判据见 REGISTERED_DEVIATIONS）。
+     被挡下时逐条说明"为什么它不算已登记偏差"，并点名脚本 —— 不许只写一句"未核对"。
+     判据演进：原来用 `status !== 'passed'`（把 skipped 也算成失败）→ 曾改为按脚本名整体豁免
+     docs-check（就是 P3-6 的口子）→ 现在按条数与断言名逐条核对。 */
   const blockers = authorityBlockers(results);
   if (blockers.length) {
+    const why = results.filter(r => blockers.includes(r.suite.name)).map(r => {
+      const reg = REGISTERED_DEVIATIONS[r.suite.name];
+      const failed = r.summary && Number.isFinite(r.summary.failed) ? r.summary.failed : null;
+      if (!reg) return `${r.suite.name}（${r.status}，不在已登记偏差之列）`;
+      if (r.status !== 'failed') return `${r.suite.name}（${r.status}，已登记偏差只认 failed，故不豁免）`;
+      if (failed !== null && failed > reg.failedAssertions) {
+        return `${r.suite.name}（失败 ${failed} 条 > 已登记 ${reg.failedAssertions} 条，属未登记的新问题）`;
+      }
+      return `${r.suite.name}（failed，但失败清单里有已登记清单之外的断言名）`;
+    });
     return { ok: false, kind: 'blocked',
-      detail: `本轮账目不完整（${blockers.join('、')} 未通过），权威数字未核对 —— 先修它们` };
+      detail: `**未执行**：本轮账目不完整 —— ${why.join('；')}；` +
+        `涉及脚本：${blockers.join('、')}（先修它们，修完重跑再比；` +
+        `权威区写 ${stated}、本轮实跑 ${agg.passed} 仅供参考，**未核对**）` };
   }
   const docsCheck = results.find(r => r.suite.name === 'docs-check');
   const knownDeviations = docsCheck && docsCheck.summary ? docsCheck.summary.failed : 0;
@@ -490,9 +610,10 @@ function main() {
   process.exit(0);
 }
 
-/* 被 require 时**不执行**：`harness-check` 要直接引用 classify/parseSummary 做规则回归，
-   不能因为 require 一下就把 15 个门禁全跑一遍。 */
-module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals, authorityBlockers };
+/* 被 require 时**不执行**：`harness-check` 要直接引用 classify/parseSummary/authorityBlockers/
+   REGISTERED_DEVIATIONS 做规则回归，不能因为 require 一下就把全部门禁跑一遍。 */
+module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals, authorityBlockers,
+  REGISTERED_DEVIATIONS, failedAssertionNames };
 
 if (require.main === module) {
   try {

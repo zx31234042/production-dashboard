@@ -206,6 +206,73 @@ const MAP = [
   ['DEP-12,DEP-13,DEP-14,DEP-15', 'declared-gap', '', '现场实施清单 / 技术支持方式 / 质保与响应时效 / 三方联调计划：均属**商务与现场条款**，非软件可验证（现场实施与合同阶段落实）']
 ];
 
+/* ---------------- AC 验收标准追溯表（AC-01～AC-12） ----------------
+   ⚠️ **AC 走独立分母，绝不并入上面的 256 条**：需求 §0.2（`需求文档\…V1.30.md:153`）已声明
+   AC「**不计入上方需求条款合计**（验收口径，非功能条目；重复计入会与"每条条款都有归属"的追溯分母冲突）」。
+   故本表的归属**只进"AC 覆盖 X / 12"这一行**，`可追溯覆盖合计 X / 256` 的分子分母一律不受影响。
+   条目格式与 MAP 完全一致：[AC 编号, 状态, 证据脚本, 证据文本]；状态词表沿用本文件头部。
+   **证据纪律**：本表只登记**现有**证据，不刷覆盖率 —— 没有对应断言的一律 `script: ''`，
+   并在第 5 列写明"为什么没有"；把 8 小时当 7 天、把 SKIP 当通过都属不合格（见 AC-07 / AC-12）。
+   立案：架构评审报告 A-2026-09-20-01 的 P1-2（`项目记录\架构评审报告-2026-09-20-01.md:69`–`76`）。 */
+
+/**
+ * 全部 AC 验收标准（AC-01～AC-12），取自需求清单的表格行。
+ * ⚠️ 与 `requirementClauses()` **故意分开**：那个函数的口径是 §0.2 的 256 条需求条款，
+ *    AC 不在其中；混进去就不是"顺带补覆盖"，而是把验收口径并进需求分母（§0.2 明令禁止）。
+ * ⚠️ AC 表的列是「编号 / 验收项 / 判定标准」**三列**，判定标准在**第 3 格**（第 2 格是"稳定性测试"这类名称）。
+ *    取错格会让下面的 AC-07 专项断言读到空串（实测踩过：写 `([^|]*)` 取到的是"稳定性测试"）。
+ * @returns {Map<string,string>} AC 编号 → 判定标准摘要（压平换行与多余空格，截 60 字）
+ */
+function acceptanceCriteria() {
+  const file = fs.readdirSync(path.join(ROOT, '需求文档')).find(f => f.endsWith('.md'));
+  const lines = fs.readFileSync(path.join(ROOT, '需求文档', file), 'utf8').split('\n');
+  const map = new Map();
+  for (const l of lines) {
+    const m = l.match(/^\|\s*(AC-\d+)\s*\|\s*([^|]*)\|\s*([^|]*)\|/);
+    if (m) map.set(m[1], m[3].trim().replace(/\s+/g, ' ').slice(0, 60));
+  }
+  return map;
+}
+
+/** AC 追溯表（见上方口径说明） */
+const AC_MAP = [
+  /* ——— 有机器证据可复跑的一类 ——— */
+  ['AC-03', 'covered-indirect', 'ui-check.js', '单次 tick + 10 个组件全量重绘耗时',
+    'NFR-01/NFR-02 的"秒级刷新"侧：ui-check 实测单次 tick + 10 个组件全量重绘 < 200 ms（实跑约 0.1 ms，见 tests\\README.md:190），1 秒周期余量充足；但"状态与参数秒级刷新"的端到端时延与时钟推进本身要真机/浏览器（stress-check 的"时钟持续推进"断言在本环境整脚本跳过），故记间接。'],
+  ['AC-06', 'covered-direct', 'contract-check.js', '数据冻结时界面判据 state.device.link 转为断连',
+    '断链降级判据有直接断言：数据冻结后 state.device.link 转 offline；补收/补传由 flushPending 补齐队列（contract-check）+ 重开后行数不变且去重键仍生效（db-check）承接。界面横幅与离线文案由 browser-check 断言（本环境不可复跑）。'],
+  ['AC-08', 'covered-direct', 'ui-check.js', 'FR-5.4 报警卡显示闭环状态',
+    '故障→报警→处理→闭环的界面链路：报警编号/类型、描述与处理信息（发生时间/等级/处理人/处理措施）、闭环状态均按行断言，且当班异常台账接收新闭环报警（contract-check）。"留痕可追溯"的**存储侧**需后端/部署阶段。'],
+  ['AC-09', 'covered-indirect', 'docs-check.js', 'index.html 不引用任何外链资源（NFR-25 内网隔离）',
+    '"无外网访问"有直接断言：index.html 不外链任何资源、src/ 不引第三方库；"未解锁无法修改维保/公告"由 browser-check 的 ?unlock=1 启动即解锁断言承接（**依赖浏览器权限，本环境不可复跑**）；"密码策略有效"属 declared-gap（README 已知限制 1：前端明文口令，须服务端校验与哈希）。'],
+
+  /* ——— 只有间接/前置件的一类 ——— */
+  ['AC-04', 'covered-indirect', 'ui-check.js', 'UI-03 色彩规范',
+    '**可机检的只有前置件**：大屏关键数据的字号下限（UI-04 逐角色断言）、UI-03 色彩规范、"航行器深度"已渲染（browser-check）都有断言；但"75 寸 4K@30Hz、4～8 m 距离清晰可读"是**现场人工观感判定**，机器断言只能证明"字号不低于规范下限"，**不构成**距离可读性的验收结论。'],
+  ['AC-10', 'covered-indirect', 'logic-check.js', '累计运行持久化：重启不倒退、跨班次不清零（DR-17）',
+    '"断电重启后数据恢复"的**数据侧**：logic-check 断言累计运行重启不倒退、db-check 断言重开后行数不变且去重键仍生效；但"重启后**无需人工干预自动恢复显示**"属部署/无人值守（DEP-02～DEP-06、ENV-20 自启与自动拉起），纯前端 Demo 无法验证。'],
+
+  /* ——— 无机器证据的一类（如实标注，不用 8 小时或跳过充当通过） ——— */
+  ['AC-01', 'manual', '', '',
+    '"P0 条目 100% 实现并现场演示通过"的判定对象是**现场演示**与"P0 清单逐条过"的组织动作；trace-check 的"优先级×状态"只是**旁证**（P0 184 条中可追溯覆盖 126 条），该比率**不等于**实现完备度（分子含间接验证，且部分 P0 依赖后端/硬件/现场），故不得据此声称 AC-01 满足，须人工/现场判定。'],
+  ['AC-02', 'declared-gap', '', '',
+    '"与 PC 上位机源头抽样比对一致率 100%"需要**真实上位机数据源**逐点抽样比对；Demo 用的是 mock 报文（contract-check 只证明缺字段不清零、字段映射可配置），**无从比对源头数据**，故为已声明缺口。'],
+  ['AC-05', 'backend-phase', '', '',
+    'IF-D 与上位机、IF-A/IF-B 与 MES 的**联调通过**属三方现场联调（IF-B.1～B.7/B.10、IF-D.7/D.10/D.12 亦整段归 backend-phase）；现有机器证据只到**契约层**（13 字段上报报文、两种回执风格、失败进入待补传队列——contract-check），接口函数名有断言而实现整批 pending，不足以构成联调结论。'],
+  ['AC-07', 'declared-gap', '', '',
+    '**⚠️ 唯一相关证据不构成满足**：验收要求"连续运行 ≥7 天无重启、无崩溃、无内存泄漏"（需求 :705），而现有唯一证据是 tests\\stress-check.js 的**默认 8 小时**整班次长跑（HOURS 默认 8，`stress-check.js:39`；tests\\README.md:257 自己写明"**8 小时 ≠ 验收要求**"，另参照 NFR-05 的 72 h 与 NFR-06 的 30 天）；**且该脚本在本受限环境整脚本 SKIP**（`stress-check.js:252` 的 env.skipSuite；本环境禁命名管道 ⇒ 退出码 3，按项目口径"**跳过 ≠ 通过**"）。**8 小时不得当 7 天、SKIP 不得当通过**：现有证据 0 条，故记 declared-gap。'],
+  ['AC-11', 'declared-gap', '', '',
+    '"看板软硬件成套实物交付 + 现场演示验收通过 + 与父项目 M6 对齐"属**商务与硬件交付**条款（与 DEP-12～DEP-15 同类），验收动作在现场/合同阶段，仓库内无对应机器证据，亦非纯软件可验。'],
+  ['AC-12', 'declared-gap', '', '',
+    '第 10 章 12 项交付物现况（实盘点）：`输出文件\\` 只有 4 份函件 + 1 份 Demo 说明（甲方 2 + 上位机方 1 + MES 方 1，各含 .md/.docx）；其中"需求规格说明书"对应需求清单本身，**其余 10 项**（系统设计说明书、界面原型/UI 设计稿、数据库脚本与初始化数据、源代码与构建说明、安装包与部署手册、接口联调文档与测试报告、测试报告、用户操作手册/运维手册、培训与验收报告、质保承诺书）无交付件；trace-check 侧仅 DEP-07 一条 declared-gap 登记了部署/运维/排障手册的缺失。"通过审核"属人工评审。']
+];
+
+/** AC 归属类型词表（与本文件头部状态词表一致；AC 段靠它拦"写了个不存在的分类"） */
+const STATUS_WORDS = new Set([
+  'covered-direct', 'covered-indirect', 'fix-pending', 'declared-gap',
+  'backend-phase', 'manual', 'subjective', 'out-of-scope'
+]);
+
 /* ---------------- 断言与工具 ---------------- */
 let passed = 0;
 const failures = [];
@@ -402,6 +469,93 @@ function main() {
   }
   const p0 = byPrio.get('P0');
   console.log(`  **AC-01 提示**：标注为 P0 的共 ${p0.total} 条，可追溯覆盖 ${p0.covered} 条 —— 该比率**不等于**"P0 100% 实现"（分子含间接验证，且部分 P0 依赖后端/硬件/现场）。`);
+
+  /* 六、AC 验收标准追溯（AC-01～AC-12；P1-2）
+     为什么单列一节而不是塞进 MAP：需求 §0.2（`需求文档\…V1.30.md:153`）声明 AC「不计入需求条款合计」，
+     故 AC 必须走**独立分母（12）**，不得改动"可追溯覆盖合计 X / 256"。 */
+  console.log('\n=== 六、AC 验收标准追溯（AC-01～AC-12，**不计入上面的 256 条分母**）===');
+  const acUniverse = acceptanceCriteria();
+  /* 第 3 步"证据文本确实在该脚本里"的容器提前取出：AC 段与主表**同规格**校验。 */
+  const MAP_SRC = new Map(MAP.map(([pattern, , script]) => [pattern, script]));
+
+  const acFlat = [];
+  for (const [id, status, script, evidence, basis] of AC_MAP) acFlat.push(`${id}\t${status}\t${script}\t${evidence}\t${basis}`);
+  const acOwner = new Map();
+  const acDup = [];
+  for (const [id, status, script, evidence, basis] of AC_MAP) {
+    if (acOwner.has(id)) acDup.push(`${id}（与 ${acOwner.get(id)[0]} 重复）`);
+    acOwner.set(id, [status, script, evidence, basis]);
+  }
+  const acUnassigned = [...acUniverse.keys()].filter(id => !acOwner.has(id));
+  const acInvalid = [
+    ...AC_MAP.filter(([id]) => !acUniverse.has(id)).map(([id]) => `${id}（需求清单里没有这条 AC）`),
+    ...AC_MAP.filter(([, status]) => !STATUS_WORDS.has(status)).map(([id, status]) => `${id}（状态词「${status}」不在词表内）`),
+    ...AC_MAP.filter(([, , script, evidence]) => (script && !evidence) || (!script && evidence))
+      .map(([id]) => `${id}（证据脚本与证据文本必须同时给出或同时为空）`),
+    ...AC_MAP.filter(([, , , , basis]) => !basis || !basis.trim()).map(([id]) => `${id}（缺"依据"一句话）`)
+  ];
+  /* 判据（与第 1 步同规格）：每条 AC 都必须**在表里出现**，且状态/证据/依据都写实。
+     ⚠️ 为何还要 `AC_MAP.length === acOwner.size`：防止**重复登记**（同一 AC 写两遍会让"条数"看着够）。
+     反证（ADR-0004 D22 定点变异）：把某条 AC 的编号改掉（等价于删掉该条），本条由全绿转红并点名该编号 ——
+     实测把 `AC-09` 改成 `AC-XX-MUTATED-AWAY` 后，detail 直接给出「未归属 1 条：AC-09」、汇总由 8/0/0 变 7/1/0、退 1。 */
+  check('AC-01～AC-12 每条都有归属、无遗漏（缺一即红）',
+    AC_MAP.length === acOwner.size && acUnassigned.length === 0 && acDup.length === 0 && acInvalid.length === 0,
+    acUnassigned.length
+      ? `未归属 ${acUnassigned.length} 条：${acUnassigned.join(', ')}`
+      : (acDup.length || acInvalid.length ? [...acDup, ...acInvalid].join('；') : `已归属 ${acOwner.size} 条 = 需求表 ${acUniverse.size} 条`));
+
+  /* AC 段证据有效性：与第 2 步同规格（脚本存在 + 证据文本确实在该脚本里），不是"登记了就算数"。 */
+  const acBadScript = [];
+  const acBadEvidence = [];
+  for (const [id, , script, evidence] of AC_MAP) {
+    if (!script) continue;
+    const p = path.join(TESTS, script);
+    if (!fs.existsSync(p)) { acBadScript.push(`${id} → ${script}`); continue; }
+    if (evidence && !fs.readFileSync(p, 'utf8').includes(evidence)) acBadEvidence.push(`${id} → ${script} 中找不到「${evidence}」`);
+  }
+  check('AC 证据指向的脚本都存在', acBadScript.length === 0, acBadScript.join('；'));
+  check('AC 证据指向的断言确实存在于该脚本', acBadEvidence.length === 0, acBadEvidence.slice(0, 6).join('；'));
+
+  /* AC 分区汇总（AC 的状态词允许与主表不同：backend-phase / declared-gap 在 AC 里同样正当）。
+     分母一律取**需求表的条数**（acUniverse.size），不取追溯表行数 —— 否则漏登一条时会显示"12 条"自欺。 */
+  const byAc = new Map();
+  for (const [id, [status]] of acOwner) byAc.set(status, (byAc.get(status) || 0) + 1);
+  console.log(`  AC 合计（需求 §0.2 声明 ${acUniverse.size} 条，**不计入上面的 256 条分母**）：已登记 ${AC_MAP.length} 条，覆盖到 ${[...acOwner.keys()].filter(id => acUniverse.has(id)).length} / ${acUniverse.size} 条`);
+  for (const [k, v] of [...byAc].sort((a, b) => b[1] - a[1])) console.log(`  ${k.padEnd(16)} ${String(v).padStart(3)} 条`);
+
+  /* AC 覆盖率单独成行 + 逐条清单（编号 / 归属类型 / 证据脚本或"无" / 依据一句话）。
+     两种分子都报，避免"AC 覆盖高"被误读：可复跑＝不依赖 browser/overlap/stress 的机器证据。 */
+  const acCov = (byAc.get('covered-direct') || 0) + (byAc.get('covered-indirect') || 0);
+  const acScriptDependent = [...acOwner].filter(([, v]) => {
+    const s = v[0];
+    return (s === 'covered-direct' || s === 'covered-indirect') && ONLINE_ONLY.has(v[1]);
+  }).length;
+  const acNoMachine = acUniverse.size - acCov;
+  console.log(`  AC 覆盖 ${acCov}/${acUniverse.size}（可复跑 ${acCov - acScriptDependent}/${acUniverse.size}、含需浏览器权限 ${acScriptDependent} 条；无机器证据 ${acNoMachine} 条）`);
+  console.log(`  AC 逐条归属（编号 / 归属类型 / 证据脚本或"无" / 依据一句话）：`);
+  for (const [id, [status, script, evidence, basis]] of acOwner) {
+    console.log(`    ${id}  ${status.padEnd(16)} ${(script || '无').padEnd(18)} ${basis}`);
+  }
+
+  /* AC-07 专项如实标注：要求 ≥7 天，证据只有 8 小时且整脚本跳过 —— 不构成满足。
+     为什么单独立一条：这是本次唯一"证据看着有、其实不成立"的条目，必须被定点变异之外的第二道机器检查钉住，
+     否则以后很容易被写成"已有 8 小时长跑 ⇒ 基本满足"。 */
+  const ac07reqDays = Number((acUniverse.get('AC-07') || '').match(/≥\s*(\d+)\s*天/)?.[1] || 0);
+  const stressHours = Number(fs.readFileSync(path.join(TESTS, 'stress-check.js'), 'utf8').match(/DSH_STRESS_HOURS\s*\|\|\s*(\d+)/)?.[1] || 0);
+  const ac07rec = acOwner.get('AC-07') || ['', '', '', ''];
+  check('AC-07 如实登记为无有效证据（≥7 天 vs 现有 8 小时且整脚本跳过，不构成满足）',
+    ac07reqDays >= 7 && stressHours > 0 && stressHours < ac07reqDays * 24 &&
+    ac07rec[0] === 'declared-gap' && !ac07rec[1] && /跳过/.test(ac07rec[3] || ''),
+    `AC-07 要求 ≥${ac07reqDays} 天、stress-check 默认 ${stressHours} 小时（整脚本跳过）、登记状态 ${ac07rec[0]}, 证据脚本 ${ac07rec[1] || '无'}`);
+
+  /* AC 与需求条款两套分母的隔离：AC 段本身不得与主表的证据引用混同（同一个脚本名两侧都用得到，
+     但"AC 覆盖率"绝不能改写主表口径）—— 这里只作提示，真正的隔离由本节的独立计数与
+     上面"可追溯覆盖合计 / owner.size(=256)"保证。 */
+  const acSharedScripts = [...new Set(AC_MAP.map(([, , s]) => s).filter(Boolean))]
+    .filter(s => [...MAP_SRC.values()].includes(s));
+  if (acSharedScripts.length) {
+    console.log(`  [提示] AC 段与需求条款主表共用 ${acSharedScripts.length} 个证据脚本（正当）：${acSharedScripts.join('、')}`);
+  }
 
   if (LIST) {
     console.log('\n=== 附：全部条款归属 ===');
