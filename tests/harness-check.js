@@ -540,6 +540,44 @@ t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTota
   }
   t.check('回归结束后 README 已被还原（不留改写痕迹）',
     fs.readFileSync(readmePath, 'utf8') === original, '');
+
+  /* ---------------- 十之二、权威校验的"可达性"回归（2026-09-20 补） ----------------
+     立案原因：`verifyAuthorityTotals` 写得再对，**只要调用点被放在提前退出之后，它就一次都不会执行**。
+     实际发生过：调用点在 `if (failed.length) { … process.exit(1) }` 之后，而 `docs-check`
+     因 2 项 6.4 已登记偏差**永远失败** ⇒ 该函数成了不可达代码，
+     `tests\README.md` 第三节自称的"唯一真源 + 与实跑比对"从来没有兑现过一次。
+     两类断言：① 前置条件判据的真值表（纯函数 `authorityBlockers`）；
+              ② **静态断言调用顺序** —— 调用点必须在提前退出之前（这条才是直接防复发的）。 */
+  const blockersOf = (rows) => runAll3.authorityBlockers(rows.map(([name, status]) =>
+    ({ suite: { name }, status })));
+  const truth = [
+    [['docs-check', 'failed'], [], '只 docs-check 失败 → 允许比对'],
+    [[], [], '全绿 → 允许比对'],
+    [[['browser-check', 'skipped'], ['docs-check', 'failed']], [], 'skipped 不算失败（浏览器类退 3）'],
+    [[['screenshot-diff', 'failed'], ['docs-check', 'failed']], ['screenshot-diff'], '有别的失败 → 阻止比对'],
+    [[['db-check', 'unverified'], ['docs-check', 'failed']], ['db-check'], 'unverified 也算阻止（没证据不等于通过）'],
+    [[['logic-check', 'error']], ['logic-check'], 'error 阻止比对'],
+    [[['docs-check', 'failed'], ['docs-check', 'passed']], [], '多个 docs-check 条目也只认这一个豁免']
+  ];
+  const truthBad = truth.filter(([rows, want]) => {
+    const got = blockersOf(rows);
+    return JSON.stringify(got) !== JSON.stringify(want);
+  });
+  t.check('权威比对前置条件：真值表逐条正确（failed/error/unverified 阻止；skipped 不阻止）',
+    truthBad.length === 0,
+    truthBad.length ? truthBad.map(([rows, want]) =>
+      `${JSON.stringify(rows)} 期望 ${JSON.stringify(want)} 实得 ${JSON.stringify(blockersOf(rows))}`).join('；')
+      : `共 ${truth.length} 个场景`);
+
+  /* 静态断言：调用点位置。用"源码中两者的字符下标"比较，脱离格式化（缩进/空行）差异。 */
+  const runAllSrc = fs.readFileSync(path.join(__dirname, 'run-all.js'), 'utf8');
+  const callAt = runAllSrc.indexOf('const auth = verifyAuthorityTotals(');
+  const earlyExitAt = runAllSrc.indexOf('if (failed.length) {');
+  t.check('权威校验的调用点早于「失败脚本明细 + 提前退出」（否则该机制不可达）',
+    callAt > 0 && earlyExitAt > 0 && callAt < earlyExitAt,
+    callAt < 0 ? '源码里找不到 verifyAuthorityTotals 的调用'
+      : earlyExitAt < 0 ? '源码里找不到 `if (failed.length) {` 提前退出'
+      : `调用点下标 ${callAt}，提前退出下标 ${earlyExitAt} —— 调用点必须更小`);
 }
 
 t.finish();

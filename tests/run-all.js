@@ -226,6 +226,28 @@ function writeRunTotals(results) {
 }
 
 /**
+ * 权威数字比对的**前置条件**（纯函数，供 `harness-check` 做真值表回归）。
+ *
+ * 只有"除 `docs-check` 外没有任何失败/未核实脚本"时，本轮账目才完整、才能拿去和权威区比。
+ * 依据：`docs-check` 的 2 项失败是 `PROJECT_RULES` 6.4 登记在案、**长期保留**的历史提交信息偏差
+ * （决定不改写历史，所以它永远是红的），因此它是唯一被允许的失败项；其余任何失败
+ * （典型：候选图未抓取导致 `screenshot-diff` 失败）都会让本轮通过数偏低，
+ * 此时比对只会报出**误导性的"权威数字漂移"**。
+ *
+ * 判据只认 `failed` / `error` / `unverified`：
+ * `skipped`（浏览器类脚本在本环境显式退 3）**不是失败**，按既有口径不影响比对。
+ *
+ * @param {Array<{suite:{name:string},status:string}>} results
+ * @returns {string[]} 阻止比对的脚本名（空数组＝可以比对）
+ */
+function authorityBlockers(results) {
+  const BLOCKING = ['failed', 'error', 'unverified'];
+  return results
+    .filter(r => BLOCKING.includes(r.status) && r.suite.name !== 'docs-check')
+    .map(r => r.suite.name);
+}
+
+/**
  * 收尾校验 `tests\README.md` 第三节的**权威数字**与本轮实跑是否一致（P2-22）。
  * 为什么放在 runner 而不是某个门禁脚本里：本 runner 是唯一持有"本轮最终账"的地方
  * （suite 成员跑到自己时还看不到后面的脚本），且它不会自递归。
@@ -242,22 +264,26 @@ function verifyAuthorityTotals(agg, results) {
   const ran = new Set(results.map(r => r.suite.name));
   const missing = offlineAll.filter(n => !ran.has(n));
   if (missing.length) {
-    return { ok: true, detail: `本轮未跑全离线门禁（缺 ${missing.length} 个），跳过权威数字比对` };
+    return { ok: true, kind: 'skipped', detail: `本轮未跑全离线门禁（缺 ${missing.length} 个），跳过权威数字比对` };
   }
   let readme = '';
   try { readme = fs.readFileSync(path.join(env.paths.tests, 'README.md'), 'utf8'); } catch (err) {
-    return { ok: false, detail: `读不到 tests\\README.md：${err.message}` };
+    return { ok: false, kind: 'broken', detail: `读不到 tests\\README.md：${err.message}` };
   }
   const numeric = require('./lib/numeric');
   const line = readme.split('\n').find(l => l.includes('离线可跑部分')) || '';
   const stated = numeric.matchNumber(line, /合计\s*\*{0,2}\s*(\d+)\s*通过/);
-  if (stated === null) return { ok: false, detail: '权威区里找不到"合计 N 通过"' };
+  if (stated === null) return { ok: false, kind: 'broken', detail: '权威区里找不到"合计 N 通过"' };
 
-  /* 已登记偏差：只允许"除 docs-check 外全绿"这一种情况 */
-  const failedOthers = results.filter(r => r.status !== 'passed' && r.suite.name !== 'docs-check' &&
-    !r.suite.needBrowser);
-  if (failedOthers.length) {
-    return { ok: false, detail: `除 docs-check 外还有失败脚本（${failedOthers.map(r => r.suite.name).join('、')}）—— 先修它们再看权威数字` };
+  /* 前置条件：只允许"除 docs-check 外全绿"这一种情况。
+     2026-09-20 修正判据：原来用 `status !== 'passed'`，把 `skipped`（浏览器类脚本在本环境
+     显式退 3）也算成"失败脚本"。改为只认 failed/error/unverified（见 `authorityBlockers`）。
+     返回值仍是 `ok:false`（既有 `harness-check` 回归断言按此口径），但**带上 kind='blocked'**，
+     由调用方区分"账目不完整"与"权威数字真的漂移"——后者才是要把 exit code 归因给权威校验的那种。 */
+  const blockers = authorityBlockers(results);
+  if (blockers.length) {
+    return { ok: false, kind: 'blocked',
+      detail: `本轮账目不完整（${blockers.join('、')} 未通过），权威数字未核对 —— 先修它们` };
   }
   const docsCheck = results.find(r => r.suite.name === 'docs-check');
   const knownDeviations = docsCheck && docsCheck.summary ? docsCheck.summary.failed : 0;
@@ -268,7 +294,7 @@ function verifyAuthorityTotals(agg, results) {
      注意：**不**接受两者的中间值（probing 时发现把 471 也放过了，那是错的）。 */
   const accepted = knownDeviations > 0 ? [agg.passed, truePass] : [agg.passed];
   if (!accepted.includes(stated)) {
-    return { ok: false, detail: `权威区写 ${stated}，本轮实跑 ${agg.passed}` +
+    return { ok: false, kind: 'mismatch', detail: `权威区写 ${stated}，本轮实跑 ${agg.passed}` +
       `（真实通过 ${truePass}）—— 权威数字已漂移，请同步 tests\\README.md 第三节` };
   }
   const allowanceNote = knownDeviations > 0 ? `（含已登记偏差 ${knownDeviations} 项，真实通过 ${truePass}）` : '';
@@ -278,9 +304,9 @@ function verifyAuthorityTotals(agg, results) {
     .filter(n => n.endsWith('-check') || n === 'screenshot-diff'))];
   const notListed = offlineAll.filter(n => !named.includes(n));
   if (notListed.length) {
-    return { ok: false, detail: `权威区漏列离线门禁：${notListed.join('、')}` };
+    return { ok: false, kind: 'broken', detail: `权威区漏列离线门禁：${notListed.join('、')}` };
   }
-  return { ok: true, detail: `权威区合计 ${stated} ＝ 本轮实跑 ${agg.passed}${allowanceNote}` };
+  return { ok: true, kind: 'ok', detail: `权威区合计 ${stated} ＝ 本轮实跑 ${agg.passed}${allowanceNote}` };
 }
 
 function main() {
@@ -409,6 +435,24 @@ function main() {
     for (const r of unverified) console.log(`  ── ${r.suite.name}：${r.detail}`);
   }
 
+  /* 权威数字校验（P2-22）：runner 是唯一持有本轮最终账的地方，故比对放这里做。
+     不通过即视为门禁失败 —— "自称权威值却没人看着"正是这条缺陷要堵的洞。
+     **位置很关键（2026-09-20 修正）**：必须放在下面 `if (failed.length)` 提前退出**之前**。
+     原实现把它放在"全绿收尾"段里，而 `docs-check` 因 2 项 6.4 已登记偏差**永远失败**，
+     于是这段校验从来没有执行过一次 —— 机制在源码里，但不可达（与 ADR-0004 要堵的
+     "通过数字 ≠ 已验证"同类：**"写了机制" ≠ "机制在跑"**）。
+     不可达性由 `harness-check` 的静态断言守着（调用点必须在提前退出之前）。 */
+  const auth = verifyAuthorityTotals(agg, results);
+  console.log(`\n权威数字校验：${auth.detail}`);
+  /* 只有"权威数字真的漂移 / 权威区不可用"才把 exit code 归因给权威校验；
+     `blocked`（本轮账目不完整）与 `skipped`（离线门禁没跑全）只如实报告，不在这里提前退出 ——
+     否则会抢在下面"失败脚本明细"之前退出，把真正的失败原因盖掉（本轮修的就是这个位置问题）。 */
+  if (auth.kind === 'mismatch' || auth.kind === 'broken') {
+    console.log('\n失败：tests\\README.md 第三节的权威数字与本轮实跑对不上（或权威区不可用）。');
+    console.log('处置：同步 tests\\README.md 第三节（权威值唯一真源），再重跑。');
+    process.exit(1);
+  }
+
   if (failed.length) {
     console.log('\n失败脚本明细（每个脚本的最关键几行）：');
     for (const r of failed) {
@@ -429,7 +473,8 @@ function main() {
   if (skipped.length) {
     console.log('\n提示：以上跳过项需在具备浏览器/命名管道权限的环境复跑，详见 tests\\README.md 第四节。');
   }
-  /* 收尾：清掉 24 小时前的临时区残留（P2-16 —— `harness.cleanup()` 此前只被"测试存在"，
+  /* 权威数字校验已在上方（提前退出之前）完成；此处不再重复。
+     收尾：清掉 24 小时前的临时区残留（P2-16 —— `harness.cleanup()` 此前只被"测试存在"，
      从未在真实运行里被调用过；放在全绿收尾处，既不干扰本轮用例，又能防止临时目录无限堆积）。 */
   try {
     const { cleanup } = require('./lib/harness');
@@ -440,15 +485,6 @@ function main() {
   } catch (err) {
     console.log(`\n  临时区收尾失败（不影响门禁结论）：${err && err.message}`);
   }
-  /* 权威数字校验（P2-22）：runner 是唯一持有本轮最终账的地方，故比对放这里收尾做。
-     不通过即视为门禁失败 —— "自称权威值却没人看着"正是这条缺陷要堵的洞。 */
-  const auth = verifyAuthorityTotals(agg, results);
-  console.log(`\n权威数字校验：${auth.detail}`);
-  if (!auth.ok) {
-    console.log('\n失败：tests\\README.md 第三节的权威数字与本轮实跑不一致。');
-    console.log('处置：同步 tests\\README.md 第三节（权威值唯一真源），再重跑。');
-    process.exit(1);
-  }
 
   console.log('\n门禁全绿（无失败脚本）。');
   process.exit(0);
@@ -456,7 +492,7 @@ function main() {
 
 /* 被 require 时**不执行**：`harness-check` 要直接引用 classify/parseSummary 做规则回归，
    不能因为 require 一下就把 15 个门禁全跑一遍。 */
-module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals };
+module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals, authorityBlockers };
 
 if (require.main === module) {
   try {
