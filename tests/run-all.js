@@ -19,6 +19,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
+const snapshot = require('./lib/snapshot');
+
 const env = require('./env');
 env.assertRuntime();
 
@@ -429,6 +431,75 @@ function verifyAuthorityTotals(agg, results) {
   return { ok: true, kind: 'ok', detail: `权威区合计 ${stated} ＝ 本轮实跑 ${agg.passed}${allowanceNote}` };
 }
 
+/* ==========================================================================
+   **工作区稳定性判定**（2026-09-20 新增；堵"被测文件正被并发写"这类假红）
+   --------------------------------------------------------------------------
+   事故形态（本会话实测）：门禁跑到一半，被测文件被**另一个进程**改写，于是门禁读到半写内容，
+   报出"实跑未产出可解析的汇总行""账本值 94/92 翻面"这类**假红**；主代理据此误判子代理越界。
+   这类结论**看起来**与"代码真的坏了"完全一样，光看输出分辨不出来 —— 所以要在机制上拦：
+   一轮运行内工作区被改写 ⇒ 该轮结论不得当作证据，且**不得**继续拿它去和权威数字比对
+   （否则会把"文件正在变"当成"权威区漂移"，进而去改 README —— 那是最坏的一种连锁误判）。
+   规则本体在 `tests\lib\snapshot.js`（纯函数 `diffSnapshots`，真值表见 harness-check 第十二节）；
+   这里只负责把规则结果翻译成"打印什么／退几"，并把这段判定抽成纯函数以便定点回归。
+   ========================================================================== */
+
+/**
+ * 根据"工作区稳定性"与"权威数字校验"的结果，决定**打印哪一句、退哪个码**（纯函数）。
+ *
+ * 优先级（顺序即优先级，**不得**调换）：
+ *   ① 工作区被改写 → 本轮结论不可作证据：跳过权威比对、退出码 1（先于一切"数字好不好看"）。
+ *   ② 权威数字漂移 / 权威区不可用 → 退出码 1（要同步 tests\README.md 第三节）。
+ *   ③ 本轮账目不完整（`blocked`）→ 退出码 1：**跳过了**对账就必须算不通过
+ *      （旧实现只打印一句"未核对"然后按"全绿"退 0，于是"没比对"被当成"比对通过"）。
+ *   ④ 离线门禁没跑全（`skipped`，如 `--only`/`--fast` 子集）→ 不构成失败（既有的正常形态）。
+ *   ⑤ 其余 → 通过。
+ *
+ * @param {Array<{path:string,kind:string}>} changed 本轮被改写的文件（空数组＝稳定）
+ * @param {{ok:boolean,kind:string,detail:string}} authority verifyAuthorityTotals 的结果
+ * @returns {{unstable:boolean, exitCode:number, titles:string[], detail:string, evidence:string}}
+ *          `titles` 为待打印的说明行（为空表示"按老样子收尾"）；`evidence` 是**证据状态**一行 ——
+ *          只有"稳定**且**权威比对真的跑了（ok）"才敢写"本轮实跑可作为证据"，其余一律写明缺口。
+ */
+function resolveGateOutcome(changed, authority) {
+  const list = Array.isArray(changed) ? changed : [];
+  if (list.length > 0) {
+    const shown = list.slice(0, 5).map(snapshot.describeChange).join('、');
+    const more = list.length > 5 ? ` 等 ${list.length} 项` : '';
+    return {
+      unstable: true,
+      exitCode: 1,
+      titles: [],
+      detail: `  ⚠ 本轮运行期间工作区被改写（${list.length} 个文件）：${shown}${more}`,
+      evidence: '证据状态：**本轮结论不可作为证据** —— 运行期间被测文件正在变化，' +
+        '读到的可能是半写内容，失败与通过都说明不了问题；**未与权威数字比对**（先让写入方停下，再复跑）'
+    };
+  }
+  const auth = authority || { ok: false, kind: 'broken', detail: '（权威校验未产出结果）' };
+  /* 证据标签只说**这轮到底核了什么**，不多说一个字：
+     · `ok === true`：工作区稳定**且**权威数字比对通过 → 这轮的账可以当证据；
+     · `kind === 'skipped'`：稳定，但**没跑全离线门禁 / 没做对账** → 只敢说"工作区比对已通过"，
+       **不许**写成"工作区稳定"（那是没核过的事实，跟"没比对"一样是拿默认值当结论）；
+     · `blocked` / `mismatch` / `broken`：核过但没过 → 明说"未经权威数字核对（对账未通过）"。 */
+  const evidence = (auth.ok === true && auth.kind !== 'skipped')
+    ? '证据状态：工作区稳定，且权威数字已核对（本轮实跑可作为证据）'
+    : (auth.kind === 'skipped'
+      ? '证据状态：运行期间工作区比对已通过（**未经权威数字核对**：本轮未跑全离线门禁 / 未做对账）'
+      : '证据状态：工作区稳定（**未经权威数字核对**：本轮对账未通过，实跑不能作权威证据）');
+  if (auth.kind === 'mismatch' || auth.kind === 'broken') {
+    return { unstable: false, exitCode: 1,
+      titles: ['\n失败：tests\\README.md 第三节的权威数字与本轮实跑对不上（或权威区不可用）。',
+        '处置：同步 tests\\README.md 第三节（权威值唯一真源），再重跑。'],
+      detail: '', evidence };
+  }
+  if (auth.kind === 'blocked') {
+    return { unstable: false, exitCode: 1,
+      titles: ['\n失败：本轮账目不完整，**已跳过**权威数字比对 —— 没比对就是没核实，不算通过。',
+        '处置：先修上面点名的问题脚本（或补齐已登记偏差），修完重跑再做对账。'],
+      detail: '', evidence };
+  }
+  return { unstable: false, exitCode: 0, titles: [], detail: '', evidence };
+}
+
 function main() {
   if (hasFlag('--list')) {
     console.log('=== 门禁脚本清单 ===');
@@ -455,6 +526,12 @@ function main() {
   console.log('=== 统一门禁（run-all） ===');
   console.log(`  ${env.describe()}`);
   console.log(`  共 ${suites.length} 个脚本${hasFlag('--fast') ? '（--fast：已跳过浏览器类与长跑）' : ''}\n`);
+
+  /* **运行开始时**的工作区快照（见上方"工作区稳定性判定"与 lib/snapshot.js）。
+     采集点很关键：必须在**任何子进程（含体检）启动之前** —— 体检与各门禁脚本都读工作区，
+     它们之间的改写同样属于"运行期间被改写"。快照自身只读、且落点 `tests\._verify\` 已被排除，
+     故不会自己把自己判成"不稳定"。**稳定轮不打印任何东西**：稳定态的行为与加本机制之前一致。 */
+  const snapBefore = snapshot.collectSnapshot();
 
   /* 管道能力探测：只影响"是否回放子进程输出到主控台"的观感。注意 **不能** 再让它影响结论 ——
      本 runner 现在无论有没有管道都把输出落文件后解析（见 runScript），所以两种环境不会出现两套账。 */
@@ -555,46 +632,85 @@ function main() {
     for (const r of unverified) console.log(`  ── ${r.suite.name}：${r.detail}`);
   }
 
-  /* 权威数字校验（P2-22）：runner 是唯一持有本轮最终账的地方，故比对放这里做。
-     不通过即视为门禁失败 —— "自称权威值却没人看着"正是这条缺陷要堵的洞。
+  /* ---------------- 权威数字校验与工作区稳定性复核 ----------------
      **位置很关键（2026-09-20 修正）**：必须放在下面 `if (failed.length)` 提前退出**之前**。
      原实现把它放在"全绿收尾"段里，而 `docs-check` 因 2 项 6.4 已登记偏差**永远失败**，
      于是这段校验从来没有执行过一次 —— 机制在源码里，但不可达（与 ADR-0004 要堵的
      "通过数字 ≠ 已验证"同类：**"写了机制" ≠ "机制在跑"**）。
-     不可达性由 `harness-check` 的静态断言守着（调用点必须在提前退出之前）。 */
+     不可达性由 `harness-check` 的静态断言守着（调用点必须在提前退出之前）。
+
+     **工作区稳定性复核（2026-09-20 新增）先于对账**：若本轮运行期间工作区被改写，结论本身
+     就不是证据，此时再拿它去比 `tests\README.md` 的权威数字，只会把"文件正在被写"读成
+     "权威区漂移"，进而误改权威区。故不稳定轮**根本不比对**（既不打印任何比对口径行，
+     也不打印"对账成功"）。快照范围与排除规则见 `tests\lib\snapshot.js`；判定是纯函数，
+     真值表见 harness-check 第十二节。`snapshot.collected === false`（目录读不到 / 采集出错）
+     按"拿不出证据"处理 —— 不许因为"拿不到证据"就默认稳定（规范 9.5-5 第 6 条）。 */
+  const snapAfter = snapshot.collectSnapshot();
+  const rewriteChanges = snapshot.diffSnapshots(snapBefore, snapAfter);
+  const snapshotProblem = snapBefore.collected ? '' : (snapBefore.reason || '基线快照采集失败');
+  const snapshotProblem2 = snapAfter.collected ? '' : (snapAfter.reason || '结束快照采集失败');
+
   const auth = verifyAuthorityTotals(agg, results);
-  console.log(`\n权威数字校验：${auth.detail}`);
-  /* 只有"权威数字真的漂移 / 权威区不可用"才把 exit code 归因给权威校验；
-     `blocked`（本轮账目不完整）与 `skipped`（离线门禁没跑全）只如实报告，不在这里提前退出 ——
-     否则会抢在下面"失败脚本明细"之前退出，把真正的失败原因盖掉（本轮修的就是这个位置问题）。 */
-  if (auth.kind === 'mismatch' || auth.kind === 'broken') {
-    console.log('\n失败：tests\\README.md 第三节的权威数字与本轮实跑对不上（或权威区不可用）。');
-    console.log('处置：同步 tests\\README.md 第三节（权威值唯一真源），再重跑。');
-    process.exit(1);
+  /* `verifyAuthorityTotals` 在账目不完整时**不比对** —— 此刻若再叠加"工作区被改写"，
+     就把它的口径改写为"未执行"，避免出现自相矛盾的输出（既说账目不完整、又说在比数）。 */
+  if (rewriteChanges.length > 0 || snapshotProblem || snapshotProblem2) {
+    const why = snapshotProblem ? `快照不可用（${snapshotProblem}）`
+      : snapshotProblem2 ? `快照不可用（${snapshotProblem2}）`
+        : `本轮运行期间工作区被改写（${rewriteChanges.length} 个文件）`;
+    auth.kind = 'skipped';
+    auth.ok = false;
+    auth.detail = `**未执行**：${why} —— 本轮结论不可作为证据，**未与权威数字比对**`;
   }
+  const changedForVerdict = (snapshotProblem || snapshotProblem2)
+    ? [{ path: `快照不可用：${snapshotProblem || snapshotProblem2}`, kind: 'changed' }]
+    : rewriteChanges;
+  const verdict = resolveGateOutcome(changedForVerdict, auth);
+  /* 不稳定轮**不打**权威数字校验那一行 —— 无论那一行写什么都容易被读成"比过了"。 */
+  const authLine = verdict.unstable ? '' : `\n权威数字校验：${auth.detail}`;
 
-  if (failed.length) {
-    console.log('\n失败脚本明细（每个脚本的最关键几行）：');
-    for (const r of failed) {
-      const lines = r.out.split('\n').filter(l => /\[FAIL\]|失败清单|^\s+\d+\.|脚本异常终止/.test(l)).slice(0, 8);
-      console.log(`\n  ── ${r.suite.name} ──`);
-      console.log(lines.map(l => '  ' + l).join('\n') || '  （无失败行可解析，请单独运行该脚本）');
+  /* 失败明细只打一遍：合并进下面那一份（P2-22 修正之后 **不应**在权威校验处提前退出，
+     否则会抢在"失败脚本明细"之前退出，把真正的失败原因盖掉）。 */
+  const tail = () => {
+    if (failed.length) {
+      console.log('\n失败脚本明细（每个脚本的最关键几行）：');
+      for (const r of failed) {
+        const lines = r.out.split('\n').filter(l => /\[FAIL\]|失败清单|^\s+\d+\.|脚本异常终止/.test(l)).slice(0, 8);
+        console.log(`\n  ── ${r.suite.name} ──`);
+        console.log(lines.map(l => '  ' + l).join('\n') || '  （无失败行可解析，请单独运行该脚本）');
+      }
+      console.log('\n提示：单独复跑某个脚本：node tests\\<名称>.js');
+      console.log(`\n本次各脚本输出已落盘：${path.relative(env.paths.root, path.join(env.paths.verify, 'run-all'))}\\`);
     }
-    console.log('\n提示：单独复跑某个脚本：node tests\\<名称>.js');
-    console.log(`\n本次各脚本输出已落盘：${path.relative(env.paths.root, path.join(env.paths.verify, 'run-all'))}\\`);
-    process.exit(1);
+    if (unverified.length) {
+      console.log('\n提示：未核实项说明脚本没给出可核实的结论（通常是不该退 0 却退了 0），须先修脚本。');
+    }
+    if (skipped.length) {
+      console.log('\n提示：以上跳过项需在具备浏览器/命名管道权限的环境复跑，详见 tests\\README.md 第四节。');
+    }
+  };
+
+  if (verdict.exitCode !== 0) {
+    /* 不稳定轮：**不打印**权威数字校验那一行（`authLine` 为空串）—— 那一行无论写什么都容易被读成"比过了"。 */
+    if (authLine) console.log(authLine);
+    if (verdict.unstable) console.log(verdict.detail);
+    else for (const line of verdict.titles) console.log(line);
+    tail();
+    console.log(`\n${verdict.evidence}`);
+    if (verdict.unstable) {
+      console.log('门禁结论：**本轮不通过**（工作区在运行期间被改写，结论不可作为证据）。');
+    } else {
+      console.log('门禁结论：不通过（详见上面的失败原因）。');
+    }
+    process.exit(verdict.exitCode);
   }
 
-  if (unverified.length) {
-    console.log('\n提示：未核实项说明脚本没给出可核实的结论（通常是不该退 0 却退了 0），须先修脚本。');
-    process.exit(1);
-  }
+  tail();
 
-  if (skipped.length) {
-    console.log('\n提示：以上跳过项需在具备浏览器/命名管道权限的环境复跑，详见 tests\\README.md 第四节。');
-  }
-  /* 权威数字校验已在上方（提前退出之前）完成；此处不再重复。
-     收尾：清掉 24 小时前的临时区残留（P2-16 —— `harness.cleanup()` 此前只被"测试存在"，
+  /* 到这一步说明本轮已经"没失败"了：证据标签放在最后一行，保证"稳定"是被记录下来的事实，
+     而不是"没打印东西"的默认解读。 */
+  console.log(`\n${verdict.evidence}`);
+
+  /* 收尾：清掉 24 小时前的临时区残留（P2-16 —— `harness.cleanup()` 此前只被"测试存在"，
      从未在真实运行里被调用过；放在全绿收尾处，既不干扰本轮用例，又能防止临时目录无限堆积）。 */
   try {
     const { cleanup } = require('./lib/harness');
@@ -613,7 +729,7 @@ function main() {
 /* 被 require 时**不执行**：`harness-check` 要直接引用 classify/parseSummary/authorityBlockers/
    REGISTERED_DEVIATIONS 做规则回归，不能因为 require 一下就把全部门禁跑一遍。 */
 module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals, authorityBlockers,
-  REGISTERED_DEVIATIONS, failedAssertionNames };
+  REGISTERED_DEVIATIONS, failedAssertionNames, resolveGateOutcome };
 
 if (require.main === module) {
   try {

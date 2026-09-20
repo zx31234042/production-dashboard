@@ -21,6 +21,7 @@ const { createRunner } = require('./lib/assert');
 const { createClock, parseTime, BOUNDARIES } = require('./lib/clock');
 const fixture = require('./lib/fixture');
 const harness = require('./lib/harness');
+const snapshot = require('./lib/snapshot');
 
 env.assertRuntime();
 const t = createRunner('夹具自检（harness-check）');
@@ -722,6 +723,247 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       ranAll.kind === 'mismatch' && !/未执行/.test(ranAll.detail), ranAll.detail);
   }
 }
+/* ---------------- 十二、"工作区稳定性"判定的真值表（2026-09-20 新增） ----------------
+   立案原因：门禁最怕的**不是**失败，而是"**被测文件正在被别的进程写**"——那时读到的半写内容
+   会被当成"代码坏了"。本会话已实际发生多起：`docs-cross-check` 报"files-check 实跑未产出可解析的
+   汇总行"（该脚本正被并发写）、同一份 README 下 `harness-check` 的账本值在 94/92 之间翻面、
+   变体被并发覆盖导致"计数在两次运行间翻面"，主代理据此误判子代理越界。
+   判据：一轮运行内工作区被改写 ⇒ 该轮结论不得当作证据（横幅 + 跳过权威比对 + 非 0 退出）。
+
+   本节只对**纯函数**做真值表（`snapshot.diffSnapshots` / `snapshot.isExcluded`），
+   不依赖"真有人并发写我的仓库"这种不可复现的条件；`run-all` 侧的可达性与调用顺序在第十三节。 */
+t.section('十二、工作区稳定性判定的真值表（运行期间被改写 ⇒ 本轮结论不可作证据）');
+{
+  const m = pairs => Object.fromEntries(pairs);
+  const A = m([['src/a.js', 'h1'], ['src/b.js', 'h2'], ['tests/x-check.js', 'h3']]);
+
+  {
+    const got = snapshot.diffSnapshots({ files: A }, { files: m([['src/a.js', 'h1'], ['src/b.js', 'H2'], ['tests/x-check.js', 'h3']]) });
+    t.check('内容变化被识别（kind=changed，且带上两轮哈希）',
+      got.length === 1 && got[0].path === 'src/b.js' && got[0].kind === 'changed' &&
+      got[0].before === 'h2' && got[0].after === 'H2', JSON.stringify(got));
+  }
+  {
+    const got = snapshot.diffSnapshots({ files: A }, { files: m([['src/a.js', 'h1'], ['src/b.js', 'h2'], ['tests/x-check.js', 'h3'], ['tests/n.yml', 'hY']]) });
+    t.check('新增文件被识别（kind=added，before=null）',
+      got.length === 1 && got[0].path === 'tests/n.yml' && got[0].kind === 'added' && got[0].before === null,
+      JSON.stringify(got));
+  }
+  {
+    const got = snapshot.diffSnapshots({ files: A }, { files: m([['src/a.js', 'h1'], ['src/b.js', 'h2']]) });
+    t.check('删除文件被识别（kind=removed，after=null）',
+      got.length === 1 && got[0].path === 'tests/x-check.js' && got[0].kind === 'removed' && got[0].after === null,
+      JSON.stringify(got));
+  }
+  {
+    const got = snapshot.diffSnapshots({ files: A }, { files: { ...A } });
+    t.check('稳定态返回空清单（**不是**"有变化但没打印"）', Array.isArray(got) && got.length === 0, JSON.stringify(got));
+  }
+  t.check('空清单边界：两份都空 → 空；空 → 有内容仍判**新增**（不许因"基线为空"就放行）',
+    snapshot.diffSnapshots({ files: {} }, { files: {} }).length === 0 &&
+    snapshot.diffSnapshots({ files: {} }, { files: m([['a.js', 'h']]) }).length === 1,
+    '空清单不能当成"没有变化"的挡箭牌');
+  t.check('缺失条目的边界：null/undefined/无 files 字段一律返回 []（**不抛错**），且不误报差异',
+    snapshot.diffSnapshots(null, null).length === 0 &&
+    snapshot.diffSnapshots(undefined, { files: A }).length === 0 &&
+    snapshot.diffSnapshots({ files: A }, undefined).length === 0 &&
+    snapshot.diffSnapshots({}, { files: {} }).length === 0 &&
+    snapshot.diffSnapshots({ files: A }, { files: A }).length === 0,
+    '入参缺失＝拿不到证据，由调用方另行处理（门禁里按"快照不可用"处理，不当成稳定）');
+  t.check('多种改写同时发生时全部列出，且按路径排序（判据必须可复现，不能靠遍历顺序）',
+    (() => {
+      const got = snapshot.diffSnapshots({ files: A },
+        { files: m([['src/a.js', 'H1'], ['src/c.js', 'h4'], ['tests/x-check.js', 'h3']]) });
+      const paths = got.map(c => c.path);
+      return got.length === 3 && paths.join('|') === 'src/a.js|src/b.js|src/c.js' &&
+        JSON.stringify(paths) === JSON.stringify([...paths].sort());
+    })(),
+    'a 改内容 / b 被删 / c 新增 —— 三条都要在，且顺序稳定');
+  t.check('路径统一为 posix 风格（跨平台清单可比、可打印；Windows 下 `path.relative` 会给反斜杠）',
+    (() => {
+      const r = snapshot.collectSnapshot();
+      return Object.keys(r.files).every(p => !p.includes('\\')) && snapshot.toPosix('a\\b\\c.js') === 'a/b/c.js';
+    })(), '');
+
+  /* 排除规则：`tests\._verify\` 是本机制自己的落盘点（各脚本日志、账本、临时库），
+     **必然**在运行期间被写；不排除则每轮都"不稳定"（D22 定点变异见下一条）。 */
+  t.check('排除规则：`._verify` 路径段被排除（含运 runners 的 run-all 日志与账本），其它目录不误伤',
+    snapshot.isExcluded('tests/._verify/run-all/x.log') &&
+    snapshot.isExcluded('tests/._verify/run-totals.json') &&
+    snapshot.isExcluded('tests/._verify/tmp/db/test.db') &&
+    !snapshot.isExcluded('tests/README.md') &&
+    !snapshot.isExcluded('src/x._verify.js') &&
+    !snapshot.isExcluded('tests/foo/._verifyish/a.js'),
+    '按**路径段**比较；`x._verify.js` 这类前缀不得误伤');
+  {
+    /* 真扫一遍（对临时目录采样，不动仓库）：`._verify` 下的改写必须看不见，`src/` 下的改写必须看见。
+       为什么采样而不是扫真仓：本节断言的是"扫描器的过滤行为"，用临时目录既能证明行为，
+       又不会因为"真仓里恰好写了什么"而红。 */
+    const root = harness.makeTempDir('stability-scan');
+    const put = (rel, text) => {
+      const full = path.join(root, rel);
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, text, 'utf8');
+    };
+    put(path.join('src', 'a.js'), 'const a = 1;\n');
+    put(path.join('server', 'b.sql'), 'select 1;\n');
+    put(path.join('tests', '._verify', 'run-all', 'a.log'), 'x\n');
+    put(path.join('tests', '._verify', 'run-totals.json'), '{}\n');
+    put(path.join('src', 'assets', 'shot.png'), 'not-really-png\n');
+    put(path.join('tests', 'screenshots-baseline', 'x.png'), 'not-really-png\n');
+    const listed = () => {
+      const snap = snapshot.collectSnapshot({ root });
+      return Object.keys(snap.files).sort();
+    };
+    const beforeList = listed();
+    put(path.join('tests', '._verify', 'run-all', 'a.log'), 'x changed\n');
+    put(path.join('tests', '._verify', 'run-totals.json'), '{"changed":1}\n');
+    const afterVerifyWrite = listed();
+    const verifyInvisible = JSON.stringify(beforeList) === JSON.stringify(afterVerifyWrite);
+    put(path.join('src', 'a.js'), 'const a = 2;\n');
+    const afterSrcWrite = listed();
+    const diff = snapshot.diffSnapshots(
+      snapshot.collectSnapshot({ root: root, dirs: snapshot.PROJECT_DIRS }),
+      { files: Object.fromEntries(afterSrcWrite.map(p => [p, 'x'])) });
+    t.check('零误伤（真扫）：`._verify` 下的落盘（脚本日志与账本）**不**计入清单',
+      verifyInvisible && !beforeList.some(p => p.includes('._verify')),
+      `扫描器给出 ${beforeList.length} 个文件：${beforeList.join('、')}`);
+    t.check('真扫：`src/` 下的内容改写会被清单看见（不是只扫不比对）；非文本文件（png）不入清单',
+      diff.some(c => c.path === 'src/a.js') &&
+      !beforeList.some(p => p.endsWith('.png')),
+      `清单含 ${beforeList.filter(p => p.startsWith('src/')).join('、')}`);
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  }
+
+  t.check('`describeChange` 的中文标签与 kind 一一对应（不稳定横幅直接复用它，不另写一份）',
+    ['added', 'removed', 'changed'].every(k => /新增|删除|内容变化/.test(snapshot.describeChange({ path: 'a.js', kind: k }))) &&
+    snapshot.describeChange({ path: 'a.js', kind: 'changed' }) === 'a.js（内容变化）',
+    snapshot.describeChange({ path: 'a.js', kind: 'changed' }));
+
+  t.check('快照自身可采（`collected === true`）且哈希取的是 SHA-256（64 位十六进制）',
+    (() => {
+      const snap = snapshot.collectSnapshot();
+      const keys = Object.keys(snap.files);
+      return snap.collected === true && keys.length > 0 &&
+        keys.every(k => /^[0-9a-f]{64}$/.test(snap.files[k])) &&
+        keys.every(k => snapshot.isTextFile(k)) &&
+        keys.every(k => !snapshot.isExcluded(k));
+    })(),
+    (() => { const s = snapshot.collectSnapshot(); return `${Object.keys(s.files).length} 个文本文件；` +
+      `root=${s.root}`; })());
+  t.check('本机清单只覆盖约定的四棵树，且不含 `._verify` / 二进制（判据范围可复核）',
+    (() => {
+      const keys = Object.keys(snapshot.collectSnapshot().files);
+      return keys.length > 0 &&
+        keys.every(k => snapshot.PROJECT_DIRS.some(d => k.startsWith(d + '/'))) &&
+        keys.every(k => snapshot.isTextFile(k) && !snapshot.isExcluded(k));
+    })(),
+    `范围：${snapshot.PROJECT_DIRS.join('、')}（共 ${Object.keys(snapshot.collectSnapshot().files).length} 个文本文件）`);
+}
+
+/* ---------------- 十三、稳定性判据与"跳过对账"的 runner 契约（含 D22 定点变异） ----------------
+   第十二节证明"判定算得对"，本节证明"runner 真的按它办"：横幅、跳过权威比对、退出码、
+   以及**调用顺序**（先复核稳定性，再对账）。D22：一条声称能挡住旧缺陷的断言，
+   用**旧写法**跑也必须被挡下 —— 否则它就是恒真的装饰。 */
+t.section('十三、稳定性判据与"跳过对账"的 runner 契约');
+{
+  const runAll5 = require('./run-all');
+  const runAllSrc5 = fs.readFileSync(path.join(__dirname, 'run-all.js'), 'utf8');
+  const authOk = { ok: true, kind: 'ok', detail: '权威区合计 1 ＝ 本轮实跑 1' };
+
+  const unstableV = runAll5.resolveGateOutcome([{ path: 'src/a.js', kind: 'changed' }], authOk);
+  t.check('不稳定 ⇒ 退出码非 0、标记 unstable、横幅含约定横幅头与"不可作为证据"',
+    unstableV.exitCode !== 0 && unstableV.unstable === true &&
+    unstableV.detail.includes('本轮运行期间工作区被改写（1 个文件）') &&
+    unstableV.detail.includes('src/a.js') &&
+    unstableV.evidence.includes('不可作为证据'),
+    unstableV.detail);
+  t.check('不稳定 ⇒ 证据标签写明"未与权威数字比对"（即使权威值当时是"对得上"）',
+    /未与权威数字比对/.test(unstableV.evidence), unstableV.evidence);
+  t.check('稳定 + 权威对账成功 ⇒ 退出码 0，且证据标签写明"权威数字已核对"',
+    (() => {
+      const v = runAll5.resolveGateOutcome([], authOk);
+      return v.exitCode === 0 && v.unstable === false && v.titles.length === 0 &&
+        /权威数字已核对/.test(v.evidence);
+    })(), runAll5.resolveGateOutcome([], authOk).evidence);
+  t.check('稳定但**未执行**比对（skipped）⇒ 不许谎称"已核对"、也不是失败',
+    (() => {
+      const v = runAll5.resolveGateOutcome([], { ok: true, kind: 'skipped', detail: '**未执行**：本轮未跑全离线门禁' });
+      return v.exitCode === 0 && v.unstable === false && /未经权威数字核对/.test(v.evidence) &&
+        !/已核对/.test(v.evidence);
+    })(), runAll5.resolveGateOutcome([], { ok: true, kind: 'skipped', detail: 'x' }).evidence);
+  t.check('稳定但权威数字漂移 ⇒ 退出码 1，且给出"同步 tests\\README.md 第三节"的处置',
+    (() => {
+      const v = runAll5.resolveGateOutcome([], { ok: false, kind: 'mismatch', detail: '权威区写 9，本轮实跑 1' });
+      return v.exitCode === 1 && v.unstable === false &&
+        v.titles.some(l => l.includes('处置：同步 tests\\README.md 第三节'));
+    })(), '漂移仍是退出码 1');
+  t.check('稳定但账目不完整（blocked）⇒ 退出码 1，且说明"已跳过权威数字比对"（没比对就是没核实）',
+    (() => {
+      const v = runAll5.resolveGateOutcome([], { ok: false, kind: 'blocked', detail: '**未执行**：本轮账目不完整' });
+      return v.exitCode === 1 && v.titles.some(l => l.includes('已跳过') && l.includes('权威数字比对'));
+    })(), 'blocked 由"只报告"收紧为失败：跳过对账不得当通过');
+
+  /* 静态契约：不稳定轮**不许**打印权威数字校验那一行（任何写法都容易被读成"比过了"）。 */
+  const authLineBranch = runAllSrc5.indexOf('verdict.unstable ?');
+  t.check('静态：不稳定时**不打**权威数字校验那一行（`verdict.unstable ? \'\' : …`）',
+    authLineBranch > 0 && /unstable\s*\?\s*''/.test(runAllSrc5.slice(authLineBranch, authLineBranch + 60)),
+    authLineBranch > 0 ? '已找到该分支' : 'run-all 里找不到"不稳定轮不打对账行"的分支');
+  t.check('静态：稳定性复核（`collectSnapshot` + `diffSnapshots`）先于对账（`verifyAuthorityTotals` 调用）',
+    (() => {
+      const after = runAllSrc5.indexOf('const snapAfter = snapshot.collectSnapshot()');
+      const diffAt = runAllSrc5.indexOf('const rewriteChanges = snapshot.diffSnapshots(');
+      const authAt = runAllSrc5.indexOf('const auth = verifyAuthorityTotals(');
+      return after > 0 && diffAt > after && authAt > diffAt;
+    })(), '顺序：结束快照 → 比对清单 → 对账（顺序反了就会拿"正在变"的账去比权威值）');
+
+  /* ---------------- D22 定点变异：旧写法必须被上面的断言挡下 ---------------- */
+  const legacyDiff = (before, after) => Object.keys(before.files || {})
+    .filter(k => (after.files || {})[k] !== before.files[k])
+    .map(k => ({ path: k, kind: 'changed' }));
+  t.check('变异①：旧写法（只比双方都有的键、只看内容变化）漏掉**新增与删除** —— 被第十二节断言挡下',
+    (() => {
+      const before = { files: { 'a.js': 'h1' } };
+      const rewritten = { files: { 'a.js': 'H1' } };                  // 内容变化：新旧写法都应看见
+      const added = { files: { 'a.js': 'h1', 'b.js': 'h2' } };         // 新增：旧写法看不见
+      const removed = { files: {} };                                  // 删除：旧写法靠"undefined ≠ 旧哈希"偶然看见
+      /* 旧写法的真实盲区是**新增**：它只遍历旧清单的键，"本轮多出来的文件"根本没有机会被看见。
+         删除能被旧写法偶然抓到（键还在、值变成 undefined）—— 这一条也要一并记下来，
+         免得把旧写法说得比实际更糟（夸大同样会让人不信判据）。 */
+      return legacyDiff(before, added).length === 0 && snapshot.diffSnapshots(before, added).length === 1 &&
+        snapshot.diffSnapshots(before, added)[0].kind === 'added' &&
+        legacyDiff(before, rewritten).length === 1 && snapshot.diffSnapshots(before, rewritten).length === 1 &&
+        legacyDiff(before, removed).length === 1 && snapshot.diffSnapshots(before, removed).length === 1 &&
+        snapshot.diffSnapshots(before, removed)[0].kind === 'removed';
+    })(), '旧写法下"新增文件/删除文件"的轮次会被判成稳定（只有内容变化看得见）');
+  t.check('变异②：若排除规则失效（把 `._verify` 一并纳入清单），本机制会把自己的落盘判成"工作区被改写" —— 被第十二节排除断言挡下',
+    (() => {
+      const all = snapshot.collectSnapshot({ excludeSegments: [] });
+      const only = snapshot.collectSnapshot();
+      const leaked = Object.keys(all.files).filter(p => p.includes('/._verify/'));
+      const legacyVerdict = snapshot.diffSnapshots({ files: all.files }, { files: only.files });
+      return leaked.length > 0 && legacyVerdict.some(c => c.path.includes('/._verify/')) &&
+        snapshot.isExcluded(leaked[0]) && snapshot.diffSnapshots({ files: only.files }, { files: only.files }).length === 0;
+    })(), (() => {
+      const all = snapshot.collectSnapshot({ excludeSegments: [] });
+      const leaked = Object.keys(all.files).filter(p => p.includes('/._verify/')).length;
+      return `不排除时清单里多出 ${leaked} 个 ._verify 文件（每轮必然被写 → 每轮都"不稳定"）`;
+    })());
+  t.check('变异③：旧写法把"工作区被改写"只当警告、继续对账（退出码 0）—— 被第十三节的 `unstable ⇒ 退出码 ≠ 0` 挡下',
+    (() => {
+      const legacyOutcome = () => ({ exitCode: 0, compare: true });
+      const legacy = legacyOutcome();
+      return legacy.exitCode === 0 && legacy.compare === true &&
+        runAll5.resolveGateOutcome([{ path: 'src/a.js', kind: 'changed' }], authOk).exitCode !== 0;
+    })(), '旧写法：打个警告然后照旧与权威数字比对，把"文件正在变"读成"权威区漂移"');
+  t.check('变异④：旧写法把"跳过对账（blocked）"当通过（退出码 0）—— 被第十三节的 blocked 断言挡下',
+    (() => {
+      const legacyBlocked = () => 0;
+      const blockedV = runAll5.resolveGateOutcome([], { ok: false, kind: 'blocked', detail: '**未执行**：本轮账目不完整' });
+      return legacyBlocked() === 0 && blockedV.exitCode !== 0;
+    })(), '旧写法：`blocked` 只打印"未核对"然后按全绿退 0');
+}
+
 t.finish();
 }
 

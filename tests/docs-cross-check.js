@@ -11,8 +11,8 @@
         七、字段语义（易错项）     八、进度标注 与 实际状态
         九、测试侧边界（测试代码不得引用业务代码）
         十、权威门禁数字的机器校验（P2-22）
-        十一、权威区逐脚本条数 ＝ 实跑值（P2-2，期望值取自实跑）
-   依赖：仅 Node 内置模块（纯文本读取）。
+        十一、权威区逐脚本条数 ＝ 实跑值（P2-2，**账本快路径 + 冲突复核**）
+   依赖：仅 Node 内置模块（纯文本读取 + 子进程落文件读回）。
    运行：node tests/docs-cross-check.js
    退出码：0 = 全部一致；1 = 有跨文档不一致（**失败项即待修缺陷**）。
    ========================================================================== */
@@ -44,8 +44,9 @@ function baselineReqFile() {
 const t = createRunner('跨文档一致性（docs-cross-check）');
 env.assertRuntime();
 
-/* 注意：main 里第十一节会**顺序**实跑一批离线门禁来取"实跑值"（见 probeOne 注释），
-   但全程同步、不 await，末尾仍是 `t.finish()` 退 0/1。 */
+/* 注意：main 里第十一节优先**读取本轮 `run-all` 的实跑账**（`tests\._verify\run-totals.json`）
+   取"实跑值"，只在"声明 ≠ 账"时对冲突脚本**单独复跑一次**（见该节 `resolveActuals` 注释）；
+   探针全程同步、不 await，末尾仍是 `t.finish()` 退 0/1。 */
 function main() {
   /* 输入文档集中读入，避免各处重复 IO */
   const arch = read('项目架构与技术栈.md');
@@ -462,14 +463,30 @@ function main() {
      注意第十节 ③ 的"列出的和 ≤ 声明合计"**抓不住这种漂移**：它只比合计，不逐脚本比。
 
      期望值**一律来自实跑**（D21：不得把 58/94/52… 之类的数字当期望值写进断言，那就成了第二个真源）：
-     本脚本对"权威区里声明了条数"的每个离线门禁**各实跑一次**，解析其汇总行
-     （`通过 N 项，失败 N 项，…`），**不再复用 `tests\._verify\run-totals.json`**。
-     为什么不用那份现成账（试过，被实测否掉）：
-       · 它是**另一个进程随时会重写**的文件 —— 实测同一份 README 下 `harness-check` 先后读到过
-         94 / 92（并发的 run-all 反复重写），于是"声明 93 vs 实跑 93"的**假绿**与真红在两次运行间翻面，
-         断言不可复现；
-       · suite 成员时序坑：账本里 `docs-cross-check` 那条是它**中途**落盘的数（实测 62/63），不是终值。
-     实跑成本实测约 12 s（12 个脚本串行；最慢的 `harness-check` 约 4 s），可接受。
+     本节需要"每个离线门禁此刻的实跑通过数"，取数走**两条路**（2026-09-20 T-20260920-10 改造）：
+
+     ① **快路径 = 本轮 `run-all` 落下的实跑账**（`tests\._verify\run-totals.json`）。
+        `run-all` 每跑完一个脚本就把该脚本的 `summary` 写进这份账，而 `docs-cross-check` 排在
+        suite **最后**，故它运行时账里已经有**前面每个离线门禁的既成事实**（不是预测）。
+        这份账是"逐脚本跑出来的数"，不是人工抄的第二个真源，符合 D21。
+     ② **冲突复核 = 只对"声明 ≠ 账"的那几个脚本单独实跑一次**（`probeOne`），
+        并以**此刻的实跑结果**为最终判据。
+
+     为什么不能无条件采信账本（**这是本节的关键设计约束**）：账本是**另一个进程随时会重写**的文件 ——
+     实测同一份 README、同一个变异条件下，账里 `harness-check` 先后读到过 94 / 92（并发的 run-all
+     反复重写），若直接拿账当判据，就会出现"声明 93 vs 账 93"的**假绿**与真红在两次运行间翻面。
+     故分工固定为：**账本负责"认定一致"（快），实跑负责"认定不一致"（准）** ——
+       · 声明 = 账  → 直接采信（12 个脚本省掉一次串行实跑，本节墙钟从约 15 s 降到约 2.5 s）；
+       · 声明 ≠ 账  → 该脚本**实跑复核**，实跑与声明也不符才判红（真漂移），
+         实跑与声明相符则判绿（账是并发轮的旧值，**不误伤**）。
+     代价（如实交代）：若某个脚本"账与声明同为旧值"（例如 README 与账都停在上一轮的 93，
+     而此刻实跑是 94），快路径会判绿 —— 这类"集体滞后"由第十节④（当前状态文档引用的门禁总数）
+     与 `run-all` 收尾的 `verifyAuthorityTotals`（按合计）拦截，且下一轮 run-all 写账后即自愈。
+
+     账本采信的前提（ADR-0004 D20，用 `t.requires` 表达，**塌了就退化为逐项实跑，不静默放过**）：
+     文件存在 + 能解析 + 其内条目覆盖当前门禁清单。任一不满足 → 对**缺的那些**脚本实跑补数
+     （单独 `node tests\docs-cross-check.js` 且账本缺失时就是"全部实跑"，与改造前行为一致）。
+     账本里 `docs-cross-check` 那条是它**中途**落盘的数（实测 62/63），不是终值 —— 故自指脚本另见下。
 
      解析覆盖两种形式（两者都要比，缺一不可）：
        ① 逐脚本清单：`` `contract-check` **58/0** ``、`` tools-check 24/0 ``（加粗可有可无）；
@@ -505,24 +522,29 @@ function main() {
   };
 
   /**
-   * 逐脚本实跑账（`tests\._verify\run-totals.json`）的读取。
+   * 逐脚本实跑账（`tests\._verify\run-totals.json`）的读取 —— **本节快路径的唯一数据入口**。
    *
    * 采信条件**不是** mtime（试过：mtime 与进程启动时刻只差 0.1 s，判定会因计时抖动而翻面 ——
    * 那样的门禁是"看运气"的），而是**内容完整性**：文件存在 + 能解析 + `suites[].summary.passed`
    * 覆盖到各个离线门禁。它可能是**上一轮** `run-all` 写的，故按内容采信后还有第二道闸：
-   * 凡"账里的数 ≠ README 声明"的脚本**一律单跑复核**（见下面的触发条件），
+   * 凡"账里的数 ≠ README 声明"的脚本**一律单跑复核**（见 `resolveActuals`），
    * 既不会有"账与声明一致却被判红"的假失败，也不会漏掉真漂移。
    * （单独运行本脚本时账内通常已含上一轮全部脚本，故复核只在真有出入时才发生。）
+   *
+   * 落盘方 `run-all` 的契约**不要求预建父目录**（它自己 `ensureDir` 后写），故本读取端
+   * 以"文件不存在"为一条正常分支（单独跑本脚本、或账本还没生成过），**不当异常**。
+   * @returns {{ok:boolean, why:string, error:?(Error|null), suites:Array, file:string}}
    */
-  const readRunTotals = () => {
+  const readRunTotals = (mode) => {
     const file = path.join(env.paths.verify, 'run-totals.json');
+    const prefix = mode === 'hard' ? '**不可读**：' : '';
     try {
-      if (!fs.existsSync(file)) return { fresh: false, why: '不存在（本轮不是经 run-all 启动，账本还没生成过）', suites: [] };
+      if (!fs.existsSync(file)) return { ok: false, why: prefix + '不存在（本轮不是经 run-all 启动，账本还没生成过）', error: null, suites: [], file };
       const json = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (!Array.isArray(json.suites)) return { fresh: false, why: '结构不对（缺 suites 数组）', suites: [] };
-      return { fresh: true, why: '', suites: json.suites };
+      if (!Array.isArray(json.suites)) return { ok: false, why: prefix + '结构不对（缺 suites 数组）', error: null, suites: [], file };
+      return { ok: true, why: '', error: null, suites: json.suites, file };
     } catch (err) {
-      return { fresh: false, why: '解析失败：' + (err && err.message), suites: [] };
+      return { ok: false, why: prefix + '读取失败：' + (err && err.message), error: err || null, suites: [], file };
     }
   };
 
@@ -555,65 +577,82 @@ function main() {
   }
 
   const totals = readRunTotals();
-  const actuals = {};                  // 脚本名 → 实跑通过数（**本轮** run-all 的逐脚本实跑账）
+  const ledger = {};                   // 脚本名 → 账本里的通过数（**本轮** run-all 的逐脚本实跑账）
   for (const s of totals.suites) {
-    if (s && s.name && s.summary) actuals[s.name] = Number(s.summary.passed);
+    if (s && s.name && s.summary) ledger[s.name] = Number(s.summary.passed);
   }
-  /** 账本里已有的离线门禁数（用于断言 6 详情；不含自指的本脚本） */
-  const ranLoggedCount = offlineGates.filter(n => n !== 'docs-cross-check' && actuals[n] !== undefined).length;
-  /** 声明值取自 readmeSrc（本进程启动时读入的那一份，`main` 顶部一次性读取） */
-  const declaredOf = (name) => {
-    if (nameDeclarations.has(name)) return nameDeclarations.get(name).declared;
-    return tableDeclarations.has(name) ? tableDeclarations.get(name).declared : null;
-  };
   /**
    * 自指脚本：**两条逐脚本断言都不比它**。
    * 理由（实测确认）：本脚本是 suite 最后一个，`run-totals.json` 里那条记录是它**中途**落盘的
    * 数（实测 62/63，含本节尚未走完的计数），不是终值；"拿上一轮的账"（T-1）同样不成立 ——
    * 它会天然与声明差一轮，变成永远红的假失败。真正可比的量只有"自己这次的最终通过数"，
    * 而那要等本节结束才确定。它的漂移由 `run-all` 收尾的 `verifyAuthorityTotals`（按合计）拦截。
+   * 注意：正因为它是自指，读账失败**不**用 `t.requires` 硬失败 —— 单独跑本脚本（没有 run-all 账）
+   * 是合法用法，此时退化为"对每个有声明的离线门禁各实跑一次"，结论照样是实跑值。
    */
   const SELF_REF = 'docs-cross-check';
+  /* 前提（ADR-0004 D20）：账本必须覆盖当前门禁清单，本节才允许走"快路径"。
+     塌了不报 FAIL（前提不成立会单独成段并使退出码非 0），但也**绝不静默放过** ——
+     下面 resolveActuals 对"账里没有"的脚本一律实跑补数（③ 退化分支）。 */
+  t.requires('run-totals.json 的条目覆盖当前门禁清单（账本缺失/过期时退化为逐项实跑，不静默放过）',
+    totals.ok && offlineGates.every(n => n === SELF_REF || ledger[n] !== undefined),
+    totals.ok
+      ? `账本缺 ${offlineGates.filter(n => n !== SELF_REF && ledger[n] === undefined).join('、') || '（无）'}`
+      : totals.why);
+  /** 声明值取自 readmeSrc（本进程启动时读入的那一份，`main` 顶部一次性读取） */
+  const declaredOf = (name) => {
+    if (nameDeclarations.has(name)) return nameDeclarations.get(name).declared;
+    return tableDeclarations.has(name) ? tableDeclarations.get(name).declared : null;
+  };
   /**
-   * 逐脚本实跑值的取数：**对"有声明"的每个离线门禁各实跑一次**（本脚本自身除外，见下）。
+   * 逐脚本实跑值的取数 —— **账本快路径 + 冲突复核**（设计取舍见本节顶部注释）。
    *
-   * 为什么最终选择"无条件实跑"而不是复用 `run-totals.json`（试过、被实测否掉）：
-   * ① 账本是**另一个进程随时会重写**的文件。实测同一份 README、同一个变异条件下，账本里
-   *    `harness-check` 先后读到过 94 / 92（并发的 run-all 反复重写），导致"声明 93 vs 实跑 93"
-   *    这种**假绿**与"声明 93 vs 实跑 94"的真红在两次运行间翻面 —— 拿一个会变的量当期望值，
-   *    断言本身就不可复现；
-   * ② suite 成员的时序坑：账本里 `docs-cross-check` 那条是它**中途**落盘的数（实测 62），终值不可能是它；
-   * ③ 成本可接受：12 个脚本串行实测约 **12 s**（最慢的 `harness-check` 约 4 s），
-   *    远低于"全量重跑"版本的数分钟 —— 后者是并发探针 + 拿不到输出造成的，不是串行实跑的代价。
-   * 期望值因此 100% 来自"此刻的实跑"（D21），不依赖任何会漂移的中间文件。
+   * 规则（三条，缺一不可）：
+   *   ① **快路径**：账里有这个脚本 → 先当成"实跑值"（它确实是逐脚本跑出来的既成事实，不是预测）；
+   *   ② **冲突复核**：`声明 ≠ 账` → 对该脚本 `probeOne()` **复跑一次**，以**此刻的实跑**为最终判据
+   *      （账本可能是并发轮的旧值，也可能 README 真漂移了 —— 只有实跑能分辨）；
+   *   ③ **账本不覆盖** → 也实跑补上（单独跑本脚本、账本缺失/过期、或 run-all 中途失败时），
+   *      **取不到就计入 unresolved/失败，绝不静默放过**（D19/D21/D23）。
+   * 为什么不是"无条件实跑"（旧实现）：12 个脚本串行实测约 13 s（最慢 `harness-check` 约 4 s），
+   * 而 `run-all` 本轮**刚刚**跑过它们并把逐脚本数落了盘 —— 再跑一遍是纯粹的重复实跑。
+   * 为什么不是"无条件信账"（另一头的错法）：账会被并发的另一个 run-all 覆盖，实测同一条件
+   * 下 `harness-check` 读到过 94 / 92，"真假红绿翻面"；故账只用来**认定一致**。
    */
-  const probeMismatch = {};
-  const probeFailures = [];                                  // 跑了但拿不到汇总行的（不得静默放过）
-  const probedNames = [];
+  const actualProbe = {};       // 脚本名 → 实跑探针拿到的通过数（仅"冲突复核 / 账本不覆盖"的脚本）
+  const probeFailures = [];     // 跑了但拿不到汇总行的（不得静默放过）
+  const probedNames = [];       // 实跑过的脚本名（含冲突复核与账本不覆盖两类）
+  const rechecked = [];         // 其中"因声明 ≠ 账而复核"的脚本名
+  const sourceOf = {};          // 脚本名 → 最终取数来源（'ledger' | 'probe'）
   const probeWallMs = (() => {
     const startedAt = Date.now();
     for (const name of offlineGates) {
-      if (name === SELF_REF) continue;                         // 自指，见 actualOf 注释
+      if (name === SELF_REF) continue;                         // 自指，见 SELF_REF 注释
       const declared = declaredOf(name);                       // 没声明的由断言 3/5 报，不猜
       if (declared === null) continue;
       if (!exists(path.join('tests', name + '.js'))) continue;
+      const logged = ledger[name];
+      const needProbe = logged === undefined || declared !== logged;
+      if (!needProbe) { sourceOf[name] = 'ledger'; continue; } // ① 快路径
       probedNames.push(name);
-      const re = probeOne(name);
-      if (re) probeMismatch[name] = re.passed;
+      if (logged !== undefined) rechecked.push(name);           // ② 声明 ≠ 账 → 冲突复核
+      const re = probeOne(name);                                // ②/③ 实跑
+      if (re) { actualProbe[name] = re.passed; sourceOf[name] = 'probe'; }
       else probeFailures.push(`${name}（实跑未产出可解析的汇总行）`);
     }
     return Date.now() - startedAt;
   })();
+  /** 账本快路径取到值的脚本数（不含自指；用于输出里的数据来源标注与断言 7） */
+  const ledgerUsed = Object.keys(sourceOf).filter(n => sourceOf[n] === 'ledger');
+  /** 冲突复核的脚本数（声明 ≠ 账）；这些脚本的最终判据是**实跑**，不是账 */
+  const recheckNames = rechecked.slice();
   /**
-   * 复核后的实跑值：来自"此刻的实跑探针"；探针没跑到的（自指脚本、或实跑失败）返回 undefined，
-   * 由断言 6 统一报"未覆盖"，不在这里猜。
+   * 取数后的实跑值：**冲突复核/实跑探针优先**（它才是"此刻"的事实），其次账本；两者都没有则
+   * 返回 undefined —— 由断言 6/7 统一报"未覆盖/取不到"并判红，**不在这里猜、也不默认通过**。
    */
   const actualOf = (name) => {
     if (name === SELF_REF) return undefined;
-    return probeMismatch[name] !== undefined ? probeMismatch[name] : actuals[name];
+    return actualProbe[name] !== undefined ? actualProbe[name] : ledger[name];
   };
-
-
   /* ---- 结构自检：解析出来的每一步都必须指向真实存在的脚本文件 ---- */
   const badNamedScript = [...nameDeclarations.keys()].filter(n => !exists(path.join('tests', n + '.js')));
   const badTableScript = [...tableDeclarations.keys()].filter(n => !exists(path.join('tests', n + '.js')));
@@ -629,7 +668,7 @@ function main() {
     if (name === SELF_REF || actualOf(name) === undefined) continue;
     if (d.declared !== actualOf(name)) {
       mismatchedNamed.push(`${name}：声明 ${d.declared} ≠ 实跑 ${actualOf(name)}` +
-        (probeMismatch[name] !== undefined ? '（已单跑复核）' : ''));
+        (recheckNames.includes(name) ? '（账本值亦不符，已实跑复核确认）' : '（取自本轮账）'));
     }
   }
   t.check('权威区逐脚本清单声明的条数 ＝ 各脚本实跑通过数',
@@ -638,7 +677,8 @@ function main() {
       ? mismatchedNamed.join('；')
       : `逐脚本一致：${[...nameDeclarations].map(([n, d]) => `${n}=${d.declared}`).join('、')}`) +
     (notDeclared.length ? `｜**权威区未声明条数**（新增脚本请按 \`\\\`name\\\` N/M\` 形式登记）：${notDeclared.join('、')}` : '') +
-    `；实跑 ${probedNames.length} 个（${probedNames.join('、') || '无'}）`);
+    `；实跑 ${probedNames.length} 个（${probedNames.join('、') || '无'}）` +
+    `｜来源：账本 ${ledgerUsed.length} 个 ＋ 冲突复核 ${recheckNames.length} 个`);
 
   /* ---- 断言 2：脚本表里的**中文形式**条数（与形式①是两处不同的文字，必须都比） ---- */
   const cpMismatch = [];
@@ -646,7 +686,7 @@ function main() {
     if (name === SELF_REF || actualOf(name) === undefined) continue;
     if (d.declared !== actualOf(name)) {
       cpMismatch.push(`${name}（${d.form}）：声明 ${d.declared} ≠ 实跑 ${actualOf(name)}` +
-        (probeMismatch[name] !== undefined ? '（已单跑复核）' : ''));
+        (recheckNames.includes(name) ? '（账本值亦不符，已实跑复核确认）' : '（取自本轮账）'));
     }
   }
   t.check('权威区脚本表里"中文形式"的逐脚本条数 ＝ 各脚本实跑通过数',
@@ -654,8 +694,16 @@ function main() {
     cpMismatch.length
       ? cpMismatch.join('；')
       : `中文形式一致（${[...tableDeclarations].map(([, d]) => `${d.form}=${d.declared}`).join('、')}）`);
-  if (dbg) t.info('（调试）声明/实跑明细：' + offlineGates.map(n =>
-    `${n}(声明=${declaredOf(n)}/账本=${actuals[n] === undefined ? '-' : actuals[n]}/探针=${probeMismatch[n] === undefined ? '-' : probeMismatch[n]}/采用=${actualOf(n)})`).join(' '));
+  if (dbg) t.info('（调试）声明/取数明细：' + offlineGates.map(n =>
+    `${n}(声明=${declaredOf(n)}/账本=${ledger[n] === undefined ? '-' : ledger[n]}` +
+    `/探针=${actualProbe[n] === undefined ? '-' : actualProbe[n]}` +
+    `/来源=${sourceOf[n] || '-'}/采用=${actualOf(n)})`).join(' '));
+
+  /* ---- 数据来源标注（**本节取值从哪来，必须一眼可见**；不是断言，但读数前先看它） ---- */
+  t.info(`实跑值来源：run-totals.json（本轮账，${ledgerUsed.length} 个脚本）` +
+    ` ＋ 冲突复核 ${recheckNames.length} 个（${recheckNames.join('、') || '无'}）` +
+    `＋ 账本不覆盖实跑 ${probedNames.length - recheckNames.length} 个` +
+    `｜账本 ${totals.ok ? '可读' : '不可读：' + totals.why}｜实跑探针墙钟 ${probeWallMs} ms`);
 
   /* ---- 断言 3：解析必须**全覆盖**，解析不到的不得静默放过 ---- */
   t.check('权威区每个离线门禁的牌面条数都被解析覆盖（解析不到的列进"未覆盖清单"）',
@@ -679,20 +727,41 @@ function main() {
       ? `**未覆盖清单**（权威区里既无 \`name\` N/M、也无"描述（N 项）"）：${uncoveredOffline.join('、')}`
       : `覆盖 ${offlineGates.length}/${offlineGates.length}（逐脚本清单 ${nameDeclarations.size} 个、中文形式 ${tableDeclarations.size} 个）`);
 
-  /* ---- 断言 6：**不得静默变绿** —— 有任何"有声明却拿不到实跑值"的必须红 ---- */
+  /* ---- 断言 6：**不得静默变绿** —— 有任何"有声明却取不到实跑值"的必须红 ----
+     判据从"探针是否跑过"泛化为"是否取到可溯源实跑值"（账本快路径 / 冲突复核 / 账本不覆盖的实跑
+     三条都算），语义**不变也未被削弱**：只要有一个有声明的离线门禁既不在账里、也没实跑出汇总行，
+     这里就判红并点名 —— 不许把"取不到"改判为通过（D19/D21/D23）。 */
   const cannotVerify = offlineGates.filter(n => n !== SELF_REF && declaredOf(n) !== null &&
-    !probedNames.includes(n));
+    actualOf(n) === undefined);
+  const ledgerUsedAll = offlineGates.filter(n => n !== SELF_REF && declaredOf(n) !== null &&
+    sourceOf[n] === 'ledger').length;
   t.check('每个有声明的离线门禁都拿到了实跑值（取不到即红，不静默放过）',
-    probedNames.length > 0 && cannotVerify.length === 0 && probeFailures.length === 0,
-    `实跑 ${probedNames.length} 个（${probedNames.join('、') || '无'}）` +
+    (ledgerUsedAll + probedNames.length) > 0 && cannotVerify.length === 0 && probeFailures.length === 0,
+    `取到实跑值 ${ledgerUsedAll + probedNames.length} 个` +
+    `（账本 ${ledgerUsedAll} 个 ＋ 实跑复核 ${probedNames.length} 个：${probedNames.join('、') || '无'}）` +
     `，拿不到汇总行 ${probeFailures.length} 个` +
     (probeFailures.length ? `：${probeFailures.join('、')}` : '') +
-    (cannotVerify.length ? `｜**未覆盖清单**（有声明却没实跑）：${cannotVerify.join('、')}` : '') +
-    `｜run-totals.json ${totals.fresh ? '可读（仅作交叉参考，不再作为期望值）' : '不可用：' + totals.why}`);
+    (cannotVerify.length ? `｜**未覆盖清单**（有声明却既不在账里、也没实跑出值）：${cannotVerify.join('、')}` : '') +
+    `｜run-totals.json ${totals.ok ? '可读（快路径数据源）' : '不可用：' + totals.why}`);
+
+  /* ---- 断言 7（2026-09-20 T-20260920-10 新增）：取数**不得留空** ----
+     新增这条是为了给"快路径"本身加护栏：改造后"取数"多了一条分支（账本），而分支越多越容易
+     出现"某个脚本悄悄没被取到值、两条逐脚本断言又都 continue 掉了"的空洞 —— 那正是 D23 说的
+     "取不到不得静默放过"。判据：每个应有实跑值的脚本（有声明 + 脚本文件存在 + 非自指）都必须
+     有明确来源（账本 / 实跑），且实跑过的脚本不得留下"跑了却没结果"的记录。 */
+  const sourceGaps = offlineGates.filter(n => n !== SELF_REF && declaredOf(n) !== null &&
+    exists(path.join('tests', n + '.js')) && sourceOf[n] === undefined);
+  const unlocatedProbes = probedNames.filter(n => actualProbe[n] === undefined);
+  t.check('第十一节的实跑值取数不留空洞（每个应有值的脚本都有来源：账本 或 实跑）',
+    sourceGaps.length === 0 && unlocatedProbes.length === 0,
+    `来源统计：账本 ${ledgerUsed.length} 个、实跑 ${probedNames.length} 个（其中冲突复核 ${recheckNames.length} 个）` +
+    (sourceGaps.length ? `｜**无来源**（既没读账也没实跑）：${sourceGaps.join('、')}` : '') +
+    (unlocatedProbes.length ? `｜**实跑无结果**：${unlocatedProbes.join('、')}` : ''));
 
   /* ---- 自指排除的如实交代：docs-cross-check 自身的声明值不在本节比对范围内 ---- */
-  const notCompared = offlineGates.filter(n => !probedNames.includes(n));
-  t.info(`未纳入逐脚本比对的离线门禁：${notCompared.join('、') || '（无）'}` +
+  const notCompared = offlineGates.filter(n => n !== SELF_REF && sourceOf[n] === undefined);
+  t.info(`未纳入逐脚本比对的离线门禁：${SELF_REF}（自指）` +
+    (notCompared.length ? `；另有未取到值的：${notCompared.join('、')}` : '') +
     '（docs-cross-check 为**自指**：它声明的条数 = 它自己这次跑出来的通过数，本节结束时才确定，' +
     '账本里那条还只是它中途落盘的数；其漂移由 run-all 收尾的 verifyAuthorityTotals 按合计拦截）' +
     `｜实跑探针墙钟 ${probeWallMs} ms`);
