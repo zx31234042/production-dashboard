@@ -1,7 +1,14 @@
 /* ==========================================================================
    当班生产统计（server/services/stats.js）
-   作用：FR-4 全组 15 项指标的**唯一核算处**；口径与公式来自
-        `src/config/board.config.js` 的 production.formula（Q-11 答复后只改配置）。
+   作用：FR-4 全组 15 项指标的**唯一核算处**；统计口径（公式）**就写在本文件里**，
+        是服务端的**权威实现**（ADR-0005 选项 B：公式留在代码，配置只存参数）。
+        `src/config/board.config.js` 的 production **只提供参数值**（planQty/cycleSec/runRate…），
+        **不提供公式**（原 production.formula 属零读取点的死配置，已按 ADR-0005 删除）。
+   Q-11 口径变化时**须同步修改**（改任一处都必须同步其它处，缺一即前后端算出两套结果）：
+        1) 本文件 :85 起的派生指标算式（:93-:96 的 firstPassRate/capacityRate/oee/avgTestSec）
+        2) `src/services/mockData.js` 的 stats 段（前端演示的第二份同类实现）
+        3) `tests/logic-check.js` 中按口径推导的**期望值**
+        4) `tests/contract-check.js` 的占位断言（OEE 段）与跨实现一致性断言（M 段）
    设计：**纯函数 + 注入时钟** —— 不读系统时间、不碰数据库、不碰界面，
         因此可以用固定时刻把"班次边界/跨零点/累计不倒退"逐条钉死（FR-4.16 / DR-17）。
    关键口径（此前前端踩过的两个坑，这里写成硬约束）：
@@ -75,7 +82,14 @@ function computeShiftStats(input) {
   const runSec = running > 0 ? byMeasures : 0;
   const idleSec = Math.max(0, elapsedSec - runSec);
 
-  /* ---------------- 三、派生指标（公式走配置，分母为 0 一律返回 0） ---------------- */
+  /* ---------------- 三、派生指标（公式即本段代码，分母为 0 一律返回 0） ----------------
+     ⚠ 权威性说明（ADR-0005 选项 B，2026-09-20 拍板）：本段是 FR-4 统计口径的**唯一执行点之一**——
+       服务端**权威实现**（仅此一处）；另一处是前端演示实现 `src/services/mockData.js` 的 stats 段。
+       此前注释写"公式走配置"**不成立**：`src/config/board.config.js` 的 production.formula
+       当时**没有任何读取点**（死配置），Q-11 答复到达后"只改配置"不会改变任何统计结果。
+       口径变化时需同步的位置：本段四条算式 / `src/services/mockData.js` 的 stats 段 /
+       `tests/logic-check.js` 的期望值 / `tests/contract-check.js` 的占位断言（跨实现一致性见其 M 段）。
+       本段为纯函数，**不得在注释以外改动算法**。 */
   const firstPassRate = pct(pass, done);                       // FR-4.10 一次性合格率
   const capacityRate = pct(done, planQty);                     // FR-4.14 产能达成率
   const oee = pct(runSec, elapsedSec);                         // FR-4.15 稼动率

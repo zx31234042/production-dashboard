@@ -1,9 +1,11 @@
 /* ==========================================================================
    看板运行配置（config/board.config.js）
-   作用：把所有"会随外部答复变化"的参数集中到这里，答复到达时只改本文件，不动业务代码。
+   作用：把所有"会随外部答复变化"的参数**值**集中到这里，答复到达时原则上只改本文件，不动业务代码。
+   例外：**统计公式不在本文件里** —— 按 ADR-0005 选项 B（2026-09-20 拍板）公式留在代码里，
+   配置只存参数；Q-11 答复到达后**须同步修改的位置清单**见下方 production 段。
    对应待确认事项（需求清单 V1.30 第 12 章）：
      - shift            ← Q-10 班次定义
-     - production       ← Q-11 统计公式与产能参数
+     - production       ← Q-11 统计参数（口径公式留在代码，不在此处）
      - faultDict        ← Q-12 故障代码字典（结构与示例；内容待补全）
      - maintenance      ← Q-13 维保周期与耗材
      - upper            ← Q-21 上位机接口规范（地址/频率/鉴权）
@@ -11,7 +13,8 @@
    依赖：无（需最先加载）
    ========================================================================== */
 /* 服务端（Node）与浏览器共用本文件：浏览器挂到 window，Node 挂到 module.exports。
-   单一真源很重要 —— 班次口径/统计公式/判定容差若各存一份，前后端必然算出两套结果。 */
+   单一真源很重要 —— 班次口径/判定容差等**参数**若各存一份，前后端必然算出两套结果。
+   （统计公式不属于"配置真源"：按 ADR-0005 选项 B 它留在实现里，见下方 production 段说明。） */
 const BOARD_CONFIG = (function () {
   'use strict';
 
@@ -48,24 +51,29 @@ const BOARD_CONFIG = (function () {
       }
     },
 
-    /* ---------------- 产能与统计口径（Q-11 答复后修改此处） ----------------
-       formula 中的键对应 utils 里的算法选择，便于口径变化时只改配置：
-         firstPass : 一次性合格率 = qualified / done
-         capacity  : 产能达成率   = done / plan
-         oee       : 稼动率       = runSec / elapsed
-         avgTest   : 单台平均测试时长 = runSec / done */
+    /* ---------------- 产能与统计参数（Q-11 答复后修改参数值） ----------------
+       ⚠ 本段只存**参数值**，不存**统计公式**（ADR-0005 选项 B，2026-09-20 负责人拍板）：
+         统计口径的**权威实现**在 `server/services/stats.js`（服务端，FR-4 唯一核算处），
+         前端演示的**第二份同类实现**在 `src/services/mockData.js` 的 stats 段；
+         **本配置不参与任何公式求值** —— 改本文件不会改变统计口径。
+       口径备忘（**历史占位，并非可执行配置**，当前无任何读取点，改它不影响任何统计结果）：
+         firstPass = qualified / done    capacity = done / plan
+         oee       = runSec / elapsed    avgTest  = runSec / done
+       （原先的 `production.formula` 键因**零读取点**已按 ADR-0005 删除，其内容仅保留于此说明。）
+       Q-11 答复到达后**须同步修改的位置清单**（改任一处都必须同步其它处，缺一即前后端口径不一致）：
+         1) `server/services/stats.js`  —— 派生指标算式 firstPassRate/capacityRate/oee/avgTestSec
+         2) `src/services/mockData.js`  —— stats 段的同类实现（前端演示）
+         3) `tests/logic-check.js`      —— 按新口径推导的**期望值**（不得沿用旧公式做同源推导）
+         4) `tests/contract-check.js`   —— 占位断言（OEE 段）与跨实现一致性断言（M 段）
+         5) 文档承诺（`项目架构与技术栈.md`、`README.md`、`项目记录/当前状态快照.md`）如仍写
+            "只改配置"，须一并改为"须同步改上述各处"
+       下方参数原样保留；只改这些参数值 ≠ 改口径。 */
     production: {
       planQty: 180,          // 当班计划测试总数
       cycleSec: 160,         // 单件测试节拍（秒）—— 任务曲线的采样点数与它一致
       runRate: 0.79,         // 有效运行占比（用于推导运行/待机时长）
       firstPassRate: 0.932,  // 一次性合格率（模拟数据用）
-      queueDepth: 72,        // 设备侧待测试排队量
-      formula: {
-        firstPass: 'qualified/done',
-        capacity: 'done/plan',
-        oee: 'runSec/elapsed',
-        avgTest: 'runSec/done'
-      }
+      queueDepth: 72         // 设备侧待测试排队量
     },
 
     /* ---------------- 故障代码字典（Q-12 答复后补全内容） ----------------
@@ -126,8 +134,9 @@ const BOARD_CONFIG = (function () {
     }
   };
 
-  /* 服务端（Node）也要用同一份配置 —— 班次口径、统计公式、判定容差必须**单一真源**，
+  /* 服务端（Node）也要用同一份配置 —— 班次口径、判定容差等**参数**必须**单一真源**，
      否则前后端会各算一套（这正是"配置集中地"的初衷，见规范 9.6）。
+     （统计公式不在此列：按 ADR-0005 选项 B 它留在实现里，见上方 production 段说明。）
      故本文件同时支持两种加载方式：浏览器全局 window.BoardConfig ／ Node 的 module.exports。 */
   if (typeof window !== 'undefined') window.BoardConfig = CFG;
   if (typeof module !== 'undefined' && module.exports) module.exports = CFG;

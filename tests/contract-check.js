@@ -13,6 +13,9 @@
          J. 文档与源码的版本号、附录 2 项数一致性
          K. 现状快照（非缺陷）：口径占位项，变了就提醒重新确认
          L. 常量集中化：颜色字面量、维保/耗材阈值是否走配置（PROJECT_RULES 五章）
+         M. 跨实现一致性：前端演示实现 mockData.js ↔ 服务端权威实现 stats.js
+            （同一组输入下 一次性合格率/产能达成率/稼动率/平均测试时长 必须一致，
+              ADR-0005 第三节建议第 2 条；配 ADR-0004 D22 定点变异反证）
    依赖：仅 Node 内置模块；不联网（只连本机回环端口）、不启动浏览器。
    运行：node tests/contract-check.js
    退出码：0 = 全部通过；1 = 有断言失败（失败项即待修缺陷）。
@@ -797,10 +800,19 @@ async function main() {
       oee.push(h.window.MockData.state.stats.oee);
     }
     const expect = h.window.BoardConfig.production.runRate * 100;
+    /* ⚠ 语义修正（评审 A-2026-09-20-01 P2-4 / ADR-0005 第三节建议第 3 条）：
+       这条是**演示占位口径**，**不是验收判据** —— 它钉的是"前端演示值直接等于配置里的
+       有效运行占比 runRate"，而不是 FR-4.15 的真实口径（真实口径应为 有效运行时长 / 班次进度，
+       见 server/services/stats.js 的 oee = pct(runSec, elapsedSec)）。
+       演示之所以成立：mockData.computeStats 里 runSec = elapsed * runRate，所以
+       runSec / elapsed 恒等于 runRate —— 这是同一份演示取值换了个写法，不能当业务判据。
+       保留它的唯一目的：Q-11 答复到达、口径改为真实实现后，这条会立刻变红，提醒同步本段
+       与界面说明；真正的跨实现口径判据在 M 段。 */
     check(
-      '稼动率仍由配置常量推导（Q-11 口径占位）',
+      '稼动率仍由配置常量推导（**演示占位口径，非验收判据**；口径变更即提醒）',
       oee.every(v => Math.abs(v - expect) < 1e-9),
-      `实测 oee=${oee.join(' / ')}%，runRate*100=${expect}%（若已改为真实口径，请同步更新界面说明）`
+      `实测 oee=${oee.join(' / ')}%，runRate*100=${expect}%（现值来自 mockData 的 runSec=elapsed*runRate，` +
+      '属演示占位口径；Q-11 答复到达后按真实口径 u=有效运行/班次进度 改写本段与界面说明，真实口径判据见 M 段）'
     );
     /* P3-12 修复后：当班异常台账不再是固定 5 条——自动闭环的报警会转入台账（保留上限 8 条）。
        本项由"固定 5 条"快照改为"确实接收新闭环报警"的行为断言。 */
@@ -853,6 +865,167 @@ async function main() {
       lampWarn.lv !== 'warn',
       `threshold=9999、实际点亮时长远低于阈值，仍判为 "${lampWarn.lv}"（780 基准与 800 阈值硬编码在 mockData.js）`
     );
+  }
+
+  /* ===== M. 跨实现一致性：前端演示实现 ↔ 服务端权威实现（ADR-0005 建议第 2 条） =====
+     背景：统计公式在仓库里有**两份实现**（`src\services\mockData.js` 的 computeStats 与
+     `server\services\stats.js` 的 computeShiftStats）。ADR-0005 采纳"公式留在代码、配置只存参数"
+     后，两份实现都必须改到位；本段就是盯住这件事的机器判据 —— 同一组输入下逐项比对
+     一次性合格率 / 产能达成率 / 稼动率 / 平均测试时长。
+
+     同一组输入怎么构造（两侧都用**仓库现值**，不写魔数）：
+       · 完成数 done = min(planQty, floor(班次已进行时长 / cycleSec))，合格 = round(done × firstPassRate)
+         —— 这正是 mockData.computeStats 的构造口径，故可**独立于被测函数**先算出来；
+       · 服务端侧把同一组计数翻译成 tasks（合格 N1 条 + 不合格 N2 条 + 测试中 2 条），
+         运行时长用**采集时刻串**表达（stats.js 的 runSec = 采集条数 − 1，秒级整数粒度），
+         取 round(班次已进行时长 × runRate)，与前端 runSec = 已进行时长 × runRate 同源。
+       两侧 `planQty` / `cycleSec` / `runRate` / `firstPassRate` 都读 `board.config.js`，
+       因此 Q-11 改参数后本段期望值自动跟随，不需要改断言。
+
+     精度口径（**实测确认，非猜测**）：
+       · 前端输出**未取整**的原始百分比（实测 93.33333333333333 / 78.88888888888889）；
+         服务端 pct() 按"保留 1 位小数"返回（实测 93.3 / 78.9，见 stats.js 的 pct() 定义）。
+         ⇒ 比对时两侧都归一到 1 位小数，容差 0.05 只用于吸收浮点表示误差（如 79 vs 78.99999999999999），
+           不是放宽业务口径。
+       · 服务端 runSec 是**整数秒**（采集条数 − 1），前端 runSec 可为小数（已进行时长 × runRate）；
+         两侧差值实测 ≤ 0.5 s（远小于 1 s），本身不构成口径分歧。
+        · 平均测试时长两侧取整口径**不同**（服务端 Math.round、前端不取整）——见 ②b，
+          按 `服务端 === Math.round(前端)` 锁为**已知边界**，不放宽容差。 */
+  section('M. 跨实现一致性（前端 mockData ↔ 服务端 stats 权威实现）');
+  {
+    const stats = require('../server/services/stats');
+    const { createShiftRules } = require('../server/services/shift');
+    /* 前提（ADR-0004 D20）：本段没有 runner 对象，用局部包装沿用 tests/lib/assert.js 的 requires 语义
+       —— 前提塌掉时**不计入通过**，而是记为一条失败并单列原因（不是"环境不满足就跳过"）。 */
+    function requires(name, ok, detail) {
+      if (!ok) {
+        console.log(`  [UNMET] 前提不成立：${name} —— ${detail}`);
+        check(name, false, `${detail}（前提不成立，本段用例不成立、不计入通过）`);
+      }
+      return Boolean(ok);
+    }
+    /* 配置真源：两侧的输入都从这里取，避免把 Q-11 参数写死在断言里 */
+    const conf = require('../src/config/board.config.js');
+    const prod = conf.production;
+    const shiftRules = createShiftRules(conf.shift.list);
+    /* 取整函数与 stats.js 的 pct() 同口径（保留 1 位小数）；比对前两侧都过一遍 */
+    const norm1 = v => Number(v.toFixed(1));
+
+    /** 把"同一组输入"分别喂给前端与服务端，返回两侧的派生指标 */
+    function evalCase(iso) {
+      const at = new Date(iso);
+      const shift = shiftRules.at(at);
+      const elapsedSec = shift.elapsedSec;
+      const done = Math.min(prod.planQty, Math.floor(elapsedSec / prod.cycleSec));
+      const pass = Math.round(done * prod.firstPassRate);
+      const runSecExact = elapsedSec * prod.runRate;      // 前端口径：已进行时长 × 有效运行占比
+      const runSecInt = Math.round(runSecExact);          // 服务端口径：采集时刻串只能表达整秒
+
+      const h = createIsolatedHarness({});
+      h.window.MockData.tick(h.__at(iso));
+      const fe = h.window.MockData.state.stats;
+
+      const list = [];
+      for (let i = 0; i < pass; i++) list.push({ result: stats.STATUS.PASS });
+      for (let i = 0; i < done - pass; i++) list.push({ result: stats.STATUS.FAIL });
+      for (let i = 0; i < 2; i++) list.push({ result: stats.STATUS.RUNNING });   // ≥1 条在测，服务端才算有效运行
+      const measures = [];
+      for (let i = 0; i <= runSecInt; i++) measures.push(new Date(at.getTime() - i * 1000));
+      const be = stats.computeShiftStats({
+        shift, tasks: list, measures, planQty: prod.planQty, cycleSec: prod.cycleSec,
+        accum: { daySec: 0, monthSec: 0, yearSec: 0, at }, addRunSec: runSecInt, now: at
+      });
+      return { iso, elapsedSec, done, pass, runSecExact, runSecInt, fe, be };
+    }
+
+    /* 四个时刻：
+       · 10:00 / 12:00 —— 整点班次进度（runSec 恰为整数），与现有 K 段同一时间基准；
+       · 14:19:30 —— 非整点、runSec 带小数的样本；
+       · 03:30:58 —— **取整边界样本**：实测 done=79、runSec=10000s，平均数 126.58227848101266，
+         即小数部分 0.58 —— 距 .5 最近的那类输入（四舍五入必然进位 127，截断则得 126），
+         用于让"服务端取整"这条已知边界**可证伪**而不是被容差盖住。 */
+    const evals = ['2026-09-18T10:00:00', '2026-09-18T12:00:00',
+      '2026-09-18T14:19:30', '2026-09-18T03:30:58'].map(evalCase);
+
+    /* 前提（ADR-0004 D20）：只声明"输入处于可用状态"，不描述被测函数的返回值 */
+    const inputsOk = evals.every(e =>
+      e.elapsedSec > 0 && e.done > 0 && e.done < prod.planQty &&
+      e.pass > 0 && e.pass < e.done && e.runSecInt > 0);
+    if (requires('跨实现一致性的输入可用（班次已进行、完成数 ∈ (0, 计划数)、运行时长 > 0）',
+      inputsOk, evals.map(e => `${e.iso}: elapsed=${e.elapsedSec}s done=${e.done} pass=${e.pass} runSec=${e.runSecInt}s`).join('；'))) {
+      /* ① 两侧对"完成数"这一共同输入必须一致（若连它都不一致，下面的比对没有意义） */
+      check(
+        '跨实现一致性前提：同一组输入下两侧的完成数一致（FR-4.4）',
+        evals.every(e => e.fe.done === e.done && e.be.doneQty === e.done),
+        evals.map(e => `${e.iso}: 前端 ${e.fe.done} / 服务端 ${e.be.doneQty} / 构造值 ${e.done}`).join('；')
+      );
+
+      /* ②a 三项百分比指标：**必须严格一致**（两侧都归一到 1 位小数，容差 0.05 只吸收浮点表示误差）。
+         `pct1` 依据：服务端 pct() 按"保留 1 位小数"返回（stats.js 的 pct() 定义）；前端输出**未取整**的
+         原始百分比（实测 firstPass=93.33333333333333、capacity=78.88888888888889）。
+         这三项不因 FR-4.13 的取整边界而放宽 —— 各自容差仍是 0.05。 */
+      const pct1 = v => Number(v.toFixed(1));
+      const rows = [
+        { name: '一次性合格率', fe: 'firstPass', be: 'firstPassRate', id: 'FR-4.10' },
+        { name: '产能达成率', fe: 'capacity', be: 'capacityRate', id: 'FR-4.14' },
+        { name: '稼动率', fe: 'oee', be: 'oee', id: 'FR-4.15' }
+      ];
+      for (const row of rows) {
+        const bad = evals.filter(e => Math.abs(pct1(e.fe[row.fe]) - e.be[row.be]) > 0.05);
+        check(
+          `跨实现一致（${row.id} ${row.name}）：前端 mockData.${row.fe} 与 server.stats.${row.be} 对同一组输入一致`,
+          bad.length === 0,
+          bad.length
+            ? bad.map(e => `${e.iso}: 前端 ${e.fe[row.fe]}（归一 ${pct1(e.fe[row.fe])}）/ 服务端 ${e.be[row.be]}`).join('；')
+            : evals.map(e => `${e.iso}: ${e.fe[row.fe]} ↔ ${e.be[row.be]}`).join('；')
+        );
+      }
+
+      /* ②b 平均测试时长（FR-4.13）：**已知取整边界**，写成可证伪的构成性断言，而不是放宽容差。
+         事实（实测 + 源码）：
+           · 公式两侧一致，都是 `runSec / done`（mockData.computeStats 与 stats.js 的派生指标段）；
+           · 差异只在最后一步：服务端对该商做 `Math.round` **取整到整秒**，
+             前端**不取整**（保留小数）。
+         ⇒ 期望关系（构成性，无魔数）：`服务端值 === Math.round(前端值)`，等价于
+           `前端值 − 服务端值 ∈ (−0.5, 0.5]`。
+         它是不是恒真？不是：服务端值是"同一个商取整后的结果"这一事实本身就是要验的关系 ——
+         一旦某侧公式分叉（分子/分母被改动），`Math.round(前端) === 服务端` 立刻不成立。
+         取整边界样本（03:30:58）实测 126.58227848101266 → 服务端 127：**截断**会得 126、
+         **四舍五入**才得 127，故这条同时锁住"服务端确实走 Math.round 而非截断"。 */
+      const avgBoundary = evals.map(e => ({
+        iso: e.iso, done: e.done, fe: e.fe.avgTest, be: e.be.avgTestSec,
+        delta: e.fe.avgTest - e.be.avgTestSec,
+        sameRound: e.be.avgTestSec === Math.round(e.fe.avgTest),
+        withinHalf: (e.fe.avgTest - e.be.avgTestSec) > -0.5 && (e.fe.avgTest - e.be.avgTestSec) <= 0.5,
+        /* 独立等价计算（不改源码）：前端值应等于 构造运行时长 / 完成数 —— 证明两侧公式同源，
+           即"不取整时两侧严格相等"，与取整无关 */
+        formulaSame: Math.abs(e.fe.avgTest - e.runSecExact / e.done) < 1e-9
+      }));
+      check(
+        '跨实现一致（FR-4.13 平均测试时长）：服务端值 === Math.round(前端值) —— 取整口径差异属已知边界' +
+        '（服务端取整、前端不取整），非公式差异',
+        avgBoundary.every(r => r.sameRound),
+        avgBoundary.map(r => `${r.iso}: 前端 ${r.fe} / 服务端 ${r.be}（done=${r.done}，Math.round(前端)=${Math.round(r.fe)}）`).join('；')
+      );
+      check(
+        '取整边界有界且与公式无关：|前端 − 服务端| ≤ 0.5，且前端值 = 运行时长 / 完成数（不取整时两侧严格相等）',
+        avgBoundary.every(r => r.withinHalf && r.formulaSame),
+        avgBoundary.map(r => `${r.iso}: 前端 ${r.fe} − 服务端 ${r.be} = ${r.delta}` +
+          `（∈ (−0.5, 0.5]：${r.withinHalf}；前端 = runSec/done：${r.formulaSame}）`).join('；')
+      );
+      /* ③ 前端基线自洽（D23 式守卫）：断言的输入口径不得在无人察觉时漂移。
+         合格数 / 完成数 若与界面输出的一次性合格率对不上，说明"同一组输入"两个字段各说各话 ——
+         这不是恒真断言：它把 mockData 里 qualified 与 firstPass 两条路径钉在一起。 */
+      const splitOk = evals.every(e =>
+        e.fe.qualified === e.pass && e.fe.unqualified === e.done - e.pass &&
+        Math.abs(norm1(e.fe.firstPass) - norm1((e.fe.qualified / e.fe.done) * 100)) < 0.05);
+      check(
+        '跨实现一致性的前端基线自洽（qualified/unqualified 与 firstPass、构造输入三者一致）',
+        splitOk,
+        evals.map(e => `${e.iso}: 前端 合格 ${e.fe.qualified} / 不合格 ${e.fe.unqualified} / 完成 ${e.fe.done}` +
+          `（构造 ${e.pass} / ${e.done - e.pass} / ${e.done}）`).join('；')
+      );
+    }
   }
 
   /* ---------------- 汇总 ---------------- */

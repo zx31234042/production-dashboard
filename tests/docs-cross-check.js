@@ -10,6 +10,8 @@
         五、技术栈断言 vs ADR      六、与规范 9.5 四条技术约束
         七、字段语义（易错项）     八、进度标注 与 实际状态
         九、测试侧边界（测试代码不得引用业务代码）
+        十、权威门禁数字的机器校验（P2-22）
+        十一、权威区逐脚本条数 ＝ 实跑值（P2-2，期望值取自实跑）
    依赖：仅 Node 内置模块（纯文本读取）。
    运行：node tests/docs-cross-check.js
    退出码：0 = 全部一致；1 = 有跨文档不一致（**失败项即待修缺陷**）。
@@ -21,6 +23,12 @@ const path = require('node:path');
 
 const env = require('./env');
 const { createRunner } = require('./lib/assert');
+
+/* 说明：环境变量 `DSH_DC_README_OVERRIDE`（**仅调试用**，正式运行不设它）用于把
+   "被校验的 README"指向一份副本 —— 本机这台机器上有并发协作方在同时改 `tests\README.md`，
+   要验证本节"全绿/变异即红"只能在一份**不受并发改写影响的副本**上做，否则同一份 README
+   两次运行读到的内容都可能不同。不设它时读的就是真文件 `tests\README.md`。 */
+const README_REL = process.env.DSH_DC_README_OVERRIDE || 'tests/README.md';
 
 const ROOT = env.paths.root;
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
@@ -36,6 +44,8 @@ function baselineReqFile() {
 const t = createRunner('跨文档一致性（docs-cross-check）');
 env.assertRuntime();
 
+/* 注意：main 里第十一节会**顺序**实跑一批离线门禁来取"实跑值"（见 probeOne 注释），
+   但全程同步、不 await，末尾仍是 `t.finish()` 退 0/1。 */
 function main() {
   /* 输入文档集中读入，避免各处重复 IO */
   const arch = read('项目架构与技术栈.md');
@@ -310,25 +320,50 @@ function main() {
   t.section('十、权威门禁数字的机器校验（P2-22）');
 
   const numeric = require('./lib/numeric');
-  const readmeSrc = read('tests/README.md');
+  const readmeSrc = read(README_REL);
   const { spawnSync } = require('node:child_process');
 
-  /** 实跑一个门禁脚本（输出落文件后回读；受限环境禁管道，故不用 pipe） */
+  /** 实跑一个门禁脚本（输出落文件后回读；受限环境禁管道，故不用 pipe）。
+   *
+   *  **日志落点很关键**：不要落在 `tests\._verify\tmp\`（临时库区）—— 本机实测那里写下的日志
+   *  会在子进程跑完前后**消失**（`statSync` 直接 ENOENT，连读都读不到 → 实跑值恒为 null，
+   *  表现为 `harness-check` 这类脚本"三次重试都拿不到汇总行"的假失败）。
+   *  落在 `tests\._verify\` 根下则次次可读（实测 2/2 成功、8813 字节）。该目录已被 .gitignore 忽略。
+   *  `timeout` 是兜底：曾实测到子进程卡住不返回，没有它上游工具超时会打断整条命令。 */
   const probe = (script) => {
-    const log = path.join(env.ensureDir(env.paths.tempRoot), `docs-cross-${script}-${process.pid}.log`);
+    const log = path.join(env.ensureDir(env.paths.verify), `docs-cross-${script}-${process.pid}.log`);
     const fd = fs.openSync(log, 'w');
     const r = spawnSync(process.execPath, [path.join(ROOT, 'tests', script + '.js')],
-      { cwd: ROOT, stdio: ['ignore', fd, fd], timeout: 300000 });
+      { cwd: ROOT, stdio: ['ignore', fd, fd], timeout: 120000 });
     try { fs.closeSync(fd); } catch { /* 忽略 */ }
     let out = '';
     try { out = fs.readFileSync(log, 'utf8'); } catch { out = ''; }
     try { fs.rmSync(log, { force: true }); } catch { /* 忽略 */ }
-    return { code: r.status, out };
+    return { code: r.status, out, timedOut: r.error ? (r.error.code === 'ETIMEDOUT') : false };
   };
 
-  /** 说明：`run-totals.json` 是 runner 落盘的实跑账，**本脚本不读它** ——
-   *  "权威值 vs 实跑合计"的比对本脚本做不了（suite 成员按定义读不到本轮最终账），
-   *  已移到 `run-all` 收尾执行（它是唯一持有最终账、且不会自递归的地方）。 */
+  /**
+   * 单个脚本的实跑探针 + **最多两次重试**（第十一节用）。
+   * 为什么要重试：本机上确有的一次拿不到汇总行的情形（同一台机器上还有别的门禁在并发跑，
+   * 子进程可能被挤到超时或输出来不及落盘）。**一次拿不到就报红是假失败**，
+   * 会让人去查根本不存在的漂移；故重试两次，三次都拿不到才判"未覆盖"（那时是真有问题）。
+   * @param {string} script 脚本名（不含 .js）
+   * @returns {{passed:number,attempts:number}|null}
+   */
+  const probeOne = (script) => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const r = probe(script);
+      const s = summaryOf(r.out);
+      if (s) return { passed: s.passed, attempts: attempt };
+    }
+    return null;
+  };
+
+  /** 说明：`run-totals.json` 里"断言合计"的那本账，**本脚本不做比对** ——
+   *  "权威值 vs 实跑合计"要等本轮全部脚本跑完才有最终账，suite 成员按定义读不到，
+   *  已移到 `run-all` 收尾执行（它是唯一持有最终账、且不会自递归的地方）。
+   *  **第十一节只借用其中的"逐脚本通过数"**（每个脚本跑完就落盘，故是既成事实而非预测），
+   *  且必须确认它是**本轮**写的（mtime 判定），详见该节注释。 */
 
   /* ① 结构完整性：权威区点名的每个脚本都必须真实存在 */
   const authLine = (readmeSrc.split('\n').find(l => l.includes('离线可跑部分')) || '');
@@ -418,6 +453,249 @@ function main() {
   t.check('权威区的"离线可验证覆盖率"与"依赖浏览器脚本条数"＝ trace-check 实跑值',
     readmeOffline === traceOffline && readmeOnlineOnly === traceOnlineOnly,
     `离线 README=${readmeOffline}/实跑=${traceOffline}；依赖 README=${readmeOnlineOnly}/实跑=${traceOnlineOnly}`);
+
+  /* ---------------- 十一、权威区逐脚本条数 ＝ 实跑值（2026-09-20 新增，P2-2） ----------------
+     立案症状（架构评审 A-2026-09-20-01 P2-2）：权威区自己写着"本节数字为权威值"，第十节也做了
+     合计/文件级/分类的机器校验，但**逐脚本那一行声明的条数没有任何断言盯着**，于是它长期漂移：
+     `docs-cross-check` 描述里写 48 项（实跑 58）、`logic-check` 写 44 项（实跑 52）、
+     `db-check` 写 46 项（实跑 50）、`harness-check` 写 73 项（实跑 94）—— 全绿着漂了很久。
+     注意第十节 ③ 的"列出的和 ≤ 声明合计"**抓不住这种漂移**：它只比合计，不逐脚本比。
+
+     期望值**一律来自实跑**（D21：不得把 58/94/52… 之类的数字当期望值写进断言，那就成了第二个真源）：
+     本脚本对"权威区里声明了条数"的每个离线门禁**各实跑一次**，解析其汇总行
+     （`通过 N 项，失败 N 项，…`），**不再复用 `tests\._verify\run-totals.json`**。
+     为什么不用那份现成账（试过，被实测否掉）：
+       · 它是**另一个进程随时会重写**的文件 —— 实测同一份 README 下 `harness-check` 先后读到过
+         94 / 92（并发的 run-all 反复重写），于是"声明 93 vs 实跑 93"的**假绿**与真红在两次运行间翻面，
+         断言不可复现；
+       · suite 成员时序坑：账本里 `docs-cross-check` 那条是它**中途**落盘的数（实测 62/63），不是终值。
+     实跑成本实测约 12 s（12 个脚本串行；最慢的 `harness-check` 约 4 s），可接受。
+
+     解析覆盖两种形式（两者都要比，缺一不可）：
+       ① 逐脚本清单：`` `contract-check` **58/0** ``、`` tools-check 24/0 ``（加粗可有可无）；
+       ② 脚本表行里的中文描述：`**夹具自检（94 项）**`、`**编码与文件卫生（11 项）**`。
+     脚本名与中文描述的对应关系**取自脚本表首列的 `tests/xxx-check.js`**（同一条表行），不另写映射表。
+
+     显式排除项（**不静默跳过**，逐条说明）：
+       · `browser-check` / `overlap-check` / `stress-check`：受限沙箱下整脚本 SKIP（退出码 3），
+         "跳过不是通过"，不拿 0 去比对，也不在本节的覆盖清单里；
+       · `preflight` / `run-all`：环境体检与 runner，不是断言门禁；
+       · `docs-cross-check`（本脚本自身）：**自指**。它声明的条数 = 它自己这次跑出来的通过数，
+         而"这次"要等本节结束后才确定（第十节已有先例：suite 成员读不到本轮最终账）。
+         拿账本里的值去比只会拿到它"中途落盘"的数或上一轮的数 —— 都不构成防漂移断言，
+         故**不纳入本节比对**，改为在断言详情里如实标注。它的漂移由 `run-all` 收尾的
+         `verifyAuthorityTotals`（合计）拦截。 */
+  t.section('十一、权威区逐脚本条数 ＝ 实跑值（P2-2）');
+  const dbg = process.env.DSH_DEBUG_S11 === '1';
+
+  const SUITES_READ = (() => {
+    try { return require('./run-all').SUITES; } catch { return null; }
+  })();
+  t.requires('能读到 run-all 的门禁清单 SUITES', Array.isArray(SUITES_READ));
+  const browserNames = new Set((SUITES_READ || []).filter(s => s.needBrowser).map(s => s.name));
+  /** 离线门禁 = run-all 清单里的 needBrowser:false（含 screenshot-diff 与 docs-cross-check 自身） */
+  const offlineGates = (SUITES_READ || []).filter(s => !s.needBrowser).map(s => s.name);
+
+  /** 从脚本输出里取汇总行（`通过 N 项，失败 N 项[(，跳过 N 项)]` 的**最后一次**出现） */
+  const summaryOf = (out) => {
+    const re = /通过\s*(\d+)\s*项，失败\s*(\d+)\s*项(?:，跳过\s*(\d+)\s*项)?/g;
+    let m; let last = null;
+    while ((m = re.exec(String(out || ''))) !== null) last = m;
+    return last ? { passed: Number(last[1]), failed: Number(last[2]), skipped: last[3] === undefined ? 0 : Number(last[3]) } : null;
+  };
+
+  /**
+   * 逐脚本实跑账（`tests\._verify\run-totals.json`）的读取。
+   *
+   * 采信条件**不是** mtime（试过：mtime 与进程启动时刻只差 0.1 s，判定会因计时抖动而翻面 ——
+   * 那样的门禁是"看运气"的），而是**内容完整性**：文件存在 + 能解析 + `suites[].summary.passed`
+   * 覆盖到各个离线门禁。它可能是**上一轮** `run-all` 写的，故按内容采信后还有第二道闸：
+   * 凡"账里的数 ≠ README 声明"的脚本**一律单跑复核**（见下面的触发条件），
+   * 既不会有"账与声明一致却被判红"的假失败，也不会漏掉真漂移。
+   * （单独运行本脚本时账内通常已含上一轮全部脚本，故复核只在真有出入时才发生。）
+   */
+  const readRunTotals = () => {
+    const file = path.join(env.paths.verify, 'run-totals.json');
+    try {
+      if (!fs.existsSync(file)) return { fresh: false, why: '不存在（本轮不是经 run-all 启动，账本还没生成过）', suites: [] };
+      const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (!Array.isArray(json.suites)) return { fresh: false, why: '结构不对（缺 suites 数组）', suites: [] };
+      return { fresh: true, why: '', suites: json.suites };
+    } catch (err) {
+      return { fresh: false, why: '解析失败：' + (err && err.message), suites: [] };
+    }
+  };
+
+  /* ---- 解析：脚本名（两种形式之一）→ 声明通过数 ---- */
+  const nameDecl = (name, textAndSource) => {
+    const re = new RegExp('`' + name + '`\\s*\\*{0,2}\\s*(\\d+)\\s*/\\s*(\\d+)', 'g');
+    for (const { text, from } of textAndSource) {
+      const m = re.exec(text);
+      if (m) return { name, declared: Number(m[1]), from };
+    }
+    return null;
+  };
+  const nameDeclarations = new Map();
+  for (const name of offlineGates) {
+    const hit = nameDecl(name, [{ text: authLine, from: '权威区逐脚本清单' }, { text: readmeSrc, from: 'tests/README.md 全文' }]);
+    if (hit) nameDeclarations.set(name, hit);
+  }
+
+  /* ---- 解析：脚本行首列的 `tests/xxx.js` ↔ 本行"中文描述（N 项）" ---- */
+  const tableDeclarations = new Map();
+  for (const line of readmeSrc.split(/\r?\n/)) {
+    const cell0 = /^\|\s*`tests[\\/]([a-z0-9-]+)\.js`\s*\|/.exec(line);
+    if (!cell0 || tableDeclarations.has(cell0[1])) continue;
+    const rest = line.slice(cell0[0].length);
+    /* 描述在"运行"列之后的"覆盖"列里，故不用 `^` 锚定；形式固定为 `描述（**N 项**…）`。
+       字符类排除 `|（）*` 反引号：既避免跨单元格，也把描述限制成一段纯中文短语。 */
+    const desc = /([^|（）*`]{1,20}?)（(?:\*\*|\s)*(\d+)\s*项/.exec(rest);
+    if (!desc) continue;
+    tableDeclarations.set(cell0[1], { name: cell0[1], form: desc[1], declared: Number(desc[2]), from: 'tests/README.md 脚本表中文描述' });
+  }
+
+  const totals = readRunTotals();
+  const actuals = {};                  // 脚本名 → 实跑通过数（**本轮** run-all 的逐脚本实跑账）
+  for (const s of totals.suites) {
+    if (s && s.name && s.summary) actuals[s.name] = Number(s.summary.passed);
+  }
+  /** 账本里已有的离线门禁数（用于断言 6 详情；不含自指的本脚本） */
+  const ranLoggedCount = offlineGates.filter(n => n !== 'docs-cross-check' && actuals[n] !== undefined).length;
+  /** 声明值取自 readmeSrc（本进程启动时读入的那一份，`main` 顶部一次性读取） */
+  const declaredOf = (name) => {
+    if (nameDeclarations.has(name)) return nameDeclarations.get(name).declared;
+    return tableDeclarations.has(name) ? tableDeclarations.get(name).declared : null;
+  };
+  /**
+   * 自指脚本：**两条逐脚本断言都不比它**。
+   * 理由（实测确认）：本脚本是 suite 最后一个，`run-totals.json` 里那条记录是它**中途**落盘的
+   * 数（实测 62/63，含本节尚未走完的计数），不是终值；"拿上一轮的账"（T-1）同样不成立 ——
+   * 它会天然与声明差一轮，变成永远红的假失败。真正可比的量只有"自己这次的最终通过数"，
+   * 而那要等本节结束才确定。它的漂移由 `run-all` 收尾的 `verifyAuthorityTotals`（按合计）拦截。
+   */
+  const SELF_REF = 'docs-cross-check';
+  /**
+   * 逐脚本实跑值的取数：**对"有声明"的每个离线门禁各实跑一次**（本脚本自身除外，见下）。
+   *
+   * 为什么最终选择"无条件实跑"而不是复用 `run-totals.json`（试过、被实测否掉）：
+   * ① 账本是**另一个进程随时会重写**的文件。实测同一份 README、同一个变异条件下，账本里
+   *    `harness-check` 先后读到过 94 / 92（并发的 run-all 反复重写），导致"声明 93 vs 实跑 93"
+   *    这种**假绿**与"声明 93 vs 实跑 94"的真红在两次运行间翻面 —— 拿一个会变的量当期望值，
+   *    断言本身就不可复现；
+   * ② suite 成员的时序坑：账本里 `docs-cross-check` 那条是它**中途**落盘的数（实测 62），终值不可能是它；
+   * ③ 成本可接受：12 个脚本串行实测约 **12 s**（最慢的 `harness-check` 约 4 s），
+   *    远低于"全量重跑"版本的数分钟 —— 后者是并发探针 + 拿不到输出造成的，不是串行实跑的代价。
+   * 期望值因此 100% 来自"此刻的实跑"（D21），不依赖任何会漂移的中间文件。
+   */
+  const probeMismatch = {};
+  const probeFailures = [];                                  // 跑了但拿不到汇总行的（不得静默放过）
+  const probedNames = [];
+  const probeWallMs = (() => {
+    const startedAt = Date.now();
+    for (const name of offlineGates) {
+      if (name === SELF_REF) continue;                         // 自指，见 actualOf 注释
+      const declared = declaredOf(name);                       // 没声明的由断言 3/5 报，不猜
+      if (declared === null) continue;
+      if (!exists(path.join('tests', name + '.js'))) continue;
+      probedNames.push(name);
+      const re = probeOne(name);
+      if (re) probeMismatch[name] = re.passed;
+      else probeFailures.push(`${name}（实跑未产出可解析的汇总行）`);
+    }
+    return Date.now() - startedAt;
+  })();
+  /**
+   * 复核后的实跑值：来自"此刻的实跑探针"；探针没跑到的（自指脚本、或实跑失败）返回 undefined，
+   * 由断言 6 统一报"未覆盖"，不在这里猜。
+   */
+  const actualOf = (name) => {
+    if (name === SELF_REF) return undefined;
+    return probeMismatch[name] !== undefined ? probeMismatch[name] : actuals[name];
+  };
+
+
+  /* ---- 结构自检：解析出来的每一步都必须指向真实存在的脚本文件 ---- */
+  const badNamedScript = [...nameDeclarations.keys()].filter(n => !exists(path.join('tests', n + '.js')));
+  const badTableScript = [...tableDeclarations.keys()].filter(n => !exists(path.join('tests', n + '.js')));
+  t.check('第十一节解析出的脚本名都指向真实存在的 tests\\*.js',
+    badNamedScript.length === 0 && badTableScript.length === 0,
+    [...badNamedScript, ...badTableScript].join('、'));
+
+  /* ---- 断言 1：逐脚本清单形式 ---- */
+  const notDeclared = offlineGates.filter(n => !nameDeclarations.has(n));
+  const mismatchedNamed = [];
+  for (const [name, d] of nameDeclarations) {
+    /* 自指脚本跳过；其余"拿不到任何实跑值"的由断言 6 报"未覆盖"，此处不猜也不硬比 */
+    if (name === SELF_REF || actualOf(name) === undefined) continue;
+    if (d.declared !== actualOf(name)) {
+      mismatchedNamed.push(`${name}：声明 ${d.declared} ≠ 实跑 ${actualOf(name)}` +
+        (probeMismatch[name] !== undefined ? '（已单跑复核）' : ''));
+    }
+  }
+  t.check('权威区逐脚本清单声明的条数 ＝ 各脚本实跑通过数',
+    nameDeclarations.size > 0 && notDeclared.length === 0 && mismatchedNamed.length === 0,
+    (mismatchedNamed.length
+      ? mismatchedNamed.join('；')
+      : `逐脚本一致：${[...nameDeclarations].map(([n, d]) => `${n}=${d.declared}`).join('、')}`) +
+    (notDeclared.length ? `｜**权威区未声明条数**（新增脚本请按 \`\\\`name\\\` N/M\` 形式登记）：${notDeclared.join('、')}` : '') +
+    `；实跑 ${probedNames.length} 个（${probedNames.join('、') || '无'}）`);
+
+  /* ---- 断言 2：脚本表里的**中文形式**条数（与形式①是两处不同的文字，必须都比） ---- */
+  const cpMismatch = [];
+  for (const [name, d] of tableDeclarations) {
+    if (name === SELF_REF || actualOf(name) === undefined) continue;
+    if (d.declared !== actualOf(name)) {
+      cpMismatch.push(`${name}（${d.form}）：声明 ${d.declared} ≠ 实跑 ${actualOf(name)}` +
+        (probeMismatch[name] !== undefined ? '（已单跑复核）' : ''));
+    }
+  }
+  t.check('权威区脚本表里"中文形式"的逐脚本条数 ＝ 各脚本实跑通过数',
+    tableDeclarations.size >= 4 && cpMismatch.length === 0,
+    cpMismatch.length
+      ? cpMismatch.join('；')
+      : `中文形式一致（${[...tableDeclarations].map(([, d]) => `${d.form}=${d.declared}`).join('、')}）`);
+  if (dbg) t.info('（调试）声明/实跑明细：' + offlineGates.map(n =>
+    `${n}(声明=${declaredOf(n)}/账本=${actuals[n] === undefined ? '-' : actuals[n]}/探针=${probeMismatch[n] === undefined ? '-' : probeMismatch[n]}/采用=${actualOf(n)})`).join(' '));
+
+  /* ---- 断言 3：解析必须**全覆盖**，解析不到的不得静默放过 ---- */
+  t.check('权威区每个离线门禁的牌面条数都被解析覆盖（解析不到的列进"未覆盖清单"）',
+    offlineGates.length > 0 && notDeclared.length === 0,
+    notDeclared.length
+      ? `**未覆盖清单**（权威区里读不出条数，或写法不在解析范围内）：${notDeclared.join('、')}`
+      : `覆盖 ${nameDeclarations.size}/${offlineGates.length} 个离线门禁` +
+        (nameDeclarations.size !== tableDeclarations.size ? '（其中带中文形式描述的见上一条）' : ''));
+
+  /* ---- 断言 4：防"声明了却对不上任何脚本"（新写一段文字却写错脚本名） ---- */
+  const declaredButUnknown = [...nameDeclarations.keys()].filter(n => !offlineGates.includes(n));
+  t.check('第十一节解析出的声明都能对上一个真实门禁脚本',
+    declaredButUnknown.length === 0,
+    declaredButUnknown.length ? `未匹配到门禁脚本：${declaredButUnknown.join('、')}` : '（0 处）');
+
+  /* ---- 断言 5：**两种形式**合起来必须覆盖每个离线门禁（新增脚本别只写一处就以为登记过了） ---- */
+  const uncoveredOffline = offlineGates.filter(n => !nameDeclarations.has(n) && !tableDeclarations.has(n));
+  t.check('两种形式合起来覆盖全部离线门禁（权威区不得漏登记某个脚本的条数）',
+    offlineGates.length > 0 && uncoveredOffline.length === 0,
+    uncoveredOffline.length
+      ? `**未覆盖清单**（权威区里既无 \`name\` N/M、也无"描述（N 项）"）：${uncoveredOffline.join('、')}`
+      : `覆盖 ${offlineGates.length}/${offlineGates.length}（逐脚本清单 ${nameDeclarations.size} 个、中文形式 ${tableDeclarations.size} 个）`);
+
+  /* ---- 断言 6：**不得静默变绿** —— 有任何"有声明却拿不到实跑值"的必须红 ---- */
+  const cannotVerify = offlineGates.filter(n => n !== SELF_REF && declaredOf(n) !== null &&
+    !probedNames.includes(n));
+  t.check('每个有声明的离线门禁都拿到了实跑值（取不到即红，不静默放过）',
+    probedNames.length > 0 && cannotVerify.length === 0 && probeFailures.length === 0,
+    `实跑 ${probedNames.length} 个（${probedNames.join('、') || '无'}）` +
+    `，拿不到汇总行 ${probeFailures.length} 个` +
+    (probeFailures.length ? `：${probeFailures.join('、')}` : '') +
+    (cannotVerify.length ? `｜**未覆盖清单**（有声明却没实跑）：${cannotVerify.join('、')}` : '') +
+    `｜run-totals.json ${totals.fresh ? '可读（仅作交叉参考，不再作为期望值）' : '不可用：' + totals.why}`);
+
+  /* ---- 自指排除的如实交代：docs-cross-check 自身的声明值不在本节比对范围内 ---- */
+  const notCompared = offlineGates.filter(n => !probedNames.includes(n));
+  t.info(`未纳入逐脚本比对的离线门禁：${notCompared.join('、') || '（无）'}` +
+    '（docs-cross-check 为**自指**：它声明的条数 = 它自己这次跑出来的通过数，本节结束时才确定，' +
+    '账本里那条还只是它中途落盘的数；其漂移由 run-all 收尾的 verifyAuthorityTotals 按合计拦截）' +
+    `｜实跑探针墙钟 ${probeWallMs} ms`);
 
   t.finish();
 }

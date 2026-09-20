@@ -4,7 +4,10 @@
          并强制每一条条款都有明确状态（没有归属的条款即报 FAIL，防止覆盖情况含糊）。
          追溯表内嵌在本文件的 MAP 中：每条 = [条款匹配, 状态, 证据脚本, 证据文本]
          条款匹配支持：精确 ID、逗号分隔多 ID、`FR-1.*` 通配（匹配该前缀全部条款）
-   依赖：仅 Node 内置模块。
+         第六节：AC-01～AC-12 验收标准追溯（**独立分母**，见需求 §0.2）。
+         第七节：第 10 章 12 项交付物**逐项存在性台账**（落点 / 部分 / 缺失 + 覆盖计数，供 AC-12 用；
+                 同样**不计入 256 条分母**；清单从需求原文解析，不硬编码）。
+   依赖：仅 Node 内置模块 + tests/lib/assert.js（统一 runner，ADR-0003 D14/D15）。
    运行：node tests/trace-check.js（可选 --list 打印每条条款的归属）
    退出码：0 = 追溯表完整且证据有效；1 = 有未归属条款或证据失效。
    状态词表：
@@ -23,11 +26,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const env = require('./env');
+const { createRunner } = require('./lib/assert');
 env.assertRuntime();
 
 const ROOT = path.resolve(__dirname, '..');
 const TESTS = path.join(ROOT, 'tests');
 const LIST = process.argv.includes('--list');
+const t = createRunner('需求追溯自检（trace-check）');
 
 /* ---------------- 追溯表 ---------------- */
 const MAP = [
@@ -234,6 +239,130 @@ function acceptanceCriteria() {
   return map;
 }
 
+/* ==========================================================================
+   第 10 章交付物清单（第七节的数据源；T-20260920-06）
+   --------------------------------------------------------------------------
+   为什么单列：AC-12（需求 :710「第 10 章交付物齐全并通过审核」）的判定对象是**第 10 章
+   （:674 起、表在 :678–691）的 12 项交付物**。原先 AC-12 的依据只按 `输出文件\` 一个目录
+   得出"其余 10 项无交付件"这样的**粗判定**；本节把 12 项**逐项**对上仓库落点，
+   把"有没有"变成可核查的数字（口径与 AC 一致：**不计入 256 条分母**）。
+
+   三条纪律：
+     ① **清单从需求原文解析**（`deliveryItems()`），不把 12 项写死在断言里 —— 需求升版增删
+        交付物时，解析结果与台账立刻对不上，断言变红逼人复核，而不是继续"数着旧清单"；
+     ② 判定只回答"**仓库里有没有对应产物**"，**不能**回答"是否齐全""是否通过审核"
+        （后两者属人工评审；机器证明不了）；
+     ③ "尚未产出"在 10 月开发冲刺之前**属时间表内的正常状态**（交付方式见需求 :676：
+        与硬件一起实物交付、交付节点 = 12 月底父项目 M6 现场终验收），故一律记"待交付"，
+        **不写成项目缺陷**。
+   ========================================================================== */
+
+/** 需求原文第 10 章交付物表的每一行 → {seq, name, desc}（**不硬编码清单**） */
+function deliveryItems() {
+  const out = [];
+  try {
+    const file = fs.readdirSync(path.join(ROOT, '需求文档')).find(f => f.endsWith('.md'));
+    const lines = fs.readFileSync(path.join(ROOT, '需求文档', file), 'utf8').split('\n');
+    const start = lines.findIndex(l => /^##\s*10\./.test(l));
+    if (start < 0) return out;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (/^##\s/.test(lines[i])) break;                       // 第 10 章结束（下一个二级标题）
+      const m = lines[i].match(/^\|\s*(\d+)\s*\|\s*([^|]+?)\s*\|\s*([^|]*)\|\s*$/);
+      if (m) out.push({ seq: Number(m[1]), name: m[2].trim(), desc: m[3].trim().replace(/\s+/g, ' ') });
+    }
+  } catch { /* 读不到就当解析不出，由第七节的 requires 如实报"前提不成立" */ }
+  return out;
+}
+
+/** 交付物判定词表：present＝仓库内有直接产物；partial＝只有组成部分/素材，本体待成文；
+ *  missing＝仓库内无任何对应产物（**待交付**）。写错词会让第七节的计数自洽断言变红。 */
+const DELIVERY_VERDICTS = new Set(['present', 'partial', 'missing']);
+
+/* 冻结基线：需求 V1.30 §10 的交付物**行数**（实测 12）。
+   注意这**不是**交付物清单 —— 清单逐项从需求原文解析（`deliveryItems()`）。
+   冻结一个数的目的：需求若增删交付物，本断言必须**变红**，逼人回来复核台账。 */
+const BASELINE_DELIVERABLE_COUNT = 12;
+
+/** 第 10 章 12 项交付物的**逐项落点与判定**（按 `name` 与需求原文对号，空白差异已归一）。
+ *  `paths` 为仓库相对路径；判 missing 的项必须为空数组（否则判定与证据自相矛盾）。 */
+const DELIVERY_LEDGER = [
+  { name: '看板系统实物', verdict: 'missing', paths: [],
+    basis: '需求 :680：看板主机（软件预装）+ 独立 75″ 电视 + 有线键鼠 + 线材的**成套实物**。仓库内无任何产物（无硬件清单、无装机记录），记"待交付"；交付方式见需求 :676（与硬件一起实物交付，节点 = 12 月底父项目 M6 现场终验收），属时间表内状态。' },
+  { name: '需求规格说明书', verdict: 'present',
+    paths: ['需求文档\\水池高速摄像生产管理看板-详细需求清单-V1.30.md',
+      '需求文档\\水池高速摄像生产管理看板-详细需求清单-V1.30.docx'],
+    basis: '需求 :681「本清单评审定稿后形成基线」—— **需求清单本身即该交付物**：.md 为基线正文、.docx 为交付件，两者都在库。⚠️ "是否已评审定稿"属人工评审，本节只能证明文件在库。' },
+  { name: '系统设计说明书', verdict: 'partial',
+    paths: ['项目架构与技术栈.md', '项目记录\\ADR\\ADR-0001-后端形态与运行时选型.md',
+      'server\\db\\schema.sql', 'src\\config\\fieldMap.js'],
+    basis: '需求 :682 要求的四类内容（架构、模块、数据库设计、字段映射表）在库都有**素材**：架构与技术栈说明、ADR-0001（DB 形态/运行时）、建表脚本、三方字段映射。但**未成文为《系统设计说明书》**（无该交付件），本体待编制。' },
+  { name: '界面原型 / UI 设计稿', verdict: 'partial',
+    paths: ['src\\assets\\screenshots', 'tests\\screenshots-baseline'],
+    basis: '需求 :683「按 4K@30Hz 大屏设计，8 个标签页全量出图」：`src\\assets\\screenshots\\` 有 10 张 4K 交付截图（8 标签页 + 曲线空态 + 上位机断连降级），`tests\\screenshots-baseline\\` 有 10 张 1080p 基准图。但那是**已实现界面的运行截图**，不是设计稿/原型（无设计源文件、无原型工程、无交互标注），故记部分。' },
+  { name: '数据库脚本与初始化数据', verdict: 'partial',
+    paths: ['server\\db\\schema.sql', 'server\\db\\index.js', 'src\\config\\board.config.js'],
+    basis: '需求 :684「建表脚本、字典数据」：建表脚本在库（`schema.sql` 13 张表、幂等、DR-01～DR-19）、初始化写入在库（`index.js` 的 `initSchema()` 落结构版本与指纹、`seedInitialData()` 落设备初始数据）；但**字典数据只有结构与示例**（`board.config.js` 的 `faultDict` 自注"内容待补全"），内容待上位机方答复 Q-12/Q-13（快照 §5.1），故记部分。' },
+  { name: '源代码与构建说明', verdict: 'partial',
+    paths: ['src', 'server', 'platform', 'index.html', 'README.md'],
+    basis: '需求 :685「看板服务 + 前端 + 配置」：源代码在库（前端 `src\\`、看板服务起始 `server\\`、平台适配 `platform\\`、入口 `index.html`）。但**构建说明没有成文交付件** —— 本项目本就无构建步骤（纯静态 + Node 内置、零 npm 依赖），`README.md` §一 只给"怎么跑起来"；且 `server\\` 尚无进程入口（只有 db/repo/services），"看板服务"还没成形为可构建产物，故记部分。' },
+  { name: '安装包与部署手册', verdict: 'missing', paths: [],
+    basis: '需求 :686「支持现场一次部署成功」：仓库内无安装包（根目录无 `package.json`，无 .msi/.exe/打包产物）也无部署手册；需求侧对应 DEP-01/DEP-07（本文件主表已分别记 backend-phase / declared-gap），快照 §六 第 6 项"部署脚本与运维文档"仍为"待开始"。记"待交付"。' },
+  { name: '接口联调文档与测试报告', verdict: 'partial',
+    paths: ['输出文件\\上位机方\\接口需求函-致设备上位机方.md', '输出文件\\MES方\\接口澄清函-致MES方.md',
+      'tools\\mock-upper\\README.md', 'tools\\mock-mes\\README.md'],
+    basis: '需求 :687「IF-D（上位机）与 IF-A/IF-B（MES）联调、补传验证记录」：**接口契约侧**文档在库（致上位机方接口需求函、致 MES 方接口澄清函、模拟上位机与模拟 MES 的说明）；但**联调本身尚未发生**（三方答复待 09-25，Q-21/Q-23），无联调记录、无补传验证记录文档，故记部分。' },
+  { name: '测试报告', verdict: 'partial',
+    paths: ['tests\\README.md', '项目记录\\审查报告-2026-09-19.md', '项目记录\\审查报告-2026-09-19-第二次.md'],
+    basis: '需求 :688「功能、性能、4K 显示、断链、7×24 稳定性」：机器可复跑的测试资产与两轮审查报告在库（`tests\\` 13 个离线门禁 + 脚本表 + 缺陷清单与处置）。但**面向交付的《测试报告》未成文**，且需求点名的"性能 / 4K 显示 / 7×24 稳定性"三项**无结论**（7×24 稳定性即 AC-07：现有证据只有 `stress-check` 默认 8 小时，且在本受限环境整脚本跳过），故记部分。' },
+  { name: '用户操作手册 / 运维手册', verdict: 'missing', paths: [],
+    basis: '需求 :689「解锁、维保录入、公告维护、故障处理」：仓库内无面向用户/运维的手册；`README.md` §三「演示交互」与 §四「数据口径」是**开发者向**说明，不构成本交付物；DEP-07 已登记部署/运维/排障手册缺失（declared-gap）。记"待交付"。' },
+  { name: '培训与验收报告', verdict: 'missing', paths: [],
+    basis: '需求 :690「现场培训记录与实物演示验收结论」：培训与实物演示验收都发生在交付节点（12 月底父项目 M6 现场终验收）的现场，仓库内无记录。记"待交付"。' },
+  { name: '质保承诺书', verdict: 'missing', paths: [],
+    basis: '需求 :691「质保 2 年，含响应时限」：仓库内无质保承诺书文本；需求 DEP-14（:669）的"质保 2 年、故障响应 ≤4 小时 / 重大故障 ≤24 小时恢复"是**要求**，不是已出具的承诺书。记"待交付"。' }
+];
+
+/**
+ * 逐项统计：需求解析结果 × 台账判定 × **声明路径的真实存在性**。
+ * `evidenced` 是**独立于判定词**的第二个来源（只认"声明路径全部真实存在"的项数），
+ * 用来发现"判定与文件系统脱节"——判定写 present 而文件不在、或写 missing 却还挂着路径。
+ * @returns {{items:Array, rows:Array, present:number, partial:number, missing:number,
+ *            inRepo:number, evidenced:number, unmatched:Array<string>,
+ *            unmatchedLedger:Array<string>, badVerdicts:Array<string>}}
+ */
+function deliveryTally() {
+  const key = (s) => String(s).replace(/\s+/g, '');
+  const items = deliveryItems();
+  const byName = new Map(DELIVERY_LEDGER.map(e => [key(e.name), e]));
+  const rows = items.map(it => {
+    const e = byName.get(key(it.name)) || null;
+    const paths = e ? e.paths.slice() : [];
+    return {
+      seq: it.seq, name: it.name, desc: it.desc,
+      verdict: e ? e.verdict : null, basis: e ? e.basis : '',
+      paths, missingPaths: paths.filter(p => !fs.existsSync(path.resolve(ROOT, p)))
+    };
+  });
+  const count = (v) => rows.filter(r => r.verdict === v).length;
+  const present = count('present');
+  const partial = count('partial');
+  const missing = count('missing');
+  return {
+    items, rows, present, partial, missing,
+    inRepo: present + partial,
+    evidenced: rows.filter(r => r.paths.length && r.missingPaths.length === 0).length,
+    unmatched: rows.filter(r => !r.verdict).map(r => `${r.seq}.${r.name}`),
+    unmatchedLedger: DELIVERY_LEDGER
+      .filter(e => !rows.some(r => key(r.name) === key(e.name))).map(e => e.name),
+    badVerdicts: DELIVERY_LEDGER
+      .filter(e => !DELIVERY_VERDICTS.has(e.verdict)).map(e => `${e.name}=${e.verdict}`)
+  };
+}
+
+/** AC-12 的"依据"文句：**在库项数由台账派生**，避免"清单里 7 项、依据里写 5 项"这种两处各写一份。
+ *  （第七节的第 6 条断言仍会把落盘数字与**当场重新派生**的数字比一遍，防手改这份文句。） */
+const DELIVERY_TALLY = deliveryTally();
+
 /** AC 追溯表（见上方口径说明） */
 const AC_MAP = [
   /* ——— 有机器证据可复跑的一类 ——— */
@@ -264,7 +393,17 @@ const AC_MAP = [
   ['AC-11', 'declared-gap', '', '',
     '"看板软硬件成套实物交付 + 现场演示验收通过 + 与父项目 M6 对齐"属**商务与硬件交付**条款（与 DEP-12～DEP-15 同类），验收动作在现场/合同阶段，仓库内无对应机器证据，亦非纯软件可验。'],
   ['AC-12', 'declared-gap', '', '',
-    '第 10 章 12 项交付物现况（实盘点）：`输出文件\\` 只有 4 份函件 + 1 份 Demo 说明（甲方 2 + 上位机方 1 + MES 方 1，各含 .md/.docx）；其中"需求规格说明书"对应需求清单本身，**其余 10 项**（系统设计说明书、界面原型/UI 设计稿、数据库脚本与初始化数据、源代码与构建说明、安装包与部署手册、接口联调文档与测试报告、测试报告、用户操作手册/运维手册、培训与验收报告、质保承诺书）无交付件；trace-check 侧仅 DEP-07 一条 declared-gap 登记了部署/运维/排障手册的缺失。"通过审核"属人工评审。']
+    /* 2026-09-20（T-20260920-06）：原依据只用**一个目录**（`输出文件\`）实盘，得"其余 10 项无交付件"；
+       现改为**逐项落点**（第七节的台账），"在库 N/12"由台账派生，逐项依据见该节清单。
+       归属类型**保持 declared-gap**：不升 `covered-*`（没有任何断言能证明"齐全/通过审核"），
+       也不改 `manual`（"不齐全"是文件系统上的客观事实，不是人工判断）。 */
+    `第 10 章交付物的**逐项落点**见本文件第七节（第 10 章交付物存在性台账，从需求原文解析、逐项 fs.existsSync 核实）：` +
+    `**在库 ${DELIVERY_TALLY.inRepo}/${DELIVERY_TALLY.items.length}**（存在 ${DELIVERY_TALLY.present} 项＝②需求规格说明书即需求清单本身；` +
+    `部分 ${DELIVERY_TALLY.partial} 项＝③系统设计说明书/④界面原型与 UI 设计稿/⑤数据库脚本与初始化数据/⑥源代码与构建说明/⑧接口联调文档/⑨测试报告，` +
+    `均只有素材或阶段性产物、**本体待成文**）；**纯缺失待交付 ${DELIVERY_TALLY.missing} 项**＝①看板系统实物/⑦安装包与部署手册/⑩用户操作手册与运维手册/⑪培训与验收报告/⑫质保承诺书。` +
+    '⚠️ **机器只能证明"有无"（文件在不在、有几项），不能证明"齐全"，更不能证明"通过审核"** —— ' +
+    'AC-12 的判定对象是"12 项齐全 + 通过审核"，后半句属人工评审；交付方式见需求 :676（与硬件一起实物交付、节点 = 12 月底父项目 M6 现场终验收），' +
+    '故"尚未产出"是时间表内的正常状态、**不是缺陷**，本项**不得**因本节的存在性断言而被读成"AC-12 已满足"。']
 ];
 
 /** AC 归属类型词表（与本文件头部状态词表一致；AC 段靠它拦"写了个不存在的分类"） */
@@ -273,19 +412,12 @@ const STATUS_WORDS = new Set([
   'backend-phase', 'manual', 'subjective', 'out-of-scope'
 ]);
 
-/* ---------------- 断言与工具 ---------------- */
-let passed = 0;
-const failures = [];
-
-function check(name, ok, detail) {
-  if (ok) {
-    passed++;
-    console.log(`  [PASS] ${name}`);
-  } else {
-    failures.push({ name, detail });
-    console.log(`  [FAIL] ${name}${detail ? ' —— ' + detail : ''}`);
-  }
-}
+/* ---------------- 断言与工具 ----------------
+   2026-09-20（T-20260920-06）：本脚本原自带一份 `check()`/`passed`/`failures`（与
+   `tests\lib\assert.js` **逐字同规格**的手写副本）。为用上 `t.requires()`（ADR-0004 D20 前提独立）
+   并统一风格，改用公共 runner：**8 条既有断言一一对应保留**（名字、判定式、detail 均未改），
+   唯一语义变化是原先把"追溯表引用了不存在的条款"写成一条**匿名 failure**（不计入 passed），
+   现按 D20 归入 `t.requires()` —— 前提成立时不计入断言数，前提塌掉时汇总单列"前提不成立"并退 1。 */
 
 /** 需求清单里"表格行"口径的全部条款（与 §0.2 条目数一致）
  *  ⚠️ 2026-09-19 修复：原正则**漏掉了 ENV 系列（20 条）** —— 导致"每条条款都有归属"是**假的全覆盖**，
@@ -342,10 +474,11 @@ function main() {
   /* 1) 每条条款必须且只能归属一组 */
   const owner = new Map();
   const dup = [];
+  const badRefs = [];
   for (const [pattern, status, script, evidence] of MAP) {
     for (const id of expand(pattern, universe)) {
       if (!universe.has(id)) {
-        failures.push({ name: `追溯表引用了不存在的条款 ${id}`, detail: pattern });
+        badRefs.push(`${id}（来自 ${pattern}）`);
         continue;
       }
       if (owner.has(id)) dup.push(`${id}（${owner.get(id)[0]} 与 ${pattern}）`);
@@ -355,8 +488,12 @@ function main() {
   const unassigned = [...universe.keys()].filter(id => !owner.has(id));
 
   console.log('=== 一、追溯表完整性 ===');
-  check('追溯表没有重复归属的条款', dup.length === 0, dup.slice(0, 6).join('；'));
-  check(
+  /* 前提（ADR-0004 D20）：追溯表引用的条款必须真实存在 —— 这是"逐条归属"这件事成立的**前提**，
+     不是对被测对象的断言。原实现写成一条匿名 failure（连断言名都不进 passed 计数），
+     故改判为前提：成立时不计入断言数，塌掉时汇总单列「前提不成立」并使退出码非 0。 */
+  t.requires('追溯表引用的条款都存在于需求清单', badRefs.length === 0, badRefs.slice(0, 6).join('；'));
+  t.check('追溯表没有重复归属的条款', dup.length === 0, dup.slice(0, 6).join('；'));
+  t.check(
     `每条需求条款都有归属（未归属 0 条）`,
     unassigned.length === 0,
     unassigned.length ? `未归属 ${unassigned.length} 条：${unassigned.slice(0, 12).join(', ')}${unassigned.length > 12 ? ' …' : ''}` : `已归属 ${owner.size} 条`
@@ -372,8 +509,8 @@ function main() {
     if (!fs.existsSync(p)) { badScript.push(`${pattern} → ${script}`); continue; }
     if (evidence && !fs.readFileSync(p, 'utf8').includes(evidence)) badEvidence.push(`${pattern} → ${script} 中找不到「${evidence}」`);
   }
-  check('证据指向的脚本都存在', badScript.length === 0, badScript.join('；'));
-  check('证据指向的断言确实存在于该脚本', badEvidence.length === 0, badEvidence.slice(0, 6).join('；'));
+  t.check('证据指向的脚本都存在', badScript.length === 0, badScript.join('；'));
+  t.check('证据指向的断言确实存在于该脚本', badEvidence.length === 0, badEvidence.slice(0, 6).join('；'));
 
   /* 2b) 证据"共用度"提示（P2-9～12 的辅助，**不判失败**）
      为何不判失败：一条断言被多条条款共用**很多时候是正当的** —— 例如
@@ -498,7 +635,7 @@ function main() {
      ⚠️ 为何还要 `AC_MAP.length === acOwner.size`：防止**重复登记**（同一 AC 写两遍会让"条数"看着够）。
      反证（ADR-0004 D22 定点变异）：把某条 AC 的编号改掉（等价于删掉该条），本条由全绿转红并点名该编号 ——
      实测把 `AC-09` 改成 `AC-XX-MUTATED-AWAY` 后，detail 直接给出「未归属 1 条：AC-09」、汇总由 8/0/0 变 7/1/0、退 1。 */
-  check('AC-01～AC-12 每条都有归属、无遗漏（缺一即红）',
+  t.check('AC-01～AC-12 每条都有归属、无遗漏（缺一即红）',
     AC_MAP.length === acOwner.size && acUnassigned.length === 0 && acDup.length === 0 && acInvalid.length === 0,
     acUnassigned.length
       ? `未归属 ${acUnassigned.length} 条：${acUnassigned.join(', ')}`
@@ -513,8 +650,8 @@ function main() {
     if (!fs.existsSync(p)) { acBadScript.push(`${id} → ${script}`); continue; }
     if (evidence && !fs.readFileSync(p, 'utf8').includes(evidence)) acBadEvidence.push(`${id} → ${script} 中找不到「${evidence}」`);
   }
-  check('AC 证据指向的脚本都存在', acBadScript.length === 0, acBadScript.join('；'));
-  check('AC 证据指向的断言确实存在于该脚本', acBadEvidence.length === 0, acBadEvidence.slice(0, 6).join('；'));
+  t.check('AC 证据指向的脚本都存在', acBadScript.length === 0, acBadScript.join('；'));
+  t.check('AC 证据指向的断言确实存在于该脚本', acBadEvidence.length === 0, acBadEvidence.slice(0, 6).join('；'));
 
   /* AC 分区汇总（AC 的状态词允许与主表不同：backend-phase / declared-gap 在 AC 里同样正当）。
      分母一律取**需求表的条数**（acUniverse.size），不取追溯表行数 —— 否则漏登一条时会显示"12 条"自欺。 */
@@ -543,7 +680,7 @@ function main() {
   const ac07reqDays = Number((acUniverse.get('AC-07') || '').match(/≥\s*(\d+)\s*天/)?.[1] || 0);
   const stressHours = Number(fs.readFileSync(path.join(TESTS, 'stress-check.js'), 'utf8').match(/DSH_STRESS_HOURS\s*\|\|\s*(\d+)/)?.[1] || 0);
   const ac07rec = acOwner.get('AC-07') || ['', '', '', ''];
-  check('AC-07 如实登记为无有效证据（≥7 天 vs 现有 8 小时且整脚本跳过，不构成满足）',
+  t.check('AC-07 如实登记为无有效证据（≥7 天 vs 现有 8 小时且整脚本跳过，不构成满足）',
     ac07reqDays >= 7 && stressHours > 0 && stressHours < ac07reqDays * 24 &&
     ac07rec[0] === 'declared-gap' && !ac07rec[1] && /跳过/.test(ac07rec[3] || ''),
     `AC-07 要求 ≥${ac07reqDays} 天、stress-check 默认 ${stressHours} 小时（整脚本跳过）、登记状态 ${ac07rec[0]}, 证据脚本 ${ac07rec[1] || '无'}`);
@@ -557,6 +694,78 @@ function main() {
     console.log(`  [提示] AC 段与需求条款主表共用 ${acSharedScripts.length} 个证据脚本（正当）：${acSharedScripts.join('、')}`);
   }
 
+  /* 七、第 10 章交付物存在性台账（T-20260920-06；AC-12 的口径细化）
+     与 AC 段同样**走独立口径**：本节的项数（12）与计数**绝不并入 `可追溯覆盖合计 X / 256`**
+     —— 交付物不是需求条款（需求 §0.2 明令 AC/交付口径不计入条款合计）。
+     本节只回答"仓库里有没有"，不回答"是否齐全/是否通过审核"。 */
+  t.section('七、第 10 章交付物存在性台账（AC-12 口径；**不计入上面的 256 条分母**）');
+
+  const dlOk = t.requires(
+    '第 10 章交付物表可从需求原文解析（需求 §10 的 "序号 / 交付物 / 说明" 表行非空）',
+    DELIVERY_TALLY.items.length > 0,
+    `${DELIVERY_TALLY.items.length} 行`);
+
+  if (dlOk) {
+    const dl = deliveryTally();                                  // 当场重新派生（不用模块加载期的缓存）
+    const VERDICT_TXT = { present: '存在', partial: '部分', missing: '缺失/待交付' };
+    console.log(`  需求原文（${path.basename(path.join(ROOT, '需求文档',
+      fs.readdirSync(path.join(ROOT, '需求文档')).find(f => f.endsWith('.md'))))}）第 10 章交付物表：${dl.items.length} 行`);
+    for (const r of dl.rows) {
+      console.log(`    ${String(r.seq).padStart(2)}. ${r.name} ［${VERDICT_TXT[r.verdict] || '**未归属**'}］`);
+      console.log(`        落点：${r.paths.length ? r.paths.join('、') : '（仓库内无对应产物）'}`);
+      console.log(`        依据：${r.basis}`);
+    }
+    /* 覆盖计数**单独成行**（口径与 AC 一致：不计入 256 条分母）。下面的断言会把这一行
+       **回读**并与逐项统计比一遍 —— 手改这个数字会让断言变红（D22 定点变异②）。 */
+    const countLine = `第 10 章交付物在库 ${dl.inRepo}/${dl.items.length}` +
+      `（存在 ${dl.present}、部分 ${dl.partial}、纯缺失待交付 ${dl.missing}）`;
+    console.log(`  ${countLine} —— 与 AC 同口径，**不计入上面的 256 条分母**`);
+
+    const seqOk = dl.items.every((it, i) => it.seq === i + 1);
+    t.check(`第 10 章交付物清单＝冻结基线 ${BASELINE_DELIVERABLE_COUNT} 项、序号 1..N 连续、说明非空（需求升版须同步本基线）`,
+      dl.items.length === BASELINE_DELIVERABLE_COUNT && seqOk &&
+      dl.items.every(it => it.name && it.desc),
+      `解析出 ${dl.items.length} 行，序号 ${dl.items.map(i => i.seq).join(',')}${seqOk ? '（连续）' : '（**不连续**）'}`);
+
+    t.check('交付物台账与需求原文逐项对号：无未归属、无多余条目、判定词合法',
+      dl.unmatched.length === 0 && dl.unmatchedLedger.length === 0 && dl.badVerdicts.length === 0,
+      [`需求里未归属：${dl.unmatched.join('、') || '无'}`,
+        `台账里多余：${dl.unmatchedLedger.join('、') || '无'}`,
+        `判定词非法：${dl.badVerdicts.join('、') || '无'}`].join('；'));
+
+    t.check('判「存在/部分」的交付物，其声明的仓库落点逐个真实存在（fs.existsSync 核实）',
+      dl.present + dl.partial > 0 && dl.rows
+        .filter(r => r.verdict === 'present' || r.verdict === 'partial')
+        .every(r => r.paths.length > 0 && r.missingPaths.length === 0),
+      dl.rows.filter(r => (r.verdict === 'present' || r.verdict === 'partial') &&
+        (r.paths.length === 0 || r.missingPaths.length > 0)).map(r =>
+        `${r.seq}.${r.name}${r.paths.length ? ' → 不存在：' + r.missingPaths.join('、') : ' → 未声明任何落点'}`).join('；') ||
+      `在库项共 ${dl.present + dl.partial} 项，声明路径 ${dl.rows.reduce((n, r) => n + r.paths.length, 0)} 条全部存在`);
+
+    t.check('判「缺失/待交付」的交付物不声明任何仓库落点（判定与证据不得互相矛盾）',
+      dl.rows.filter(r => r.verdict === 'missing').every(r => r.paths.length === 0),
+      dl.rows.filter(r => r.verdict === 'missing' && r.paths.length).map(r =>
+        `${r.seq}.${r.name} 判缺失却声明了 ${r.paths.join('、')}`).join('；') ||
+      `缺失项 ${dl.missing} 项，落点声明均为空`);
+
+    /* 覆盖计数自洽（验收判据 ④）：报告值（**回读刚打印的那一行**）＝逐项统计值，
+       且"声明路径全部存在"的项数（独立于判定词、来自文件系统）＝在库项数。 */
+    const reported = Number((countLine.match(/在库\s*(\d+)\s*\/\s*(\d+)/) || [])[1]);
+    t.check('覆盖计数与逐项判定自洽（报告值＝逐项统计值；且"声明路径存在"的项数＝在库项数）',
+      reported === dl.inRepo && dl.inRepo === dl.present + dl.partial &&
+      dl.present + dl.partial + dl.missing === dl.items.length && dl.evidenced === dl.inRepo,
+      `报告值 ${reported}；判定统计 存在 ${dl.present}+部分 ${dl.partial}=${dl.inRepo}/${dl.items.length}（缺失 ${dl.missing}）；路径存在的项数 ${dl.evidenced}`);
+
+    /* AC-12 的归属不得悄悄升级：仍 declared-gap、仍**不冒领**机器证据（证据脚本留空），
+       依据里必须写明"在库 N/12"与"机器只证有无、不证审核"。 */
+    const ac12rec = acOwner.get('AC-12') || ['', '', '', ''];
+    t.check('AC-12 仍记 declared-gap 且不冒领机器证据，依据写明"在库 N/12"与"机器只证有无、不证审核"',
+      ac12rec[0] === 'declared-gap' && ac12rec[1] === '' &&
+      (ac12rec[3] || '').includes(`在库 ${dl.inRepo}/${dl.items.length}`) &&
+      /通过审核/.test(ac12rec[3] || '') && /不能证明/.test(ac12rec[3] || ''),
+      `归属 ${ac12rec[0] || '无'}、证据脚本 ${ac12rec[1] || '无'}、依据${(ac12rec[3] || '').includes(`在库 ${dl.inRepo}/${dl.items.length}`) ? '含' : '**缺**'}「在库 ${dl.inRepo}/${dl.items.length}」`);
+  }
+
   if (LIST) {
     console.log('\n=== 附：全部条款归属 ===');
     for (const [id, [pattern, status, script, evidence]] of [...owner].sort()) {
@@ -564,15 +773,9 @@ function main() {
     }
   }
 
-  console.log('\n=== 汇总 ===');
-  /* 冻结格式（规范 9.5-5）：三字段齐全，`run-all` 与 tests\README 都解析这一行 */
-  console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 0 项`);
-  if (failures.length) {
-    console.log('\n失败清单：');
-    failures.forEach((f, i) => console.log(`  ${i + 1}. ${f.name}${f.detail ? ' —— ' + f.detail : ''}`));
-    process.exit(1);
-  }
-  process.exit(0);
+  /* 汇总与退出码交给公共 runner（冻结格式见规范 9.5-5 / assert.js 的"输出契约"：
+     `通过 N 项，失败 N 项，跳过 N 项` —— `run-all`、`tests\README.md` 权威区都解析这一行）。 */
+  t.finish();
 }
 
 try {
