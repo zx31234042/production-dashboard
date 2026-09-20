@@ -30,7 +30,7 @@ production-dashboard/
 │   ├── assets/screenshots/       # 交付文档用的界面截图
 │   ├── components/               # 可复用界面片段（一个文件一个组件）
 │   ├── config/                   # 可调参数集中地
-│   │   ├── board.config.js       #   数据源、班次、统计口径、维保、接口地址
+│   │   ├── board.config.js       #   数据源、班次、维保、接口地址等**参数**（统计公式不在此，见 ADR-0005）
 │   │   └── fieldMap.js           #   三方字段映射（看板 ↔ 上位机 ↔ 附录 2）
 │   ├── pages/Dashboard.js        # 页面装配：标签切换、统一渲染
 │   ├── services/                 # 数据层

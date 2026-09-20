@@ -766,6 +766,163 @@ function main() {
       `归属 ${ac12rec[0] || '无'}、证据脚本 ${ac12rec[1] || '无'}、依据${(ac12rec[3] || '').includes(`在库 ${dl.inRepo}/${dl.items.length}`) ? '含' : '**缺**'}「在库 ${dl.inRepo}/${dl.items.length}」`);
   }
 
+  /* 八、AC-01「逐条签核清单」：P0 中**未被"直接断言"承接**的条款（T-20260920-09）
+     ---------------------------------------------------------------------------
+     立案：AC-01（需求 :699「本清单 P0 条目 100% 实现并现场演示通过」）的判定对象是**现场演示**
+     与"P0 清单逐条过"的组织动作 —— 机器证明不了"是否已实现"。而第五之二节的
+     `P0 可追溯覆盖 126/184` 分子里**含间接验证**，被读成"实现完备度"就高估了。
+     故按负责人批准的口径 (a)「只标注有无断言承接」：**"有断言承接"＝ covered-direct**，
+     其余**一律**进清单，逐条打印【编号 / 状态 / 一句话原因】供现场/终验收**逐条签核**。
+     机器只保证**清单完整、可核对**（不漏项、不藏项），**不判定"是否已实现"**。
+
+     三条纪律：
+      ① 清单**从现有追溯表派生**（MAP → owner），**不另建第二份 P0 名单** —— 否则就是第二个真源；
+         优先级沿用 `requirementPriorities()`（与第五之二节同一个函数），不新写解析规则；
+      ② 只读取、只汇总，**不重分类**：清单里每条的状态一律取自 owner，断言④会把这一点逐条比一遍；
+      ③ 本清单**不计入 256 条分母**（与 AC 段同属验收口径，需求 §0.2 明令不计入条款合计），
+         也不改动第五 / 六 / 七节的任何数字与判定。
+     ⚠️ 需求里 DR 表是「编号/数据表/关键字段/说明」**四列**、IF-C / IF-0 部分行的末列是**备注** ——
+        这些行**没有优先级字段**，故**不计入 P0**（第五之二节已同口径排除，本节沿用同一个 prio 表）。 */
+  t.section('八、AC-01 逐条签核清单：P0 中未被"直接断言"承接的条款（口径 (a)；**不计入上面的 256 条分母**）');
+
+  const p0Ids = [...universe.keys()].filter(id => prio.get(id) === 'P0');
+  const noPrioIds = [...universe.keys()].filter(id => !prio.has(id));
+  const p0Ready = t.requires('需求原文里能解析出标注为 P0 的条款（AC-01 的判定基数，非空）',
+    p0Ids.length > 0, `P0 ${p0Ids.length} 条、无优先级字段 ${noPrioIds.length} 条`);
+
+  if (p0Ready) {
+    /* 清单条目的状态**一律取自 owner**（不重分类）；owner 缺失的 P0 显式记「未归属」**并进清单**，
+       使"不许藏项"在归属塌掉时也不会静默丢条。 */
+    const p0All = p0Ids.map(id => {
+      const r = owner.get(id);
+      return r ? { id, status: r[1], script: r[2], evidence: r[3] }
+        : { id, status: '(未归属)', script: '', evidence: '追溯表（MAP）里没有这条 P0 的归属' };
+    });
+    const p0Unowned = p0All.filter(it => it.status === '(未归属)').map(it => it.id);
+    const directAll = p0All.filter(it => it.status === 'covered-direct');
+    const p0List = p0All.filter(it => it.status !== 'covered-direct');
+
+    /* 「有断言承接」的**第二条独立来源**：状态词写着 covered-direct 还不够，必须**证据可核实**
+       （脚本存在 + 证据文本确实在该脚本里，与第 2 步同规格）。有了它，"把没有直接断言的条款
+       标成 covered-direct"会让「有断言承接 ＋ 清单 ＝ P0 总数」当场不成立 —— D22 定点变异①的红点。 */
+    const srcCache = new Map();
+    const scriptSrc = (s) => {
+      if (!srcCache.has(s)) {
+        const p = path.join(TESTS, s);
+        srcCache.set(s, fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null);
+      }
+      return srcCache.get(s);
+    };
+    const backable = (it) => {
+      const src = it.script ? scriptSrc(it.script) : null;
+      return Boolean(src) && (!it.evidence || src.includes(it.evidence));
+    };
+    const directBacked = directAll.filter(backable);
+    const directUnbacked = directAll.filter(it => !backable(it));
+
+    /* 一句话原因：状态词给出"为什么不算直接断言"，再接追溯表里的原始证据/原因文本（**不改写**）。 */
+    const LEAD = {
+      'covered-indirect': '仅间接验证（有可复跑断言，但它验证的不是本条本身）',
+      'fix-pending': '已确认缺陷待修',
+      'declared-gap': '已声明缺口（Demo 明确不做，README「已知限制」已登记）',
+      'backend-phase': '属后端/部署/目标硬件阶段，纯前端 Demo 无法验证',
+      'manual': '须人工判断（观感/规范等），当前无断言',
+      'subjective': '主观项（动效/防烧屏等）',
+      'out-of-scope': '已声明不在本期范围'
+    };
+    const reasonOf = (it) => {
+      const lead = LEAD[it.status] || `状态词「${it.status}」不在词表内（须复核）`;
+      return it.script ? `${lead}；现有证据：${it.script} ← ${it.evidence}`
+        : `${lead}；${it.evidence || '（追溯表未写原因）'}`;
+    };
+
+    console.log(`  口径：清单只收**需求里标注了优先级的 P0**；另有 ${noPrioIds.length} 条条款在需求原文里` +
+      '本就没有优先级字段（DR 表四列、IF-C / IF-0 部分行末列为备注），**不计入 P0、也不进本清单**。');
+    console.log(`  P0 共 ${p0Ids.length} 条；其中"有断言承接"（covered-direct 且证据可核实）${directBacked.length} 条。`);
+
+    /* 单行计数：**回读**这一行做断言（手改数字即红 —— D22 定点变异②）。 */
+    const tally = new Map();
+    for (const it of p0List) tally.set(it.status, (tally.get(it.status) || 0) + 1);
+    const tallyTxt = [...tally].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([k, v]) => `${k} ${v}`).join('、');
+    const countLine = `P0 未被直接断言承接 ${p0List.length}/${p0Ids.length}（其中 ${tallyTxt}）`;
+    console.log(`  ${countLine} —— 供现场/终验收**逐条签核**；**不计入上面的 256 条分母**`);
+
+    console.log('  逐条清单（编号 / 状态 / 一句话原因）—— 机器不判定"是否已实现"，只保证不漏项、不藏项：');
+    const printed = [];
+    for (const it of p0List) {
+      const line = `    ${it.id.padEnd(10)} ${String(it.status).padEnd(16)} ${reasonOf(it)}`;
+      printed.push(line);
+      console.log(line);
+    }
+    console.log(`  （清单 ${printed.length} 条；签核动作＝逐条确认"是否已实现"，与本清单是否完整无关。）`);
+
+    /* 回读计数行与逐条清单行 —— 断言比的是**打印出来的产物**，不是内存里的中间量。 */
+    const cm = countLine.match(/^P0 未被直接断言承接 (\d+)\/(\d+)（其中 (.*)）$/);
+    const repX = cm ? Number(cm[1]) : NaN;
+    const repTotal = cm ? Number(cm[2]) : NaN;
+    const repTally = new Map((cm ? cm[3].split('、') : []).map(s => {
+      const mm = s.trim().match(/^(\S+)\s+(\d+)$/);
+      return [mm ? mm[1] : s.trim(), mm ? Number(mm[2]) : NaN];
+    }));
+    const tallyMismatch = [...new Set([...tally.keys(), ...repTally.keys()])]
+      .filter(k => (tally.get(k) || 0) !== (repTally.get(k) || 0))
+      .map(k => `${k}：报告 ${repTally.has(k) ? repTally.get(k) : '缺'} vs 逐条 ${tally.get(k) || 0}`);
+    const parsed = printed.map(l => {
+      const m = l.match(/^\s{4}(\S+)\s+(\S+)\s+(.+)$/);
+      return m ? { id: m[1], status: m[2], reason: m[3] } : { id: l.trim(), status: '(解析失败)', reason: '' };
+    });
+
+    /* ① P0 每条都有归属（不得有未归属的 P0）；基数与第五之二节**同源**（两处各写一份必漂移）。 */
+    t.check('AC-01 清单①：P0 条款在追溯表里逐条有归属（未归属 0 条），P0 基数与第五之二节报告值一致',
+      p0Unowned.length === 0 && p0Ids.length === p0.total && noPrioIds.length === noPrio,
+      p0Unowned.length ? `未归属 ${p0Unowned.length} 条：${p0Unowned.join(', ')}`
+        : `P0 ${p0Ids.length} 条 ＝ 第五之二节 ${p0.total} 条；无优先级字段 ${noPrioIds.length} 条 ＝ 第五之二节 ${noPrio} 条`);
+
+    /* ② 报告计数自洽 + 不漏不重（回读刚打印的计数行；把计数改错、或把某条判成 covered-direct，都会红）。
+       "不漏不重"的锚是 directBacked（**证据可核实**的直接断言数），**不是**状态词本身。 */
+    t.check('AC-01 清单②：报告计数与逐条清单自洽（回读值＝清单条数、分类子计数＝逐条统计值），且"有断言承接 ＋ 清单 ＝ P0 总数"',
+      repX === p0List.length && repTotal === p0Ids.length && tallyMismatch.length === 0 &&
+      directBacked.length + p0List.length === p0Ids.length,
+      `报告 ${repX}/${repTotal}；逐条清单 ${p0List.length} 条；有证据的直接断言 ${directBacked.length} 条；` +
+      `分类差异：${tallyMismatch.join('；') || '无'}；不漏不重 ${directBacked.length}＋${p0List.length}＝${directBacked.length + p0List.length} vs P0 ${p0Ids.length}`);
+
+    /* ③ 不漏不重（**打印出来的清单** vs 归属）：清单＝P0 中全部非 covered-direct、无重复、
+       无 covered-direct 混入，且"清单 id 集合"与"直接断言 id 集合"互补、并集＝全部 P0。 */
+    const listedIds = parsed.map(r => r.id);
+    const dupIds = listedIds.filter((id, i) => listedIds.indexOf(id) !== i);
+    const leaked = parsed.filter(r => r.status === 'covered-direct');
+    /* 互补集的另一半取 **directBacked（证据可核实）**，不取状态词派生的 directAll ——
+       这样"把某条 P0 的状态从 backend-phase 改成 covered-direct"会让并集少一条，本断言当场变红。 */
+    const backedIds = directBacked.map(it => it.id);
+    const union = new Set([...listedIds, ...backedIds]);
+    t.check('AC-01 清单③：不漏不重（清单 ＋ 有断言承接 ＝ P0 全集、无重复、无 covered-direct 混入清单）',
+      parsed.length === p0List.length && dupIds.length === 0 && leaked.length === 0 &&
+      union.size === p0Ids.length && union.size === backedIds.length + listedIds.length,
+      `清单 ${listedIds.length} 条（重复 ${dupIds.join('、') || '无'}；混入 covered-direct ${leaked.length} 条）；` +
+      `有断言承接（证据可核实）${backedIds.length} 条；并集 ${union.size} vs P0 ${p0Ids.length}`);
+
+    /* ④ 清单每条的状态词合法且 ≠ covered-direct、与追溯表登记状态**逐条一致**、原因非空。 */
+    const badWord = parsed.filter(r => !STATUS_WORDS.has(r.status));
+    const notDirect = parsed.filter(r => r.status === 'covered-direct');
+    const statusDrift = parsed.filter(r => !owner.has(r.id) || owner.get(r.id)[1] !== r.status);
+    const emptyReason = parsed.filter(r => !r.reason.trim());
+    t.check('AC-01 清单④：清单每条状态词合法且 ≠ covered-direct、与追溯表登记状态逐条一致、原因非空',
+      parsed.length === p0List.length && badWord.length === 0 && notDirect.length === 0 &&
+      statusDrift.length === 0 && emptyReason.length === 0,
+      `解析出 ${parsed.length} 条；状态词非法：${badWord.map(r => `${r.id}=${r.status}`).join('、') || '无'}；` +
+      `covered-direct 混入：${notDirect.map(r => r.id).join('、') || '无'}；` +
+      `与追溯表不一致：${statusDrift.map(r => r.id).join('、') || '无'}；原因为空：${emptyReason.map(r => r.id).join('、') || '无'}`);
+
+    /* ⑤ "有断言承接"必须**条条有可核实的证据**（脚本存在 + 证据文本在该脚本里）——
+       这是拦"把无直接断言的 P0 悄悄升级成 covered-direct"的第二道机器闸（第一道是清单②的"不漏不重"）。 */
+    t.check('AC-01 清单⑤：判为"有断言承接"（covered-direct）的 P0 每条都有可核实证据（防止无直接断言者被升级）',
+      directUnbacked.length === 0,
+      directUnbacked.length
+        ? `无证据却判 covered-direct 的 ${directUnbacked.length} 条：${directUnbacked.map(it => `${it.id}（脚本 ${it.script || '无'}）`).join('、')}`
+        : `有断言承接 ${directBacked.length} 条，脚本与证据文本均已核实（同第 2 步规格：脚本存在 + 证据文本在该脚本里）`);
+  }
+
   if (LIST) {
     console.log('\n=== 附：全部条款归属 ===');
     for (const [id, [pattern, status, script, evidence]] of [...owner].sort()) {
