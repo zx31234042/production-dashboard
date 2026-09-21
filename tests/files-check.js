@@ -29,7 +29,11 @@ const ROOT = env.paths.root;
 /** 需要检查编码/乱码的文本文件扩展名 */
 const TEXT_EXT = new Set(['.js', '.css', '.html', '.json', '.md', '.cmd', '.ps1', '.txt', '.sql']);
 /** 不进入版本库的目录（甲方原件、提取件、自检产物） */
-const SKIP_DIRS = new Set(['.git', 'node_modules', '.claude', '来源文件', 'reference', '._verify']);
+/* 注意：这份跳过清单是**硬编码**的，不读 `.gitignore` —— 所以凡"本机专用、已 gitignore"
+   的目录都必须在这里显式列出，否则漏一个就会把本机文件算进扫描数。
+   `本地归档`：本机归档区（需求历史版本、函件草稿），已在 .gitignore 中，
+   属本机专用、不入库，不应计入仓库卫生扫描。 */
+const SKIP_DIRS = new Set(['.git', 'node_modules', '.claude', '来源文件', 'reference', '._verify', '本地归档']);
 /** Tab 缩进检查范围（相对路径前缀） */
 const TAB_SCOPE = ['src', 'server', 'tests', 'index.html', 'tools'];
 /** 常见 mojibake 特征：PS 5.1 双重编码把中文变成"缁熶竴/鐢ㄤ緥/鍙ユ焺"这类**罕见双字组合**。
@@ -64,7 +68,7 @@ function hasBom(buf) {
 }
 
 const files = walk(ROOT).filter(f => TEXT_EXT.has(path.extname(f).toLowerCase()));
-t.info(`扫描 ${files.length} 个文本文件（已跳过 .git / 来源文件 / reference / ._verify）`);
+t.info(`扫描 ${files.length} 个文本文件（已跳过 .git / 来源文件 / reference / ._verify / 本地归档）`);
 
 /* ---------------- 一、编码损坏 ---------------- */
 t.section('一、编码损坏（替换符 / mojibake）');
