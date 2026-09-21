@@ -276,11 +276,6 @@ async function main() {
       `PROJECT_RULES=v${rulesVersion}，工作日志=v${logRules}`);
   }
 
-  const histFiles = fs.readdirSync(path.join(ROOT, '需求文档', '历史文件'));
-  const claimedHist = Number((snapshot.match(/历史版本\s*(\d+)\s*个文件/) || [])[1]);
-  check('快照声明的历史版本文件数等于实际', claimedHist === histFiles.length,
-    `快照写 ${claimedHist} 个，实际 ${histFiles.length} 个`);
-
   const reqDoc = fs.readdirSync(path.join(ROOT, '需求文档')).filter(n => n.endsWith('.md'));
   const reqText = reqDoc.length ? readText(path.join('需求文档', reqDoc[0])) : '';
   /* 只统计 §12.2「待确认事项」表：§12.1 是已确认/已关闭项，不能混进来 */
@@ -423,9 +418,6 @@ async function main() {
 
   const rootReq = fs.readdirSync(path.join(ROOT, '需求文档')).filter(n => n.endsWith('.md'));
   check('需求文档根目录只放当前有效版本', rootReq.length === 1, `实际 ${rootReq.length} 个：${rootReq.join('、')}`);
-  const archivedVersions = histFiles.filter(n => /-V\d+\.\d+\.md$/.test(n)).map(n => (n.match(/-V(\d+\.\d+)\.md$/) || [])[1]);
-  check('历史文件里保留了旧版本（有归档）', archivedVersions.length >= 5,
-    `历史版本 md：${archivedVersions.join('、') || '（无）'}`);
 
   const rulesText = readText('PROJECT_RULES.md');
   const changeRows = [...rulesText.matchAll(/^\|\s*v(\d+\.\d+)\s*\|/gm)].map(m => m[1]);

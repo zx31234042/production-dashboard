@@ -34,7 +34,7 @@ const ROOT = env.paths.root;
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 const exists = rel => fs.existsSync(path.join(ROOT, rel));
 
-/** 取需求文档当前基线文件名（排除 历史文件/） */
+/** 取需求文档当前基线文件名（只取 需求文档/ 根目录下的当前基线） */
 function baselineReqFile() {
   const dir = path.join(ROOT, '需求文档');
   const files = fs.readdirSync(dir).filter(f => f.endsWith('.md'));

@@ -245,7 +245,7 @@ function createComponentHarness(componentRels, domMock) {
   return sandbox.window;
 }
 
-/** 取需求文档当前基线版本号（文件名里的 Vx.y，排除 历史文件/） */
+/** 取需求文档当前基线版本号（只取 需求文档/ 根目录下的当前基线，文件名里的 Vx.y） */
 function baselineRequirementVersion() {
   const dir = path.join(ROOT, '需求文档');
   const files = fs.readdirSync(dir, { withFileTypes: true })
