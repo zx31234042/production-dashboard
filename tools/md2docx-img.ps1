@@ -25,22 +25,34 @@ $FONT_MONO = "Consolas"
 $CONTENT_TWIPS = 10466           # A4 纵向、左右页边距 720 twip 时的正文宽度
 $EMU_PER_TWIP = 635
 
+# 段落内换行：Markdown 表格单元格无法写多行，作者用 <br> 分段。
+# 这里输出 Word 的行内换行 <w:br/>（同一段落内），**不拆段落** —— 拆段落会在表格单元格里引入多余间距。
+function Brk() {
+  return "<w:r><w:br/></w:r>"
+}
+
 function Runs([string]$text, [int]$sz = 21, [bool]$boldAll = $false, [string]$color = "") {
   $sb = New-Object System.Text.StringBuilder
   if ($null -eq $text) { return "" }
   $pattern = '(\*\*.+?\*\*|`[^`]+`)'
-  $parts = [regex]::Split($text, $pattern)
-  foreach ($p in $parts) {
-    if ([string]::IsNullOrEmpty($p)) { continue }
-    $isBold = $boldAll; $isCode = $false; $content = $p
-    if ($p -match '^\*\*(.+)\*\*$') { $content = $Matches[1]; $isBold = $true }
-    elseif ($p -match '^`(.+)`$') { $content = $Matches[1]; $isCode = $true }
-    $t = Esc $content
-    $rf = if ($isCode) { "<w:rFonts w:ascii=`"$FONT_MONO`" w:hAnsi=`"$FONT_MONO`" w:eastAsia=`"$FONT_EA`"/>" } else { "<w:rFonts w:ascii=`"$FONT_AS`" w:hAnsi=`"$FONT_AS`" w:eastAsia=`"$FONT_EA`"/>" }
-    $b = if ($isBold) { "<w:b/>" } else { "" }
-    $c = if ($color -ne "") { "<w:color w:val=`"$color`"/>" } elseif ($isCode) { "<w:color w:val=`"A31515`"/>" } else { "" }
-    $szv = if ($isCode) { $sz - 1 } else { $sz }
-    [void]$sb.Append("<w:r><w:rPr>$rf$b$c<w:sz w:val=`"$szv`"/><w:szCs w:val=`"$szv`"/></w:rPr><w:t xml:space=`"preserve`">$t</w:t></w:r>")
+  # 先按 <br> / <br/> / <br /> 切段（大小写不敏感、允许中间空格），再逐段做行内解析；
+  # 注意：字面 &lt;br&gt; 是转义形式，不被 -split 命中，仍由 Esc() 原样输出。
+  $segs = $text -split '(?i)<br\s*/?>'
+  for ($si = 0; $si -lt $segs.Count; $si++) {
+    if ($si -gt 0) { [void]$sb.Append((Brk)) }
+    $parts = [regex]::Split($segs[$si], $pattern)
+    foreach ($p in $parts) {
+      if ([string]::IsNullOrEmpty($p)) { continue }
+      $isBold = $boldAll; $isCode = $false; $content = $p
+      if ($p -match '^\*\*(.+)\*\*$') { $content = $Matches[1]; $isBold = $true }
+      elseif ($p -match '^`(.+)`$') { $content = $Matches[1]; $isCode = $true }
+      $t = Esc $content
+      $rf = if ($isCode) { "<w:rFonts w:ascii=`"$FONT_MONO`" w:hAnsi=`"$FONT_MONO`" w:eastAsia=`"$FONT_EA`"/>" } else { "<w:rFonts w:ascii=`"$FONT_AS`" w:hAnsi=`"$FONT_AS`" w:eastAsia=`"$FONT_EA`"/>" }
+      $b = if ($isBold) { "<w:b/>" } else { "" }
+      $c = if ($color -ne "") { "<w:color w:val=`"$color`"/>" } elseif ($isCode) { "<w:color w:val=`"A31515`"/>" } else { "" }
+      $szv = if ($isCode) { $sz - 1 } else { $sz }
+      [void]$sb.Append("<w:r><w:rPr>$rf$b$c<w:sz w:val=`"$szv`"/><w:szCs w:val=`"$szv`"/></w:rPr><w:t xml:space=`"preserve`">$t</w:t></w:r>")
+    }
   }
   return $sb.ToString()
 }
