@@ -500,6 +500,32 @@ function resolveGateOutcome(changed, authority) {
   return { unstable: false, exitCode: 0, titles: [], detail: '', evidence };
 }
 
+/**
+ * **最终退出码的组合判据**（纯函数，供 `harness-check` 第十四节做真值表与 D22 定点变异）。
+ *
+ * 为什么必须单独抽出来（2026-09-21 修 P1：`51eed59` 那次重构引入的回归）：
+ * `resolveGateOutcome` 只建模两件事 —— **工作区稳定性** 与 **权威数字对账**。它**不建模**
+ * "有没有脚本失败"，于是"稳定 + 对账 ok"时它返回 `exitCode: 0`；旧实现拿它当唯一判据就落进
+ * "成功收尾"，在有 `FAIL` 的轮次上打印"门禁全绿（无失败脚本）"并 `exit 0`（实测：
+ * `FAIL docs-check 41 / 2 / 0` 与"门禁全绿"同屏、退出码 0）—— 同时违反规范 9.5-5
+ * 「`1` = 有断言失败」与 `tests\README.md` 的「任一失败即非零退出」。现在两个来源**都要**看：
+ *   · `verdict.exitCode`：不稳定轮 / 权威区漂移（`mismatch`、`broken`）/ 对账被跳过（`blocked`）
+ *     ⇒ 1；`skipped`（`--only`/`--fast` 子集没跑全离线门禁）**不构成失败** ⇒ 0（既有语义不变）。
+ *   · `failed` / `unverified` 非空：**无条件** 1 —— **包括**"失败项仅为 `PROJECT_RULES` 6.4
+ *     已登记偏差"的情形（登记偏差只免"对账被阻止"，**不免退出码**：偏差仍是未修复的断言失败）。
+ *
+ * @param {{failed?:Array, unverified?:Array, verdict?:{exitCode?:number}}} entry
+ * @returns {number} 0 = 无失败脚本且判定通过；1 = 有失败/未核实脚本，或判定本身为不通过
+ */
+function finalExitCode(entry) {
+  const e = entry || {};
+  const failed = Array.isArray(e.failed) ? e.failed : [];
+  const unverified = Array.isArray(e.unverified) ? e.unverified : [];
+  const verdict = e.verdict || {};
+  if (failed.length > 0 || unverified.length > 0) return 1;
+  return verdict.exitCode ?? 0;
+}
+
 function main() {
   if (hasFlag('--list')) {
     console.log('=== 门禁脚本清单 ===');
@@ -665,7 +691,24 @@ function main() {
     ? [{ path: `快照不可用：${snapshotProblem || snapshotProblem2}`, kind: 'changed' }]
     : rewriteChanges;
   const verdict = resolveGateOutcome(changedForVerdict, auth);
-  /* 不稳定轮**不打**权威数字校验那一行 —— 无论那一行写什么都容易被读成"比过了"。 */
+  /* 最终退出码 = "脚本层面有没有失败/未核实" **与** "判定层面过没过" 的组合（见 finalExitCode）。
+     只取其中一半就是本次要修的回归：只看 `verdict.exitCode` 会把"有 FAIL"的轮次退成 0。 */
+  const finalCode = finalExitCode({ failed, unverified, verdict });
+  /* 有失败脚本、但判定层面（稳定性 + 对账）仍然判过（典型：失败项**仅为已登记偏差**）时，
+     必须**明写**为什么最终仍退 1 —— 否则读者只看到"权威数字校验：合计一致"会以为全绿。 */
+  const failedNote = (failed.length > 0 && verdict.exitCode === 0)
+    ? `\n门禁未全绿：失败项仅为已登记偏差（${failed.map(r => r.suite.name).join('、')} N 项；`
+      + '见 PROJECT_RULES 6.4）—— 按规范 9.5-5 仍退 1。'
+    : '';
+  /* 不稳定轮**不打**权威数字校验那一行 —— 无论那一行写什么都容易被读成"比过了"（T2 既有设计，
+     2026-09-20 由静态断言守着：`verdict.unstable ? ''`）。稳定轮则**一律打印**（含全绿轮）：
+     旧实现只在失败分支打印它，绿轮把它丢掉，于是"这一轮到底核过没有"只能靠证据状态文字去猜 ——
+     与"有 FAIL 却报全绿"是同一处重构留下的两个缺口。位置固定在证据状态行之前。
+     写出口径说明：用 `fs.writeSync(1, …)` 直写 stdout（与下方 child 日志同一手法）。
+     原因（2026-09-21 实测）：这一行是本轮**唯一的对账口径**，必须在任何环境下都落得下来；
+     而同一位置的 `console.log(authLine)` 在 `--only` 子集轮里**没有产出任何字节**
+     （同一分支内相邻的 `console.log(\`\\n${verdict.evidence}\`)` 却正常打印，钩住
+     `console.log` 与 `fs.writeSync` 都观测不到它），换成直写后实测稳定可见。 */
   const authLine = verdict.unstable ? '' : `\n权威数字校验：${auth.detail}`;
 
   /* 失败明细只打一遍：合并进下面那一份（P2-22 修正之后 **不应**在权威校验处提前退出，
@@ -689,25 +732,37 @@ function main() {
     }
   };
 
-  if (verdict.exitCode !== 0) {
-    /* 不稳定轮：**不打印**权威数字校验那一行（`authLine` 为空串）—— 那一行无论写什么都容易被读成"比过了"。 */
-    if (authLine) console.log(authLine);
+  if (finalCode !== 0) {
+    /* 不稳定轮：`authLine` 为空串，故这里不会打印对账行（T2 的冻结行为，由静态断言守着）。 */
+    if (failedNote) console.log(failedNote);
+    if (authLine) fs.writeSync(1, authLine + '\n');
     if (verdict.unstable) console.log(verdict.detail);
     else for (const line of verdict.titles) console.log(line);
     tail();
     console.log(`\n${verdict.evidence}`);
     if (verdict.unstable) {
       console.log('门禁结论：**本轮不通过**（工作区在运行期间被改写，结论不可作为证据）。');
-    } else {
+    } else if (verdict.exitCode !== 0) {
       console.log('门禁结论：不通过（详见上面的失败原因）。');
+    } else {
+      /* 走到这里：判定层面（稳定性 + 对账）是过的，不通过的只有脚本层面的 failed/unverified。 */
+      console.log('门禁结论：不通过（有失败/未核实脚本，见上面的明细）。');
     }
-    process.exit(verdict.exitCode);
+    process.exit(finalCode);
   }
 
   tail();
 
-  /* 到这一步说明本轮已经"没失败"了：证据标签放在最后一行，保证"稳定"是被记录下来的事实，
-     而不是"没打印东西"的默认解读。 */
+  /* **稳定轮一律打印权威对账行**（含全绿轮）：这是"本轮到底核过没有"的唯一口径行。
+     不稳定轮在 `authLine` 处已被置空，故此处不会打印（T2 的冻结行为不变）。
+     位置固定在证据状态行之前 —— 让"核过什么"先于"证据状态"出现，避免读者只看结论文字。 */
+  if (authLine) fs.writeSync(1, authLine + '\n');
+
+  /* `finalCode === 0` 意味着**失败与未核实集合都为空**（`finalExitCode` 的判据），
+     且判定层面也退 0。注意这里**不能**只写"没失败"就完事：`verdict.exitCode === 0` 只覆盖
+     "工作区稳定 + 权威数字对账通过"这一段，脚本层面的通过与否由 `failed`/`unverified` 决定 ——
+     旧注释（"到这一步说明本轮已经'没失败'了"）把两者的来源混为一谈，正是回归的温床。
+     证据标签放在最后一行，保证"稳定"是被记录下来的事实，而不是"没打印东西"的默认解读。 */
   console.log(`\n${verdict.evidence}`);
 
   /* 收尾：清掉 24 小时前的临时区残留（P2-16 —— `harness.cleanup()` 此前只被"测试存在"，
@@ -722,14 +777,22 @@ function main() {
     console.log(`\n  临时区收尾失败（不影响门禁结论）：${err && err.message}`);
   }
 
-  console.log('\n门禁全绿（无失败脚本）。');
+  /* "门禁全绿"这句是**结论**，只能贴在真正全绿上：显式包在"失败与未核实都为空"里，
+     并由 `harness-check` 第十四节静态断言守住可达性（不许只靠上面那个提前退出"顺便"保证）。 */
+  if (failed.length === 0 && unverified.length === 0) {
+    console.log('\n门禁全绿（无失败脚本）。');
+  } else {
+    /* 理论不可达（上一处提前退出已退 1）；留着是为了"这句永不被无条件打印"。 */
+    console.log(`\n门禁结论：不通过（有失败/未核实脚本 ${failed.length + unverified.length} 项）。`);
+    process.exit(1);
+  }
   process.exit(0);
 }
 
 /* 被 require 时**不执行**：`harness-check` 要直接引用 classify/parseSummary/authorityBlockers/
    REGISTERED_DEVIATIONS 做规则回归，不能因为 require 一下就把全部门禁跑一遍。 */
 module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals, authorityBlockers,
-  REGISTERED_DEVIATIONS, failedAssertionNames, resolveGateOutcome };
+  REGISTERED_DEVIATIONS, failedAssertionNames, resolveGateOutcome, finalExitCode };
 
 if (require.main === module) {
   try {

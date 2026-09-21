@@ -15,6 +15,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const os = require('node:os');
+const { spawnSync } = require('node:child_process');
 
 const env = require('./env');
 const { createRunner } = require('./lib/assert');
@@ -962,6 +963,207 @@ t.section('十三、稳定性判据与"跳过对账"的 runner 契约');
       const blockedV = runAll5.resolveGateOutcome([], { ok: false, kind: 'blocked', detail: '**未执行**：本轮账目不完整' });
       return legacyBlocked() === 0 && blockedV.exitCode !== 0;
     })(), '旧写法：`blocked` 只打印"未核对"然后按全绿退 0');
+}
+
+/* ---------------- 十四、最终退出码的组合判据（P1：有 FAIL 却退 0 并打印"门禁全绿"） ----------------
+   事故（提交 `51eed59` 引入，2026-09-21 修）：`tests\run-all.js` 收尾把"最终退出码"交给
+   `resolveGateOutcome` 一个来源决定，而那个纯函数**只建模"工作区稳定性 + 权威数字对账"**，
+   不建模"有没有脚本失败" ⇒ 稳定 + 对账 ok 时返回 0 ⇒ 执行落到成功收尾，在有 `FAIL` 的轮次上
+   打印"门禁全绿（无失败脚本）"并退 0（实测：`FAIL docs-check 41 / 2 / 0` 与"门禁全绿"同屏）。
+   本节把两件事钉死：
+     ① **真值表**：`failed`/`unverified` 非空 ⇒ 无条件 1（**含"失败项仅为已登记偏差"**）；
+        判定层面的 `blocked`/`mismatch`/`broken`/`unstable` ⇒ 1；`skipped`（子集）与"干净轮" ⇒ 0。
+     ② **可达性静态断言**：源码里"门禁全绿"那句必须只在"失败集合为空"的路径上可达。
+   真值表与静态断言各自都能被**定点变异**证伪（见下方变异⑤）—— 只写静态文本检查会漏掉
+   "函数体被改成只看 exitCode"，这正是事故本体的形状。 */
+t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门禁全绿"不得被顺带打印）');
+{
+  const runAll6 = require('./run-all');
+  const runAllSrc6 = fs.readFileSync(path.join(__dirname, 'run-all.js'), 'utf8');
+  const gateSrc = runAllSrc6.split(/\r?\n/);
+
+  /* 真值表用的最小夹具：`finalExitCode` 只读 suite.name / 数组长度，故无需真结果对象。 */
+  const script = name => ({ suite: { name } });
+  const verdictOf = code => ({ unstable: false, exitCode: code, titles: [], detail: '', evidence: '' });
+  const codeOf = (failed, unverified, verdict) => runAll6.finalExitCode({ failed, unverified, verdict });
+
+  t.check('组合判据是纯函数且已导出（真值表与 D22 变异都要直接调它）',
+    typeof runAll6.finalExitCode === 'function', typeof runAll6.finalExitCode);
+
+  t.check('有失败脚本（判定层面"稳定 + 对账 ok"⇒ exitCode 0）⇒ **最终仍退 1** —— 事故本体',
+    codeOf([script('docs-check')], [], verdictOf(0)) === 1 &&
+    codeOf([script('ui-check'), script('db-check')], [], verdictOf(0)) === 1,
+    `failed=1/verdict=0 ⇒ ${codeOf([script('docs-check')], [], verdictOf(0))}（修复前是 0）`);
+
+  t.check('**失败项仅为已登记偏差**（docs-check 2 项 6.4 偏差）⇒ 仍退 1（豁免只免"阻止对账"，不免退出码）',
+    (() => {
+      /* 用真实的已登记偏差判据造这条场景：它是"能继续对账"的，绝不能因此被算成"全绿"。 */
+      const dev = { suite: { name: 'docs-check' }, status: 'failed',
+        summary: { passed: 41, failed: 2, skipped: 0 }, out: '' };
+      const blocked = runAll6.authorityBlockers([dev]);
+      return blocked.length === 0 && codeOf([dev], [], verdictOf(0)) === 1;
+    })(), '已登记偏差：对账放行（blockers 空），退出码仍为 1 —— 两件事必须分开建模');
+
+  t.check('未核实脚本（退出码 0 但拿不出断言证据）⇒ 非 0，与失败同档',
+    codeOf([], [script('browser-check')], verdictOf(0)) === 1 &&
+    codeOf([], [script('browser-check')], { unstable: false, exitCode: 1 }) === 1,
+    `failed=0/unverified=1 ⇒ ${codeOf([], [script('browser-check')], verdictOf(0))}`);
+
+  t.check('`blocked` / `mismatch` / `broken` / 不稳定（判定层面 exitCode 1）⇒ 1，与失败集合无关',
+    codeOf([], [], verdictOf(1)) === 1 && codeOf([], [], verdictOf(2)) !== 0 &&
+    codeOf([], [], { unstable: true, exitCode: 1 }) === 1,
+    '四类判定层不通过都由 verdict.exitCode 带出来（本函数不得把它抹成 0）');
+
+  t.check('干净轮（无失败/未核实 + 判定层面 0，含 `skipped` 子集轮）⇒ 0 —— 不得把正常形态误判为失败',
+    codeOf([], [], verdictOf(0)) === 0 &&
+    /* `--only contract-check`：对账 skipped 仍是 exitCode 0，最终码必须跟着是 0 */
+    codeOf([], [], verdictOf(0)) === 0 &&
+    codeOf([], [], { unstable: false, exitCode: 0 }) === 0,
+    '`skipped`（未跑全离线门禁）不构成失败：既有语义不变');
+
+  t.check('组合判据**不许**只看 `verdict.exitCode`（旧写法的定义式：那样上面第 2 条必红）',
+    !/return\s+verdict\.exitCode\s*;/.test(runAllSrc6) &&
+    /failed\.length\s*>\s*0/.test(runAllSrc6.slice(runAllSrc6.indexOf('function finalExitCode'))),
+    '函数体里必须出现"失败集合非空即 1"这一支');
+
+  /* ---------------- "门禁全绿"的可达性：静态守住，不靠"上面的提前退出顺便保证" ---------------- */
+  /* 锚点取**唯一的完整字面量**（含 `\n` 转义与句号）：只搜"门禁全绿"四个字会先命中上方注释。 */
+  const greenNeedle = "console.log('\\n门禁全绿（无失败脚本）。')";
+  const greenAt = runAllSrc6.indexOf(greenNeedle);
+  const guardAt = greenAt > 0 ? runAllSrc6.lastIndexOf('if (failed.length === 0 && unverified.length === 0) {', greenAt) : -1;
+  /* 守卫块的收口大括号靠**配对扫描**取（跳过字符串与注释）：直接 `foundAt + indexOf('}')` 会命中
+     `else {` 左近的括号，`lastIndexOf('}', greenAt)` 又会退到 `} else if` 去 —— 两种都会把块切错。 */
+  const matchBrace = (src, openAt) => {
+    let depth = 0;
+    for (let i = openAt; i < src.length; i++) {
+      const ch = src[i];
+      if (ch === "'" || ch === '"' || ch === '`') {
+        for (i++; i < src.length && src[i] !== ch; i++) { if (src[i] === '\\') i++; }
+        continue;
+      }
+      if (ch === '/' && src[i + 1] === '/') { i = src.indexOf('\n', i); if (i < 0) return -1; continue; }
+      if (ch === '/' && src[i + 1] === '*') { i = src.indexOf('*/', i + 2); if (i < 0) return -1; i++; continue; }
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) return i; }
+    }
+    return -1;
+  };
+  const guardBrace = guardAt > 0 ? runAllSrc6.indexOf('{', guardAt) : -1;
+  const guardEnd = guardBrace > 0 ? matchBrace(runAllSrc6, guardBrace) : -1;
+  const greenBlock = guardEnd > guardBrace && greenAt < guardEnd ? runAllSrc6.slice(guardBrace, guardEnd) : '';
+  const lineOf = at => runAllSrc6.slice(0, at).split(/\r?\n/).length;
+  t.check('静态：`门禁全绿` 那句 `console.log` 唯一一处，且落在 `if (failed.length === 0 && unverified.length === 0)` 的块内',
+    greenAt > 0 && runAllSrc6.split(greenNeedle).length - 1 === 1 && guardAt > 0 && guardEnd > guardBrace &&
+      greenAt < guardEnd && greenBlock.includes(greenNeedle),
+    greenAt > 0
+      ? `源码第 ${lineOf(greenAt)} 行；守卫在第 ${lineOf(guardAt)} 行、块收口在第 ${lineOf(guardEnd)} 行`
+      : '源码里找不到那句"门禁全绿"');
+  t.check('静态：那句 `console.log` 之后经 `} else { … process.exit(1) }` 紧跟 `process.exit(0)`（打印与退 0 成对、中间无第二个成功出口）',
+    greenAt > 0 && /门禁全绿（无失败脚本）。'\);\r?\n\s*\}\s*else\s*\{[\s\S]{0,220}?process\.exit\(1\);\r?\n\s*\}\r?\n\s*process\.exit\(0\);/
+      .test(runAllSrc6.slice(greenAt, greenAt + 400)),
+    '打印"全绿"之后不许继续走到别的收尾；守卫的 else 支只能是退 1 的兜底');
+  t.check('静态：提前退出用组合后的 `finalCode`，且它取自 `finalExitCode({ failed, unverified, verdict })`',
+    (() => {
+      const finalAt = runAllSrc6.indexOf('const finalCode = finalExitCode({ failed, unverified, verdict });');
+      const exitAt = runAllSrc6.indexOf('if (finalCode !== 0) {');
+      const greenPool = runAllSrc6.indexOf(greenNeedle);
+      /* 反向断言：**提前退出那处**不得再拿 `verdict.exitCode` 当判据 —— 事故本体就是
+         `if (verdict.exitCode !== 0) { … }` 把"脚本失败"整段漏掉。措辞分支里的
+         `} else if (verdict.exitCode !== 0) {`（只选打印哪句话、不退出）不算违规，故按行首形态区分。 */
+      const oldGuard = /(^|\r?\n)\s*if \(verdict\.exitCode !== 0\) \{/.test(runAllSrc6);
+      return finalAt > 0 && exitAt > finalAt && greenPool > exitAt && !oldGuard;
+    })(),
+    '提前退出的判据必须是组合后的最终码；旧写法行首的 `if (verdict.exitCode !== 0) {` 就是事故入口');
+  t.check('静态：权威对账行在**失败分支与绿轮收尾**各打印一次（旧实现只在失败分支打印，绿轮丢弃）',
+    runAllSrc6.split("fs.writeSync(1, authLine + '\\n')").length - 1 === 2 &&
+      runAllSrc6.includes('if (authLine) fs.writeSync(1, authLine'),
+    `源码里该打印语句出现 ${runAllSrc6.split("fs.writeSync(1, authLine + '\\n')").length - 1} 次（应为 2）`);
+
+  /* ---------------- 端到端：真跑一次 runner，看输出里到底有没有对账行（防"静态看着对、跑起来没有"） ----------------
+     为什么要真跑：本节上面所有断言都是**对源码文本/纯函数**的检查，而本次回归恰恰是
+     "文本都对、跑起来结论错"这一类（实测：同一分支里相邻的 `console.log` 能打印、`authLine` 那行没有产出）。
+     **只允许 `--only <单个脚本>`**：跑全量会把 harness-check（本脚本）自己再拉起来一层，
+     而本节的端到端断言又在那一层里再 spawn —— 实测直接递归到拿不到任何输出（status=null）。
+     `docs-check` 这条既是"有 FAIL 的轮次"（41/2 已登记偏差）又足够快，且不会递归。 */
+  const runAllPath = path.join(__dirname, 'run-all.js');
+  const runOnly = suite => {
+    const tmpOut = path.join(os.tmpdir(), `t1-runall-${process.pid}-${suite}.log`);
+    const fd = fs.openSync(tmpOut, 'w');
+    const r = spawnSync(process.execPath, [runAllPath, '--no-preflight', '--only', suite],
+      { cwd: path.join(__dirname, '..'), stdio: ['ignore', fd, fd], timeout: 120 * 1000 });
+    fs.closeSync(fd);
+    const text = fs.readFileSync(tmpOut, 'utf8');
+    fs.rmSync(tmpOut, { force: true });
+    return { status: r.status, text, error: r.error ? (r.error.code || r.error.message) : '' };
+  };
+  let failRun = null;
+  t.check('端到端：跑含 FAIL 的轮次（`--only docs-check`）⇒ 退出码 1、打印 FAIL 行，且**不含**"门禁全绿"',
+    (() => {
+      failRun = runOnly('docs-check');
+      const t2 = failRun.text;
+      return failRun.status === 1 && /FAIL {2}docs-check/.test(t2) && !t2.includes('门禁全绿') &&
+        t2.includes('门禁结论：不通过');
+    })(), (() => {
+      if (!failRun) return '未能取到该轮输出';
+      const has = s => (failRun.text.includes(s) ? '有' : '缺');
+      return `退出码 ${failRun.status}${failRun.error ? `（spawn 错误 ${failRun.error}）` : ''}`
+        + `｜FAIL docs-check ${has('FAIL  docs-check')}｜"门禁全绿" ${has('门禁全绿')}（应为"缺"）`;
+    })());
+  t.check('端到端：跑 `--only contract-check`（无失败脚本）⇒ 退出码 0，打印"门禁全绿"**且同时打印权威对账行**',
+    (() => {
+      const sub = runOnly('contract-check');
+      return sub.status === 0 && sub.text.includes('门禁全绿（无失败脚本）。') &&
+        sub.text.includes('权威数字校验：**未执行**：本轮未跑全离线门禁');
+    })(), (() => {
+      const sub = runOnly('contract-check');
+      return `退出码 ${sub.status}${sub.error ? `（spawn 错误 ${sub.error}）` : ''}`
+        + `｜权威对账行 ${sub.text.includes('权威数字校验：**未执行**') ? '有' : '缺'}｜门禁全绿 ${sub.text.includes('门禁全绿') ? '有' : '缺'}`
+        + '（绿轮丢弃对账行是同一处重构的第二个缺口：必须"绿轮也打印"）';
+    })());
+
+  /* ---------------- D22 定点变异⑤：旧写法（只看 verdict.exitCode）必须被上面的断言挡下 ---------------- */
+  const finalFn = runAllSrc6.match(/function finalExitCode\(entry\) \{[\s\S]*?\n\}/);
+  /* 变异内容：把组合判据换回旧写法 —— 删掉"失败/未核实集合非空 ⇒ 1"那一支，只认 verdict.exitCode。 */
+  const mutatedFinalFn = 'function finalExitCode(entry) {\n'
+    + '  const e = entry || {};\n'
+    + '  const verdict = e.verdict || {};\n'
+    + '  return verdict.exitCode ?? 0;\n'
+    + '}';
+  const mutateSrc = src => src.replace(finalFn[0], mutatedFinalFn);
+  /* 载入一段变异的 run-all 源码：只替换"最终退出码"函数体，其余（含 resolveGateOutcome）原样保留。
+     用 `Module._compile` 而非写临时文件：不落地、不碰仓库；`require('./lib/snapshot')` 走真实模块。 */
+  const loadSourceVariant = (src, id) => {
+    const Module = require('node:module');
+    const m = new Module(id, null);
+    m.filename = path.join(__dirname, 'run-all.js');
+    m.paths = Module._nodeModulePaths(__dirname);
+    m._compile(src, m.filename);
+    return m.exports;
+  };
+
+  t.check('变异⑤：把组合判据改回"只看 verdict.exitCode" ⇒ 第十四节断言必红；恢复后回绿',
+    (() => {
+      let lookupHit = false;
+      try {
+        if (!finalFn) { lookupHit = true; throw new Error('变异锚点未命中：源码里找不到 `function finalExitCode(entry) { … }`'); }
+        const mutated = loadSourceVariant(mutateSrc(runAllSrc6), path.join(__dirname, 'run-all.js'));
+        const mutFailed = mutated.finalExitCode({ failed: [script('docs-check')], unverified: [], verdict: verdictOf(0) });
+        const mutUnverified = mutated.finalExitCode({ failed: [], unverified: [script('browser-check')], verdict: verdictOf(0) });
+        const mutClean = mutated.finalExitCode({ failed: [], unverified: [], verdict: verdictOf(0) });
+        const curFailed = runAll6.finalExitCode({ failed: [script('docs-check')], unverified: [], verdict: verdictOf(0) });
+        const curClean = runAll6.finalExitCode({ failed: [], unverified: [], verdict: verdictOf(0) });
+        /* 变异后：有 FAIL 却退 0（旧缺陷活回来了）；恢复后：同样输入退 1；干净轮两侧都必须 0
+           （否则"挡下"可能只是把一切都判红 —— 那种断言同样不可信）。 */
+        return mutFailed === 0 && mutUnverified === 0 && mutClean === 0 && curFailed === 1 && curClean === 0;
+      } catch (err) {
+        lookupHit = true;
+        t.info('变异⑤未执行：' + (err && err.message));
+        return false;
+      } finally {
+        if (lookupHit) t.info('变异⑤：变异体未能载入，本条按失败处理（不许把"跑不了"当通过）');
+      }
+    })(), '变异内容：finalExitCode 只 `return verdict.exitCode ?? 0`（删掉 failed/unverified 那一支）；'
+      + '变异后实测：failed=1/verdict=0 → 0 且 unverified=1 → 0（红）；恢复后实测：failed=1 → 1、干净轮 → 0（绿）');
 }
 
 t.finish();
