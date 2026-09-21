@@ -180,7 +180,10 @@ CREATE TABLE IF NOT EXISTS notice (
 );
 CREATE INDEX IF NOT EXISTS ix_notice_valid ON notice(valid_from, valid_to);
 
-/* ---------------- DR-11 MES 上传日志表（去重与追溯） ---------------- */
+/* ---------------- DR-11 MES 上传日志表（去重与追溯） ----------------
+   本表同时是**上报失败待补传队列的持久化载体**（技术债 E10 / IF-B.9 / NFR-13）：
+   上报失败的报文以 state = '待补传' 落在这里，进程重启后按 `state IN ('待补传','失败')`
+   读回补齐清单（读写实现见 server/repo/uploadQueue.js、server/services/uploadQueue.js）。 */
 CREATE TABLE IF NOT EXISTS upload_log (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   upload_id     TEXT NOT NULL,                   -- 幂等键（MES 去重、回执核对）
@@ -191,7 +194,9 @@ CREATE TABLE IF NOT EXISTS upload_log (
   elapsed_ms    INTEGER,                         -- 耗时
   retry_count   INTEGER NOT NULL DEFAULT 0,
   state         TEXT NOT NULL,                   -- 成功 / 失败 / 待补传
-  created_at    TEXT NOT NULL
+  created_at    TEXT NOT NULL,
+  fail_reason   TEXT,                            -- E10：失败原因（人工重报清单要看"为什么失败"）
+  updated_at    TEXT                             -- E10：最近一次状态变更时间（重报成功/仍失败均刷新）
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_upload_log_id ON upload_log(upload_id, interface);
 CREATE INDEX IF NOT EXISTS ix_upload_log_state ON upload_log(state, created_at);

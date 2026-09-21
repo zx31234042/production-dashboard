@@ -2,7 +2,7 @@
    数据库连接与初始化（server/db/index.js）
    作用：打开本地 SQLite 库、执行建表脚本、写入结构版本与初始字典数据，
         并暴露备份/保留策略所需的最小能力。
-   依据：DR-01～DR-19（需求清单 V1.30 第 7 章）、ADR-0001 D5（SQLite + WAL）、
+   依据：DR-01～DR-19（需求清单 V1.31 第 7 章）、ADR-0001 D5（SQLite + WAL）、
         ADR-0002 D9/D10（Node 24 LTS、零 npm 依赖，使用内置 node:sqlite）。
    依赖：node:path、node:fs 与内置 node:sqlite。**不依赖任何第三方包**。
    用法：
@@ -17,8 +17,12 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 /** 当前表结构版本；**改动 schema.sql 时必须同步 +1**，供后续迁移判断
- *  2026-09-19 由 '1' 升到 '2'：`schema_meta` 新增 `schema_fingerprint` 键（P3 表外 code-12）。 */
-const SCHEMA_VERSION = '2';
+ *  2026-09-19 由 '1' 升到 '2'：`schema_meta` 新增 `schema_fingerprint` 键（P3 表外 code-12）。
+ *  2026-09-20 由 '2' 升到 '3'（技术债 E10）：`upload_log` 增列 `fail_reason`、`updated_at`
+ *    —— 该表兼作"上报失败待补传队列"的持久化载体（IF-B.9 / NFR-13），失败原因与最近变更时间
+ *    是人工重报清单的必要字段。**升版是必须的**：schema.sql 正文一变，指纹即变，
+ *    `verifySchemaConsistency()` 会以"指纹变了而结构版本没变"报错（本条约定的机器守护）。 */
+const SCHEMA_VERSION = '3';
 
 /** 建表脚本位置（与本文件同目录） */
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');

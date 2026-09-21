@@ -19,6 +19,11 @@ const { createRunner } = require('./lib/assert');
 const { makeTempDb } = require('./lib/harness');
 const fixture = require('./lib/fixture');
 const db = require('../server/db');
+/* 结构版本的**单一真源**：`server/db/index.js` 导出的 `SCHEMA_VERSION`
+   （与上面的 `db` 是同一个模块实例，走 require 缓存；这里显式取出，让断言里的期望值来源一眼可见）。
+   为什么这样写：断言里**不得再出现 `'2'` 这类写死数字** —— 实现座位升版（`'2'` → `'3'`）时，
+   本文件必须一个字都不用改。 */
+const { SCHEMA_VERSION } = require('../server/db/index.js');
 const maintain = require('../server/db/maintain');
 const measureRepo = require('../server/repo/measure');
 const curveRepo = require('../server/repo/curve');
@@ -27,7 +32,9 @@ env.assertRuntime();
 const t = createRunner('本地库结构自检（db-check）');
 const NOW = '2026-09-19 10:00:00';
 
-/** 需求 V1.28 第 7 章要求存在的表（DR-01～DR-12、DR-18） */
+/** 需求 V1.31 第 7 章要求存在的表（DR-01～DR-12、DR-18）。
+ *  这里只管"需求追溯"（哪几张表是需求点名的，少一张即缺陷）；
+ *  **表数与表清单一律不写死** —— 期望表集由 `server/db/schema.sql` 的建表清单推导（见 parseSchemaTables）。 */
 const REQUIRED_TABLES = [
   'device', 'task', 'standard', 'measure_rt', 'result', 'shift_stat',
   'alarm', 'warning', 'maintenance', 'notice', 'upload_log', 'op_log', 'task_curve'
@@ -64,6 +71,29 @@ const REPORT_TO_COLUMN = {
   collectTime: 'collect_time', testStatus: 'test_status'
 };
 
+/* ---------------- 单一真源解析（schema.sql） ----------------
+   为什么要有这两个函数：本脚本原先把"库内应有 13 张表"写死在断言里，于是**动 schema.sql
+   （哪怕只改注释）都得连测试一起改**，而 schema.sql 才是建表的**单一真源**。
+   现在改为：期望表集**从 schema.sql 正文解析**（加表/减表由它自动跟随），再与库内
+   `sqlite_master` 的实际表（db.listTables）**逐名比对** —— 判据强度不降（两边必须完全相同）。 */
+
+/** 去掉 SQL 注释（块注释 / 行注释），避免注释里出现的 `CREATE TABLE` 被误当成建表声明。
+ *  边界：schema.sql 内没有字符串字面量，故不区分"字符串里的 `--`"。 */
+function stripSqlComments(sql) {
+  return String(sql).replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/--[^\n\r]*/g, ' ');
+}
+
+/** 从 schema.sql 解析建表清单（按正文出现顺序）。
+ *  只认 `CREATE TABLE [IF NOT EXISTS] <name>`；`CREATE [UNIQUE] INDEX` 不会命中。
+ *  边界：不支持带引号/方括号的标识符（schema.sql 未使用这种写法）。 */
+function parseSchemaTables(sql) {
+  const names = [];
+  const re = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][A-Za-z0-9_]*)/gi;
+  let m;
+  while ((m = re.exec(stripSqlComments(sql))) !== null) names.push(m[1]);
+  return names;
+}
+
 async function main() {
   /* ---------------- 一、建表与结构 ---------------- */
   t.section('一、建表与结构（DR-01～DR-12、DR-18）');
@@ -86,15 +116,35 @@ async function main() {
     t.check('库内记录了 schema 指纹，且与当前 schema.sql 一致（改了 schema 必须升版本）',
       db.getSchemaFingerprint(handle.db) === fp && vsc.ok === true,
       vsc.reason || `fingerprint=${fp}`);
-    t.check('结构版本已随指纹机制升到 2（本次改动自身遵守了这条约定）',
-      db.SCHEMA_VERSION === '2' && db.getSchemaVersion(handle.db) === '2',
-      `SCHEMA_VERSION=${db.SCHEMA_VERSION}`);
+    /* 结构版本同样**不写死数字**：期望值取自单一真源 `server/db/index.js` 导出的 `SCHEMA_VERSION`
+       （文件顶部 require 出来的那个常量）。判据强度未放松 —— 库内记的版本与代码版本不一致
+       （漏跑 initSchema、迁移写错、连的是旧库）必红；"/^\d+$/" 那半句是防"两边同为空的假通过"。 */
+    t.check('库内记录的结构版本 = server/db/index.js 导出的 SCHEMA_VERSION（单一真源，不写死数字）',
+      /^\d+$/.test(SCHEMA_VERSION) && db.getSchemaVersion(handle.db) === SCHEMA_VERSION,
+      `SCHEMA_VERSION=${SCHEMA_VERSION}，库内记录=${db.getSchemaVersion(handle.db)}`);
   }
 
+  /* 期望表集**从 schema.sql 推导**（单一真源），再与库内实际表逐名比对 ——
+     原先写死的"13 张"由 schema.sql 自动跟随：实现座位升版时本文件不用改（只加列，不加表）。
+     为什么还要比 REQUIRED_TABLES：**两边都由 schema.sql 派生时，"加了一张表"会同时跟着变而永远相等**
+     （指纹断言同理 —— 库是本次 initSchema 现建的）。故保留这份"需求点名表清单"作**独立参照**：
+     加表必红（须先登记为需求），删表必红（需求点名的表没了）。 */
+  const declaredTables = parseSchemaTables(db.readSchemaSql());
   const tables = db.listTables(handle.db);
-  const missing = REQUIRED_TABLES.filter(x => !tables.includes(x));
-  t.check(`需求要求的 ${REQUIRED_TABLES.length} 张表全部存在`, missing.length === 0,
-    missing.length ? `缺失：${missing.join(', ')}` : `实际 ${tables.length} 张（含 schema_meta）`);
+  const notInDb = declaredTables.filter(x => !tables.includes(x));        // schema.sql 声明了、库内没有
+  const notInSchema = tables.filter(x => !declaredTables.includes(x));    // 库内有、schema.sql 没声明
+  const unregistered = declaredTables.filter(x => x !== 'schema_meta' && !REQUIRED_TABLES.includes(x));
+  const missing = REQUIRED_TABLES.filter(x => !tables.includes(x));       // 需求点名、实际缺失
+  const tableProblems = [];
+  if (notInDb.length) tableProblems.push(`schema.sql 声明但库内缺：${notInDb.join(', ')}`);
+  if (notInSchema.length) tableProblems.push(`库内有但 schema.sql 未声明：${notInSchema.join(', ')}`);
+  if (unregistered.length) tableProblems.push(`schema.sql 多出需求未登记的表（须先在需求/REQUIRED_TABLES 里登记）：${unregistered.join(', ')}`);
+  if (missing.length) tableProblems.push(`需求要求但缺失：${missing.join(', ')}`);
+  t.check(`schema.sql 建表清单 = 库内实际表（共 ${declaredTables.length} 张，含 schema_meta），` +
+    `且需求要求的 ${REQUIRED_TABLES.length} 张全在其中`,
+    declaredTables.length > 0 && declaredTables.length === tables.length && tableProblems.length === 0,
+    tableProblems.length ? tableProblems.join('；')
+      : `schema.sql ${declaredTables.length} 张 = 库内 ${tables.length} 张：${tables.join(', ')}`);
 
   const colProblems = [];
   for (const [table, cols] of Object.entries(REQUIRED_COLUMNS)) {

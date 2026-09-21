@@ -418,7 +418,7 @@ function main() {
     readmeEnv[0] === traceEnv[0] && readmeEnv[1] === traceEnv[1],
     `README=ENV ${readmeEnv.join('/')}，实跑=ENV ${traceEnv.join('/')}`);
 
-  /* README 写法：`可追溯覆盖 164 条（64.1%）`；不写"164/256"那种形式，故按"条"取分子 */
+  /* README 写法：`可追溯覆盖 162 条（63.0%）`；不写"162/257"那种形式，故按"条"取分子 */
   const readmeCov = [
     numeric.matchNumber(readmeSrc, /可追溯覆盖\s*(\d+)\s*条/),
     numeric.matchNumber(readmeSrc, /(\d+)\s*条\*\*需求条款/)

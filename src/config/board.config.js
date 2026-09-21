@@ -3,7 +3,7 @@
    作用：把所有"会随外部答复变化"的参数**值**集中到这里，答复到达时原则上只改本文件，不动业务代码。
    例外：**统计公式不在本文件里** —— 按 ADR-0005 选项 B（2026-09-20 拍板）公式留在代码里，
    配置只存参数；Q-11 答复到达后**须同步修改的位置清单**见下方 production 段。
-   对应待确认事项（需求清单 V1.30 第 12 章）：
+   对应待确认事项（需求清单 V1.31 第 12 章）：
      - shift            ← Q-10 班次定义
      - production       ← Q-11 统计参数（口径公式留在代码，不在此处）
      - faultDict        ← Q-12 故障代码字典（结构与示例；内容待补全）
@@ -113,7 +113,15 @@ const BOARD_CONFIG = (function () {
       pathTemplate: '/service/{serviceName}/{methodName}',
       /* 回执风格：'status' = {status,msg,data}（接口定义）；'code' = {code,msg,uploadId}（附录 2） */
       responseStyle: 'status',
-      retry: { max: 5, baseDelayMs: 1000 }   // 失败重试：指数退避（IF-B.9）
+      /* 补传队列容量上限（E10）：达到上限时**拒绝入队并告警**，绝不静默丢弃已缓存报文（NFR-13）。
+         落库持久化在服务端 server/services/uploadQueue.js（写 upload_log，重启后从库读回），
+         本项供浏览器侧适配层（src/services/api.js）自检与状态展示使用。 */
+      queueCap: 5000,
+      /* 说明（E10，2026-09-20 已定决策）：**不做自动重试** —— 不实现指数退避、不加定时器；
+         上报失败只做两件事：①告警/暴露待补传条数；②把失败报文落库留存。重报由**人工触发**
+         （src/services/api.js 的 retryPending()；flushPending() 只刷新状态、不发送）。
+         原先的 `retry: { max, baseDelayMs }` 键自 V1.31 起**已删除** —— 它在 E10 后就没有任何读取点，
+         按 ADR-0005「死配置不留」清理，不再为兼容 `CFG.mes.retry.*` 保留键位。 */
     },
 
     /* ---------------- 设备参数判定容差（FR-3.5～3.8、FR-3.16） ----------------

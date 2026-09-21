@@ -4,7 +4,15 @@
    对应需求：
      - IF-D  上位机 → 看板：applyUpperPayload()、startUpper()
      - IF-B  看板 → MES  ：buildReportPayload()、uploadReport()（附录 2，13 字段）
-     - IF-B.9 失败缓存与重试：pending 队列 + 指数退避
+     - IF-B.9 失败缓存：uploadReport() 失败即写明失败原因并进补传队列，**不自动重试**（见下）
+     - IF-B.9 人工重报：retryPending() —— **唯一**会主动重发补传报文的入口（供 UI-20 调用）；
+                flushPending() 只刷新待补传状态，**不发送**（V1.31：不做任何自动重发）
+   失败处置（2026-09-20 技术债 E10 起，**已定决策**）：
+     上报失败时**只做两件事**：①**告警/暴露待补传条数**（getStatus().pendingCount）；②**把失败报文
+     落库留存**。**不做自动重试**（无指数退避、无定时器）—— 重报由**人工触发**。
+     落库的落地端是服务端：`server/services/uploadQueue.js`（写 `upload_log`，进程重启可读回）；
+     本文件是浏览器侧的适配层（file:// 下无 require、无 SQLite），只保留**内存队列**供自检
+     与状态展示，队列满时**拒绝入队并告警**（旧实现是 shift() 丢最旧，与 NFR-13 冲突）。
    依赖：config/board.config.js、config/fieldMap.js（需先加载）
    说明：本文件不操作 DOM，只做数据转换与网络收发（PROJECT_RULES 9.2）
    ========================================================================== */
@@ -14,7 +22,8 @@ window.Api = (function () {
   const CFG = window.BoardConfig;
   const MAP = window.FieldMap;
 
-  /* 上报失败待补传队列（内存态；正式实现应落库，见 DR-18/DR-19） */
+  /* 上报失败待补传队列（浏览器侧内存态：仅用于自检与状态展示；
+     持久化由服务端 server/services/uploadQueue.js 落 upload_log，见文件头 E10 说明） */
   let pending = [];
   /* 上报流水号序号，保证同一秒内多次上报也不重复 */
   let uploadSeq = 0;
@@ -22,6 +31,25 @@ window.Api = (function () {
   let upperTimer = null;
   /* 最近一次成功收到上位机数据的时刻 */
   let lastUpperAt = 0;
+
+  /**
+   * 补传队列已满：**拒绝入队**，绝不静默丢弃已缓存报文（NFR-13 / 技术债 E10）。
+   * 旧实现在超过 5000 条时 `shift()` 丢掉最旧一条，属"悄悄丢数据"，已废止。
+   */
+  function QueueFullError(limit, size) {
+    const err = new Error(
+      '上报补传队列已满（' + size + '/' + limit + '）：拒绝入队以避免丢弃已缓存报文（NFR-13），请人工处理待补传清单');
+    err.name = 'QueueFullError';
+    err.code = 'UPLOAD_QUEUE_FULL';
+    err.limit = limit;
+    err.size = size;
+    return err;
+  }
+
+  /** 队列容量上限（缺省 5000，与旧实现同量级；由 CFG.mes.queueCap 配置，见 board.config.js） */
+  function queueCap() {
+    return CFG.mes.queueCap === undefined ? 5000 : CFG.mes.queueCap;
+  }
 
   /* ---------------- 通用小工具 ---------------- */
 
@@ -252,13 +280,13 @@ window.Api = (function () {
   }
 
   /**
-   * 上报一帧数据到 MES
-   * 未配置 baseUrl 时为空操作（返回 skipped），便于开发期直接运行
+   * 把一帧报文发到 MES：**只发，不入队**，成功/失败都如实返回，队列记账交给调用方。
+   * 抽出来是为了让 uploadReport()（首发失败即入队）与 retryPending()（人工重报）共用同一段发送逻辑：
+   * 否则人工重报再走一遍 uploadReport()，"失败即入队"会给队列里同一报文添出重复条目。
+   * @returns {Promise<{ok:boolean, receipt?:object, url:string, failReason?:string,
+   *                    responseCode?:string, responseText?:string, error?:string}>}
    */
-  async function uploadReport(payload, serviceName, methodName) {
-    const body = payload || buildReportPayload(window.MockData ? window.MockData.state : {});
-    if (!CFG.mes.baseUrl) return { ok: false, skipped: true, reason: '未配置 MES 地址（Q-23）' };
-
+  async function sendReport(body, serviceName, methodName) {
     const url = buildUrl(serviceName || 'report', methodName || 'receiveReport');
     try {
       const res = await fetch(url, {
@@ -272,13 +300,53 @@ window.Api = (function () {
       const text = await res.text();
       let receipt = null;
       try { receipt = JSON.parse(text); } catch (e) { receipt = { raw: text }; }
-      const ok = isReceiptOk(receipt);
-      if (!ok) queuePending(body);
-      return { ok, receipt, url };
+      if (isReceiptOk(receipt)) return { ok: true, receipt, url };
+      /* 回执判为失败：把失败原因一并带回（人工重报界面需要它，别只留一个 ok=false） */
+      return {
+        ok: false, receipt, url,
+        failReason: receiptReason(receipt),
+        responseCode: receipt && receipt.code !== undefined
+          ? String(receipt.code)
+          : (receipt && receipt.status !== undefined ? String(receipt.status) : '无回执'),
+        responseText: text
+      };
     } catch (err) {
-      queuePending(body);
-      return { ok: false, error: err.message, url };
+      const msg = err && err.message ? err.message : String(err);
+      return { ok: false, url, error: msg, failReason: msg, responseCode: '网络错误', responseText: '' };
     }
+  }
+
+  /**
+   * 上报一帧数据到 MES
+   * 未配置 baseUrl 时为空操作（返回 skipped），便于开发期直接运行
+   * 失败（回执判失败 / 网络异常）→ 写明失败原因并进补传队列；**队列满时拒绝入队并如实回报**
+   * 注意：失败后**不自动重发**（IF-B.9 / V1.31），重报只由人工触发的 retryPending() 承担。
+   * @returns {Promise<{ok:boolean, receipt?:object, url?:string, error?:string,
+   *                    skipped?:boolean, reason?:string, queueFull?:boolean, pendingCount?:number}>}
+   */
+  async function uploadReport(payload, serviceName, methodName) {
+    const body = payload || buildReportPayload(window.MockData ? window.MockData.state : {});
+    if (!CFG.mes.baseUrl) return { ok: false, skipped: true, reason: '未配置 MES 地址（Q-23）' };
+
+    const startedAt = Date.now();
+    const r = await sendReport(body, serviceName, methodName);
+    if (r.ok) return { ok: true, receipt: r.receipt, url: r.url };
+
+    /* 失败即入队（唯一的一次入队点）；上报结果里带回原因与队列状态，供界面/告警使用 */
+    const queued = queuePending({
+      payload: body,
+      failReason: r.failReason,
+      responseCode: r.responseCode,
+      responseText: r.responseText,
+      elapsedMs: Date.now() - startedAt
+    });
+    const out = {
+      ok: false, url: r.url,
+      pendingCount: queued.pendingCount, queueFull: queued.queueFull
+    };
+    if (r.receipt !== undefined) out.receipt = r.receipt;
+    if (r.error !== undefined) out.error = r.error;
+    return out;
   }
 
   /** 判断回执是否成功（兼容两种回执风格，见 Q-23） */
@@ -288,37 +356,173 @@ window.Api = (function () {
     return receipt.status === 1 || receipt.status === '1';
   }
 
-  function queuePending(body) {
-    pending.push({ payload: body, at: Date.now(), tries: 0, uploadId: body.uploadId });
-    if (pending.length > 5000) pending.shift();   // 防止无限增长
+  /** 从回执里取一句可读的失败原因（人工重报时要看"为什么失败"） */
+  function receiptReason(receipt) {
+    if (!receipt) return '无回执';
+    const msg = receipt.msg || receipt.message || receipt.raw;
+    if (msg) return String(msg);
+    if (receipt.code !== undefined) return '回执 code=' + receipt.code;
+    if (receipt.status !== undefined) return '回执 status=' + receipt.status;
+    return '回执判为失败';
   }
 
-  /** 补传：按指数退避重试待传队列（IF-B.9）；退避次数受 CFG.mes.retry.max 约束，报文不丢弃 */
-  async function flushPending() {
-    if (!CFG.mes.baseUrl || pending.length === 0) return { sent: 0, left: pending.length };
-    const now = Date.now();
-    const rest = [];
-    let sent = 0;
-    for (const item of pending) {
-      /* 退避轮次封顶：超过 retry.max 后按最大间隔继续重试，仍保留在队列里（保证不丢数） */
-      const cappedTries = Math.min(item.tries, CFG.mes.retry.max);
-      const delay = CFG.mes.retry.baseDelayMs * Math.pow(2, cappedTries);
-      if (now - item.at < delay) { rest.push(item); continue; }
-      const r = await uploadReport(item.payload, 'report', 'receiveReport');
-      if (r.ok) { sent++; } else { item.tries++; item.at = now; rest.push(item); }
+  /**
+   * 上报失败 → 进补传队列（浏览器侧内存队列；落库留在服务端，见文件头 E10 说明）
+   * **队列满时抛 QueueFullError（拒绝入队）**，由 uploadReport() 捕获后如实回报，
+   * 绝不静默丢弃最旧报文（旧实现 `pending.shift()` 已废止，与 IF-B.9 / NFR-13 冲突）。
+   * @param {{payload:object, failReason:string, responseCode:string, responseText:string, elapsedMs:number}} entry
+   * @returns {{queued:boolean, pendingCount:number, queueFull:boolean, error?:string}}
+   */
+  function queuePending(entry) {
+    const limit = queueCap();
+    if (pending.length >= limit) {
+      const err = QueueFullError(limit, pending.length);
+      console.error('[Api] ' + err.message);
+      return { queued: false, pendingCount: pending.length, queueFull: true, error: err.message };
     }
-    pending = rest;
-    return { sent, left: pending.length };
+    pending.push({
+      payload: entry.payload,
+      uploadId: entry.payload && entry.payload.uploadId,
+      at: Date.now(),
+      tries: 0,
+      failReason: entry.failReason || '',
+      responseCode: entry.responseCode || '',
+      responseText: entry.responseText || '',
+      elapsedMs: entry.elapsedMs === undefined ? null : entry.elapsedMs
+    });
+    /* 只暴露条数（告警用）；不做自动重试、不起定时器 —— 重报由人工触发（E10 已定决策） */
+    return { queued: true, pendingCount: pending.length, queueFull: false };
+  }
+
+  /**
+   * 刷新待补传状态：**只刷新，不发送**。
+   * 按 IF-B.9（V1.31）：不做自动重发，本函数只刷新状态；发送一律由人工触发的 retryPending 承担。
+   * 因此本函数**不发起任何网络请求**（无 fetch、无定时器、无退避），只重算并暴露
+   * 待补传条数 / 队列容量 / 告警标志（getStatus() 的 pendingCount / queueAlert / queueFull）。
+   * 旧实现在这里主动把队列逐条发出去，被 main.js 每秒调用一次 ⇒ 事实上就是自动重发，已按 V1.31 废止。
+   * 仍保持 async 仅为兼容既有调用方写法 `Api.flushPending().catch(...)`（src/main.js），不产生异步副作用。
+   * @returns {Promise<{sent:number, failed:number, left:number, remaining:number,
+   *                    pendingCount:number, capacity:number,
+   *                    queueAlert:boolean, queueFull:boolean}>}
+   *          sent/failed 恒为 0（本函数不发送、不尝试）；left 为旧字段名（保留以免静默打断既有调用方），
+   *          remaining 与 retryPending() 返回同名同义。
+   */
+  async function flushPending() {
+    const s = getStatus();
+    return {
+      sent: 0,                        // 未发送任何报文（不自动重发）
+      failed: 0,                      // 未做任何尝试
+      left: s.pendingCount,
+      remaining: s.pendingCount,
+      pendingCount: s.pendingCount,
+      capacity: s.pendingCapacity,
+      queueAlert: s.queueAlert,
+      queueFull: s.queueFull
+    };
+  }
+
+  /**
+   * 人工触发的补传重报（IF-B.9，V1.31）：**唯一会主动重发补传报文的入口**，供 UI-20 调用。
+   * 语义：
+   *   - 只在被调用时发送：无定时器、无指数退避、不自动重试（NFR-10 / NFR-13）；成功后也不追加后续发送；
+   *   - 按队列顺序（FIFO）逐条重发；成功 → **移出队列**；仍失败 → **保留在队列里**并把 tries 累加 1，
+   *     同时刷新 failReason / responseCode，**绝不丢弃报文**；
+   *   - 未配置 MES 地址时只回报 skipped，不做任何发送与出队。
+   * @param {{ids?:string[], limit?:number}} [options]
+   *        ids   —— 只重报这些 uploadId（缺省＝全部待补传报文）
+   *        limit —— 最多重报条数（正整数；缺省＝不限制）
+   * @returns {Promise<{sent:number, failed:number, remaining:number,
+   *                    results:Array<{uploadId:string, ok:boolean, error?:string, receipt?:object}>,
+   *                    skipped?:boolean, reason?:string}>}
+   */
+  async function retryPending(options) {
+    const opt = options || {};
+    const wantIds = Array.isArray(opt.ids) && opt.ids.length
+      ? new Set(opt.ids.map(String))
+      : null;
+    const selected = pending.filter(item => !wantIds || wantIds.has(String(item.uploadId)));
+    const max = Number.isInteger(opt.limit) && opt.limit > 0 ? opt.limit : selected.length;
+    const targets = selected.slice(0, max);
+    const results = [];
+
+    if (!CFG.mes.baseUrl) {
+      return {
+        sent: 0, failed: 0, remaining: pending.length, results,
+        skipped: true, reason: '未配置 MES 地址（Q-23）'
+      };
+    }
+
+    const attempted = new Set();
+    const kept = new Set();
+    let sent = 0;
+    let failed = 0;
+
+    for (const item of targets) {
+      const r = await sendReport(item.payload, 'report', 'receiveReport');
+      attempted.add(item);
+      if (r.ok) {
+        sent++;
+        results.push({ uploadId: item.uploadId, ok: true, receipt: r.receipt });
+        continue;
+      }
+      /* 仍失败：留在队列里、累加次数（人工重报界面据此显示"已试 N 次"） */
+      failed++;
+      kept.add(item);
+      item.tries++;
+      item.at = Date.now();
+      item.failReason = r.error || r.failReason || '回执判为失败';
+      item.responseCode = r.responseCode || item.responseCode;
+      item.responseText = r.responseText || item.responseText;
+      results.push({ uploadId: item.uploadId, ok: false, error: item.failReason });
+    }
+
+    /* 未选中的条目按原顺序留在队列；选中的成功条目出队，失败条目保留 */
+    pending = pending.filter(item => !attempted.has(item) || kept.has(item));
+
+    return { sent, failed, remaining: pending.length, results };
+  }
+
+  /**
+   * 待补传清单（条数 + 明细），供后续"一键重报"界面与自检项使用。
+   * 只读，不触发任何网络请求。
+   * @param {number} [limit] 最多返回条数（缺省全量）
+   * @returns {{count:number, capacity:number, overflow:boolean, full:boolean, items:Array<object>}}
+   */
+  function listPending(limit) {
+    const cap = queueCap();
+    const items = pending.map(item => ({
+      uploadId: item.uploadId,
+      tries: item.tries,
+      at: item.at,
+      failReason: item.failReason,
+      responseCode: item.responseCode,
+      elapsedMs: item.elapsedMs,
+      payload: item.payload
+    }));
+    const sliced = Number.isInteger(limit) && limit > 0 ? items.slice(0, limit) : items;
+    return {
+      count: pending.length,
+      capacity: cap,
+      overflow: pending.length >= cap,
+      full: pending.length >= cap,
+      items: sliced
+    };
   }
 
   /** 供界面显示的自检信息 */
   function getStatus(now) {
+    const cap = queueCap();
+    const pendingCount = pending.length;
     return {
       dataSource: CFG.dataSource,
       upperUrl: CFG.upper.url || '（未配置，待 Q-21）',
       upperStale: isUpperStale(now),
       mesUrl: CFG.mes.baseUrl || '（未配置，待 Q-23）',
-      pendingCount: pending.length,
+      pendingCount: pendingCount,
+      pendingCapacity: cap,
+      /* 队列接近/达到上限时置位，供界面与巡检**告警**（不再静默丢弃，见 E10） */
+      queueAlert: pendingCount >= Math.max(1, Math.floor(cap * 0.9)),
+      queueFull: pendingCount >= cap,
       responseStyle: CFG.mes.responseStyle
     };
   }
@@ -329,7 +533,11 @@ window.Api = (function () {
     /* IF-D */
     applyUpperPayload, validatePayload, isUpperStale, syncLinkState, startUpper, stopUpper,
     /* IF-B */
-    buildReportPayload, buildUrl, uploadReport, flushPending, nextUploadId, isReceiptOk,
+    buildReportPayload, buildUrl, uploadReport, nextUploadId, isReceiptOk, receiptReason,
+    /* 待补传清单（查询 / 人工重报） */
+    listPending, retryPending,
+    /* 状态刷新（不发送） */
+    flushPending,
     /* 状态 */
     getStatus,
     /* 工具（供自测工具复用） */

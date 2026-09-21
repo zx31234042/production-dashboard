@@ -80,8 +80,8 @@
     /* 上报 MES：仅当配置了 MES 地址（Q-23 关闭后）才实际发送，否则为空操作 */
     if (CFG.mes.baseUrl) {
       setInterval(() => {
-        /* 先补传历史失败报文（IF-B.9，P1-2），再上报本帧 */
-        Api.flushPending().catch(err => console.warn('[main] MES 补传异常：' + err.message));
+        /* 刷新待补传状态与告警（**不发送**；重报由人工触发的 Api.retryPending 承担），再上报本帧 */
+        Api.flushPending().catch(err => console.warn('[main] 待补传状态刷新异常：' + err.message));
         Api.uploadReport(Api.buildReportPayload(state))
           .then(r => { if (!r.ok) console.warn('[main] MES 上报未成功：' + (r.reason || r.error || '回执异常')); });
       }, CFG.reportIntervalMs);

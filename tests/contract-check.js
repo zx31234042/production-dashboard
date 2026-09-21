@@ -4,7 +4,8 @@
          A. 附录 2 契约（13 字段）↔ config/fieldMap.js 的 boardToReport
          B. 上位机报文契约：fieldMap.upperToBoard ↔ samplePayload ↔ mockUpperSource ↔ tools/mock-upper
          C. services/api.js 的 IF-D 行为（缺字段容错 / 冻结判定 / 配置化生效）
-         D. services/api.js 的 IF-B 行为（13 字段上报 / 两种回执风格 / 失败补传）
+         D. services/api.js 的 IF-B 行为（13 字段上报 / 两种回执风格 / 失败入队——**不自动重发**；
+            flushPending 只刷新待补传状态与告警、不发送，人工入口 retryPending 才发送）
          E. ?source=upper 端到端链路（内置模拟上位机的取帧顺序）
          F. IF-D 降级接线：数据冻结时界面判据 state.device.link 是否跟随（IF-D.9）
          G. 派生统计量的收敛与累计一致性（当班统计非负、累计运行不倒退、待办与自检可闭环）
@@ -19,7 +20,8 @@
    依赖：仅 Node 内置模块；不联网（只连本机回环端口）、不启动浏览器。
    运行：node tests/contract-check.js
    退出码：0 = 全部通过；1 = 有断言失败（失败项即待修缺陷）。
-   对应需求：IF-C.1（三方映射表）、IF-B.8（附录 2 共 13 字段）、IF-B.9（失败补传）、
+   对应需求：IF-C.1（三方映射表）、IF-B.8（附录 2 共 13 字段）、
+             IF-B.9（失败入队**不自动重发**：flushPending 只刷新状态与告警、人工入口 retryPending 才发送）、
              IF-D.9（断连/数据冻结）、FR-2.6、Q-21、Q-23
    ========================================================================== */
 'use strict';
@@ -486,13 +488,61 @@ async function main() {
       `ok=${up3.ok}，pending ${beforePending} → ${afterPending}`
     );
 
-    CFG.mes.baseUrl = `http://127.0.0.1:${portStatus}`;
-    CFG.mes.retry.baseDelayMs = 0;
+    /* 6.10 后半（V1.31 语义，C-58～C-62）：上报失败**不做任何自动重发**（IF-B.9 / NFR-10 / NFR-13）。
+       失败只做两件事：①告警/暴露待补传条数；②报文本地持久化留存（浏览器侧为内存队列，
+       落库在 server/services/uploadQueue.js）。重报**完全由人工触发**（UI-20，尚未实现）。
+       故原「链路恢复后 flushPending 补齐队列」一条拆成两条：
+         (a) flushPending() 只刷新状态、不发送；
+         (b) 唯一会主动发送的是人工入口 retryPending()。
+       待补传场景由上面 up3 的失败直接构造（失败报文已被压进队列），
+       不再依赖已按 ADR-0005 删除的 CFG.mes.retry 键（见 src/config/board.config.js）。 */
+    CFG.mes.baseUrl = `http://127.0.0.1:${portStatus}`;   // 链路"恢复"：若还在自动重发，这里就会把队列发空
+    const queueCapSaved = CFG.mes.queueCap;
+    /* 临时把容量收窄到 1：待补传已有 1 条，告警位必须**当场重算**为 true。
+       否则"状态/告警字段确实被刷新"就无从证明（写死的 false 也会通过）。 */
+    CFG.mes.queueCap = 1;
+    const flushLogBefore = (await (await fetch(`http://127.0.0.1:${portStatus}/log`)).json()).items.length;
+    const pendBeforeFlush = Api.getStatus().pendingCount;
     const flushed = await Api.flushPending();
+    const pendAfterFlush = Api.getStatus().pendingCount;
+    const statusAfterFlush = Api.getStatus();   // 仍在校窄容量下取，供与 flushPending 的回报逐字比对
+    CFG.mes.queueCap = queueCapSaved;           // 立即还原，后面的人工重报仍用原容量
+    const flushLogAfter = (await (await fetch(`http://127.0.0.1:${portStatus}/log`)).json()).items.length;
     check(
-      '补传：链路恢复后 flushPending 补齐队列（6.10 后半）',
-      flushed.sent === 1 && flushed.left === 0,
-      `sent=${flushed.sent}，left=${flushed.left}`
+      '只刷新不发送：flushPending 重算并暴露待补传状态与告警，但不发任何报文、队列条数不变（6.10 后半 · IF-B.9 V1.31）',
+      flushed.sent === 0 && flushed.failed === 0 &&
+      pendAfterFlush === pendBeforeFlush &&
+      flushLogAfter === flushLogBefore &&
+      flushed.pendingCount === pendAfterFlush && flushed.left === pendAfterFlush &&
+      flushed.remaining === pendAfterFlush &&
+      flushed.capacity === statusAfterFlush.pendingCapacity && flushed.capacity === 1 &&
+      flushed.queueAlert === true && flushed.queueAlert === statusAfterFlush.queueAlert &&
+      flushed.queueFull === true && flushed.queueFull === statusAfterFlush.queueFull,
+      `sent=${flushed.sent} failed=${flushed.failed}；待补传 ${pendBeforeFlush} → ${pendAfterFlush}；` +
+      `假 MES 收件数 ${flushLogBefore} → ${flushLogAfter}（不变即未发送）；` +
+      `回报 pendingCount=${flushed.pendingCount} capacity=${flushed.capacity} queueAlert=${flushed.queueAlert} queueFull=${flushed.queueFull}`
+    );
+    /* (b) 人工入口才发送：retryPending() 是**唯一**会主动重发补传报文的函数（供 UI-20 调用）。
+           先让链路仍不通 —— 失败条目必须留在队列且有"已试次数"累加；再让链路恢复 —— 成功条目必须移出队列。 */
+    const beforeRetry = Api.listPending().items[0];
+    CFG.mes.baseUrl = `http://127.0.0.1:${portFail}`;
+    const retryStillFail = await Api.retryPending({ limit: 1 });
+    const keptItem = Api.listPending().items[0];
+    const pendAfterRetryFail = Api.getStatus().pendingCount;
+    CFG.mes.baseUrl = `http://127.0.0.1:${portStatus}`;
+    const retryThenOk = await Api.retryPending();
+    const pendAfterRetryOk = Api.getStatus().pendingCount;
+    check(
+      '人工入口才发送：retryPending 重报后仍失败者保留且次数累加、成功者移出队列（6.10 后半 · IF-B.9 V1.31）',
+      beforeRetry !== undefined &&
+      retryStillFail.sent === 0 && retryStillFail.failed === 1 &&
+      retryStillFail.remaining === pendAfterFlush && pendAfterRetryFail === pendAfterFlush &&
+      keptItem !== undefined && keptItem.uploadId === beforeRetry.uploadId &&
+      keptItem.tries === beforeRetry.tries + 1 &&
+      retryThenOk.sent === pendAfterRetryFail && retryThenOk.failed === 0 && pendAfterRetryOk === 0,
+      `人工重报（链路未恢复）sent=${retryStillFail.sent} failed=${retryStillFail.failed}，` +
+      `tries ${beforeRetry && beforeRetry.tries} → ${keptItem && keptItem.tries}，队列仍 ${pendAfterRetryFail} 条；` +
+      `人工重报（链路恢复）sent=${retryThenOk.sent}，队列 ${pendAfterRetryFail} → ${pendAfterRetryOk} 条`
     );
   }
 
@@ -574,9 +624,11 @@ async function main() {
       'src/main.js 未调用 syncLinkState，数据冻结不会触发界面降级'
     );
     check(
-      '接线：main.js 调用 Api.flushPending（IF-B.9 补传必须被触发）',
+      '接线：main.js 周期调用 Api.flushPending 刷新待补传状态与告警（存在性断言；IF-B.9 V1.31）',
       /Api\.flushPending\s*\(/.test(readText('src/main.js')),
-      'src/main.js 未调用 flushPending，失败报文只进队列、永不补传（P1-2）'
+      'src/main.js 未调用 flushPending，待补传条数与队列告警不会周期刷新。' +
+      'V1.31 口径：flushPending 只刷新待补传状态与告警；发送由人工触发（IF-B.9 V1.31，唯一发送入口为 retryPending）。' +
+      '本断言只查"周期刷新仍被接线"，**不要求** retryPending 在 UI 侧已有调用点 —— 人工重报入口属 UI-20，尚未实现（见"需上层决策"）'
     );
     check(
       'Api.getStatus() 的结果应被界面消费',

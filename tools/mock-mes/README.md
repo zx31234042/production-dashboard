@@ -61,7 +61,7 @@ curl http://127.0.0.1:8802/log
 | `mes.baseUrl` | `src/config/board.config.js` | 指向本工具地址，如 `http://127.0.0.1:8802` |
 | `mes.pathTemplate` | 同上 | 默认 `/service/{serviceName}/{methodName}` |
 | `mes.responseStyle` | 同上 | 必须与启动本工具时的 `--receipt` 一致，否则回执判定会失败 |
-| `mes.retry` | 同上 | 失败重试次数与退避基数 |
+| `mes.queueCap` | 同上 | 补传队列容量上限；满则**拒绝入队并告警**，不静默丢弃报文。**不做自动重试**（IF-B.9 V1.31）：上报失败只入队＋告警＋本地持久化留存，重报由人工 `Api.retryPending()` 触发（`mes.retry` 键已按 ADR-0005「死配置不留」删除） |
 
 > `mes.baseUrl` 为空时，看板**不会发起上报**（属正常行为，避免未联调时报错）。配置后才开始周期上报。
 
