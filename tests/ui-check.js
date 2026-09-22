@@ -261,12 +261,15 @@ function functionBody(src, name) {
  * 与上面的记录型假 DOM（`makeRecorder`）的区别，正是本条用例需要的两件事：
  *   ① 节点**按 id 缓存**（同一 id 恒等，与真实 `$` 一致）—— 否则"组件改的节点"与"用例看的节点"不是同一个；
  *   ② 如实记录 `hidden` 与 `classList` 成员（`makeRecorder` 的 classList 是空壳，且没有 hidden）；
- *   ③ `setTimeout`/`clearTimeout` 只**登记**不真等：用例按 `delay` 找到回调并手工触发。
- * @returns {{w:object, nodes:Map<string,object>, timers:Array, click:Function, fire:Function}}
+ *   ③ `setTimeout`/`clearTimeout` 只**登记**不真等：用例按 `delay` 找到回调并手工触发；
+ *   ④ `console.warn` **捕获**（不回放）：`armAutoLock()` 未 bind 时的"不静默失效"判据要读它。
+ * @returns {{w:object, nodes:Map<string,object>, node:Function, timers:Array,
+ *            warnings:Array<string>, click:Function, fire:Function}}
  */
 function loadAutoLockFixture() {
   const nodes = new Map();
   const timers = [];
+  const warnings = [];
   let timerSeq = 0;
 
   const node = id => {
@@ -300,7 +303,15 @@ function loadAutoLockFixture() {
     return o;
   };
 
-  const sandbox = { console };
+  /* `warn` 只捕获、不回放：它是"未 bind 不静默失效"（FR-8.2）的判据来源，
+     回放会把一条**预期内**的警告混进门禁输出，看上去像故障。log/error 照旧透传。 */
+  const sandbox = {
+    console: {
+      log: (...a) => console.log(...a),
+      error: (...a) => console.error(...a),
+      warn: (...a) => { warnings.push(a.map(x => (x && x.message) ? x.message : String(x)).join(' ')); }
+    }
+  };
   sandbox.window = sandbox;
   sandbox.setTimeout = (fn, delay) => { const id = ++timerSeq; timers.push({ id, delay, fn, fired: false, cancelled: false }); return id; };
   sandbox.clearTimeout = id => { const t = timers.find(x => x.id === id); if (t) t.cancelled = true; };
@@ -323,7 +334,140 @@ function loadAutoLockFixture() {
     nodes,
     node,
     timers,
+    warnings,
     click: id => node(id).__fire('click'),
+    /** 触发**尚未触发且未被取消**的、delay 匹配的最后一个定时器回调 */
+    fire: delay => {
+      const t = timers.filter(x => x.delay === delay && !x.cancelled && !x.fired).pop();
+      if (!t) throw new Error(`没有待触发的 ${delay} ms 定时器（已登记：${timers.map(x => x.delay).join('/') || '无'}）`);
+      t.fired = true;
+      t.fn();
+      return t;
+    }
+  };
+}
+
+/**
+ * F-02 旁路**启动**夹具（`?unlock=1`）：按 index.html 的加载顺序在 vm 里装配**真实**的一整套前端
+ * （config → services → components → pages → **main**），只把浏览器环境换成桩件 ——
+ * 于是 `src/main.js` 的 IIFE 会**真的跑完 `start()`**（`document.readyState='complete'` ⇒ 直接走 start 分支）。
+ *
+ * 为什么非要真跑 main.js（而不是在源码里 `indexOf('SettingPanel.armAutoLock(')`）：
+ * 静态调用点判据是 ADR-0004 D23 说的"防空洞" —— 把那一行**注释掉**（字符串仍在源码里）或把调用
+ * 挪到 `unlockByParam` 分支**之外**，静态判据照样绿（已实测：注释掉后 60 条全绿）。
+ * 本夹具只认**行为结果**：启动后 state 是否真解锁、是否真登记了 300000 ms 定时器。
+ *
+ * 与 `loadAutoLockFixture` 的分工：那一个只装到组件层、由用例手工 bind()/click()；
+ * 本夹具额外提供（缺一不可）：
+ *   ① `location.search`：旁路参数的**唯一**来源 —— 参数改名、判定改写、分支挪位都会改变观察结果；
+ *   ② `setInterval` 桩件：只登记不真跑（否则每秒刷新把 Node 进程钉住不退出）；
+ *   ③ `document.getElementById` 恒返回**按 id 缓存**的节点（main.js 要取 `#stage` 施加舞台缩放）。
+ * @param {string} search 查询串，如 `'?unlock=1'`、`'?tab=0'`
+ * @returns {{w:object, nodes:Map<string,object>, node:Function, timers:Array, intervals:Array,
+ *            warnings:Array<string>, fire:Function}}
+ */
+function loadBootFixture(search) {
+  const nodes = new Map();
+  const timers = [];
+  const intervals = [];
+  const warnings = [];
+  let timerSeq = 0;
+  let intervalSeq = 0;
+
+  const node = id => {
+    if (nodes.has(id)) return nodes.get(id);
+    const classes = new Set();
+    const handlers = {};
+    const o = {
+      __id: id, hidden: false, disabled: false, value: '', className: '', style: {}, dataset: {},
+      classList: {
+        add: c => classes.add(c),
+        remove: c => classes.delete(c),
+        contains: c => classes.has(c),
+        toggle: (c, on) => {
+          if (on === undefined ? !classes.has(c) : on) classes.add(c);
+          else classes.delete(c);
+        }
+      },
+      addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); },
+      __fire: type => (handlers[type] || []).forEach(fn => fn({ key: 'Enter' })),
+      querySelector: sel => node(id + ' ' + sel),
+      appendChild: () => {},
+      remove: () => {},
+      closest: () => null
+    };
+    Object.defineProperty(o, 'textContent', {
+      get() { return o.__text || ''; }, set(v) { o.__text = String(v); }, configurable: true
+    });
+    Object.defineProperty(o, 'innerHTML', {
+      get() { return o.__html || ''; }, set(v) { o.__html = String(v); }, configurable: true
+    });
+    nodes.set(id, o);
+    return o;
+  };
+
+  /* warn 只捕获不回放（与 loadAutoLockFixture 同口径）：`armAutoLock()` 未 bind 时的警告是
+     **预期输出**，回放会让门禁输出看上去像故障；log/error 照旧透传，异常不被吞掉。 */
+  const sandbox = {
+    console: {
+      log: (...a) => console.log(...a),
+      error: (...a) => console.error(...a),
+      warn: (...a) => { warnings.push(a.map(x => (x && x.message) ? x.message : String(x)).join(' ')); }
+    },
+    location: { search },                 /* main.js 读 location.search 取评审参数 */
+    URLSearchParams,                      /* 不是 V8 内建，须显式注入 vm 上下文 */
+    innerWidth: 3840, innerHeight: 2160,  /* fitStage() 要读；按 4K 基准，缩放比正好 1 */
+    addEventListener: () => {}            /* window.addEventListener('resize', fitStage) */
+  };
+  sandbox.window = sandbox;
+  sandbox.setTimeout = (fn, delay) => { const id = ++timerSeq; timers.push({ id, delay, fn, fired: false, cancelled: false }); return id; };
+  sandbox.clearTimeout = id => { const t = timers.find(x => x.id === id); if (t) t.cancelled = true; };
+  sandbox.setInterval = (fn, delay) => { const id = ++intervalSeq; intervals.push({ id, delay, fn }); return id; };
+  sandbox.clearInterval = () => {};
+  sandbox.document = {
+    readyState: 'complete',               /* 直接执行 start()，不必再触发 DOMContentLoaded */
+    getElementById: node,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => node('created-' + (++timerSeq)),
+    addEventListener: () => {}
+  };
+
+  vm.createContext(sandbox);
+  const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  run('src/config/board.config.js');
+  run('src/config/fieldMap.js');
+  run('src/utils/format.js');
+  sandbox.window.Dom = {
+    $: node,
+    setText: () => {}, setHTML: () => {}, setClass: () => {},
+    setStyle: () => {}, toggleClass: () => {}
+  };
+  run('src/services/mockData.js');
+  run('src/services/api.js');
+  [
+    'src/components/HeaderBar.js',
+    'src/components/TabsBar.js',
+    'src/components/CurveChart.js',
+    'src/components/DeviceStatusPanel.js',
+    'src/components/TaskPanel.js',
+    'src/components/ShiftPanel.js',
+    'src/components/StatsPanel.js',
+    'src/components/AlarmPanel.js',
+    'src/components/MaintPanel.js',
+    'src/components/NoticePanel.js',
+    'src/components/SettingPanel.js',
+    'src/pages/Dashboard.js'
+  ].forEach(run);
+  run('src/main.js');                     /* readyState='complete' ⇒ 启动流程在本次 run 内跑完 */
+
+  return {
+    w: sandbox.window,
+    nodes,
+    node,
+    timers,
+    intervals,
+    warnings,
     /** 触发**尚未触发且未被取消**的、delay 匹配的最后一个定时器回调 */
     fire: delay => {
       const t = timers.filter(x => x.delay === delay && !x.cancelled && !x.fired).pop();
@@ -928,6 +1072,137 @@ async function main() {
         'F-02 手动锁定不弹提示（FR-8.2）：提示弹窗只挂在自动锁定分支',
         seqErr === null && manualQuiet,
         seqErr ? `夹具执行异常：${seqErr}` : steps.join('；')
+      );
+    }
+
+    /* (e) `?unlock=1` 旁路（main.js）：置位解锁后调用导出的 `SettingPanel.armAutoLock()`。
+       判据分两段，且两段都必须是**行为**判据：
+         ① 真启动（`loadBootFixture()` 在 vm 里加载**真实** main.js 并跑完 start()）：
+            `?unlock=1` ⇒ 已解锁 + 恰登记 1 个 300000 ms 自动锁定定时器 + 无"armAutoLock() 在
+            bind() 之前被调用"的警告（= arm 确实发生在 Dashboard.init → SettingPanel.bind 之后）；
+            不带该参数 ⇒ 未解锁 + 不登记任何 300000 ms 定时器（= arm 确实在 `unlockByParam` 分支**内**）。
+         ② 再按该分支的调用序列（setUnlocked(true) → armAutoLock()）验回调行为（锁定 + 弹提示 + 2 s 隐藏）。
+       为什么不用 `mainSrc.indexOf('SettingPanel.armAutoLock(')` 钉调用点：那正是 ADR-0004 D23 的
+       静态防空洞 —— 把调用**注释掉**（字符串仍在源码里）或把它挪出 `unlockByParam` 分支，
+       这种判据照样绿（**修复前实测**：把那行注释掉后 60 条仍全绿），拔掉也不红。 */
+    {
+      let bootErr = null;
+      let bootOn = null;          /* ?unlock=1 的启动观察 */
+      let bootOff = null;         /* 不带该参数的启动观察（钉住"调用必须在分支内"） */
+      try {
+        const on = loadBootFixture('?unlock=1');
+        bootOn = {
+          unlocked: on.w.MockData.state.unlocked,
+          lockTimers: on.timers.filter(x => x.delay === 300000 && !x.cancelled).length,
+          warn: on.warnings.join(' | ')
+        };
+        const off = loadBootFixture('?tab=0');
+        bootOff = {
+          unlocked: off.w.MockData.state.unlocked,
+          lockTimers: off.timers.filter(x => x.delay === 300000 && !x.cancelled).length
+        };
+      } catch (e) {
+        bootErr = e.message;
+      }
+      const booted = bootErr === null && bootOn !== null && bootOff !== null &&
+        bootOn.unlocked === true && bootOn.lockTimers === 1 && bootOn.warn === '' &&
+        bootOff.unlocked === false && bootOff.lockTimers === 0;
+      /* 通过时也把观察值播出来（失败时另见 detail）：门禁输出本身即可复核，不必重跑一遍夹具 */
+      if (bootErr === null) {
+        console.log(`        参考（真实 main.js 启动）：?unlock=1 ⇒ 解锁=${bootOn.unlocked}、300000 ms 定时器 ${bootOn.lockTimers} 个、` +
+          `console.warn=${bootOn.warn || '（无）'}；?tab=0 ⇒ 解锁=${bootOff.unlocked}、300000 ms 定时器 ${bootOff.lockTimers} 个`);
+      }
+
+      let byErr = null;
+      let armedRet = null;
+      let armedTimers = -1;
+      let byUnlocked = null;
+      let byTipShown = false;
+      let byTipTimers = -1;
+      let byTipHidden = false;
+      const steps = [bootErr
+        ? `真实 main.js 启动异常：${bootErr}`
+        : `真实 main.js 启动：?unlock=1 ⇒ 解锁=${bootOn.unlocked}、300000 ms 定时器 ${bootOn.lockTimers} 个、` +
+          `console.warn=${bootOn.warn || '（无）'}；?tab=0 ⇒ 解锁=${bootOff.unlocked}、300000 ms 定时器 ${bootOff.lockTimers} 个`];
+      try {
+        const fx = loadAutoLockFixture();
+        const M = fx.w.MockData;
+        const tip = fx.node('autoLockTip');
+        tip.hidden = true;
+        fx.w.Components.SettingPanel.bind(M.state, () => {});      /* Dashboard.init(state) 里做的事之一 */
+        M.setUnlocked(true);                                        /* ?unlock=1 的置位 */
+        armedRet = fx.w.Components.SettingPanel.armAutoLock();       /* main.js 的旁路调用 */
+        armedTimers = fx.timers.filter(x => x.delay === 300000 && !x.cancelled && !x.fired).length;
+        steps.push(`armAutoLock() 返回 ${armedRet}，未触发/未取消的 300000 ms 定时器 ${armedTimers} 个`);
+
+        fx.fire(300000);
+        byUnlocked = M.state.unlocked;
+        byTipShown = tip.hidden === false && tip.classList.contains('show');
+        byTipTimers = fx.timers.filter(x => x.delay === 2000 && !x.fired).length;
+        steps.push(`300000 ms 回调后 state.unlocked=${byUnlocked}，弹窗显示=${byTipShown}，2000 ms 定时器 ${byTipTimers} 个`);
+
+        fx.fire(2000);
+        byTipHidden = tip.hidden === true && !tip.classList.contains('show');
+        steps.push(`2000 ms 回调后弹窗回到隐藏态=${byTipHidden}`);
+      } catch (e) {
+        byErr = e.message;
+      }
+      check(
+        'F-02 旁路接线（?unlock=1）：真实 main.js 启动时该分支 arm（已解锁 + 恰 1 个 300000 ms 定时器 + arm 在 Dashboard.init 之后），无该参数时不 arm；该定时器回调置为锁定并弹出提示 → 2000 ms 后自动隐藏',
+        byErr === null && booted && armedRet && armedTimers === 1 && byUnlocked === false &&
+          byTipShown && byTipTimers === 1 && byTipHidden,
+        byErr ? `夹具执行异常：${byErr}` : steps.join('；')
+      );
+    }
+
+    /* (e2) 未 bind 时 `armAutoLock()` 必须"不静默失效"：返回 false + console.warn，且不登记任何计时 */
+    {
+      let nbErr = null;
+      let refusedRet = null;
+      let refusedTimers = -1;
+      let warned = false;
+      let warnText = '';
+      try {
+        const fx = loadAutoLockFixture();
+        fx.w.MockData.setUnlocked(true);       /* 即便已解锁，未 bind 也无从登记自动锁定 */
+        refusedRet = fx.w.Components.SettingPanel.armAutoLock();
+        refusedTimers = fx.timers.filter(x => !x.cancelled).length;
+        warned = fx.warnings.some(w => /armAutoLock\(\) 在 bind\(\) 之前被调用/.test(w) && /自动锁定未登记/.test(w));
+        warnText = fx.warnings.join(' | ');
+      } catch (e) {
+        nbErr = e.message;
+      }
+      const refused = refusedRet === false;
+      check(
+        'F-02 未 bind 时不静默失效：armAutoLock() 返回 false、不登记计时、且 console.warn 说明"自动锁定未登记"',
+        nbErr === null && refused && refusedTimers === 0 && warned,
+        nbErr ? `夹具执行异常：${nbErr}` : `返回值=${refusedRet}，未取消定时器 ${refusedTimers} 个，捕获 warn=${warnText || '（无）'}`
+      );
+    }
+
+    /* (e3) 重复 arm 不堆叠：`?unlock=1` 与手动解锁可能先后触发，任一时刻只应有一个自动锁定计时 */
+    {
+      let rpErr = null;
+      let pending = -1;
+      let cancelled = -1;
+      let rets = '';
+      try {
+        const fx = loadAutoLockFixture();
+        const M = fx.w.MockData;
+        fx.w.Components.SettingPanel.bind(M.state, () => {});
+        M.setUnlocked(true);
+        const r1 = fx.w.Components.SettingPanel.armAutoLock();
+        const r2 = fx.w.Components.SettingPanel.armAutoLock();
+        rets = `${r1}/${r2}`;
+        pending = fx.timers.filter(x => x.delay === 300000 && !x.cancelled && !x.fired).length;
+        cancelled = fx.timers.filter(x => x.delay === 300000 && x.cancelled).length;
+      } catch (e) {
+        rpErr = e.message;
+      }
+      check(
+        'F-02 重复 arm 不堆叠：连续两次调用后未触发/未取消的 300000 ms 定时器恰 1 个（且发生过 1 次 clearTimeout）',
+        rpErr === null && pending === 1 && cancelled === 1,
+        rpErr ? `夹具执行异常：${rpErr}` : `两次返回值=${rets}；存活 300000 ms 定时器 ${pending} 个，被 clearTimeout 的 ${cancelled} 个`
       );
     }
 

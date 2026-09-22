@@ -16,6 +16,12 @@ window.Components.SettingPanel = (function () {
   const AUTO_LOCK_MS = 5 * 60 * 1000;
   let autoLockTimer = null;
 
+  /* 已用 bind() 装配过的 arm 闭包；供 `armAutoLock()` 这个**导出接口**使用。
+     为什么要导出：`?unlock=1` 评审旁路（src/main.js）直接调 `MockData.setUnlocked(true)`，
+     不走设置页的 `#setUnlockBtn` → tryUnlock()，若不 arm 就永远不自动锁定、也不弹提示。
+     计时逻辑仍只有一份（bind 内的 armAutoLock），这里只是把同一份逻辑的引用拿出来。 */
+  let autoLockArmer = null;
+
   /* ---------------- 自动锁定提示弹窗（FR-8.2：自动锁定时弹提示性弹窗，显示 2 s） ----------------
      DOM 契约（测试可断言）：
        节点     index.html `#autoLockTip`（role="status"，初始带 `hidden` 属性）
@@ -125,6 +131,9 @@ window.Components.SettingPanel = (function () {
     function clearAutoLock() {
       if (autoLockTimer) { clearTimeout(autoLockTimer); autoLockTimer = null; }
     }
+    /* 把同一份 arm/clear 逻辑暴露给模块级 `armAutoLock()`（见文件顶部变量注释）：
+       旁路解锁（?unlock=1）与手动解锁走的是**同一个定时器与同一个回调**，行为完全一致。 */
+    autoLockArmer = { arm: armAutoLock, clear: clearAutoLock };
 
     function tryUnlock() {
       // 演示实现：真实系统须由服务端校验口令（NFR-14），不得在前端存放明文
@@ -238,5 +247,25 @@ window.Components.SettingPanel = (function () {
     });
   }
 
-  return { render, bind };
+  /**
+   * FR-8.2：arm 自动锁定（导出接口，供 `?unlock=1` 旁路等**非设置页**解锁路径复用）。
+   *
+   * 行为与设置页手动解锁（`#setUnlockBtn` → tryUnlock → armAutoLock）**完全一致**：
+   * 登记一个 AUTO_LOCK_MS（300000 ms = 5 分钟）定时器；到点若仍处于解锁态则
+   * `setUnlocked(false)` + 写操作日志 + 弹 2 s 提示（#autoLockTip，AUTO_LOCK_TIP_MS = 2000）；
+   * 重复调用会先 clearTimeout 再重新计时，**不堆叠定时器**。
+   *
+   * @returns {boolean} true = 已登记计时；false = 尚未 bind()（此时设置页未装配，无法自动锁定，
+   *          调用方应视为配置错误而不是静默放过 —— 故同时 console.warn 提示）
+   */
+  function armAutoLock() {
+    if (!autoLockArmer) {
+      console.warn('[SettingPanel] armAutoLock() 在 bind() 之前被调用：自动锁定未登记（FR-8.2）');
+      return false;
+    }
+    autoLockArmer.arm();
+    return true;
+  }
+
+  return { render, bind, armAutoLock };
 })();

@@ -58,7 +58,8 @@
     const tab = Number(q.get('tab'));
     if (Number.isInteger(tab) && tab >= 0 && tab < Dashboard.TABS.length) Dashboard.switchTab(tab);
     if (q.get('link') === 'off') M.toggleLink();
-    if (q.get('unlock') === '1') M.setUnlocked(true);
+    const unlockByParam = q.get('unlock') === '1';
+    if (unlockByParam) M.setUnlocked(true);
     if (q.get('curve') === 'none') M.clearCurve();
     if (q.get('source')) CFG.dataSource = q.get('source');   // ?source=upper 用上位机报文驱动
 
@@ -76,6 +77,15 @@
     step();
 
     setInterval(step, CFG.refreshMs);
+
+    /* ?unlock=1 旁路（评审/Demo 用）：解锁状态已在上方置位，这里补上**与设置页手动解锁一致**的
+       arm 自动锁定（FR-8.2）—— 否则该模式下既不自动锁定、也不弹 #autoLockTip，演示与浏览器
+       用例都看不到新行为。必须在 Dashboard.init(state) 之后调用：设置页由 Dashboard 装配，
+       armAutoLock() 依赖那一份计时逻辑。 */
+    if (unlockByParam) {
+      M.pushLog('解锁', '评审旁路 ?unlock=1 直接解锁（演示实现）');
+      window.Components.SettingPanel.armAutoLock();
+    }
 
     /* 上报 MES：仅当配置了 MES 地址（Q-23 关闭后）才实际发送，否则为空操作 */
     if (CFG.mes.baseUrl) {

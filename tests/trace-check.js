@@ -91,7 +91,10 @@ const MAP = [
 
   /* FR-8 系统设置 */
   ['FR-8.1', 'covered-direct', 'browser-check.js', '?unlock=1 启动即解锁'],
-  ['FR-8.2', 'covered-indirect', 'ui-check.js', 'FR-8.2 解锁状态超时（5 分钟）自动锁定'],
+  /* 2026-09-22（F-02 跟随单）：原证据是源码正则（"有没有 5*60 的计时"），属静态写法匹配，
+     且 F-02 的时序缺陷正说明它锁不住语义。改指 ui-check 的行为断言 —— 它走真路径
+     SettingPanel.bind → 解锁 → 触发 300000 ms 回调，断言锁定态与 2 s 弹窗显隐，故升 covered-direct。 */
+  ['FR-8.2', 'covered-direct', 'ui-check.js', 'F-02 自动锁定行为（FR-8.2）：解锁后登记 300000 ms 定时器 → 回调置为锁定并弹出提示 → 2000 ms 后自动隐藏'],
   ['FR-8.3,FR-8.4', 'declared-gap', '', 'README 已知限制 1：前端明文密码，正式实现须服务端校验与哈希'],
   ['FR-8.5,FR-8.6', 'covered-indirect', 'ui-check.js', 'FR-8.6 设置页提供关键参数配置入口'],
   ['FR-8.7', 'covered-indirect', 'ui-check.js', 'FR-8.7 / NFR-15 解锁后的写操作留痕'],
@@ -99,7 +102,13 @@ const MAP = [
   /* FR-9 页面与交互 */
   ['FR-9.1,FR-9.3', 'covered-direct', 'browser-check.js', '切换 8 个标签页'],
   ['FR-9.2', 'covered-indirect', 'browser-check.js', '默认首页是「设备状态」'],
-  ['FR-9.4', 'covered-direct', 'browser-check.js', '快进 320 秒后自动回到「设备状态」首页'],
+  /* 2026-09-22（F-02 跟随单）：原证据 browser-check 的 B6 需浏览器权限、本环境不可复跑（属 §3b 的
+     在线类）。改指 ui-check 的 F-02 时序护栏 —— 它**离线**直接锁住 FR-9.4 的两个可机检口径：
+     默认值 310000 ms（5 分 10 秒）与"须晚于 FR-8.2 的锁定时刻"（差值恰 10000 ms）。
+     残留（如实登记）：**"无操作后真的切换回首页"这一行为**仍只有 B6 断言（B6 断言未删，
+     只是不再是本行证据），纯前端离线夹具不跑定时器链 + `TabsBar.setActive`，故不冒充。
+     归属仍记 covered-direct：证据的断言名含条款编号，且直接断言的正是该条款的数值与先后关系。 */
+  ['FR-9.4', 'covered-direct', 'ui-check.js', 'F-02 时序护栏（FR-8.2/FR-9.4）：AUTO_LOCK_MS < IDLE_RETURN_MS 且差值恰为 10000 ms（锁定先于回首页 10 s）'],
   ['FR-9.5', 'declared-gap', '', 'README 已知限制 11：标签页未做自动轮播；路线图技术债 E3（2026-09-19 补登记，P3-11）'],
   ['FR-9.6', 'covered-indirect', 'ui-check.js', '单次 tick + 10 个组件全量重绘耗时'],
   ['FR-9.7', 'covered-indirect', 'ui-check.js', 'FR-9.7 大屏交互屏蔽'],
