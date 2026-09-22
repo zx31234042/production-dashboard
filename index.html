@@ -168,11 +168,36 @@
           <span class="flow-step" data-step="待复检">待复检</span>
         </div>
 
-        <div class="card-title sm mt-24">设备参数与设定阈值<span class="title-note">次要（FR-3.5～3.8、3.16）</span></div>
-        <table class="data-table compact fill" id="tkCompareTable">
-          <thead><tr><th>参数</th><th>设定值</th><th>实际值</th><th>偏差</th><th>状态</th></tr></thead>
+        <!-- ---------- 测试标准区（FR-3.16 改写 / FR-3.18 显示 / FR-3.19 录入） ----------
+             上下限按**正负偏差**显示：上限＝典型值＋上偏差、下限＝典型值＋下偏差；
+             典型值**只显示、不参与判定**；三态（正常/临近）只用于深度与速度。
+             「解锁」后点击上限/下限数字进入八步录入（反色+高亮框+0.5 s 闪烁 → 输入 →
+             回车或点击其他区域退出并注入）；未解锁时点击数字无响应（AC-09）。 -->
+        <div class="card-title sm mt-24">测试标准区<span class="title-note">深度 / 速度（FR-3.18 显示 · FR-3.19 录入）</span></div>
+        <div class="std-note" id="tkStdMeta">典型值只显示、不参与判定；上下限按正负偏差（上限＝典型值＋上偏差）</div>
+        <table class="data-table compact std-limits" id="tkStdTable">
+          <thead><tr><th>检测参数</th><th>上限</th><th>下限</th><th>典型值</th></tr></thead>
           <tbody></tbody>
         </table>
+        <div class="std-edit" id="tkStdEdit" hidden>
+          <span class="std-edit-label" id="tkStdEditLabel">录入上限</span>
+          <input class="std-edit-input mono" id="tkStdInput" inputmode="decimal"
+                 autocomplete="off" placeholder="输入数值后回车">
+          <span class="std-edit-hint">回车确认 · Esc 取消 · 点击其他区域同样确认</span>        </div>
+        <div class="std-msg" id="tkStdMsg">当前已锁定：请在「操作设置」页输入密码解锁（演示密码 8888）后方可录入上下限</div>
+
+        <!-- 相机参数移入二级菜单（FR-3.16 最终口径 / FR-3.5～3.8 改归属）：
+             菜单项**只含参数名 + 设定值**（不展示实测值、偏差与状态 —— 四项相机参数是
+             上位机侧设备参数，不参与本看板系统测试判定，状态判定不在本看板职权范围内）；
+             表下给出一行归属说明。默认折叠，避免二级菜单体积膨胀。 -->
+        <details class="camera-menu" id="tkCameraMenu">
+          <summary>相机参数（二级菜单）<span class="title-note">上位机侧设备参数</span></summary>
+          <table class="data-table compact" id="tkCompareTable">
+            <thead><tr><th>参数</th><th>设定值</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div class="std-note">上位机侧设备参数，不参与本看板判定</div>
+        </details>
       </div>
     </section>
 

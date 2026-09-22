@@ -741,7 +741,15 @@ function main() {
     tail();
     console.log(`\n${verdict.evidence}`);
     if (verdict.unstable) {
-      console.log('门禁结论：**本轮不通过**（工作区在运行期间被改写，结论不可作为证据）。');
+      /* **结论行 token 统一**（2026-09-22 座位 R 立案；修 `harness-check` 第十四节那条端到端断言的偶发假红）：
+         四句"不通过"结论行共用**同一个机器可读 token**`门禁结论：不通过`。本句原先写作
+         `门禁结论：**本轮不通过**（…）` —— 于是任何按 token 读日志的消费者（首当其冲是
+         `tests\harness-check.js` 那条搜 `门禁结论：不通过` 的端到端断言）在"本轮工作区被改写"
+         这类轮次上**取不到结论**，变成假红。实测：N=20 次 `--only docs-check`（并发写方在改
+         `tests\ui-check.js`）4 次取不到；而每次日志尾部**完整且以 `\n` 结尾** ⇒ 根因**不是**
+         `console.log` 被 `process.exit` 截断（见上方 `authLine` 那段直写说明），而是**措辞分支不统一**。
+         语义一字未减：仍写明"本轮结论不可作为证据"与"工作区在运行期间被改写"。 */
+      console.log('门禁结论：不通过（**本轮结论不可作为证据**：工作区在运行期间被改写）。');
     } else if (verdict.exitCode !== 0) {
       console.log('门禁结论：不通过（详见上面的失败原因）。');
     } else {

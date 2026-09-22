@@ -1,11 +1,16 @@
 /* ==========================================================================
-   模拟数据源（services/mockData.js）— 按需求清单 V1.32 口径编写
+   模拟数据源（services/mockData.js）— 按需求清单 V1.33 口径编写
    作用：产生并逐秒推进看板所需的全部数据；界面组件只读取本文件输出的 state
    依赖：utils/format.js（需先加载）
    口径说明：
    - depth  : 航行器深度（相机系统测量的航行器水下深度，非相机自身下放深度）— C-32
    - speed  : 航行速度（X-Y 平面合成），velocity_x / velocity_y 为分速度 — C-23
    - 主要展示：航行器深度 + 航行速度；相机参数（帧率/增益/快门）为设备参数，次要展示 — C-31
+   - 判定对象：**深度与速度的测试标准上下限**（FR-3.14 改写 C-75 / FR-3.18）；相机参数属上位机侧
+     设备参数，本看板**既不做判定、也不做状态判定**（C-84④）⇒ 预警（含 FR-5.8 参数阈值临近预警）
+     一律**不得引用任何相机参数**；标准未设定（必要项缺失）时不做判定、不产生该预警
+   - 测试标准来源（FR-3.18）：`state.task.standard`（FR-3.19 现场录入）优先，未建立时回退
+     `config/board.config.js` 的 `standards.default`（仅演示）
    - 19 台相机的取值/整合由 PC 上位机完成，本看板按给定值直接展示，不做二次聚合 — C-30/IF-D.13
    - 统计口径与班次时间严格一致：班次进度、运行时长、产量均由当前时钟推导，跨班次自动清零（FR-4.16）
    后期接入真实接口时：本文件由 services/api.js 替代（见 PROJECT_RULES 9.2）
@@ -234,16 +239,123 @@ window.MockData = (function () {
     ];
   }
 
+  /* ---------------- 测试标准（FR-3.18 / FR-3.19）与三态判据 ----------------
+     判定对象＝**深度与速度的测试标准上下限**（FR-3.14 改写，C-75）；相机参数（帧率/增益/快门/
+     相机水下深度）属**上位机侧设备参数**，本看板**既不做判定、也不做状态判定**（C-84④），
+     故下方判据里**不出现任何相机参数**。
+     标准来源（FR-3.18）：运行时真源 state.task.standard（FR-3.19 现场录入）优先，
+     未建立时回退 config/board.config.js 的 standards.default（仅演示）；
+     必要项＝典型值＋上偏差＋下偏差，缺一即"标准未设定"（不判定、也不产生预警）。 */
+  const BCstd = BC.standards || {};
+  const STD_DIGITS = typeof BCstd.digits === 'number' ? BCstd.digits : 2;
+  const PARAM_CN = { depth: '深度', speed: '速度' };
+
+  /** 测试标准配置段（每次调用现读：整套配置被替换后仍取到当前值，不做加载期快照） */
+  function stdCfg() {
+    const live = window.BoardConfig && window.BoardConfig.standards;
+    return live || BCstd || {};
+  }
+
+  /** 临近带比例（FR-3.18 / C-84①，单一真源＝config standards.nearRatio） */
+  function nearRatio() {
+    const r = stdCfg().nearRatio;
+    return typeof r === 'number' ? r : 0.15;
+  }
+
+  /** 取某参数（depth / speed）当前生效的标准规格；口径与 components/TaskPanel.js 的 ensureRow() 一致 */
+  function standardSpecOf(kind) {
+    const task = state.task || {};
+    const live = (task.standard && task.standard[kind]) || null;
+    if (live) return live;
+    const dft = stdCfg().default || {};
+    return dft[kind] || null;
+  }
+
+  const isFiniteNum = v => typeof v === 'number' && Number.isFinite(v);
+
+  /**
+   * 测试标准三态（FR-3.14 / FR-3.18）—— **唯一一份**判据实现。
+   *   - 超范围 err（红）：实测值落在闭区间 [下限, 上限] 之外（压线即合格）；
+   *   - 临近   warn（黄）：距上/下限边界的距离 ≤ (上限 − 下限) × `standards.nearRatio`（含等号、至少一格）；
+   *   - 其余   ok（正常）；必要项缺失（典型值/上偏差/下偏差任一不是有限数）⇒ idle（标准未设定，不判定）。
+   * `components/TaskPanel.js` 的 `levelOf()` **直接转发本函数** —— 界面三态（FR-3.18）与预警（FR-5.8）
+   * 共用同一份公式与同一份配置，**不存在第二份口径**。
+   * 三态比较全部换算到**显示精度网格**（两位小数 ⇒ 0.01）上的整数再比较：实测值、上下限、
+   * 临近带宽都化作"格数"，比较即 `距离格数 ≤ 带宽格数`，没有二进制浮点误差 ——
+   * 否则 `5.2 − 0.06` 在浮点里是 5.140000000000001，恰好等于带宽的值会漏判一格。
+   * @param {number} real 实测值（深度或速度）
+   * @param {object|null} spec 标准规格（typical / upperDev / lowerDev / digits）
+   * @returns {{lv:string, text:string}} lv ∈ idle / ok / warn / err
+   */
+  function standardLevel(real, spec) {
+    if (!isFiniteNum(real) || !spec ||
+        !isFiniteNum(spec.typical) || !isFiniteNum(spec.upperDev) || !isFiniteNum(spec.lowerDev)) {
+      return { lv: 'idle', text: '标准未设定' };
+    }
+    const GRID = Math.pow(10, -(typeof spec.digits === 'number' ? spec.digits : STD_DIGITS));
+    const upper = round2(spec.typical + spec.upperDev);
+    const lower = round2(spec.typical + spec.lowerDev);
+    const tol = (upper - lower) * nearRatio();
+    const unit = 1 / GRID;
+    /* 带宽格数 k = max(1, ceil(tol × 每单位格数))：含等号（距离 ≤ 带宽即临近），且至少一格，
+       不会退化成空区间（`- 1e-9` 是浮点容差修正：`0.4 × 0.15 = 0.06000000000000005`）。 */
+    const k = Math.max(1, Math.ceil(tol * unit - 1e-9));
+    const vU = Math.round(round2(real) * unit);
+    const upU = Math.round(upper * unit);
+    const loU = Math.round(lower * unit);
+    /* 三态区间（上下对称）：
+         超范围 err（红）：v < 下限 或 v > 上限 —— 判定区间是闭区间 [下限, 上限]，压线即合格；
+         临近   warn（黄）：[上限−tol, 上限) 或 (下限, 下限+tol] —— 含等号，但不含上/下限本身；
+         其余 ok（正常）。 */
+    if (vU > upU || vU < loU) return { lv: 'err', text: '超范围' };
+    if ((upU - vU <= k && vU < upU) || (vU - loU <= k && vU > loU)) {
+      return { lv: 'warn', text: '临近' };
+    }
+    return { lv: 'ok', text: '正常' };
+  }
+
+  /**
+   * 参数阈值临近预警（FR-5.8，P0）：判定对象＝**深度与速度的测试标准上下限**（FR-3.14 / FR-3.18），
+   * 判据复用 standardLevel()（与界面三态同一份实现）。超范围时**沿用同一预警名称**、等级取 err（红）；
+   * **标准未设定（必要项缺失）⇒ 不产生该预警**（无从判定则不报警）。
+   * 相机参数不参与本预警的任何判定（C-84④）。
+   * @returns {{title:string, detail:string, lv:string}|null} null = 不产生该预警
+   */
+  function buildParamWarning() {
+    const real = (state.task && state.task.real) || {};
+    const rows = ['depth', 'speed'].map(kind => {
+      const spec = standardSpecOf(kind);
+      return { kind, spec, lv: standardLevel(real[kind], spec) };
+    }).filter(r => r.lv.lv !== 'idle');
+    if (!rows.length) return null;                 // 标准未设定 ⇒ 不产生该预警
+    const worst = rows.some(r => r.lv.lv === 'err') ? 'err'
+      : (rows.some(r => r.lv.lv === 'warn') ? 'warn' : 'ok');
+    const detail = rows.map(r => {
+      const d = typeof r.spec.digits === 'number' ? r.spec.digits : STD_DIGITS;
+      const unit = r.spec.unit ? ' ' + r.spec.unit : '';
+      const upper = round2(r.spec.typical + r.spec.upperDev);
+      const lower = round2(r.spec.typical + r.spec.lowerDev);
+      return PARAM_CN[r.kind] + ' ' + round2(real[r.kind]).toFixed(d) + unit +
+        '（标准 ' + lower.toFixed(d) + '～' + upper.toFixed(d) + unit + '）判' + r.lv.text;
+    }).join('；');
+    return {
+      title: '参数阈值临近预警',
+      detail: detail + (worst === 'ok'
+        ? '，均处于允许范围'
+        : '（临近判据：实测距上/下限边界 ≤ (上限−下限)×' + nearRatio() + '）'),
+      lv: worst
+    };
+  }
+
   /* ---------------- 预警计算 ---------------- */
   function buildWarnings() {
-    const t = state.task, m = state.maint;
+    const m = state.maint;
     const out = [];
-    /* 1) 参数阈值临近：以设备参数（实际帧率 vs 设定帧率）判定 */
-    const fpsDev = Math.abs(t.real.fps - t.std.fps);
-    const fpsPct = t.std.fps > 0 ? (fpsDev / t.std.fps) * 100 : 0;
-    out.push(fpsPct >= 0.5
-      ? { title: '参数阈值临近预警', detail: `实时帧率偏差 ${fpsPct.toFixed(2)}%（设定 ${t.std.fps} fps / 实时 ${t.real.fps} fps）`, lv: 'warn' }
-      : { title: '参数阈值临近预警', detail: `实时帧率偏差 ${fpsPct.toFixed(2)}%，处于允许范围`, lv: 'ok' });
+    /* 1) 参数阈值临近（FR-5.8）：判定对象＝深度与速度的测试标准上下限（FR-3.14 / FR-3.18）；
+          **不再用相机参数（帧率/增益/快门/相机水下深度）做判定或状态** —— 相机参数属上位机侧
+          设备参数，本看板既不做判定也不做状态判定（C-84④）。标准未设定时不产生该预警。 */
+    const paramWarn = buildParamWarning();
+    if (paramWarn) out.push(paramWarn);
     /* 2) 维保到期（阈值取配置 maintenance.warnDays，不在代码里写死） */
     out.push(m.daysLeft <= CFG.maintWarnDays
       ? { title: '设备维保到期预警', detail: `距计划维保还有 ${m.daysLeft} 天（${m.next}）`, lv: 'warn' }
@@ -507,5 +619,7 @@ window.MockData = (function () {
     state.curveTick.unitIndex = -1;   // 由首次 tick 按当前任务初始化
   })();
 
-  return { state, tick, toggleLink, injectAlarm, setUnlocked, pushLog, closeActiveAlarm, clearCurve, CFG, DEVICE_NOMINAL };
+  return { state, tick, toggleLink, injectAlarm, setUnlocked, pushLog, closeActiveAlarm, clearCurve, CFG, DEVICE_NOMINAL,
+           /* 供界面与自检复用：三态判据与标准取值的**唯一实现**（TaskPanel.levelOf 直接转发本函数） */
+           standardLevel, standardSpecOf };
 })();

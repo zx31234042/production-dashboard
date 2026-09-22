@@ -54,7 +54,9 @@ function readText(rel) {
 /** 解析 CSS 文本 → Map(选择器, { 属性: 值 })；后出现的同名选择器覆盖前者 */
 function parseCss(text) {
   const rules = new Map();
-  const noComment = text.replace(/\/\*[\s\S]*?\*\//g, '');
+  /* 换行先归一：`global.css` 是 CRLF，`;` 切段后属性名会带 `\r\n` 前缀
+     （实测：键成了 `'\r\n  box-shadow'`，`decls['box-shadow']` 恒 undefined ⇒ 断言假红） */
+  const noComment = String(text).replace(/\r\n?/g, '\n').replace(/\/\*[\s\S]*?\*\//g, '');
   for (const m of noComment.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
     const selector = m[1].trim().replace(/\s+/g, ' ');
     const decls = {};
@@ -479,6 +481,234 @@ function loadBootFixture(search) {
   };
 }
 
+/**
+ * 任务数据页「测试标准区 / 相机二级菜单」夹具（FR-3.16 改写 / FR-3.18 / FR-3.19）。
+ *
+ * 为什么不能直接复用 `loadUi` 的记录型假 DOM：V1.33 的三条条款要的是**交互与注入行为**，
+ * 而记录型假 DOM 缺三件必需的能力 ——
+ *   ① **按 id 缓存的节点**（`loadUi` 每次 `$()` 都新建节点，于是"组件改的节点"与"用例看的节点"
+ *      不是同一个：`#tkStdEdit` 的 `hidden`、`#std0upper` 的 `parentNode` 都观察不到）；
+ *   ② **可派发的事件**（点上限/下限数字走 `#panel-task` 的 mousedown 委托，回车/Esc/失焦走
+ *      `#tkStdInput` 的 keydown/blur）—— 没有事件就无法区分"未解锁点数字不进入录入态"与
+ *      "解锁后点数字进入录入态"；
+ *   ③ **元素的父子关系**（`climbTo()` 靠 `parentNode` 向上找 `.std-num` / `.std-edit`）。
+ *
+ * 本夹具提供上述三点，并额外把 `#tkStdEdit` 的 `innerHTML` 渲染成**前三个直接子元素**——
+ * 与 index.html 的结构（label span / input / hint span）一致，于是"锁定后点击数字不进入录入态"
+ * 有一个**可证伪**的观察量：锁定 ⇒ `hidden` 保持 true、且 `#tkStdEdit` 内**没有** `#tkStdInput`
+ * 可聚焦（证明不是"输入框其实在，只是没隐藏"）。
+ *
+ * 真实依赖：`TaskPanel` / `SettingPanel` / `Dashboard` 都是 vm 里的真组件；只把浏览器环境换成桩件。
+ * @param {object} [taskState] 用例自备的 state；给了就**整体替换** `MockData.state` 的内容
+ *        （逐键覆盖，保留同一个对象 —— 组件的 `TaskPanel` 事件处理器读的是
+ *        `window.MockData.state`，换个对象会让它与用例的 `fx.state` 指向不同实例，
+ *        表现为"解锁了却点不动"；实测踩过）。
+ *        为什么必须给：`pushLog()` 从 `state.clock` 取时间戳、`setUnlocked()` 改 `state.unlocked`，
+ *        而真单例的 `clock` 在脚本加载时是空的（不给自备 state 的话留痕时间戳成了 `--:--:--`）。
+ * @returns {{W:object, state:object, timers:Array, alerts:Array<string>, idleResets:number,
+ *            fire:Function, click:Function, screen:Function, node:Function,
+ *            input:Function, snap:Function}}
+ */
+function loadTaskStdFixture(taskState) {
+  const nodes = new Map();
+  const timers = [];
+  const alerts = [];
+  /** tbody 正文的**原始** HTML（key = '表id tbody'）：`innerHTML` 的 getter 要返回"上个渲染周期
+      的正文"才与浏览器一致，而 `querySelector('tbody')` 必须按**本次**写入的正文重建子节点，
+      两者不能共用一个字段（实测踩过：共用时 querySelector 读到旧/空正文 ⇒ 单元格一个都查不到）。
+      注意正文是组件**直接** `tbody.innerHTML = …` 写的，不经过 `Dom.setHTML`，
+      故记录动作必须挂在 innerHTML 的 setter 上。 */
+  const rawTbody = new Map();
+  let seq = 0;
+  let idleResets = 0;          /* "无操作回首页"计时被重置的次数（夹具计数桩累加） */
+
+  let sandbox = null;
+  let renderSeq = 0;           /* #tkCompareTable/#tkStdTable 正文的渲染次数（单元格对象按此换代） */
+  let inputEl = null;          /* #tkStdInput：懒查询（与组件一致，避免渲染顺序耦合） */
+  let editBox = null;          /* #tkStdEdit */
+
+  /** 取（必要时创建）按 id 缓存的节点 */
+  function node(id) {
+    if (nodes.has(id)) return nodes.get(id);
+    const handlers = {};
+    const classes = new Set();
+    const o = {
+      __id: id, hidden: false, disabled: false, value: '', className: '', style: {}, dataset: {},
+      __children: [],
+      classList: {
+        add: c => classes.add(c),
+        remove: c => classes.delete(c),
+        contains: c => classes.has(c),
+        toggle: (c, on) => { if (on === undefined ? !classes.has(c) : on) classes.add(c); else classes.delete(c); }
+      },
+      addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); },
+      /** 派发事件；载荷默认带 `key:'Enter'` 与 no-op `preventDefault`（组件的 keydown 分支要调它） */
+      __fire: (type, extra) => (handlers[type] || []).forEach(fn =>
+        fn(Object.assign({ key: 'Enter', preventDefault() {} }, extra))),
+      /** 输入框专用：把 value 换成输入框自己的值（浏览器与组件共用同一节点） */
+      focus() {}, select() {}, blur() {},
+      appendChild() {}, remove() {}, closest: () => null,
+      get parentNode() { return o.__parent || null; }
+    };
+    Object.defineProperty(o, 'textContent', {
+      get() { return o.__text || ''; }, set(v) { o.__text = String(v); }, configurable: true
+    });
+    Object.defineProperty(o, 'innerHTML', {
+      get() { return o.__html || ''; },
+      set(v) {
+        o.__html = String(v);
+        /* tbody：记录正文供 querySelector('tbody') 解析（见 rawTbody 的注释） */
+        if (/ tbody$/.test(id)) rawTbody.set(id, o.__html);
+        /* #tkStdEdit 按 index.html 的子元素结构（label / input / hint）重建，
+           这样 #tkStdInput 的可查询性直接反映"录入行是可见的" */
+        if (id === 'tkStdEdit') {
+          editBox = o;
+          o.__children = ['tkStdEditLabel', 'tkStdInput', 'tkStdEditHint'].map(cid => {
+            const c = node(cid);
+            c.__parent = o;
+            return c;
+          });
+          if (!inputEl) inputEl = o.__children[1];
+        }
+      },
+      configurable: true
+    });
+    o.querySelector = sel => {
+      if (sel !== 'tbody') return node(id + ' ' + sel);
+      renderSeq++;
+      /* tbody 的 id **必须带表的 id**：`#tkStdTable`（测试标准区）与 `#tkCompareTable`
+         （相机二级菜单）各有自己的 tbody；若共用一个节点，后渲染的相机表会**覆盖**标准表
+         （实测踩过：标准表正文被相机两列内容顶掉，四条结构断言一起假红）。 */
+      const tb = node(id + ' tbody');
+      tb.__parent = o;
+      const rows = [];
+      const src = rawTbody.get(id + ' tbody') || '';
+      /* 注意：渲染出的单元格是 `<td class="…">`（td 后紧跟空格），须用 `\b` 而不是 `\s` */
+      const rowRe = /<tr\b[^>]*>([\s\S]*?)<\/tr>/g;
+      const tdRe = /<td\b([^>]*)>([\s\S]*?)<\/td>/g;
+      for (const rm of src.matchAll(rowRe)) {
+        const row = node(id + ' tr' + renderSeq + '_' + rows.length);
+        row.__parent = tb;
+        const cls = (/^<tr\b[^>]*\bdata-kind="([^"]+)"/.exec(rm[0]) || [])[1] || '';
+        row.dataset.kind = cls;
+        let cellIdx = 0;
+        row.__children = [];
+        for (const cm of rm[1].matchAll(tdRe)) {
+          /* 单元格 id 按「第几次渲染 + 行 + 列」派生：同一次渲染内**恒等**（事件目标与
+             用例断言的对象是同一个），换一次渲染即换新对象（与真实 innerHTML 重建一致） */
+          const td = node(id + ' c' + renderSeq + '_' + (rows.length * 4 + cellIdx++));
+          td.__parent = row;
+          const cm2 = /\bclass="([^"]*)"/.exec(cm[1]);
+          const dm = /\bdata-edit="([^"]*)"/.exec(cm[1]);
+          String(cm2 ? cm2[1] : '').split(/\s+/).filter(Boolean).forEach(x => td.classList.add(x));
+          if (dm) td.dataset.edit = dm[1];
+          td.innerHTML = cm[2];
+          row.__children.push(td);
+        }
+        rows.push(row);
+      }
+      tb.__children = rows;
+      return tb;
+    };
+    nodes.set(id, o);
+    return o;
+  }
+
+  sandbox = {
+    console: { log: () => {}, warn: () => {}, error: () => {} },
+    alert: msg => { alerts.push(String(msg)); },
+    setTimeout: (fn, delay) => { const id = ++seq; timers.push({ id, delay, fn, fired: false, cancelled: false }); return id; },
+    clearTimeout: id => { const t = timers.find(x => x.id === id); if (t) t.cancelled = true; },
+    addEventListener: () => {},
+    Date
+  };
+  sandbox.window = sandbox;
+  sandbox.document = {
+    readyState: 'complete',
+    getElementById: node,
+    /* 没有 addEventListener ⇒ 三个组件自带的"装配一次"IIFE 一律不跑（避免在 MockData 未就位时
+       抢跑），装配改由用例显式调用 TaskPanel.bind() / Dashboard.init() / SettingPanel.bind() */
+    querySelectorAll: () => [],
+    querySelector: () => null,
+    createElement: () => node('created-' + (++seq)),
+    addEventListener: undefined
+  };
+  vm.createContext(sandbox);
+  const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  run('src/config/board.config.js');
+  run('src/config/fieldMap.js');
+  run('src/utils/format.js');
+  sandbox.window.Dom = {
+    $: node,
+    setText: (id, v) => { node(id).textContent = v; },
+    setHTML: (id, v) => { node(id).innerHTML = v; },
+    setClass: (id, v) => { node(id).className = v; },
+    setStyle: (id, prop, val) => { node(id).style[prop] = val; },
+    toggleClass: (id, cls, on) => { node(id).classList.toggle(cls, on); }
+  };
+  run('src/services/mockData.js');
+  run('src/components/TaskPanel.js');
+  run('src/components/SettingPanel.js');
+  run('src/pages/Dashboard.js');
+  /* Dashboard.init() 还要装配标签栏与报警面板；本用例只关心"回首页计时"那一条时钟，
+     给这两个组件空实现即可（不加载真组件＝不把无关 DOM 依赖拖进夹具）。
+     注：`SettingPanel.bind` 用**真组件**（FR-3.19 第⑧步要的就是真 armAutoLock 计时）。 */
+  sandbox.window.Components.TabsBar = { build() {}, setActive() {}, renderLinkStatus() {} };
+  sandbox.window.Components.AlarmPanel = { bind() {}, render() {}, renderAll() {} };
+  /* 用例自备的 state 逐键覆盖 MockData 的单例（见函数头 @param taskState 的说明）。
+     必须**保留同一个对象**：`TaskPanel` 的事件处理器读 `window.MockData.state`，
+     换对象会让它和用例的 `fx.state` 指向不同实例。 */
+  if (taskState) Object.assign(sandbox.window.MockData.state, taskState);
+  /* `Dashboard.init` 照旧用真实现 —— FR-3.19 第⑧步要观察的正是它内部
+     `SettingPanel.bind(state, resetIdleTimer)` 那条接线。
+     ⚠️ 计数桩为什么不能挂在这里：自动锁定回调**只置锁定态、不回调 onActivity**
+     （它自己就是"锁定"这一动作），挂这里读到的恒是 0（实测踩过）。 */
+  const Dash = sandbox.window.Pages.Dashboard;
+  /* FR-3.19 第⑧步要观察 `TaskPanel.activity()` 是否真的走到"重置无操作回首页计时"。
+     为什么用 spy 而不是 `bind(state, onActivity)` 的计数桩：`Dashboard.init()` 的装配列表里
+     **没有** `TaskPanel.bind`（它是 DOM 就绪后自 bind），故注入的 onActivity 收不到这次调用，
+     计数恒 0（实测踩过）。spy 装在最外层公开函数上，`activity()` 的 `Pages.Dashboard.resetIdleTimer()`
+     必然经过它 —— 真路径，不依赖装配顺序。 */
+  const realResetIdle = Dash.resetIdleTimer;
+  Dash.resetIdleTimer = function spyResetIdleTimer() {
+    idleResets++;
+    return realResetIdle();
+  };
+
+  const api = {
+    W: sandbox.window,
+    state: sandbox.window.MockData.state,
+    timers,
+    alerts,
+    /** 真实 `Dashboard.resetIdleTimer()` 被调用的累计次数（夹具把它包成 spy，见上方注释） */
+    get idleResets() { return idleResets; },
+    node,
+    /** 触发**尚未触发且未被取消**的、delay 匹配的最后一个定时器回调 */
+    fire: delay => {
+      const t = timers.filter(x => x.delay === delay && !x.cancelled && !x.fired).pop();
+      if (!t) throw new Error(`没有待触发的 ${delay} ms 定时器（已登记：${timers.map(x => x.delay).join('/') || '无'}）`);
+      t.fired = true;
+      t.fn();
+      return t;
+    },
+    /** 点击（mousedown）某个节点的 `.std-num` 祖先：沿 parentNode 上溯，模拟真实事件冒泡 */
+    click: target => {
+      let cur = target;
+      while (cur && !(cur.classList && cur.classList.contains('std-num'))) cur = cur.parentNode;
+      node('panel-task').__fire('mousedown', { target: cur || target });
+    },
+    /** 在 #tkStdInput 上派发事件（keydown/blur）；key 默认 'Enter'（组件的回车确认分支） */
+    screen: (type, key) => { if (!inputEl) inputEl = node('tkStdInput'); inputEl.__fire(type, { key: key || 'Enter' }); },
+    input: () => { if (!inputEl) inputEl = node('tkStdInput'); return inputEl; },
+    editBox: () => editBox,
+    /** 真实 `Dashboard.resetIdleTimer()` 被调用的次数（夹具把它包成 spy，见上方注释） */
+    idleActivity: () => { idleResets++; },
+    /** 状态快照：用于"非法录入不得写入"的前后比对 */
+    snap: () => JSON.stringify(sandbox.window.MockData.state)
+  };
+  return api;
+}
+
 /* ---------------- 需求规范基线（来源：`需求文档\` 下的当前基线版需求清单） ---------------- */
 /* §5 UI-03 色彩规范、UI-04 字号规范（4K 基准）；§4.1/4.3/4.4/4.9 的功能条目 */
 const UI03 = { '--ok': '#00B050', '--warn': '#FFC000', '--err': '#FF0000', '--idle': '#808080', '--bg': '#0B1A2B' };
@@ -491,6 +721,114 @@ const UI04 = [
   { role: '辅助说明（取下限最小者）', selector: null, min: 40 }
 ];
 const HELPER_SELECTORS = ['.title-note', '.card-title.sm .title-note', '.link-note', '.tile-note', '.chart-foot', '.chart-empty .empty-note', '.hint', '.form-label'];
+
+/* ==========================================================================
+   V1.33 测试标准区（FR-3.16 改写 / FR-3.18 / FR-3.19）——用例侧的解析与规范化工具
+   --------------------------------------------------------------------------
+   三条纪律：
+    ① **断言名里逐字写条款编号**（trace-check 把断言名当逐字证据引用）；
+    ② 判据里的**数字一律从配置/state 实算**（`standards.nearRatio`、`AUTO_LOCK_MS`、
+       典型值与偏差都来自配置段或 state 快照），**不硬编码 15% / 300000 ms / 12.50** ——
+       配置改了断言要跟着改判，而不是假绿；
+    ③ 只做**可证伪**的观察：解析失败（拿不到结构）时返回 null/负值，断言随之变红。
+   ========================================================================== */
+
+/** 构造一份**自足**的任务状态（字段齐备 ⇒ TaskPanel 走正常渲染分支，而非 FR-3.17 空态） */
+function mkStdTaskState() {
+  return {
+    clock: { date: '2026-09-22', week: '星期二', time: '14:30:00' },
+    device: { name: '水池高速摄像生产管理看板', code: 'SB-01', link: 'online', mes: 'online' },
+    shift: { list: [], team: '检验一班', operator: '张伟', leader: '李建国' },
+    unlocked: false,
+    task: {
+      procOrderNo: 'MES20260922001', productCode: 'CP-2026-A17', productName: '水下振动测试件',
+      batchNo: 'PC20260922-01', drawingNo: 'SJ-4471-02', orderNo: 'DD20260922-118',
+      std: { depth: 12.50, gain: 2.5, fps: 1000, shutter: 500 },
+      real: { depth: 12.68, speed: 5.00, vx: 4.90, vy: 0.10, fps: 1000, gain: 2.5, shutter: 500, cameraDepth: 12.00 },
+      unitIndex: 1, progress: 0.5, result: '测试中', lastResult: '合格', planQty: 300
+    },
+    stats: { plan: 300, started: 120, notStarted: 180, done: 118, testing: 1, pending: 0, firstPass: 0.9 },
+    alarm: { active: null, queue: [], ledger: [] },
+    warnings: [], notices: { notices: [], tips: [], todo: [] }, selfCheck: [], opLog: [],
+    maint: { records: [] }, curve: {}, curveTick: {}
+  };
+}
+
+/** 按 VM 里的真实配置（standards.digits / default 段）取某参数的规格；取不到返回 null（断言即变红） */
+function makeStdSpec(W, kind) {
+  const STD = (W.BoardConfig || {}).standards || {};
+  const row = (STD.default || {})[kind];
+  if (!row) return null;
+  return {
+    unit: row.unit, digits: typeof STD.digits === 'number' ? STD.digits : null,
+    typical: row.typical, upperDev: row.upperDev, lowerDev: row.lowerDev,
+    upper: W.Format.round2(row.typical + row.upperDev),
+    lower: W.Format.round2(row.typical + row.lowerDev)
+  };
+}
+
+/** 解析 `#tkStdTable` 的正文 HTML → 每行的 { kind, tds:[{cls, edit}] }；拿不到结构时给出空数组
+ *  ⚠️ 单元格形如 `<td class="std-num upper">`、行形如 `<tr data-kind="depth">` ——
+ *     标签名后紧跟的是**空格**，故必须用 `\b` 收尾（写成 `\s` 会一个都匹配不到）。 */
+function parseStdRows(tbodyHtml) {
+  const rows = [];
+  for (const rm of String(tbodyHtml || '').matchAll(/<tr\b([^>]*)>([\s\S]*?)<\/tr>/g)) {
+    const kind = (/\bdata-kind="([^"]*)"/.exec(rm[1]) || [])[1] || '';
+    const tds = [...rm[2].matchAll(/<td\b([^>]*)>([\s\S]*?)<\/td>/g)].map(td => ({
+      cls: (/\bclass="([^"]*)"/.exec(td[1]) || [])[1] || '',
+      edit: (/\bdata-edit="([^"]*)"/.exec(td[1]) || [])[1] || '',
+      text: td[2]
+    }));
+    rows.push({ kind, tds });
+  }
+  return rows;
+}
+
+/** 某一行里 `data-edit` 为给定值的单元格；取不到返回 null */
+function stdCell(rows, kind, edit) {
+  const row = rows.find(r => r.kind === kind);
+  if (!row) return null;
+  return row.tds.find(td => td.edit === edit) || null;
+}
+
+/** 某一行里的「典型值」单元格（第 4 格：检测参数 / 上限 / 下限 / 典型值）；取不到返回 null */
+function typicalCell(rows, kind) {
+  const row = rows.find(r => r.kind === kind);
+  return row ? (row.tds[3] || null) : null;
+}
+
+/** 从形如 `<span class="std-value">12.80</span>` 的片段里取出数值（不合口径返回 null） */
+function valueOf(snippet, digits) {
+  const m = /<span class="std-value">(-?\d+(?:\.\d+)?)<\/span>/.exec(String(snippet || ''));
+  if (!m) return null;
+  return new RegExp(`^-?\\d+\\.\\d{${digits}}$`).test(m[1]) ? Number(m[1]) : null;
+}
+
+/** 单元格里的单位文本（`<span class="std-unit"> m/s</span>` → 'm/s'） */
+function unitOf(snippet) {
+  const m = /<span class="std-unit">([^<]*)<\/span>/.exec(String(snippet || ''));
+  return m ? m[1].trim() : null;
+}
+
+/** 单元格里的典型值数字（`12.50<span class="std-unit">…` → 12.5；也接受含 `<td class="std-typical mono">` 的整格片段） */
+function typicalOf(snippet, digits) {
+  const m = /(?:<td[^>]*class="[^"]*std-typical[^"]*"[^>]*>)?\s*(-?\d+(?:\.\d+)?)\s*(?:<|$)/.exec(String(snippet || ''));
+  if (!m) return null;
+  return new RegExp(`^-?\\d+\\.\\d{${digits}}$`).test(m[1]) ? Number(m[1]) : null;
+}
+
+/** 单元格里的偏差文本（`上偏差 +0.30 · 下偏差 -0.20` → '+0.30' / '-0.20'） */
+function devOf(snippet, label) {
+  const m = new RegExp(label + '\\s*([+-]\\d+(?:\\.\\d+)?)').exec(String(snippet || ''));
+  return m ? m[1] : null;
+}
+
+/** 把 `.std-num` / `.std-name` 单元格文本压成可比较的规整串 */
+const stdCellText = td => (td ? String(td.text).replace(/<[^>]*>/g, '').replace(/\s+/g, '') : '');
+
+/** 取 `<th>…</th>` 的表头文字数组 */
+const thOf = seg => [...String(seg || '').matchAll(/<th[^>]*>([\s\S]*?)<\/th>/g)]
+  .map(m => m[1].replace(/<[^>]*>/g, '').trim());
 
 async function main() {
   const cssVars = readText('src/styles/variables.css');
@@ -680,18 +1018,44 @@ async function main() {
   }
 
   {
-    /* FR-3.14 实测值超阈值高亮（黄=临近、红=超标） */
+    /* FR-3.14 / FR-3.16（V1.33 改判）：原判据是"设备参数对比表里帧率超标、增益临近"——
+       V1.33 把相机参数移出任务数据页主体（改由二级菜单只含参数名+设定值），
+       这条判据的载体（`#tkCompareTable` 的实测值/偏差/状态列）**已被移走**，故按新口径改判：
+
+         FR-3.14 的判定对象＝**深度与速度的测试标准值**，三态（正常/临近/超范围）**只用于**深度与速度；
+         相机参数**不做判定** —— 于是新的可证伪判据分两半：
+           ① 满足必要条件：`#tkStdTable` 里深度/速度两行**都带**三态列（`std-state`），不是"没判"而是"判了"；
+           ② 相机参数不判定：**同一份** state 下把相机四项实测值推成荒诞离群值（帧率 ×3、增益 ×50、
+              设定深度 ±5 m），相机二级菜单的渲染结果与状态**逐字不变**（判定/状态不在本看板职责范围），
+              且整块相机菜单 HTML 里**不出现任何三态字面量**。 */
     const s = JSON.parse(JSON.stringify(W.MockData.state));
-    s.task.real.fps = s.task.std.fps + 5;        // 帧率容差 err=2 → 应判"超标"
-    s.task.real.gain = s.task.std.gain + 0.2;    // 增益容差 warn=0.15 / err=0.30 → 应判"临近"
+    const std0 = W.Format.round2;
+    s.task.real.depth = std0(s.task.std.depth + 0.05);
+    s.task.real.speed = std0(s.task.std.speed + 0.05);
     ui.out.length = 0;
     W.Components.TaskPanel.render(s);
-    const table = lastHtml(ui.out, 'tkCompareTable tbody') || '';
-    check('FR-3.14 超阈值判定：帧率超标、增益临近', /超标/.test(table) && /临近/.test(table),
-      `帧率 +5fps、增益 +0.2 后表格中 ${/超标/.test(table) ? '有' : '无'}超标、${/临近/.test(table) ? '有' : '无'}临近`);
-    const warnings = W.MockData.state.warnings.map(w => w.title + ':' + w.lv).join(' | ');
-    check('FR-3.14 预警区与设备参数判定联动', W.MockData.state.warnings.some(w => w.title.includes('参数阈值')),
-      `当前预警：${warnings}`);
+    const stdTbody = lastHtml(ui.out, 'tkStdTable tbody') || '';
+    const camA = lastHtml(ui.out, 'tkCompareTable tbody') || '';
+    check(
+      'FR-3.14/FR-3.18 三态判定只用于深度与速度：#tkStdTable 的深度/速度两行都渲染出三态列（std-state）',
+      (stdTbody.match(/class="std-state (?:ok|warn|err|idle)"/g) || []).length === 2,
+      `std-state 命中 ${(stdTbody.match(/class="std-state (?:ok|warn|err|idle)"/g) || []).length} 处（应为 2：深度 1 + 速度 1）`
+    );
+
+    /* 相机四项推成离群值：二级菜单必须逐字不变，且不含任何三态字面量 */
+    s.task.real.fps = s.task.std.fps * 3;
+    s.task.real.gain = s.task.std.gain * 50;
+    s.task.real.cameraDepth = s.task.std.depth + 5;
+    s.task.real.shutter = s.task.std.shutter * 4;
+    ui.out.length = 0;
+    W.Components.TaskPanel.render(s);
+    const camB = lastHtml(ui.out, 'tkCompareTable tbody') || '';
+    check(
+      'FR-3.14/FR-3.16 相机参数不做判定：四项实测值推成离群值后二级菜单渲染逐字不变、且无三态字面量',
+      camA.length > 0 && camB === camA && !/正常|临近|超范围|超标/.test(camB),
+      `渲染前 ${camA.length} 字 / 渲染后 ${camB.length} 字，${camB === camA ? '逐字一致' : '**发生变化**'}；` +
+      `三态字面量=${/正常|临近|超范围|超标/.test(camB) ? '有（违反 FR-3.14 只判深度/速度）' : '无'}`
+    );
   }
 
   {
@@ -858,6 +1222,543 @@ async function main() {
     check('FR-6.10 检修记录表按行渲染（时间/内容/责任人/状态四列）',
       tbody.includes('<tr>') && ['mono', 'ok', 'warn'].some(c => tbody.includes(c)),
       `tbody 片段数 ${(tbody.match(/<tr>/g) || []).length}`);
+  }
+
+  /* ==========================================================================
+     U3c 测试标准区（FR-3.16 改写 / FR-3.18 显示 / FR-3.19 八步录入 / FR-3.14 判定对象）
+     --------------------------------------------------------------------------
+     立案：V1.33 把任务数据页右下角原「设备参数对比区」改写为「测试标准区」，相机参数移入二级菜单。
+     于是 U2 里两条旧断言的基础被移走（见上方改判），本段按**新口径**补齐可证伪判据。
+     夹具：`loadTaskStdFixture()`（真 TaskPanel/SettingPanel/Dashboard + 可派发事件的按 id 缓存桩件）。
+     ========================================================================== */
+  section('U3c 测试标准区与相机二级菜单（FR-3.16 / FR-3.18 / FR-3.19 / FR-3.14）');
+  {
+    const fx = loadTaskStdFixture(mkStdTaskState());
+    const T = fx.W.Components.TaskPanel;
+    const STDCFG = fx.W.BoardConfig.standards;
+    /* 临近比例与单位精度**读配置**，不硬编码：配置改了断言随之改判（FR-3.18 / NFR-19） */
+    const ratio = STDCFG.nearRatio;
+    const digits = STDCFG.digits;
+    const dep = makeStdSpec(fx.W, 'depth');
+    const spd = makeStdSpec(fx.W, 'speed');
+    const r2 = fx.W.Format.round2;
+    const tolOf = spec => r2((spec.upper - spec.lower) * ratio);
+    const snap = () => fx.snap();
+    let before = '';
+
+    /* 装配（顺序即真实启动顺序）：TaskPanel 的录入事件（面板 mousedown 委托 + 输入框 keydown/blur）
+       → Dashboard.init（真实现：内部 `SettingPanel.bind(state, resetIdleTimer)`）
+       → 用例再 bind 一次 SettingPanel，把 onActivity 顶成**夹具计数桩**。
+       为什么必须留到最后 bind：`TaskPanel.activity()` 调的是"最近一次 bind 的 onActivity"，
+       而自动锁定回调自己不回调 onActivity，故只有这条计数桩能证明"重置回首页计时"真的发生了。 */
+    T.bind(fx.state);
+    fx.W.Pages.Dashboard.init(fx.state);
+    fx.W.Components.SettingPanel.bind(fx.state, fx.idleActivity);
+    T.render(fx.state);
+    const rows = parseStdRows(fx.node('tkStdTable tbody').innerHTML);
+    const cells = ['depth', 'speed'].flatMap(k => ['upper', 'lower'].map(side => stdCell(rows, k, k + (side === 'upper' ? 'Upper' : 'Lower'))));
+    check(
+      'FR-3.18 测试标准区显示深度/速度两行、每行含上限/下限两个可录入单元格（data-edit 齐全）',
+      rows.length === 2 && rows.map(r => r.kind).join(',') === 'depth,speed' &&
+      cells.every(c => c !== null) && rows.every(r => r.tds.length === 4),
+      `行=${rows.map(r => `${r.kind}(${r.tds.length} 格)`).join(' / ') || '（未解析到结构）'}；` +
+      `可录入格=${cells.filter(Boolean).length}/4`
+    );
+    const limitsOk = [['depth', dep], ['speed', spd]].every(([kind, spec]) => {
+      const u = stdCell(rows, kind, kind + 'Upper');
+      const l = stdCell(rows, kind, kind + 'Lower');
+      return spec && valueOf(u && u.text, digits) === spec.upper && valueOf(l && l.text, digits) === spec.lower;
+    });
+    check(
+      'FR-3.18 上限＝典型值＋上偏差、下限＝典型值＋下偏差（按配置 default 段与 state 实算，非硬编码）',
+      limitsOk,
+      [['depth', dep], ['speed', spd]].map(([kind, spec]) => {
+        const u = stdCell(rows, kind, kind + 'Upper');
+        const l = stdCell(rows, kind, kind + 'Lower');
+        return `${kind}: 上限格=${valueOf(u && u.text, digits)} 应=${spec && spec.upper}；` +
+          `下限格=${valueOf(l && l.text, digits)} 应=${spec && spec.lower}`;
+      }).join('；')
+    );
+    check(
+      'FR-3.18 深度单位 m、速度单位 m/s，且上下限与典型值一律保留两位小数（位数读配置 standards.digits）',
+      [dep, spd].every(spec => spec && spec.digits === digits) &&
+      unitOf(typicalCell(rows, 'depth') && typicalCell(rows, 'depth').text) === 'm' &&
+      unitOf(typicalCell(rows, 'speed') && typicalCell(rows, 'speed').text) === 'm/s' &&
+      valueOf(stdCell(rows, 'depth', 'depthUpper') && stdCell(rows, 'depth', 'depthUpper').text, digits) !== null &&
+      valueOf(stdCell(rows, 'speed', 'speedLower') && stdCell(rows, 'speed', 'speedLower').text, digits) !== null &&
+      typicalOf(typicalCell(rows, 'depth') && typicalCell(rows, 'depth').text, digits) !== null &&
+      typicalOf(typicalCell(rows, 'speed') && typicalCell(rows, 'speed').text, digits) !== null,
+      `digits=${digits}（深度/速度配置位数 ${dep && dep.digits}/${spd && spd.digits}）；` +
+      `深度行单位=${JSON.stringify(unitOf(typicalCell(rows, 'depth') && typicalCell(rows, 'depth').text))}、` +
+      `速度行单位=${JSON.stringify(unitOf(typicalCell(rows, 'speed') && typicalCell(rows, 'speed').text))}`
+    );
+    check(
+      'FR-3.18 典型值单元格给出两位小数取值与带符号偏差（上偏差 +、下偏差 −），且两行都有',
+      [['depth', dep], ['speed', spd]].every(([kind, spec]) => {
+        const t = typicalCell(rows, kind);
+        return typicalOf(t && t.text, digits) === spec.typical &&
+          devOf(t && t.text, '上偏差') === '+' + spec.upperDev.toFixed(digits) &&
+          devOf(t && t.text, '下偏差') === (spec.lowerDev >= 0 ? '+' : '') + spec.lowerDev.toFixed(digits);
+      }),
+      [['depth', dep], ['speed', spd]].map(([kind, spec]) => {
+        const t = typicalCell(rows, kind);
+        return `${kind}: 典型值=${typicalOf(t && t.text, digits)} 应=${spec.typical}；` +
+          `上偏差=${devOf(t && t.text, '上偏差')} 应=+${spec.upperDev.toFixed(digits)}；` +
+          `下偏差=${devOf(t && t.text, '下偏差')} 应=${(spec.lowerDev >= 0 ? '+' : '') + spec.lowerDev.toFixed(digits)}`;
+      }).join('；')
+    );
+    check(
+      'FR-3.18 典型值只显示不改变 state：#tkStdMeta 写明"典型值只显示、不参与判定"与上下限由典型值±偏差导出',
+      /典型值只显示、不参与判定/.test(String(fx.node('tkStdMeta').textContent || '')) &&
+      /上限＝典型值＋上偏差/.test(String(fx.node('tkStdMeta').textContent || '')) &&
+      /下限＝典型值＋下偏差/.test(String(fx.node('tkStdMeta').textContent || '')) &&
+      fx.state.task.standard === undefined,
+      `#tkStdMeta=${JSON.stringify(String(fx.node('tkStdMeta').textContent || '').slice(0, 80))}；` +
+      `state.task.standard=${fx.state.task.standard === undefined ? '未建（只显示不写入）' : '已被渲染建立'}`
+    );
+
+    /* ---- (b) 三态：正常 / 临近黄 / 超范围红（FR-3.18 / FR-3.14），阈值用配置 nearRatio 实算 ---- */
+    const depTol = tolOf(dep);
+    const spdTol = tolOf(spd);
+    const colorOf = id => fx.node(id).style.color;
+    /* 临近带内侧 0.01 m/s：距下限已进入 (上限−下限)×nearRatio 之内（恰落在边界上会被两位小数取整
+       推到带外，故取带内一点，判据仍完全由配置的 nearRatio 实算） */
+    fx.state.task.real.depth = r2(dep.lower + depTol) - r2(1 / Math.pow(10, digits));
+    fx.state.task.real.speed = r2(spd.upper + 0.5);             /* 超上限 */
+    T.render(fx.state);
+    check(
+      'FR-3.18/FR-3.14 超范围红、临近黄（三态只用于深度与速度）：临近判据＝实测距边界 ≤ (上限−下限)×nearRatio（比例读配置）',
+      /class="std-state warn"/.test(fx.node('tkStdTable tbody').innerHTML) &&
+      colorOf('tkDepth') === 'var(--warn)' && colorOf('tkSpeed') === 'var(--err)',
+      `nearRatio=${ratio} ⇒ 深度容差 ${depTol}（实测 depth=${fx.state.task.real.depth} ∈ [${dep.lower}, ${r2(dep.lower + depTol)}]）⇒ ${colorOf('tkDepth')}；` +
+      `实测 speed=${fx.state.task.real.speed} > 上限 ${spd.upper} ⇒ ${colorOf('tkSpeed')}`
+    );
+    check(
+      'FR-3.18 临近/超范围两态判据互斥：临近带内的实测值不得被判超范围，超上限的实测值必须红（同一渲染内的两行对照）',
+      (() => {
+        const body = fx.node('tkStdTable tbody').innerHTML;
+        const warnDepth = /data-kind="depth">[\s\S]*?class="std-state warn"/.test(body);
+        const errSpeed = /data-kind="speed">[\s\S]*?class="std-state err"/.test(body);
+        return warnDepth && errSpeed;
+      })(),
+      `深度行判临近=${/data-kind="depth">[\s\S]*?class="std-state warn"/.test(fx.node('tkStdTable tbody').innerHTML)}、` +
+      `速度行判超范围=${/data-kind="speed">[\s\S]*?class="std-state err"/.test(fx.node('tkStdTable tbody').innerHTML)}`
+    );
+    fx.state.task.real.depth = r2(dep.typical - (dep.typical - dep.lower) / 2);
+    fx.state.task.real.speed = r2(spd.typical + (spd.upper - spd.typical) / 2);
+    T.render(fx.state);
+    check(
+      'FR-3.18 区间内（远离上下限）判正常：两行三态都是 ok，且实测值不被染成黄/红',
+      /data-kind="depth">[\s\S]*?class="std-state ok"/.test(fx.node('tkStdTable tbody').innerHTML) &&
+      /data-kind="speed">[\s\S]*?class="std-state ok"/.test(fx.node('tkStdTable tbody').innerHTML) &&
+      colorOf('tkDepth') === '' && colorOf('tkSpeed') === '',
+      `深度 depth=${fx.state.task.real.depth}⇒${colorOf('tkDepth') || '（默认色）'}；` +
+      `速度 speed=${fx.state.task.real.speed}⇒${colorOf('tkSpeed') || '（默认色）'}`
+    );
+
+    /* ---- (b2) FR-3.18 临近带的**闭边界**（含等号）与**压线不算超范围** ----
+       立案（D22 变异 M6）：把 `standardLevel()` 的临近判据 `<= k` 改成 `< k`
+       （即取消"距离恰等于带宽也算临近"）时，此前 ui-check 87/0 仍全绿 —— 原有 near 用例的实测值
+       离边界尚有余量，落进两种写法都判 warn 的区域，**锁不住闭边界**。
+       本段按实现在**显示精度网格上的整数口径**构造两侧对照（判据全部从 `standards.digits /
+       nearRatio / default` 实算，不写死 0.06 / 15% / 8 格）：
+         带宽格数 k = max(1, ceil((上限−下限)×nearRatio ÷ 最小格))；
+         距边界恰 k 格     ⇒ 临界（含等号）⇒ `warn`；
+         距边界 k+1 格     ⇒ 出带         ⇒ `ok`；
+         恰等于上/下限（压线）⇒ 判定区间是闭区间 [下限, 上限] ⇒ `ok`，**不得**判 `err`。
+       判据与实现逐值对照（`T.levelOf`），并同时核对渲染出的 `std-state` 类名与主展示色 ——
+       既锁公式、也锁界面三态（FR-3.14 / FR-3.18）。 */
+    {
+      const levelOf = (v, spec) => T.levelOf(v, spec) || {};
+      const specLines = [['depth', dep], ['speed', spd]].map(([kind, spec]) => {
+        const grid = Math.pow(10, -spec.digits);            /* 最小格（两位小数 ⇒ 0.01） */
+        const tol = r2((spec.upper - spec.lower) * ratio);
+        const k = Math.max(1, Math.ceil(tol / grid - 1e-9));
+        return { kind, spec, grid, tol, k };
+      });
+      const specOf = kind => (kind === 'depth' ? dep : spd);
+      const nearAt = (line, side, steps) => ({
+        v: r2(side === 'upper' ? line.spec.upper - steps * line.grid : line.spec.lower + steps * line.grid),
+        want: steps <= line.k ? 'warn' : 'ok'
+      });
+      const probes = specLines.flatMap(line => [
+        { kind: line.kind, label: `距上限恰 ${line.k} 格`, ...nearAt(line, 'upper', line.k) },
+        { kind: line.kind, label: `距上限 ${line.k + 1} 格`, ...nearAt(line, 'upper', line.k + 1) },
+        { kind: line.kind, label: `距下限恰 ${line.k} 格`, ...nearAt(line, 'lower', line.k) },
+        { kind: line.kind, label: `距下限 ${line.k + 1} 格`, ...nearAt(line, 'lower', line.k + 1) }
+      ]).map(p => ({ ...p, got: levelOf(p.v, specOf(p.kind)).lv }));
+
+      /* 渲染侧核对：把探针值逐个喂给 render，该行的三态类名必须与 levelOf 一致 */
+      const renderMismatch = [];
+      for (const p of probes) {
+        fx.state.task.real[p.kind] = p.v;
+        T.render(fx.state);
+        const seg = new RegExp(`data-kind="${p.kind}">[\\s\\S]*?class="std-state (\\w+)"`)
+          .exec(fx.node('tkStdTable tbody').innerHTML);
+        if (!seg || seg[1] !== p.want) renderMismatch.push(`${p.kind} ${p.label} 渲染判 ${seg ? seg[1] : '（未解析到）'} 应 ${p.want}`);
+      }
+      const logicMismatch = probes.filter(p => p.got !== p.want);
+      check(
+        'FR-3.18 临近带含等号（闭边界）：距边界恰等于带宽 ⇒ 临近（warn）；再往外一格 ⇒ 正常（ok）；判据按配置 digits/nearRatio 实算',
+        probes.length === 8 && logicMismatch.length === 0 && renderMismatch.length === 0,
+        `带宽格数 k：深度 ${specLines[0].k} 格（tol ${specLines[0].tol}）、速度 ${specLines[1].k} 格（tol ${specLines[1].tol}）⇒ ` +
+        (logicMismatch.length
+          ? `判据不符 ${logicMismatch.length} 项：` + logicMismatch.map(p => `${p.kind} ${p.label} 实测 ${p.v} 判 ${p.got} 应 ${p.want}`).join('；')
+          : probes.map(p => `${p.kind} ${p.label}(${p.v})=${p.got}`).join('，')) +
+        (renderMismatch.length ? `；渲染不符：${renderMismatch.join('；')}` : '')
+      );
+
+      /* 压线（恰等于上/下限）：闭区间 ⇒ 正常，不得判超范围 */
+      const edgeProbes = specLines.flatMap(line => [
+        { kind: line.kind, label: '实测＝上限（压线）', v: line.spec.upper, want: 'ok' },
+        { kind: line.kind, label: '实测＝下限（压线）', v: line.spec.lower, want: 'ok' }
+      ]).map(p => ({ ...p, got: levelOf(p.v, specOf(p.kind)).lv }));
+      const edgeMismatch = edgeProbes.filter(p => p.got !== p.want);
+      const edgeColors = [];
+      for (const p of edgeProbes) {
+        fx.state.task.real[p.kind] = p.v;
+        T.render(fx.state);
+        if ((p.kind === 'depth' ? colorOf('tkDepth') : colorOf('tkSpeed')) !== '') {
+          edgeMismatch.push({ kind: p.kind, label: p.label + '（主展示被着色）', got: colorOf(p.kind === 'depth' ? 'tkDepth' : 'tkSpeed'), want: '（默认色）' });
+        }
+        edgeColors.push(`${p.kind}${p.label}=${(p.kind === 'depth' ? colorOf('tkDepth') : colorOf('tkSpeed')) || '（默认色）'}`);
+      }
+      check(
+        'FR-3.18 压线不算超范围：实测恰等于上限或下限（闭区间边界）⇒ 正常（ok），且主展示数字不着红/黄',
+        edgeProbes.length === 4 && edgeMismatch.length === 0,
+        edgeMismatch.length
+          ? `不符：` + edgeMismatch.map(p => `${p.kind} ${p.label} 判 ${p.got} 应 ${p.want}`).join('；')
+          : `压线四例（深度/速度 × 上/下限）均判 ok；主展示色：${edgeColors.join('，')}`
+      );
+
+      /* 复位到典型值，避免把探针值留给后面的用例 */
+      fx.state.task.real.depth = r2(dep.typical);
+      fx.state.task.real.speed = r2(spd.typical);
+      T.render(fx.state);
+    }
+
+    /* ---- (c) 相机参数二级菜单：只含参数名 + 设定值，无实测值/偏差/状态列（FR-3.16 改写） ---- */
+    const camRows = parseStdRows(fx.node('tkCompareTable tbody').innerHTML);
+    const camLabels = camRows.map(r => stdCellText(r.tds[0]));
+    const camHead = thOf((html.match(/id="tkCompareTable"[\s\S]*?<thead><tr>([\s\S]*?)<\/tr>/) || [])[1] || '');
+    const camCfg = (fx.W.BoardConfig.camera || {}).rows || [];
+    const camDetail = fx.node('tkCompareTable tbody').innerHTML;
+    check(
+      'FR-3.16 相机参数二级菜单只含参数名 + 设定值两列：表头列集恰为「参数/设定值」、每行恰 2 格',
+      camHead.join(',') === '参数,设定值' && camRows.length === camCfg.length && camRows.length > 0 &&
+      camRows.every(r => r.tds.length === 2),
+      `#tkCompareTable thead = [${camHead.join(' | ')}]（index.html）；正文 ${camRows.length} 行、每行 ` +
+      `${camRows.map(r => r.tds.length).join('/') || '—'} 格（配置 ${camCfg.length} 项）`
+    );
+    check(
+      'FR-3.16 相机二级菜单不含实测值/偏差/状态：正文无"偏差"、无三态字面量；且只改 real 段实测值后菜单渲染**逐字不变**',
+      camDetail.length > 0 && !/偏差/.test(camDetail) && !/正常|临近|超范围|超标/.test(camDetail) &&
+      (() => {
+        const keep = { depth: fx.state.task.real.depth, fps: fx.state.task.real.fps, gain: fx.state.task.real.gain };
+        fx.state.task.real.depth = r2(keep.depth + 3);
+        fx.state.task.real.fps = keep.fps * 2;
+        fx.state.task.real.gain = r2(keep.gain + 7);
+        T.render(fx.state);
+        const moved = fx.node('tkCompareTable tbody').innerHTML;
+        fx.state.task.real.depth = keep.depth; fx.state.task.real.fps = keep.fps; fx.state.task.real.gain = keep.gain;
+        T.render(fx.state);
+        return moved === camDetail;
+      })(),
+      `正文出现"偏差"=${/偏差/.test(camDetail)}、三态字面量=${/正常|临近|超范围|超标/.test(camDetail)}；` +
+      `正文=${JSON.stringify(camDetail.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 110))}`
+    );
+    check(
+      'FR-3.16 菜单项为参数名 + 设定值（值取自 state.task.std 的设定值，逐项按配置位数格式化：相机设定深度/相机增益/设定帧率/快门速度）',
+      camRows.length === camCfg.length && camRows.length > 0 && camRows.every((r, i) => {
+        const row = camCfg[i];
+        const sv = fx.state.task.std[row.key];
+        return camLabels[i] === row.label && stdCellText(r.tds[1]) === (typeof sv === 'number' ? sv.toFixed(row.digits) : '—') + (row.unit || '');
+      }),
+      camRows.map((r, i) => `${camLabels[i]} vs ${camCfg[i] && camCfg[i].label}＝${JSON.stringify(stdCellText(r.tds[1]))}`).join('；')
+    );
+    check(
+      'FR-3.16 二级菜单下给出归属说明行（上位机侧设备参数，不参与本看板判定）',
+      /上位机侧设备参数，不参与本看板判定/.test(html) && /id="tkCameraMenu"/.test(html) &&
+      /<details[^>]*class="[^"]*camera-menu[^"]*"[^>]*id="tkCameraMenu"/.test(html),
+      `index.html 含归属说明=${/上位机侧设备参数，不参与本看板判定/.test(html)}；` +
+      `#tkCameraMenu 是 <details class="camera-menu">=${/<details[^>]*class="[^"]*camera-menu[^"]*"[^>]*id="tkCameraMenu"/.test(html)}`
+    );
+
+    /* ---- (d) FR-3.19 第 4 步：反色 + 高亮框 + 0.5 s 闪烁的样式契约（静态，读 CSS） ---- */
+    {
+      const css = readText('src/styles/global.css');
+      const blink = /@keyframes\s+stdBlink\s*\{([\s\S]*?)\n\}/.exec(css) || [];
+      /* 三项样式走 `parseCss()`（已按 CRLF 归一，见该函数注释）——
+         之前这四条断言假红的根因就是 `global.css` 是 CRLF，属性名带上了 `\r\n` 前缀。 */
+      const rulesCss = parseCss(css);
+      const editing = rulesCss.get('.std-limits td.is-editing') || {};
+      const animMs = Number((String(editing.animation || '').match(/\s(\d*\.?\d+)s(\s|$)/) || [])[1]) * 1000;
+      const invRule = rulesCss.get('.std-limits td.is-editing .std-value') || {};
+      check(
+        'FR-3.19 第4步 反色、高亮框与 0.5 s ± 50 ms 闪烁的样式契约齐备（@keyframes stdBlink + .is-editing 的 animation/box-shadow/反色文字）',
+        /@keyframes\s+stdBlink/.test(css) && /50%,\s*100%\s*\{\s*opacity/.test(blink[1] || '') &&
+        editing.animation === 'stdBlink .5s step-end infinite' &&
+        Math.abs(animMs - 500) <= 50 &&
+        /inset 0 0 0 \d+px/.test(editing['box-shadow'] || '') &&
+        /var\(--accent\)/.test(editing.background || '') &&
+        invRule.color !== undefined && invRule.color.toUpperCase() !== '#FFFFFF',
+        `@keyframes stdBlink=${/@keyframes\s+stdBlink/.test(css)}；animation=${JSON.stringify(editing.animation)}（${animMs} ms，允差 ±50）；` +
+        `box-shadow=${JSON.stringify(editing['box-shadow'] || '（缺）')}；背景=${JSON.stringify(editing.background || '（缺）')}；` +
+        `反色文字色=${JSON.stringify(invRule.color || '（缺）')}`
+      );
+    }
+
+    /* ---- (e) 第 ①③④⑧ 步：未解锁点击数字不进入录入态；解锁后才进入（FR-3.19 / AC-09） ---- */
+    fx.node('tkStdEdit').hidden = true;                     /* index.html 的初始 hidden */
+    /** 取当前渲染出的、带指定 data-edit 的可录入单元格（事件目标与断言对象是同一个节点） */
+    const realCell = type => {
+      /* 走 querySelector('tbody') 而不是 __children：前几个 check 里的 `T.render()` 会重建
+         单元格对象，只有经过一次 tbody 查询，夹具缓存里的节点才与"最后一次渲染"对齐 */
+      const tb = fx.node('tkStdTable').querySelector('tbody');
+      return tb.__children.slice().reverse().map(r => r.__children.find(td => td.dataset.edit === type)).find(Boolean) || null;
+    };
+    /** 关闭"上一个用例留下的"录入会话（避免它的退出提交污染下一个用例的观察）：
+     *  组件在"点击其他区域"时会**先提交再处理点击**，故不显式收尾的话，下一个用例的第一次点击
+     *  会顺带用**当前输入框内容**提交上一个会话 —— 实测就踩过这条（下一个用例的 alert 计数与
+     *  opLog 都多出一条与它无关的留痕）。
+     *  注：这里**不手工清 `#tkStdMsg`** —— 它是组件的渲染产物（`render()` 按
+     *  lastErr/lastInfo/session/unlocked 四态择一写入），手工改写会让"锁定后应看到锁定提示"
+     *  这条断言变成对用例自己写的内容的观察（自证），而不是对组件输出的观察。 */
+    const closeSession = () => { fx.input().value = ''; fx.screen('blur'); };
+    fx.click(realCell('depthUpper'));                       /* 锁定时点真实的上限格 */
+    check(
+      'FR-3.19 第⑧步 未解锁时点击上限/下限数字不进入录入态：#tkStdEdit 保持隐藏、且录入行内无可聚焦的 #tkStdInput',
+      fx.node('tkStdEdit').hidden === true && /class="[^"]*is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML)) === false,
+      `#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}；正文含 is-editing=` +
+      `${/class="[^"]*is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML))}；` +
+      `#tkStdMsg=${JSON.stringify(String(fx.node('tkStdMsg').textContent || '').slice(0, 40))}`
+    );
+    fx.W.MockData.setUnlocked(true);
+    fx.click(realCell('depthUpper'));
+    const editRows = parseStdRows(fx.node('tkStdTable tbody').innerHTML);
+    const editingCell = stdCell(editRows, 'depth', 'depthUpper');
+    check(
+      'FR-3.19 第③④步 解锁后点击上限数字进入录入态：该格带 is-editing（反色+高亮+闪烁）、#tkStdEdit 可见、标签写明「深度上限」',
+      /(?:^|\s)is-editing(?:\s|$)/.test(editingCell ? editingCell.cls : '') &&
+      !/(?:^|\s)is-editing(?:\s|$)/.test((stdCell(editRows, 'depth', 'depthLower') || {}).cls || '') &&
+      fx.node('tkStdEdit').hidden === false &&
+      /深度上限/.test(String(fx.node('tkStdEditLabel').textContent || '')),
+      `上限格 class=${JSON.stringify(editingCell && editingCell.cls)}；下限格 class=` +
+      `${JSON.stringify(stdCell(editRows, 'depth', 'depthLower') && stdCell(editRows, 'depth', 'depthLower').cls)}；` +
+      `#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}；标签=${JSON.stringify(String(fx.node('tkStdEditLabel').textContent || ''))}`
+    );
+    check(
+      'FR-3.19 第③步 点击数字会重置"无操作回首页"计时并重新登记自动锁定（activity()：Dashboard.resetIdleTimer + SettingPanel.armAutoLock）',
+      (() => {
+        const lockMs = evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS'));
+          fx.timers.length = 0;                        /* 只观察本次点击登记了什么 */
+          const resetsBefore = fx.idleResets;
+          fx.click(realCell('depthUpper'));
+        const pending = fx.timers.filter(t => t.delay === lockMs && !t.cancelled && !t.fired).length;
+        return pending === 1 && fx.idleResets === resetsBefore + 1;
+      })(),
+      `AUTO_LOCK_MS=${evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS'))} ms；` +
+      `点击后存活自动锁定定时器=${fx.timers.filter(t => t.delay === evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS')) && !t.cancelled && !t.fired).length} 个；` +
+      `回首页计时重置累计=${fx.idleResets} 次`
+    );
+
+    /* ---- (f) 第 ⑥ 步校验：非法（下限 > 上限 / 典型值越界）⇒ 弹窗 + 不写入 ----
+       "不写入"的判定对象是**标准取值**（unit/digits/typical/upperDev/lowerDev）逐字不变；
+       `opLog` 会**增加一条"被拒绝"留痕**，那是 FR-3.19 的**预期**行为（并发录入逐条留痕），
+       故快照比对必须把 opLog 排除在外 —— 否则会把"按规范留痕"误判成"非法值被写入"。
+       实现侧依据：`commitSession()` 的两条校验分支都在 `ensureStd()`/写 `upperDev`/`lowerDev` **之前** return。 */
+    const stdKeys = ['unit', 'digits', 'typical', 'upperDev', 'lowerDev'];
+    const stdDepth = () => fx.state.task.standard && fx.state.task.standard.depth;
+    const stdDepthVals = () => JSON.stringify(stdKeys.map(k => (stdDepth() || {})[k]));
+
+    fx.click(realCell('depthLower'));
+    fx.input().value = '+0.60';                       /* 下偏差显式取正 ⇒ 下限 13.10 > 上限 12.80 */
+    const depthValsBefore = stdDepthVals();    const logCountBefore = fx.state.opLog.length;
+    fx.alerts.length = 0;
+    fx.screen('keydown');                             /* 回车 */
+    const rejectedLog = fx.state.opLog[fx.state.opLog.length - 1] || {};
+    check(
+      'FR-3.19 第⑥步 非法录入（下限 > 上限）⇒ alert 弹窗提醒、标准取值逐字不变（不写入）、且 opLog 追加一条"被拒绝"留痕',
+      fx.alerts.length === 1 && /下限/.test(fx.alerts[0]) && /上限/.test(fx.alerts[0]) &&
+      stdDepthVals() === depthValsBefore && fx.state.opLog.length === logCountBefore + 1 &&
+      /录入被拒绝/.test(String(rejectedLog.detail || '')),
+      `alert=${fx.alerts.length} 次（${JSON.stringify((fx.alerts[0] || '').slice(0, 56))}）；` +
+      `标准取值${stdDepthVals() === depthValsBefore ? '未变' : '**被改动**'}（${depthValsBefore}）；` +
+      `opLog ${logCountBefore} → ${fx.state.opLog.length} 条，末条=${JSON.stringify(String(rejectedLog.detail || '').slice(0, 40))}`
+    );
+    check(
+      'FR-3.19 第⑥步 非法录入后录入态被退出且显示红字提醒：#tkStdEdit 隐藏、#tkStdMsg 带 err 类',
+      fx.node('tkStdEdit').hidden === true && /err/.test(String(fx.node('tkStdMsg').className || '')) &&
+      !/is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML)),
+      `#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}；#tkStdMsg.className=${JSON.stringify(String(fx.node('tkStdMsg').className || ''))}`
+    );
+
+    /* 典型值越界分支（FR-3.19 第⑥步第二项校验）：构造一个**下限 ≤ 上限 成立、但典型值不在区间内**
+       的状态，再录下限 —— 应被"典型值在上下限之间"挡下。
+       为什么这样造：校验顺序是「下限 ≤ 上限」在前、居中校验在后，若构造出让下限 > 上限的
+       偏差组合，命中的会是**第一项**校验（实测踩过：12.95/上限13.25/下限12.75 其实是合法区间，
+       于是那条断言看到的是"合法写入"，不是"非法拒绝"）。
+       取 `upperDev = -0.40`（上限 12.10 < 典型值 12.50 ⇒ 当前区间本就不含典型值），
+       注入 `lowerDev = -0.45`（下限 12.05 ≤ 上限 12.10，第一项通过），于是只剩第二项拦它。 */
+    T.ensureStd(fx.state, 'depth');
+    T.ensureStd(fx.state, 'speed');
+    fx.state.task.standard.depth.upperDev = -0.40;
+    fx.state.task.standard.depth.lowerDev = -0.50;
+    closeSession();                                   /* 收掉上一个用例留下的会话 */
+    fx.click(realCell('depthLower'));
+    fx.input().value = '-0.45';
+    const depthValsBefore2 = stdDepthVals();
+    const logCountBefore2 = fx.state.opLog.length;
+    fx.alerts.length = 0;
+    fx.screen('keydown');
+    check(
+      'FR-3.19 第⑥步 非法录入（典型值不在上下限之间）⇒ 弹窗且标准取值逐字不变（不写入）、opLog 追加被拒绝留痕',
+      fx.alerts.length === 1 && /典型值/.test(fx.alerts[0]) && /不在上下限/.test(fx.alerts[0]) &&
+      stdDepthVals() === depthValsBefore2 && fx.state.opLog.length === logCountBefore2 + 1 &&
+      /录入被拒绝/.test(String((fx.state.opLog[fx.state.opLog.length - 1] || {}).detail || '')),
+      `alert=${JSON.stringify((fx.alerts[0] || '').slice(0, 70))}；当前标准=${depthValsBefore2}；` +
+      `标准取值${stdDepthVals() === depthValsBefore2 ? '未变' : '**被改动**'}；opLog ${logCountBefore2} → ${fx.state.opLog.length} 条`
+    );
+
+    /* ---- (g) 第 ⑤⑥ 步：不带符号按默认口径（下偏差负、上偏差正）＋ 回车/点击其他区域注入 ---- */
+    fx.state.task.standard.depth.typical = dep.typical;              /* 复位为配置典型值，便于实算比对 */
+    /* 同时把偏差复位成**配置默认段**：上一个用例刻意把上/下偏差改成 −0.40/−0.50（造"典型值越界"），
+       若不复位，本用例注入 −0.35 会让下限 12.15 > 上限 12.10，被"下限 ≤ 上限"挡下（实测踩过）。 */
+    fx.state.task.standard.depth.upperDev = dep.upperDev;
+    fx.state.task.standard.depth.lowerDev = dep.lowerDev;
+    closeSession();                                                  /* 收掉上一个用例留下的会话 */
+    fx.click(realCell('depthLower'));
+    fx.input().value = '0.35';                                       /* 无符号 ⇒ 下偏差应为 −0.35 */
+    const beforeLower = stdDepth().lowerDev;
+    fx.screen('keydown');                                            /* 回车 = 退出并注入 */
+    const lowerAfter = stdDepth().lowerDev;
+    const lowerLimit = stdCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth', 'depthLower');
+    check(
+      'FR-3.19 第⑤⑥步 无符号输入按默认口径（下偏差默认负）：回车退出并注入，下限＝典型值＋(输入取负)，画面随之刷新',
+      lowerAfter === -0.35 && lowerAfter !== beforeLower && valueOf(lowerLimit && lowerLimit.text, digits) === r2(dep.typical - 0.35),
+      `下偏差 ${beforeLower} → ${lowerAfter}（应 −0.35）；画面下限格=${valueOf(lowerLimit && lowerLimit.text, digits)} 应=${r2(dep.typical - 0.35)}`
+    );
+    fx.click(realCell('depthUpper'));
+    fx.input().value = '0.35';                                       /* 无符号 ⇒ 上偏差应为 +0.35 */
+    fx.screen('blur');                                               /* 失焦 = 点击其他区域，同样退出并注入 */
+    const upperAfter = stdDepth().upperDev;
+    check(
+      'FR-3.19 第⑤⑥步 无符号输入按默认口径（上偏差默认正）：失焦（点击其他区域）退出并注入，上限＝典型值＋输入',
+      upperAfter === 0.35 && valueOf(stdCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth', 'depthUpper').text, digits) === r2(dep.typical + 0.35),
+      `上偏差=${upperAfter}（应 +0.35）；画面上限格=` +
+      `${valueOf(stdCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth', 'depthUpper').text, digits)} 应=${r2(dep.typical + 0.35)}`
+    );
+
+    /* ---- (h) Esc / 取消：不注入 ---- */
+    const speedValsBefore = JSON.stringify(['upperDev', 'lowerDev'].map(k => (fx.state.task.standard.speed || {})[k]));
+    fx.click(realCell('speedUpper'));
+    fx.input().value = '0.90';
+    const logCountBefore3 = fx.state.opLog.length;
+    fx.alerts.length = 0;
+    fx.screen('keydown', 'Escape');                    /* Esc：与"回车注入"形成对照 */
+    check(
+      'FR-3.19 第⑥步 Esc 取消不注入：标准取值与显示逐字不变、不弹窗、录入态退出（与"回车注入"形成对照）',
+      JSON.stringify(['upperDev', 'lowerDev'].map(k => (fx.state.task.standard.speed || {})[k])) === speedValsBefore &&
+      fx.alerts.length === 0 && fx.node('tkStdEdit').hidden === true &&
+      !/is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML)) &&
+      fx.state.opLog.length === logCountBefore3 + 1 &&
+      /取消.*录入/.test(String((fx.state.opLog[fx.state.opLog.length - 1] || {}).detail || '')),
+      `speed 偏差${JSON.stringify(['upperDev', 'lowerDev'].map(k => (fx.state.task.standard.speed || {})[k])) === speedValsBefore ? '未变' : '**被改动**'}；` +
+      `alert=${fx.alerts.length} 次；#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}；` +
+      `末条日志=${JSON.stringify(String((fx.state.opLog[fx.state.opLog.length - 1] || {}).detail || '').slice(0, 40))}`
+    );
+
+    /* ---- (i) 第 ⑦ 步：留痕（内容、时间戳、班组编号） ----
+       先补一次**成功注入**（Esc 取消只留"取消"日志，取末条会取到取消记录 —— 实测踩过），
+       再看该条日志的内容/时间戳/班组编号。 */
+    closeSession();
+    fx.click(realCell('speedLower'));
+    fx.input().value = '0.25';
+    fx.screen('keydown');                                            /* 回车注入（无符号 ⇒ 下偏差 −0.25） */
+    const log = fx.state.opLog[fx.state.opLog.length - 1] || {};
+    const detail = String(log.detail || '');
+    check(
+      'FR-3.19 第⑦步 成功后留痕：state.opLog 末条含动作、改动前后数值、生效时间戳（取自 state.clock）与班组编号（取自 config.shift.roster.teamId）',
+      fx.state.opLog.length > 0 && log.action === '测试标准录入' &&
+      /\d{2}:\d{2}:\d{2}/.test(String(log.time || '')) &&
+      new RegExp('生效时间 ' + fx.state.clock.date + ' ' + fx.state.clock.time).test(detail) &&
+      detail.includes(fx.W.BoardConfig.shift.roster.teamId) &&
+      /→/.test(detail) && /新偏差/.test(detail),
+      `末条日志=${JSON.stringify({ action: log.action, time: log.time, date: log.date, detail: detail.slice(0, 90) })}；` +
+      `期望时间戳=${JSON.stringify(fx.state.clock.date + ' ' + fx.state.clock.time)}、班组编号=${JSON.stringify(fx.W.BoardConfig.shift.roster.teamId)}`
+    );
+    check(
+      'FR-3.19 配套约束"修改成功前不改动现有值与显示"：取消/非法录入不留半成品（日志只记录被拒绝与取消，state 里没有未成功生效的标准行）',
+      fx.state.opLog.some(o => /录入被拒绝/.test(String(o.detail || ''))) &&
+      fx.state.opLog.some(o => /取消.*录入/.test(String(o.detail || ''))) &&
+      /^CP-2026-A17$/.test(String(fx.state.task.standard.productCode || '')) &&
+      fx.state.task.standard.revision >= 2,
+      `opLog 动作=${fx.state.opLog.map(o => o.action).join('/')}；` +
+      `standard.productCode=${JSON.stringify(fx.state.task.standard.productCode)}、revision=${fx.state.task.standard.revision}`
+    );
+
+    /* ---- (j) 第 ⑧ 步 锁定语义：录入会话中 activity() 重置回首页计时 + 重新 arm（同一个 5 分钟计时器） ---- */
+    fx.timers.length = 0;
+    const resetsBefore = fx.idleResets;
+    fx.click(realCell('speedLower'));
+    const lockMs2 = evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS'));
+    check(
+      'FR-3.19 第⑧步 锁定＝与 FR-8.2 同一个 5 分钟无操作计时器：录入动作触发 activity() 时先重置回首页计时、再重新 arm 自动锁定（各 1 次、只存活 1 个计时器）',
+      fx.idleResets === resetsBefore + 1 &&
+      fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length === 1 &&
+      fx.timers.filter(t => t.cancelled).length === 0,
+      `回首页计时重置次数 ${resetsBefore} → ${fx.idleResets}；存活 ${lockMs2} ms 自动锁定定时器 ` +
+      `${fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length} 个；` +
+      `已取消 ${fx.timers.filter(t => t.cancelled).length} 个（应为 0：本次仅 arm 一次）`
+    );
+    fx.click(realCell('speedLower'));
+    closeSession();                                                   /* 收掉本次会话，使下一步只观察"又一次动作" */
+    const cancelledBefore = fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length;
+    fx.click(realCell('speedLower'));                                 /* 第二个动作：重复 arm 不堆叠 */
+    check(
+      'FR-3.19 第⑧步 连续录入动作不堆叠自动锁定计时（第二次 arm ⇒ 仍只存活 1 个、且把上一次的计时 clearTimeout 掉）',
+      fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length === 1 &&
+      fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length === cancelledBefore + 1,
+      `存活=${fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length} 个、` +
+      `被取消=${fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length} 个（本次动作前 ${cancelledBefore} 个）`
+    );
+    /* ---- (k) 第 ⑧ 步 锁定后点击数字不进入录入态 + 可观察反馈 ----
+       本用例**必须换一副全新夹具**：`renderMsg()` 的择一顺序是
+       `lastErr → lastInfo → session → 未解锁提示 → 已解锁提示`，而 `lastInfo` 是组件模块级的
+       "最近一次成功回执"，上面几条用例刚注入过一串成功值 ⇒ 复用旧夹具时锁定提示会被 lastInfo
+       顶掉（实测踩过：`#tkStdMsg` 读到的仍是"录入中…/xx 已更新…"）。
+       新夹具 = 真 TaskPanel + 真 armAutoLock 计时，且从"未解锁"起步，走最短真路径：
+       render（未解锁）→ setUnlocked(true) → 点击数字（进入录入态）→ 收尾 →
+       setUnlocked(false) → render（每秒 renderAll 的等效动作）→ 点击数字（**不**进入录入态）。 */
+    {
+      const fx2 = loadTaskStdFixture(mkStdTaskState());
+      const T2 = fx2.W.Components.TaskPanel;
+      fx2.W.MockData.setUnlocked(false);
+      T2.bind(fx2.state);
+      T2.render(fx2.state);
+      const cellOf = type => {
+        const tb = fx2.node('tkStdTable').querySelector('tbody');
+        return tb.__children.slice().reverse().map(r => r.__children.find(td => td.dataset.edit === type)).find(Boolean) || null;
+      };
+      fx2.W.MockData.setUnlocked(true);
+      fx2.click(cellOf('depthUpper'));                                 /* 解锁 ⇒ 进入录入态（真路径） */
+      const enteredWhenUnlocked = fx2.node('tkStdEdit').hidden === false;
+      fx2.screen('keydown', 'Escape');                                 /* 收尾：Esc 取消（不注入、且清掉回执态） */
+      fx2.W.MockData.setUnlocked(false);                               /* 自动锁定到点 ⇒ 解锁态失效 */
+      T2.render(fx2.state);                                            /* 每秒 renderAll 一次：锁定提示在这里写入 */
+      const msgLocked = String(fx2.node('tkStdMsg').textContent || '');
+      fx2.click(cellOf('depthUpper'));                                 /* 锁定后的第一次点击 */
+      check(
+        'FR-3.19 第⑧步 锁定后点击数字不进入录入态并给出可观察反馈（#tkStdEdit 隐藏、该格无 is-editing、#tkStdMsg 明示"当前已锁定…解锁"）',
+        enteredWhenUnlocked && fx2.node('tkStdEdit').hidden === true &&
+        !/is-editing/.test(String(fx2.node('tkStdTable tbody').innerHTML)) &&
+        /当前已锁定/.test(msgLocked) && /解锁/.test(msgLocked) &&
+        String(fx2.node('tkStdMsg').textContent || '') === msgLocked,
+        `解锁态点击进入录入态=${enteredWhenUnlocked}；锁定后 #tkStdEdit.hidden=${fx2.node('tkStdEdit').hidden}、` +
+        `含 is-editing=${/is-editing/.test(String(fx2.node('tkStdTable tbody').innerHTML))}；` +
+        `#tkStdMsg=${JSON.stringify(msgLocked.slice(0, 46))}`
+      );
+    }
   }
 
   /* ===== U4 每秒整屏重绘的副作用 ===== */

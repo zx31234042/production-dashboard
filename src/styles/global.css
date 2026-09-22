@@ -1,6 +1,7 @@
 /* ==========================================================================
    看板样式 · 布局与组件
    设计基准：3840 × 2160 @30Hz；舞台按视口等比缩放（UI-02）
+   需求版本：V1.33（FR-3.16 改写「测试标准区」+ 相机参数二级菜单、FR-3.18 显示、FR-3.19 录入）
    依赖：variables.css（需先于本文件引入）
    ========================================================================== */
 * { box-sizing: border-box; }
@@ -310,6 +311,72 @@ html, body {
 .flow-step.on[data-step="合格"]   { color: var(--ok);   background: rgba(0,176,80,.16); }
 .flow-step.on[data-step="不合格"] { color: var(--err);  background: rgba(255,0,0,.16); }
 .flow-step.on[data-step="待复检"] { color: var(--warn); background: rgba(255,192,0,.16); }
+
+/* ---------- 测试标准区（FR-3.16 改写 / FR-3.18 显示 / FR-3.19 录入） ----------
+   上下限按正负偏差显示（上限＝典型值＋上偏差、下限＝典型值＋下偏差），单位在表头；
+   典型值只显示、不参与判定；三态（超范围红 / 临近黄）只用于深度与速度。
+   解锁后可点击上限/下限数字进入录入：反色 + 高亮框 + 0.5 s 闪烁（见 .is-editing）。 */
+.std-note { font-size: 36px; color: var(--muted); line-height: 1.3; word-break: break-all; }
+.std-limits { flex: none; }
+.std-limits td { font-size: 44px; padding: 14px 12px; }
+.std-limits tr:last-child td { border-bottom: none; }
+.std-limits .std-name { font-size: 44px; color: var(--muted); }
+.std-limits .std-typical { font-size: 46px; font-weight: 700; }
+.std-limits .std-unit { font-size: 34px; color: var(--muted); margin-left: 8px; }
+.std-limits .std-dev { display: block; font-size: 32px; color: var(--muted); font-weight: 400; }
+.std-limits .std-num { user-select: none; -webkit-user-select: none; }
+.std-limits .std-state { font-size: 34px; margin-left: 12px; }
+.std-limits .std-state.idle { color: var(--muted); }
+.std-limits.is-locked .std-num { opacity: .92; cursor: default; }
+.std-limits:not(.is-locked) .std-num { cursor: pointer; }
+.std-limits .std-num.upper { color: #9FD8FF; }
+.std-limits .std-num.lower { color: #9FD8FF; }
+
+/* 第 4 步：反色 + 高亮框 + 0.5 s 间隔闪烁（三态颜色落在数字本体上，编辑态除外） */
+@keyframes stdBlink {
+  0%, 49.9% { opacity: 1; }
+  50%, 100% { opacity: .18; }
+}
+.std-limits td.is-editing {
+  animation: stdBlink .5s step-end infinite;
+  background: var(--accent);
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 4px #FFFFFF;
+}
+.std-limits td.is-editing .std-value { color: #04243D; font-weight: 700; }
+
+/* 录入行（第 5～6 步）：回车或点击其他区域退出并注入 */
+.std-edit {
+  display: flex; align-items: center; gap: 14px; margin-top: 12px;
+  padding: 14px 20px; border-radius: 12px; flex: none;
+  background: rgba(56,163,224,.14); border: 2px solid var(--accent);
+}
+.std-edit[hidden] { display: none; }
+.std-edit-label { font-size: 40px; font-weight: 700; color: #BEE6FF; }
+.std-edit-input {
+  font-size: 44px; padding: 8px 16px; border-radius: 10px; min-width: 0; width: 240px;
+  background: rgba(0,0,0,.4); border: 2px solid var(--line); color: var(--text); outline: none;
+  user-select: text; -webkit-user-select: text;
+}
+.std-edit-input:focus { border-color: var(--accent); }
+.std-edit-hint { font-size: 32px; color: var(--muted); }
+.std-msg { font-size: 36px; color: var(--muted); margin-top: 10px; line-height: 1.3; flex: none; }
+.std-msg.err { color: var(--err); }
+.std-msg.ok { color: var(--ok); }
+
+/* 相机参数二级菜单（FR-3.16 最终口径）：默认折叠；菜单项只含参数名 + 设定值 */
+.camera-menu { flex: 1; min-height: 0; margin-top: 14px; overflow: hidden; }
+.camera-menu > summary {
+  font-size: 42px; font-weight: 600; color: var(--muted); cursor: pointer;
+  padding: 10px 18px; border-radius: 10px;
+  background: rgba(255,255,255,.04); border: 1px dashed var(--line);
+  display: flex; align-items: baseline; gap: 16px;
+}
+.camera-menu > summary .title-note { font-size: 34px; }
+.camera-menu[open] > summary { color: var(--text); border-style: solid; }
+.camera-menu[open] .data-table { max-height: 300px; overflow: auto; display: block; }
+.camera-menu .data-table.compact td { font-size: 38px; padding: 10px 12px; }
+.camera-menu .data-table.compact th { font-size: 36px; padding: 0 12px 8px; }
 
 /* ---------- 班次 ---------- */
 .shift-list { display: flex; flex-direction: column; gap: 18px; flex: 1; }

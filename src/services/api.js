@@ -1,9 +1,14 @@
 /* ==========================================================================
    接口适配层（services/api.js）
+   需求版本：V1.33（FR-3.18 显示 / FR-3.19 录入；`uclValue`/`lclValue` 报绝对值，见 IF-B.5）
    作用：把"外部报文"与"看板内部数据"互相转换，使接口规范/字段名变化时只需改配置。
    对应需求：
      - IF-D  上位机 → 看板：applyUpperPayload()、startUpper()
-     - IF-B  看板 → MES  ：buildReportPayload()、uploadReport()（附录 2，13 字段）
+     - IF-B.8 看板 → MES：buildReportPayload()、uploadReport()（**附录 2 的 13 字段，不增不减**）
+     - IF-B.5 看板 → MES：buildParamReportPayload()（**§1.2.5 关键运行参数**：深度/速度两条
+               `dataList`，各带 `avgValue`/`maxValue`/`minValue`/`uclValue`/`lclValue`/`IsPass`；
+               `uclValue`/`lclValue` 报**绝对值**＝典型值 ± 偏差，任一必要项缺失即该条走占位
+               `65535` / `IsPass=null`）。该结构与附录 2 的 13 字段**相互独立**，不得混成一个字段集合
      - IF-B.9 失败缓存：uploadReport() 失败即写明失败原因并进补传队列，**不自动重试**（见下）
      - IF-B.9 人工重报：retryPending() —— **唯一**会主动重发补传报文的入口（供 UI-20 调用）；
                 flushPending() 只刷新待补传状态，**不发送**（V1.31：不做任何自动重发）
@@ -240,7 +245,15 @@ window.Api = (function () {
   /* ---------------- IF-B：看板内部 → MES 上报 ---------------- */
 
   /**
-   * 组装附录 2 上报报文（13 字段）
+   * 组装上报报文（附录 2 的 13 字段 ＋ N-7 的标准上下限与判定位）
+   *
+   * **V1.33 上下限口径（FR-3.18/FR-3.19，2026-09-22 负责人拍定）**：
+   *   - `uclValue` / `lclValue` 报**绝对值**（上限＝典型值＋上偏差，下限＝典型值＋下偏差），
+   *     与界面显示同值；**不是偏差本身**。派生规则写在 `fieldMap.reportTransform`（不在本文件写死）。
+   *   - **任一必要项缺失 ⇒ 整条参数走占位**：`uclValue`/`lclValue` 取 `CFG.mes.reportPlaceholder`
+   *     （默认 65535，澄清函 N-7 已发口径）、`IsPass` = `null`（表示"不做判定"），
+   *     字段结构完整、不缺项 —— 与致 MES 方澄清函 N-7 §"标准值未到位期间的上报口径"一致。
+   *   - `IsPass` 由本看板按标准上下限判定后上报，不需要 MES 判定（N-7）。
    * @param {object} state 看板状态
    * @param {Date}   now   采集时刻
    */
@@ -268,6 +281,129 @@ window.Api = (function () {
       out[field] = v;
     });
     return out;
+  }
+
+  /**
+   * 组装 **§1.2.5 关键运行参数报文（IF-B.5 / `PARAM_INFO_RECV` / C-78）** —— 与附录 2 的
+   * 13 字段**相互独立**：本结构以 `dataList` 承载检测参数，深度与速度各占**一条 `dataList`**
+   * （`tagParam`＝`depth` / `speed`），每条带 `avgValue` / `maxValue` / `minValue` /
+   * `uclValue` / `lclValue` / `IsPass`。
+   *
+   * V1.33 上下限口径（FR-3.18/FR-3.19，2026-09-22 负责人拍定 + 澄清函 N-7）：
+   *   - `uclValue` / `lclValue` 报**绝对值**（上限＝典型值＋上偏差、下限＝典型值＋下偏差），
+   *     与界面显示同值；**不是偏差本身**。派生规则在 `fieldMap.standardOf()`（单一真源）。
+   *   - **任一必要项缺失 ⇒ 该条 `tagParam` 整条走占位**：`uclValue`/`lclValue` 取
+   *     `CFG.mes.reportPlaceholder`（默认 65535，N-7 已发口径）、`IsPass` = `null`（不做判定），
+   *     字段保留、结构不缺项；三类缺失组合（只设偏差未设典型值 / 只设上偏差 / 只设一项指标）
+   *     都落到同一占位分支（`limits[kind]` 为 null）。
+   *   - `IsPass` 由本看板按标准上下限判定后上报，不需要 MES 判定（N-7）。
+   *   - 聚合口径：`avgValue`/`maxValue`/`minValue` 取**单次任务内的有效采样点**；逐点原始序列
+   *     不外传、不落库（N-2）。前端 Demo 的采样缓冲是 `state.curveTick`（每设备秒推一个点）；
+   *     服务端落库后改读库，取值口径不变。
+   * @param {object} state 看板状态
+   * @param {Date}   now   采集时刻
+   * @returns {{workshopNo:string, procOrderNo:string, opCode:string, opName:string,
+   *            equipCode:string, equipName:string, timestamp:string, dataList:Array<object>}}
+   */
+  function buildParamReportPayload(state, now) {
+    const d = now || new Date();
+    const task = (state && state.task) || {};
+    const limits = standardLimits(state);
+    const placeholder = (CFG.mes && CFG.mes.reportPlaceholder !== undefined)
+      ? CFG.mes.reportPlaceholder : 65535;
+    const stats = taskSampleStats(state);
+
+    return {
+      workshopNo: (state && state.workshop && state.workshop.no) || CFG.workshopNo || '19',
+      procOrderNo: task.procOrderNo || '',
+      opCode: task.processCode || CFG.processCode || '',
+      opName: task.processName || CFG.processName || '',
+      equipCode: getPath(state, 'device.code') || CFG.device.equipCode || '',
+      equipName: getPath(state, 'device.name') || CFG.device.name || '',
+      timestamp: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+                 `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
+      dataList: ['depth', 'speed'].map(kind => {
+        const st = stats[kind] || {};
+        /* 该条是否具备完整标准：典型值＋上偏差＋下偏差，缺一即**该条**走占位 */
+        const lim = limits[kind] || null;
+        return {
+          tagParam: kind,
+          avgValue: round(st.avg, 2),
+          maxValue: round(st.max, 2),
+          minValue: round(st.min, 2),
+          uclValue: lim ? lim.upper : placeholder,
+          lclValue: lim ? lim.lower : placeholder,
+          /* 判定用**本条参数**的聚合值（标准齐备且有采样才判定；否则不做判定） */
+          IsPass: (lim && st.hasData) ? isPassOne(kind, st.avg, lim) : null
+        };
+      })
+    };
+  }
+
+  /**
+   * 单参数是否落在标准上下限内（FR-3.19：**典型值只显示、不参与判定**）。
+   * 判据只有上下限。
+   * @param {string} kind   'depth' | 'speed'
+   * @param {number} value  待判定值（§1.2.5 用该参数的聚合值）
+   * @param {{upper:number, lower:number}} lim 标准上下限绝对值
+   * @returns {boolean}
+   */
+  function isPassOne(kind, value, lim) {
+    if (!lim || typeof value !== 'number' || !Number.isFinite(value)) return false;
+    return value >= lim.lower && value <= lim.upper;
+  }
+
+  /**
+   * 单次任务内的有效采样聚合（avg / max / min）与"是否有采样"标志。
+   * 数据源：`state.curveTick`（当前任务逐秒缓冲）；无缓冲时退回"最近一次已完成任务"的
+   * `state.curve`，保证报文结构完整（不出现 undefined）。
+   * @returns {{depth:object, speed:object}} 每项 {avg:number|null, max:number|null, min:number|null, hasData:boolean}
+   */
+  function taskSampleStats(state) {
+    const tick = (state && state.curveTick) || {};
+    const curve = (state && state.curve) || {};
+    const out = {};
+    ['depth', 'speed'].forEach(kind => {
+      const live = Array.isArray(tick[kind]) ? tick[kind].filter(isFiniteNum) : [];
+      const done = (!live.length && curve[kind] && Array.isArray(curve[kind].values))
+        ? curve[kind].values.filter(isFiniteNum) : [];
+      const v = live.length ? live : done;
+      out[kind] = v.length ? {
+        avg: v.reduce((a, b) => a + b, 0) / v.length,
+        max: Math.max.apply(null, v),
+        min: Math.min.apply(null, v),
+        hasData: true
+      } : { avg: null, max: null, min: null, hasData: false };
+    });
+    return out;
+  }
+
+  /** 是否为有限数值（采样过滤用） */
+  function isFiniteNum(v) { return typeof v === 'number' && Number.isFinite(v); }
+
+  /**
+   * 取当前 (产品号＋工序号) 的**逐参数**标准上下限**绝对值**（FR-3.18 取值真源）。
+   * 换算只有一份实现：`config/fieldMap.js` 的 `standardLimits()`（本函数只是空值防护），
+   * 避免"界面一套、上报又一套"（规范 9.6 单一真源）。
+   * 逐参数返回是 IF-B.5 的硬要求：**任一必要项缺失即"该条 `tagParam`"走占位**，
+   * 缺深度那条不能连速度那条一起占位。
+   * @returns {{depth:{upper:number,lower:number}|null, speed:{upper:number,lower:number}|null}}
+   *          某项为 null = 该参数必要项（典型值/上偏差/下偏差）缺失 ⇒ 该条按占位上报
+   */
+  function standardLimits(state) {
+    if (typeof MAP.standardLimits !== 'function') return { depth: null, speed: null };
+    return MAP.standardLimits(state);
+  }
+
+  /**
+   * 按标准上下限判定**当前实测值**是否合格（FR-3.19：**典型值只显示、不参与判定**）。
+   * 供界面自检复用；§1.2.5 报文里每条 `dataList` 的判定用单参数聚合值（见 isPassOne）。
+   * @returns {boolean}
+   */
+  function isPassByStandard(state, limits) {
+    const real = (state && state.task && state.task.real) || {};
+    if (!limits) return false;
+    return ['depth', 'speed'].every(kind => isPassOne(kind, real[kind], limits[kind]));
   }
 
   /** 生成接口 URL：/service/{serviceName}/{methodName} 模板替换 */
@@ -534,6 +670,10 @@ window.Api = (function () {
     applyUpperPayload, validatePayload, isUpperStale, syncLinkState, startUpper, stopUpper,
     /* IF-B */
     buildReportPayload, buildUrl, uploadReport, nextUploadId, isReceiptOk, receiptReason,
+    /* IF-B.5 §1.2.5 关键运行参数报文（含 uclValue/lclValue/IsPass 占位口径） */
+    buildParamReportPayload,
+    /* IF-B 标准上下限口径（FR-3.18/FR-3.19、N-7）：供界面与联调自检复用 */
+    standardLimits, isPassByStandard,
     /* 待补传清单（查询 / 人工重报） */
     listPending, retryPending,
     /* 状态刷新（不发送） */

@@ -1,6 +1,6 @@
 -- ==========================================================================
 -- 看板本地库表结构（server/db/schema.sql）
--- 依据：需求清单 V1.28 第 7 章「数据需求」DR-01～DR-19
+-- 依据：需求清单 V1.33 第 7 章「数据需求」DR-01～DR-19
 -- 引擎：SQLite（node:sqlite 内置模块），WAL 模式，见 ADR-0001 D5
 -- 约定：
 --   * 时间统一为文本 'yyyy-MM-dd HH:mm:ss'（DR-16，本机 NTP 时间基准）
@@ -51,18 +51,51 @@ CREATE TABLE IF NOT EXISTS task (
 CREATE INDEX IF NOT EXISTS ix_task_status ON task(status);
 CREATE INDEX IF NOT EXISTS ix_task_plan_start ON task(plan_start_time);
 
-/* ---------------- DR-03 测试标准表（设备参数类阈值，来源 IF-A 工艺信息） ---------------- */
+/* ---------------- DR-03 测试标准表（(产品,工序,版本) 追加式，来源 IF-A 工艺信息 + 本机录入）
+   模型定稿（2026-09-22，需求评审报告 F-04 的 C1 条件）：**追加式版本行** ——
+   一条标准＝一行；改标准＝**新增一行（version_no +1）**，旧行原样保留、永不覆盖。
+   由此"历史判定不追溯"（草案第二节）才可实现：判定当时引用的版本行仍在库里，事后回查不被改写。
+   列与单位口径：
+     product_code / process_code  标准维度＝**产品号＋工序号**（process_code 缺省 '' 表示该产品通用）
+     version_no                   同一 (产品,工序) 内的版本序号，从 1 起、只增不改
+     depth_upper_dev / depth_lower_dev   深度上下**偏差**（m；下偏差为负；基准＝深度典型值）
+     depth_typical                       深度典型值（m；**只显示、不参与判定**）
+     speed_upper_dev / speed_lower_dev   速度上下偏差（m/s；口径同上）
+     speed_typical                       速度典型值（m/s；只显示）
+     effective_from               生效时间（本机时间文本，DR-16）；查询"指定时刻生效版本"用它
+     created_by                   录入人
+     team_code                    录入时**当前生效班次**的班组编号（与 FR-1.6 同一真源，见 DR-12）
+     created_at                   落库时间
+   单位与精度：速度 **m/s**、深度 **m**，**库内存数值**（两位小数由上层换算与显示）；
+   偏差允许为负。上下限绝对值＝典型值 ± 偏差，由服务层换算（server/services/standard.js）。 */
 CREATE TABLE IF NOT EXISTS standard (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  product_code    TEXT NOT NULL,
-  set_depth       REAL,                          -- 相机设定深度（设备参数，次要展示）
-  set_gain        REAL,
-  set_frame_rate  INTEGER,
-  set_shutter     INTEGER,
-  effective_from  TEXT NOT NULL,
-  created_at      TEXT NOT NULL
+  id                INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_code      TEXT NOT NULL,
+  process_code      TEXT NOT NULL DEFAULT '',    -- 工序号；'' = 该产品通用
+  version_no        INTEGER NOT NULL,            -- 版本号（同 产品+工序 内从 1 起）
+  depth_upper_dev   REAL,                        -- 深度上偏差（m，默认正）
+  depth_lower_dev   REAL,                        -- 深度下偏差（m，默认负）
+  depth_typical     REAL,                        -- 深度典型值（m，只显示）
+  speed_upper_dev   REAL,                        -- 速度上偏差（m/s，默认正）
+  speed_lower_dev   REAL,                        -- 速度下偏差（m/s，默认负）
+  speed_typical     REAL,                        -- 速度典型值（m/s，只显示）
+  effective_from    TEXT NOT NULL,               -- 生效时间（yyyy-MM-dd HH:mm:ss）
+  created_by        TEXT,                        -- 录入人
+  team_code         TEXT,                        -- 班组编号（取当前生效班次）
+  created_at        TEXT NOT NULL,
+  UNIQUE(product_code, process_code, version_no) -- 唯一键：追加式，同版本号不得重复
 );
+-- 取「指定时刻生效版本」的查询索引：WHERE product_code=? AND process_code=? AND effective_from<=? ORDER BY effective_from DESC, version_no DESC
+CREATE INDEX IF NOT EXISTS ix_standard_pair ON standard(product_code, process_code, effective_from DESC);
 CREATE INDEX IF NOT EXISTS ix_standard_product ON standard(product_code, effective_from);
+/* ⚠ 旧库兼容（V1.33 之前的 `standard` 只有 set_depth/set_gain/set_frame_rate/set_shutter，无工序与版本号）：
+   那是**不兼容的结构变更**，光靠 `CREATE TABLE IF NOT EXISTS`（对旧表是空操作）升不上来，必须重建表。
+   SQLite 写不出"条件 DDL"（`ALTER TABLE ... RENAME` 没有 `IF EXISTS`；`RAISE()` 只能出现在触发器体内；
+   临时触发器守卫又要内层事务，会与外层事务冲突 —— 三条路都已实测不通），**所以重建不写在本文件里**，
+   而是由 `server/db/index.js` 的 `initSchema()` 按结构判据显式执行（见那边的 `migrateLegacyStandard()`）：
+   判据成立才重建、重建后判据不再成立 ⇒ 天然幂等；`schema.sql` 只负责**新建库的结构正本**。
+   这一段旧库重建曾被误写在 schema.sql 里按"每次执行"跑，实测后果是**每次 initSchema 都把真实版本行
+   换成占位行**（追加式模型下等于静默毁数据），已改掉 —— 详情见本次交付说明。 */
 
 /* ---------------- DR-04 实测数据表（高频时序；DR-13 去重键） ----------------
    注意：只落 1 s 采样；500 ms 原始帧**只进内存不落库**（ADR-0001 D7） */
@@ -201,17 +234,30 @@ CREATE TABLE IF NOT EXISTS upload_log (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_upload_log_id ON upload_log(upload_id, interface);
 CREATE INDEX IF NOT EXISTS ix_upload_log_state ON upload_log(state, created_at);
 
-/* ---------------- DR-12 操作日志表（解锁后写操作留痕） ---------------- */
+/* ---------------- DR-12 操作日志表（解锁后写操作留痕） ----------------
+   `team_code`（班组编号）＝ V1.33 增列：留痕要能回答"**哪个班组**在什么时候改了什么"。
+   来源**唯一**：录入时**当前生效班次**的班组，与 FR-1.6（看板头部"所属班组"）**同一真源**
+   —— `src/config/board.config.js` 的 `shift.roster.team`（联调后由 MES 人员班组资质接口提供）。
+   本表只存值、不自己推导班组（仓储层写入见 server/repo/opLog.js）；
+   禁止另起一套"按操作人姓名反查班组"之类的来源，否则审计口径会与头部显示分裂。 */
 CREATE TABLE IF NOT EXISTS op_log (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   op_time       TEXT NOT NULL,
   operator      TEXT,                            -- 操作人
-  op_type       TEXT NOT NULL,                   -- 维保录入/公告发布/异常闭环/参数配置/解锁 …
+  op_type       TEXT NOT NULL,                   -- 维保录入/公告发布/异常闭环/参数配置/解锁/标准录入 …
   content       TEXT,                            -- 操作内容
   result        TEXT,                            -- 成功/失败
+  team_code     TEXT,                            -- 班组编号（取当前生效班次，与 FR-1.6 同一真源）
   created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_op_log_time ON op_log(op_time);
+/* 旧库兼容：V1.33 之前的 op_log 无 `team_code` 列。这里**故意不是**纯 DDL 幂等语句 ——
+   SQLite 不支持 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`（已实测：`near "EXISTS": syntax error`），
+   `CREATE TABLE IF NOT EXISTS` 对旧表又是空操作、列不会凭空出现。因此 `team_code` 的补齐
+   交给 `server/db/index.js` 的 `initSchema()`：它在执行完本文件后跑一小段**幂等升级步骤**
+   （`ALTER TABLE op_log ADD COLUMN team_code TEXT`，已存在时吞掉 `duplicate column name`）。
+   这与本仓既有分工一致：schema.sql 描述**结构正本**（新建库/新表），`SCHEMA_VERSION` 驱动的
+   升级动作由读取 schema 的那个模块统一执行。相关索引也放在升级步骤里建（旧表补列前建会报错）。 */
 
 /* ---------------- DR-18 任务曲线表（每完成一件固化一条完整曲线） ----------------
    samples 以 JSON 数组存采样序列（实测 160 点约 915 字节，见 ADR-0001 附件） */

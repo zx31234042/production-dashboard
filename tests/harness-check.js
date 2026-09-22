@@ -1079,6 +1079,25 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       runAllSrc6.includes('if (authLine) fs.writeSync(1, authLine'),
     `源码里该打印语句出现 ${runAllSrc6.split("fs.writeSync(1, authLine + '\\n')").length - 1} 次（应为 2）`);
 
+  /* 立案（2026-09-22 座位 R）：`node tests\harness-check.js` 偶发 133 通过 / 1 失败，红的就是下面那条端到端断言，
+     失败明细形如 `退出码 1｜FAIL docs-check 有｜"门禁全绿" 缺（应为"缺"）` —— 即它的第四条判据
+     `t2.includes('门禁结论：不通过')` 取不到。**实测根因不是截断**：N=20 次 `--no-preflight --only docs-check`
+     有 4 次取不到该字面量，但每次日志尾部都**完整且以 `\n` 结尾**（尾部原文："门禁结论：**本轮不通过**
+     （工作区在运行期间被改写，结论不可作为证据）。"）—— 真正的根因是**结论行 token 不统一**：
+     并发写方在改 `tests\ui-check.js` 时，`lib/snapshot.js` 的稳定性判定按设计把该轮判成"不稳定"，
+     于是 run-all 走的是**另一句措辞**，那句话里没有"门禁结论：不通过"这个机器可读的 token
+     （run-all 侧已按此把四句结论统一成同一 token）。
+     故冻结：run-all 里**每一句**打印结论的行都必须带 `门禁结论：不通过`；并要求 ≥ 4 处 ——
+     防"把结论行删掉"这种把断言弄成恒真的绕过（本断言只认**打印语句行**：含 `console.log(` 或 `fs.writeSync(`）。 */
+  const verdictToken = '门禁结论：不通过';
+  const verdictPrints = runAllSrc6.split(/\r?\n/)
+    .filter(l => /console\.log\(|fs\.writeSync\(/.test(l) && l.includes('门禁结论：'));
+  const verdictMissing = verdictPrints.filter(l => !l.includes(verdictToken));
+  t.check('静态：run-all 每句"门禁结论"打印都带 `门禁结论：不通过` 这个 token（不稳定轮也不例外；≥4 处，防删行绕过）',
+    verdictPrints.length >= 4 && verdictMissing.length === 0,
+    `结论打印语句 ${verdictPrints.length} 处（应 ≥ 4），缺 token 的 ${verdictMissing.length} 处`
+      + (verdictMissing.length ? `：${verdictMissing.map(l => l.trim().slice(0, 56)).join(' ｜ ')}` : ''));
+
   /* ---------------- 端到端：真跑一次 runner，看输出里到底有没有对账行（防"静态看着对、跑起来没有"） ----------------
      为什么要真跑：本节上面所有断言都是**对源码文本/纯函数**的检查，而本次回归恰恰是
      "文本都对、跑起来结论错"这一类（实测：同一分支里相邻的 `console.log` 能打印、`authLine` 那行没有产出）。
