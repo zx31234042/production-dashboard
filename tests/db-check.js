@@ -32,7 +32,7 @@ env.assertRuntime();
 const t = createRunner('本地库结构自检（db-check）');
 const NOW = '2026-09-19 10:00:00';
 
-/** 需求 V1.31 第 7 章要求存在的表（DR-01～DR-12、DR-18）。
+/** 需求 V1.32 第 7 章要求存在的表（DR-01～DR-12、DR-18）。
  *  这里只管"需求追溯"（哪几张表是需求点名的，少一张即缺陷）；
  *  **表数与表清单一律不写死** —— 期望表集由 `server/db/schema.sql` 的建表清单推导（见 parseSchemaTables）。 */
 const REQUIRED_TABLES = [

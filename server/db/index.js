@@ -2,7 +2,7 @@
    数据库连接与初始化（server/db/index.js）
    作用：打开本地 SQLite 库、执行建表脚本、写入结构版本与初始字典数据，
         并暴露备份/保留策略所需的最小能力。
-   依据：DR-01～DR-19（需求清单 V1.31 第 7 章）、ADR-0001 D5（SQLite + WAL）、
+   依据：DR-01～DR-19（需求清单 V1.32 第 7 章）、ADR-0001 D5（SQLite + WAL）、
         ADR-0002 D9/D10（Node 24 LTS、零 npm 依赖，使用内置 node:sqlite）。
    依赖：node:path、node:fs 与内置 node:sqlite。**不依赖任何第三方包**。
    用法：
