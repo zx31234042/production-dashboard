@@ -20,8 +20,8 @@ window.MockUpperSource = (function () {
   /** 初始化内部随机游走状态 */
   function init(now) {
     return {
-      depth: 12.68,        // 航行器水下深度
-      vx: 4.90,            // 水平速度
+      depth: 5.00,         // 航行器水下深度（量程 [4, 6] m；初值＝标准典型值 5.00，与 mockData 一致）
+      vx: 5.00,            // 水平速度（初值＝速度标准典型值 ⇒ 合成速度 5.00）
       vy: 0.10,            // 垂直速度
       fpsRaw: CFG.production ? 400 : 400,
       gainRaw: 2.5,
@@ -44,9 +44,14 @@ window.MockUpperSource = (function () {
     const d = now || new Date();
     const s = prev || init(d);
 
-    /* ---- 实测数据：随机游走，保持 speed = √(vx²+vy²) ---- */
-    s.depth = clamp(round2(s.depth + (Math.random() - 0.5) * 0.06), 12.20, 13.10);
-    s.vx = clamp(round2(s.vx + (Math.random() - 0.5) * 0.10), 4.50, 5.30);
+    /* ---- 实测数据：随机游走，保持 speed = √(vx²+vy²) ----
+       航行器深度量程 [4, 6] m（负责人 2026-09-22 确认，C-86）；游走区间 [4.77, 5.33]、步长 ±0.06/s
+       与 services/mockData.js **同一组数值**（标准典型值 5.00、上下限 5.30/4.80；10 万 tick 实测
+       正常 58.7% / 临近 26.8% / 超范围 14.5%）—— 否则 ?source=upper 与 mockData 演示口径不一致，
+       开屏就判"超范围"，与「测试标准区」显示的标准自相矛盾。
+       速度同口径：vx 游走 [4.78, 5.22]、步长 ±0.06/s（标准带 [4.80, 5.20]） */
+    s.depth = clamp(round2(s.depth + (Math.random() - 0.5) * 0.12), 4.77, 5.33);
+    s.vx = clamp(round2(s.vx + (Math.random() - 0.5) * 0.12), 4.78, 5.22);
     s.vy = clamp(round2(s.vy + (Math.random() - 0.5) * 0.04), -0.25, 0.35);
     const speed = round2(Math.sqrt(s.vx * s.vx + s.vy * s.vy));
 
@@ -96,6 +101,9 @@ window.MockUpperSource = (function () {
       orderNo: 'DD20260917-118',
       planQty: CFG.production.planQty,
 
+      /* 设定深度 ＝ **相机设定深度**（FR-3.5 / IF-D.3 的「设备参数」，由任务数据页二级菜单
+         承载，属上位机侧、不参与本看板判定），**不是航行器深度** ⇒ 不随深度量程 [4, 6] m 迁移，
+         保持 12.50（与 tools/mock-upper/mock-upper.js 同构、与 mockData 的"设定深度 12.50 m"公告一致）。 */
       stdDepth: 12.50,
       stdGain: 2.5,
       stdFps: 400,

@@ -63,7 +63,7 @@ node mock-upper.js --once --push http://127.0.0.1:8802/service/upper/realtime
 | 实测 | `depth`、`speed`、`velocity_x`、`velocity_y` | **航行器**水下深度与速度（主要展示对象） |
 | 设备参数 | `frameRate`、`gain`、`shutter`、`cameraDepth` | 帧率/增益/快门、**相机自身**水下深度 |
 | 工单 | `productCode`、`productName`、`batchNo`、`drawingNo`、`orderNo`、`planQty` | 工单与计划量 |
-| 测试标准 | `stdDepth`、`stdGain`、`stdFps`、`stdShutter` | 设定阈值，用于与实测值对照判定 |
+| 相机设备参数 | `stdDepth`、`stdGain`、`stdFps`、`stdShutter` | **相机设定深度**/相机增益/设定帧率/快门速度（FR-3.5 / IF-D.3 的**设备参数**，**不参与本看板判定**，由任务数据页二级菜单只读展示，FR-3.16）。**注意**：它们**不是**测试标准上下限（那是看板侧按产品＋工序录入的 `standard`，FR-3.18/3.19） |
 | 进度结果 | `result`、`unitIndex`、`progress` | 单任务结果、件号、进度（0~1） |
 
 > **注意区分**：`depth` 是**航行器**水下深度；`cameraDepth` 是**相机自身**水下深度（现场传感器）。两者不可混用。

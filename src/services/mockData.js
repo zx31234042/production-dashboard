@@ -1,5 +1,5 @@
 /* ==========================================================================
-   模拟数据源（services/mockData.js）— 按需求清单 V1.33 口径编写
+   模拟数据源（services/mockData.js）— 按需求清单 V1.34 口径编写
    作用：产生并逐秒推进看板所需的全部数据；界面组件只读取本文件输出的 state
    依赖：utils/format.js（需先加载）
    口径说明：
@@ -7,8 +7,20 @@
    - speed  : 航行速度（X-Y 平面合成），velocity_x / velocity_y 为分速度 — C-23
    - 主要展示：航行器深度 + 航行速度；相机参数（帧率/增益/快门）为设备参数，次要展示 — C-31
    - 判定对象：**深度与速度的测试标准上下限**（FR-3.14 改写 C-75 / FR-3.18）；相机参数属上位机侧
-     设备参数，本看板**既不做判定、也不做状态判定**（C-84④）⇒ 预警（含 FR-5.8 参数阈值临近预警）
-     一律**不得引用任何相机参数**；标准未设定（必要项缺失）时不做判定、不产生该预警
+     设备参数，本看板**既不做判定、也不做状态判定**（C-84④）⇒ 参数类预警（FR-5.8「参数阈值临近预警」
+     / 「参数超范围预警」两类）一律**不得引用任何相机参数**；标准未设定（必要项缺失）时不做判定、
+     不产生任何参数类预警
+   - 参数类预警的**条数口径**（负责人 2026-09-22"预警名称需要细分"）：**一个参数最多一条** ——
+     深度与速度各自按最坏态择名（临近 ⇒「参数阈值临近预警」warn；超范围 ⇒「参数超范围预警」err），
+     互不合并 ⇒ 参数类最多 2 条，加上维保/耗材/工单三类固定各 1 条 ⇒ `state.warnings` 最多 5 条
+   - 演示取值（负责人 2026-09-22 把深度量程改定为 [4, 6] m，并**批准调演示数据**使三态在几十秒的
+     演示窗口内可见、且不再"超范围红常亮"）：**标准值不改**（深度标准典型值 5.00、上下限 5.30/4.80
+     由需求 C-86 冻结；速度标准 5.00、上下限 5.20/4.80 为演示占位），只调**演示游走区间与步长**：
+       · 深度游走 [4.77, 5.33]、步长 ±0.06/s ⇒ 实测 10 万 tick：正常 58.7% / 临近 26.8% / 超范围 14.5%
+       · 速度（分速度 vx）游走 [4.78, 5.22]、步长 ±0.06/s ⇒ 正常 59.8% / 临近 25.5% / 超范围 14.7%
+     两者目标分布均 ≈ 负责人要求的 60 / 25 / 15；演示值始终落在量程内（深度 [4,6] m、速度 [3,8] m/s）。
+     改前口径（深度 [4.60,5.45]、vx [4.50,5.30]，步长 ±0.03/±0.05）实测 2 万 tick：
+     深度 47/19/34、速度 32/14/55 ⇒「参数超范围预警」在 70% 的帧上常亮（现场会被读成"总在报警"）。
    - 测试标准来源（FR-3.18）：`state.task.standard`（FR-3.19 现场录入）优先，未建立时回退
      `config/board.config.js` 的 `standards.default`（仅演示）
    - 19 台相机的取值/整合由 PC 上位机完成，本看板按给定值直接展示，不做二次聚合 — C-30/IF-D.13
@@ -75,12 +87,15 @@ window.MockData = (function () {
   /* 生成"上一次任务"的完整曲线（仅用于演示：模拟上位机已整合完成的历史任务数据） */
   function synthCurve(unitIndex) {
     const depth = [], speed = [];
-    let vx = 4.90, vy = 0.10;
+    let vx = 5.00, vy = 0.10;
     for (let i = 0; i < CURVE_SAMPLES; i++) {
       const phase = i / (CURVE_SAMPLES - 1);
-      const base = 12.62 + 0.16 * Math.sin(Math.PI * phase);   // 任务内深度呈缓升缓降形态
-      depth.push(clamp(round2(base + (Math.random() - 0.5) * 0.05), 12.20, 13.10));
-      vx = clamp(round2(vx + (Math.random() - 0.5) * 0.10), 4.50, 5.30);
+      /* 深度演示取值（量程 [4, 6] m ⇒ 演示值必须落进该量程）：clamp 与下方 state.task.real.depth
+         的游走区间取**同一段** [4.77, 5.33]；基线取标准带中点 5.05、振幅 0.24 ⇒ 曲线自"正常"缓升
+         穿过"临近"带、峰值触到上限 5.30 附近（同一份判据下三态都出现，不会"曲线永远全绿"）。 */
+      const base = 5.05 + 0.24 * Math.sin(Math.PI * phase);   // 任务内深度呈缓升缓降形态
+      depth.push(clamp(round2(base + (Math.random() - 0.5) * 0.05), 4.77, 5.33));
+      vx = clamp(round2(vx + (Math.random() - 0.5) * 0.12), 4.78, 5.22);
       vy = clamp(round2(vy + (Math.random() - 0.5) * 0.04), -0.25, 0.35);
       speed.push(round2(Math.sqrt(vx * vx + vy * vy)));
     }
@@ -153,10 +168,18 @@ window.MockData = (function () {
     task: {
       procOrderNo: 'MES20260917001', productCode: 'CP-2026-A17', productName: '水下振动测试件',
       batchNo: 'PC20260917-03', drawingNo: 'SJ-4471-02', orderNo: 'DD20260916-118',
-      /* 测试标准阈值（相机设备参数，次要展示） */
+      /* 相机侧设备参数（FR-3.5 / IF-D.3 的「**相机设定深度**」等四项；键名对应 board.config.camera.rows
+         的 `key`，由 TaskPanel.renderCameras() 渲染进任务数据页二级菜单（FR-3.16，只读展示））：
+         `depth` ＝**相机设定深度**（与 `real.cameraDepth`＝相机自身水下深度**同侧**，典型 12.50），
+         增益/帧率/快门同属此类。**设备参数不参与本看板判定**（C-84④）。
+         ⚠ 这**不是**测试标准上下限 —— 测试标准（典型值 ± 上下偏差）在 `state.task.standard`（FR-3.18/3.19），
+            两套数据语义不同、各有单一真源，切勿互相取值。 */
       std:  { depth: 12.50, gain: DEVICE_NOMINAL.gain, fps: DEVICE_NOMINAL.fps, shutter: DEVICE_NOMINAL.shutter },
-      /* 实时实测：航行器深度与速度为实测主体；相机参数为设备参数 */
-      real: { depth: 12.68, speed: 5.00, vx: 4.90, vy: 0.10,
+      /* 实时实测：航行器深度与速度为实测主体；相机参数为设备参数。
+         深度初值取标准典型值 5.00 —— 演示深度量程为 [4, 6] m（负责人 2026-09-22 确认）；
+         速度初值同取典型值 5.00（vx 5.00 / vy 0.10 ⇒ 合成速度 5.00），故开屏即"正常"态、
+         随游走在几十秒内依次出现"临近/超范围"（见本文件头部"演示取值"口径）。 */
+      real: { depth: 5.00, speed: 5.00, vx: 5.00, vy: 0.10,
               fps: DEVICE_NOMINAL.fps, gain: DEVICE_NOMINAL.gain, shutter: DEVICE_NOMINAL.shutter,
               cameraDepth: 12.00 },   // 相机自身水下深度（FR-3.16 / IF-D.1，与航行器深度 depth 严格区分）
       fpsRaw: DEVICE_NOMINAL.fps, gainRaw: DEVICE_NOMINAL.gain, shutterRaw: DEVICE_NOMINAL.shutter,
@@ -280,6 +303,8 @@ window.MockData = (function () {
    *   - 其余   ok（正常）；必要项缺失（典型值/上偏差/下偏差任一不是有限数）⇒ idle（标准未设定，不判定）。
    * `components/TaskPanel.js` 的 `levelOf()` **直接转发本函数** —— 界面三态（FR-3.18）与预警（FR-5.8）
    * 共用同一份公式与同一份配置，**不存在第二份口径**。
+   * 细分对应（负责人 2026-09-22）：本函数返回的 `warn` ⇒「参数阈值临近预警」、`err` ⇒「参数超范围预警」，
+   * 两个名称在 `buildParamWarnings()` 里按态择名；本函数本身**只出三态、不出名称**（名称不重复两份）。
    * 三态比较全部换算到**显示精度网格**（两位小数 ⇒ 0.01）上的整数再比较：实测值、上下限、
    * 临近带宽都化作"格数"，比较即 `距离格数 ≤ 带宽格数`，没有二进制浮点误差 ——
    * 否则 `5.2 − 0.06` 在浮点里是 5.140000000000001，恰好等于带宽的值会漏判一格。
@@ -315,47 +340,71 @@ window.MockData = (function () {
   }
 
   /**
-   * 参数阈值临近预警（FR-5.8，P0）：判定对象＝**深度与速度的测试标准上下限**（FR-3.14 / FR-3.18），
-   * 判据复用 standardLevel()（与界面三态同一份实现）。超范围时**沿用同一预警名称**、等级取 err（红）；
-   * **标准未设定（必要项缺失）⇒ 不产生该预警**（无从判定则不报警）。
-   * 相机参数不参与本预警的任何判定（C-84④）。
-   * @returns {{title:string, detail:string, lv:string}|null} null = 不产生该预警
+   * 参数类预警（FR-5.8，P0）——**两个细分名称**（负责人 2026-09-22 裁定"预警名称需要细分"）：
+   *   · 临近（`lv='warn'`）  ⇒ 名称「**参数阈值临近预警**」；
+   *   · 超范围（`lv='err'`）⇒ 名称「**参数超范围预警**」。
+   * 判定对象＝**深度与速度的测试标准上下限**（FR-3.14 / FR-3.18），判据仍复用**唯一一份**
+   * `standardLevel()`（与界面三态同一份实现）。**深度与速度分别成条**：每个参数按自身最坏态择名
+   * （该参数临近 ⇒ 出临近条；该参数超范围 ⇒ 出超范围条），一条预警里**只含一个参数**。
+   * **标准未设定（必要项缺失）⇒ 该参数两条预警都不产生**（无从判定则不报警）；
+   * 相机参数（fps/gain/shutter/cameraDepth）不参与任何判定（C-84④）。
+   * 条数口径：**一个参数最多一条** ⇒ 本函数返回 0～2 条；调用方 `buildWarnings()` 已按条展开，
+   * 不存在"两个参数挤成一条"的旧设计。
+   * @returns {Array<{title:string, detail:string, lv:string}>} 空数组 = 无参数类预警
    */
-  function buildParamWarning() {
+  function buildParamWarnings() {
     const real = (state.task && state.task.real) || {};
     const rows = ['depth', 'speed'].map(kind => {
       const spec = standardSpecOf(kind);
       return { kind, spec, lv: standardLevel(real[kind], spec) };
-    }).filter(r => r.lv.lv !== 'idle');
-    if (!rows.length) return null;                 // 标准未设定 ⇒ 不产生该预警
-    const worst = rows.some(r => r.lv.lv === 'err') ? 'err'
-      : (rows.some(r => r.lv.lv === 'warn') ? 'warn' : 'ok');
-    const detail = rows.map(r => {
+    }).filter(r => r.lv.lv !== 'idle');        // 标准未设定 ⇒ 该参数不进任何一条
+    /* 同一三态可能同时出现在两个参数上：按"最坏态"排序后把**同态的参数**合并进同一条 ——
+       条数仍由"态"决定（最多 2 条），名称由态决定，故不会出现"既临近又超范围"的名字冲突。 */
+    const order = { err: 0, warn: 1, ok: 2 };
+    const sorted = rows.slice().sort((a, b) => order[a.lv.lv] - order[b.lv.lv]);
+    const groups = [];
+    sorted.forEach(r => {
+      if (r.lv.lv === 'ok') return;            // 正常态不单独成条（并入下方 ok 汇总提示）
+      const g = groups.find(x => x.lv === r.lv.lv);
+      if (g) g.rows.push(r); else groups.push({ lv: r.lv.lv, rows: [r] });
+    });
+    const detailOf = r => {
       const d = typeof r.spec.digits === 'number' ? r.spec.digits : STD_DIGITS;
       const unit = r.spec.unit ? ' ' + r.spec.unit : '';
       const upper = round2(r.spec.typical + r.spec.upperDev);
       const lower = round2(r.spec.typical + r.spec.lowerDev);
       return PARAM_CN[r.kind] + ' ' + round2(real[r.kind]).toFixed(d) + unit +
         '（标准 ' + lower.toFixed(d) + '～' + upper.toFixed(d) + unit + '）判' + r.lv.text;
-    }).join('；');
-    return {
-      title: '参数阈值临近预警',
-      detail: detail + (worst === 'ok'
-        ? '，均处于允许范围'
-        : '（临近判据：实测距上/下限边界 ≤ (上限−下限)×' + nearRatio() + '）'),
-      lv: worst
     };
+    const out = groups.map(g => ({
+      title: g.lv === 'err' ? '参数超范围预警' : '参数阈值临近预警',
+      detail: g.rows.map(detailOf).join('；') +
+        (g.lv === 'warn'
+          ? '（临近判据：实测距上/下限边界 ≤ (上限−下限)×' + nearRatio() + '）'
+          : '（超出标准上下限闭区间，压线即合格）'),
+      lv: g.lv
+    }));
+    /* 两参数都判正常时不需要预警；但为保持"参数类恒有回执"的旧展示形态（浅色 ok 条），
+       仍给出唯一一条「参数阈值临近预警」ok 条：它不是预警（不计入 warnCount），文案明示均正常。 */
+    if (!out.length && rows.length) {
+      out.push({
+        title: '参数阈值临近预警',
+        detail: rows.map(detailOf).join('；') + '，均处于允许范围',
+        lv: 'ok'
+      });
+    }
+    return out;
   }
 
   /* ---------------- 预警计算 ---------------- */
   function buildWarnings() {
     const m = state.maint;
     const out = [];
-    /* 1) 参数阈值临近（FR-5.8）：判定对象＝深度与速度的测试标准上下限（FR-3.14 / FR-3.18）；
-          **不再用相机参数（帧率/增益/快门/相机水下深度）做判定或状态** —— 相机参数属上位机侧
-          设备参数，本看板既不做判定也不做状态判定（C-84④）。标准未设定时不产生该预警。 */
-    const paramWarn = buildParamWarning();
-    if (paramWarn) out.push(paramWarn);
+    /* 1) 参数类预警（FR-5.8 细分后为两条名称）：判定对象＝深度与速度的测试标准上下限
+          （FR-3.14 / FR-3.18）；**不再用相机参数（帧率/增益/快门/相机水下深度）做判定或状态** ——
+          相机参数属上位机侧设备参数，本看板既不做判定也不做状态判定（C-84④）。
+          标准未设定（必要项缺失）时该参数不出预警。条数口径：一个参数最多一条（深度/速度各按最坏态择名）。 */
+    buildParamWarnings().forEach(w => out.push(w));
     /* 2) 维保到期（阈值取配置 maintenance.warnDays，不在代码里写死） */
     out.push(m.daysLeft <= CFG.maintWarnDays
       ? { title: '设备维保到期预警', detail: `距计划维保还有 ${m.daysLeft} 天（${m.next}）`, lv: 'warn' }
@@ -482,8 +531,16 @@ window.MockData = (function () {
 
     /* ---- 实测数据（模拟上位机整合后的单一结果值，看板不做二次聚合） ---- */
     const t = state.task;
-    t.real.depth = clamp(round2(t.real.depth + (Math.random() - 0.5) * 0.06), 12.20, 13.10);
-    t.real.vx = clamp(round2(t.real.vx + (Math.random() - 0.5) * 0.10), 4.50, 5.30);
+    /* 演示分布（负责人 2026-09-22 批准调**演示数据**，使三态在几十秒的演示窗口内可见）：
+       深度标准带 [4.80, 5.30]（需求 C-86 冻结，未改）＋ 临近带宽 0.075（=0.15×跨度，按显示精度取整
+       8 格）⇒ **只调演示游走**：区间 [4.77, 5.33]、步长 ±0.06/s。实测 10 万 tick：
+       正常 58.7% / 临近 26.8% / 超范围 14.5%；新启动 60 s 内三态全现 ≈64%（首达临近 ≈20 s、超范围 ≈30 s）。
+       改前（[4.60,5.45]、±0.03/s）超范围 34.3%、滚动 60 s 三态全现仅 38% ⇒"超范围红"近半时间常亮。
+       速度同口径：vx 游走 [4.78, 5.22]、步长 ±0.06/s（标准带 [4.80, 5.20]）⇒
+       正常 59.8% / 临近 25.5% / 超范围 14.7%，新启动 60 s 内三态全现 ≈80%。
+       两参数的演示值恒在量程内（深度 [4,6] m、速度 [3,8] m/s），不会触发录入侧"超量程"拒绝。 */
+    t.real.depth = clamp(round2(t.real.depth + (Math.random() - 0.5) * 0.12), 4.77, 5.33);
+    t.real.vx = clamp(round2(t.real.vx + (Math.random() - 0.5) * 0.12), 4.78, 5.22);
     t.real.vy = clamp(round2(t.real.vy + (Math.random() - 0.5) * 0.04), -0.25, 0.35);
     t.real.speed = round2(Math.sqrt(t.real.vx * t.real.vx + t.real.vy * t.real.vy));   // X-Y 平面合成速度
 

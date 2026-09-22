@@ -1,6 +1,6 @@
 /* ==========================================================================
    三方字段映射表（config/fieldMap.js）
-   需求版本：V1.33（FR-3.18 显示 / FR-3.19 录入）
+   需求版本：V1.34（FR-3.18 显示 / FR-3.19 录入）
    作用：定义"看板内部字段 ↔ 上位机报文 ↔ 附录 2 上报字段"的对应关系。
          外部字段名一变，只改本文件；业务代码不动。
    对应待确认事项：
@@ -59,7 +59,9 @@ window.FieldMap = (function () {
       'task.real.shutter':      { key: 'shutter',     digits: 0 },
       'task.real.cameraDepth':  { key: 'cameraDepth', digits: 2 },
 
-      /* 测试标准阈值（设备参数） */
+      /* 测试标准阈值（设备参数）：`stdDepth` ＝ **相机设定深度**（FR-3.5 / IF-D.3 的「设备参数」，
+         由任务数据页二级菜单展示、不参与本看板判定），与航行器深度（`task.real.depth`，量程
+         [4, 6] m）是**两个物理量** ⇒ 不随深度量程迁移，保持 12.50；其余三项为相机设备参数 */
       'task.std.depth':         { key: 'stdDepth',   digits: 2 },
       'task.std.gain':          { key: 'stdGain',    digits: 1 },
       'task.std.fps':           { key: 'stdFps',     digits: 0 },
@@ -110,7 +112,7 @@ window.FieldMap = (function () {
       testStatus: 1,
       stage: '运行',
       linkStatus: 'online',
-      depth: 12.68,
+      depth: 5.00,                              // 航行器深度（量程 [4, 6] m，演示典型值 5.00）
       speed: 4.89,
       velocity_x: 4.89,
       velocity_y: 0.10,
@@ -124,7 +126,7 @@ window.FieldMap = (function () {
       drawingNo: 'SJ-4471-02',
       orderNo: 'DD20260917-118',
       planQty: 180,
-      stdDepth: 12.50,
+      stdDepth: 12.50,                          // 相机设定深度（设备参数，与航行器深度无关）
       stdGain: 2.5,
       stdFps: 400,
       stdShutter: 500,

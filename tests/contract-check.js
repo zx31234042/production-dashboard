@@ -355,6 +355,67 @@ async function main() {
     );
   }
 
+  /* ---- B2. 相机侧设定值：`state.task.std` ↔ 上位机报文 `std*` 跨实现一致 ＋ 与航行器深度标准**分语义** ----
+     立案（ADR-0004 D22 定点变异 B 漏判）：把 `src/services/mockData.js` 的 `std: { depth: 12.50, … }`
+     改成 `5.00`（＝把**相机设定深度**误当成航行器深度标准的量级）后，**改动前**的 ui-check 90/0、
+     copy-check 28/0、contract-check 66/0、tools-check 24/0 **全绿** —— 因为此前没有任何断言把这两套语义分开：
+     `state.task.std` 只被"二级菜单显示值 = state.task.std[key]"这类**自洽**断言读过（写什么就显示
+     什么，值改错了照样自洽），而报文侧的 `stdDepth` 是另一份硬编码的 12.50，两边从未对过账。
+     本条把它钉成两件**可证伪**的事实（字段名与精度都取自 `fieldMap.upperToBoard`，不硬编码）：
+       ① **跨实现一致**：`state.task.std.{depth,gain,fps,shutter}`（＝任务数据页二级菜单显示的那四项，
+          FR-3.16）与 `services/mockUpperSource.js` 产出的 `stdDepth/stdGain/stdFps/stdShutter`
+          （IF-D.3 / FR-3.5 的「设备参数」，即 fieldMap 的 `task.std.*` → `key` 映射）逐项相等；
+       ② **语义钉开**：`state.task.std.depth` ＝**相机设定深度**（FR-3.5 / IF-D.3 设备参数，与
+          `real.cameraDepth`＝相机自身水下深度同侧、±12 m 量级），**不得**等于**航行器深度标准**的
+          典型值（FR-3.18 / C-86：`standards.default.depth.typical` ＝ 5.00 m；现场录入后取
+          `state.task.standard.depth`）—— 两套数据语义不同、各有单一真源（见 board.config.js 的
+          `standards` / `camera` 两段注释与 fieldMap.js 对 `task.std.depth` 的注），故"相等"即上游
+          那类错误（菜单显示相机设定深度 5.00 m，而 cameraDepth ≈ 12.0 / 上位机 stdDepth = 12.50）。
+       ③ **同侧旁证**（把②从"两个数不相等"提升为"两个物理量分属两侧"）：相机设定深度与**相机自身
+          水下深度**的距离必须**小于**它与**航行器实测深度**的距离（两者都实算，不写死 12 / 5）。
+     反证（变异 B）：① 报 depth 不一致（5.00 vs 12.50），② 报"相机设定深度 ＝ 航行器深度标准典型值"，
+     ③ 同侧性反转（|5−12| = 7 ≮ |5−5| = 0）—— 三半各自独立变红。 */
+  {
+    const CAM_KEYS = ['depth', 'gain', 'fps', 'shutter'];
+    const camFrame = UpperSource.sample();
+    const camRows = CAM_KEYS.map(kind => {
+      const spec = MAP.upperToBoard['task.std.' + kind];
+      const key = typeof spec === 'string' ? spec : (spec && spec.key);
+      const digits = (spec && typeof spec.digits === 'number') ? spec.digits : 2;
+      const board = (Mock.state.task.std || {})[kind];
+      const wire = key === undefined ? undefined : camFrame[key];
+      /* 按 fieldMap 声明的位数比对（显示精度即契约精度），避免浮点表示差异被当成实现差异 */
+      const norm = v => (typeof v === 'number' && Number.isFinite(v)) ? Number(v.toFixed(digits)) : v;
+      const num = v => typeof v === 'number' && Number.isFinite(v);
+      return {
+        kind, key, board, wire,
+        same: key !== undefined && num(board) && num(wire) && norm(board) === norm(wire)
+      };
+    });
+    const camOk = camRows.length > 0 && camRows.every(r => r.same);
+    /* 航行器深度标准的典型值：运行时真源（FR-3.19 现场录入）优先、未录入回退演示默认段 ——
+       与 mockData.standardSpecOf / fieldMap.standardLimits 同一取值口径 */
+    const runStdDepth = (Mock.state.task.standard || {}).depth;
+    const dftStdDepth = ((CFG.standards || {}).default || {}).depth;
+    const vesselTypical = (runStdDepth || dftStdDepth || {}).typical;
+    const camSetDepth = (Mock.state.task.std || {}).depth;
+    const camOwnDepth = (Mock.state.task.real || {}).cameraDepth;   // 相机自身水下深度（IF-D.1）
+    const vesselReal = (Mock.state.task.real || {}).depth;          // 航行器实测深度
+    const num = v => typeof v === 'number' && Number.isFinite(v);
+    const sideOk = num(camSetDepth) && num(camOwnDepth) && num(vesselReal) &&
+      Math.abs(camSetDepth - camOwnDepth) < Math.abs(camSetDepth - vesselReal);
+    check(
+      'FR-3.5/FR-3.16/IF-D.3 相机侧设定值跨实现一致且与航行器深度标准（FR-3.18 / C-86）分语义：' +
+      'state.task.std.{depth,gain,fps,shutter} ↔ mockUpperSource 的 std{Depth,Gain,Fps,Shutter} 逐项相等，' +
+      '且相机设定深度 ≠ 航行器深度标准典型值（两套语义不得混用）',
+      camOk && camSetDepth !== vesselTypical && sideOk,
+      camRows.map(r => `${r.kind}: state.task.std.${r.kind}=${r.board} ↔ 报文 ${r.key}=${r.wire}${r.same ? '（一致）' : '（**不一致**）'}`).join('；') +
+      `；相机设定深度 ${camSetDepth} vs 航行器深度标准典型值 ${vesselTypical}` +
+      `${camSetDepth === vesselTypical ? '（**相等：把相机设备参数当成了航行器深度标准**）' : '（已分开）'}` +
+      `；同侧性（|设定深度−相机自身水下深度| ${Math.abs(camSetDepth - camOwnDepth)} < |设定深度−航行器实测深度| ${Math.abs(camSetDepth - vesselReal)}）=${sideOk}`
+    );
+  }
+
   /* ===== C. IF-D 行为：applyUpperPayload / 冻结判定 / 配置化（6.3～6.6） ===== */
   section('C. IF-D 适配层行为（tests/README 6.3～6.6）');
   const state = cloneState();

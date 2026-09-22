@@ -1,6 +1,6 @@
 /* ==========================================================================
    组件：任务数据页（components/TaskPanel.js）
-   需求版本：V1.33
+   需求版本：V1.34
    需求：FR-3 工单信息、实时实测数据、测试进度与结果
          FR-3.16（改写）任务数据页右下角为**测试标准区**（深度/速度的上下限偏差与典型值）；
                          相机参数移入**二级菜单**，菜单项**只含参数名 + 设定值**
@@ -50,9 +50,10 @@ window.Components.TaskPanel = (function () {
 
   const PARAM_LABEL = { depth: '深度', speed: '速度' };
 
-  /* 演示用兜底标准（仅当配置段缺失时生效；运行时真源是 state.task.standard） */
+  /* 演示用兜底标准（仅当配置段缺失时生效；运行时真源是 state.task.standard）——
+     取值与 config `standards.default` 同步（深度量程 [4, 6] m 由负责人 2026-09-22 确认） */
   const FALLBACK_STD = {
-    depth: { unit: 'm',   typical: 12.50, upperDev: 0.30, lowerDev: -0.20 },
+    depth: { unit: 'm',   typical: 5.00, upperDev: 0.30, lowerDev: -0.20 },
     speed: { unit: 'm/s', typical: 5.00,  upperDev: 0.20, lowerDev: -0.20 }
   };
 

@@ -80,7 +80,7 @@ let seq = 0;
 
 function initInner(now) {
   return {
-    depth: 12.68, vx: 4.90, vy: 0.10,
+    depth: 5.00, vx: 5.00, vy: 0.10,
     fpsRaw: 400, gainRaw: 2.5, shutterRaw: 500,
     cameraDepth: 12.00,
     startedAt: now
@@ -92,8 +92,13 @@ function nextPayload(args, now) {
   if (!inner) inner = initInner(now);
   const s = inner;
 
-  s.depth = clamp(round2(s.depth + (Math.random() - 0.5) * 0.06), 12.20, 13.10);
-  s.vx = clamp(round2(s.vx + (Math.random() - 0.5) * 0.10), 4.50, 5.30);
+  /* 航行器深度：量程 [4, 6] m（需求 C-86），演示游走 [4.77, 5.33]、步长 ±0.06/s ——
+     与 src/services/mockUpperSource.js / src/services/mockData.js **同一组数值**（三处同口径），
+     避免"经工具产出的报文"与"经 mockUpperSource 产出的报文"在航行器深度上互相矛盾。
+     速度同口径：vx 游走 [4.78, 5.22]、步长 ±0.06/s。
+     注：cameraDepth（相机自身水下深度）与 stdDepth（相机设定深度）是**另外的物理量**，不随之迁移。 */
+  s.depth = clamp(round2(s.depth + (Math.random() - 0.5) * 0.12), 4.77, 5.33);
+  s.vx = clamp(round2(s.vx + (Math.random() - 0.5) * 0.12), 4.78, 5.22);
   s.vy = clamp(round2(s.vy + (Math.random() - 0.5) * 0.04), -0.25, 0.35);
   const speed = round2(Math.sqrt(s.vx * s.vx + s.vy * s.vy));
 

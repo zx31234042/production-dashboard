@@ -1163,16 +1163,126 @@ async function main() {
         const list = String(lastHtml(ui.out, 'alQueueList') || '');
         return /3 条未闭环/.test(note) && list.includes('A2') && list.includes('A3');
       })(), '队首留卡片、其余两条进队列列表');
-    check('FR-5.8～5.11 预防性预警区按字典渲染标题与详情（联动设备参数判定）',
+    /* V1.34（C-88）改判：预警区夹具原用「帧率接近上限 / 当前 950/1000 fps」——
+       那是**相机参数**驱动的旧口径；C-88 明确参数类预警的判定对象＝**深度与速度的
+       测试标准上下限**、**相机参数不参与**，且参数类为**两条具名**。夹具与判据随之改判
+       （断言名保留 `FR-5.8～5.11 预防性预警区按字典渲染标题与详情` 前缀不变 ——
+       `trace-check` 把它当**逐字证据**），核对项由 2 项增至 7 项（只增不减）。 */
+    check('FR-5.8～5.11 预防性预警区按字典渲染标题与详情（判定对象＝深度与速度的标准上下限，相机参数不参与）',
       (() => {
         ui.out.length = 0;
         W.Components.AlarmPanel.render({
           alarm: { active: null, queue: [], ledger: [] },
-          warnings: [{ lv: 'warn', title: '帧率接近上限', detail: '当前 950/1000 fps' }]
+          warnings: [
+            { lv: 'warn', title: '参数阈值临近预警', detail: '深度 5.20 m（标准 4.80～5.30 m）判临近' },
+            { lv: 'err', title: '参数超范围预警', detail: '速度 8.40 m/s（标准 3.00～8.00 m/s）判超范围' },
+            { lv: 'ok', title: '设备维保到期预警', detail: '距计划维保还有 9 天' }
+          ]
         });
         const list = String(lastHtml(ui.out, 'alWarningList') || '');
-        return list.includes('帧率接近上限') && list.includes('950/1000');
-      })(), '');
+        return list.includes('参数阈值临近预警') && list.includes('深度 5.20 m') &&
+          list.includes('参数超范围预警') && list.includes('速度 8.40 m/s') &&
+          list.includes('设备维保到期预警') &&
+          list.includes('lv-warn') && list.includes('lv-err');
+      })(), '参数类两条具名（黄 lv-warn / 红 lv-err）+ 维保类按字典逐条渲染标题与详情');
+    /* V1.34（C-88）新增：参数类预警的**名称与条数口径**（不是渲染，而是读 mockData 的实算产物）。
+       判据五条，逐条可证伪（下面前 4 条均做过定点变异反证，见本轮报告）：
+       ① 参数类**最多 2 条**（一个参数最多一条：深度/速度各按最坏态择名）⇒ 造第 3 条即红；
+       ② 参数类**不得出现第三个名字**（把标题改成任何别的"参数…"名即红）；
+       ③ **相机参数不参与判定**：任何预警标题里都不得出现帧率/增益/快门/相机
+          ⇒ 把参数类预警换回旧口径的「帧率接近上限」即红（**这一条专治"只看名字前缀"的漏网**：
+          旧判据按 `includes('参数')` 过滤，相机参数名根本进不了集合，会静默放行）；
+       ④ 名称与等级色一一对应（「参数超范围预警」⇔ lv='err'；「参数阈值临近预警」⇔ lv≠'err'，
+          含标准已设定但两参数都正常时的 ok 回执条）⇒ "名字对了色错了"即红；
+       ⑤ 每条都有非空 detail（不得用空详情的占位名充数）。 */
+    check('FR-5.8 参数类预警为两条具名（参数阈值临近预警 / 参数超范围预警）且至多 2 条、名称与等级色一一对应、相机参数不参与（无相机参数类预警名）',
+      (() => {
+        const PARAM_TITLES = ['参数阈值临近预警', '参数超范围预警'];
+        const CAMERA_WORDS = ['帧率', '增益', '快门', '相机'];
+        const all = W.MockData.state.warnings || [];
+        const param = all.filter(w => PARAM_TITLES.includes(w.title));
+        const stray = all.filter(w => String(w.title).includes('参数') && !PARAM_TITLES.includes(w.title));
+        return param.length <= 2 &&
+          stray.length === 0 &&
+          all.every(w => !CAMERA_WORDS.some(k => String(w.title).includes(k))) &&
+          param.every(w => (w.title === '参数超范围预警') === (w.lv === 'err')) &&
+          param.every(w => typeof w.detail === 'string' && w.detail.length > 0);
+      })(),
+      `实算预警 ${(W.MockData.state.warnings || []).map(w => `${w.title}/${w.lv}`).join('、') || '（0 条：标准未设定）'}`);
+
+    /* V1.34（C-88）新增（ADR-0004 D22 定点变异 A 的补钉）：上一条判据读的是**当时碰巧的**
+       `state.warnings` —— 实测随机游走常落在"两参数都正常 / 只有临近"的帧上，于是
+       **变异 A**（把 mockData 的『参数超范围预警』整名改成『参数阈值临近预警』，即让 err 顶着临近名）
+       下**改动前**的 ui-check 90/0、copy-check 28/0 **全绿** —— 名称与等级色的对应关系没有任何断言真正判过。
+       本条**先把 err 级参数类预警真正构造出来再判**，构造只写**运行时真源** `state.task.standard`
+       （FR-3.19 现场录入的标准行；`mockData.standardSpecOf` 优先读它，故下一帧 tick 即按新标准重算；
+       **不碰源码、不碰配置**）：
+         · 深度标准取在**量程下沿**（typical = `standards.range.depth.min` + 3 格、上下偏差 ±1 格
+           ⇒ 上下限 4.02～4.04 m，仍落在量程 [4, 6] 内、是合法可录入的行），而演示深度游走区间是
+           [4.77, 5.33]（mockData 头部口径）⇒ **深度几乎每帧都判超范围（err）**；
+         · 速度不写标准行 ⇒ 按 mockData 的回退口径取 `standards.default.speed`（4.80～5.20），
+           其态随游走变化；循环 tick（上限 2000 帧）直到同一帧里**同时**出现 err 与 warn 两条参数类
+           预警（实测 200 次独立试验的命中帧 ≤ 82，故上限留了 20 倍余量；真到不了即判红，不静默放过）。
+       判据四条，全部落在**该帧的真实实算产物**上：
+         ① 确实存在 err 级参数类预警（否则本条形同虚设 —— 这正是旧判据漏掉变异 A 的原因）；
+         ② 名称 ⇔ 等级色一一对应：「参数超范围预警」⇔ lv='err'、「参数阈值临近预警」⇔ lv≠'err'；
+         ③ 参数类预警的**名称集合恰为这两条具名**（既不得缺、也不得冒出第三个"参数…"名）；
+         ④ 参数类恰 2 条（一个参数一条：深度 err + 速度 warn）。
+       参数类的识别口径＝**buildWarnings 的建表顺序**（参数类在前、其后固定 3 条：维保/耗材/工单），
+       故 `warnings.slice(0, 长度−3)` 恒为参数类 —— **不拿被测的名称当筛子**（否则改名后连"哪条是
+       参数类"都判不出，判据会退化成对着自己的输入打转）。 */
+    {
+      const M = W.MockData;
+      const PARAM_TITLES = ['参数阈值临近预警', '参数超范围预警'];
+      const NON_PARAM = 3;                        // 参数类之后固定三条：维保 / 耗材 / 工单
+      const STD = W.BoardConfig.standards || {};
+      const RANGE_DEPTH = (STD.range || {}).depth || {};
+      const grid = 1 / Math.pow(10, STD.digits);   // 显示精度一格（两位小数 ⇒ 0.01 m）
+      const savedStandard = M.state.task.standard;
+      const obs = { frames: 0, errFrames: 0, hit: null, pairs: [], titles: [], bad: [], stray: [] };
+      let buildErr = null;
+      try {
+        M.state.task.standard = {
+          depth: { unit: 'm', digits: STD.digits,
+                   typical: RANGE_DEPTH.min + 3 * grid, upperDev: grid, lowerDev: -grid }
+        };
+        const base = new Date('2026-09-18T15:30:00').getTime();
+        for (let i = 0; i < 2000 && obs.hit === null; i++) {
+          M.tick(new Date(base + i * 1000));
+          obs.frames++;
+          const all = M.state.warnings || [];
+          const param = all.slice(0, Math.max(0, all.length - NON_PARAM));
+          if (param.some(w => w.lv === 'err')) obs.errFrames++;
+          if (param.some(w => w.lv === 'err') && param.some(w => w.lv === 'warn')) {
+            obs.hit = i;
+            obs.pairs = param.map(w => `${w.title}/${w.lv}`);
+            obs.titles = param.map(w => w.title);
+            obs.bad = param.filter(w => (w.title === '参数超范围预警') !== (w.lv === 'err'));
+            obs.stray = param.filter(w => !PARAM_TITLES.includes(w.title));
+          }
+        }
+      } catch (e) {
+        buildErr = e;
+      } finally {
+        M.state.task.standard = savedStandard;    // 还原运行时真源，后面的用例不受影响
+      }
+      check(
+        'FR-5.8/C-88 名称与等级色一一对应（在**确实存在 err 级参数类预警**的状态下判定，非源码字符串搜索）：深度越标准上限 ⇒「参数超范围预警」/err、速度落临近带 ⇒「参数阈值临近预警」/warn，参数类名称集合恰为这两条具名',
+        buildErr === null && obs.hit !== null && obs.errFrames > 0 &&
+        obs.bad.length === 0 && obs.stray.length === 0 &&
+        obs.titles.length === 2 && PARAM_TITLES.every(n => obs.titles.includes(n)),
+        buildErr ? `构造/判定异常：${buildErr.message}`
+          : `构造的深度标准＝量程下沿 ${RANGE_DEPTH.min + 3 * grid}±${grid}（上下限 ` +
+            `${(RANGE_DEPTH.min + 2 * grid).toFixed(STD.digits)}～${(RANGE_DEPTH.min + 4 * grid).toFixed(STD.digits)} m，` +
+            `在量程 [${RANGE_DEPTH.min}, ${RANGE_DEPTH.max}] 内）；扫 ${obs.frames} 帧、其中 ${obs.errFrames} 帧含 err 级参数类预警；` +
+            (obs.hit === null
+              ? '**2000 帧内从未出现"err 与 warn 同时存在"的参数类帧**（构造前提不成立，判据无从成立）'
+              : `命中帧参数类名称/等级色＝[${obs.pairs.join('、')}]；名称集合=${JSON.stringify(obs.titles)}` +
+                `（应恰为 ${JSON.stringify(PARAM_TITLES)}）` +
+                (obs.bad.length ? `；**名称与等级色不符**：${obs.bad.map(w => `${w.title}/${w.lv}`).join('、')}` : '') +
+                (obs.stray.length ? `；**冒出第三个参数类名字**：${obs.stray.map(w => w.title).join('、')}` : ''))
+      );
+    }
     check('FR-5.12/FR-5.13/FR-5.14 当班异常台账按行渲染（时间/编号/描述/闭环状态）',
       (() => {
         ui.out.length = 0;
