@@ -7,7 +7,7 @@
          B3 键盘演示键 D：进入断连降级态
          B4 逐页点击切换：始终只有一个面板 active，头部信息常显
          B5 三种分辨率下无滚动条（3840×2160 / 1920×1080 / 1366×768）
-         B6 无操作自动回首页（用虚拟时间快进 3 分钟）
+         B6 无操作自动回首页（用虚拟时间快进 5 分 10 秒）
          B7 关键页面截图落到 tests/._verify/（已被 .gitignore 忽略），供人工比对
    运行：node tests/browser-check.js
    依赖：本机已安装 Microsoft Edge；无 npm 依赖（用 Node 内置 WebSocket 直连 CDP）。
@@ -424,21 +424,23 @@ async function main() {
   await cdp.send('Emulation.clearDeviceMetricsOverride');
 
   /* ===== B6 无操作自动回首页（虚拟时间快进） ===== */
-  section('B6 无操作 3 分钟自动返回首页（FR-9.4）');
+  section('B6 无操作 5 分 10 秒自动返回首页（FR-9.4）');
   try {
     await openPage('', 2200);
     await clickTab(5);
     await sleep(300);
-    await cdp.send('Emulation.setVirtualTimePolicy', { policy: 'advance', budget: 200000 });
+    /* FR-9.4（V1.32）：默认 5 分 10 秒 = 310000 ms。budget 必须**严格大于**该阈值，
+       否则快进结束仍停在当前页，用例会假失败（原为 200000/3 分钟，阈值升到 310 s 后必然失败）。 */
+    await cdp.send('Emulation.setVirtualTimePolicy', { policy: 'advance', budget: 320000 });
     await sleep(1500);
     const after = await evaluate(`(() => {
       const act = document.querySelector('.tab-panel.active');
       return act ? act.id : null;
     })()`);
     await cdp.send('Emulation.setVirtualTimePolicy', { policy: 'pause' }).catch(() => {});
-    check('快进 200 秒后自动回到「设备状态」首页', after === 'panel-status', `当前激活面板=${after}`);
+    check('快进 320 秒后自动回到「设备状态」首页', after === 'panel-status', `当前激活面板=${after}`);
   } catch (e) {
-    skip('无操作 3 分钟自动返回首页', '虚拟时间快进不可用：' + e.message);
+    skip('无操作 5 分 10 秒自动返回首页', '虚拟时间快进不可用：' + e.message);
   }
 
   /* ===== B7 截图 ===== */

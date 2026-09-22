@@ -21,7 +21,8 @@ window.Pages.Dashboard = (function () {
     { id: 'panel-setting', label: '操作设置' }
   ];
   const HOME_TAB = 0;                        // 默认首页（FR-9.2）
-  const IDLE_RETURN_MS = 3 * 60 * 1000;      // FR-9.4：无操作 3 分钟自动回首页
+  /* 5 分 10 秒；须晚于 FR-8.2 的 5 分钟锁定，确保锁定先发生——审查 F-02（原 3 分钟早于锁定，回首页时解锁态仍可能有效） */
+  const IDLE_RETURN_MS = 5 * 60 * 1000 + 10 * 1000;   // FR-9.4：无操作自动回默认首页（可配置）
 
   let idleTimer = null;
 

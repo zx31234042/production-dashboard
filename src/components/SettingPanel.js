@@ -16,6 +16,29 @@ window.Components.SettingPanel = (function () {
   const AUTO_LOCK_MS = 5 * 60 * 1000;
   let autoLockTimer = null;
 
+  /* ---------------- 自动锁定提示弹窗（FR-8.2：自动锁定时弹提示性弹窗，显示 2 s） ----------------
+     DOM 契约（测试可断言）：
+       节点     index.html `#autoLockTip`（role="status"，初始带 `hidden` 属性）
+       显示     `hidden` 属性移除 + 加 class `show`（CSS：.auto-lock-tip.show 为 display:flex）
+       隐藏     `hidden` 属性加回 + 去 class `show`（两者由本文件同一处代码同步切换）
+       文案     `#autoLockTipTitle` = 自动锁定；`#autoLockTipText` = 解锁已超过 5 分钟，系统已自动锁定
+       计时     显示后 setTimeout(2000) 自动隐藏；重复触发清掉上一个定时器（复用同一节点，不堆叠） */
+  const AUTO_LOCK_TIP_MS = 2000;
+  let autoLockTipTimer = null;
+
+  function showAutoLockTip() {
+    const tip = $('autoLockTip');
+    if (!tip) return;
+    tip.hidden = false;
+    tip.classList.add('show');
+    if (autoLockTipTimer) clearTimeout(autoLockTipTimer);
+    autoLockTipTimer = setTimeout(() => {
+      autoLockTipTimer = null;
+      tip.hidden = true;
+      tip.classList.remove('show');
+    }, AUTO_LOCK_TIP_MS);
+  }
+
   /* ---------------- 渲染 ---------------- */
   function render(state) {
     const unlocked = state.unlocked;
@@ -95,6 +118,7 @@ window.Components.SettingPanel = (function () {
         M.pushLog('自动锁定', '解锁后超过 5 分钟，系统自动回到锁定状态');
         msg.textContent = '解锁已超过 5 分钟，系统已自动锁定';
         msg.className = 'pwd-msg';
+        showAutoLockTip();          /* FR-8.2：仅"自动锁定"弹提示弹窗（手动点「锁定」不弹），2 s 后自动消失 */
         render(state);
       }, AUTO_LOCK_MS);
     }

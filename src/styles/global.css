@@ -474,3 +474,18 @@ textarea.form-input { resize: none; }
   background: rgba(255,192,0,.94); color: #1A1200;
   box-shadow: 0 8px 30px rgba(0,0,0,.5);
 }
+
+/* 自动锁定提示弹窗（FR-8.2）：默认隐藏，由 SettingPanel.js 加 class "show" 显示，2 s 后自动消失。
+   用绝对定位，避免成为 #stage 网格的第四个网格项（与 .degraded-banner 同一处理方式）。 */
+.auto-lock-tip {
+  position: absolute; left: 50%; top: 300px; transform: translateX(-50%);
+  z-index: 30; display: none; align-items: center; gap: 26px;
+  padding: 26px 56px; border-radius: 16px;
+  background: rgba(18,39,64,.97); border: 2px solid var(--warn);
+  box-shadow: 0 10px 40px rgba(0,0,0,.55);
+  font-size: 46px;
+}
+.auto-lock-tip.show { display: flex; }
+.auto-lock-tip[hidden] { display: none; }
+.auto-lock-tip .tip-title { font-size: 52px; font-weight: 700; color: var(--warn); }
+.auto-lock-tip .tip-text { color: var(--text); }

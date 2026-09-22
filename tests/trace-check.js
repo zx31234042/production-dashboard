@@ -91,7 +91,7 @@ const MAP = [
 
   /* FR-8 系统设置 */
   ['FR-8.1', 'covered-direct', 'browser-check.js', '?unlock=1 启动即解锁'],
-  ['FR-8.2', 'covered-indirect', 'ui-check.js', 'FR-8.2 解锁状态超时'],
+  ['FR-8.2', 'covered-indirect', 'ui-check.js', 'FR-8.2 解锁状态超时（5 分钟）自动锁定'],
   ['FR-8.3,FR-8.4', 'declared-gap', '', 'README 已知限制 1：前端明文密码，正式实现须服务端校验与哈希'],
   ['FR-8.5,FR-8.6', 'covered-indirect', 'ui-check.js', 'FR-8.6 设置页提供关键参数配置入口'],
   ['FR-8.7', 'covered-indirect', 'ui-check.js', 'FR-8.7 / NFR-15 解锁后的写操作留痕'],
@@ -99,7 +99,7 @@ const MAP = [
   /* FR-9 页面与交互 */
   ['FR-9.1,FR-9.3', 'covered-direct', 'browser-check.js', '切换 8 个标签页'],
   ['FR-9.2', 'covered-indirect', 'browser-check.js', '默认首页是「设备状态」'],
-  ['FR-9.4', 'covered-direct', 'browser-check.js', '快进 200 秒后自动回到'],
+  ['FR-9.4', 'covered-direct', 'browser-check.js', '快进 320 秒后自动回到「设备状态」首页'],
   ['FR-9.5', 'declared-gap', '', 'README 已知限制 11：标签页未做自动轮播；路线图技术债 E3（2026-09-19 补登记，P3-11）'],
   ['FR-9.6', 'covered-indirect', 'ui-check.js', '单次 tick + 10 个组件全量重绘耗时'],
   ['FR-9.7', 'covered-indirect', 'ui-check.js', 'FR-9.7 大屏交互屏蔽'],

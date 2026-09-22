@@ -166,6 +166,175 @@ function lastHtml(out, id) {
   return hits.length ? hits[hits.length - 1].value : null;
 }
 
+/* ---------------- F-02 护栏用的源码读数工具（ADR-0004 D23：比数值，不比字符串写法） ----------------
+   立案：审查发现 F-02 —— `SettingPanel.AUTO_LOCK_MS`（5 min）曾早于 `Dashboard.IDLE_RETURN_MS`（3 min），
+   回首页时解锁态仍可能有效。修法是把两者的**数值关系**钉住，而不是在源码里搜某个字符串写法：
+   若断言写成"源码含不含 `10 * 1000`"，把常量换成等价的 `310000` 就会假失败，
+   而把错的 `3 * 60 * 1000` 改回来却可能照样绿 —— 那正是 D23 说的"静态防空洞"。 */
+
+/** 取 `const NAME = <表达式>;` 里的表达式文本（取不到返回 null） */
+function constExpr(src, name) {
+  const m = src.match(new RegExp(`const\\s+${name}\\s*=\\s*([^;]+);`));
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * 只允许「数字 + `*` `+` `-` `/` + 括号 + 空白」的极小表达式求值器（递归下降，不用 eval/Function）。
+ * 白名单之外一律抛错 —— 调用方必须把它变成 FAIL，不得兜底成 0（否则断言会静默变弱）。
+ * @param {string} expr 形如 `5 * 60 * 1000 + 10 * 1000`
+ * @returns {number} 求值结果
+ */
+function evalNumericExpr(expr) {
+  const src = String(expr);
+  if (!/^[\d\s*+\-/()]+$/.test(src)) throw new Error(`表达式含白名单外的字符：${JSON.stringify(src)}`);
+  let i = 0;
+  const skipWs = () => { while (i < src.length && /\s/.test(src[i])) i++; };
+  const number = () => {
+    skipWs();
+    const m = /^\d+(?:\.\d+)?/.exec(src.slice(i));
+    if (!m) throw new Error(`第 ${i} 个字符处应为数字：${JSON.stringify(src)}`);
+    i += m[0].length;
+    return Number(m[0]);
+  };
+  const primary = () => {
+    skipWs();
+    if (src[i] === '(') {
+      i++;
+      const v = sum();
+      skipWs();
+      if (src[i] !== ')') throw new Error(`括号不配对：${JSON.stringify(src)}`);
+      i++;
+      return v;
+    }
+    return number();
+  };
+  const term = () => {
+    let v = primary();
+    for (;;) {
+      skipWs();
+      const op = src[i];
+      if (op !== '*' && op !== '/') return v;
+      i++;
+      const r = primary();
+      v = op === '*' ? v * r : v / r;
+    }
+  };
+  const sum = () => {
+    let v = term();
+    for (;;) {
+      skipWs();
+      const op = src[i];
+      if (op !== '+' && op !== '-') return v;
+      i++;
+      v = op === '+' ? v + term() : v - term();
+    }
+  };
+  const value = sum();
+  skipWs();
+  if (i !== src.length) throw new Error(`表达式有多余内容：${JSON.stringify(src)}`);
+  if (!Number.isFinite(value)) throw new Error(`表达式不是有限数值：${JSON.stringify(src)}`);
+  return value;
+}
+
+/** 取 `function NAME(...) { ... }` 的函数体源码（按花括号配对，跳过字符串字面量）；取不到返回 null */
+function functionBody(src, name) {
+  const head = src.indexOf(`function ${name}(`);
+  if (head < 0) return null;
+  const open = src.indexOf('{', head);
+  if (open < 0) return null;
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (c === '{') depth++;
+    else if (c === '}') { depth--; if (depth === 0) return src.slice(open, i + 1); }
+    else if (c === "'" || c === '"' || c === '`') {
+      const q = c;
+      i++;
+      while (i < src.length && src[i] !== q) { if (src[i] === '\\') i++; i++; }
+    }
+  }
+  return null;
+}
+
+/**
+ * F-02 行为夹具：在 vm 里加载**真实** `SettingPanel`，用可判定的 DOM/定时器桩件走真路径。
+ * 与上面的记录型假 DOM（`makeRecorder`）的区别，正是本条用例需要的两件事：
+ *   ① 节点**按 id 缓存**（同一 id 恒等，与真实 `$` 一致）—— 否则"组件改的节点"与"用例看的节点"不是同一个；
+ *   ② 如实记录 `hidden` 与 `classList` 成员（`makeRecorder` 的 classList 是空壳，且没有 hidden）；
+ *   ③ `setTimeout`/`clearTimeout` 只**登记**不真等：用例按 `delay` 找到回调并手工触发。
+ * @returns {{w:object, nodes:Map<string,object>, timers:Array, click:Function, fire:Function}}
+ */
+function loadAutoLockFixture() {
+  const nodes = new Map();
+  const timers = [];
+  let timerSeq = 0;
+
+  const node = id => {
+    if (nodes.has(id)) return nodes.get(id);
+    const classes = new Set();
+    const handlers = {};
+    const o = {
+      __id: id, hidden: false, disabled: false, value: '', className: '', style: {}, dataset: {},
+      classList: {
+        add: c => classes.add(c),
+        remove: c => classes.delete(c),
+        contains: c => classes.has(c),
+        toggle: (c, on) => {
+          if (on === undefined ? !classes.has(c) : on) classes.add(c);
+          else classes.delete(c);
+        }
+      },
+      addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); },
+      __fire: type => (handlers[type] || []).forEach(fn => fn({ key: 'Enter' })),
+      querySelector: sel => node(id + ' ' + sel),
+      appendChild: () => {},
+      remove: () => {}
+    };
+    Object.defineProperty(o, 'textContent', {
+      get() { return o.__text || ''; }, set(v) { o.__text = String(v); }, configurable: true
+    });
+    Object.defineProperty(o, 'innerHTML', {
+      get() { return ''; }, set() {}, configurable: true
+    });
+    nodes.set(id, o);
+    return o;
+  };
+
+  const sandbox = { console };
+  sandbox.window = sandbox;
+  sandbox.setTimeout = (fn, delay) => { const id = ++timerSeq; timers.push({ id, delay, fn, fired: false, cancelled: false }); return id; };
+  sandbox.clearTimeout = id => { const t = timers.find(x => x.id === id); if (t) t.cancelled = true; };
+  sandbox.document = { querySelectorAll: () => [], getElementById: () => null, querySelector: () => null };
+  vm.createContext(sandbox);
+  const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  run('src/config/board.config.js');
+  run('src/config/fieldMap.js');
+  run('src/utils/format.js');
+  sandbox.window.Dom = {
+    $: node,
+    setText: () => {}, setHTML: () => {}, setClass: () => {},
+    setStyle: () => {}, toggleClass: () => {}
+  };
+  run('src/services/mockData.js');
+  run('src/components/SettingPanel.js');
+
+  return {
+    w: sandbox.window,
+    nodes,
+    node,
+    timers,
+    click: id => node(id).__fire('click'),
+    /** 触发**尚未触发且未被取消**的、delay 匹配的最后一个定时器回调 */
+    fire: delay => {
+      const t = timers.filter(x => x.delay === delay && !x.cancelled && !x.fired).pop();
+      if (!t) throw new Error(`没有待触发的 ${delay} ms 定时器（已登记：${timers.map(x => x.delay).join('/') || '无'}）`);
+      t.fired = true;
+      t.fn();
+      return t;
+    }
+  };
+}
+
 /* ---------------- 需求规范基线（来源：`需求文档\` 下的当前基线版需求清单） ---------------- */
 /* §5 UI-03 色彩规范、UI-04 字号规范（4K 基准）；§4.1/4.3/4.4/4.9 的功能条目 */
 const UI03 = { '--ok': '#00B050', '--warn': '#FFC000', '--err': '#FF0000', '--idle': '#808080', '--bg': '#0B1A2B' };
@@ -644,10 +813,123 @@ async function main() {
     const allSrc = [mainSrc, dashSrc, setSrc, mockSrc].join('\n');
 
     check(
-      'FR-8.2 解锁状态超时（建议 5 分钟）自动锁定',
+      'FR-8.2 解锁状态超时（5 分钟）自动锁定',
       /setUnlocked\(\s*false\s*\)/.test(allSrc) && /(5\s*\*\s*60|300000|5\s*\*\s*60\s*\*\s*1000)/.test(allSrc),
       '只有手动「锁定」按钮会置 false，没有"解锁后 5 分钟自动锁定"的计时'
     );
+
+    /* ---- F-02 回归护栏（审查发现 F-02：解锁 5 min 曾**早于**回首页 3 min ⇒ 回首页时解锁态仍可能有效）
+       V1.32 口径：FR-8.2 锁定 5 分钟（300000 ms）先发生；FR-9.4 回首页默认 5 分 10 秒（310000 ms）
+       后发生。前两条只做**数值**判定（先把常量表达式求值，再比大小 / 比差值），
+       后四条是弹窗契约与行为断言 —— 一律不做源码字符串匹配（ADR-0004 D23）。 ---- */
+    let lockMs = null;
+    let returnMs = null;
+    let tipMs = null;
+    let constErr = null;
+    try {
+      lockMs = evalNumericExpr(constExpr(setSrc, 'AUTO_LOCK_MS'));
+      returnMs = evalNumericExpr(constExpr(dashSrc, 'IDLE_RETURN_MS'));
+      tipMs = evalNumericExpr(constExpr(setSrc, 'AUTO_LOCK_TIP_MS'));
+    } catch (e) {
+      constErr = e.message;
+    }
+
+    check(
+      'F-02 时序护栏（FR-8.2/FR-9.4）：AUTO_LOCK_MS < IDLE_RETURN_MS 且差值恰为 10000 ms（锁定先于回首页 10 s）',
+      constErr === null && lockMs < returnMs && returnMs - lockMs === 10000,
+      constErr
+        ? `常量表达式无法求值：${constErr}`
+        : `AUTO_LOCK_MS=${lockMs}，IDLE_RETURN_MS=${returnMs}，差值=${returnMs - lockMs} ms（应为 10000）`
+    );
+    check(
+      'FR-8.2/FR-9.4 数值口径：自动锁定 300000 ms（5 分钟）、回首页 310000 ms（5 分 10 秒）',
+      constErr === null && lockMs === 300000 && returnMs === 310000,
+      constErr ? `常量表达式无法求值：${constErr}` : `AUTO_LOCK_MS=${lockMs}（应 300000），IDLE_RETURN_MS=${returnMs}（应 310000）`
+    );
+
+    /* (b) 弹窗静态契约：节点、初始隐藏、两个子节点、2 s 时长、防定时器堆叠 */
+    const tipOpen = html.match(/<div[^>]*\bid="autoLockTip"[^>]*>/);
+    const tipStart = tipOpen ? html.indexOf(tipOpen[0]) : -1;
+    const tipEnd = tipStart >= 0 ? html.indexOf('</div>', tipStart) : -1;
+    const tipBlock = tipEnd > tipStart ? html.slice(tipStart, tipEnd) : '';
+    check(
+      'F-02 弹窗 DOM 契约（FR-8.2）：#autoLockTip 存在、初始带 hidden、且含标题与正文两个子节点',
+      tipOpen !== null && /\shidden(?=[\s>])/.test(tipOpen[0]) &&
+        tipBlock.includes('id="autoLockTipTitle"') && tipBlock.includes('id="autoLockTipText"'),
+      tipOpen === null
+        ? 'index.html 里没有 id="autoLockTip" 的节点'
+        : `起始标签=${tipOpen[0]}；子节点=${tipBlock.includes('id="autoLockTipTitle"') ? '有' : '缺'}标题 / ` +
+          `${tipBlock.includes('id="autoLockTipText"') ? '有' : '缺'}正文`
+    );
+    const tipBody = functionBody(setSrc, 'showAutoLockTip');
+    check(
+      'F-02 提示时长（FR-8.2）：AUTO_LOCK_TIP_MS = 2000 ms，且 showAutoLockTip 内先 clearTimeout（不堆叠定时器）',
+      tipMs === 2000 && tipBody !== null && /clearTimeout\s*\(/.test(tipBody),
+      `AUTO_LOCK_TIP_MS=${tipMs}（应 2000）；showAutoLockTip ` +
+      (tipBody === null ? '未找到函数体' : (/clearTimeout\s*\(/.test(tipBody) ? '内有 clearTimeout' : '内无 clearTimeout'))
+    );
+
+    /* (c) 行为断言：走真路径（bind → 解锁 → 自动锁定回调 → 提示隐藏回调 → 手动锁定分支） */
+    {
+      let seqErr = null;
+      let unlockedAfter = null;
+      let tipShown = false;
+      let tipTimersAfter = 0;
+      let tipHiddenAgain = false;
+      let manualQuiet = false;
+      const steps = [];
+      try {
+        const fx = loadAutoLockFixture();
+        const M = fx.w.MockData;
+        const tip = fx.node('autoLockTip');
+        tip.hidden = true;                        /* 对应 index.html 的初始 `hidden` 属性 */
+        let activity = 0;
+        fx.w.Components.SettingPanel.bind(M.state, () => { activity++; });
+
+        /* 真口令（演示密码 8888，见 mockData 的 CFG.unlockPassword）走 #setUnlockBtn 的 click 处理 */
+        fx.nodes.get('setPwd').value = M.CFG.unlockPassword;
+        fx.click('setUnlockBtn');
+        steps.push(`解锁后 state.unlocked=${M.state.unlocked}`,
+          `登记定时器=[${fx.timers.filter(x => !x.cancelled).map(x => x.delay).join(',')}] ms`,
+          `onActivity 回调 ${activity} 次`);
+
+        fx.fire(300000);                          /* 触发自动锁定回调 */
+        unlockedAfter = M.state.unlocked;
+        tipShown = tip.hidden === false && tip.classList.contains('show');
+        tipTimersAfter = fx.timers.filter(x => x.delay === 2000 && !x.fired).length;
+        steps.push(`300000 ms 回调后 state.unlocked=${unlockedAfter}，弹窗显示=${tipShown}，` +
+          `新登记 2000 ms 定时器 ${tipTimersAfter} 个`);
+
+        fx.fire(2000);                            /* 触发提示 2 s 自动隐藏回调 */
+        tipHiddenAgain = tip.hidden === true && !tip.classList.contains('show');
+        steps.push(`2000 ms 回调后弹窗回到隐藏态=${tipHiddenAgain}`);
+
+        /* 手动「锁定」分支：只锁不弹（弹窗只属于自动锁定） */
+        tip.hidden = true;
+        tip.classList.remove('show');
+        fx.nodes.get('setPwd').value = M.CFG.unlockPassword;
+        fx.click('setUnlockBtn');
+        const tipTimersBefore = fx.timers.filter(x => x.delay === 2000).length;
+        fx.click('setLockBtn');
+        manualQuiet = M.state.unlocked === false && tip.hidden === true &&
+          !tip.classList.contains('show') && fx.timers.filter(x => x.delay === 2000).length === tipTimersBefore;
+        steps.push(`手动锁定后 state.unlocked=${M.state.unlocked}，弹窗仍隐藏=` +
+          `${tip.hidden && !tip.classList.contains('show')}，未新增 2000 ms 定时器=` +
+          `${fx.timers.filter(x => x.delay === 2000).length === tipTimersBefore}`);
+      } catch (e) {
+        seqErr = e.message;
+      }
+      check(
+        'F-02 自动锁定行为（FR-8.2）：解锁后登记 300000 ms 定时器 → 回调置为锁定并弹出提示 → 2000 ms 后自动隐藏',
+        seqErr === null && unlockedAfter === false && tipShown && tipTimersAfter === 1 && tipHiddenAgain,
+        seqErr ? `夹具执行异常：${seqErr}` : steps.join('；')
+      );
+      check(
+        'F-02 手动锁定不弹提示（FR-8.2）：提示弹窗只挂在自动锁定分支',
+        seqErr === null && manualQuiet,
+        seqErr ? `夹具执行异常：${seqErr}` : steps.join('；')
+      );
+    }
 
     check(
       'FR-8.7 / NFR-15 解锁后的写操作留痕（真实操作日志）',

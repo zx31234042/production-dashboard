@@ -422,6 +422,13 @@
     </div>
   </footer>
 
+  <!-- 自动锁定提示弹窗（FR-8.2）：仅在"自动锁定"发生时出现，显示 2 秒后自动消失；
+       显隐由 src/components/SettingPanel.js 切换（hidden 属性 + class "show"） -->
+  <div class="auto-lock-tip" id="autoLockTip" role="status" hidden>
+    <span class="tip-title" id="autoLockTipTitle">自动锁定</span>
+    <span class="tip-text" id="autoLockTipText">解锁已超过 5 分钟，系统已自动锁定</span>
+  </div>
+
 </div>
 
 <!-- 加载顺序：config → utils → services → components → pages → main
