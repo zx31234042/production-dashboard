@@ -7,6 +7,8 @@
          B3 键盘演示键 D：进入断连降级态
          B4 逐页点击切换：始终只有一个面板 active，头部信息常显
          B5 三种分辨率下无滚动条（3840×2160 / 1920×1080 / 1366×768）
+         B5b 任务数据页「测试标准区」U-4 版面（V1.36 / C-95）：3840×2160 下把三态徽标强制成
+             最坏态「超范围」，逐格量「内容是否只有一行／无横向溢出／参数名与徽标同排」
          B6 无操作自动回首页（用虚拟时间快进 5 分 10 秒）
          B7 关键页面截图落到 tests/._verify/（已被 .gitignore 忽略），供人工比对
    运行：node tests/browser-check.js
@@ -420,6 +422,192 @@ async function main() {
     })`);
     check(`${w}×${h} 无横/纵向滚动条`, m.scrollbar === false,
       `scrollWidth=${m.sw} / innerWidth=${m.iw}，scrollHeight=${m.sh} / innerHeight=${m.ih}`);
+  }
+  await cdp.send('Emulation.clearDeviceMetricsOverride');
+
+  /* ===== B5b 任务数据页「测试标准区」U-4 版面真机判据（V1.36 / C-95） =====
+     立案：负责人 2026-09-24 手动测试反馈 U-4（真机截图复现）——三态徽标为三字「超范围」时，
+     测试标准区出现**预期外换行**（第 5 格只读导出值被压成两行）。C-95 要求：
+     参数名与徽标**同排**、第 5 格导出值**一行显示且不丢「上限/下限」字样**、表头仍允许换行、
+     字号口径不变（U-1）。静态声明层证据在 ui-check 的 (d3) 段；本段证明**真机渲染结果**。
+     判据（逐条都打印实测值）：
+       ① 结构齐备：`?tab=1` 的 `#tkStdTable` 恰好两行 × 5 格、每行 1 个 `.std-state`；
+       ② **最坏态强制**：`document.querySelectorAll('.std-limits .std-state')` 逐一把 `textContent`
+          改成 `超范围`，并回读确认改成功（不确认就是"没跑最坏态也算过"）；
+       ③ 每个 `td` 的内容**只有一行**：`Range` 包围盒高 ÷ 单行推进量 取整 === 1。
+          「单行推进量」＝该格内每个文本 run 的
+          `max(同字号同字体族探针实测单行高, 该 run 自身 line-height × 舞台缩放比)` 的最大值
+          （探针 = `position:absolute` + `white-space:nowrap` 的 span ⇒ 只可能是一行）。
+          为什么**不**直接拿 td 的 computed `line-height` 当除数：真机实测（probe2.json 配置 B）
+          「典型值」格 内容高 86 ÷ td 行高 58 = **1.483**，距 `Math.round` 的 1.5 悬崖只差 0.017
+          ⇒ 会误报（格内 `.std-value` 是 64px 字体、td 的 line-height 只是 48px 字体的 normal）。
+          题面口径的 `包围盒高 ÷ td 行高` 仍逐格打印（`ratioByLh`）供人工对照。
+          ⚠️ **不用** `getClientRects().length`：那是行内盒碎片数 —— "参数名＋徽标同排"会被数成 2 而误报。
+       ④ 第 5 格 `.std-derived`：`textContent` 仍含「上限」「下限」两词、计算值 `white-space === nowrap`、
+          `text-overflow !== ellipsis`（不得省略号截断）、且行数 = 1；
+       ⑤ 无横向溢出：任一 `td` 的 `scrollWidth ≤ clientWidth + 1`，且 `Range` 内容宽（÷ 缩放）不超出内容盒 + 2；
+          `table.scrollWidth ≤ table.clientWidth + 1`；
+          （后一个 2 px 容差是**辅助**判据：真机上"参数名＋徽标"格的横向余量本身就只有约 0.5 px，
+            取 1 px 会贴边抖动；真被挤压时超出量是几十像素，2 px 仍然决定性。主判据 `scrollWidth`
+            的 +1 px 容差按题面口径原样保留。）
+       ⑥ 参数名与徽标**同排**且垂直居中对齐：徽标左边界 ≥ 参数名右边界 − 1 px（若徽标折到下一行，
+          它的左边界会退回内容盒左端 ⇒ 差值为负，本条直接变红）；且两者 `top` 差与 `bottom` 差
+          ≤ 参数名单行高的 1/2（基线对齐 ⇒ 同排时差值 ≈ 字号差 × 字体内容比，远小于半行高；
+          折行时差值 ≈ 一个行高 ⇒ 变红）。
+     ⚠️ 强制徽标与全部量测在**同一次 `Runtime.evaluate` 内**完成：页面每秒 tick 会重绘 tbody，
+     跨调用改写会被下一帧冲掉（主代理此前实测过），同一次同步求值内不可能被插入重绘。
+     ⚠️ `#stage` 被 main.js 按 `min(innerWidth/3840, innerHeight/2160)` 等比缩放 ⇒
+     `getBoundingClientRect()` 是**缩放后**的值，`clientWidth` / computed `line-height` 是**未缩放**的布局值，
+     故按 `table.clientWidth` 与 `table` 的 rect 之比归一后再比较（3840×2160 下该比值应为 1）。
+     本段依赖浏览器权限：无 Edge / 沙箱禁命名管道时整脚本在此前已 `skipSuite`（退 3，跳过 ≠ 通过）。 */
+  section('B5b 任务数据页测试标准区 U-4 版面（V1.36 / C-95：3840×2160、强制徽标＝超范围）');
+  await setViewport(3840, 2160);
+  await openPage('?tab=1', 2500);
+  const u4 = await evaluate(`(() => {
+    const table = document.getElementById('tkStdTable');
+    if (!table) return { fatal: '未找到 #tkStdTable（任务数据页未渲染？）' };
+    const badges = [].slice.call(document.querySelectorAll('.std-limits .std-state'));
+    if (!badges.length) return { fatal: '未找到 .std-limits .std-state' };
+    /* ① 强制最坏态：徽标文案＝三字「超范围」（负责人截图里的态），并回读确认 */
+    const forced = badges.map(function (b) { b.textContent = '超范围'; return b.textContent; });
+    const rows = [].slice.call(table.querySelectorAll('tbody tr'));
+    if (!rows.length) return { fatal: '#tkStdTable tbody 没有数据行' };
+    /* 舞台缩放归一：getBoundingClientRect（缩放后）÷ clientWidth（布局） */
+    const tableRect = table.getBoundingClientRect();
+    const scale = table.clientWidth > 0 ? (tableRect.width / table.clientWidth) : 1;
+    /* 隐形探针：复制该段文本的字体，nowrap + absolute ⇒ 高度就是该字体的"单行内容高" */
+    const probeH = function (cs, text) {
+      const s = document.createElement('span');
+      s.style.cssText = 'position:absolute;left:-99999px;top:0;visibility:hidden;white-space:nowrap;';
+      s.style.fontFamily = cs.fontFamily; s.style.fontSize = cs.fontSize;
+      s.style.fontWeight = cs.fontWeight; s.style.fontStyle = cs.fontStyle;
+      s.textContent = text;
+      document.body.appendChild(s);
+      const h = s.getBoundingClientRect().height;
+      s.parentNode.removeChild(s);
+      return h;
+    };
+    const textRuns = function (td) {
+      const out = [];
+      (function walk(el) {
+        [].slice.call(el.childNodes).forEach(function (n) {
+          if (n.nodeType === 3) {
+            if (n.textContent.trim()) out.push({ el: n.parentElement || el, text: n.textContent.trim() });
+          } else if (n.nodeType === 1) { walk(n); }
+        });
+      })(td);
+      return out;
+    };
+    const cells = [];
+    rows.forEach(function (tr) {
+      [].slice.call(tr.children).forEach(function (td, i) {
+        const cs = getComputedStyle(td);
+        /* 逐文本 run 取两个量：
+             ① contentArea＝该 run 的"单行内容高"（同字号同字体族隐形探针实测、落在同一缩放上下文里）；
+             ② advance＝该 run 的"单行推进量"＝ max(内容高, 该 run 自身 line-height × 缩放比)。
+           除数取 run 的 max，**不是** td 的 computed line-height —— 这是实测定点修正：
+           真机探针（tests\\._verify\\u4\\probe2.json，配置 B＝现状 40px/6px）实测「典型值」格
+           内容高 86 / td 行高 58 = **1.483**，离 Math.round 的 1.5 悬崖只差 0.017 —— 因为格内
+           .std-value 是 64px 字体（内容高 ≈1.34em），而 td 的 line-height 只是 48px 字体的
+           normal（≈1.21em）。按 run 取 max 后：单行时除数恰等于内容高 ⇒ 比值 **1.000**（离 1.5 有 0.5 余量）；
+           断成两行时包围盒＝内容高＋行推进 ⇒ 比值 ≈1.78–1.90 ⇒ 取整 2（离 1.5 同样有余量）。
+           两侧都不贴边 ⇒ 该指标在真机上既不误报也不漏报。题面口径的「包围盒高 ÷ td 行高」
+           仍逐格打印（ratioByLh）供人工对照。 */
+        let contentArea = 0, areaSrc = '（格内无可测文本）', advance = 0, advSrc = '（同左）';
+        textRuns(td).forEach(function (r) {
+          const rcs = getComputedStyle(r.el);
+          const h = probeH(rcs, r.text);
+          const rlh = parseFloat(rcs.lineHeight);
+          const adv = Math.max(h, isFinite(rlh) && rlh > 0 ? rlh * scale : 0);
+          if (h > contentArea) { contentArea = h; areaSrc = rcs.fontSize + ' × ' + JSON.stringify(r.text.slice(0, 8)); }
+          if (adv > advance) { advance = adv; advSrc = rcs.fontSize + ' 行高=' + (isFinite(rlh) && rlh > 0 ? rlh + 'px' : 'normal'); }
+        });
+        const tdLh = parseFloat(cs.lineHeight);
+        const divisor = advance;
+        const range = document.createRange();
+        range.selectNodeContents(td);
+        const rb = range.getBoundingClientRect();
+        const pL = parseFloat(cs.paddingLeft) || 0, pR = parseFloat(cs.paddingRight) || 0;
+        const innerW = td.clientWidth - pL - pR;
+        const innerOverflow = scale > 0 ? (rb.width / scale - innerW) : 0;
+        const badge = td.querySelector('.std-state');
+        let pair = null;
+        if (badge) {
+          const tn = [].slice.call(td.childNodes).filter(function (n) {
+            return n.nodeType === 3 && n.textContent.trim();
+          })[0];
+          if (tn) {
+            const nr = document.createRange();
+            nr.selectNodeContents(tn);
+            const nb = nr.getBoundingClientRect(), bb = badge.getBoundingClientRect();
+            pair = {
+              nameRight: +nb.right.toFixed(2), badgeLeft: +bb.left.toFixed(2),
+              leftGap: +(bb.left - nb.right).toFixed(2),
+              topDiff: +Math.abs(bb.top - nb.top).toFixed(2),
+              bottomDiff: +Math.abs(bb.bottom - nb.bottom).toFixed(2),
+              nameH: +nb.height.toFixed(2)
+            };
+          }
+        }
+        cells.push({
+          row: tr.getAttribute('data-kind'), col: i, cls: String(td.className),
+          text: td.textContent.trim().slice(0, 40),
+          contentH: +rb.height.toFixed(2), contentArea: +contentArea.toFixed(2),
+          divisor: +divisor.toFixed(2), areaSrc: areaSrc, advSrc: advSrc,
+          ratio: divisor > 0 ? +(rb.height / divisor).toFixed(3) : null,
+          ratioByLh: (isFinite(tdLh) && tdLh > 0) ? +(rb.height / (tdLh * scale)).toFixed(3) : null,
+          lines: divisor > 0 ? Math.round(rb.height / divisor) : null,
+          scrollW: td.scrollWidth, clientW: td.clientWidth,
+          innerW: +innerW.toFixed(2), innerOverflow: +innerOverflow.toFixed(2),
+          nowrap: cs.whiteSpace, textOverflow: cs.textOverflow, pair: pair
+        });
+      });
+    });
+    return {
+      viewport: [window.innerWidth, window.innerHeight],
+      scale: +scale.toFixed(4),
+      forced: forced, rowCount: rows.length, cells: cells,
+      table: { scrollW: table.scrollWidth, clientW: table.clientWidth }
+    };
+  })()`);
+
+  if (!u4 || u4.fatal) {
+    /* 取不到被测对象 ⇒ FAIL（不得静默通过、也不兜底成"跳过"） */
+    check('B5b/U-4 任务数据页测试标准区可在真机量测（?tab=1、#tkStdTable 两行、徽标齐备）',
+      false, (u4 && u4.fatal) || 'evaluate 未返回结果');
+  } else {
+    const cellBrief = c => `${c.row}.${c.col}[${c.cls.replace(/\s+/g, '/')}] 包围盒高=${c.contentH}` +
+      ` ÷ 单行推进(${c.advSrc})=${c.divisor} = ${c.ratio} ⇒ ${c.lines} 行（内容高=${c.contentArea}，` +
+      `题面口径 包围盒高÷td行高=${c.ratioByLh}）`;
+    check('B5b/U-4 最坏态「超范围」已真实复现且结构齐备：两行 × 5 格 × 每行 1 个徽标，徽标文案实测为三字',
+      u4.rowCount === 2 && u4.cells.length === 10 && u4.forced.length === 2 &&
+      u4.forced.every(t => t === '超范围') && u4.cells.filter(c => c.pair).length === 2,
+      `视口=${u4.viewport[0]}×${u4.viewport[1]}（stage scale=${u4.scale}）；行数=${u4.rowCount}、格数=${u4.cells.length}；` +
+      `徽标强制后文案=[${u4.forced.join('、')}]（应 2 个「超范围」）；带"参数名＋徽标"的格=${u4.cells.filter(c => c.pair).length} 个`);
+    check('B5b/U-4 每个 td 的内容只占一行（Range 包围盒高 ÷ 单行基准 取整 === 1；逐格打印实测值）',
+      u4.cells.length === 10 && u4.cells.every(c => c.lines === 1),
+      u4.cells.map(cellBrief).join('；'));
+    const dc = u4.cells.filter(c => /std-derived/.test(c.cls));
+    check('B5b/U-4 第 5 格只读导出值一行显示、不截断、不丢字（含「上限」「下限」两词 + computed white-space=nowrap + 非 ellipsis + 行数=1）',
+      dc.length === 2 && dc.every(c => c.text.includes('上限') && c.text.includes('下限') &&
+        c.nowrap === 'nowrap' && c.textOverflow !== 'ellipsis' && c.lines === 1),
+      dc.map(c => `${c.row}: 文本=${JSON.stringify(c.text)}、含上限=${c.text.includes('上限')}、含下限=${c.text.includes('下限')}、` +
+        `white-space=${c.nowrap}、text-overflow=${c.textOverflow}、行数=${c.lines}`).join('；') ||
+      '（未找到 .std-derived 格 —— 取不到即 FAIL）');
+    check('B5b/U-4 任一 td 无横向溢出（scrollWidth ≤ clientWidth + 1），且 Range 内容宽（÷ 缩放）不超出内容盒 + 2 px',
+      u4.cells.length === 10 && u4.cells.every(c => c.scrollW <= c.clientW + 1 && c.innerOverflow <= 2),
+      u4.cells.map(c => `${c.row}.${c.col}: scrollWidth=${c.scrollW}/clientWidth=${c.clientW}、` +
+        `内容宽−内容盒=${c.innerOverflow}（内容盒=${c.innerW}）`).join('；'));
+    check('B5b/U-4 表格无横向溢出（table.scrollWidth ≤ table.clientWidth + 1）',
+      u4.table.scrollW <= u4.table.clientW + 1,
+      `table.scrollWidth=${u4.table.scrollW} / table.clientWidth=${u4.table.clientW}`);
+    const pairs = u4.cells.filter(c => c.pair && /std-name/.test(c.cls));
+    check('B5b/U-4 参数名与三态徽标同排且垂直居中对齐（徽标左边界 ≥ 参数名右边界 − 1 px；顶差/底差 ≤ 参数名单行高的 1/2）',
+      pairs.length === 2 && pairs.every(c => c.pair.leftGap >= -1 &&
+        c.pair.topDiff <= c.pair.nameH / 2 && c.pair.bottomDiff <= c.pair.nameH / 2),
+      pairs.map(c => `${c.row}: 参数名右边界=${c.pair.nameRight}、徽标左边界=${c.pair.badgeLeft}（间距=${c.pair.leftGap}）、` +
+        `顶差=${c.pair.topDiff}、底差=${c.pair.bottomDiff}（容差=参数名单行高 ${c.pair.nameH} 的一半=${(c.pair.nameH / 2).toFixed(2)}）`)
+        .join('；') || '（未找到 .std-name 格或其中缺「参数名＋徽标」—— 取不到即 FAIL）');
   }
   await cdp.send('Emulation.clearDeviceMetricsOverride');
 

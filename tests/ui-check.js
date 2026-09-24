@@ -1512,15 +1512,22 @@ async function main() {
       `depth 典型值格文本=${JSON.stringify(stdCellText(stdCell(rows, 'depth', 'depthTypical')))}；` +
       `正文含 .std-dev=${/std-dev/.test(String(fx.node('tkStdTable tbody').innerHTML))}`
     );
+    /* V1.36（U-5 / C-96）改判：说明行由长句精简为**只有一句** ⇒ 判据从"包含若干片段"改为
+       **逐字相等**（`===`，不是正则 test），并**反向**断言长句与尾部 meta 均已删除（防回潮）。
+       ⚠️ 为什么不能顺手把"上下限为只读导出值 / 典型值不参与判定"一起删掉：
+       那是**界面语义**，不是这句文案的属性 —— 按 C-96「信息不丢失」的口径，它由**第 5 格
+       `.std-derived`**（无 `data-edit`、无 `std-num`、导出值实算，见上方两条既有断言）与
+       三个 `data-edit` 单元格集合承担；本段不重复断言它们，但也**不得**因文案精简而失去该证据。 */
+    const metaText = String(fx.node('tkStdMeta').textContent || '');
+    const META_ONLY = '典型值 / 上偏差 / 下偏差三格可录入';
+    const metaBanned = ['上限＝', '下限＝', '只读导出值', '不参与判定', '班组', '生效时间', '版本'];
+    const metaHits = metaBanned.filter(s => metaText.includes(s));
     check(
-      'FR-3.18 典型值可录入但不参与判定：#tkStdMeta 写明"三格可录入""上下限为只读导出值""典型值不参与判定"，且渲染不写 state',
-      /典型值 \/ 上偏差 \/ 下偏差三格可录入/.test(String(fx.node('tkStdMeta').textContent || '')) &&
-      /上限＝典型值＋上偏差/.test(String(fx.node('tkStdMeta').textContent || '')) &&
-      /下限＝典型值＋下偏差/.test(String(fx.node('tkStdMeta').textContent || '')) &&
-      /只读导出值/.test(String(fx.node('tkStdMeta').textContent || '')) &&
-      /典型值不参与判定/.test(String(fx.node('tkStdMeta').textContent || '')) &&
-      fx.state.task.standard === undefined,
-      `#tkStdMeta=${JSON.stringify(String(fx.node('tkStdMeta').textContent || '').slice(0, 96))}；` +
+      'FR-3.18（U-5 / C-96）说明行逐字只有一句「典型值 / 上偏差 / 下偏差三格可录入」：不含导出公式长句、' +
+      '不含「只读导出值」「典型值不参与判定」、不含尾部 meta（班组/生效时间/版本），且渲染仍不写 state',
+      metaText === META_ONLY && metaHits.length === 0 && fx.state.task.standard === undefined,
+      `#tkStdMeta=${JSON.stringify(metaText)}（应逐字等于 ${JSON.stringify(META_ONLY)}）；` +
+      `反向命中（应为空）=[${metaHits.join('、')}]；` +
       `state.task.standard=${fx.state.task.standard === undefined ? '未建（渲染不写入）' : '已被渲染建立'}`
     );
 
@@ -1763,6 +1770,61 @@ async function main() {
         String(menuRule.flex || '').replace(/\s+/g, '') === 'none',
         `.std-limits flex=${JSON.stringify(limitsRule.flex || '（缺）')}、height=${JSON.stringify(limitsRule.height || '（缺）')}、` +
         `min-height=${JSON.stringify(limitsRule['min-height'] || '（缺）')}；.camera-menu flex=${JSON.stringify(menuRule.flex || '（缺）')}`
+      );
+    }
+
+    /* ---- (d3) U-4（C-95）"预期外换行"的**声明层**机器证据（纯 CSS 可查，与真机判据互补） ----
+       立案（V1.36 / C-95，负责人手动测试反馈 U-4，真机截图复现）：三态徽标由 2 字变 3 字
+       （「超范围」）后，参数名列变宽 ⇒ 5 列最大内容宽之和超出卡片可用宽 ⇒ 浏览器按自动表格布局
+       **挑一列断行**，而当时唯一允许换行的第 5 格（`.std-derived` 旧版 `white-space: normal`）被压成两行。
+       故**根因修复点就是第 5 格的 `white-space: nowrap`**，本段把它单独点名（改回 normal 即红）。
+       ⚠️ `.std-limits th` 的 `white-space: normal` 是**有意保留**的既有设计（需求 C-95 原文：
+       "表头仍允许换行（既有设计，本次不动）"）—— 这里写成**正向**断言，防止有人"顺手统一成 nowrap"。
+       本段只查**声明**（静态、离线可复跑）；同一条要求在真机的**渲染结果**由 browser-check 的
+       B5b 段（3840×2160、强制徽标＝超范围、逐格量包围盒）承接。 */
+    {
+      const rulesCss = parseCss(readText('src/styles/global.css'));
+      /** 读某选择器的 `white-space` 声明；读不到返回 '（缺）'（不得兜底成 nowrap，否则删规则也变绿） */
+      const wsOf = sel => {
+        const d = rulesCss.get(sel);
+        return d && d['white-space'] !== undefined ? String(d['white-space']).trim() : '（缺）';
+      };
+      const derivedWs = wsOf('.std-limits.compact .std-derived');
+      const stateWs = wsOf('.std-limits .std-state');
+      const nameWs = wsOf('.std-limits.compact .std-name');
+      const thWs = wsOf('.std-limits th');
+      check(
+        'FR-3.18（U-4 / C-95）**根因修复点**：第 5 格只读导出值不换行 —— `.std-limits.compact .std-derived` 的 white-space === nowrap',
+        derivedWs === 'nowrap',
+        `.std-limits.compact .std-derived white-space=${JSON.stringify(derivedWs)}（应 nowrap；旧版为 normal ⇒ 被三字徽标挤成两行）`
+      );
+      check(
+        'FR-3.18（U-4 / C-95）参数名与三态徽标同排不换行：`.std-limits.compact .std-name` 与 `.std-limits .std-state` 的 white-space 均 === nowrap',
+        nameWs === 'nowrap' && stateWs === 'nowrap',
+        `.std-limits.compact .std-name white-space=${JSON.stringify(nameWs)}、` +
+        `.std-limits .std-state white-space=${JSON.stringify(stateWs)}（均应 nowrap）`
+      );
+      check(
+        'FR-3.16（U-4 / C-95 有意保留）表头仍允许换行：`.std-limits th` 的 white-space === normal（正向断言，防"顺手改掉"）',
+        thWs === 'normal',
+        `.std-limits th white-space=${JSON.stringify(thWs)}（需求 C-95 明示"表头仍允许换行，本次不动"）`
+      );
+      /* 宽度账的两个余量来源（U-1 字号区间的**上界** 40 px ＋ 单元格横向内边距 6 px）：
+         C-95 的修法"限于样式与列宽"，即靠这两项给 5 列最大内容宽之和腾出余量。
+         `padding` 简写按 CSS 展开规则取横向值（1 值＝四边相同；2/3 值＝第 2 个值；4 值＝第 2、4 个）。 */
+      const derivedPx = fontPx(rulesCss, '.std-limits.compact .std-derived');
+      const padRaw = String((rulesCss.get('.std-limits.compact td') || {}).padding || '').trim();
+      const padParts = padRaw.split(/\s+/).filter(Boolean);
+      const padH = padParts.length === 0 ? []
+        : padParts.length === 1 ? [padParts[0], padParts[0]]
+          : padParts.length === 4 ? [padParts[1], padParts[3]]
+            : [padParts[1], padParts[1]];
+      const padHOk = padH.length === 2 && padH.every(v => /^6px$/.test(v));
+      check(
+        'FR-3.18（U-4 / C-95 宽度账）第 5 格字号取 U-1 区间 [36,40] px（实测上界 40）且 `.std-limits.compact td` 横向内边距 6 px（余量来源）',
+        typeof derivedPx === 'number' && derivedPx >= 36 && derivedPx <= 40 && padHOk,
+        `.std-derived font-size=${derivedPx} px（应 ∈[36,40]）；.std-limits.compact td padding=${JSON.stringify(padRaw || '（缺）')}` +
+        ` ⇒ 横向=[${padH.join('、')}]（应 6px/6px）`
       );
     }
 

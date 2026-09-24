@@ -1,6 +1,8 @@
 /* ==========================================================================
    组件：任务数据页（components/TaskPanel.js）
-   需求版本：V1.35（按 C-90 / C-91 改「显示与录入对象」：上限/下限绝对值 → 典型值/上偏差/下偏差）
+   需求版本：V1.36（V1.36 / C-96（U-5） 精简测试标准区说明行文案：`#tkStdMeta` 只留一句「典型值 / 上偏差 /
+              下偏差三格可录入」，删去导出公式长句与尾部 meta（班组/生效时间/版本）；
+              V1.35 / C-90 + C-91 起「显示与录入对象」＝典型值 / 上偏差 / 下偏差，上限/下限为导出值）
    需求：FR-3 工单信息、实时实测数据、测试进度与结果
          FR-3.16 任务数据页右下角为**测试标准区**（深度/速度的典型值、上偏差、下偏差）；
                          相机参数移入**二级菜单**，菜单项**只含参数名 + 设定值**
@@ -37,6 +39,11 @@
        （任一校验不通过时 `state.task.standard` **逐字不变**、不留半成品）；单人操作、无二次复核；
        历史判定**不追溯**。
      - 数值/单位/精度/量程/三态阈值一律取自 config/board.config.js 的 `standards` 段与 state，**不写死**。
+   口径（V1.36 / C-96（U-5）：说明行文案精简）：
+     - `#tkStdMeta` 逐字为「典型值 / 上偏差 / 下偏差三格可录入」**一句、无括号、无 meta 后缀**；
+       index.html 的初值与渲染结果同句（锁定态的 `#tkStdMsg` 文案不动）。
+     - 界面事实未因此丢失：班组在页头常显（FR-1.6）、标准生效时间与版本仍在留痕与操作日志
+       （FR-3.19⑦）、上限/下限本身仍以第 5 格**只读导出值**呈现在界面上。
    ========================================================================== */
 window.Components = window.Components || {};
 window.Components.TaskPanel = (function () {
@@ -576,21 +583,18 @@ window.Components.TaskPanel = (function () {
    * 测试标准区（FR-3.18 / V1.35 / C-90）：**典型值 / 上偏差 / 下偏差三格可录入**，
    * 上限＝典型值＋上偏差、下限＝典型值＋下偏差作为**只读导出值**在第 5 格给出（不含 std-num、无 data-edit）。
    * 任一必要项（典型值 / 上偏差 / 下偏差）缺失 ⇒ 该格显示 `—`，且该行**不产生**导出上下限（导出格 `—`）。
+   *
+   * 说明行文案（V1.36 / C-96，负责人手动测试反馈 U-5）：`#tkStdMeta` **只保留一句**「典型值 / 上偏差 / 下偏差三格可录入」——
+   * 精简掉原长句（导出公式与"典型值不参与判定"）与尾部括号 meta（班组 / 标准生效时间 / 版本）。
+   * 界面事实未丢失：班组在页头常显（FR-1.6）、生效时间与版本仍在留痕与操作日志（FR-3.19⑦）、
+   * 导出的上下限本身仍以第 5 格只读值呈现在界面上。故本函数**不再计算 meta**，也不带任何括号后缀。
    */
   function renderStandards(state) {
     const task = (state && state.task) || {};
     const table = $('tkStdTable');
     const tbody = table ? table.querySelector('tbody') : null;
 
-    const meta = [];
-    const shift = (state && state.shift) || {};
-    if (shift.team) meta.push('班组 ' + shift.team);
-    const std = task.standard;
-    if (std && std.effectiveAt) meta.push('标准生效时间 ' + std.effectiveAt);
-    if (std && std.revision) meta.push('版本 V' + std.revision);
-    setText('tkStdMeta', '典型值 / 上偏差 / 下偏差三格可录入；上限＝典型值＋上偏差、下限＝典型值＋下偏差' +
-      '为只读导出值；典型值不参与判定（判定对象＝导出的上下限）' +
-      (meta.length ? '（' + meta.join(' · ') + '）' : ''));
+    setText('tkStdMeta', '典型值 / 上偏差 / 下偏差三格可录入');
 
     if (tbody) {
       tbody.innerHTML = ['depth', 'speed'].map(kind => {
