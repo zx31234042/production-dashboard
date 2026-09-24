@@ -1,26 +1,42 @@
 /* ==========================================================================
    组件：任务数据页（components/TaskPanel.js）
-   需求版本：V1.34
+   需求版本：V1.35（按 C-90 / C-91 改「显示与录入对象」：上限/下限绝对值 → 典型值/上偏差/下偏差）
    需求：FR-3 工单信息、实时实测数据、测试进度与结果
-         FR-3.16（改写）任务数据页右下角为**测试标准区**（深度/速度的上下限偏差与典型值）；
+         FR-3.16 任务数据页右下角为**测试标准区**（深度/速度的典型值、上偏差、下偏差）；
                          相机参数移入**二级菜单**，菜单项**只含参数名 + 设定值**
                          （不做状态判定、不显示实测值/偏差）
          FR-3.5～3.8（改归属）相机设定深度/增益/帧率/快门速度的**设定值**由二级菜单承载
-         FR-3.18（新增）上下限与典型值**显示**：正负偏差形式；典型值只显示、不参与判定；
-                         超范围红、临近黄（三态仅用于深度与速度）
-         FR-3.19（新增）上下限**录入与修改**：八步逻辑（解锁 → 任务数据页 → 点上限/下限数字 →
-                         反色+高亮框+0.5 s 闪烁 → 输入 → 回车或点击其他区域退出并注入 →
-                         校验「非法值」「小数位非法（> standards.digits）」「下限 ≤ 上限」
-                         「典型值在上下限之间」「超量程（standards.range）」—— 任一不通过即弹窗且不写入 →
-                         留痕（内容/时间戳/班组编号）→ 主动锁定或长时间无操作即锁定，锁定后点数字无响应）
-         FR-3.14（判定对象改写）三态判定的对象是深度与速度
-         AC-09 未解锁不得修改测试标准上下限（任务数据页入口同受密码保护）
-   口径（2026-09-22 负责人拍定，方案来源：项目记录\需求变更草案-V1.32-标准值录入与显示.md）：
-     - 基准＝典型值；上限＝典型值＋上偏差、下限＝典型值＋下偏差；按正负偏差显示与录入；
-       下偏差默认负、上偏差默认正；输入不带正负号则按默认口径处理。
-     - 典型值**只显示**；判定只用上下限；修改前不改动现有值与显示；单人操作、无二次复核；
+         FR-3.18（V1.35 / C-90 改显示对象）**显示**：深度与速度分别显示**典型值、上偏差、下偏差**
+                         （三者均为录入单元格），并由 `上限＝典型值＋上偏差`、`下限＝典型值＋下偏差`
+                         **导出**上下限（表内第 5 格以**只读导出值**给出，供判定核对）；
+                         单位 深度 m / 速度 m/s，均两位小数；超范围红、临近黄（三态仅用于深度与速度）；
+                         典型值可录入可修改，**但不参与判定**（判定对象＝导出的上下限）
+         FR-3.19（V1.35 / C-90 + C-91）三个单元格的**录入与修改**：八步逻辑
+                         （解锁 → 任务数据页 → ③点**典型值/上偏差/下偏差**任一数字 →
+                         ④反色 + 高亮框 2 px + **1 s ± 50 ms** 闪烁 → ⑤输入（下偏差默认负、
+                         上偏差默认正、不带符号按默认口径；典型值为非负绝对量、不带符号）→
+                         ⑥回车或点击其他区域退出并注入；先校验、任一不通过即弹窗且**不写入**：
+                           a) 非法值（非数值）/ 小数位非法（> standards.digits）
+                           b) `下偏差 ≤ 上偏差`（按两位小数取整后的隐含下限比较）
+                           c) `上偏差 ≥ 0 ≥ 下偏差`（典型值存在时；等价"典型值在导出上下限之间"）
+                              —— 典型值为空时跳过本项
+                           d) 上/下偏差须**同时存在或同时为空**
+                           e) 超量程：按**导出的上/下限绝对值**是否落在 `standards.range[kind]`（深度 4～6 m、
+                              速度 3～8 m/s，单一真源在 config/board.config.js）内
+                         → ⑦**成功与被拒均逐单元格留痕**（成功记被改单元格 + 前后值 + 导出上下限 + 时间戳 + 班组编号；
+                             被拒记被改单元格 + 拒绝原因 + 时间戳 + 班组编号，两者同一条可对号）
+                         → ⑧主动锁定或 5 分钟无操作即锁定，锁定后点数字不响应）
+                         改典型值 ⇒ 上下限随偏差**整体平移**；改偏差 ⇒ **仅对应一侧**变化
+         FR-3.14 三态判定的对象是**导出的上下限**，参数只有深度与速度
+         AC-09 未解锁不得修改测试标准（任务数据页入口同受密码保护）
+   口径（V1.35：负责人 2026-09-24 手动测试反馈裁定 U-3 / C-90 + C-91）：
+     - 录入对象＝典型值 / 上偏差 / 下偏差，**三个单元格均可录入**；
+       上限＝典型值＋上偏差、下限＝典型值＋下偏差为**导出值**（只读，不参与录入）。
+     - 下偏差默认负、上偏差默认正；输入不带正负号按默认口径处理；典型值为非负绝对量、不带符号。
+     - 典型值**可录入、可修改，但不参与判定**；判定只用导出的上下限；修改前不改动现有值与显示
+       （任一校验不通过时 `state.task.standard` **逐字不变**、不留半成品）；单人操作、无二次复核；
        历史判定**不追溯**。
-     - 数值/单位/精度/三态阈值一律取自 config/board.config.js 的 `standards` 段与 state，**不写死**。
+     - 数值/单位/精度/量程/三态阈值一律取自 config/board.config.js 的 `standards` 段与 state，**不写死**。
    ========================================================================== */
 window.Components = window.Components || {};
 window.Components.TaskPanel = (function () {
@@ -49,6 +65,17 @@ window.Components.TaskPanel = (function () {
   ];
 
   const PARAM_LABEL = { depth: '深度', speed: '速度' };
+
+  /* 三个可录入单元格（FR-3.19③ / C-90）：单元格后缀 → state 字段。
+     后缀与 DR-03 / 服务端的字段名**同名**（`depthTypical` / `depthUpperDev` / `depthLowerDev`），
+     于是 `data-edit` 值、留痕文案、落库字段三处可一一对应，不再各起一套名字。 */
+  const FIELDS = [
+    { suffix: 'Typical',  key: 'typical',  name: '典型值' },
+    { suffix: 'UpperDev', key: 'upperDev', name: '上偏差' },
+    { suffix: 'LowerDev', key: 'lowerDev', name: '下偏差' }
+  ];
+  const FIELD_OF = {};
+  FIELDS.forEach(f => { FIELD_OF[f.suffix] = f; });
 
   /* 演示用兜底标准（仅当配置段缺失时生效；运行时真源是 state.task.standard）——
      取值与 config `standards.default` 同步（深度量程 [4, 6] m 由负责人 2026-09-22 确认） */
@@ -128,8 +155,9 @@ window.Components.TaskPanel = (function () {
   }
 
   /**
-   * 是否满足"有标准可显示"：必要项＝典型值＋上偏差＋下偏差。
-   * **典型值只显示、不参与判定** —— 少了偏差就不算"标准已设定"（R-18 判据）。
+   * 是否满足"有标准可显示"：必要项＝典型值＋上偏差＋下偏差（V1.35：三格均可录入）。
+   * **典型值可录入、可修改，但不参与判定** —— 少了任一必要项就不算"标准已设定"（R-18 判据），
+   * 此时该行不产生导出上下限、三态为 idle（标准未设定）。
    */
   function hasStandard(state, kind) {
     const row = ensureRow(state, kind);
@@ -198,29 +226,32 @@ window.Components.TaskPanel = (function () {
 
   /* ---------------- 录入会话（FR-3.19 第 3～6 步） ---------------- */
 
-  function labelOf(type) {
-    const kind = type.indexOf('depth') === 0 ? 'depth' : 'speed';
-    return PARAM_LABEL[kind] + (type.indexOf('Upper') > 0 ? '上限' : '下限');
-  }
-
+  /** 录入单元格类型：`{depth|speed}{Typical|UpperDev|LowerDev}`（FR-3.19③ / C-90） */
   function kindOf(type) {
     return type.indexOf('depth') === 0 ? 'depth' : 'speed';
   }
 
-  function sideOf(type) {
-    return type.indexOf('Upper') > 0 ? 'upper' : 'lower';
+  /** 该单元格对应的字段规格（{ suffix, key, name }）；不在三格之内 ⇒ null */
+  function fieldOf(type) {
+    return FIELD_OF[type.slice(kindOf(type).length)] || null;
   }
 
-  /** 第 3～4 步：点击上限/下限数字 ⇒ 反色 + 高亮框 + 0.5 s 闪烁，随后进入输入 */
+  /** 录入行的标题文案：「深度 典型值」/「深度 上偏差」/「深度 下偏差」（渲染时前置"录入 "） */
+  function labelOf(type) {
+    const f = fieldOf(type);
+    return PARAM_LABEL[kindOf(type)] + (f ? ' ' + f.name : '');
+  }
+
+  /** 第 3～4 步：点击典型值/上偏差/下偏差数字 ⇒ 反色 + 高亮框（2 px）+ 1 s ± 50 ms 闪烁，随后进入输入 */
   function startSession(state, type) {
     if (!state || !state.unlocked) return;      /* 第 8 步：锁定后点击数字无响应 */
+    if (!fieldOf(type)) return;                 /* 非三格之一（旧上限/下限格已不存在）不进入录入态 */
     session = { type };
     lastErr = null;
     lastInfo = null;
-    const row = ensureRow(state, kindOf(type)) || {};
     activity();
     render(state);                              /* 先画出闪烁中的数字（第 4 步） */
-    /* 0.3 s 后聚焦输入框；闪烁自点击瞬间就在跑，闪烁周期 = 0.5 s */
+    /* 0.3 s 后聚焦输入框；闪烁自点击瞬间就在跑，闪烁周期由 styles/global.css 定为 1 s */
     window.setTimeout(() => {
       if (!session || session.type !== type) return;
       const input = document.getElementById(DOM_INPUT);
@@ -257,9 +288,14 @@ window.Components.TaskPanel = (function () {
   /**
    * 第 6 步：回车或点击其他区域 ⇒ 退出录入并注入。**先校验、后注入** —— 任何一支不通过都立即
    * return，既不写 state、也不改动显示（FR-3.19 第⑥步 + 配套约束"修改成功前不改动现有值与显示"）。
-   * 校验分支（FR-3.19 第⑥步："非法值、超量程或小数位非法一律弹窗提醒、不写入"）：
-   *   ① 非法值（非数值）；② 小数位非法（> `standards.digits`）；③「下限 ≤ 上限」；
-   *   ④「典型值在上下限之间」（典型值尚未设定的组合不做本项）；⑤ 超量程（`standards.range[kind]`）。
+   * 校验分支（V1.35 / C-91 按**偏差模型**重述，判定对象仍是**导出的上下限**）：
+   *   ① 非法值（非数值）；② 典型值带负号（非负绝对量、不带符号）；
+   *   ③ 小数位非法（> `standards.digits`）；
+   *   ④ 上偏差与下偏差**须同时存在或同时为空**；
+   *   ⑤ `下偏差 ≤ 上偏差`（按两位小数取整后的**隐含下限/上限**比较）；
+   *   ⑥ `上偏差 ≥ 0 ≥ 下偏差`（典型值存在时；等价"典型值在导出上下限之间"）—— 典型值为空时跳过；
+   *   ⑦ 超量程：按**导出的上/下限绝对值**是否落在 `standards.range[kind]` 内。
+   * 校验全程只读 state：候选值写在**临时对象** `next` 上，故任一不通过时 `state.task.standard` 逐字不变。
    */
   function commitSession(state) {
     if (!session) return;
@@ -270,85 +306,138 @@ window.Components.TaskPanel = (function () {
     clearEditor();
 
     const kind = kindOf(type);
-    const side = sideOf(type);
+    const f = fieldOf(type);
     const row = ensureRow(state, kind);
-    if (!row) return;
+    if (!row || !f) return;
     const digits = typeof row.digits === 'number' ? row.digits : STD_DIGITS;
+    const label = labelOf(type);
 
-    /* 下偏差默认负、上偏差默认正；输入不带正负号则按默认口径处理 */
-    const n = normalizeNum(typed, side);
+    /* 校验①：非法值（非数值） */
+    const n = normalizeNum(typed, f.key);
     if (n === null) {
-      fail(state, '「' + labelOf(type) + '」未识别到有效数值，本次不写入（原有数值与显示保持不变）');
+      fail(state, label, '「' + label + '」未识别到有效数值，本次不写入（原有数值与显示保持不变）');
       return;
     }
-
-    /* 校验一：小数位非法（FR-3.19 第⑥步）。精度由配置单一真源 `standards.digits` 决定（默认 2），
-       多于该位数一律拒绝 —— 绝不让 normalizeNum 把任意位数的小数照单全收地写进偏差。 */
+    /* 校验②：典型值为**非负绝对量、不带符号**（FR-3.19⑤）—— 输入负号一律拒绝，不做"取绝对值"的猜测 */
+    if (f.key === 'typical' && /^-/.test(normalizeChars(typed))) {
+      fail(state, label, '校验未通过：典型值为非负绝对量、不带符号（本次输入 "' + String(typed) +
+        '" 带负号），本次不写入');
+      return;
+    }
+    /* 校验③：小数位非法（FR-3.19 第⑥步）。精度由配置单一真源 `standards.digits` 决定（默认 2），
+       多于该位数一律拒绝 —— 绝不让 normalizeNum 把任意位数的小数照单全收地写进标准值。 */
     const typedDigits = decimalsOf(typed);
     if (typedDigits > digits) {
-      fail(state, '校验未通过：小数位非法，「' + labelOf(type) + '」最多 ' + digits + ' 位小数（本次输入 ' +
+      fail(state, label, '校验未通过：小数位非法，「' + label + '」最多 ' + digits + ' 位小数（本次输入 ' +
         typedDigits + ' 位），本次不写入');
       return;
     }
 
-    const before = limitOf(row, side);
-    const upperDev = side === 'upper' ? n : row.upperDev;
-    const lowerDev = side === 'lower' ? n : row.lowerDev;
-    const upper = isNum(upperDev) ? round2(row.typical + upperDev) : null;
-    const lower = isNum(lowerDev) ? round2(row.typical + lowerDev) : null;
+    /* 校验：把本次输入替换到**临时规格**上（不碰 state，也不碰 row） */
+    const next = {
+      typical: f.key === 'typical' ? n : row.typical,
+      upperDev: f.key === 'upperDev' ? n : row.upperDev,
+      lowerDev: f.key === 'lowerDev' ? n : row.lowerDev
+    };
+    const hasU = isNum(next.upperDev);
+    const hasL = isNum(next.lowerDev);
+    const hasT = isNum(next.typical);
 
-    /* 校验二：下限 ≤ 上限 */
-    if (isNum(upper) && isNum(lower) && lower > upper) {
-      fail(state, '校验未通过：下限 ' + fmt(lower, row.digits) + ' 大于上限 ' + fmt(upper, row.digits) +
-        '（上限＝典型值＋上偏差、下限＝典型值＋下偏差），本次不写入');
+    /* 校验④：上/下偏差须**同时存在或同时为空**（FR-3.19⑥ 既有规则）—— 半套偏差无法形成区间 */
+    if (hasU !== hasL) {
+      fail(state, label, '校验未通过：上偏差与下偏差必须同时存在或同时为空（当前'
+        + (hasU ? '只设了上偏差' : '只设了下偏差') + '），本次不写入');
       return;
     }
-    /* 校验三：典型值在上下限之间 */
-    if (isNum(row.typical) && isNum(upper) && isNum(lower) &&
-        (row.typical > upper || row.typical < lower)) {
-      fail(state, '校验未通过：典型值 ' + fmt(row.typical, row.digits) + ' 不在上下限 [' +
-        fmt(lower, row.digits) + ', ' + fmt(upper, row.digits) + '] 之间，本次不写入');
-      return;
+
+    /* 导出上限/下限（典型值与偏差都齐备时才有值；缺任一项 ⇒ null，"缺项不产生导出值"） */
+    const upper = (hasT && hasU) ? round2(next.typical + next.upperDev) : null;
+    const lower = (hasT && hasL) ? round2(next.typical + next.lowerDev) : null;
+
+    /* 校验⑤：下偏差 ≤ 上偏差 —— 比较的是**两位小数取整后的隐含下限/上限**（C-84 D-3 / C-91）。
+       典型值为空时仍校本项（用偏差自身比较，等价于以 0 为基准的同一约束）。 */
+    if (hasU && hasL) {
+      const upCmp = isNum(upper) ? upper : round2(next.upperDev);
+      const loCmp = isNum(lower) ? lower : round2(next.lowerDev);
+      if (loCmp > upCmp) {
+        fail(state, label, '校验未通过：下偏差 ≤ 上偏差 不成立（导出下限 ' + fmt(loCmp, digits) + ' 大于导出上限 ' +
+          fmt(upCmp, digits) + '；上限＝典型值＋上偏差、下限＝典型值＋下偏差），本次不写入');
+        return;
+      }
     }
-    /* 校验四：超量程（FR-3.19 第⑥步）—— 量程取自配置**单一真源** `standards.range[参数种类]`，
-       校验本次录入得到的上限/下限**绝对值**是否落在量程内；越界即拒绝（实现里不写死量程数值）。 */
+    /* 校验⑥：上偏差 ≥ 0 ≥ 下偏差（典型值存在时）。等价于"典型值落在导出的上下限之间"（C-91）；
+       典型值为空 ⇒ **跳过本项**（IF-B.5"只设偏差未设典型值"的兼容防御分支）。 */
+    if (hasT && hasU && hasL) {
+      if (round2(next.upperDev) < 0) {
+        fail(state, label, '校验未通过：上偏差 ' + devTxt(next.upperDev, digits) + ' 小于 0（要求上偏差 ≥ 0 ≥ 下偏差）⇒' +
+          '典型值 ' + fmt(next.typical, digits) + ' 高于导出上限 ' + fmt(upper, digits) + '，本次不写入');
+        return;
+      }
+      if (round2(next.lowerDev) > 0) {
+        fail(state, label, '校验未通过：下偏差 ' + devTxt(next.lowerDev, digits) + ' 大于 0（要求上偏差 ≥ 0 ≥ 下偏差）⇒' +
+          '典型值 ' + fmt(next.typical, digits) + ' 低于导出下限 ' + fmt(lower, digits) + '，本次不写入');
+        return;
+      }
+    }
+    /* 校验⑦：超量程（FR-3.19 第⑥步）—— 量程取自配置**单一真源** `standards.range[参数种类]`，
+       校验本次录入得到的**导出上限/下限绝对值**是否落在量程内；越界即拒绝（实现里不写死量程数值）。
+       典型值缺失 ⇒ 没有导出值可判（导出格显示"—"），本项不参与。 */
     const range = rangeOf(kind);
     if (range) {
       const over = [['上限', upper], ['下限', lower]].find(([, v]) =>
         isNum(v) && ((range.min !== null && v < range.min) || (range.max !== null && v > range.max)));
       if (over) {
         const unit = row.unit ? ' ' + row.unit : '';
-        fail(state, '校验未通过：' + over[0] + ' ' + fmt(over[1], digits) + unit + ' 超出' +
+        fail(state, label, '校验未通过：' + over[0] + ' ' + fmt(over[1], digits) + unit + ' 超出' +
           PARAM_LABEL[kind] + '量程 [' + fmt(range.min, digits) + ', ' + fmt(range.max, digits) + ']' + unit +
           '，本次不写入');
         return;
       }
     }
 
-    /* 注入：只写 state（运行时真源），并记录生效时间戳（标准自生效时间起生效，历史不追溯） */
+    /* 注入：只写 state（运行时真源），并记录生效时间戳（标准自生效时间起生效，历史不追溯）。
+       改典型值 ⇒ 上下限随偏差整体平移；改偏差 ⇒ 仅对应一侧变化（由导出公式自然成立）。 */
+    const beforeTxt = f.key === 'typical' ? fmt(row.typical, digits) : devTxt(row[f.key], digits);
+    const afterTxt = f.key === 'typical' ? fmt(n, digits) : devTxt(n, digits);
+    const beforeUp = limitOf(row, 'upper');
+    const beforeLo = limitOf(row, 'lower');
+
     const target = ensureStd(state, kind);
-    target[side === 'upper' ? 'upperDev' : 'lowerDev'] = n;
+    target[f.key] = n;
     const std = state.task.standard;
     std.effectiveAt = ((state.clock && state.clock.date) || '') + ' ' + ((state.clock && state.clock.time) || '');
     std.operator = (state.shift && state.shift.operator) || '';
     std.revision = (isNum(std.revision) ? std.revision : 1) + 1;
 
-    const after = limitOf(target, side);
-    const dev = devTxt(n, target.digits);
+    const afterUp = limitOf(target, 'upper');
+    const afterLo = limitOf(target, 'lower');
+    const unit = (target.unit || '');
+    const limitTxt = '导出上限 ' + fmt(beforeUp, digits) + ' → ' + fmt(afterUp, digits) +
+      '、导出下限 ' + fmt(beforeLo, digits) + ' → ' + fmt(afterLo, digits) + (unit ? ' ' + unit : '');
     lastErr = null;
-    lastInfo = labelOf(type) + '已更新：' + fmt(before, target.digits) + ' → ' + fmt(after, target.digits) +
-      '（新偏差 ' + dev + ' ' + (target.unit || '') + '）';
-    logEntry(labelOf(type) + '：' + fmt(before, target.digits) + ' → ' + fmt(after, target.digits) +
-      '；新偏差 ' + dev + ' ' + (target.unit || '') + '；生效时间 ' + std.effectiveAt);
+    lastInfo = '「' + label + '」已更新：' + beforeTxt + ' → ' + afterTxt + '（' + limitTxt + '）';
+    /* 第⑦步 成功留痕（逐单元格）：被改单元格 + 修改前后值 + 导出上下限 + 生效时间（班组编号由 logEntry 追加）；
+       被拒留痕同口径（同一条同时给出被改单元格与拒绝原因），见 fail()。 */
+    logEntry('被改单元格「' + label + '」：' + beforeTxt + ' → ' + afterTxt + '；' + limitTxt +
+      '；生效时间 ' + std.effectiveAt);
     activity();
     render(state);
   }
 
-  /** 非法录入：弹窗提醒 + 画面留痕，**不改动任何数值** */
-  function fail(state, msg) {
+  /**
+   * 非法录入：弹窗提醒 + **逐单元格**画面留痕，**不改动任何数值**。
+   * 留痕同时给出「**哪一格被拒**」与「**为什么被拒**」（DR-12 `op_log` 是审计台账，两者必须同一条可对号，
+   * 否则现场排查只看得到原因、看不到对象）：
+   *   被改单元格「深度 典型值」：录入被拒绝 —— 校验未通过：上限 6.20 m 超出深度量程 [4.00, 6.00] m，本次不写入；班组编号 TM-3901
+   * 时间戳与班组编号仍由 logEntry 追加；弹窗文案保持原样（只说校验原因，不改口径）。
+   * @param {object} state 看板状态
+   * @param {string} label 被改单元格名（如「深度 典型值」，来自 labelOf(type)）
+   * @param {string} msg   校验未通过的具体原因（原样进入 alert 与留痕）
+   */
+  function fail(state, label, msg) {
     lastErr = msg;
     lastInfo = null;
-    logEntry('录入被拒绝：' + msg);
+    logEntry('被改单元格「' + label + '」：录入被拒绝 —— ' + msg);
     window.alert(msg);
     render(state);
   }
@@ -394,10 +483,14 @@ window.Components.TaskPanel = (function () {
 
   /**
    * 解析录入数值并按默认符号口径归一化（FR-3.19 第 5 步）：
-   *   下偏差默认负 —— 不带符号按负数处理；上偏差默认正 —— 不带符号按正数处理。
+   *   下偏差（lowerDev）默认负 —— 不带符号按负数处理；上偏差（upperDev）默认正 —— 不带符号按正数处理；
+   *   典型值（typical）为**非负绝对量** —— 一律返回绝对值，负号由调用方按"非法"拦下（见 commitSession 校验②）。
+   * @param {string} raw 输入框原文
+   * @param {string} key 字段名 `typical` / `upperDev` / `lowerDev`（兼容旧的 'upper' / 'lower' 写法）
    * @returns {number|null} null = 无法识别为有限数值（调用方按"不写入"处理）
    */
-  function normalizeNum(raw, side) {
+  function normalizeNum(raw, key) {
+    const k = key === 'upper' ? 'upperDev' : (key === 'lower' ? 'lowerDev' : key);
     const t = normalizeChars(raw);
     if (!t) return null;
     const explicit = /[+-]/.test(t);
@@ -407,8 +500,9 @@ window.Components.TaskPanel = (function () {
     const n = Number(s);
     if (!Number.isFinite(n)) return null;
     const mag = Math.abs(n);
+    if (k === 'typical') return mag;
     /* 不带正负号 ⇒ 按默认口径（下偏差负、上偏差正）；带符号 ⇒ 以操作人输入的符号为准 */
-    if (side === 'lower') return (explicit && !isNeg) ? mag : -mag;
+    if (k === 'lowerDev') return (explicit && !isNeg) ? mag : -mag;
     return (explicit && isNeg) ? -mag : mag;
   }
 
@@ -435,7 +529,8 @@ window.Components.TaskPanel = (function () {
     if (!panel || typeof panel.addEventListener !== 'function') return;
     booted = true;
 
-    /* 第 3 步：点击上限/下限数字（事件委托：表格每秒重绘也不会丢监听）。
+    /* 第 3 步：点击**典型值 / 上偏差 / 下偏差**任一数字（`data-edit` = 参数种类 + 字段后缀）。
+       事件委托：表格每秒重绘也不会丢监听；**不给每个 td 单独挂监听**。
        第 6 步：正在录入时点击其他区域 ⇒ 先退出并注入，再处理本次点击。 */
     panel.addEventListener('mousedown', e => {
       const state = window.MockData ? window.MockData.state : null;
@@ -477,7 +572,11 @@ window.Components.TaskPanel = (function () {
 
   /* ---------------- 渲染 ---------------- */
 
-  /** 测试标准区（FR-3.18）：深度/速度的上下限（正负偏差形式）与典型值 */
+  /**
+   * 测试标准区（FR-3.18 / V1.35 / C-90）：**典型值 / 上偏差 / 下偏差三格可录入**，
+   * 上限＝典型值＋上偏差、下限＝典型值＋下偏差作为**只读导出值**在第 5 格给出（不含 std-num、无 data-edit）。
+   * 任一必要项（典型值 / 上偏差 / 下偏差）缺失 ⇒ 该格显示 `—`，且该行**不产生**导出上下限（导出格 `—`）。
+   */
   function renderStandards(state) {
     const task = (state && state.task) || {};
     const table = $('tkStdTable');
@@ -489,7 +588,8 @@ window.Components.TaskPanel = (function () {
     const std = task.standard;
     if (std && std.effectiveAt) meta.push('标准生效时间 ' + std.effectiveAt);
     if (std && std.revision) meta.push('版本 V' + std.revision);
-    setText('tkStdMeta', '典型值只显示、不参与判定；上限＝典型值＋上偏差，下限＝典型值＋下偏差' +
+    setText('tkStdMeta', '典型值 / 上偏差 / 下偏差三格可录入；上限＝典型值＋上偏差、下限＝典型值＋下偏差' +
+      '为只读导出值；典型值不参与判定（判定对象＝导出的上下限）' +
       (meta.length ? '（' + meta.join(' · ') + '）' : ''));
 
     if (tbody) {
@@ -499,23 +599,27 @@ window.Components.TaskPanel = (function () {
         const lv = levelOf(real, spec);
         const unit = (spec && spec.unit) ? ' ' + spec.unit : '';
         const digits = spec && typeof spec.digits === 'number' ? spec.digits : STD_DIGITS;
-        const cell = (side, css) => {
-          const v = spec ? limitOf(spec, side) : null;
-          const txt = isNum(v) ? v.toFixed(digits) : '—';
-          const type = kind + (side === 'upper' ? 'Upper' : 'Lower');
+        /* 可录入单元格（FR-3.19③）：`data-edit` = 参数种类 + 字段后缀（与 DR-03 字段同名） */
+        const numCell = (suffix, css, text, extra) => {
+          const type = kind + suffix;
           const editing = !!(session && session.type === type);
           return '<td class="std-num ' + css + (editing ? ' is-editing' : '') + '" data-edit="' + type + '">' +
-            '<span class="std-value">' + esc(txt) + '</span></td>';
+            '<span class="std-value">' + esc(text) + '</span>' + (extra || '') + '</td>';
         };
+        /* 导出上下限：典型值与两侧偏差齐备时才有值（缺项 ⇒ 不产生导出值，显示 —） */
+        const upper = limitOf(spec, 'upper');
+        const lower = limitOf(spec, 'lower');
+        const derived = (isNum(upper) && isNum(lower))
+          ? '上限 ' + upper.toFixed(digits) + ' · 下限 ' + lower.toFixed(digits)
+          : '—';
         return '<tr data-kind="' + kind + '">' +
           '<td class="std-name">' + esc(PARAM_LABEL[kind]) +
           '<span class="std-state ' + lv.lv + '">' + esc(lv.text) + '</span></td>' +
-          cell('upper', 'upper') +
-          cell('lower', 'lower') +
-          '<td class="std-typical mono">' + esc(spec ? fmt(spec.typical, digits) : '—') +
-          '<span class="std-unit">' + esc(unit) + '</span>' +
-          '<span class="std-dev">上偏差 ' + esc(devTxt(spec && spec.upperDev, digits)) +
-          ' · 下偏差 ' + esc(devTxt(spec && spec.lowerDev, digits)) + '</span></td>' +
+          numCell('Typical', 'std-typical', spec ? fmt(spec.typical, digits) : '—',
+            '<span class="std-unit">' + esc(unit) + '</span>') +
+          numCell('UpperDev', 'std-upperdev', devTxt(spec && spec.upperDev, digits)) +
+          numCell('LowerDev', 'std-lowerdev', devTxt(spec && spec.lowerDev, digits)) +
+          '<td class="std-derived">' + esc(derived) + '</td>' +
           '</tr>';
       }).join('');
     }
@@ -528,7 +632,7 @@ window.Components.TaskPanel = (function () {
     const box = $('tkStdEdit');
     if (!box) return;
     box.hidden = !session;
-    if (session) setText('tkStdEditLabel', labelOf(session.type));
+    if (session) setText('tkStdEditLabel', '录入 ' + labelOf(session.type));
   }
 
   /** 提示行：未解锁说明（AC-09）/ 录入中说明 / 成功回执 / 非法提醒 */
@@ -538,8 +642,9 @@ window.Components.TaskPanel = (function () {
     if (lastErr) setEditMsg('err', lastErr);
     else if (lastInfo) setEditMsg('ok', lastInfo);
     else if (session) setEditMsg('', '录入中：回车确认并注入，Esc 取消，点击其他区域同样确认');
-    else if (!unlocked) setEditMsg('', '当前已锁定：请在「操作设置」页输入密码解锁（演示密码 8888）后方可录入上下限');
-    else setEditMsg('', '已解锁：点击上限或下限数字即可录入（单人操作、无二次复核）');
+    else if (!unlocked) setEditMsg('', '当前已锁定：解锁后方可录入典型值、上偏差与下偏差' +
+      '（请在「操作设置」页输入密码解锁，演示密码 8888）');
+    else setEditMsg('', '已解锁：点击典型值、上偏差或下偏差数字即可录入（单人操作、无二次复核）');
   }
 
   function setEditMsg(cls, text) {
@@ -651,6 +756,8 @@ window.Components.TaskPanel = (function () {
   return {
     render, bind: setup,
     /* 供自检/后续座位复用：标准取值与判据（单一真源仍在本组件内） */
-    limitOf, levelOf, hasStandard, normalizeNum, ensureStd
+    limitOf, levelOf, hasStandard, normalizeNum, ensureStd,
+    /* 三格录入单元格（FR-3.19③ / C-90）的类型解析：`depthUpperDev` → { suffix, key, name } */
+    fieldOf, kindOf, labelOf
   };
 })();

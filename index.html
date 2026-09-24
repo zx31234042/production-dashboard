@@ -168,23 +168,28 @@
           <span class="flow-step" data-step="待复检">待复检</span>
         </div>
 
-        <!-- ---------- 测试标准区（FR-3.16 改写 / FR-3.18 显示 / FR-3.19 录入） ----------
-             上下限按**正负偏差**显示：上限＝典型值＋上偏差、下限＝典型值＋下偏差；
-             典型值**只显示、不参与判定**；三态（正常/临近）只用于深度与速度。
-             「解锁」后点击上限/下限数字进入八步录入（反色+高亮框+0.5 s 闪烁 → 输入 →
-             回车或点击其他区域退出并注入）；未解锁时点击数字无响应（AC-09）。 -->
+        <!-- ---------- 测试标准区（FR-3.16 / FR-3.18 显示 / FR-3.19 录入，V1.35 / C-90 + C-91） ----------
+             显示与录入对象＝**典型值 / 上偏差 / 下偏差**（三个单元格均可录入）；
+             上限＝典型值＋上偏差、下限＝典型值＋下偏差，作为**只读导出值**在最后一格给出（不参与录入）；
+             判定对象仍是**导出的上下限**；典型值可录入可修改，但不参与判定。
+             「解锁」后点击三格中任一数字进入八步录入
+             （反色 + 高亮框 2 px + **1 s ± 50 ms** 闪烁 → 输入 → 回车或点击其他区域退出并注入）；
+             校验：非法值 / 小数位非法 / 下偏差 ≤ 上偏差（含两位小数取整后的隐含下限）/
+             上偏差 ≥ 0 ≥ 下偏差（典型值存在时）/ 上·下偏差同时存在或同时为空 /
+             超量程（按导出上/下限绝对值）—— 任一不通过弹窗提醒且不写入（state 逐字不变）。
+             未解锁时点击数字无响应（AC-09）。 -->
         <div class="card-title sm mt-24">测试标准区<span class="title-note">深度 / 速度（FR-3.18 显示 · FR-3.19 录入）</span></div>
-        <div class="std-note" id="tkStdMeta">典型值只显示、不参与判定；上下限按正负偏差（上限＝典型值＋上偏差）</div>
+        <div class="std-note" id="tkStdMeta">典型值 / 上偏差 / 下偏差三格可录入；上限＝典型值＋上偏差、下限＝典型值＋下偏差为只读导出值</div>
         <table class="data-table compact std-limits" id="tkStdTable">
-          <thead><tr><th>检测参数</th><th>上限</th><th>下限</th><th>典型值</th></tr></thead>
+          <thead><tr><th>检测参数</th><th>典型值</th><th>上偏差</th><th>下偏差</th><th>上限 / 下限（导出）</th></tr></thead>
           <tbody></tbody>
         </table>
         <div class="std-edit" id="tkStdEdit" hidden>
-          <span class="std-edit-label" id="tkStdEditLabel">录入上限</span>
+          <span class="std-edit-label" id="tkStdEditLabel">录入 深度 典型值</span>
           <input class="std-edit-input mono" id="tkStdInput" inputmode="decimal"
                  autocomplete="off" placeholder="输入数值后回车">
-          <span class="std-edit-hint">回车确认 · Esc 取消 · 点击其他区域同样确认</span>        </div>
-        <div class="std-msg" id="tkStdMsg">当前已锁定：请在「操作设置」页输入密码解锁（演示密码 8888）后方可录入上下限</div>
+          <span class="std-edit-hint">典型值（非负、不带符号）/ 上偏差（默认正）/ 下偏差（默认负）；上限＝典型值＋上偏差、下限＝典型值＋下偏差为只读导出值 —— 回车确认 · Esc 取消 · 点击其他区域同样确认</span>        </div>
+        <div class="std-msg" id="tkStdMsg">当前已锁定：解锁后方可录入典型值、上偏差与下偏差（请在「操作设置」页输入密码解锁，演示密码 8888）</div>
 
         <!-- 相机参数移入二级菜单（FR-3.16 最终口径 / FR-3.5～3.8 改归属）：
              菜单项**只含参数名 + 设定值**（不展示实测值、偏差与状态 —— 四项相机参数是

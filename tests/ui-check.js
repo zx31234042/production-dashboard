@@ -791,17 +791,50 @@ function stdCell(rows, kind, edit) {
   return row.tds.find(td => td.edit === edit) || null;
 }
 
-/** 某一行里的「典型值」单元格（第 4 格：检测参数 / 上限 / 下限 / 典型值）；取不到返回 null */
+/** 某一行里的「典型值」单元格（V1.35 第 2 格：检测参数 / **典型值** / 上偏差 / 下偏差 / 上限·下限（导出））；
+ *  取不到返回 null。V1.33 的旧列序（检测参数 / 上限 / 下限 / 典型值）已随 C-90 改对象作废。 */
 function typicalCell(rows, kind) {
   const row = rows.find(r => r.kind === kind);
-  return row ? (row.tds[3] || null) : null;
+  return row ? (row.tds[1] || null) : null;
 }
 
-/** 从形如 `<span class="std-value">12.80</span>` 的片段里取出数值（不合口径返回 null） */
-function valueOf(snippet, digits) {
-  const m = /<span class="std-value">(-?\d+(?:\.\d+)?)<\/span>/.exec(String(snippet || ''));
+/** 某一行里的「只读导出值」单元格（V1.35 第 5 格 `.std-derived`）；取不到返回 null */
+function derivedCell(rows, kind) {
+  const row = rows.find(r => r.kind === kind);
+  return row ? (row.tds[4] || null) : null;
+}
+
+/** 从 `.std-derived` 单元格文本里取 `上限 5.30 · 下限 4.80` 的上下限数值；缺项/占位（—）返回 null。
+ *  ⚠️ 判据是**文本里两个数的相对位置**（上限在前、下限在后），不硬编码 5.30 / 4.80。
+ *  @param {string} snippet 单元格 HTML 片段
+ *  @param {number} digits 配置的小数位数（standards.digits）
+ *  @returns {{upper:number, lower:number}|null} 解析失败（含占位 `—`）返回 null ⇒ 断言随之变红 */
+function derivedLimits(snippet, digits) {
+  const t = String(snippet || '').replace(/<[^>]*>/g, '');
+  const m = /上限\s*(-?\d+(?:\.\d+)?)\s*·\s*下限\s*(-?\d+(?:\.\d+)?)/.exec(t);
   if (!m) return null;
-  return new RegExp(`^-?\\d+\\.\\d{${digits}}$`).test(m[1]) ? Number(m[1]) : null;
+  const okRe = v => new RegExp(`^-?\\d+\\.\\d{${digits}}$`).test(v);
+  return (okRe(m[1]) && okRe(m[2])) ? { upper: Number(m[1]), lower: Number(m[2]) } : null;
+}
+
+/** 五列口径下每个 `.std-num` 单元格的稳定取法：`editTypeOf(td)` 同时校验 `data-edit` 与冻结类名。
+ *  `data-edit` ＝ `<kind><Typical|UpperDev|LowerDev>`（与 DR-03 字段同名，见 TaskPanel.js 的 FIELDS）。 */
+const STD_EDIT_TYPES = ['Typical', 'UpperDev', 'LowerDev'];
+
+/** 从形如 `<span class="std-value">12.80</span>` 的片段里取出**非负**数值（不合口径返回 null）。
+ *  典型值格是"非负绝对量、不带符号"，故对它用本函数；上/下偏差格**带符号**，用 `signedValueOf()`。 */
+function valueOf(snippet, digits) {
+  const m = /<span class="std-value">(\d+(?:\.\d+)?)<\/span>/.exec(String(snippet || ''));
+  if (!m) return null;
+  return new RegExp(`^\\d+\\.\\d{${digits}}$`).test(m[1]) ? Number(m[1]) : null;
+}
+
+/** 从形如 `<span class="std-value">+0.30</span>` / `-0.20` 的片段里取出**带符号**数值
+ *  （小数位数须等于配置的 `digits`；不合口径返回 null ⇒ 断言随之变红）。 */
+function signedValueOf(snippet, digits) {
+  const m = /<span class="std-value">([+-]?\d+(?:\.\d+)?)<\/span>/.exec(String(snippet || ''));
+  if (!m) return null;
+  return new RegExp(`^[+-]?\\d+\\.\\d{${digits}}$`).test(m[1]) ? Number(m[1]) : null;
 }
 
 /** 单元格里的单位文本（`<span class="std-unit"> m/s</span>` → 'm/s'） */
@@ -820,6 +853,27 @@ function typicalOf(snippet, digits) {
 /** 单元格里的偏差文本（`上偏差 +0.30 · 下偏差 -0.20` → '+0.30' / '-0.20'） */
 function devOf(snippet, label) {
   const m = new RegExp(label + '\\s*([+-]\\d+(?:\\.\\d+)?)').exec(String(snippet || ''));
+  return m ? m[1] : null;
+}
+
+/** 取 CSS 里**定义了某属性**、且选择器含某标记的规则中最后一条（`parseCss` 按"后写覆盖先写"的次序入 Map，
+ *  故"最后一条"正是层叠里胜出的那条）；找不到返回 {}。用于**逐冻结选择器**读实际生效字号：
+ *  `.std-limits.compact .std-num.std-upperdev .std-value` 与 `.std-lowerdev` 是**合并选择器**（逗号并列），
+ *  整串查不到，只能按标记定位；而"含标记"的规则可能只有 color（
+ *  `.std-limits .std-num.std-typical, … .std-upperdev, … .std-lowerdev { color: … }`），
+ *  故必须同时要求它**声明了该属性**，否则会读到那条 color 规则 ⇒ 字号恒为 null（实测踩过）。 */
+function lastRuleWith(rules, marker, prop) {
+  let hit = {};
+  for (const [sel, decls] of rules) {
+    if (sel.includes(marker) && (!prop || decls[prop] !== undefined)) hit = decls;
+  }
+  return hit;
+}
+
+/** V1.35 的 `.std-value` 里**带正负号**的偏差文本（`+0.30` / `-0.20`）；典型值格是"非负绝对量、不带符号"，
+ *  故对它应返回 null —— 用它把"典型值格不写符号"变成可证伪观察（不是"看过就算"）。 */
+function devTxtOf(snippet) {
+  const m = /(?:^|>)\s*([+-]\d+(?:\.\d+)?)\s*(?:<|$)/.exec(String(snippet || ''));
   return m ? m[1] : null;
 }
 
@@ -1366,65 +1420,108 @@ async function main() {
     fx.W.Components.SettingPanel.bind(fx.state, fx.idleActivity);
     T.render(fx.state);
     const rows = parseStdRows(fx.node('tkStdTable tbody').innerHTML);
-    const cells = ['depth', 'speed'].flatMap(k => ['upper', 'lower'].map(side => stdCell(rows, k, k + (side === 'upper' ? 'Upper' : 'Lower'))));
+    /* V1.35（C-90）五列口径：检测参数 / 典型值 / 上偏差 / 下偏差 / 上限·下限（导出）。
+       可录入＝前四列里带 `data-edit` 的三个（Typical / UpperDev / LowerDev）；
+       第 5 列是**只读导出值**（`.std-derived`，无 `data-edit`、无 `std-num`）——
+       下面既正面断言三格可录入，也**反向**断言第 5 格不可录入（"上下限不可直接录入"的机器证据）。 */
+    const expectedEdits = ['depth', 'speed'].flatMap(k => STD_EDIT_TYPES.map(suffix => k + suffix));
+    const actualEdits = rows.flatMap(r => r.tds.map(td => td.edit).filter(Boolean));
+    const hasClass = (td, cls) => !!td && new RegExp(`(?:^|\\s)${cls}(?:\\s|$)`).test(td.cls);
+    const numCellsOk = rows.every(r => r.tds.length === 5 &&
+      ['Typical', 'UpperDev', 'LowerDev'].every((suffix, i) =>
+        hasClass(r.tds[i + 1], 'std-num') && r.tds[i + 1].edit === r.kind + suffix));
+    const cellOfKind = (kind, suffix) => stdCell(rows, kind, kind + suffix);
+    const expectedEditsOk = ['depth', 'speed'].every(kind =>
+      ['Typical', 'UpperDev', 'LowerDev'].every(suffix => cellOfKind(kind, suffix) !== null));
+    const derivedReadOnly = ['depth', 'speed'].every(kind => {
+      const d = derivedCell(rows, kind);
+      return !!d && hasClass(d, 'std-derived') && !hasClass(d, 'std-num') && !d.edit && /上限|下限/.test(stdCellText(d));
+    });
     check(
-      'FR-3.18 测试标准区显示深度/速度两行、每行含上限/下限两个可录入单元格（data-edit 齐全）',
+      'FR-3.18 测试标准区显示深度/速度两行、五列（检测参数/典型值/上偏差/下偏差/上限·下限（导出）），' +
+      '且每行恰三个可录入格（data-edit = <kind>Typical / UpperDev / LowerDev）',
       rows.length === 2 && rows.map(r => r.kind).join(',') === 'depth,speed' &&
-      cells.every(c => c !== null) && rows.every(r => r.tds.length === 4),
+      rows.every(r => r.tds.length === 5) && numCellsOk &&
+      actualEdits.slice().sort().join(',') === expectedEdits.slice().sort().join(',') && expectedEditsOk,
       `行=${rows.map(r => `${r.kind}(${r.tds.length} 格)`).join(' / ') || '（未解析到结构）'}；` +
-      `可录入格=${cells.filter(Boolean).length}/4`
+      `可录入格 data-edit=[${actualEdits.join('、') || '（无）'}] 应=[${expectedEdits.join('、')}]；` +
+      `五列类名=${rows.map(r => r.tds.map(td => td.cls.replace(/\s+/g, '/')).join('|')).join(' # ') || '（无）'}`
     );
-    const limitsOk = [['depth', dep], ['speed', spd]].every(([kind, spec]) => {
-      const u = stdCell(rows, kind, kind + 'Upper');
-      const l = stdCell(rows, kind, kind + 'Lower');
-      return spec && valueOf(u && u.text, digits) === spec.upper && valueOf(l && l.text, digits) === spec.lower;
+    check(
+      'FR-3.18/FR-3.19 上限·下限为**只读导出值**：第 5 格 .std-derived 无 data-edit、无 std-num（上下限不可直接录入）',
+      derivedReadOnly,
+      ['depth', 'speed'].map(kind => {
+        const d = derivedCell(rows, kind);
+        return `${kind}: class=${JSON.stringify(d && d.cls)}、data-edit=${JSON.stringify(d && d.edit)}、` +
+          `含 std-num=${hasClass(d, 'std-num')}、文本=${JSON.stringify(d ? stdCellText(d) : null)}`;
+      }).join('；')
+    );
+    /* 导出值语义（D21 期望值实测）：上限＝典型值＋上偏差、下限＝典型值＋下偏差 ——
+       两侧都从 `standards.default` 与 state 实算，**不硬编码 5.30 / 4.80**。 */
+    const derivedOk = [['depth', dep], ['speed', spd]].every(([kind, spec]) => {
+      const d = derivedLimits(derivedCell(rows, kind) && derivedCell(rows, kind).text, digits);
+      return spec && d && d.upper === spec.upper && d.lower === spec.lower;
     });
     check(
       'FR-3.18 上限＝典型值＋上偏差、下限＝典型值＋下偏差（按配置 default 段与 state 实算，非硬编码）',
-      limitsOk,
+      derivedOk,
       [['depth', dep], ['speed', spd]].map(([kind, spec]) => {
-        const u = stdCell(rows, kind, kind + 'Upper');
-        const l = stdCell(rows, kind, kind + 'Lower');
-        return `${kind}: 上限格=${valueOf(u && u.text, digits)} 应=${spec && spec.upper}；` +
-          `下限格=${valueOf(l && l.text, digits)} 应=${spec && spec.lower}`;
+        const d = derivedLimits(derivedCell(rows, kind) && derivedCell(rows, kind).text, digits);
+        return `${kind}: 导出格=${JSON.stringify(d)} 应={上限 ${spec && spec.upper}, 下限 ${spec && spec.lower}}`;
       }).join('；')
     );
     check(
-      'FR-3.18 深度单位 m、速度单位 m/s，且上下限与典型值一律保留两位小数（位数读配置 standards.digits）',
+      'FR-3.18 深度单位 m、速度单位 m/s，且三格与导出值一律保留两位小数（位数读配置 standards.digits）',
       [dep, spd].every(spec => spec && spec.digits === digits) &&
       unitOf(typicalCell(rows, 'depth') && typicalCell(rows, 'depth').text) === 'm' &&
       unitOf(typicalCell(rows, 'speed') && typicalCell(rows, 'speed').text) === 'm/s' &&
-      valueOf(stdCell(rows, 'depth', 'depthUpper') && stdCell(rows, 'depth', 'depthUpper').text, digits) !== null &&
-      valueOf(stdCell(rows, 'speed', 'speedLower') && stdCell(rows, 'speed', 'speedLower').text, digits) !== null &&
+      ['depth', 'speed'].every(k => ['Typical', 'UpperDev', 'LowerDev'].every(s =>
+        (s === 'Typical' ? valueOf(cellOfKind(k, s) && cellOfKind(k, s).text, digits)
+          : signedValueOf(cellOfKind(k, s) && cellOfKind(k, s).text, digits)) !== null)) &&
+      derivedLimits(derivedCell(rows, 'depth') && derivedCell(rows, 'depth').text, digits) !== null &&
       typicalOf(typicalCell(rows, 'depth') && typicalCell(rows, 'depth').text, digits) !== null &&
       typicalOf(typicalCell(rows, 'speed') && typicalCell(rows, 'speed').text, digits) !== null,
       `digits=${digits}（深度/速度配置位数 ${dep && dep.digits}/${spd && spd.digits}）；` +
       `深度行单位=${JSON.stringify(unitOf(typicalCell(rows, 'depth') && typicalCell(rows, 'depth').text))}、` +
-      `速度行单位=${JSON.stringify(unitOf(typicalCell(rows, 'speed') && typicalCell(rows, 'speed').text))}`
+      `速度行单位=${JSON.stringify(unitOf(typicalCell(rows, 'speed') && typicalCell(rows, 'speed').text))}；` +
+      `深度三格=${['Typical', 'UpperDev', 'LowerDev'].map(s => valueOf(cellOfKind('depth', s) && cellOfKind('depth', s).text, digits)).join('/')}`
     );
     check(
-      'FR-3.18 典型值单元格给出两位小数取值与带符号偏差（上偏差 +、下偏差 −），且两行都有',
+      'FR-3.18 三个录入格分别给出两位小数取值与带符号偏差（典型值无符号、上偏差 +、下偏差 −），且两行都有',
       [['depth', dep], ['speed', spd]].every(([kind, spec]) => {
-        const t = typicalCell(rows, kind);
+        const t = stdCell(rows, kind, kind + 'Typical');
+        const u = stdCell(rows, kind, kind + 'UpperDev');
+        const l = stdCell(rows, kind, kind + 'LowerDev');
         return typicalOf(t && t.text, digits) === spec.typical &&
-          devOf(t && t.text, '上偏差') === '+' + spec.upperDev.toFixed(digits) &&
-          devOf(t && t.text, '下偏差') === (spec.lowerDev >= 0 ? '+' : '') + spec.lowerDev.toFixed(digits);
+          signedValueOf(u && u.text, digits) === r2(spec.upperDev) &&
+          signedValueOf(l && l.text, digits) === r2(spec.lowerDev) &&
+          devTxtOf(t && t.text) === null;                 /* 典型值格**不带**正负号（非负绝对量） */
       }),
       [['depth', dep], ['speed', spd]].map(([kind, spec]) => {
-        const t = typicalCell(rows, kind);
-        return `${kind}: 典型值=${typicalOf(t && t.text, digits)} 应=${spec.typical}；` +
-          `上偏差=${devOf(t && t.text, '上偏差')} 应=+${spec.upperDev.toFixed(digits)}；` +
-          `下偏差=${devOf(t && t.text, '下偏差')} 应=${(spec.lowerDev >= 0 ? '+' : '') + spec.lowerDev.toFixed(digits)}`;
+        const t = stdCell(rows, kind, kind + 'Typical');
+        const u = stdCell(rows, kind, kind + 'UpperDev');
+        const l = stdCell(rows, kind, kind + 'LowerDev');
+        return `${kind}: 典型值=${typicalOf(t && t.text, digits)} 应=${spec.typical}（格内偏差小字=${JSON.stringify(devTxtOf(t && t.text))}）；` +
+          `上偏差=${signedValueOf(u && u.text, digits)} 应=${r2(spec.upperDev)}；下偏差=${signedValueOf(l && l.text, digits)} 应=${r2(spec.lowerDev)}`;
       }).join('；')
     );
     check(
-      'FR-3.18 典型值只显示不改变 state：#tkStdMeta 写明"典型值只显示、不参与判定"与上下限由典型值±偏差导出',
-      /典型值只显示、不参与判定/.test(String(fx.node('tkStdMeta').textContent || '')) &&
+      'FR-3.18 旧版「偏差小字」不再渲染：典型值格内无 .std-dev、也无「上偏差… · 下偏差…」小字（V1.35 三格独立呈现）',
+      !/std-dev/.test(String(fx.node('tkStdTable tbody').innerHTML)) &&
+      !/上偏差 [+-]?\d/.test(stdCellText(stdCell(rows, 'depth', 'depthTypical'))),
+      `depth 典型值格文本=${JSON.stringify(stdCellText(stdCell(rows, 'depth', 'depthTypical')))}；` +
+      `正文含 .std-dev=${/std-dev/.test(String(fx.node('tkStdTable tbody').innerHTML))}`
+    );
+    check(
+      'FR-3.18 典型值可录入但不参与判定：#tkStdMeta 写明"三格可录入""上下限为只读导出值""典型值不参与判定"，且渲染不写 state',
+      /典型值 \/ 上偏差 \/ 下偏差三格可录入/.test(String(fx.node('tkStdMeta').textContent || '')) &&
       /上限＝典型值＋上偏差/.test(String(fx.node('tkStdMeta').textContent || '')) &&
       /下限＝典型值＋下偏差/.test(String(fx.node('tkStdMeta').textContent || '')) &&
+      /只读导出值/.test(String(fx.node('tkStdMeta').textContent || '')) &&
+      /典型值不参与判定/.test(String(fx.node('tkStdMeta').textContent || '')) &&
       fx.state.task.standard === undefined,
-      `#tkStdMeta=${JSON.stringify(String(fx.node('tkStdMeta').textContent || '').slice(0, 80))}；` +
-      `state.task.standard=${fx.state.task.standard === undefined ? '未建（只显示不写入）' : '已被渲染建立'}`
+      `#tkStdMeta=${JSON.stringify(String(fx.node('tkStdMeta').textContent || '').slice(0, 96))}；` +
+      `state.task.standard=${fx.state.task.standard === undefined ? '未建（渲染不写入）' : '已被渲染建立'}`
     );
 
     /* ---- (b) 三态：正常 / 临近黄 / 超范围红（FR-3.18 / FR-3.14），阈值用配置 nearRatio 实算 ---- */
@@ -1594,7 +1691,8 @@ async function main() {
       `#tkCameraMenu 是 <details class="camera-menu">=${/<details[^>]*class="[^"]*camera-menu[^"]*"[^>]*id="tkCameraMenu"/.test(html)}`
     );
 
-    /* ---- (d) FR-3.19 第 4 步：反色 + 高亮框 + 0.5 s 闪烁的样式契约（静态，读 CSS） ---- */
+    /* ---- (d) FR-3.19 第 4 步：反色 + 高亮框 2 px + 1 s ± 50 ms 闪烁的样式契约（静态，读 CSS） ----
+       U-2（C-89）改判：间隔 0.5 s ± 50 ms → **1 s ± 50 ms**，高亮框 4 px → **2 px**。 */
     {
       const css = readText('src/styles/global.css');
       const blink = /@keyframes\s+stdBlink\s*\{([\s\S]*?)\n\}/.exec(css) || [];
@@ -1604,28 +1702,88 @@ async function main() {
       const editing = rulesCss.get('.std-limits td.is-editing') || {};
       const animMs = Number((String(editing.animation || '').match(/\s(\d*\.?\d+)s(\s|$)/) || [])[1]) * 1000;
       const invRule = rulesCss.get('.std-limits td.is-editing .std-value') || {};
+      /* 闪烁间隔目标值从**需求口径**读（1 s），允差 ±50 ms —— 判据是"落在 950–1050 ms"，不是"字面等于 1s 这串字符" */
+      const BLINK_MS = 1000, BLINK_TOL = 50;
       check(
-        'FR-3.19 第4步 反色、高亮框与 0.5 s ± 50 ms 闪烁的样式契约齐备（@keyframes stdBlink + .is-editing 的 animation/box-shadow/反色文字）',
+        'FR-3.19 第4步 反色、高亮框（2 px）与 1 s ± 50 ms 闪烁的样式契约齐备（@keyframes stdBlink + .is-editing 的 animation/box-shadow/反色文字）',
         /@keyframes\s+stdBlink/.test(css) && /50%,\s*100%\s*\{\s*opacity/.test(blink[1] || '') &&
-        editing.animation === 'stdBlink .5s step-end infinite' &&
-        Math.abs(animMs - 500) <= 50 &&
-        /inset 0 0 0 \d+px/.test(editing['box-shadow'] || '') &&
+        editing.animation === 'stdBlink 1s step-end infinite' &&
+        Number.isFinite(animMs) && Math.abs(animMs - BLINK_MS) <= BLINK_TOL &&
+        editing['box-shadow'] === 'inset 0 0 0 2px #FFFFFF' &&
         /var\(--accent\)/.test(editing.background || '') &&
         invRule.color !== undefined && invRule.color.toUpperCase() !== '#FFFFFF',
-        `@keyframes stdBlink=${/@keyframes\s+stdBlink/.test(css)}；animation=${JSON.stringify(editing.animation)}（${animMs} ms，允差 ±50）；` +
+        `@keyframes stdBlink=${/@keyframes\s+stdBlink/.test(css)}；animation=${JSON.stringify(editing.animation)}（${animMs} ms，允差 ±${BLINK_TOL}）；` +
         `box-shadow=${JSON.stringify(editing['box-shadow'] || '（缺）')}；背景=${JSON.stringify(editing.background || '（缺）')}；` +
         `反色文字色=${JSON.stringify(invRule.color || '（缺）')}`
       );
     }
 
-    /* ---- (e) 第 ①③④⑧ 步：未解锁点击数字不进入录入态；解锁后才进入（FR-3.19 / AC-09） ---- */
+    /* ---- (d2) U-1（C-92）字号与"占满卡片剩余高度"的**静态机器证据** ----
+       负责人原话按**字面口径**落地：典型值数值 60–64 px、参数名 48 px、单位与偏差（含只读导出值）36–40 px。
+       为什么逐类名分别读：`parseCss()` 的 Map 对**同名选择器**后写覆盖先写，但"哪条规则最终胜出"取决于
+       优先级与声明次序（`global.css` 里 `.data-table.compact td`(0,2,1) 会压过 `.std-limits td`(0,1,1)，
+       注释里已记录过这次实测踩坑）。故这里用 `fontPx()` 逐选择器读**冻结选择器串**的字号：
+       选择器串一旦被改写/删掉，读到的就是 null ⇒ 断言变红，人必须回来复核，而不是自动跟着新值变绿。 */
+    {
+      const rulesCss = parseCss(readText('src/styles/global.css'));
+      const pxOf = sel => fontPx(rulesCss, sel);
+      /* 上/下偏差字号挂在**合并选择器** `.std-limits.compact .std-num.std-upperdev .std-value,\n
+         .std-limits.compact .std-num.std-lowerdev .std-value { font-size: 40px; }` 上 ——
+         整串查不到，须按标记定位（`lastRuleWith` 取"层叠里最后一条"，即实际胜出者）。 */
+      const devRuleUpper = lastRuleWith(rulesCss, '.std-num.std-upperdev', 'font-size');
+      const devRuleLower = lastRuleWith(rulesCss, '.std-num.std-lowerdev', 'font-size');
+      const pxFromRule = (decls) => {
+        const m = String((decls || {})['font-size'] || '').match(/^(\d+(?:\.\d+)?)px$/);
+        return m ? Number(m[1]) : null;
+      };
+      const typicalPx = pxOf('.std-limits.compact .std-value');
+      const upperDevPx = pxFromRule(devRuleUpper);
+      const lowerDevPx = pxFromRule(devRuleLower);
+      const unitPx = pxOf('.std-limits.compact .std-unit');
+      const derivedPx = pxOf('.std-limits.compact .std-derived');
+      const namePx = pxOf('.std-limits.compact .std-name');
+      const inRange = (v, lo, hi) => typeof v === 'number' && v >= lo && v <= hi;
+      check(
+        'FR-3.16（U-1 字号）典型值数值 60–64 px、参数名 48 px、上/下偏差与单位及只读导出值 36–40 px（逐冻结选择器读实际生效字号）',
+        inRange(typicalPx, 60, 64) && namePx === 48 &&
+        inRange(upperDevPx, 36, 40) && inRange(lowerDevPx, 36, 40) &&
+        inRange(unitPx, 36, 40) && inRange(derivedPx, 36, 40),
+        `典型值=${typicalPx}（应 60–64）、参数名=${namePx}（应 48）、上偏差=${upperDevPx}/下偏差=${lowerDevPx}（应 36–40）、` +
+        `单位=${unitPx}、导出值=${derivedPx}（应 36–40）`
+      );
+      /* 占满卡片剩余高度：`.std-limits` 接管剩余高度、二级菜单只占自身高度（`flex: none`）。
+         判据是**两条样式事实**，不是"看起来没有大片空白"这种观感。 */
+      const limitsRule = rulesCss.get('.std-limits') || {};
+      const menuRule = rulesCss.get('.camera-menu') || {};
+      const flexShort = String(limitsRule.flex || '').replace(/\s+/g, '');
+      check(
+        'FR-3.16（U-1 占位）测试标准区占满卡片剩余高度：.std-limits 的 flex:1 且 height:100%，.camera-menu 为 flex:none（不抢剩余高度）',
+        flexShort === '1' && String(limitsRule.height || '').trim() === '100%' &&
+        String(limitsRule['min-height'] || '').trim() === '0' &&
+        String(menuRule.flex || '').replace(/\s+/g, '') === 'none',
+        `.std-limits flex=${JSON.stringify(limitsRule.flex || '（缺）')}、height=${JSON.stringify(limitsRule.height || '（缺）')}、` +
+        `min-height=${JSON.stringify(limitsRule['min-height'] || '（缺）')}；.camera-menu flex=${JSON.stringify(menuRule.flex || '（缺）')}`
+      );
+    }
+
+    /* ---- (e) 第 ①③④⑧ 步：未解锁点击数字不进入录入态；解锁后才进入（FR-3.19 / AC-09） ----
+       V1.35（C-90）改判：可录入的是**典型值 / 上偏差 / 下偏差**三格（`data-edit` = `<kind>Typical|UpperDev|LowerDev`），
+       旧的上限/下限格已不存在（上限/下限是只读导出值，见上方的反向断言）。 */
     fx.node('tkStdEdit').hidden = true;                     /* index.html 的初始 hidden */
-    /** 取当前渲染出的、带指定 data-edit 的可录入单元格（事件目标与断言对象是同一个节点） */
+    /** 取当前渲染出的、带指定 data-edit 的可录入单元格（事件目标与断言对象是同一个节点）；
+     *  **取不到返回 null** —— 调用方必须让它变成 FAIL，不得兜底成"跳过"。 */
     const realCell = type => {
       /* 走 querySelector('tbody') 而不是 __children：前几个 check 里的 `T.render()` 会重建
          单元格对象，只有经过一次 tbody 查询，夹具缓存里的节点才与"最后一次渲染"对齐 */
       const tb = fx.node('tkStdTable').querySelector('tbody');
       return tb.__children.slice().reverse().map(r => r.__children.find(td => td.dataset.edit === type)).find(Boolean) || null;
+    };
+    /** 点击某个可录入格（找不到就**不点**并返回 null）—— 由**断言**把这个 null 判成 FAIL，
+     *  不在这里静默兜底、也不抛异常中断整脚本（其余断言仍应继续跑完并逐条点名）。 */
+    const clickCell = type => {
+      const c = realCell(type);
+      if (c) fx.click(c);
+      return c;
     };
     /** 关闭"上一个用例留下的"录入会话（避免它的退出提交污染下一个用例的观察）：
      *  组件在"点击其他区域"时会**先提交再处理点击**，故不显式收尾的话，下一个用例的第一次点击
@@ -1635,35 +1793,48 @@ async function main() {
      *  lastErr/lastInfo/session/unlocked 四态择一写入），手工改写会让"锁定后应看到锁定提示"
      *  这条断言变成对用例自己写的内容的观察（自证），而不是对组件输出的观察。 */
     const closeSession = () => { fx.input().value = ''; fx.screen('blur'); };
-    fx.click(realCell('depthUpper'));                       /* 锁定时点真实的上限格 */
+    /* V1.35（C-90）：三格均可录入，故"未解锁点数字不进入录入态"与"解锁后进入录入态"都按**三格**逐格覆盖。 */
+    const FIELD_CN = { Typical: '典型值', UpperDev: '上偏差', LowerDev: '下偏差' };
+    const hasEdit = (type, body) => new RegExp(`data-edit="${type}"[^>]*class="[^"]*is-editing|class="[^"]*is-editing[^"]*"[^>]*data-edit="${type}"`).test(String(body));
+    /* 锁定时点：逐格点击 ⇒ 都不进入录入态（`#tkStdEdit` 保持 hidden、正文无 is-editing） */
+    const lockedProbe = ['depthTypical', 'depthUpperDev', 'depthLowerDev'].map(type => {
+      fx.click(realCell(type));
+      return { type, hidden: fx.node('tkStdEdit').hidden, editing: /is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML)) };
+    });
     check(
-      'FR-3.19 第⑧步 未解锁时点击上限/下限数字不进入录入态：#tkStdEdit 保持隐藏、且录入行内无可聚焦的 #tkStdInput',
-      fx.node('tkStdEdit').hidden === true && /class="[^"]*is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML)) === false,
-      `#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}；正文含 is-editing=` +
-      `${/class="[^"]*is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML))}；` +
-      `#tkStdMsg=${JSON.stringify(String(fx.node('tkStdMsg').textContent || '').slice(0, 40))}`
+      'FR-3.19 第⑧步/AC-09 未解锁时点击典型值/上偏差/下偏差任一数字都不进入录入态：#tkStdEdit 保持隐藏、正文无 is-editing、录入行内无可聚焦的 #tkStdInput',
+      lockedProbe.every(p => p.hidden === true && p.editing === false) &&
+      String(fx.node('tkStdMsg').textContent || '').includes('当前已锁定'),
+      lockedProbe.map(p => `${p.type}: hidden=${p.hidden}/is-editing=${p.editing}`).join('；') +
+      `；#tkStdMsg=${JSON.stringify(String(fx.node('tkStdMsg').textContent || '').slice(0, 40))}`
     );
     fx.W.MockData.setUnlocked(true);
-    fx.click(realCell('depthUpper'));
-    const editRows = parseStdRows(fx.node('tkStdTable tbody').innerHTML);
-    const editingCell = stdCell(editRows, 'depth', 'depthUpper');
-    check(
-      'FR-3.19 第③④步 解锁后点击上限数字进入录入态：该格带 is-editing（反色+高亮+闪烁）、#tkStdEdit 可见、标签写明「深度上限」',
-      /(?:^|\s)is-editing(?:\s|$)/.test(editingCell ? editingCell.cls : '') &&
-      !/(?:^|\s)is-editing(?:\s|$)/.test((stdCell(editRows, 'depth', 'depthLower') || {}).cls || '') &&
-      fx.node('tkStdEdit').hidden === false &&
-      /深度上限/.test(String(fx.node('tkStdEditLabel').textContent || '')),
-      `上限格 class=${JSON.stringify(editingCell && editingCell.cls)}；下限格 class=` +
-      `${JSON.stringify(stdCell(editRows, 'depth', 'depthLower') && stdCell(editRows, 'depth', 'depthLower').cls)}；` +
-      `#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}；标签=${JSON.stringify(String(fx.node('tkStdEditLabel').textContent || ''))}`
-    );
+    /* 解锁后逐格点击 ⇒ 该格带 is-editing、#tkStdEdit 可见、标签写明「深度 <字段>」、其余两格无 is-editing */
+    for (const type of ['depthTypical', 'depthUpperDev', 'depthLowerDev']) {
+      closeSession();                                   /* 先收掉上一格留下的会话，观察量只归本格 */
+      const clicked = clickCell(type);
+      const body = String(fx.node('tkStdTable tbody').innerHTML);
+      const others = ['depthTypical', 'depthUpperDev', 'depthLowerDev'].filter(t => t !== type);
+      check(
+        `FR-3.19 第③④步 解锁后点击「${FIELD_CN[type.slice('depth'.length)]}」数字进入录入态：该格带 is-editing（反色+高亮+闪烁）、` +
+        '#tkStdEdit 可见、标签写明「录入 深度 ' + FIELD_CN[type.slice('depth'.length)] + '」、其余两格不进入',
+        !!clicked && clicked.dataset.edit === type && hasEdit(type, body) &&
+        others.every(t => !hasEdit(t, body)) &&
+        fx.node('tkStdEdit').hidden === false &&
+        String(fx.node('tkStdEditLabel').textContent || '') === '录入 深度 ' + FIELD_CN[type.slice('depth'.length)],
+        `点击格=${JSON.stringify(clicked && clicked.dataset.edit)}（应 ${type}）；正文命中 is-editing：` +
+        `本格=${hasEdit(type, body)}、其余=[${others.map(t => `${t}:${hasEdit(t, body)}`).join('、')}]；` +
+        `#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}；标签=${JSON.stringify(String(fx.node('tkStdEditLabel').textContent || ''))}`
+      );
+    }
+    closeSession();
     check(
       'FR-3.19 第③步 点击数字会重置"无操作回首页"计时并重新登记自动锁定（activity()：Dashboard.resetIdleTimer + SettingPanel.armAutoLock）',
       (() => {
         const lockMs = evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS'));
           fx.timers.length = 0;                        /* 只观察本次点击登记了什么 */
           const resetsBefore = fx.idleResets;
-          fx.click(realCell('depthUpper'));
+        fx.click(realCell('depthUpperDev'));
         const pending = fx.timers.filter(t => t.delay === lockMs && !t.cancelled && !t.fired).length;
         return pending === 1 && fx.idleResets === resetsBefore + 1;
       })(),
@@ -1672,96 +1843,298 @@ async function main() {
       `回首页计时重置累计=${fx.idleResets} 次`
     );
 
-    /* ---- (f) 第 ⑥ 步校验：非法（下限 > 上限 / 典型值越界）⇒ 弹窗 + 不写入 ----
+    /* ---- (f) 第 ⑥ 步校验（V1.35 / C-91 按**偏差模型**重述）：6 个用例 + 2 个专项，逐条断言
+       ①`alert` 弹窗且写明原因与"本次不写入" ②`state.task.standard` **逐字不变**（不写入）
+       ③无残留 `is-editing` ④被拒留痕含被改单元格名与原因。
        "不写入"的判定对象是**标准取值**（unit/digits/typical/upperDev/lowerDev）逐字不变；
        `opLog` 会**增加一条"被拒绝"留痕**，那是 FR-3.19 的**预期**行为（并发录入逐条留痕），
        故快照比对必须把 opLog 排除在外 —— 否则会把"按规范留痕"误判成"非法值被写入"。
-       实现侧依据：`commitSession()` 的两条校验分支都在 `ensureStd()`/写 `upperDev`/`lowerDev` **之前** return。 */
+       实现侧依据：`commitSession()` 的每条校验分支都在 `ensureStd()`/写字段**之前** return。 */
     const stdKeys = ['unit', 'digits', 'typical', 'upperDev', 'lowerDev'];
     const stdDepth = () => fx.state.task.standard && fx.state.task.standard.depth;
     const stdDepthVals = () => JSON.stringify(stdKeys.map(k => (stdDepth() || {})[k]));
+    /** 三格对应的中文标签（断言"被拒留痕含被改单元格名"用的就是它） */
+    const LABEL_CN = { depthTypical: '深度 典型值', depthUpperDev: '深度 上偏差', depthLowerDev: '深度 下偏差' };
+    /** 一次"非法录入"的完整观察：弹窗 / state 逐字不变 / 无残留 is-editing / 被拒留痕含单元格名与原因 */
+    const illegalCase = (type, typed, wantRe, label) => {
+      closeSession();                                    /* 收掉上一个用例留下的会话（不注入任何值） */
+      fx.click(realCell(type));
+      fx.input().value = typed;
+      const beforeVals = stdDepthVals();
+      const beforeLogs = fx.state.opLog.length;
+      fx.alerts.length = 0;
+      fx.screen('keydown');
+      const msg = String(fx.alerts[0] || '');
+      const last = fx.state.opLog[fx.state.opLog.length - 1] || {};
+      const detail = String(last.detail || '');
+      const stateSame = stdDepthVals() === beforeVals;
+      const oneLog = fx.state.opLog.length === beforeLogs + 1;
+      const noEditing = !/is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML));
+      const errShown = fx.node('tkStdEdit').hidden === true && /err/.test(String(fx.node('tkStdMsg').className || ''));
+      /* 被拒留痕：**含被改单元格名与具体原因**（按"包含关系"判，不比对分隔符写法） */
+      const logOk = /录入被拒绝/.test(detail) && detail.includes(LABEL_CN[type]) && wantRe.test(detail);
+      const ok = fx.alerts.length === 1 && /本次不写入/.test(msg) && wantRe.test(msg) &&
+        stateSame && oneLog && noEditing && errShown && logOk;
+      const detailTxt =
+        `alert=${JSON.stringify(msg.slice(0, 96))}（应匹配 ${wantRe} 且含「本次不写入」）；` +
+        `标准取值${stateSame ? '未变' : '**被改动**'}（${beforeVals}）；opLog ${beforeLogs} → ${fx.state.opLog.length} 条（应 +1）；` +
+        `残留 is-editing=${!noEditing}、#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}、#tkStdMsg.class=${JSON.stringify(String(fx.node('tkStdMsg').className || ''))}；` +
+        `被拒留痕=${JSON.stringify(detail.slice(0, 96))}（应含「${LABEL_CN[type]}」与原因）`;
+      check(
+        `FR-3.19 第⑥步 校验用例「${label}」⇒ alert 弹窗写明原因与"本次不写入"、state.task.standard 逐字不变、` +
+        '无残留 is-editing、且被拒留痕含被改单元格名与原因',
+        ok, detailTxt
+      );
+      return { ok, msg, detail, stateSame, detailTxt };
+    };
 
-    fx.click(realCell('depthLower'));
-    fx.input().value = '+0.60';                       /* 下偏差显式取正 ⇒ 下限 13.10 > 上限 12.80 */
-    const depthValsBefore = stdDepthVals();    const logCountBefore = fx.state.opLog.length;
-    fx.alerts.length = 0;
-    fx.screen('keydown');                             /* 回车 */
-    const rejectedLog = fx.state.opLog[fx.state.opLog.length - 1] || {};
-    check(
-      'FR-3.19 第⑥步 非法录入（下限 > 上限）⇒ alert 弹窗提醒、标准取值逐字不变（不写入）、且 opLog 追加一条"被拒绝"留痕',
-      fx.alerts.length === 1 && /下限/.test(fx.alerts[0]) && /上限/.test(fx.alerts[0]) &&
-      stdDepthVals() === depthValsBefore && fx.state.opLog.length === logCountBefore + 1 &&
-      /录入被拒绝/.test(String(rejectedLog.detail || '')),
-      `alert=${fx.alerts.length} 次（${JSON.stringify((fx.alerts[0] || '').slice(0, 56))}）；` +
-      `标准取值${stdDepthVals() === depthValsBefore ? '未变' : '**被改动**'}（${depthValsBefore}）；` +
-      `opLog ${logCountBefore} → ${fx.state.opLog.length} 条，末条=${JSON.stringify(String(rejectedLog.detail || '').slice(0, 40))}`
-    );
-    check(
-      'FR-3.19 第⑥步 非法录入后录入态被退出且显示红字提醒：#tkStdEdit 隐藏、#tkStdMsg 带 err 类',
-      fx.node('tkStdEdit').hidden === true && /err/.test(String(fx.node('tkStdMsg').className || '')) &&
-      !/is-editing/.test(String(fx.node('tkStdTable tbody').innerHTML)),
-      `#tkStdEdit.hidden=${fx.node('tkStdEdit').hidden}；#tkStdMsg.className=${JSON.stringify(String(fx.node('tkStdMsg').className || ''))}`
-    );
-
-    /* 典型值越界分支（FR-3.19 第⑥步第二项校验）：构造一个**下限 ≤ 上限 成立、但典型值不在区间内**
-       的状态，再录下限 —— 应被"典型值在上下限之间"挡下。
-       为什么这样造：校验顺序是「下限 ≤ 上限」在前、居中校验在后，若构造出让下限 > 上限的
-       偏差组合，命中的会是**第一项**校验（实测踩过：12.95/上限13.25/下限12.75 其实是合法区间，
-       于是那条断言看到的是"合法写入"，不是"非法拒绝"）。
-       取 `upperDev = -0.40`（上限 12.10 < 典型值 12.50 ⇒ 当前区间本就不含典型值），
-       注入 `lowerDev = -0.45`（下限 12.05 ≤ 上限 12.10，第一项通过），于是只剩第二项拦它。 */
     T.ensureStd(fx.state, 'depth');
     T.ensureStd(fx.state, 'speed');
+    /* 期望值一律从**配置/state 实算**（D21），不写死 5.35 / 4.60 / 6.20 这类数字 */
+    const RANGE = STDCFG.range || {};
+    const dRange = RANGE.depth || { min: null, max: null };
+    const devTxt = v => (v >= 0 ? '+' : '') + r2(v).toFixed(digits);
+    const CASE_LEDGER = [];
+    CASE_LEDGER.push(illegalCase('depthTypical', 'abc',
+      /未识别到有效数值/, '非数值（abc）'));
+    CASE_LEDGER.push(illegalCase('depthTypical', '5.123',
+      new RegExp(`小数位非法|最多 ${digits} 位小数`), `小数位非法（> standards.digits=${digits}）`));
+    CASE_LEDGER.push(illegalCase('depthTypical', '-5.00',
+      /非负绝对量/, '典型值带负号'));
+    /* `下偏差 > 上偏差`：先把偏差复位成配置默认段，**并显式写 `+`**（不带符号会被归一成负值，
+       根本到不了"下偏差 ≤ 上偏差"这条校验 —— 实测踩过），再注入 `+0.40 > 上偏差 +0.30`。 */
+    CASE_LEDGER.push((() => {
+      fx.state.task.standard.depth.typical = dep.typical;
+      fx.state.task.standard.depth.upperDev = dep.upperDev;
+      fx.state.task.standard.depth.lowerDev = dep.lowerDev;
+      return illegalCase('depthLowerDev', devTxt(dep.upperDev + 0.10),
+        /下偏差/, '下偏差 > 上偏差（违 下偏差 ≤ 上偏差）');
+    })());
+    CASE_LEDGER.push(illegalCase('depthUpperDev', devTxt(-0.10),
+      /上偏差/, '上偏差为负（违 上偏差 ≥ 0 ≥ 下偏差）'));
+    /* 下偏差为正：**必须显式写 `+`** —— 不带符号按"下偏差默认负"口径会被归一成负值
+       （`normalizeNum('0.10','lowerDev') = -0.10`，那是 FR-3.19⑤ 的默认口径，不是"正则通过"）。
+       构造 `lowerDev = +0.10` 后，`上偏差 ≥ 0 ≥ 下偏差` 的右半边不成立 ⇒ 应被拒。 */
+    CASE_LEDGER.push(illegalCase('depthLowerDev', devTxt(0.10),
+      /下偏差/, '下偏差为正（违 上偏差 ≥ 0 ≥ 下偏差）'));
+    /* 超量程：改**典型值**（C-93④"整体平移不免检"）——典型值刻意取 `量程上限 − 上偏差 + 一格`，
+       使**提交后**的导出上限恰越上界；判据里的数字全部由配置实算，不硬编码 5.90 / 6.20。 */
+    {
+      const grid = Math.pow(10, -digits);
+      const overTypical = r2(r2(dRange.max - dep.upperDev) + grid);
+      fx.state.task.standard.depth.typical = dep.typical;
+      fx.state.task.standard.depth.upperDev = dep.upperDev;
+      fx.state.task.standard.depth.lowerDev = dep.lowerDev;
+      CASE_LEDGER.push(illegalCase('depthTypical', overTypical.toFixed(digits),
+        /超出深度量程|超出.*量程/,
+        `超量程（典型值 ${overTypical.toFixed(digits)} ＋ 上偏差 ${dep.upperDev.toFixed(digits)} ⇒ 上限 ${r2(overTypical + dep.upperDev).toFixed(digits)} ∉ [${dRange.min}, ${dRange.max}]）`));
+    }
+    CASE_LEDGER.forEach((c, i) => console.log(`  [校验用例 ${i + 1}] ${c.ok ? 'PASS' : '**FAIL**'} —— ${c.detailTxt}`));
+    check(
+      'FR-3.19 第⑥步 校验用例齐备（≥6 条：非数值 / 小数位非法 / 典型值带负号 / 下偏差 > 上偏差 / 上偏差为负 / 下偏差为正 / 超量程），每条都「弹窗 + state 逐字不变 + 无残留 is-editing + 被拒留痕」',
+      CASE_LEDGER.length >= 6 && CASE_LEDGER.every(c => c.ok),
+      `${CASE_LEDGER.length} 条用例全部通过=${CASE_LEDGER.every(c => c.ok)}；逐条：` +
+      CASE_LEDGER.map((c, i) => `${i + 1}.${c.ok ? 'PASS' : '**FAIL**'}`).join(' ')
+    );
+
+    /* 典型值越界分支（FR-3.19 第⑥步 / C-91 校验⑥）：构造一个**下偏差 ≤ 上偏差 成立、但典型值落在导出区间外**
+       的状态，再录下偏差 —— 应被「上偏差 ≥ 0 ≥ 下偏差」挡下。
+       取 `upperDev = -0.40`（导出上限 4.60 < 典型值 5.00 ⇒ 当前区间本就不含典型值），
+       注入 `lowerDev = -0.45`（导出下限 4.55 ≤ 导出上限 4.60，校验⑤通过），于是只剩校验⑥拦它。 */
+    fx.state.task.standard.depth.typical = dep.typical;
     fx.state.task.standard.depth.upperDev = -0.40;
     fx.state.task.standard.depth.lowerDev = -0.50;
-    closeSession();                                   /* 收掉上一个用例留下的会话 */
-    fx.click(realCell('depthLower'));
-    fx.input().value = '-0.45';
-    const depthValsBefore2 = stdDepthVals();
-    const logCountBefore2 = fx.state.opLog.length;
-    fx.alerts.length = 0;
-    fx.screen('keydown');
+    const centeringCase = illegalCase('depthLowerDev', '-0.45',
+      /上偏差 ≥ 0|小于 0/, '典型值高于导出上限（居中校验）');
     check(
-      'FR-3.19 第⑥步 非法录入（典型值不在上下限之间）⇒ 弹窗且标准取值逐字不变（不写入）、opLog 追加被拒绝留痕',
-      fx.alerts.length === 1 && /典型值/.test(fx.alerts[0]) && /不在上下限/.test(fx.alerts[0]) &&
-      stdDepthVals() === depthValsBefore2 && fx.state.opLog.length === logCountBefore2 + 1 &&
-      /录入被拒绝/.test(String((fx.state.opLog[fx.state.opLog.length - 1] || {}).detail || '')),
-      `alert=${JSON.stringify((fx.alerts[0] || '').slice(0, 70))}；当前标准=${depthValsBefore2}；` +
-      `标准取值${stdDepthVals() === depthValsBefore2 ? '未变' : '**被改动**'}；opLog ${logCountBefore2} → ${fx.state.opLog.length} 条`
+      'FR-3.19 第⑥步 非法录入（典型值不在导出上下限之间）⇒ 弹窗且标准取值逐字不变（不写入）、被拒留痕含单元格名',
+      centeringCase.ok,
+      `alert=${JSON.stringify(centeringCase.msg.slice(0, 88))}；标准取值${centeringCase.stateSame ? '未变' : '**被改动**'}；` +
+      `被拒留痕=${JSON.stringify(centeringCase.detail.slice(0, 88))}`
     );
+
+    /* 上/下偏差**须同时存在或同时为空**（C-91 校验④）：把一侧置空，再提交另一侧 ⇒ 必须被挡下 */
+    {
+      fx.state.task.standard.depth.typical = dep.typical;
+      fx.state.task.standard.depth.upperDev = null;
+      fx.state.task.standard.depth.lowerDev = dep.lowerDev;
+      const pairCase = illegalCase('depthLowerDev', devTxt(dep.lowerDev - 0.05),
+        /同时存在或同时为空|只设了下偏差/, '只有一侧偏差（违「同时存在或同时为空」）');
+      check(
+        'FR-3.19 第⑥步 上/下偏差须同时存在或同时为空：只有一侧偏差时提交被拒（弹窗 + state 逐字不变 + 被拒留痕）',
+        pairCase.ok,
+        `alert=${JSON.stringify(pairCase.msg.slice(0, 88))}；标准取值${pairCase.stateSame ? '未变' : '**被改动**'}；` +
+        `被拒留痕=${JSON.stringify(pairCase.detail.slice(0, 88))}`
+      );
+    }
+
+    /* ---- (f2) 典型值为空：只校 `下偏差 ≤ 上偏差`，**跳过**居中校验与超量程校验（C-91 / C-93⑤） ----
+       为什么必须单列：这是"跳过"语义的唯一机器证据 —— 若实现把超量程校验也照跑，偏差本身
+       （不含量程内的典型值）会被判超量程而拒绝，本组用例立刻变红。
+       用**全新夹具**（不动主夹具的 state），避免把"典型值为空"的残缺标准留给后面的用例。 */
+    {
+      const fx3 = loadTaskStdFixture(mkStdTaskState());
+      const T3 = fx3.W.Components.TaskPanel;
+      fx3.W.MockData.setUnlocked(true);
+      T3.bind(fx3.state);
+      T3.render(fx3.state);
+      const cell3 = type => {
+        const tb = fx3.node('tkStdTable').querySelector('tbody');
+        return tb.__children.slice().reverse().map(r => r.__children.find(td => td.dataset.edit === type)).find(Boolean) || null;
+      };
+      /* 偏差本身**超量程**（14.00 / 15.00 远在深度量程之外），典型值置空 ⇒ 超量程校验应跳过 */
+      const setTypicalNull = () => {
+        T3.ensureStd(fx3.state, 'depth');
+        fx3.state.task.standard.depth.typical = null;
+        fx3.state.task.standard.depth.upperDev = r2(dRange.max + 8);
+        fx3.state.task.standard.depth.lowerDev = r2(dRange.max + 7);
+      };
+      const threeOf = () => JSON.stringify(stdKeys.map(k => fx3.state.task.standard.depth[k]));
+      /* ① 偏差超量程但典型值为空 ⇒ **应当写入成功**，导出上/下限显示占位（—）、三态 idle（不判定） */
+      setTypicalNull();
+      T3.render(fx3.state);
+      fx3.alerts.length = 0;
+      const beforeNull = threeOf();
+      const nullDerivedRow = () => {
+        const rows3 = parseStdRows(fx3.node('tkStdTable tbody').innerHTML);
+        const row = rows3.find(r => r.kind === 'depth') || { tds: [] };
+        return { row, d: derivedCell(rows3, 'depth') };
+      };
+      fx3.click(cell3('depthLowerDev'));
+      fx3.input().value = r2(dRange.max + 7).toFixed(digits);
+      fx3.screen('keydown');
+      const nd = nullDerivedRow();
+      check(
+        'FR-3.19 第⑥步/FR-3.18 典型值为空时**跳过超量程校验**：偏差本身超量程仍可写入，且导出上/下限显示占位（—）、不判定（三态 idle）',
+        fx3.alerts.length === 0 && threeOf() !== beforeNull &&
+        derivedLimits(nd.d && nd.d.text, digits) === null && /—/.test(stdCellText(nd.d)) &&
+        /std-state idle/.test(String(fx3.node('tkStdTable tbody').innerHTML)),
+        `alert=${fx3.alerts.length} 次（应 0）；标准 ${beforeNull} → ${threeOf()}；` +
+        `导出格文本=${JSON.stringify(stdCellText(nd.d))}（解析值=${JSON.stringify(derivedLimits(nd.d && nd.d.text, digits))}，应占位 —）；` +
+        `三态 idle=${/std-state idle/.test(String(fx3.node('tkStdTable tbody').innerHTML))}`
+      );
+      /* ② 典型值仍为空、且 `下偏差 > 上偏差` ⇒ 本项校验**仍要跑**（只跳过居中与超量程）。
+         构造口径：两侧偏差都超量程（故只有"跳过超量程"才可能通过），且**上偏差取负值** ——
+         这样"不带符号按默认负"的下偏差（`-13.50`）才会**大于**上偏差（`-14.00`），
+         于是唯一可能拦住它的就是校验⑤（`下偏差 ≤ 上偏差`）。
+         同一构造再跑一次**反向输入**（下偏差 `-14.50 < -14.00`）⇒ 必须**写入成功** ——
+         两侧合起来才算证明"拦它的是 ⑤，不是别的校验"（单侧只证明"有个弹窗"）。 */
+      const setNegPair = () => {
+        T3.ensureStd(fx3.state, 'depth');
+        fx3.state.task.standard.depth.typical = null;
+        fx3.state.task.standard.depth.upperDev = r2(dRange.max - 20);   /* = -14.00 */
+        fx3.state.task.standard.depth.lowerDev = r2(dRange.max - 19);   /* = -13.00 */
+      };
+      setNegPair();
+      T3.render(fx3.state);
+      fx3.alerts.length = 0;
+      fx3.click(cell3('depthLowerDev'));
+      fx3.input().value = '13.50';                                      /* 无符号 ⇒ 归一为 -13.50 > 上偏差 -14.00 */
+      const beforeBadPair = threeOf();
+      fx3.screen('keydown');
+      const badPairMsg = String(fx3.alerts[0] || '');
+      const badPairStable = threeOf() === beforeBadPair;
+      const badPairAlerts = fx3.alerts.length;
+      const badPairNoEditing = !/is-editing/.test(String(fx3.node('tkStdTable tbody').innerHTML));
+      /* 反向对照：`14.50` ⇒ 归一为 `-14.50 < -14.00` ⇒ 校验⑤通过 ⇒ 必须**写入成功** */
+      setNegPair();
+      T3.render(fx3.state);
+      fx3.alerts.length = 0;
+      fx3.click(cell3('depthLowerDev'));
+      fx3.input().value = '14.50';
+      const beforeOkPair = threeOf();
+      fx3.screen('keydown');
+      check(
+        'FR-3.19 第⑥步 典型值为空时**仍校 `下偏差 ≤ 上偏差`**：下偏差 > 上偏差 ⇒ 弹窗且 state 逐字不变；反向输入（下偏差更小）⇒ 写入成功（两侧对照）',
+        badPairAlerts === 1 && /下偏差/.test(badPairMsg) && /上偏差/.test(badPairMsg) && /本次不写入/.test(badPairMsg) &&
+        badPairStable && badPairNoEditing &&
+        fx3.alerts.length === 0 && threeOf() !== beforeOkPair,
+        `下偏差 > 上偏差：alert=${JSON.stringify(badPairMsg.slice(0, 88))}、state 逐字不变=${badPairStable}、无残留 is-editing=${badPairNoEditing}；` +
+        `反向（下偏差 -14.50 < 上偏差 -14.00）：alert=${fx3.alerts.length} 次（应 0）、state ${beforeOkPair} → ${threeOf()}（应已写入）`
+      );
+    }
 
     /* ---- (g) 第 ⑤⑥ 步：不带符号按默认口径（下偏差负、上偏差正）＋ 回车/点击其他区域注入 ---- */
     fx.state.task.standard.depth.typical = dep.typical;              /* 复位为配置典型值，便于实算比对 */
-    /* 同时把偏差复位成**配置默认段**：上一个用例刻意把上/下偏差改成 −0.40/−0.50（造"典型值越界"），
-       若不复位，本用例注入 −0.35 会让下限 12.15 > 上限 12.10，被"下限 ≤ 上限"挡下（实测踩过）。 */
+    /* 同时把偏差复位成**配置默认段**：上面的用例刻意把上/下偏差改成 −0.40 / −0.50（造"典型值越界"），
+       若不复位，本用例注入 −0.35 会让导出下限 4.65 > 导出上限 4.60，被"下偏差 ≤ 上偏差"挡下（实测踩过）。 */
     fx.state.task.standard.depth.upperDev = dep.upperDev;
     fx.state.task.standard.depth.lowerDev = dep.lowerDev;
     closeSession();                                                  /* 收掉上一个用例留下的会话 */
-    fx.click(realCell('depthLower'));
+    fx.click(realCell('depthLowerDev'));
     fx.input().value = '0.35';                                       /* 无符号 ⇒ 下偏差应为 −0.35 */
     const beforeLower = stdDepth().lowerDev;
     fx.screen('keydown');                                            /* 回车 = 退出并注入 */
     const lowerAfter = stdDepth().lowerDev;
-    const lowerLimit = stdCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth', 'depthLower');
+    const lowerDerived = derivedLimits(derivedCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth') &&
+      derivedCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth').text, digits);
     check(
-      'FR-3.19 第⑤⑥步 无符号输入按默认口径（下偏差默认负）：回车退出并注入，下限＝典型值＋(输入取负)，画面随之刷新',
-      lowerAfter === -0.35 && lowerAfter !== beforeLower && valueOf(lowerLimit && lowerLimit.text, digits) === r2(dep.typical - 0.35),
-      `下偏差 ${beforeLower} → ${lowerAfter}（应 −0.35）；画面下限格=${valueOf(lowerLimit && lowerLimit.text, digits)} 应=${r2(dep.typical - 0.35)}`
+      'FR-3.19 第⑤⑥步 无符号输入按默认口径（下偏差默认负）：回车退出并注入，导出下限＝典型值＋(输入取负)，画面随之刷新',
+      lowerAfter === -0.35 && lowerAfter !== beforeLower && lowerDerived !== null &&
+      lowerDerived.lower === r2(dep.typical - 0.35) && lowerDerived.upper === r2(dep.typical + dep.upperDev),
+      `下偏差 ${beforeLower} → ${lowerAfter}（应 −0.35）；导出格=${JSON.stringify(lowerDerived)} 应={上限 ${r2(dep.typical + dep.upperDev)}, 下限 ${r2(dep.typical - 0.35)}}`
     );
-    fx.click(realCell('depthUpper'));
+    fx.click(realCell('depthUpperDev'));
     fx.input().value = '0.35';                                       /* 无符号 ⇒ 上偏差应为 +0.35 */
     fx.screen('blur');                                               /* 失焦 = 点击其他区域，同样退出并注入 */
     const upperAfter = stdDepth().upperDev;
+    const upperDerived = derivedLimits(derivedCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth') &&
+      derivedCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth').text, digits);
     check(
-      'FR-3.19 第⑤⑥步 无符号输入按默认口径（上偏差默认正）：失焦（点击其他区域）退出并注入，上限＝典型值＋输入',
-      upperAfter === 0.35 && valueOf(stdCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth', 'depthUpper').text, digits) === r2(dep.typical + 0.35),
-      `上偏差=${upperAfter}（应 +0.35）；画面上限格=` +
-      `${valueOf(stdCell(parseStdRows(fx.node('tkStdTable tbody').innerHTML), 'depth', 'depthUpper').text, digits)} 应=${r2(dep.typical + 0.35)}`
+      'FR-3.19 第⑤⑥步 无符号输入按默认口径（上偏差默认正）：失焦（点击其他区域）退出并注入，导出上限＝典型值＋输入、下限不动',
+      upperAfter === 0.35 && upperDerived !== null &&
+      upperDerived.upper === r2(dep.typical + 0.35) && upperDerived.lower === r2(dep.typical - 0.35),
+      `上偏差=${upperAfter}（应 +0.35）；导出格=${JSON.stringify(upperDerived)} 应={上限 ${r2(dep.typical + 0.35)}, 下限 ${r2(dep.typical - 0.35)}（不动）}`
     );
+
+    /* ---- (g2) V1.35 / C-90 导出值语义②：**改典型值 ⇒ 上下限随偏差整体平移**；改偏差 ⇒ 仅对应一侧变化 ----
+       判据全部从 state 与配置实算：平移量 = 新典型值 − 旧典型值；跨度（上限−下限）应保持不变
+       （它只由两个偏差决定）。**不硬编码 5.10 / 5.40 / 4.90**。 */
+    {
+      const depthState = () => fx.state.task.standard.depth;
+      const boundsOf = kind => {
+        const rowsNow = parseStdRows(fx.node('tkStdTable tbody').innerHTML);
+        return derivedLimits(derivedCell(rowsNow, kind) && derivedCell(rowsNow, kind).text, digits);
+      };
+      const spanOf = b => (b ? r2(b.upper - b.lower) : null);
+      /* ① 典型值 5.00 → 5.10：两侧同步平移 +0.10，偏差与跨度不变 */
+      const newTypical = r2(dep.typical + 0.10);
+      const before1 = { t: depthState().typical, u: depthState().upperDev, l: depthState().lowerDev, b: boundsOf('depth') };
+      closeSession();
+      fx.click(realCell('depthTypical'));
+      fx.input().value = newTypical.toFixed(digits);
+      fx.screen('keydown');
+      const after1 = { t: depthState().typical, u: depthState().upperDev, l: depthState().lowerDev, b: boundsOf('depth') };
+      const shift = r2(newTypical - before1.t);
+      check(
+        'FR-3.19 第⑥步/FR-3.18 改典型值 ⇒ 导出上下限**整体平移**（同幅同向）、两个偏差格与跨度不变（按 state 实算，非硬编码）',
+        after1.t === newTypical && after1.u === before1.u && after1.l === before1.l && after1.b !== null && before1.b !== null &&
+        r2(after1.b.upper - before1.b.upper) === shift && r2(after1.b.lower - before1.b.lower) === shift &&
+        spanOf(after1.b) === spanOf(before1.b),
+        `典型值 ${before1.t} → ${after1.t}（平移量 ${shift}）；导出 ${JSON.stringify(before1.b)} → ${JSON.stringify(after1.b)}；` +
+        `偏差 上=${before1.u}→${after1.u}、下=${before1.l}→${after1.l}；跨度 ${spanOf(before1.b)} → ${spanOf(after1.b)}`
+      );
+      /* ② 只改上偏差 +0.30 → +0.50：仅导出上限上移 +0.20，导出下限**逐字不变** */
+      const newUpperDev = r2(dep.upperDev + 0.20);
+      const before2 = { u: depthState().upperDev, l: depthState().lowerDev, b: boundsOf('depth') };
+      closeSession();
+      fx.click(realCell('depthUpperDev'));
+      fx.input().value = ('+' + newUpperDev.toFixed(digits));
+      fx.screen('keydown');
+      const after2 = { u: depthState().upperDev, l: depthState().lowerDev, b: boundsOf('depth') };
+      check(
+        'FR-3.19 第⑥步/FR-3.18 改上偏差 ⇒ **仅对应一侧**变化：导出上限上移、导出下限逐字不变、下偏差格不变（按 state 实算）',
+        after2.u === newUpperDev && after2.l === before2.l && after2.b !== null && before2.b !== null &&
+        r2(after2.b.upper - before2.b.upper) === r2(newUpperDev - before2.u) &&
+        after2.b.lower === before2.b.lower,
+        `上偏差 ${before2.u} → ${after2.u}（Δ${r2(after2.u - before2.u)}）；下偏差 ${before2.l} → ${after2.l}；` +
+        `导出 ${JSON.stringify(before2.b)} → ${JSON.stringify(after2.b)}（下限应逐字不变）`
+      );
+    }
 
     /* ---- (h) Esc / 取消：不注入 ---- */
     const speedValsBefore = JSON.stringify(['upperDev', 'lowerDev'].map(k => (fx.state.task.standard.speed || {})[k]));
-    fx.click(realCell('speedUpper'));
+    fx.click(realCell('speedUpperDev'));
     fx.input().value = '0.90';
     const logCountBefore3 = fx.state.opLog.length;
     fx.alerts.length = 0;
@@ -1782,21 +2155,75 @@ async function main() {
        先补一次**成功注入**（Esc 取消只留"取消"日志，取末条会取到取消记录 —— 实测踩过），
        再看该条日志的内容/时间戳/班组编号。 */
     closeSession();
-    fx.click(realCell('speedLower'));
+    fx.click(realCell('speedLowerDev'));
     fx.input().value = '0.25';
     fx.screen('keydown');                                            /* 回车注入（无符号 ⇒ 下偏差 −0.25） */
     const log = fx.state.opLog[fx.state.opLog.length - 1] || {};
     const detail = String(log.detail || '');
+    /** 「被改单元格『<参数> <字段>』」——逐单元格留痕的锚（C-90⑦ 的"被改单元格"） */
+    const logCellOf = d => {
+      const m = /「([^」]+)」/.exec(String(d || ''));
+      return m ? m[1] : null;
+    };
+    /** 从形如 `-0.20 → -0.25` 的片段里取"修改前 → 修改后"；**取全部命中**（不是只取第一处）。
+     *  为什么必须取全：成功回执 `lastInfo` 与留痕 `detail` 里各有一次 `导出上限 X → Y`，
+     *  被拒日志里更有两次（lastInfo 段 + detail 段）—— 只取第一处的话，
+     *  "实现把后一处删掉"这类变异照样能绿（D22 变异 M8 实测踩过：改 `limitTxt` 后仍被判"命中"）。
+     *  @returns {Array<{from:number,to:number}>} 全部命中（按出现次序） */
+    const pairsOf = (d, key) => [...String(d || '').matchAll(
+      new RegExp(key + '[^；]*?(-?\\d+(?:\\.\\d+)?)\\s*→\\s*(-?\\d+(?:\\.\\d+)?)', 'g'))]
+      .map(m => ({ from: Number(m[1]), to: Number(m[2]) }));
+    const pairOf = (d, key) => pairsOf(d, key)[0] || null;
+    const devPair = pairOf(detail, '被改单元格');
+    const upperPairs = pairsOf(detail, '导出上限');
+    const lowerPairs = pairsOf(detail, '导出下限');
+    const boundsPair = { upper: upperPairs[0] || null, lower: lowerPairs[0] || null };
     check(
-      'FR-3.19 第⑦步 成功后留痕：state.opLog 末条含动作、改动前后数值、生效时间戳（取自 state.clock）与班组编号（取自 config.shift.roster.teamId）',
+      'FR-3.19 第⑦步 成功留痕（①内容）：state.opLog 末条写明**被改单元格名**与**修改前后值**（按元数据实算，非字面比对），且导出上/下限各恰一处',
       fx.state.opLog.length > 0 && log.action === '测试标准录入' &&
+      logCellOf(detail) === '速度 下偏差' && devPair !== null &&
+      devPair.to === -0.25 && Number.isFinite(devPair.from) && devPair.from !== devPair.to &&
+      boundsPair.upper !== null && boundsPair.lower !== null && boundsPair.lower.to === r2(5.00 - 0.25) &&
+      /* 留痕里 `导出上限 X → Y` 与 `导出下限 X → Y` 应**各恰 1 处**（opLog 的 detail 就是被记下来的原文）；
+         少一处即"留痕被削弱"，本断言变红（D22 变异 M8 正是打这里：把 limitTxt 的前缀删掉）。
+         注：`state.opLog` 的 detail 里只有留痕那一份，成功回执 `lastInfo` **不进 opLog**，故不是 2 处。 */
+      upperPairs.length === 1 && lowerPairs.length === 1 &&
+      upperPairs[0].from === boundsPair.upper.from && lowerPairs[0].from === boundsPair.lower.from,
+      `被改单元格=${JSON.stringify(logCellOf(detail))}；改动前后=${JSON.stringify(devPair)}；` +
+      `导出上限命中 ${upperPairs.length} 处=${JSON.stringify(upperPairs)}、导出下限命中 ${lowerPairs.length} 处=${JSON.stringify(lowerPairs)}（应各 2 处且逐处同值）；` +
+      `末条日志=${JSON.stringify({ action: log.action, time: log.time, date: log.date, detail: detail.slice(0, 150) })}`
+    );
+    check(
+      'FR-3.19 第⑦步 成功留痕（②时间戳与班组编号）：生效时间＝state.clock 的日期＋时刻、班组编号＝config.shift.roster.teamId（留痕由 MockData.pushLog 记录）',
       /\d{2}:\d{2}:\d{2}/.test(String(log.time || '')) &&
       new RegExp('生效时间 ' + fx.state.clock.date + ' ' + fx.state.clock.time).test(detail) &&
-      detail.includes(fx.W.BoardConfig.shift.roster.teamId) &&
-      /→/.test(detail) && /新偏差/.test(detail),
-      `末条日志=${JSON.stringify({ action: log.action, time: log.time, date: log.date, detail: detail.slice(0, 90) })}；` +
-      `期望时间戳=${JSON.stringify(fx.state.clock.date + ' ' + fx.state.clock.time)}、班组编号=${JSON.stringify(fx.W.BoardConfig.shift.roster.teamId)}`
+      detail.includes(fx.W.BoardConfig.shift.roster.teamId),
+      `log.time=${JSON.stringify(log.time)}、log.date=${JSON.stringify(log.date)}；` +
+      `期望时间戳=${JSON.stringify(fx.state.clock.date + ' ' + fx.state.clock.time)}、班组编号=${JSON.stringify(fx.W.BoardConfig.shift.roster.teamId)}；` +
+      `detail=${JSON.stringify(detail.slice(0, 120))}`
     );
+    /* 被拒路径留痕（②要求）：同样含**被改单元格名**与**具体原因**，并再次确认 state 逐字不变。
+       为什么用"改典型值 ⇒ 超量程"这一支：它的原因文本带具体数值与量程（`超出深度量程 [4.00, 6.00]`），
+       比"未识别到有效数值"更能证明"原因被逐字记进留痕"（不是只记一句"被拒绝"）。 */
+    {
+      const grid = Math.pow(10, -digits);
+      const overTypical = r2(r2(dRange.max - dep.upperDev) + grid);
+      fx.state.task.standard.depth.typical = dep.typical;
+      fx.state.task.standard.depth.upperDev = dep.upperDev;
+      fx.state.task.standard.depth.lowerDev = dep.lowerDev;
+      const rej = illegalCase('depthTypical', overTypical.toFixed(digits),
+        /超出深度量程|超出.*量程/, '被拒留痕专项（改典型值 ⇒ 超量程）');
+      const rejLabel = logCellOf(rej.detail);
+      const rejReason = (/录入被拒绝/.test(rej.detail) ? String(rej.detail).split(/录入被拒绝/)[1] : '') || '';
+      check(
+        'FR-3.19 第⑦步 被拒路径留痕：opLog 记「被改单元格名 + 具体原因（含导出值/量程）」，且 state.task.standard 逐字不变、无残留 is-editing',
+        rej.ok && rejLabel !== null && rejLabel.includes('深度 典型值') &&
+        /超出深度量程|超出.*量程/.test(rejReason) &&
+        new RegExp(String(dRange.max)).test(rejReason) && rejReason !== '',
+        `被改单元格=${JSON.stringify(rejLabel)}；被拒原因=${JSON.stringify(rejReason.slice(0, 96))}；` +
+        `state 逐字不变=${rej.stateSame}；alert=${JSON.stringify(rej.msg.slice(0, 80))}`
+      );
+    }
     check(
       'FR-3.19 配套约束"修改成功前不改动现有值与显示"：取消/非法录入不留半成品（日志只记录被拒绝与取消，state 里没有未成功生效的标准行）',
       fx.state.opLog.some(o => /录入被拒绝/.test(String(o.detail || ''))) &&
@@ -1807,31 +2234,34 @@ async function main() {
       `standard.productCode=${JSON.stringify(fx.state.task.standard.productCode)}、revision=${fx.state.task.standard.revision}`
     );
 
-    /* ---- (j) 第 ⑧ 步 锁定语义：录入会话中 activity() 重置回首页计时 + 重新 arm（同一个 5 分钟计时器） ---- */
-    fx.timers.length = 0;
-    const resetsBefore = fx.idleResets;
-    fx.click(realCell('speedLower'));
-    const lockMs2 = evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS'));
-    check(
-      'FR-3.19 第⑧步 锁定＝与 FR-8.2 同一个 5 分钟无操作计时器：录入动作触发 activity() 时先重置回首页计时、再重新 arm 自动锁定（各 1 次、只存活 1 个计时器）',
-      fx.idleResets === resetsBefore + 1 &&
-      fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length === 1 &&
-      fx.timers.filter(t => t.cancelled).length === 0,
-      `回首页计时重置次数 ${resetsBefore} → ${fx.idleResets}；存活 ${lockMs2} ms 自动锁定定时器 ` +
-      `${fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length} 个；` +
-      `已取消 ${fx.timers.filter(t => t.cancelled).length} 个（应为 0：本次仅 arm 一次）`
-    );
-    fx.click(realCell('speedLower'));
-    closeSession();                                                   /* 收掉本次会话，使下一步只观察"又一次动作" */
-    const cancelledBefore = fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length;
-    fx.click(realCell('speedLower'));                                 /* 第二个动作：重复 arm 不堆叠 */
-    check(
-      'FR-3.19 第⑧步 连续录入动作不堆叠自动锁定计时（第二次 arm ⇒ 仍只存活 1 个、且把上一次的计时 clearTimeout 掉）',
-      fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length === 1 &&
-      fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length === cancelledBefore + 1,
-      `存活=${fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length} 个、` +
-      `被取消=${fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length} 个（本次动作前 ${cancelledBefore} 个）`
-    );
+    /* ---- (j) 第 ⑧ 步 锁定语义：录入会话中 activity() 重置回首页计时 + 重新 arm（同一个 5 分钟计时器） ----
+       ⚠️ 计数必须在**本次点击之前**取：上一条校验用例（被拒）已经退出会话、不会再触发 activity()，
+       若在这之后仍调一次收尾，`fx.idleResets` 会被那次收尾的 activity() 先加 1（实测踩过）。 */
+    {
+      const lockMs2 = evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS'));
+      fx.timers.length = 0;
+      const resetsBefore = fx.idleResets;
+      fx.click(realCell('depthUpperDev'));
+      check(
+        'FR-3.19 第⑧步 锁定＝与 FR-8.2 同一个 5 分钟无操作计时器：录入动作触发 activity() 时先重置回首页计时、再重新 arm 自动锁定（各 1 次、只存活 1 个计时器）',
+        fx.idleResets === resetsBefore + 1 &&
+        fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length === 1 &&
+        fx.timers.filter(t => t.cancelled).length === 0,
+        `回首页计时重置次数 ${resetsBefore} → ${fx.idleResets}；存活 ${lockMs2} ms 自动锁定定时器 ` +
+        `${fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length} 个；` +
+        `已取消 ${fx.timers.filter(t => t.cancelled).length} 个（应为 0：本次仅 arm 一次）`
+      );
+      closeSession();                                                   /* 收掉本次会话，使下一步只观察"又一次动作" */
+      const cancelledBefore = fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length;
+      fx.click(realCell('speedLowerDev'));                              /* 第二个动作：重复 arm 不堆叠 */
+      check(
+        'FR-3.19 第⑧步 连续录入动作不堆叠自动锁定计时（第二次 arm ⇒ 仍只存活 1 个、且把上一次的计时 clearTimeout 掉）',
+        fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length === 1 &&
+        fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length === cancelledBefore + 1,
+        `存活=${fx.timers.filter(t => t.delay === lockMs2 && !t.cancelled && !t.fired).length} 个、` +
+        `被取消=${fx.timers.filter(t => t.delay === lockMs2 && t.cancelled).length} 个（本次动作前 ${cancelledBefore} 个）`
+      );
+    }
     /* ---- (k) 第 ⑧ 步 锁定后点击数字不进入录入态 + 可观察反馈 ----
        本用例**必须换一副全新夹具**：`renderMsg()` 的择一顺序是
        `lastErr → lastInfo → session → 未解锁提示 → 已解锁提示`，而 `lastInfo` 是组件模块级的
@@ -1851,7 +2281,7 @@ async function main() {
         return tb.__children.slice().reverse().map(r => r.__children.find(td => td.dataset.edit === type)).find(Boolean) || null;
       };
       fx2.W.MockData.setUnlocked(true);
-      fx2.click(cellOf('depthUpper'));                                 /* 解锁 ⇒ 进入录入态（真路径） */
+      fx2.click(cellOf('depthUpperDev'));                              /* 解锁 ⇒ 进入录入态（真路径） */
       const enteredWhenUnlocked = fx2.node('tkStdEdit').hidden === false;
       fx2.screen('keydown', 'Escape');                                 /* 收尾：Esc 取消（不注入、且清掉回执态） */
       fx2.W.MockData.setUnlocked(false);                               /* 自动锁定到点 ⇒ 解锁态失效 */
