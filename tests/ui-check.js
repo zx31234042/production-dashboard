@@ -1069,6 +1069,24 @@ async function main() {
     const unmapped = modes.filter(m => modeToStatus[m] === undefined);
     check('FR-2.8 运行模式 ↔ 上报 testStatus 映射覆盖全部模式', modes.length > 0 && unmapped.length === 0,
       `未覆盖：${unmapped.join('、')}`);
+
+    /* D1（V1.37 / C-98）：码 `2` 的**界面显示**为「正常停机」，而「维保检修」**无对应状态码**
+       （来源为本机维保状态）—— 两者在状态面板里同为灰（`--idle`，UI-03）。
+       判据取自**渲染出来的图例**（逐项取"节点 → 色标变量"），故把它变成可证伪观察：
+       改文案、改配色、把某一项并到别的色标上，这里都会红，而不是"看一眼源码就算数"。 */
+    const legendPairs = [...legend.matchAll(/class="legend-dot" style="background:([^"]+)"><\/span>([^<]+)<\/div>/g)]
+      .map(m => ({ color: m[1], name: m[2] }));
+    const legendColor = new Map(legendPairs.map(p => [p.name, p.color]));
+    const idleHex = (parseCss(cssVars).get(':root') || {})['--idle'];
+    check('FR-2.1/FR-2.2/D1 图例五模式的色标一一对应，且「正常停机」（码 2 的显示模式）与「维保检修」（无对应码）同为灰 ' +
+      `（--idle＝${UI03['--idle']}）`,
+      legendPairs.length === 5 &&
+      legendColor.get('待机') === 'var(--warn)' && legendColor.get('测试运行') === 'var(--ok)' &&
+      legendColor.get('正常停机') === 'var(--idle)' && legendColor.get('维保检修') === 'var(--idle)' &&
+      legendColor.get('故障锁定') === 'var(--err)' &&
+      String(idleHex || '').toUpperCase() === UI03['--idle'],
+      `图例实测 ${legendPairs.map(p => `${p.name}=${p.color}`).join('、')}；--idle=${idleHex}` +
+      '（待机=黄/测试运行=绿/正常停机·维保检修=灰/故障锁定=红）');
   }
 
   {

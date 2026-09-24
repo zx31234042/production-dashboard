@@ -1,5 +1,7 @@
 /* ==========================================================================
    模拟上位机（services/mockUpperSource.js）
+   需求版本：V1.37（C-98④ / FR-2.5：运行阶段由 `testStatus` 导出 ——
+              准备=0／运行=1／判定=2／**完成=回到 0**；"完成"为过渡阶段）
    作用：在真实上位机接口（Q-21）到位前，产生**符合接口契约的报文**，
         经 services/api.js 的适配层喂给看板，用于端到端自测。
    与 tools/mock-upper/mock-upper.js（Node 版）**同构**：
@@ -61,7 +63,13 @@ window.MockUpperSource = (function () {
     s.shutterRaw = clamp(s.shutterRaw + (Math.random() - 0.5) * 6, 488, 512);
     s.cameraDepth = clamp(round2(s.cameraDepth + (Math.random() - 0.5) * 0.04), 11.80, 12.20);
 
-    /* ---- 任务进度与运行阶段：4 阶段（准备 / 运行 / 判定 / 完成） ---- */
+    /* ---- 任务进度与运行阶段：4 阶段（准备 / 运行 / 判定 / 完成） ----
+       **阶段 ↔ testStatus 的导出规则（C-98④ / FR-2.5；代码语义以附录 2 为准）**：
+         准备 = 0（待机）／运行 = 1（测试中）／**判定 = 2（测试完成）**／**完成 = 回到 0**（待机）
+       —— "完成"是**过渡阶段**（稳定显示 ≥2 s 或显示到下一次进入"运行"），故**回到 0**；
+          "判定"的结束由本方判定（数据处理与 MES 通信完成），不新增"看板 → 上位机"反向信号；
+          `3`（设备异常）为**正交状态**：任何阶段都可能出现、出现时阶段冻结（走「故障锁定」+ 单独告警）。
+       ⚠ 必须与 tools/mock-upper/mock-upper.js 的同一段**逐字一致**（两处是同一口径的模拟器）。 */
     const cycle = CFG.production.cycleSec;
     const elapsed = Math.floor((d.getTime() - s.startedAt) / 1000);
     const unitSec = elapsed % cycle;
@@ -71,8 +79,8 @@ window.MockUpperSource = (function () {
     let stage, result, testStatus;
     if (unitSec < 8)            { stage = '准备'; result = '待测试'; testStatus = 0; }
     else if (progress < 0.85)   { stage = '运行'; result = '测试中'; testStatus = 1; }
-    else if (progress < 0.97)   { stage = '判定'; result = '测试中'; testStatus = 1; }
-    else                        { stage = '完成'; result = '测试中'; testStatus = 2; }
+    else if (progress < 0.97)   { stage = '判定'; result = '测试中'; testStatus = 2; }
+    else                        { stage = '完成'; result = '测试中'; testStatus = 0; }
     s.result = result;
 
     const payload = {

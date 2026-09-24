@@ -109,7 +109,9 @@ function makeFrame(opts = {}) {
     velocity_x: vx,
     velocity_y: vy,
     collectTime: opts.at || '2026-09-19 10:00:00',
-    testStatus: opts.testStatus === undefined ? 1 : opts.testStatus,     // 1=测试中
+    /* 附录 2 的代码语义（V1.37 / C-98）：0=待机／1=测试中／2=测试完成／3=设备异常。
+       默认 1＝测试中（帧内不区分运行/判定阶段；阶段文本 `stage` 由模拟上位机另行导出，见 FR-2.5） */
+    testStatus: opts.testStatus === undefined ? 1 : opts.testStatus,
     uploadId: `UP-${String(i).padStart(6, '0')}`
   };
 }

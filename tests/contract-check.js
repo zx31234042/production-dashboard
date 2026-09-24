@@ -3,6 +3,8 @@
    作用：把 tests/README.md 第 6.1～6.7 项里**可离线执行**的部分脚本化，覆盖：
          A. 附录 2 契约（13 字段）↔ config/fieldMap.js 的 boardToReport
          B. 上位机报文契约：fieldMap.upperToBoard ↔ samplePayload ↔ mockUpperSource ↔ tools/mock-upper
+         B3. testStatus 口径（V1.37 / C-98）：附录 2 代码语义（0=待机/1=测试中/2=测试完成/3=设备异常）
+             ↔ 显示模式四态（2 显示为「正常停机」）↔ 上报 MES 反查表（**维保检修→0**，本次修正点）
          C. services/api.js 的 IF-D 行为（缺字段容错 / 冻结判定 / 配置化生效）
          D. services/api.js 的 IF-B 行为（13 字段上报 / 两种回执风格 / 失败入队——**不自动重发**；
             flushPending 只刷新待补传状态与告警、不发送，人工入口 retryPending 才发送）
@@ -22,7 +24,8 @@
    退出码：0 = 全部通过；1 = 有断言失败（失败项即待修缺陷）。
    对应需求：IF-C.1（三方映射表）、IF-B.8（附录 2 共 13 字段）、
              IF-B.9（失败入队**不自动重发**：flushPending 只刷新状态与告警、人工入口 retryPending 才发送）、
-             IF-D.9（断连/数据冻结）、FR-2.6、Q-21、Q-23
+             IF-D.9（断连/数据冻结）、FR-2.1/FR-2.5/FR-2.8（V1.37 / C-98：testStatus 口径与映射表）、
+             FR-2.6、Q-21、Q-23
    ========================================================================== */
 'use strict';
 
@@ -413,6 +416,73 @@ async function main() {
       `；相机设定深度 ${camSetDepth} vs 航行器深度标准典型值 ${vesselTypical}` +
       `${camSetDepth === vesselTypical ? '（**相等：把相机设备参数当成了航行器深度标准**）' : '（已分开）'}` +
       `；同侧性（|设定深度−相机自身水下深度| ${Math.abs(camSetDepth - camOwnDepth)} < |设定深度−航行器实测深度| ${Math.abs(camSetDepth - vesselReal)}）=${sideOk}`
+    );
+  }
+
+  /* ---- B3. testStatus 口径（V1.37 / C-98）：附录 2 代码语义、上报反查表、显示模式四态 ----
+     立案（2026-09-24 负责人裁定）：C-98 把 `testStatus` 的取值语义统一到**附录 2**
+     （`0=待机`／`1=测试中`／`2=测试完成`／`3=设备异常`），并连带修正两处口径。本段把三件事
+     钉成可证伪的断言（D1/D2 即裁定里的两条判定）：
+       ① **D1（显示侧，FR-2.8）**：`upperToBoard['status.mode'].map` 的**输出**仍是看板的
+          **显示模式四态**（0→待机／1→测试运行／2→正常停机／3→故障锁定）—— "代码语义＝测试完成"
+          与"界面显示＝正常停机"**并存**，故这张表**不随附录 2 改名**（改错了，界面与 copy-check
+          的运行模式文案会立刻对不上）。
+       ② **D2（上报侧，IF-B.8 / FR-2.8）**：`modeToTestStatus` 反查表逐项对账，其中
+          **「维保检修」是本次修正点** —— 原实现误写 `2`（在附录 2 语义下等于"上报：测试完成"，
+          属**语义失真**），现按本机维保状态无上位机码、上报按 `0`（待机）取值。
+       ③ 反查表的**键集**必须等于 FR-2.1 的五种运行模式（从界面组件实读，不写死）、
+          **值域 ⊆ {0,1,2,3} 的整数**（附录 2 只有四态）；有码的四模式上，反查表必须与正查表一致。
+     证据口径（D19）：下面把两张表的实际取值原样打印出来。 */
+  section('B3. testStatus 口径（V1.37 / C-98：附录 2 代码语义 ↔ 显示模式 ↔ 上报反查表）');
+  {
+    /* D1 的期望值：**显示模式**四态（这一条判的就是"输出侧不许跟着代码语义改名"） */
+    const EXPECT_MODE_MAP = { 0: '待机', 1: '测试运行', 2: '正常停机', 3: '故障锁定' };
+    const modeSpec = MAP.upperToBoard['status.mode'];
+    const modeMap = (modeSpec && modeSpec.map) || null;
+    check('FR-2.8/D1 码语义（附录 2：2=测试完成）与显示模式（2=正常停机）并存：' +
+      "upperToBoard['status.mode'].map 的输出仍是显示模式四态 0→待机／1→测试运行／2→正常停机／3→故障锁定",
+      Boolean(modeMap) &&
+      Object.keys(modeMap).length === Object.keys(EXPECT_MODE_MAP).length &&
+      Object.entries(EXPECT_MODE_MAP).every(([code, name]) => modeMap[code] === name),
+      `实际映射 ${JSON.stringify(modeMap)}；期望 ${JSON.stringify(EXPECT_MODE_MAP)}` +
+      '（若把输出改成"测试完成"，界面显示与 copy-check 的运行模式文案会立刻对不上）'
+    );
+
+    /* 五模式清单：从界面组件**实读**（FR-2.1 的"5 种运行模式"就是状态面板图例里这五个），不写死 */
+    const panelSrc = readText('src/components/DeviceStatusPanel.js');
+    const legendModes = [...panelSrc.matchAll(/\{\s*name:\s*'([^']+)'\s*,\s*color:/g)].map(m => m[1]);
+    const reverse = MAP.modeToTestStatus || null;
+    /* D2 的逐项期望（**维保检修→0 单列点名**：本次修正点，失败时一眼可见） */
+    const EXPECT_REVERSE = { '待机': 0, '测试运行': 1, '正常停机': 2, '维保检修': 0, '故障锁定': 3 };
+    const reverseRows = Object.entries(EXPECT_REVERSE).map(([mode, code]) => ({
+      mode, code, actual: reverse ? reverse[mode] : undefined
+    }));
+    const reverseBad = reverseRows.filter(r => r.actual !== r.code);
+    check('FR-2.8/IF-B.8/D2 上报 MES 反查表 modeToTestStatus 逐项对账（附录 2 代码语义）：' +
+      '待机→0／测试运行→1／正常停机→2／**维保检修→0（本次修正点：原误写 2 ＝ 上报"测试完成"）**／故障锁定→3',
+      Boolean(reverse) && reverseBad.length === 0,
+      reverseRows.map(r => `${r.mode}→${r.actual === undefined ? '（缺）' : r.actual}` +
+        `${r.actual === r.code ? '' : `（应为 ${r.code}）`}`).join('／') +
+      `；表实际取值 ${JSON.stringify(reverse)}`
+    );
+    check('FR-2.1/FR-2.8 反查表的键集 ＝ 状态面板图例的五种运行模式（不含未定义模式、也不漏模式），' +
+      '且取值域 ⊆ {0,1,2,3} 的整数（附录 2 只有 待机/测试中/测试完成/设备异常 四态）',
+      Boolean(reverse) && legendModes.length === 5 &&
+      Object.keys(reverse).length === legendModes.length &&
+      legendModes.every(m => Object.prototype.hasOwnProperty.call(reverse, m)) &&
+      Object.values(reverse).every(v => Number.isInteger(v) && v >= 0 && v <= 3),
+      `图例五模式＝[${legendModes.join('、')}]（从 DeviceStatusPanel.js 实读）；` +
+      `反查表键＝[${reverse ? Object.keys(reverse).join('、') : '（无表）'}]；` +
+      `值域＝[${reverse ? Object.values(reverse).join('、') : '—'}]`
+    );
+    /* 正查表 / 反查表在有码的四模式上必须双向一致（同一份口径的两个方向，各写一份必漂移） */
+    const codedModes = Object.entries(modeMap || {}).map(([code, name]) => ({ code: Number(code), name }));
+    const crossBad = codedModes.filter(m => !reverse || reverse[m.name] !== m.code);
+    check('FR-2.8 正查表（码→显示模式）与反查表（显示模式→上报码）在有码的四模式上双向一致' +
+      '（「维保检修」在附录 2 里无对应码 ⇒ 只出现在反查表，其上报码由上面那条单独点名）',
+      codedModes.length === 4 && crossBad.length === 0,
+      codedModes.map(m => `${m.code}→${m.name}→上报 ${reverse ? reverse[m.name] : '（缺表）'}`).join('；') +
+      (crossBad.length ? `；**不一致**：${crossBad.map(m => m.name).join('、')}` : '')
     );
   }
 

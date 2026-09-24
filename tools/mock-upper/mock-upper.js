@@ -6,6 +6,8 @@
      ① 作为数据源被查询：启动 HTTP 服务，GET /realtime 返回一帧报文
      ② 作为推送方：用 --push <目标URL> 周期性 POST 报文到目标（联调时指向看板服务）
    字段契约：与 src/config/fieldMap.js 的 upperToBoard 键保持一致（改动须同步两处）
+   需求版本：V1.37（C-98④ / FR-2.5：运行阶段由 `testStatus` 导出 ——
+              准备=0／运行=1／判定=2／**完成=回到 0**；与 src/services/mockUpperSource.js 同口径）
    依赖：仅 Node 内置模块，无需 npm install，不访问外网
    运行：node tools/mock-upper/mock-upper.js --help
    ========================================================================== */
@@ -112,11 +114,17 @@ function nextPayload(args, now) {
   const progress = unitSec / args.cycleSec;
   const unitIndex = Math.floor(elapsed / args.cycleSec) + 1;
 
+  /* 运行阶段 ↔ testStatus 的导出规则（C-98④ / FR-2.5；代码语义以需求清单附录 2 为准）：
+       准备 = 0（待机）／运行 = 1（测试中）／**判定 = 2（测试完成）**／**完成 = 回到 0**（待机）
+     —— "完成"是**过渡阶段**（稳定显示 ≥2 s 或显示到下一次进入"运行"），故**回到 0**；
+        "判定"的结束由本方判定（数据处理与 MES 通信完成），不新增"看板 → 上位机"反向信号；
+        `3`（设备异常）为**正交状态**：任何阶段都可能出现、出现时阶段冻结（走「故障锁定」+ 单独告警）。
+     ⚠ 必须与 src/services/mockUpperSource.js 的同一段**逐字一致**（两处是同一口径的模拟器）。 */
   let stage, result, testStatus;
   if (unitSec < 8)          { stage = '准备'; result = '待测试'; testStatus = 0; }
   else if (progress < 0.85) { stage = '运行'; result = '测试中'; testStatus = 1; }
-  else if (progress < 0.97) { stage = '判定'; result = '测试中'; testStatus = 1; }
-  else                      { stage = '完成'; result = '测试中'; testStatus = 2; }
+  else if (progress < 0.97) { stage = '判定'; result = '测试中'; testStatus = 2; }
+  else                      { stage = '完成'; result = '测试中'; testStatus = 0; }
 
   const d = new Date(now);
   return {
