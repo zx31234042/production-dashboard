@@ -9,6 +9,10 @@
          B5 三种分辨率下无滚动条（3840×2160 / 1920×1080 / 1366×768）
          B5b 任务数据页「测试标准区」U-4 版面（V1.36 / C-95）：3840×2160 下把三态徽标强制成
              最坏态「超范围」，逐格量「内容是否只有一行／无横向溢出／参数名与徽标同排」
+         B5c 任务数据页「测试标准区」**占满卡片剩余高度**（U-1 / FR-3.16 / C-92）的**真机判据**：
+              3840×2160、`?tab=1` 下量「#tkStdTable 实测高 vs 卡片内容区剩余高度」与
+              「两行行高 vs 自然高度（临时把表移出文档流实测）」，并做页内 `flex:none` 对照
+              （对照只改当次 Runtime.evaluate 的临时 DOM，**不改仓库文件**）——每项都打印实测数字
          B6 无操作自动回首页（用虚拟时间快进 5 分 10 秒）
          B7 关键页面截图落到 tests/._verify/（已被 .gitignore 忽略），供人工比对
    运行：node tests/browser-check.js
@@ -611,7 +615,162 @@ async function main() {
   }
   await cdp.send('Emulation.clearDeviceMetricsOverride');
 
-  /* ===== B6 无操作自动回首页（虚拟时间快进） ===== */
+  /* ===== B5c 任务数据页「测试标准区」占满卡片剩余高度：U-1 的**真机**判据（V1.36 / C-92） =====
+     立案：FR-3.16 版面要求测试标准区**占满卡片剩余高度**（需求 :393 与 C-92）。此前只有
+     `ui-check` 的**声明层**断言（`.std-limits { flex:1; min-height:0; height:100% }` +
+     `.camera-menu { flex:none }`）—— 声明写了不等于真机上真的把行拉高了。本段在真机上量：
+       ① 表下方/上方无剩余空白（与相邻已显示兄弟的缝隙 ≤ 该侧 computed margin + 2 px）
+       ② 表确被 flex 拉伸（表高 ≥ 自然高 × 1.5；自然高＝整表临时移出文档流实测）
+       ③ 无纵向溢出（表底 ≤ 卡片**内容盒底** + 2 px、卡片无滚动条）
+       ④ 页内对照（防假绿）：临时 flexGrow=0 **且** height=auto 后表塌回自然高（≤ 正常态 40%），随后还原复测
+     ⚠️ **几何模型（2026-09-24 按主代理沙箱外真机实测数据重写）**：上一版把"卡片内容盒底"
+     用 `card.offsetTop + card.clientHeight − paddingBottom` 推导、又拿"表前兄弟累加"当剩余高度顶点，
+     得出"剩余 1135 / 内容盒底 1646"这类**错误基准**，把正确版面判成 FAIL（①0.744、③超出 78.41、
+     ④对照态反被 `height:100%` 撑到整卡高）。现只用 `getBoundingClientRect` + `computed margin/padding`。
+     真机实测（3840×2160）：卡 399–1950（padding 31，内容盒底 1919、内高 1520）、表前兄弟 ≈481、
+     表高 844.42、表后兄弟 ≈194.6 ⇒ 481 + 844.4 + 194.6 ≈ 1520，**恰好占满、无剩余空白**。
+     阈值/容差：A1 取 0（只容忍兄弟自身 margin）、A2 取 1.5×（实测 ≈3.1×）、A3 取 2 px、
+     A4 取"对照态 ≤ 正常态 40%"（实测 19%）；2 px 为亚像素/舍入容差，实测差值 0.0–10 px 量级、不贴边。
+     ⚠️ 本段依赖浏览器权限：无 Edge / 沙箱禁命名管道时整脚本已 `skipSuite`（退 3，跳过 ≠ 通过）。 */
+  section('B5c 任务数据页测试标准区占满卡片剩余高度（U-1 / C-92：3840×2160、页内 flex:none 对照）');
+  await setViewport(3840, 2160);
+  await openPage('?tab=1', 2500);
+  const u1 = await evaluate(`(() => {
+    const table = document.getElementById('tkStdTable');
+    if (!table) return { fatal: '未找到 #tkStdTable' };
+    const card = table.closest('.card');
+    if (!card) return { fatal: '#tkStdTable 不在 .card 内（版面结构变了？）' };
+    const rows = [].slice.call(table.querySelectorAll('tbody tr'));
+    if (rows.length < 2) return { fatal: '数据行不足 2 行，无法量"两行被拉伸"' };
+    const rowH = (tr) => tr.getBoundingClientRect().height;
+
+    const visible = (el) => {
+      const cs = getComputedStyle(el);
+      return cs.display !== 'none' && cs.visibility !== 'hidden' && el.getBoundingClientRect().height > 0;
+    };
+    const px = (v) => (isFinite(parseFloat(v)) ? parseFloat(v) : 0);
+    const hOf = (el) => (el ? +el.getBoundingClientRect().height.toFixed(2) : null);
+
+    /* A1：表前后**已显示的**兄弟 —— 直接用 rect 量缝隙，不自行推导卡片几何 */
+    const kids = [].slice.call(card.children);
+    const ti = kids.indexOf(table);
+    const prev = ti > 0 ? kids.slice(0, ti).filter(visible).slice(-1)[0] : null;
+    const next = kids.slice(ti + 1).filter(visible)[0] || null;
+    const tableRect = table.getBoundingClientRect();
+    const tableMarginTop = px(getComputedStyle(table).marginTop);
+    const nextMarginTop = next ? px(getComputedStyle(next).marginTop) : 0;
+    const gapBelow = next ? +(next.getBoundingClientRect().top - tableRect.bottom).toFixed(2) : null;
+    const gapAbove = prev ? +(tableRect.top - prev.getBoundingClientRect().bottom).toFixed(2) : null;
+
+    /* A3 的基准：卡片**内容盒底**（只用 rect + computed padding，不用 clientHeight/offsetTop 推导） */
+    const cardCs = getComputedStyle(card);
+    const cardRect = card.getBoundingClientRect();
+    const cardContentBottom = +(cardRect.bottom - px(cardCs.paddingBottom)).toFixed(2);
+    const bottomOverflow = +(tableRect.bottom - cardContentBottom).toFixed(2);
+
+    const tableH_normal = +table.getBoundingClientRect().height.toFixed(2);
+    const rowH_normal = rows.map((tr) => +tr.getBoundingClientRect().height.toFixed(2));
+
+    /* A2 的自然高：整表临时移出文档流（absolute + 自动高 + 自动宽 + 不参与 flex），量完逐字还原 */
+    const st = table.style.cssText;
+    const r0 = table.getBoundingClientRect();
+    const parentCs = getComputedStyle(table.parentElement);
+    table.style.position = 'absolute';
+    table.style.left = (-30000 - Math.round(r0.left) + px(parentCs.paddingLeft)) + 'px';
+    table.style.top = '0px';
+    table.style.width = (parentCs.clientWidth - px(parentCs.paddingLeft) - px(parentCs.paddingRight)) + 'px';
+    table.style.height = 'auto';
+    table.style.maxHeight = 'none';
+    table.style.flex = '0 0 auto';
+    const tableH_natural = +table.getBoundingClientRect().height.toFixed(2);
+    const rowH_natural = rows.map((tr) => +tr.getBoundingClientRect().height.toFixed(2));
+    table.style.cssText = st;                       // 逐字还原 inline 样式
+
+    /* A4 的页内对照：flexGrow=0 **且** height=auto（两个都要 —— 只改 flex 会让 height:100%
+       按"整卡内容高"解析、把表撑得比正常还高，那是模型污染不是对照），量高后立即还原并复测 */
+    table.style.flexGrow = '0';
+    table.style.height = 'auto';
+    const csCtrl = getComputedStyle(table);
+    const tableH_control = +table.getBoundingClientRect().height.toFixed(2);
+    const controlFlexGrow = csCtrl.flexGrow;
+    const controlHeightRaw = csCtrl.height;
+    table.style.removeProperty('flex-grow');
+    table.style.removeProperty('height');
+    const tableH_restored = +table.getBoundingClientRect().height.toFixed(2);
+    const restoredCs = getComputedStyle(table);
+
+    const cardContentTop = cardRect.top + px(cardCs.paddingTop);
+    const contentH = +(cardRect.height - px(cardCs.paddingTop) - px(cardCs.paddingBottom)).toFixed(2);
+    const sibBefore = +(tableRect.top - cardContentTop).toFixed(2);
+    const sibAfter = +(cardContentBottom - tableRect.bottom).toFixed(2);
+    return {
+      viewport: [window.innerWidth, window.innerHeight],
+      rows: rows.length, kinds: rows.map((tr) => tr.getAttribute('data-kind')),
+      card: { top: +cardRect.top.toFixed(2), bottom: +cardRect.bottom.toFixed(2),
+        padT: px(cardCs.paddingTop), padB: px(cardCs.paddingBottom),
+        contentH: contentH, contentBottom: cardContentBottom,
+        scrollOverflow: card.scrollHeight - card.clientHeight },
+      geometry: { sibBefore: sibBefore, tableH: tableH_normal, sibAfter: sibAfter,
+        reconstructed: +(sibBefore + tableH_normal + sibAfter).toFixed(2),
+        prevTag: prev ? (prev.id || String(prev.className)) : null, prevH: hOf(prev),
+        nextTag: next ? (next.id || String(next.className)) : null, nextH: hOf(next) },
+      tableH_normal: tableH_normal, tableH_natural: tableH_natural,
+      tableH_control: tableH_control, tableH_restored: tableH_restored,
+      controlFlexGrow: controlFlexGrow, controlHeightRaw: controlHeightRaw,
+      restoredFlexGrow: restoredCs.flexGrow, restoredHeightRaw: restoredCs.height,
+      tableBottom: +tableRect.bottom.toFixed(2), cardContentBottom: cardContentBottom,
+      bottomOverflow: bottomOverflow,
+      gapBelow: gapBelow, nextMarginTop: +nextMarginTop.toFixed(2),
+      gapAbove: gapAbove, tableMarginTop: +tableMarginTop.toFixed(2),
+      rowH_normal: rowH_normal, rowH_natural: rowH_natural,
+      tolerance: 2
+    };
+  })()`);
+
+  if (!u1 || u1.fatal) {
+    check('B5c/U-1 测试标准区占满卡片剩余高度可在真机量测（?tab=1、#tkStdTable 两行、卡片容器齐备）',
+      false, (u1 && u1.fatal) || 'evaluate 未返回结果');
+  } else {
+    const stretch = u1.tableH_natural > 0 ? +(u1.tableH_normal / u1.tableH_natural).toFixed(3) : null;
+    const controlRatio = u1.tableH_normal > 0 ? +((u1.tableH_control / u1.tableH_normal) * 100).toFixed(1) : null;
+    const rowBrief = u1.rowH_normal.map((v, i) => `${u1.kinds[i]}: 行高 ${v} / 自然 ${u1.rowH_natural[i]}`).join('；');
+    const geo = u1.geometry;
+    const brief = `视口=${u1.viewport[0]}×${u1.viewport[1]}；卡片 ${u1.card.top}–${u1.card.bottom}` +
+      `（padding ${u1.card.padT}/${u1.card.padB}、内容盒底=${u1.card.contentBottom}、内高=${u1.card.contentH}）；` +
+      `几何对账：表前 ${geo.sibBefore} + 表高 ${geo.tableH} + 表后 ${geo.sibAfter} = ${geo.reconstructed}` +
+      `（应＝内高 ${u1.card.contentH}，差 ${(geo.reconstructed - u1.card.contentH).toFixed(2)}）`;
+
+    check('B5c/U-1 A1 表下方（与上方）无剩余空白：与相邻已显示兄弟的缝隙 ≤ 该侧 computed margin + 2px',
+      u1.gapBelow !== null && u1.gapAbove !== null &&
+      u1.gapBelow <= u1.nextMarginTop + u1.tolerance && u1.gapAbove <= u1.tableMarginTop + u1.tolerance,
+      `表下缝隙=${u1.gapBelow}（下一兄弟 ${geo.nextTag} 高 ${geo.nextH}、其 margin-top=${u1.nextMarginTop}、容差 ${u1.tolerance}）；` +
+      `表上缝隙=${u1.gapAbove}（上一兄弟 ${geo.prevTag} 高 ${geo.prevH}、表 margin-top=${u1.tableMarginTop}）；` +
+      `判据：缝隙 ≤ 相邻兄弟/表自身 computed margin + ${u1.tolerance}px ⇒ "把剩余高度吃完、没有多余空白"；${brief}`);
+
+    check('B5c/U-1 A2 表确被 flex 拉伸：表高 ≥ 自然高的 1.5 倍（自然高＝整表临时移出文档流实测）',
+      stretch !== null && stretch >= 1.5,
+      `表高=${u1.tableH_normal} / 自然高=${u1.tableH_natural} = **${stretch}×**（阈值 1.5×；本环境实测应 ≈3.1×）；` +
+      `行高对照：${rowBrief}；${brief}`);
+
+    check('B5c/U-1 A3 无纵向溢出：表底 ≤ 卡片**内容盒底** + 2px，且卡片未产生滚动条',
+      u1.bottomOverflow <= u1.tolerance && u1.card.scrollOverflow <= u1.tolerance,
+      `表底=${u1.tableBottom} / 内容盒底=${u1.cardContentBottom} ⇒ 超出 ${u1.bottomOverflow}px（容差 ${u1.tolerance}）；` +
+      `卡片 scrollHeight−clientHeight=${u1.card.scrollOverflow}px；${brief}`);
+
+    check('B5c/U-1 A4 页内对照（防假绿）：临时 flexGrow=0 且 height=auto 后表塌回自然高（≤ 正常态 40%），随后还原复测一致',
+      u1.tableH_control <= u1.tableH_normal * 0.40 && u1.tableH_restored === u1.tableH_normal,
+      `对照态（flex-grow=${u1.controlFlexGrow}、computed height=${u1.controlHeightRaw}）表高=${u1.tableH_control}` +
+      ` ＝ 正常态 ${u1.tableH_normal} 的 **${controlRatio}%**（判据 ≤40%；本环境实测应 ≈19%）；` +
+      `还原后复测=${u1.tableH_restored}（应＝正常态 ⇒ 页面未被污染）、computed flex-grow=${u1.restoredFlexGrow}、height=${u1.restoredHeightRaw}`);
+
+    check('B5c/U-1 A4b 对照是"同一次 evaluate 的临时 DOM 改动"而非改仓库文件（flex-grow / height 已还原为样式表取值）',
+      String(u1.restoredFlexGrow) !== '0' && String(u1.restoredHeightRaw) !== 'auto' &&
+      u1.tableH_restored === u1.tableH_normal,
+      `还原后 computed flex-grow=${u1.restoredFlexGrow}（不应是 0）、height=${u1.restoredHeightRaw}（不应是 auto）；` +
+      `表高复测=${u1.tableH_restored} ＝ 正常态 ${u1.tableH_normal}`);
+  }
+  await cdp.send('Emulation.clearDeviceMetricsOverride');
+
   section('B6 无操作 5 分 10 秒自动返回首页（FR-9.4）');
   try {
     await openPage('', 2200);

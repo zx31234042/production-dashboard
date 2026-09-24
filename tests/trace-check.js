@@ -105,6 +105,11 @@ const MAP = [
      browser-check 的 B5b 段（3840×2160、`?tab=1`、强制徽标＝「超范围」、逐格量 `Range` 包围盒）——
      它**依赖浏览器权限**、在本受限环境整脚本跳过，故**不登记为本行的证据**（本行仍记 ui-check 的实算断言），
      也不计入"离线可验证覆盖"（browser-check 在 `ONLINE_ONLY` 集合内）。
+     ⚠️ V1.36（U-1）另有一条**版面**要求：「测试标准区**占满卡片剩余高度**」。它的**真机**证据由
+     `browser-check` 的 **B5c** 段承接（3840×2160、`?tab=1`：量 `#tkStdTable` 实际高度与卡片剩余高度之比、
+     两行行高相对自然高度的拉伸倍数，并含页内 `flex:none` 对照），与 B5b **同口径**：
+     **browser-class，不登记为离线可追溯覆盖**（browser-check 在 `ONLINE_ONLY` 集合内）；
+     本行仍只登记 ui-check 的**声明层**断言（`.std-limits{flex:1;min-height:0;height:100%}`）。
      FR-3.19（录入类：三格均可录入 / 反色+高亮 2 px+1 s 闪烁 / 回车与失焦注入 / 整体平移 / 六类校验弹窗且不写入 /
               逐单元格留痕含时间戳与班组编号 / 锁定后点击无响应）：
        · `FR-3.19 第4步 反色、高亮框（2 px）与 1 s ± 50 ms 闪烁的样式契约齐备（@keyframes stdBlink + .is-editing 的 animation/box-shadow/反色文字）`
@@ -368,7 +373,7 @@ function acceptanceCriteria() {
    第 10 章交付物清单（第七节的数据源；T-20260920-06）
    --------------------------------------------------------------------------
    为什么单列：AC-12（需求 :795「第 10 章交付物齐全并通过审核」）的判定对象是**第 10 章
-   （:759 起、表在 :763–776）的 12 项交付物**。原先 AC-12 的依据只按 `输出文件\` 一个目录
+   （需求 §10 :759 起、表在 :763–776）的 12 项交付物**。原先 AC-12 的依据只按 `输出文件\` 一个目录
    得出"其余 10 项无交付件"这样的**粗判定**；本节把 12 项**逐项**对上仓库落点，
    把"有没有"变成可核查的数字（口径与 AC 一致：**不计入 259 条分母**）。
 
@@ -608,6 +613,361 @@ function requirementPriorities() {
     return [p];
   });
 }
+
+/* ==========================================================================
+   注释里的「需求行号引用」自检（第九节的数据与规则；T-20260924-T3）
+   --------------------------------------------------------------------------
+   立案依据（**实测**）：2026-09-24 的诚实性探针 M7 证明 —— 把本文件注释里的
+   `需求 … :234` 改成 `:233`，脚本照样 **20/0 全绿、exit 0**。也就是说：本文件里**成体系**的
+   需求行号引用当时**没有任何机器校验**，升版时极易集体漂移（V1.36 这一批就重导了 20 余处）。
+
+   做法（三条，缺一不可）：
+     ① **真源仍是当轮需求文件本身**（`需求文档\*.md`）。本节**不复制**任何需求正文，
+        只做「引用 ↔ 真源」的对账：引用处的语义锚点 + 被引用行号那一行的原文，
+        两边都要命中同一个锚点 —— 任一错位即红。
+     ② `CITATION_LEDGER` ＝ **逐处清单**（哪一行、第几处、引用了需求第几行），
+        `ANCHORS` ＝ 与它一一对应的锚点表（引用处长什么样 + 需求那一行该长什么样）。
+        两侧由第九节的**双向对账**核实：源码里扫到的引用集合 ↔ 清单 ∪ 锚点 ∪ 豁免，
+        多一处、少一处都变红（不许"把校验范围缩小到自己能过"）。
+     ③ 判不出锚点的引用一律进 `CITATION_EXEMPT` / `XFILE_EXEMPT` 并**逐条给理由**；
+        豁免清单为空是"当前没有"，不是"允许静默跳过" —— 豁免计数参与对账。
+
+   ⚠️ 维护纪律（升版时）：需求升版重导行号后，本节的清单/锚点表**必须同步**；
+      改完跑 `node tests\trace-check.js`，第九节会把"哪一处引用的行号或锚点对不上"直接点名。
+      本文件顶部注释里写死的 `:234` 等行号，就是靠这一节守着的。
+   ⚠️ 本节是"引用 ↔ 真源"的对账，**不构成**任何条款的实现证据（D19）。
+   ========================================================================== */
+
+/** 归一（比对用）：去掉空白与反引号 —— 只用于**比对**，绝不用于改写真源（真源仍是需求文件原文）。 */
+function normSpace(s) {
+  return String(s == null ? '' : s)
+    .replace(/[`\s]/g, '')
+    .replace(/¦/g, '')
+    .replace(/（/g, '(').replace(/）/g, ')');
+}
+
+const REQ_DIR = path.join(ROOT, '需求文档');
+const REQ_FILE = fs.readdirSync(REQ_DIR).find(f => f.endsWith('.md')) || null;
+const REQ_LINES = REQ_FILE
+  ? fs.readFileSync(path.join(REQ_DIR, REQ_FILE), 'utf8').split('\n').map(s => s.replace(/\r$/, ''))
+  : [];
+/** 本文件自身源码（**被检对象**：注释里的行号引用就在这里）。
+ *  ⚠️ **锚点表与形态表所在的区块整段掩掉**：那些行里写的是"引用该长什么样"的**模式**，
+ *  自身也含 `需求 …:759` 之类的字面 —— 不掩掉就会被当成真的引用（本节的自指陷阱，实测踩过）。
+ *  掩码用空串替换，**行号与其余行的偏移量不变**。 */
+const ANCHOR_REGION = (() => {
+  const lines = fs.readFileSync(__filename, 'utf8').split('\n').map(s => s.replace(/\r$/, ''));
+  const a = lines.findIndex(l => /^const ANCHORS = \{/.test(l));
+  const b = a < 0 ? -1 : lines.findIndex((l, i) => i > a && /^\};/.test(l));
+  const c = lines.findIndex(l => /^const CITATION_PATTERNS = \[/.test(l));
+  const d = c < 0 ? -1 : lines.findIndex((l, i) => i > c && /^\];/.test(l));
+  return { lines, spans: [a >= 0 && b > a ? [a, b] : null, c >= 0 && d > c ? [c, d] : null].filter(Boolean) };
+})();
+const SELF_LINES = ANCHOR_REGION.lines.map((l, i) =>
+  ANCHOR_REGION.spans.some(([a, b]) => i >= a && i <= b) ? '' : l);
+
+/** 引用形态表（"需求行号引用"的**定义**）。要增删形态必须同步第九节的冻结基线，
+ *  否则"清单 ⊆ 扫描"或"扫描 ⊆ 清单"当场变红 —— 形态表本身也是被对账的对象。 */
+const CITATION_PATTERNS = [
+  /* ⚠️ 两个坑（都是**实测踩过**的，不是预防性设计）：
+     ① `需求` 之后必须紧跟空白或 `§`：否则会从「需求**文档**\…-V1.36.md:234」中间起匹配，
+        把**跨文件引用**误当成本文件对需求清单的行号引用；
+     ② 命中里含反引号的要丢掉：`需求文档\…-V1.36.md:234` 写在反引号里，而
+        「需求 §0.2 的合计行见 `需求文档…`:234」这种写法会让非贪婪匹配跨过反引号，
+        把行内代码段吞进来 —— 掩掉代码段并丢掉含反引号的命中，剩下的才是真正的"引用需求清单行号"。 */
+  { name: '需求 §X.Y …:NNN', re: /需求(?=\s|§)[^\n]{0,40}?:\s*\d+/g },
+  { name: '需求 <编号> …（:NNN）', re: /需求(?=\s|§)[^\n]{0,40}?（\s*:\s*\d+\s*）/g },
+  { name: '需求 <编号> …（:NNN）半角', re: /需求(?=\s|§)[^\n]{0,40}?\(\s*:\s*\d+\s*\)/g },
+  /* 区间连接写法：`需求 §10 :759 起、表在 :763–776` 里，第二处是**裸 `:A–B`**（冒号前紧邻的是
+     汉字"在"而不是"需求…"）。故这一形态要求"冒号前是中文连接词（在/至/到/见/起）、
+     且前面不是文件名/标识符"，由 `expandBareCitations()` 先补成"需求 …:A–B"的统一写法。 */
+  { name: '需求 …:A–B（区间，含裸写法补全）', re: /(?<![\w.\-\\/:'"$}>])[\u4e00-\u9fa5]\s*:\s*\d+\s*[–—]\s*\d+/g }
+];
+
+/** 行内代码段（反引号）区间的起止位置。落在其中的 `:NNN` **不是**本文件对需求清单的引用
+ *  —— 写成反引号的都是**文件名 + 行号**（如 `需求文档\…-V1.36.md:234`）或**示例写法**。 */
+function codeSpans(line) {
+  const spans = [];
+  const re = /`[^`]*`/g;
+  let m;
+  while ((m = re.exec(line)) !== null) spans.push([m.index, m.index + m[0].length]);
+  return spans;
+}
+
+/** 扫描前把**行内代码段**整段替换为**等长空格** —— 于是"本文件注释里举的例子"与
+ *  "文件名 + 行号"都不会被算成引用。等长替换保证偏移量与源码原文一致（可与原文逐字对账）。 */
+function maskCodeSpans(line) {
+  let out = line;
+  for (const [a, b] of codeSpans(line)) out = out.slice(0, a) + ' '.repeat(b - a) + out.slice(b);
+  return out;
+}
+
+/** 把**依赖同一轮引用的裸 `:NNN` 写法**补全为统一的 `需求 …:NNN`。
+ *  只有"冒号前紧邻的是**中文**（需求侧措辞：`在` / `见` / `起` …）且前 8 字里出现 `需求` / `§` / 条款编号"
+ *  才补 —— 其余裸 `:NNN`（`stress-check.js:39`、`07:59:30`、`{0,24}` 之类）一律不动：
+ *  它们是**非需求文件**的行号或时间字面量，不属本节口径。
+ *  ⚠️ 输入必须是**已掩码**的文本（调用方先 `maskCodeSpans`），否则会把示例写法补成引用；
+ *  ⚠️ 同一分支里带 `需求` 前缀的成文引用置于前，避免把裸 `:数字` 这种写法又补一次前缀；
+ *  ⚠️ 冒号前是 `$` / `}` / `>` 的一律不补 —— 那是本文件的 `${n}`、`=>` 等**代码语法**里的冒号。 */
+function expandBareCitations(masked) {
+  return masked.replace(
+    /需求(?=\s|§)[^\n]{0,40}?:\s*\d+|(?<![\w.\-\\/:'"$}>])([\u4e00-\u9fa5])\s*:(\d+)(?![\d:])/g,
+    (m, cn, d, off) => {
+      if (cn === undefined) return m;                                   // 已是成文引用，原样保留
+      const before = masked.slice(Math.max(0, off - 8), off);
+      return /需求|§|[A-Z]{2,}-\d/.test(before) ? `需求 …:${d}` : m;
+    }
+  );
+}
+
+/** 从一行文本里扫出全部「需求行号引用」。
+ *  排除规则：**行内代码段（反引号）里的不算**（本节自己的示例、文件名 + 行号都在里面）。
+ *  再做两件事：
+ *   ① **去重**：重叠命中按"更长者胜、同起点的靠前者胜"；
+ *   ② **粘合**：相邻两处引用若间距 ≤ 16 个字符，则**合并为一次引用**并把区间一并收进来
+ *      （`§10 :759 起、表在 :763–776`＝一次引用；`需求 :776` 与 `需求 DEP-14（:754）`
+ *      在同一句里紧挨着 ⇒ 各自独立，因为它们之间的文字超过 16 字）。 */
+function scanCitations(line) {
+  const text = expandBareCitations(maskCodeSpans(line));
+  const raw = [];
+  for (const p of CITATION_PATTERNS) {
+    p.re.lastIndex = 0;
+    let m;
+    while ((m = p.re.exec(text)) !== null) {
+      const filePart = m[0].split(':')[0];
+      if (/\.md|\\/.test(filePart)) continue;                          // 跨文件引用 ⇒ 不算
+      const seg = m[0].match(/^([\s\S]*?):\s*(\d+)/);
+      if (!seg) continue;
+      raw.push({ lineNo: Number(seg[2]), text: m[0], start: m.index, end: m.index + m[0].length });
+    }
+  }
+  raw.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const hits = [];
+  for (const h of raw) {
+    if (hits.some(o => o.start < h.end && h.start < o.end)) continue;   // 重叠 ⇒ 同一次引用
+    hits.push(h);
+  }
+  for (let i = 0; i < hits.length; i++) {
+    while (i + 1 < hits.length && hits[i + 1].start - hits[i].end <= 16) {   // ① 粘合
+      hits[i] = { ...hits[i], text: text.slice(hits[i].start, hits[i + 1].end), end: hits[i + 1].end };
+      hits.splice(i + 1, 1);
+    }
+    if (i === hits.length - 1) {                                             // ② 行尾粘连（区间另一头）
+      const tail = text.slice(hits[i].end, hits[i].end + 16);
+      const m2 = tail.match(/^\s*[–—]\s*\d+/);
+      if (m2) hits[i] = { ...hits[i], text: hits[i].text + tail.slice(0, m2[0].length), end: hits[i].end + m2[0].length };
+    }
+    /* ③ **区间续写**：`需求 §10 :759 起、表在 :763–776` —— 第二处是**裸 `:A–B`**
+       （两处引用之间的"起、表在 "是连接词）。把两处**并成一次引用**，区间端点才能被逐端点核对；
+       否则 `:763–776` 这一头会从引用文本里漏掉（定点变异实测：止点改成 `:775` 时其余断言全绿）。 */
+    if (i + 1 < hits.length && text.slice(hits[i].end, hits[i + 1].start).includes('–')) {
+      hits[i] = { ...hits[i], text: text.slice(hits[i].start, hits[i + 1].end), end: hits[i + 1].end };
+      hits.splice(i + 1, 1);
+    }
+    /* 引用原文**去掉两侧空白**：命中是从某处开始到某处结束的片段，行首/连接词前的空白
+       不算引用的一部分（否则"锚点 ↔ 引用原文"的比对会被空白搅乱）。 */
+    hits[i].text = hits[i].text.trim();
+    const m3 = hits[i].text.match(/^([\s\S]*?):\s*(\d+)/);
+    hits[i].lineNo = Number(m3[2]);
+    /* 区间止点：整段引用里**最后一个**「:数字」或「–数字」—— 与起点无关，故用最后一次命中。 */
+    const rangeTail = hits[i].text.match(/(?::|[–—])\s*(\d+)(?![\d\S])/g);
+    hits[i].range = rangeTail && rangeTail.length > 1
+      ? [hits[i].lineNo, Number(rangeTail[rangeTail.length - 1].replace(/[^\d]/g, ''))]
+      : null;
+  }
+  return hits;
+}
+
+/** 扫描用的**放宽版**：连"落在行内代码段里"的候选也算 —— 只给**跨文件/示例引用**（xfile）登记用。
+ *  ⚠️ 取命中的**第 1 处**（按出现位置）。 */
+function scanCitationsRaw(line) {
+  const hits = [];
+  for (const p of CITATION_PATTERNS) {
+    p.re.lastIndex = 0;
+    let m;
+    while ((m = p.re.exec(line)) !== null) {
+      const seg = m[0].match(/^([\s\S]*?):\s*(\d+)/);
+      if (!seg) continue;
+      hits.push({ lineNo: Number(seg[2]), text: m[0], start: m.index, end: m.index + m[0].length });
+    }
+  }
+  hits.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+  const out = [];
+  for (const h of hits) {
+    if (out.some(o => o.start < h.end && h.start < o.end)) continue;
+    out.push(h);
+  }
+  return out;
+}
+
+/** 逐处清单：[源码行号(1 起), 该行第几处(0 起), 引用的需求行号, 类型]。
+ *  `type`：req＝本文件对需求清单的行号引用 / xfile＝**跨文件/示例**引用
+ *         （`需求文档\…-V1.36.md:234` 这种"文件名 + 行号"，或本节注释里的示例写法）。
+ *  ⚠️ 本清单是**逐处**登记的（同一行两处就写两条），不是"每行一条" —— 少登一处会被扫描侧抓到。 */
+const CITATION_LEDGER = [
+  /* —— in-scope：本文件对需求清单行号的引用（逐处锚定） —— */
+  ['L212', 0, 549, 'req'],
+  ['L375', 0, 795, 'req'],
+  ['L376', 0, 776, 'req', '区间引用：止点＝被引用行号，起点另记在末位', 759],
+  ['L385', 0, 761, 'req'],
+  ['L420', 0, 765, 'req'],
+  ['L420', 1, 761, 'req'],
+  ['L424', 0, 766, 'req'],
+  ['L428', 0, 767, 'req'],
+  ['L431', 0, 768, 'req'],
+  ['L434', 0, 769, 'req'],
+  ['L437', 0, 770, 'req'],
+  ['L439', 0, 771, 'req'],
+  ['L443', 0, 772, 'req'],
+  ['L446', 0, 773, 'req'],
+  ['L448', 0, 774, 'req'],
+  ['L450', 0, 775, 'req'],
+  ['L452', 0, 776, 'req'],
+  ['L452', 1, 754, 'req'],
+  ['L525', 0, 790, 'req'],
+  ['L538', 0, 761, 'req'],
+  ['L1285', 0, 784, 'req'],
+  /* —— 跨文件 / 示例：引的是**别的文件**自己的行号，或本节注释里的示例写法 —— */
+  ['L12', 0, 234, 'xfile', '需求文档\\…-V1.36.md'],
+  ['L345', 0, 235, 'xfile', '需求文档\\…V1.36.md'],
+  ['L621', 0, 234, 'xfile', '需求文档\\…-V1.36.md（示例）'],
+  ['L656', 0, 759, 'xfile', '本节注释里的示例写法（裸 :A–B 补全）'],
+  ['L1464', 0, 759, 'xfile', '本节注释里第二次举同一示例']
+];
+
+/** 清单 → 引用对象（带源码行原文），供锚点表与对账共用。
+ *  `hit` 为 null 表示该处**扫不到**（清单登记错了或源码被改坏）。
+ *  in-scope 用严格扫描（反引号里的不算）；xfile 用放宽扫描（它们本来就在反引号里）。 */
+function buildManifest(ledger, allLines) {
+  const out = [];
+  for (const [srcRaw, idx, reqNo, type, file, rangeStart] of ledger) {
+    const srcNo = typeof srcRaw === 'number' ? srcRaw : Number(String(srcRaw).replace(/^L/, ''));
+    const line = allLines[srcNo - 1];
+    /* 源码行号用 `L123` 写：这样本节源码里就不会出现形如 `[123, 0, 456, 'req'],` 的"裸数字 + 冒号"
+       片段被自己的扫描器当成引用（自指陷阱的第三道闸）。
+       第 6 个元素（可选）＝**区间起点**：仅"区间引用"用，`reqNo` 取的是区间**止点**
+       （因为锚点核的就是止点那一行；起点由第九节⑭的端点断言按**位置严格相等**核）。 */
+    const hits = line === undefined ? [] : (type === 'xfile' ? scanCitationsRaw(line) : scanCitations(line));
+    const hit = hits[idx] || null;
+    out.push({
+      srcNo, idx, reqNo, type, file: file || '', line, hit, rangeStart: rangeStart || null,
+      text: hit ? hit.text : '**扫不到引用（清单登记错 / 源码被改坏，需人工核）**',
+      key: `${srcNo}:${idx}`
+    });
+  }
+  return out;
+}
+
+const CITATIONS = buildManifest(CITATION_LEDGER, SELF_LINES);
+const IN_SCOPE = CITATIONS.filter(c => c.type !== 'xfile');
+const XFILE = CITATIONS.filter(c => c.type === 'xfile');
+
+/** 「锚点 ↔ 引用原文」的自洽判定（**双向包含**）：
+ *  锚点里带 `${n}` 占位，去掉占位符后的**字面部分**天然是被截断的前缀/后缀：
+ *  · `交付方式见需求 :${n}` 的字面部分 `交付方式见需求:` ⊂ 引用原文 `需求 :761` ＋ 前后文；
+ *  · `需求 :${n}` 的字面部分 `需求:` 是引用原文 `需求 :549` 的**前缀**。
+ *  故判据取双向包含（任一侧含另一侧即可），两侧都归一（去空白/反引号/全角括号）。
+ *  这条判据保证"锚点确实锚在这一处引用上"：把锚点键挪到别处、或把锚点改成别的语义标签，都会红。
+ *  空字面部分一律判不成立。 */
+function anchorFitsPhrase(literal, phrase) {
+  const l = normSpace(literal), p = normSpace(phrase);
+  if (!l || !p) return false;
+  return p.includes(l) || l.includes(p);
+}
+
+/** **源码侧锚点是否仍成立**：把锚点的源码侧写法按占位符切成**字面片段**，逐段按顺序在
+ *  **归一后的源码行**里定位（允许片段之间夹着行号数字，如 `需求 §` …` 起、表在 :` … `）。
+ *  足以拦住"锚点写着老短语、引用已被改写"（定点变异实测：语义标签改成「交付方式见交付说明」⇒ 红）。 */
+function sourceAnchorHolds(c, srcHalf) {
+  if (!c.hit || !c.line) return false;
+  if (c.line.indexOf(c.hit.text) < 0) return false;            // 引用原文已不在该行 ⇒ 清单登记错了
+  const nsLine = normSpace(c.line);
+  const frags = String(srcHalf).replace(/\$\{[^}]*\}/g, '{号}').split('{号}')
+    .map(normSpace).filter(Boolean);
+  if (!frags.length) return false;
+  let from = 0;
+  for (const part of frags) {
+    const at = nsLine.indexOf(part, from);
+    if (at < 0) return false;
+    from = at + part.length;
+  }
+  return true;
+}
+
+/** 锚点表（键＝`源码行号:第几处`，与 `CITATION_LEDGER` 的 **in-scope** 条目一一对应）。
+ *  每项的 `anchor` 格式为 `源码侧写法（含锚点）¦需求那一行该含的正则`。
+ *  · **源码侧**是字面短语（去掉 `${n}` 与 `「」` 后须逐字出现在该行源码里）；
+ *  · **需求行侧**是正则（只归一空白与反引号 ⇒ 带 `**` / `|` 的写法要写成 `\*\*` / `\|`）；
+ *  · 行号一律用 `${n}` 占位（如 `:${n + 17}`），写死会被九⑧ 拦下。 */
+const ANCHORS = {
+  '212:0': { anchor: '需求 :${n}¦^\\|UI-20\\|\\*\\*待补传清单与人工重报入口\\*\\*', name: 'UI-20 条款行（锚点＝条款编号本身）' },
+  '375:0': { anchor: '需求 :${n}¦^\\|AC-12\\|文档完整性\\|', name: 'AC-12 判定标准原文' },
+  '376:0': { anchor: '需求 §{号} :{号} 起、表在 :{号}¦^\\|12\\|质保承诺书\\|', name: '第 10 章交付物表末行（＝区间止点 :776）；`{号}` 是**行号占位**（对应 ${rangeStart}/${n}/${rangeEnd}），区间两端另由 `RANGE_ANCHORS` 逐端点核' },
+  '385:0': { anchor: '交付方式见需求 :${n}¦^\\*\\*交付方式：\\*\\*', name: '第 10 章"交付方式"整段' },
+  '420:0': { anchor: '需求 :${n}¦^\\|1\\|看板系统实物\\|', name: '交付物①「看板系统实物」表行' },
+  '420:1': { anchor: '与硬件一起实物交付¦^\\*\\*交付方式：\\*\\*', name: '同行第二处引用仍指"交付方式"段' },
+  '424:0': { anchor: '需求 :${n}¦^\\|2\\|需求规格说明书\\|', name: '交付物②「需求规格说明书」表行' },
+  '428:0': { anchor: '需求 :${n}¦^\\|3\\|系统设计说明书\\|', name: '交付物③「系统设计说明书」表行' },
+  '431:0': { anchor: '需求 :${n}¦^\\|4\\|界面原型/UI设计稿\\|', name: '交付物④「界面原型 / UI 设计稿」表行' },
+  '434:0': { anchor: '需求 :${n}¦^\\|5\\|数据库脚本与初始化数据\\|', name: '交付物⑤「数据库脚本与初始化数据」表行' },
+  '437:0': { anchor: '需求 :${n}¦^\\|6\\|源代码与构建说明\\|', name: '交付物⑥「源代码与构建说明」表行' },
+  '439:0': { anchor: '需求 :${n}¦^\\|7\\|安装包与部署手册\\|', name: '交付物⑦「安装包与部署手册」表行' },
+  '443:0': { anchor: '需求 :${n}¦^\\|8\\|接口联调文档与测试报告\\|', name: '交付物⑧「接口联调文档与测试报告」表行' },
+  '446:0': { anchor: '需求 :${n}¦^\\|9\\|测试报告\\|', name: '交付物⑨「测试报告」表行' },
+  '448:0': { anchor: '需求 :${n}¦^\\|10\\|用户操作手册/运维手册\\|', name: '交付物⑩「用户操作手册 / 运维手册」表行' },
+  '450:0': { anchor: '需求 :${n}¦^\\|11\\|培训与验收报告\\|', name: '交付物⑪「培训与验收报告」表行' },
+  '452:0': { anchor: '需求 :${n}¦^\\|12\\|质保承诺书\\|', name: '交付物⑫「质保承诺书」表行' },
+  '452:1': { anchor: '需求 DEP-14（:${n}¦^\\|DEP-${n - 740}\\|', name: 'DEP-14 条款行（锚点＝条款编号本身）' },
+  '525:0': { anchor: '连续运行 ≥7 天无重启、无崩溃、无内存泄漏"（需求¦^\\|AC-07\\|稳定性测试\\|', name: 'AC-07 判定标准原文（含"≥7 天"）' },
+  '538:0': { anchor: '交付方式见需求 :${n}¦^\\*\\*交付方式：\\*\\*', name: '第 10 章"交付方式"整段（与 :385 同源、两处都核）' },
+  '1285:0': { anchor: 'AC-01（需求 :${n}¦^\\|AC-01\\|功能完整性\\|', name: 'AC-01 判定标准原文（锚点＝AC 编号本身）' }
+};
+
+/** 区间引用的**端点说明**（键＝`源码行号:第几处`）：
+ *  `需求 §10 :759 起、表在 :763–776` 一次带了三个行号（引用行 759＝第 10 章标题、
+ *  区间起 763＝交付物表表头、区间止 776＝表末行）。本节的锚点表只核**被引用行号所指的那一行**，
+ *  故这里注明：① 该引用为**区间起**（行号 759）时，其锚点直接取**区间那一头**的端点行；
+ *  ② 区间那一头由**扫描侧解析出的区间端点**（`hit.range`）与本表 `rangeEnd` 的**位置严格相等**断言兜住
+ *  —— 只核"被引用行"会漏掉端点（定点变异实测：把 `:776` 改成 `:775` 时其余断言全绿）。 */
+const RANGE_ANCHORS = {
+  '376:0': {
+    rangeStart: { at: '+4', mustMatch: '^\\|序号\\|交付物\\|说明\\|', name: '第 10 章交付物表**表头行**（区间起点）' },
+    rangeEnd: { at: '+17', mustMatch: '^\\|12\\|质保承诺书\\|', name: '第 10 章交付物表**末行（第 12 项）**（区间止点）' }
+  }
+};
+
+
+/** 跨文件 / 示例引用的**逐条理由**（键＝`源码行号:第几处`）。 */
+const XFILE_EXEMPT = {
+  '12:0': '写法为 `需求文档\\…-V1.36.md:234`（行内代码段里的跨文件引用）；指需求文件自己的行号，其正确性由第七节 §0.2 台账与需求文件本身核实，本节不另行锚定。',
+  '345:0': '`需求文档\\…V1.36.md:235` —— AC 段口径说明里的跨文件引用；同行的 in-scope 引用由锚点表覆盖，此处仅为"文件名 + 行号"写法。',
+  '621:0': '`需求文档\\…-V1.36.md:234` —— 本文件注释里**举例说明**"跨文件写法"的一处；该行位于 `CITATION_PATTERNS` 区块内（已掩码，严格扫描看不到）。',
+  '656:0': '本节注释里**举例说明**裸 `:A–B` 写法的示例（位于锚点代码块内、已掩码）；不是本文件对需求清单的行号引用。',
+  '1464:0': '本节注释里第二次举同一示例（说明"裸写法会被补全成引用"）；在代码段内，不是对需求清单的引用。'
+};
+
+/** 无锚点且**不属于跨文件/示例引用**的 in-scope 引用（必须为空）。
+ *  与 `XFILE_EXEMPT` 的区别：后者是"设计上就不锚"，这里是"本可锚却没锚"。 */
+const CITATION_EXEMPT = {};
+
+/** 「锚点里带有非行号数字」的**显式豁免**（键＝`源码行号:第几处`）：只有"该数字是
+ *  **引用文本里本来就有的语义锚点**（不是被引用的行号）"才允许登记 —— 例如区间引用
+ *  `需求 §10 :759 起、表在 :763–776` 里的 `:759`：它是**第 10 章标题的行号**，
+ *  与"被引用行（759）"同值，写死在源码侧锚点里不会随升版漂移（需求侧另有 `${n}` 占位核对）。
+ *  其余锚点一律不得出现字面行号 —— 写死会随升版漂移，等于没锚。 */
+const ANCHOR_DIGIT_EXEMPT = {
+  '376:0': '源码侧锚点里的 `:759` 是**引用文本自身的语义锚点**（第 10 章标题行号，与"被引用行 759"同值，不随升版漂移）；需求行侧仍用 `${n}` 占位核对，故不构成"写死行号"。'
+};
+
+/** 冻结基线（V1.36 实测，本文件源码实扫）：
+ *  · `CITATION_BASELINE_INSCOPE` ＝ **21 处** in-scope 引用（对需求清单行号的引用，逐处锚定）
+ *  · `CITATION_BASELINE_XFILE`  ＝ **5 处** 跨文件/示例引用（逐条登记理由）
+ *  · `CITATION_BASELINE_TOTAL`  ＝ **26 处** 合计（＝清单总条数）
+ *  为什么冻结：形态表 `CITATION_PATTERNS` 一旦被改窄（或某类引用整体写错），
+ *  "清单 ⊆ 扫描"仍可能成立但引用数会缩水 —— 这些基线就是那种"悄悄缩小校验范围"的红线。 */
+const CITATION_BASELINE_INSCOPE = 21;
+const CITATION_BASELINE_XFILE = 5;
+const CITATION_BASELINE_TOTAL = 26;
 
 function main() {
   const universe = requirementClauses();
@@ -1077,6 +1437,252 @@ function main() {
       directUnbacked.length
         ? `无证据却判 covered-direct 的 ${directUnbacked.length} 条：${directUnbacked.map(it => `${it.id}（脚本 ${it.script || '无'}）`).join('、')}`
         : `有断言承接 ${directBacked.length} 条，脚本与证据文本均已核实（同第 2 步规格：脚本存在 + 证据文本在该脚本里）`);
+  }
+
+  /* 九、注释里的「需求行号引用」自检（T-20260924-T3）
+     ---------------------------------------------------------------------------
+     立案（实测）：诚实性探针 M7 证明 —— 把本文件注释里某处需求行号引用（例如合计行那处）改成相邻的错号，
+     脚本照样 20/0 全绿、exit 0 ⇒ **代码里成体系的需求行号引用当时完全没有机器校验**。
+     本节把"引用 ↔ 当轮需求文件"的**双向对账**做起来：源码侧的行号引用逐处登记、逐处锚定，
+     被引用的那一行必须命中同一锚点；源码里多一处、少一处都变红。
+     口径：**不复制需求正文**（真源仍是当轮需求文件），只加对账；
+          本节的计数**不并入上面的 259 条分母**（与 AC 段、交付物台账同属旁证口径）。
+     ⚠️ 渲染结果类的真机证据不在这里（见 B5b / B5c，属 browser-class）。 */
+  t.section('九、注释里的需求行号引用自检（引用 ↔ 当轮需求文件双向对账）');
+
+  const citeOk = t.requires('当轮需求清单（需求文档\\*.md）可读',
+    REQ_FILE !== null && REQ_LINES.length > 0,
+    REQ_FILE ? `${REQ_FILE}：${REQ_LINES.length} 行` : '需求文档\\ 下没有 .md');
+
+  if (citeOk) {
+    /* 源码侧扫描（**全文件逐行**，与清单无关）：只认"本文件对需求清单行号"的引用 */
+    const found = [];
+    SELF_LINES.forEach((l, i) => scanCitations(l).forEach((h, idx) =>
+      found.push({ srcNo: i + 1, idx, text: h.text, reqNo: h.lineNo, range: h.range })));
+    /* 计数对账用的两个量（同一口径：去空白与反引号）：
+       ① 「需求…:数字」的**出现次数**；② 裸「:数字」的出现次数
+       （形如 `需求 §10 :759`、`需求 DEP-14（:754）` —— 这些**没有被"需求…:"形态覆盖**，
+         正是最容易整体漂移却没人看的那一类）。 */
+    const rawReqColon = SELF_LINES.reduce((n, l) => n + (normSpace(l).match(/需求[^\n]{0,24}?:\d+/g) || []).length, 0);
+    const bareColon = SELF_LINES.reduce((n, l) => n + (normSpace(l).match(/:\d+/g) || []).length, 0);
+
+    console.log(`  引用形态（共 ${CITATION_PATTERNS.length} 种）：${CITATION_PATTERNS.map(p => p.name).join('；')}`);
+    console.log(`  源码实测：in-scope 引用 ${found.length} 处；清单登记 ${CITATIONS.length} 处（in-scope ${IN_SCOPE.length} + 跨文件/示例 ${XFILE.length}）。`);
+    console.log(`  计数对账：源码里「需求…:数字」出现 ${rawReqColon} 次、裸「:数字」出现 ${bareColon} 次；` +
+      `冻结基线 in-scope ${CITATION_BASELINE_INSCOPE} / 跨文件 ${CITATION_BASELINE_XFILE} / 合计 ${CITATION_BASELINE_TOTAL}。`);
+
+    /* 逐处解析锚点：源码侧在哪、锚点是什么、需求那一行该含什么、实际命中没有 */
+    const resolved = IN_SCOPE.map(c => {
+      const a = ANCHORS[c.key];
+      if (!a) return { c, anchored: false };
+      const parts = String(a.anchor).split('¦');
+      /* 源码侧锚点里若残留 `|` 分隔符 ⇒ 该条还没按新写法迁移（`|` 同时是正则元字符） */
+      const badSeparator = parts.length < 2 || parts[0].split('¦')[0].includes('|');
+      const rangeStartNo = c.hit && c.hit.range ? c.hit.range[0] : c.reqNo;
+      /* 源码侧锚点的**字面部分**：去掉**所有** `${…}` 占位（含 `${rangeStart}` / `${rangeEnd}`）与「」。
+         此前只去掉 `${n…}` ⇒ 区间那条的字面里还留着 `${rangeStart}`，源码侧核对必然假红（实测踩过）。 */
+      const srcHalf = parts[0].replace(/\$\{[^}]*\}/g, '').replace(/[「」]/g, '');
+      const srcP = parts[0]
+        .replace(/\$\{rangeStart\}/g, String(rangeStartNo))
+        .replace(/\$\{rangeEnd\}/g, String(c.hit && c.hit.range ? c.hit.range[1] : c.reqNo))
+        .replace(/\$\{n\}/g, String(c.reqNo));
+      const docP = parts.slice(1).map(s => s
+        .replace(/\$\{rangeStart\}/g, String(rangeStartNo))
+        .replace(/\$\{rangeEnd\}/g, String(c.hit && c.hit.range ? c.hit.range[1] : c.reqNo))
+        .replace(/\$\{n \+ (\d+)\}/g, (_, d) => String(c.reqNo + Number(d)))
+        .replace(/\$\{n - (\d+)\}/g, (_, d) => String(c.reqNo - Number(d)))
+        .replace(/\$\{n\}/g, String(c.reqNo)));
+      const target = normSpace(REQ_LINES[c.reqNo - 1] || '');
+      const srcTarget = normSpace(c.line || '');
+      const docMatch = docP.map((p, i) => {
+        let re = null, m2 = null, lines_hit = 0;
+        try {
+          re = new RegExp(normSpace(p));
+          m2 = target.match(re);
+          /* **跨行干扰检查**：该锚点模式在整份需求文件里应当**只**命中被引用那一行 */
+          lines_hit = REQ_LINES.filter(l => re.test(normSpace(l))).length;
+        } catch (e) { /* 模式非法 ⇒ 下面如实报 */ }
+        return {
+          pat: String(parts[i + 1]), re, ok: Boolean(m2), linesHit: lines_hit,
+          hit: m2 ? String(m2[0]).slice(0, 60) : '',
+          index: m2 ? +((target.indexOf(m2[0]) / Math.max(1, target.length)).toFixed(3)) : null
+        };
+      });
+      return {
+        c, anchored: true, a, srcHalf, badSeparator,
+        /* 源码侧核对（**只认字面锚点**）：锚点里写的字面部分（去掉 ${…} 占位与「」）与
+           **该处引用原文**必须互相包含（锚点可带语义前缀如「交付方式见需求 」，也可只是引用原文的一部分）
+           —— 即"这条锚点还锚在这一处引用上"。
+           ⚠️ 不能拿含 `${n}` 的整串去比源码行：区间引用的被引用行号是**止点**（776），
+           而源码行里写的是区间起止（`:759 起、表在 :763–776`），整串比对必然假红（实测踩过）。 */
+        srcOk: !badSeparator && sourceAnchorHolds(c, srcHalf),        reqLine: REQ_LINES[c.reqNo - 1] || '',
+        docMatch
+      };
+    });
+
+    const anchoredKeys = new Set(resolved.filter(r => r.anchored).map(r => r.c.key));
+    const exemptKeys = new Set(Object.keys(CITATION_EXEMPT));
+    const xfileKeys = new Set(XFILE.map(c => c.key));
+    const missing = IN_SCOPE.filter(c => !anchoredKeys.has(c.key) && !exemptKeys.has(c.key));
+    const orphanAnchors = Object.keys(ANCHORS).filter(k => !IN_SCOPE.some(c => c.key === k));
+    const anchorKeySrcCount = (fs.readFileSync(__filename, 'utf8').match(/^\s*'\d+:\d+':\s*\{\s*anchor:/gm) || []).length;
+    /* 锚点里的行号**一律用 `${n}` 占位**：需求行侧若出现"冒号/区间号 + 具体数字"（`:759` 这种）即红。
+       （`4K@30Hz`、`7×24`、`NFR-05` 这类**内容**数字不含冒号，不受此规则约束。） */
+    const anchorDigits = Object.keys(ANCHORS)
+      .filter(k => /[:–—]\s*\d/.test(String(ANCHORS[k].anchor).split('¦').slice(1).join('¦')
+        .replace(/\$\{n[^}]*\}/g, '')))
+      .filter(k => !Object.prototype.hasOwnProperty.call(ANCHOR_DIGIT_EXEMPT, k));
+    if (Object.keys(ANCHOR_DIGIT_EXEMPT).length) {
+      console.log('  锚点数字豁免清单（逐条给理由）：');
+      for (const [k, reason] of Object.entries(ANCHOR_DIGIT_EXEMPT)) console.log(`    · ${k}：${reason}`);
+    }
+
+    const manifestMissing = found.filter(f => !IN_SCOPE.some(c => c.srcNo === f.srcNo && c.idx === f.idx));
+    const scanMissing = CITATIONS.filter(c => !c.hit);
+    if (process.env.T3_DEBUG) {
+      for (const r of resolved.filter(x => !x.srcOk)) {
+        console.log(`    [dbg] ${r.c.key} srcHalf=「${r.srcHalf}」 hit=「${r.c.hit ? r.c.hit.text : '(无)'}」`);
+      }
+    }
+    const badAnchor = resolved.filter(r => r.anchored && (!r.srcOk || r.docMatch.some(d => !d.ok)));
+    const weakAnchor = resolved.filter(r => r.anchored && r.docMatch.some(d => d.ok && d.linesHit !== 1));
+
+    if (badAnchor.length) {
+      console.log('  锚点未命中的逐条明细（源码侧写法 / 需求那一行实际内容）：');
+      for (const r of badAnchor) {
+        console.log(`    ❌ ${r.c.srcNo}:${r.c.idx} 引用「${r.c.text}」→ 需求 :${r.c.reqNo}（${r.a.name}）`);
+        console.log(`       源码侧应有锚点：${r.srcHalf}  ⇒ ${r.srcOk ? '命中' : '**未命中**'}`);
+        console.log(`       需求 :${r.c.reqNo} 实际内容：${r.reqLine.slice(0, 140)}`);
+        r.docMatch.forEach((d, i) => console.log(`       需求行锚点 ${i + 1}：/${d.re ? d.re.source : d.pat}/ ⇒ ` +
+          `${d.ok ? '命中「' + d.hit + '」@位置比 ' + d.index : '**未命中**'}`));
+      }
+    } else {
+      for (const r of resolved) {
+        console.log(`    ${r.c.srcNo}:${r.c.idx} 引用「${r.c.text}」→ 需求 :${r.c.reqNo}（${r.a.name}）：源码侧锚点「${r.srcHalf}」命中；` +
+          `需求行 ${r.docMatch.map(d => `锚点=「${d.hit}」@${d.index}（全文件命中 ${d.linesHit} 行）`).join('、')}`);
+      }
+    }
+    if (weakAnchor.length) {
+      console.log('  ⚠️ 锚点不够"唯一"（同一模式在需求文件别处也命中 ⇒ 行号漂移时可能照样绿）：');
+      for (const r of weakAnchor) {
+        console.log(`    · ${r.c.srcNo}:${r.c.idx} → 需求 :${r.c.reqNo}：` +
+          r.docMatch.filter(d => d.ok && d.linesHit !== 1).map(d => `「${d.hit}」命中 ${d.linesHit} 行`).join('；'));
+      }
+    }
+    if (missing.length) console.log(`  ⚠️ 无锚点且未登记豁免的引用：${missing.map(c => `${c.srcNo}:${c.idx}「${c.text}」`).join('；')}`);
+    console.log(`  跨文件 / 示例引用豁免清单（${XFILE.length} 条，逐条给理由）：`);
+    for (const [k, reason] of Object.entries(XFILE_EXEMPT)) console.log(`    · ${k}：${reason}`);
+    console.log('  「本可锚却没锚」的豁免清单：**空**（in-scope 引用全部可自动判定锚点，无静默跳过）');
+    console.log(`  对账：in-scope 扫描 ${found.length} 处 ＝ 清单 ${IN_SCOPE.length} 条 ＝ 锚点 ${anchoredKeys.size} + 豁免 ${exemptKeys.size}；` +
+      `跨文件/示例 ${XFILE.length} 条；${found.length === IN_SCOPE.length ? '✅ 引用总数与源码出现次数一致' : '❌ 不一致'}`);
+
+    const before = t.counts.passed;
+    const insN = IN_SCOPE.length, nxN = XFILE.length;
+    t.check('九① 需求清单可被本节读取（真源存在，行号有落点）',
+      REQ_LINES.length >= CITATION_BASELINE_INSCOPE && REQ_LINES.length >= Math.max(...CITATIONS.map(c => c.reqNo)),
+      `${REQ_FILE}：${REQ_LINES.length} 行；引用到的最大行号 ${Math.max(...CITATIONS.map(c => c.reqNo))}`);
+    t.check('九② 引用的需求行号不越界（行号必须落在当轮需求文件里）',
+      CITATIONS.every(c => c.reqNo >= 1 && c.reqNo <= REQ_LINES.length &&
+        (!c.hit || !c.hit.range || c.hit.range[1] <= REQ_LINES.length)),
+      CITATIONS.filter(c => c.reqNo < 1 || c.reqNo > REQ_LINES.length).map(c => `${c.srcNo}:${c.idx}→:${c.reqNo}`).join('；') ||
+      `全部 ${CITATIONS.length} 处行号 ∈ [1, ${REQ_LINES.length}]`);
+    t.check('九③ 源码扫到的引用 ↔ 逐条清单**双向对账**（多一处、少一处都红 —— 这就是"引用总数 vs 源码出现次数"的构成性对账）',
+      manifestMissing.length === 0 && scanMissing.length === 0 && found.length === IN_SCOPE.length,
+      [`扫描 ${found.length} 处 / 清单 ${IN_SCOPE.length} 处`,
+        `源码有而清单没有：${manifestMissing.map(f => `${f.srcNo}「${f.text}」`).join('；') || '无'}`,
+        `清单有而源码扫不到：${scanMissing.map(c => `${c.srcNo}:${c.idx}`).join('；') || '无'}`].join('；'));
+    t.check('九④ 引用总数 ≥ 冻结基线（in-scope 与跨文件各一条；形态表被改窄 / 某类引用整体写错时变红）',
+      found.length >= CITATION_BASELINE_INSCOPE && XFILE.length >= CITATION_BASELINE_XFILE &&
+      CITATIONS.length === CITATION_BASELINE_TOTAL,
+      `in-scope ${found.length} 处（基线 ${CITATION_BASELINE_INSCOPE}）、跨文件/示例 ${XFILE.length} 条（基线 ${CITATION_BASELINE_XFILE}）、` +
+      `清单合计 ${CITATIONS.length}（基线 ${CITATION_BASELINE_TOTAL}）` +
+      (found.length < CITATION_BASELINE_INSCOPE || XFILE.length < CITATION_BASELINE_XFILE
+        ? ' —— **引用数缩水**：形态表或源码被改窄了？' : ''));
+    t.check('九⑤ 逐条清单逐处登记：每条都在源码里扫得到、行号与源码一致、类型合法（req/xfile）、无重复登记',
+      scanMissing.length === 0 &&
+      CITATIONS.every(c => c.hit && ['req', 'xfile'].includes(c.type) &&
+        /* 行号一致性：区间引用的 `reqNo` 记的是**区间止点**，故与扫描起点比时取区间起点 */
+        c.hit.lineNo === (c.rangeStart !== null ? c.rangeStart : c.reqNo)) &&
+      new Set(CITATIONS.map(c => c.key)).size === CITATIONS.length,
+      `清单 ${CITATIONS.length} 条（唯一键 ${new Set(CITATIONS.map(c => c.key)).size} 个）；` +
+      `扫不到：${CITATIONS.filter(c => !c.hit).map(c => c.key).join('；') || '无'}；` +
+      `行号不一致：${CITATIONS.filter(c => c.hit && c.hit.lineNo !== c.reqNo).map(c => `${c.key} 登记 ${c.reqNo} vs 实测 ${c.hit.lineNo}`).join('；') || '无'}`);
+    t.check('九⑥ 每处 in-scope 引用都携带可判定锚点（源码侧写法 + 被引用行的原文），且**每处都真的命中了**（不许静默跳过）',
+      badAnchor.length === 0 && resolved.length === insN,
+      badAnchor.map(r => `${r.c.srcNo}:${r.c.idx}「${r.c.text}」→ 需求 :${r.c.reqNo}（${r.srcOk ? '需求行未命中' : '源码侧未命中'}）`).join('；') ||
+      `${insN} 处全部命中（源码侧锚点 + 需求行锚点各 ≥1 个）`);
+    t.check('九⑦ 锚点表与 in-scope 清单一 一对应、键唯一（无孤儿锚点、无重复键、每条锚点都有可读名称、分隔符已迁移）',
+      anchorKeySrcCount === Object.keys(ANCHORS).length &&
+      orphanAnchors.length === 0 &&
+      anchoredKeys.size === Object.keys(ANCHORS).length &&
+      resolved.every(r => !r.anchored || (r.a.name && r.a.name.length > 0 && !r.badSeparator)),
+      `锚点表键 ${Object.keys(ANCHORS).length} 个（源码里字面量键 ${anchorKeySrcCount} 个）；in-scope 带锚点 ${anchoredKeys.size} 条；` +
+      `孤儿锚点：${orphanAnchors.join('；') || '无'}；分隔符未迁移：${resolved.filter(r => r.badSeparator).map(r => r.c.key).join('；') || '无'}`);
+    t.check('九⑧ 锚点的需求行侧不写死行号（行号只用 `${n}` 占位；写死 ⇒ 行号漂移时锚点跟着漂，等于没锚）',
+      anchorDigits.length === 0,
+      anchorDigits.length ? `写死了行号的锚点：${anchorDigits.join('；')}`
+        : `${Object.keys(ANCHORS).length} 个锚点的需求行侧除 \${n} 占位符外无字面行号`);
+    t.check('九⑨ 无法自动判定锚点的引用**必须**逐条登记豁免并给理由（in-scope 豁免为空＝当前没有此类引用，不是"允许跳过"）',
+      missing.length === 0 &&
+      Object.entries(CITATION_EXEMPT).every(([, reason]) => String(reason).trim().length >= 12) &&
+      xfileKeys.size === XFILE.length &&
+      XFILE.every(c => String(XFILE_EXEMPT[c.key] || '').trim().length >= 12),
+      missing.length ? `未登记豁免：${missing.map(c => `${c.srcNo}:${c.idx}`).join('；')}`
+        : `in-scope 无锚点引用 0 处（豁免 ${Object.keys(CITATION_EXEMPT).length} 条）；` +
+          `跨文件/示例 ${XFILE.length} 条均已逐条写明理由（${Object.keys(XFILE_EXEMPT).length} 条）`);
+    t.check('九⑩ 引用总数守恒：清单数 ＝ in-scope 扫描 + 跨文件数 ＝ 锚点数 + 豁免数 + 跨文件数（三路计数互相钉住）',
+      CITATIONS.length === found.length + nxN && CITATIONS.length === CITATION_BASELINE_TOTAL &&
+      found.length === anchoredKeys.size + exemptKeys.size &&
+      found.length >= CITATION_BASELINE_INSCOPE && nxN >= CITATION_BASELINE_XFILE,
+      `清单 ${CITATIONS.length}（基线 ${CITATION_BASELINE_TOTAL}）＝ in-scope ${found.length} + 跨文件/示例 ${nxN}；` +
+      `in-scope ＝ 锚点 ${anchoredKeys.size} + 豁免 ${exemptKeys.size}；` +
+      `基线 in-scope ${CITATION_BASELINE_INSCOPE} / 跨文件 ${CITATION_BASELINE_XFILE}`);
+    t.check('九⑪ 引用**不出现在断言/可执行代码里**（只允许出现在注释与说明字符串中，避免把行号写进运行时逻辑）',
+      CITATIONS.every(c => !/\bcheck\s*\(/.test(c.line || '')),
+      CITATIONS.filter(c => /\bcheck\s*\(/.test(c.line || '')).map(c => `${c.srcNo}`).join('；') ||
+      `${CITATIONS.length} 处引用所在行均不含 check( 调用`);
+    t.check('九⑫ "引用总数 vs 源码出现次数"的**独立计数对账**：源码里 \'需求…:数字\' 的出现次数 ≥ 清单条数；' +
+      '且裸 \':数字\' 形态出现次数 ≥ in-scope 引用数（裸形态没被"需求…:"覆盖，最容易整体漂移）',
+      rawReqColon >= CITATIONS.length && bareColon >= found.length,
+      `「需求…:数字」出现 ${rawReqColon} 次 ≥ 清单 ${CITATIONS.length} 条；` +
+      `裸「:数字」出现 ${bareColon} 次 ≥ in-scope ${found.length} 处（差 ${bareColon - found.length} 次＝区间端点、非需求文件的 :39/:252、示例写法等）`);
+    t.check('九⑬ 锚点具备**跨行唯一性**：每条需求行锚点模式在整份需求文件里只命中被引用的那一行' +
+      '（否则行号漂到另一行、锚点照样命中 ⇒ 该锚点等于没核住）',
+      weakAnchor.length === 0,
+      weakAnchor.length
+        ? weakAnchor.map(r => `${r.c.srcNo}:${r.c.idx}→:${r.c.reqNo}：` +
+            r.docMatch.filter(d => d.ok && d.linesHit !== 1).map(d => `「${d.hit}」命中 ${d.linesHit} 行`).join('；')).join('｜')
+        : `${resolved.length} 处锚点模式在需求文件内均只命中 1 行`);
+    t.check('九⑭ 区间引用的**两个端点**逐端点核对（位置严格相等）：区间起/止处那一行必须命中该端点的锚点' +
+      '（只核"被引用行"会漏掉端点 —— 定点变异实测：把 `:776` 改成 `:775` 时其余断言全绿）',
+      Object.keys(RANGE_ANCHORS).every(k => {
+        const c = IN_SCOPE.find(x => x.key === k);
+        const r = RANGE_ANCHORS[k];
+        if (!c || !c.hit || !c.hit.range || c.rangeStart === null) return false;
+        const base = c.hit.lineNo;   // 区间偏移以**被引用行**（＝区间起点）为基准
+        /* 左右两侧**位置严格相等**：清单登记的（区间起, 被引用行号）＝扫描解析出的区间
+           —— 止点改成 :775 会让 `c.hit.range[1] !== c.reqNo` 当场变红（定点变异实测过）。 */
+        if (c.hit.range[0] !== c.rangeStart || c.hit.range[1] !== c.reqNo) return false;   // 扫描解析的 [起点, 止点] 与清单登记的 (rangeStart, reqNo) 位置严格相等
+        return [r.rangeStart, r.rangeEnd].every(e => {
+          const at = base + Number(String(e.at).replace('+', ''));
+          const line = REQ_LINES[at - 1];
+          return typeof line === 'string' && new RegExp(e.mustMatch).test(normSpace(line));
+        });
+      }),
+      Object.keys(RANGE_ANCHORS).map(k => {
+        const c = IN_SCOPE.find(x => x.key === k);
+        const r = RANGE_ANCHORS[k];
+        if (!c || !c.hit) return `${k}: 引用扫不到`;
+        if (!c.hit.range) return `${k}: 该引用没解析出区间（range=null）`;
+        return `${k} 「${c.hit.text}」→ 扫描解析区间 [${c.hit.range.join(', ')}]、清单登记 [起点 ${c.rangeStart}, 止点 ${c.reqNo}]；` +
+          [r.rangeStart, r.rangeEnd].map(e => {
+            const at = c.hit.lineNo + Number(String(e.at).replace('+', ''));
+            const line = normSpace(REQ_LINES[at - 1] || '');
+            const ok = new RegExp(e.mustMatch).test(line);
+            return `${e.name} 应在 :${at} ⇒ ${ok ? '命中' : '**未命中**'}（该行=${line.slice(0, 40)}）`;
+          }).join('；');
+      }).join(' ｜ '));
+    console.log(`  （本节按上述断言计 ${t.counts.passed - before} 条；数字不写死，以汇总行为准）`);
   }
 
   if (LIST) {
