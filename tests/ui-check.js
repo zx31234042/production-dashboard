@@ -3652,6 +3652,188 @@ async function main() {
     );
   }
 
+  /* ===== U7b E39（★★，D10）：E38 的同族残留 —— 缺口帧"把无法计算显示成零"还剩 2 处 ===== */
+  section('U7b 缺口帧"无法计算"残留两处的显式无数据（E39）');
+
+  /* 立案（D9 定位，负责人 2026-09-27 裁定方案 (a)；E38 已按此口径在 `StatsPanel`（15 个统计位）与
+     `ShiftPanel`（3 个班次进度位）收口并真机验证通过，本次收 E38 的**同族残留 2 处**）：
+       ① `src/components/DeviceStatusPanel.js`：缺口帧 `#stRunTime` 走 `state.stats.runSec || 0`
+          ⇒ 显示 `00:00:00`，读起来像"本班零运行"（实测基线 `01:51:00`）；
+       ② `src/components/TaskPanel.js`：缺口帧 `#tkProgressText` 走 `state.stats.done / plan`
+          ⇒ 显示「当班已完成 0 / 0 件」，读起来像"当班一件没干"（实测基线「52 / 180 件」）。
+     口径（与 E38 完全一致，不另造机制）：凡**无法计算**的数值一律显示**显式无数据**「—」，
+     **禁止** `0`／`0.0%`／`00:00:00`／空串；判断**只认显式状态位** `state.stats.noData`
+     （**不得**靠"值是不是 0"去猜 —— 真实 0 仍显示 0）；配置改回后**自愈**回真实值。
+     判据一律**行为**判据（真 main.js 逐帧驱动 + 节点文本 + 本帧写入证据），不做源码字符串匹配（ADR-0004 D23）。 ---- */
+  {
+    const COMPONENTS_E39 = [
+      'src/components/HeaderBar.js', 'src/components/TabsBar.js', 'src/components/CurveChart.js',
+      'src/components/DeviceStatusPanel.js', 'src/components/TaskPanel.js', 'src/components/ShiftPanel.js',
+      'src/components/StatsPanel.js', 'src/components/AlarmPanel.js', 'src/components/MaintPanel.js',
+      'src/components/NoticePanel.js', 'src/components/SettingPanel.js'
+    ];
+    const GAP_E39 = [{ name: '晚班', start: 0, end: 8 }, { name: '中班', start: 16, end: 24 }];
+    const FULL_E39 = [
+      { name: '晚班', start: 0, end: 8 },
+      { name: '早班', start: 8, end: 16 },
+      { name: '中班', start: 16, end: 24 }
+    ];
+    const NO_DATA_E39 = '—';
+    /* E39 两处：`#stRunTime`（设备状态页"实时运行时长"）与 `#tkProgressText`（任务页"当班已完成"文案） */
+    const E39_IDS = ['stRunTime', 'tkProgressText'];
+    const textOf = (fx, id) => String(fx.node(id).textContent || '');
+    const snapE39 = fx => E39_IDS.reduce((a, id) => (a[id] = textOf(fx, id), a), {});
+    const writesOf = (fx, id) => fx.out.filter(e => e.kind === 'text' && e.id === id).length;
+    /** 判"这一格是不是显式无数据表达"：整格等于占位符，或**文案里含独立占位符**"… — 件"
+        （任务页的"当班已完成"位本身就是一句完整文案）；同时不得是 0 / 0.0% / 空串 / undefined 文本 */
+    const isNoDataE39 = v => {
+      const s = String(v === undefined || v === null ? '' : v);
+      if (s === '' || /^(0(\.0+)?%?)$/.test(s)) return false;
+      return s === NO_DATA_E39 || s.indexOf(NO_DATA_E39) >= 0;
+    };
+    /**
+     * 判"像是把无法计算写成了零"：时长位是 `00:00:00`（或空串），或完成数位出现"0 / N 件"/"0 件"
+     * —— 注意 `0 / N 件` 是**缺陷形状**（0 计划也是 0），真实 0 的口径另由控制组按 noData:false 判定。
+     */
+    const zeroLikeE39 = v => {
+      const s = String(v === undefined || v === null ? '' : v);
+      return s === '' || s === '00:00:00' || /(^|[^\d])0\s*\/\s*\d+\s*件/.test(s);
+    };
+    const hasCountE39 = v => /\d+\s*\/\s*\d+\s*件/.test(String(v || ''));
+    const secsE39 = v => {
+      const m = /^(\d{2}):(\d{2}):(\d{2})$/.exec(String(v || ''));
+      return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : null;
+    };
+    const E39 = { err: null, r: null };
+    try {
+      const fx = loadFrameFixture(COMPONENTS_E39);
+      fx.frame();                                    /* 首帧（正常配置）+1 s 稳态 */
+      const beforeGap = snapE39(fx);
+      /* 基线帧的**结构**证据（防"组件压根没跑也能绿"）：两处都被写过、且写着真实值 */
+      const baselineWrites = E39_IDS.reduce((a, id) => (a[id] = writesOf(fx, id), a), {});
+      const baselineStat = {
+        noData: fx.w.MockData.state.stats.noData,
+        runSec: fx.w.MockData.state.stats.runSec,
+        done: fx.w.MockData.state.stats.done
+      };
+      const gapWritesBefore = E39_IDS.reduce((a, id) => (a[id] = writesOf(fx, id), a), {});
+
+      fx.setShiftList(GAP_E39);                      /* 内存覆盖 ⇒ 下一帧起 `shiftOf()` 抛缺口 */
+      fx.frame();
+      const during = {
+        cells: snapE39(fx),
+        statsNoData: fx.w.MockData.state.stats.noData,
+        raw: { runSec: fx.w.MockData.state.stats.runSec, done: fx.w.MockData.state.stats.done }
+      };
+      /* "缺口帧确实被本帧改写"：这一帧里两个节点各被**再写一次**（不是沿用上帧文本） */
+      const gapWrites = E39_IDS.reduce((a, id) => (a[id] = writesOf(fx, id) - gapWritesBefore[id], a), {});
+
+      fx.setShiftList(FULL_E39);                     /* 就地改回正常配置（同一个数组引用） */
+      fx.frame();
+      const heal = {
+        cells: snapE39(fx),
+        statsNoData: fx.w.MockData.state.stats.noData,
+        raw: { done: fx.w.MockData.state.stats.done, plan: fx.w.MockData.state.stats.plan }
+      };
+
+      /* 控制组（锁"只认状态位、不靠值猜"）：真实 0 + `noData:false` ⇒ 两处**照旧显示 0**，
+         不是"—"。这是**真实零运行**的合法表达（如班次刚开始/设备刚启动），不得被本处置吞掉。
+         为什么不复用上面那个夹具：`step()` 每一帧都会重算 `state.stats`（注入时钟从 10:20:30 起步，
+         `runSec` 必然非 0），人为置 0 会被下一帧覆盖掉 —— 那就观察不到"值是 0 而状态位为 false"这一态。
+         故这里**直接以受控 state 调真组件**（与 U3b 的 `W.Components.*.render(受控 state)` 同一手法：
+         真 state 取 `MockData.state`，只覆盖 `runSec/done` 与显式状态位），断言仍然是**行为**判据
+         （组件写出的节点文本），不是源码字符串匹配。 */
+      const st = fx.w.MockData.state.stats;
+      const zeroState = Object.assign({}, fx.w.MockData.state, {
+        stats: Object.assign({}, st, { runSec: 0, done: 0, noData: false })
+      });
+      const zeroWritesBefore = E39_IDS.reduce((a, id) => (a[id] = writesOf(fx, id), a), {});
+      fx.w.Components.DeviceStatusPanel.render(zeroState);
+      fx.w.Components.TaskPanel.render(zeroState);
+      const zero = {
+        cells: snapE39(fx),
+        statsNoData: zeroState.stats.noData,
+        raw: { runSec: zeroState.stats.runSec, done: zeroState.stats.done, plan: zeroState.stats.plan }
+      };
+      const ctrlWrites = E39_IDS.reduce((a, id) => (a[id] = writesOf(fx, id) - zeroWritesBefore[id], a), {});
+
+      E39.r = { beforeGap, baselineWrites, baselineStat, during, gapWrites, heal, zero, ctrlWrites };
+    } catch (e) {
+      E39.err = e.message;
+    }
+
+    const r39 = E39.r;
+    const gapBad = r39 === null ? E39_IDS.slice()
+      : E39_IDS.filter(id => !isNoDataE39(r39.during.cells[id]) || zeroLikeE39(r39.during.cells[id]));
+    check(
+      'E39（D10）缺口帧"实时运行时长"（#stRunTime）与任务页"当班已完成"文案（#tkProgressText）显示**显式无数据**' +
+      `（"${NO_DATA_E39}"）：一律为占位，**不得**是 0 / 00:00:00 / 0 / N 件 / 空串，且缺口帧 state.stats.noData === true`,
+      E39.err === null && r39 !== null && r39.during.statsNoData === true && gapBad.length === 0,
+      E39.err ? `夹具执行异常：${E39.err}` : r39 === null ? '（无观察值）' :
+        `缺口帧 #stRunTime=${JSON.stringify(r39.during.cells.stRunTime)}、` +
+        `#tkProgressText=${JSON.stringify(r39.during.cells.tkProgressText)}；` +
+        `不合判据的位=${JSON.stringify(gapBad)}（判据：显式"—"且不是 0/00:00:00/0_N件/空串）；` +
+        `state.stats.noData=${JSON.stringify(r39.during.statsNoData)}；` +
+        `缺口帧 state.stats=${JSON.stringify(r39.during.raw)}`
+    );
+
+    check(
+      'E39b（D10）缺口帧这两处**确实是被本帧改写过的**（本帧各被写入 ≥1 次、且文本不等于缺口前基线的真实值）：' +
+      '证明断言观察到的是"无数据"状态本身，而不是"这两格压根没被渲染/没被写"',
+      E39.err === null && r39 !== null &&
+      E39_IDS.every(id => r39.gapWrites[id] >= 1) &&
+      E39_IDS.every(id => r39.during.cells[id] !== r39.beforeGap[id]),
+      E39.err ? `夹具执行异常：${E39.err}` : r39 === null ? '（无观察值）' :
+        `缺口前基线=${JSON.stringify(r39.beforeGap)}；缺口帧=${JSON.stringify(r39.during.cells)}；` +
+        `缺口帧内写入次数=${JSON.stringify(r39.gapWrites)}（应各 ≥1）；` +
+        `仍等于基线的位=${JSON.stringify(E39_IDS.filter(id => r39.during.cells[id] === r39.beforeGap[id]))}（应全不同）`
+    );
+
+    /* 自愈判据分两类（缺口期到自愈跨越 2 帧 ⇒ 真实时钟往前走 2 s）：时长位按"合法 HH:MM:SS +
+       相对基线位移 ≤10 s"（真值确实在走，不把正常推进判成假红）；完成数位按"回到正整数件数，
+       且与基线同形/同量级"（完成数派生于运行时长，位移由同一条时钟推断，故不要求逐字相等）。 */
+    const healBad = r39 === null ? E39_IDS.slice()
+      : E39_IDS.filter(id => isNoDataE39(r39.heal.cells[id]) || zeroLikeE39(r39.heal.cells[id]));
+    const healRunSecs = r39 === null ? null : secsE39(r39.heal.cells.stRunTime);
+    const baseRunSecs = r39 === null ? null : secsE39(r39.beforeGap.stRunTime);
+    const healDoneM = r39 === null ? null : /当班已完成\s*(\d+)\s*\/\s*(\d+)\s*件/.exec(r39.heal.cells.tkProgressText);
+    const baseDoneM = r39 === null ? null : /当班已完成\s*(\d+)\s*\/\s*(\d+)\s*件/.exec(r39.beforeGap.tkProgressText);
+    const healRunOk = healRunSecs !== null && baseRunSecs !== null && Math.abs(healRunSecs - baseRunSecs) <= 10;
+    const healDoneOk = !!healDoneM && !!baseDoneM && Number(healDoneM[1]) > 0 &&
+      Number(healDoneM[2]) === Number(baseDoneM[2]) && Math.abs(Number(healDoneM[1]) - Number(baseDoneM[1])) <= 2;
+    check(
+      'E39c（D10）自愈后两处回到真实值：配置改回无缺口后 #stRunTime 为合法 HH:MM:SS（非"—"、相对基线位移 ≤10 s）、' +
+      '#tkProgressText 回到真实正整数完成数（形如「当班已完成 N / M 件」，计划数与基线一致）',
+      E39.err === null && r39 !== null && healRunOk && healDoneOk && healBad.length === 0 &&
+      r39.heal.statsNoData === false,
+      E39.err ? `夹具执行异常：${E39.err}` : r39 === null ? '（无观察值）' :
+        `自愈后 #stRunTime=${JSON.stringify(r39.heal.cells.stRunTime)}（合法 HH:MM:SS=${healRunSecs !== null}、` +
+        `相对基线 ${JSON.stringify(r39.beforeGap.stRunTime)} 位移=${healRunSecs !== null && baseRunSecs !== null ? Math.abs(healRunSecs - baseRunSecs) : 'n/a'} s，判据 ≤10 s）；` +
+        `#tkProgressText=${JSON.stringify(r39.heal.cells.tkProgressText)}（基线 ${JSON.stringify(r39.beforeGap.tkProgressText)}，` +
+        `正整数完成数=${!!healDoneM && Number(healDoneM[1]) > 0}）；` +
+        `仍为无数据/零形状的位=${JSON.stringify(healBad)}；` +
+        `state.stats.noData ${JSON.stringify(r39.during.statsNoData)} → ${JSON.stringify(r39.heal.statsNoData)}`
+    );
+
+    /* 防"只认状态位、不靠值猜"被改坏：真实 0（`noData:false`）必须**照旧显示 0**，
+       绝不因为"值是 0"就被写成"—" —— 否则真实的"零运行/零完成"会被本处置吞掉。 */
+    check(
+      'E39d（D10）真实 0 不被误显示为"—"（锁定"只认状态位、不靠值猜"）：人为把统计置 0 但显式 noData=false 时，' +
+      '#stRunTime 仍为合法时长（00:00:00 属真实零运行的合法表达）、#tkProgressText 仍为「当班已完成 0 / 180 件」，两处都**不是**"—"',
+      E39.err === null && r39 !== null &&
+      r39.zero.statsNoData === false &&
+      r39.ctrlWrites.stRunTime >= 1 && r39.ctrlWrites.tkProgressText >= 1 &&
+      secsE39(r39.zero.cells.stRunTime) !== null && !isNoDataE39(r39.zero.cells.stRunTime) &&
+      /当班已完成\s*0\s*\/\s*180\s*件/.test(r39.zero.cells.tkProgressText) &&
+      !isNoDataE39(r39.zero.cells.tkProgressText),
+      E39.err ? `夹具执行异常：${E39.err}` : r39 === null ? '（无观察值）' :
+        `控制组 state.stats.noData=${JSON.stringify(r39.zero.statsNoData)}（真实 0 ⇒ 不得显示"—"）；` +
+        `#stRunTime=${JSON.stringify(r39.zero.cells.stRunTime)}、` +
+        `#tkProgressText=${JSON.stringify(r39.zero.cells.tkProgressText)}；` +
+        `本帧两处写入次数=${JSON.stringify(r39.ctrlWrites)}（各 ≥1 ⇒ 确实渲染过，不是"没跑也算过"）`
+    );
+  }
+
   /* ---- E35（★）：`#setSyncBtn`（NTP 手动同步）缺锁定守卫 ----
      与三处保存（维保/公告/参数，见 R26-P2-1 的 f3）**同一口径**：锁定态必须 `denyLocked('时间同步')`
      —— 既不得写 `pushLog('时间同步')`，也不得只改 `#setMsg`（那是 `#setMsg` 而不是指定的反馈位），

@@ -698,8 +698,24 @@ window.Components.TaskPanel = (function () {
     renderCameras(state);
   }
 
+  /**
+   * E39（★★，2026-09-27）：**"无法计算"不得显示成"零完成"**（E38 的同族残留）。
+   * 缺口帧里 `state.stats` 是数据层的无数据快照（`MockData.noDataStats()`：同键集 + `noData:true`，
+   * 逐键值均为 0），改前 `#tkProgressText` 照原样取 `state.stats.done / state.stats.plan`
+   * ⇒ 显示「当班已完成 0 / 0 件」（基线同为 52 / 180 件），把"时刻无法归属、算不出完成数"
+   * 读成了"当班一件没干"，违背"不得伪造数据"。
+   * 判据与统计页（`StatsPanel`）／班次页（`ShiftPanel`）**同一口径**：只认**显式状态位**
+   * `state.stats.noData === true`（不靠"值是不是 0"去猜 —— 真实 0 仍显示 0），
+   * 缺口帧只保留与时刻无关的事实（当前件序号），把完成数换成显式无数据「—」；
+   * 自愈后 `tick()` 重新写入带 `noData:false` 的真实统计 ⇒ 自动退出本分支、回到真实完成数。
+   */
+  const NO_DATA = '—';
+
   function render(state) {
     const t = (state && state.task) || {};
+    /* E39：本帧统计是否"不成立"（班次配置缺口 ⇒ 时刻无法归属）——**只认显式状态位**，
+       与统计页/班次页同一判据；正常帧为 false（见 mockData.computeStats），真实 0 仍照常显示。 */
+    const noData = state.stats.noData === true;
 
     /* 无在测工单：给出空态占位并结束本次渲染 */
     if (!t || !t.procOrderNo || !t.real || !t.std) { renderWaiting(state); return; }
@@ -733,7 +749,9 @@ window.Components.TaskPanel = (function () {
     const pct = t.progress * 100;
     setText('tkProgressPct', pct.toFixed(1) + '%');
     setStyle('tkProgressBar', 'width', pct.toFixed(1) + '%');
-    setText('tkProgressText', `当前第 ${t.unitIndex} 件 · 当班已完成 ${state.stats.done} / ${state.stats.plan} 件`);
+    setText('tkProgressText', noData
+      ? `当前第 ${t.unitIndex} 件 · 当班已完成 ${NO_DATA} 件`
+      : `当前第 ${t.unitIndex} 件 · 当班已完成 ${state.stats.done} / ${state.stats.plan} 件`);
 
     /* 单任务测试结果（五态流转）；色值引用 styles/variables.css 的 CSS 变量（UI-03） */
     const colors = { '合格': 'var(--ok)', '不合格': 'var(--err)', '待复检': 'var(--warn)', '待测试': 'var(--idle)' };

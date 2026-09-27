@@ -10,6 +10,16 @@ window.Components.DeviceStatusPanel = (function () {
   const { setText, setHTML, setStyle, $ } = window.Dom;
   const curve = () => window.Components.CurveChart;
 
+  /* E39（★★，2026-09-27）：**"无法计算"不得显示成"零运行"**（E38 的同族残留）。
+     缺口帧里 `state.stats` 取的是数据层的无数据快照（`MockData.noDataStats()`：同键集 + `noData:true`，
+     逐键值均为 0），改前此处写 `state.stats.runSec || 0` ⇒ `#stRunTime` 显示 `00:00:00`，
+     把"时刻无法归属、算不出运行时长"读成了"本班一秒都没运行"（D8 自己都拒绝伪造当班班次、
+     把班次位写成"—"，同口径）。
+     这里只认**显式状态位**（不靠"值是不是 0"去猜 —— 真实 0 仍要显示 `00:00:00`）：
+     `noData === true` ⇒ 输出"—"（该页既有占位风格，见 `#stCamDepth` 与统计页 15 位）。
+     自愈后 `tick()` 重新写入带 `noData:false` 的真实统计 ⇒ 本分支自动退出、回到真实时长。 */
+  const NO_DATA = '—';
+
   /* 5 种运行模式与状态色标（FR-2.1、FR-2.2）
      待机=黄、测试运行=绿、正常停机/维保检修=灰、故障锁定=红
      色值统一取自 styles/variables.css（UI-03），此处只引用变量名 */
@@ -37,7 +47,7 @@ window.Components.DeviceStatusPanel = (function () {
     setText('stSpeed', t.real.speed.toFixed(2));
     setText('stVx', t.real.vx.toFixed(2));
     setText('stVy', t.real.vy.toFixed(2));
-    setText('stRunTime', window.Format.clock(state.stats.runSec || 0));
+    setText('stRunTime', state.stats.noData === true ? NO_DATA : window.Format.clock(state.stats.runSec || 0));
     setText('stDepthNote', '水下深度实测值 · 上位机整合后提供');
     setText('stSpeedNote', 'X-Y 平面合成速度 · vx / vy 为分速度');
 
