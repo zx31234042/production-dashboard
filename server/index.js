@@ -42,6 +42,13 @@ const { mountIfD } = require('./http/routes/ifD');
 /* W2 的挂载口（`server/http/routes/ifA.js`）：IF-A 接收（MES 派工/物料/工艺/设备）的唯一接线点，见下方 6c 段 */
 const { mountIfA } = require('./http/routes/ifA');
 
+/* 注入出口（ADR-0003 D17 / E42）：本文件的时间**一律**经 platformClock 取，不裸写 `new Date()` /
+   `Date.now()`；形态与 `server/http/router.js`、`server/services/dispatch.js` 及下方 IF-D/IF-A
+   挂载处**完全一致**（`platformClock.createClock({mode:'real'}).source()`），**不新造第二套时钟**。
+   为什么在模块级先建一份：崩溃兜底（`installCrashGuards`）可能在 `start()` 之前就要时间戳；
+   `start({clock})` 注入的时钟会在启动时覆盖它（见下方 `currentClock()`）。 */
+const processClock = platformClock.createClock({ mode: 'real' });
+
 /** 默认监听地址：**仅回环**。理由见下方 start() 内的告警分支。 */
 const DEFAULT_HOST = '127.0.0.1';
 /** 默认端口（2026-09-27 负责人裁定：默认 127.0.0.1:8787，可配） */
@@ -254,10 +261,36 @@ const state = {
   dbFile: null,
   logger: null,
   config: null,
+  clock: null,
   startedAt: 0,
   stopping: null,
   lastError: null
 };
+
+/**
+ * 解析注入时钟（E42：让 `startedAt` / `uptimeSec` / `lastError.at` 都能被注入时钟钉死，
+ * 不再"时间戳只能读墙钟"）。只认"时钟对象"（有 `now()`，与 `platform\clock.js` /
+ * `tests\lib\clock.js` 的共同子集一致）；缺 `source()` 的最简注入按**同一时刻**补一个适配层
+ * —— 适配层不含自己的时间，故不算"第二套时钟"。
+ */
+function resolveClock(options = {}) {
+  const injected = options.clock;
+  if (injected && typeof injected.now === 'function') {
+    if (typeof injected.source === 'function') return injected;
+    return { now: () => injected.now(), source: () => () => injected.now() };
+  }
+  return platformClock.createClock({ mode: 'real' });
+}
+
+/** 当前生效的时钟：注入的优先；未注入（含崩溃兜底早于 `start()`）即模块级真实时钟。 */
+function currentClock() {
+  return state.clock || processClock;
+}
+
+/** 当前时刻的 ISO 串 —— `lastError.at` 一律经此取，不再裸 `new Date().toISOString()`。 */
+function isoNow() {
+  return currentClock().now().toISOString();
+}
 
 /** 当前监听地址（未监听时给配置值，便于日志与自检在任何阶段都能读到） */
 function listenAddress() {
@@ -280,7 +313,7 @@ function healthPayload() {
   const ifd = state.router && typeof state.router.ifdStatus === 'function' ? state.router.ifdStatus() : null;
   return Object.assign({
     ok: true,
-    uptimeSec: state.startedAt ? Math.max(0, Math.round((Date.now() - state.startedAt) / 1000)) : 0,
+    uptimeSec: state.startedAt ? Math.max(0, Math.round((currentClock().now().getTime() - state.startedAt) / 1000)) : 0,
     dbWritable: Boolean(state.db),
     version: readBaselineVersion(),
     listen: `${addr.address}:${addr.port}`,
@@ -305,8 +338,11 @@ function fatal(logger, title, lines) {
  * 启动服务。
  * @param {{
  *   argv?:string[], env?:object, boardConfig?:object, logger?:object,
- *   heartbeatMs?:number, installSignalHandlers?:boolean, logConsole?:boolean
+ *   heartbeatMs?:number, installSignalHandlers?:boolean, logConsole?:boolean,
+ *   clock?:{now:Function, source?:Function}
  * }} [options]
+ *   `clock` 是**时钟注入出口**（E42）：传了就全进程（路由 / IF-D / IF-A / `/health` 的
+ *   `uptimeSec` / `lastError.at`）都用它，未传即 `platformClock.createClock({mode:'real'})`。
  * @returns {Promise<{host:string, port:number, listen:string, router:object, logger:object, health:Function}>}
  */
 async function start(options = {}) {
@@ -314,6 +350,8 @@ async function start(options = {}) {
   /* 允许"停后再起"：清掉上一轮的收尾标记，否则新一轮收到信号会被幂等短路掉、永远不会退 */
   state.stopping = null;
   state.lastError = null;
+  /* 时钟注入出口（E42）：从这里起，本进程的"现在几点"只有一个来源 */
+  state.clock = resolveClock(options);
   const installSignalHandlers = options.installSignalHandlers !== false;
 
   /* ---- 1. 配置 ---- */
@@ -373,12 +411,13 @@ async function start(options = {}) {
   /* ---- 6. 路由与监听 ---- */
   const router = createRouter({
     getHealth: () => healthPayload(),
-    /* 时钟注入出口（ADR-0003 D17）：与下方 IF-D/IF-A 挂载**同一形态**
-       （`platformClock.createClock({mode:'real'}).source()`），不新造第二套 ——
-       SSE 的 ready/ping/openedAt 时间戳由它给出，`router.js` 里不再裸 `new Date()`。 */
-    now: platformClock.createClock({ mode: 'real' }).source(),
+    /* 时钟注入出口（ADR-0003 D17 / E42）：全进程**同一份**时钟（`currentClock()`），
+       形态仍是 `platformClock.createClock({mode:'real'}).source()`，不新造第二套 ——
+       SSE 的 ready/ping/openedAt 时间戳由它给出，`router.js` 里不再裸 `new Date()`；
+       于是 `start({clock})` 注入固定时钟时，路由/IF-D/IF-A 与 `/health` 的 uptime 用的是同一时刻。 */
+    now: currentClock().source(),
     onError: (err, extra) => {
-      state.lastError = { message: err.message, at: new Date().toISOString() };
+      state.lastError = { message: err.message, at: isoNow() };
       logger.error(`[HTTP 500] ${err && err.stack ? err.stack : err}`, extra);
     },
     maxBodyBytes: cfg.maxBodyBytes,
@@ -409,7 +448,7 @@ async function start(options = {}) {
   const ifd = mountIfD(router, {
     db: state.db,
     logger,
-    now: platformClock.createClock({ mode: 'real' }).source()
+    now: currentClock().source()
   });
   /* 把 IF-D 状态快照挂到 router 上（**只挂一个只读函数**，不改 router.js）：
      `healthPayload()` 据此把断连状态一并暴露到 `GET /health`（FR-2.6 的"可被读取"），
@@ -429,7 +468,7 @@ async function start(options = {}) {
   const ifa = mountIfA(router, {
     db: state.db,
     logger,
-    now: platformClock.createClock({ mode: 'real' }).source(),
+    now: currentClock().source(),
     ifd: () => {
       /* IF-D 侧取值**仅供比对与展示**（C-100 / C-102）：取内存态最近一帧（`ingest.lastFrame()`，
          由 ifD 挂载结果暴露的 `instance` 读到；**不改 ifD.js、不加新真源**）。取不到就是 null，
@@ -453,7 +492,7 @@ async function start(options = {}) {
   const server = http.createServer((req, res) => {
     /* 统一入口；路由器内部已经把异常收敛成稳定的 JSON 错误体，这里再兜一层"连响应都发不出去"的情况 */
     Promise.resolve(router.handle(req, res)).catch(err => {
-      state.lastError = { message: err.message, at: new Date().toISOString() };
+      state.lastError = { message: err.message, at: isoNow() };
       logger.error(`[HTTP 处理异常] ${err && err.stack ? err.stack : err}`, { url: req.url });
       try { res.destroy(); } catch { /* 已断开 */ }
     });
@@ -491,7 +530,7 @@ async function start(options = {}) {
 
   const addr = server.address();
   const listenText = `${addr.address}:${addr.port}`;
-  state.startedAt = Date.now();
+  state.startedAt = currentClock().now().getTime();
   state.running = true;
 
   logger.info(`[启动完成] 监听 ${listenText}（pid=${process.pid}，DSH_ENV=${process.env.DSH_ENV || 'dev'}）`);
@@ -623,7 +662,7 @@ function stop(reason) {
  */
 function installCrashGuards() {
   process.on('uncaughtException', err => {
-    state.lastError = { message: err && err.message, at: new Date().toISOString(), kind: 'uncaughtException' };
+    state.lastError = { message: err && err.message, at: isoNow(), kind: 'uncaughtException' };
     try {
       if (state.logger) state.logger.error(`[未捕获异常] ${err && err.stack ? err.stack : err}`);
       else console.error(`[未捕获异常] ${err && err.stack ? err.stack : err}`);
@@ -632,7 +671,7 @@ function installCrashGuards() {
   });
   process.on('unhandledRejection', reason => {
     const err = reason instanceof Error ? reason : new Error(String(reason));
-    state.lastError = { message: err.message, at: new Date().toISOString(), kind: 'unhandledRejection' };
+    state.lastError = { message: err.message, at: isoNow(), kind: 'unhandledRejection' };
     try {
       if (state.logger) state.logger.error(`[未处理的 Promise rejection] ${err.stack || err.message}`);
       else console.error(`[未处理的 Promise rejection] ${err.stack || err.message}`);

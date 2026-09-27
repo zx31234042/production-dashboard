@@ -201,11 +201,19 @@ function main() {
      判据（先查实情再定，避免自造规则）：**允许"可注入 + 缺省兜底"写法** —— 形如
      `options.now || new Date()`、`d = new Date()`、`clock ? clock.now() : new Date()`；
      **禁止**的是"没有注入出口、直接用当前时间参与逻辑"（那会让用例不可重复）。
-     `platform\clock.js` 是时间来源本身，**豁免**。 */
+     `platform\clock.js` 是时间来源本身，**豁免**。
+     **E42 收紧（2026-09-27）**：旧判据用 `/[?:]\s*new Date()/` 认"注入出口"，于是**对象字面量的
+     键冒号**被误认成三元兜底 —— `state.lastError = { …, at: new Date().toISOString() }` 靠它侥幸
+     过闸（与 D11 刚修掉的 SSE 注释帧同类，是那轮修复后的遗留不一致点）。两条修正：
+       ① `:` 必须是**三元冒号**（同层有未配对的 `?`）；`{ key: … }` 的键冒号**不算**注入出口；
+       ② `Date.now()` 与 `new Date()` **同等**受管（此前完全不看 `Date.now()` ⇒ 裸 `Date.now()` 静默过闸）。
+     断言名**保持原文**：`项目记录\ADR\ADR-0003-测试环境.md:141` 逐字引用了它，而该文件不在本轮可改范围。 */
   /**
    * 逐行返回"去掉注释后"的代码行（P3-7 需要：注释里会写"禁止 new Date()"这类说明，
    * 首版把这些注释行判成了违规）。只做**行级轻量处理**：识别 `//` 与成对的 `/* … *\/`，
    * 足够用于静态扫描，不追求完整 JS 词法分析。
+   * E42 补：成对的块注释也可能**全在同一行**（首版只处理跨行块，一行 JSDoc 里的 `new Date()`
+   * 就被误判成"裸时钟"）—— 注释必须先剥干净，判据才对事不对字面。
    */
   const stripComments = (src) => {
     const out = [];
@@ -218,13 +226,65 @@ function main() {
         line = line.slice(end + 2);
         inBlock = false;
       }
-      const open = line.indexOf('/*');
-      if (open >= 0 && line.indexOf('*/', open) < 0) { inBlock = true; line = line.slice(0, open); }
+      for (;;) {
+        const open = line.indexOf('/*');
+        if (open < 0) break;
+        const close = line.indexOf('*/', open + 2);
+        if (close < 0) { inBlock = true; line = line.slice(0, open); break; }
+        line = line.slice(0, open) + line.slice(close + 2);
+      }
       const slash = line.indexOf('//');
       if (slash >= 0) line = line.slice(0, slash);
       out.push(line);
     }
     return out;
+  };
+
+  /* 被管的时钟调用：`new Date()` 与 `Date.now()` **同等**（E42②：此前只看 `new Date()`）。 */
+  const CLOCK_CALL_RE = /(?:new Date|Date\.now)\(\s*\)/g;
+
+  /**
+   * `line[colonIdx]` 是不是**三元**的 `:`（E42①：对象字面量的键冒号必须判否）。
+   * 行级轻量判定：从冒号往左扫，成对括号内的内容整体跳过；**同层**先遇到未闭合的 `{` ⇒ 这个冒号是
+   * 对象字面量的键分隔符（`{ at: new Date() }` 不是注入出口）；**同层**先遇到真三元 `?` ⇒ 是三元
+   * 假分支（`… ? x : new Date()`）。`?.` 与 `??` 不是三元运算符，故跳过。
+   */
+  const isTernaryColon = (line, colonIdx) => {
+    let depth = 0;
+    for (let i = colonIdx - 1; i >= 0; i--) {
+      const c = line[i];
+      if (c === ')' || c === ']' || c === '}') { depth++; continue; }
+      if (c === '(' || c === '[' || c === '{') {
+        if (depth > 0) depth--;
+        else if (c === '{') return false;
+        continue;
+      }
+      if (depth > 0) continue;
+      if (c === '?') {
+        if (line[i + 1] === '.' || line[i + 1] === '?' || line[i - 1] === '?') continue;
+        return true;
+      }
+    }
+    return false;
+  };
+
+  /**
+   * `line.slice(start, end)` 这处时钟调用是否留有注入出口（**同一行**判定）：
+   *   · 缺省兜底：`X || new Date()` ／ `X || Date.now()`
+   *   · 形参默认值：`param = new Date()` 或 `param = new Date(),`
+   *     （首版 `=\s*new Date()` 过宽，把 `const now = new Date();` 也当成了形参默认值 ——
+   *      反证时发现该写法**没能被抓出**，故要求左侧是 `(param =`、右侧紧跟逗号或右括号）
+   *   · 三元兜底：`cond ? new Date()` ／ `cond ? x : Date.now()`
+   */
+  const injectableCall = (line, start, end) => {
+    const before = line.slice(0, start);
+    const after = line.slice(end);
+    if (/\|\|\s*$/.test(before)) return true;
+    if (/\(\s*[A-Za-z_$][\w$]*\s*=\s*$/.test(before) && /^\s*[,)]/.test(after)) return true;
+    const m = /([?:])\s*$/.exec(before);
+    if (!m) return false;
+    if (m[1] === '?') return true;
+    return isTernaryColon(line, m.index);
   };
 
   const clockHits = [];
@@ -233,16 +293,12 @@ function main() {
       const rel = path.relative(ROOT, f);
       if (rel === path.join('platform', 'clock.js')) continue;
       stripComments(fs.readFileSync(f, 'utf8')).forEach((line, i) => {
-        if (!/new Date\(\s*\)/.test(line)) return;
-        /* 精确判据（首版 `=\s*new Date()` 过宽，把 `const now = new Date();` 也当成了形参默认值 ——
-           反证时发现该写法**没能被抓出**，故收紧为其后必须紧跟逗号或右括号）：
-           · 缺省兜底：`X || new Date()`
-           · 形参默认值：`param = new Date()` 或 `param = new Date(),`
-           · 三元兜底：`cond ? new Date()` 或 `: new Date()` */
-        const injectable = /\|\|\s*new Date\(\s*\)/.test(line) ||
-          /\(\s*\w+\s*=\s*new Date\(\s*\)\s*[,)]/.test(line) ||
-          /[?:]\s*new Date\(\s*\)/.test(line);
-        if (!injectable) clockHits.push(`${rel}:${i + 1}`);
+        CLOCK_CALL_RE.lastIndex = 0;
+        for (let m = CLOCK_CALL_RE.exec(line); m; m = CLOCK_CALL_RE.exec(line)) {
+          if (injectableCall(line, m.index, m.index + m[0].length)) continue;
+          clockHits.push(`${rel}:${i + 1}（裸 ${m[0]}）`);
+          break;
+        }
       });
     }
   }
