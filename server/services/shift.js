@@ -2,7 +2,17 @@
    班次计算（server/services/shift.js）
    作用：把"某个时刻属于哪个班次、班次从几点到几点、进行了多久、跨零点归哪一天"
         全部算清楚。这是 FR-4.16（跨零点归属正确）与 FR-1.9/1.10（当前班次与起止时间）
-        的唯一实现处 —— **口径来自 src/config/board.config.js 的 shift.list，不在此处另定**。
+        的**服务端口径（权威实现）** —— **口径来自 src/config/board.config.js 的 shift.list，
+        不在此处另定**。
+   ⚠ R26-P3-5 更正：原写"唯一实现处"，**与事实不符** —— 浏览器侧 `src/services/mockData.js`
+        的 `shiftOf()` 是同一规则的**第二份实现**（前端不能 require 服务端模块，只能逐字复制规则）。
+        两侧必须**逐条同规则、改动须同步**，否则头屏班次与服务端统计会分叉（当前配置
+        0-8/8-16/16-24 下两侧输出一致，故长期潜伏；跨零点配置下曾实测分叉）。
+        逐条对照（机器断言见 `tests/logic-check.js` 的「二、」段）：
+          ① 命中判据：end > start ⇒ 半开区间 [start, end)；end < start（跨零点）⇒ [start, 24) ∪ [0, end)；
+          ② `end = 24` 表示次日 0 点（结束日 +1）；
+          ③ 归属日 = 班次**开始**那天（跨零点且处于 0～end 段时回退一天）；
+          ④ 时刻不属任何班次（配置缺口）⇒ **显式抛错**，绝不静默兜底（两侧同）。
    依赖：platform/clock.js（时间一律注入，禁止 new Date()）。
    ========================================================================== */
 'use strict';
@@ -53,23 +63,24 @@ function createShiftRules(list) {
 
     /* 找到包含该时刻的规则（半开区间 [start, end)）；`end=24` 表示次日 0 点。
        ⚠ P2-3 修复：跨零点规则（end < start，如 22→6）**过去永远匹配不到** ——
-       `hour >= 22 && hour < 6` 恒为假，于是悄悄落到下面的兜底分支。
-       跨零点时应为 `hour >= start || hour < end`（22:00-23:59 与 00:00-05:59 两段）。 */
+       `hour >= 22 && hour < 6` 恒为假，于是悄悄落到兜底分支。
+       跨零点时应为 `hour >= start || hour < end`（22:00-23:59 与 00:00-05:59 两段）。
+       注：那个兜底分支已按 R26-P3-5 删除，改为下面的显式抛错。 */
     const inRule = (r, h) => (r.end > r.start ? (h >= r.start && h < r.end) : (h >= r.start || h < r.end));
-    let rule = rules.find(r => inRule(r, hour));
-    let startDayOffset = 0;
+    const rule = rules.find(r => inRule(r, hour));
     if (!rule) {
-      /* 配置存在缺口时的兜底：取"下一个会开始的班次"，并把开始日回退一天，
-         保证 elapsed/total 仍算得出来（正常配置下不会走到这里） */
-      const sorted = [...rules].sort((a, b) => a.start - b.start);
-      rule = sorted.find(r => r.start > hour) || sorted[0];
-      startDayOffset = -1;
-    } else if (rule.end < rule.start && hour < rule.end) {
-      /* 跨零点规则且当前处于**次日凌晨**那一段（如 22→6 的 03:00）：
-         班次开始于**前一天** 22:00，归属日期随之回退一天（FR-4.16 的实质）。
-         漏这一步会把 05:30 算成"当天 22:00 才开始"，elapsed 变成负数或荒唐值。 */
-      startDayOffset = -1;
+      /* R26-P3-5：配置缺口**不再静默兜底**。旧实现取"下一个会开始的班次"并把开始日回退一天，
+         于是一个谁都不属于的时刻会被显示成"某班次刚好跑满/刚开始"（改前实测 GAP3 配置
+         —— 甲6-10/乙10-14/丙14-18 —— 在 20:00 给出「甲班 6-10 归属前一天 elapsed=total=14400s」）。
+         与上面 :26 的配置校验是同一个取舍：看板上显示错的班次名与时长比直接报错危险得多 ⇒ 一律拒绝。
+         缺口即配置缺陷（正常配置三段班首尾相接、覆盖完整 24 小时）。 */
+      throw new RangeError(`shift: ${fmt(d)} 不属任何班次（配置缺口）—— 班次表 ` +
+        rules.map(r => `${r.name} ${r.start}-${r.end}`).join(' / '));
     }
+    /* 跨零点规则且当前处于**次日凌晨**那一段（如 22→6 的 03:00）：
+       班次开始于**前一天** 22:00，归属日期随之回退一天（FR-4.16 的实质）。
+       漏这一步会把 05:30 算成"当天 22:00 才开始"，elapsed 变成负数或荒唐值。 */
+    const startDayOffset = (rule.end < rule.start && hour < rule.end) ? -1 : 0;
 
     const startAt = new Date(d.getFullYear(), d.getMonth(), d.getDate() + startDayOffset,
       rule.start === 24 ? 0 : rule.start, 0, 0, 0);

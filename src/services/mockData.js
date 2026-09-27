@@ -152,12 +152,34 @@ window.MockData = (function () {
   /* ---------------- 通用工具（统一来自 utils/format.js） ---------------- */
   const { pad, clamp, round1, round2 } = window.Format;
 
+  /* 班次推导（头屏 FR-1.9/1.10 的班次名与起止、FR-4.16 的跨零点归属都由它出）——
+     ⚠ 与 `server/services/shift.js` 的 `at()` **同口径**（浏览器侧不能 require 服务端模块，
+        故这里是**逐字同规则的第二份实现**），**改动须同步**，否则头屏班次与服务端统计会分叉
+        （R26-P3-5）。四条同规则：
+        ① 命中判据（半开区间）：`end > start` ⇒ `[start, end)`；`end < start`（跨零点，如 22→6）
+           ⇒ `[start, 24) ∪ [0, end)`；
+        ② `end === 24` 表示次日 0 点（结束日 +1）；
+        ③ 归属日 = 班次**开始**那天（跨零点且处于 0～end 段时回退一天）；
+        ④ 时刻不属任何班次（配置缺口）⇒ **显式抛错**，不静默兜底。旧实现 `|| SHIFTS[2]`
+           既**不支持跨零点**（22→6 在 0～5 点恒无命中），又会在缺口时悄悄给出**末段**班次
+           （实测：三段含跨零点配置下 03:00 被显示成末段「中班 14:00-22:00」、进度 0）。 */
   function shiftOf(now) {
-    const h = now.getHours();
-    const s = SHIFTS.find(x => h >= x.start && h < x.end) || SHIFTS[2];
-    const start = new Date(now); start.setHours(s.start, 0, 0, 0);
-    const end = new Date(now); setEnd(end, s);
-    function setEnd(d, sh) { d.setHours(sh.end === 24 ? 0 : sh.end, 0, 0, 0); if (sh.end === 24) d.setDate(d.getDate() + 1); }
+    const hour = now.getHours() + now.getMinutes() / 60 + now.getSeconds() / 3600;
+    const inRule = (r, h) => (r.end > r.start ? (h >= r.start && h < r.end) : (h >= r.start || h < r.end));
+    const s = SHIFTS.find(x => inRule(x, hour));
+    if (!s) {
+      throw new Error(`班次配置存在缺口：${pad(now.getHours())}:${pad(now.getMinutes())} 不属任何班次` +
+        `（班次表 ${SHIFTS.map(x => `${x.name} ${x.start}-${x.end}`).join(' / ')}）`);
+    }
+    /* 跨零点规则且当前处于**次日凌晨**那一段（如 22→6 的 03:00）：班次开始于前一天 22:00，
+       起止时刻随之回退一天（与 shift.js 的 `startDayOffset` 同一含义），total 仍为完整班次时长 */
+    const back = (s.end < s.start && hour < s.end) ? -1 : 0;
+    const start = new Date(now); start.setHours(s.start === 24 ? 0 : s.start, 0, 0, 0);
+    start.setDate(start.getDate() + back);
+    const end = new Date(now); end.setHours(s.end === 24 ? 0 : s.end, 0, 0, 0);
+    end.setDate(end.getDate() + back);
+    if (s.end === 24) end.setDate(end.getDate() + 1);
+    if (s.end <= s.start) end.setDate(end.getDate() + 1);
     return { def: s, start, end, total: (end - start) / 1000 };
   }
 

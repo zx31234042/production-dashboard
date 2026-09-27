@@ -10,12 +10,18 @@
    ========================================================================== */
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+
 const env = require('./env');
 const { createRunner } = require('./lib/assert');
 const { createClock, BOUNDARIES } = require('./lib/clock');
 const cfg = require('../src/config/board.config.js');
 const { createShiftRules } = require('../server/services/shift');
 const stats = require('../server/services/stats');
+
+const ROOT = path.resolve(__dirname, '..');
 
 env.assertRuntime();
 const t = createRunner('当班统计与班次边界自检（logic-check）');
@@ -29,6 +35,47 @@ function tasks(n, result) {
 function mixed(spec) {
   return Object.entries(spec).flatMap(([result, n]) => tasks(n, result));
 }
+
+/* ---------------- 前端班次推导：在独立 vm 里真加载 mockData.js（R26-P3-5 用） ----------------
+   为什么要两侧都验：`src/services/mockData.js` 的 `shiftOf()` 是 `server/services/shift.js`
+   `at()` 的**第二份实现**（浏览器侧不能 require 服务端模块，只能逐字同规则）—— 头屏班次
+   （FR-1.9/1.10）与 FR-4.16 跨零点归属由它出。两侧一旦不同规则，头屏班次会与服务端统计分叉，
+   而当前配置（0-8/8-16/16-24）下两侧输出一致，故缺陷长期潜伏。
+   加载手法与 `tests/ui-check.js` 的 `loadUi()`／`tests/contract-check.js` 的
+   `createIsolatedHarness()` **完全一致**（vm.createContext ＋ 按 index.html 顺序 run 源码），
+   此处只取本用例需要的最小加载集（config → fieldMap → format → mockData），**不另造框架**。 */
+function loadFrontEnd(list) {
+  const sandbox = { console };
+  sandbox.window = sandbox;
+  vm.createContext(sandbox);
+  const run = rel => vm.runInContext(fs.readFileSync(path.join(ROOT, rel), 'utf8'), sandbox,
+    { filename: path.join(ROOT, rel) });
+  run('src/config/board.config.js');
+  /* 班次定义在 mockData.js **加载时**就快照进 SHIFTS ⇒ 必须先改配置再加载
+     （与 contract-check 的 `mutate` 钩子同一个原因） */
+  sandbox.window.BoardConfig.shift.list = list;
+  run('src/config/fieldMap.js');
+  run('src/utils/format.js');
+  run('src/services/mockData.js');
+  return {
+    /** 驱动一次 tick，返回头屏消费的 state.shift 字段（异常原样抛出，供"必须显式抛错"用例断言） */
+    tickAt(iso) {
+      sandbox.window.MockData.tick(vm.runInContext(`new Date(${JSON.stringify(iso)})`, sandbox));
+      const s = sandbox.window.MockData.state.shift;
+      return { name: s.name, start: s.start, end: s.end, range: s.range,
+        elapsed: s.elapsed, total: s.total, pct: s.pct };
+    }
+  };
+}
+
+/** 执行 fn 并把结果/异常都变成可断言的值：{ok:true,out} 或 {ok:false,err}
+    （断言里一律用它取值，这样"实现改成抛错"只会让断言变红并打印原因，不会把脚本打崩） */
+function callOrThrow(fn) {
+  try { return { ok: true, out: fn() }; } catch (e) { return { ok: false, err: `${e.name}: ${e.message}` }; }
+}
+
+/** 把 callOrThrow 的结果压成一句可读文本（失败详情用） */
+const brief = (r, pick) => (r.ok ? pick(r.out) : `【抛错】${r.err}`);
 
 /* ---------------- 一、班次规则来自配置（不硬编码） ---------------- */
 t.section('一、班次规则（FR-1.9/1.10，口径来自 board.config.js）');
@@ -118,6 +165,106 @@ t.section('二、班次边界自动切换与跨零点归属（FR-4.16）');
     badRejected === badCfgs.length, `${badRejected}/${badCfgs.length} 被拒绝`);
   t.check('空班次列表仍报错（既有行为不回退）',
     (() => { try { createShiftRules([]); return false; } catch { return true; } })());
+
+  /* ---- R26-P3-5：跨零点与配置缺口在**两侧**（服务端权威实现 ↔ 前端第二实现）逐点对账 ----
+     两侧必须逐条同规则：① 命中判据（跨零点 = [start,24) ∪ [0,end)）② 边界半开 [start,end)
+     ③ end=24 ④ 时刻不属任何班次（配置缺口）⇒ 一律显式抛错、绝不静默兜底。
+     判据要求的配置＝单班跨零点 `[{夜班 22→6}]`；另加"三段含跨零点（覆盖完整 24h）"与
+     "三段带缺口（末段＝丙班）"两个对照配置。 */
+  const NIGHT1 = [{ name: '夜班', start: 22, end: 6 }];
+  const NIGHT3 = [
+    { name: '夜班', start: 22, end: 6 },
+    { name: '白班', start: 6, end: 14 },
+    { name: '中班', start: 14, end: 22 }
+  ];
+  const GAP3 = [
+    { name: '甲班', start: 6, end: 10 },
+    { name: '乙班', start: 10, end: 14 },
+    { name: '丙班', start: 14, end: 18 }     // 末段：旧前端兜底 `|| SHIFTS[2]` 会把它当成 18:00～06:00 的班次
+  ];
+  const hhmmOf = n => `${String(n === 24 ? 0 : n).padStart(2, '0')}:00`;
+  { /* ① 服务端口径 */
+    const srvNight = createShiftRules(NIGHT1);
+    const late = callOrThrow(() => srvNight.at('2026-09-19T23:00:00'));
+    const early = callOrThrow(() => srvNight.at('2026-09-20T03:00:00'));
+    t.check('R26-P3-5 跨零点 22→6（服务端）：23:00 与 03:00 都必须命中夜班（不得落任何兜底段）',
+      late.ok && early.ok && late.out.name === '夜班' && early.out.name === '夜班',
+      `23:00→${brief(late, o => o.name)}，03:00→${brief(early, o => o.name)}`);
+    t.check('R26-P3-5 跨零点 22→6（服务端）：03:00 归属前一日、起于前一日 22:00，整班 8 小时、已过 5 小时',
+      early.ok && early.out.date === '2026-09-19' && early.out.startAt === '2026-09-19 22:00:00' &&
+      early.out.endAt === '2026-09-20 06:00:00' && early.out.totalSec === 8 * 3600 &&
+      early.out.elapsedSec === 5 * 3600,
+      brief(early, o => `归属 ${o.date} ${o.startAt}→${o.endAt}，elapsed=${o.elapsedSec}s total=${o.totalSec}s`));
+    const b2200 = callOrThrow(() => srvNight.at('2026-09-19T22:00:00'));
+    const b0559 = callOrThrow(() => srvNight.at('2026-09-20T05:59:59'));
+    const b2159 = callOrThrow(() => srvNight.at('2026-09-19T21:59:00'));
+    const b0600 = callOrThrow(() => srvNight.at('2026-09-20T06:00:00'));
+    const isNight = r => r.ok && r.out.name === '夜班';
+    t.check('R26-P3-5 跨零点边界开闭（服务端）：半开 [22:00, 06:00) —— 含 22:00/05:59:59，不含 21:59/06:00',
+      isNight(b2200) && isNight(b0559) && !isNight(b2159) && !isNight(b0600),
+      `22:00→${brief(b2200, o => o.name)}，05:59:59→${brief(b0559, o => o.name)}，` +
+      `21:59→${brief(b2159, o => o.name)}，06:00→${brief(b0600, o => o.name)}`);
+    const gapSrv = callOrThrow(() => srvNight.at('2026-09-19T12:00:00'));
+    t.check('R26-P3-5 配置缺口不再静默兜底（服务端）：单班 22→6 在 12:00 显式抛错，不返回任何班次',
+      !gapSrv.ok && /缺口/.test(String(gapSrv.err)) && /12:00:00/.test(String(gapSrv.err)),
+      gapSrv.ok ? `静默返回了 ${gapSrv.out.name}（elapsed=${gapSrv.out.elapsedSec}s）` : gapSrv.err);
+    const gapSrv3 = callOrThrow(() => createShiftRules(GAP3).at('2026-09-19T20:00:00'));
+    t.check('R26-P3-5 配置缺口不再返回"下一个/末段"班次（服务端）：GAP3 在 20:00 抛错（旧实现静默返回「甲班」）',
+      !gapSrv3.ok && !(gapSrv3.out && gapSrv3.out.name === '甲班'),
+      gapSrv3.ok ? `静默返回了 ${gapSrv3.out.name} ${gapSrv3.out.start}-${gapSrv3.out.end}` : gapSrv3.err);
+  }
+  { /* ② 前端第二实现（vm 真加载 mockData.js） */
+    const feNight1 = loadFrontEnd(NIGHT1);
+    const feLate = callOrThrow(() => feNight1.tickAt('2026-09-19T23:00:00'));
+    const feEarly = callOrThrow(() => feNight1.tickAt('2026-09-20T03:00:00'));
+    const srvEarly = createShiftRules(NIGHT1).at('2026-09-20T03:00:00');
+    t.check('R26-P3-5 跨零点 22→6（前端 mockData）：23:00 与 03:00 头屏班次都是夜班 22:00-06:00，且进度与服务端逐值一致',
+      feLate.ok && feEarly.ok &&
+      feLate.out.name === '夜班' && feLate.out.range === '22:00 - 06:00' &&
+      feEarly.out.name === '夜班' && feEarly.out.range === '22:00 - 06:00' &&
+      feEarly.out.elapsed === srvEarly.elapsedSec && feEarly.out.total === srvEarly.totalSec,
+      `23:00→${brief(feLate, o => `${o.name} ${o.range} ${o.elapsed}s/${o.total}s`)}，` +
+      `03:00→${brief(feEarly, o => `${o.name} ${o.range} ${o.elapsed}s/${o.total}s`)}` +
+      `（服务端 ${srvEarly.elapsedSec}s/${srvEarly.totalSec}s）`);
+    const fe2200 = callOrThrow(() => loadFrontEnd(NIGHT1).tickAt('2026-09-19T22:00:00'));
+    const fe0559 = callOrThrow(() => loadFrontEnd(NIGHT1).tickAt('2026-09-20T05:59:59'));
+    const fe2159 = callOrThrow(() => loadFrontEnd(NIGHT1).tickAt('2026-09-19T21:59:00'));
+    const fe0600 = callOrThrow(() => loadFrontEnd(NIGHT1).tickAt('2026-09-20T06:00:00'));
+    const feIsNight = r => r.ok && r.out.name === '夜班';
+    t.check('R26-P3-5 跨零点边界开闭（前端 mockData）：半开 [22:00, 06:00) —— 含 22:00/05:59:59，不含 21:59/06:00',
+      feIsNight(fe2200) && feIsNight(fe0559) && !feIsNight(fe2159) && !feIsNight(fe0600),
+      `22:00→${brief(fe2200, o => o.name)}，05:59:59→${brief(fe0559, o => o.name)}，` +
+      `21:59→${brief(fe2159, o => o.name)}，06:00→${brief(fe0600, o => o.name)}`);
+    const feGap = callOrThrow(() => loadFrontEnd(GAP3).tickAt('2026-09-19T20:00:00'));
+    t.check('R26-P3-5 配置缺口不再静默兜底（前端 mockData）：GAP3 在 20:00 显式抛错，不静默给出末段「丙班」',
+      !feGap.ok && /缺口/.test(String(feGap.err)) && !(feGap.out && feGap.out.name === '丙班'),
+      feGap.ok ? `静默返回了 ${feGap.out.name} ${feGap.out.range}` : feGap.err);
+    const feN3 = callOrThrow(() => loadFrontEnd(NIGHT3).tickAt('2026-09-20T03:00:00'));
+    t.check('R26-P3-5 跨零点不再落兜底段（前端 mockData）：NIGHT3 在 03:00 是夜班（改前落末段「中班 14:00-22:00」、进度 0）',
+      feN3.ok && feN3.out.name === '夜班' && feN3.out.range === '22:00 - 06:00' &&
+      feN3.out.elapsed === 5 * 3600 && feN3.out.total === 8 * 3600,
+      brief(feN3, o => `${o.name} ${o.range} ${o.elapsed}s/${o.total}s`));
+  }
+  { /* ③ 回归：当前配置（0-8/8-16/16-24）两侧对整点与边界逐点一致 */
+    const feCur = loadFrontEnd(cfg.shift.list);
+    const srvCur = createShiftRules(cfg.shift.list);
+    const points = ['2026-09-19T00:00:00', '2026-09-19T07:59:00', '2026-09-19T08:00:00',
+      '2026-09-19T15:59:00', '2026-09-19T16:00:00', '2026-09-19T23:59:00'];
+    const pairs = points.map(iso => ({
+      hm: iso.slice(11, 16),
+      srv: callOrThrow(() => srvCur.at(iso)),
+      fe: callOrThrow(() => feCur.tickAt(iso))
+    }));
+    t.check('R26-P3-5 两侧同口径（当前配置）：六个边界时刻的班次名逐点一致',
+      pairs.every(p => p.srv.ok && p.fe.ok && p.srv.out.name === p.fe.out.name),
+      pairs.map(p => `${p.hm}=${brief(p.srv, o => o.name)}/${brief(p.fe, o => o.name)}`).join(' '));
+    t.check('R26-P3-5 两侧同口径（当前配置）：起止时刻与已进行/总时长逐点一致（elapsed+remaining=total）',
+      pairs.every(p => p.srv.ok && p.fe.ok &&
+        p.fe.out.start === hhmmOf(p.srv.out.start) && p.fe.out.end === hhmmOf(p.srv.out.end) &&
+        p.fe.out.elapsed === p.srv.out.elapsedSec && p.fe.out.total === p.srv.out.totalSec &&
+        p.srv.out.elapsedSec + p.srv.out.remainingSec === p.srv.out.totalSec),
+      pairs.map(p => `${p.hm}=${brief(p.fe, o => `${o.range} ${o.elapsed}s/${o.total}s`)}`).join(' '));
+  }
 }
 
 /* ---------------- 三、15 项指标（FR-4.1～4.15） ---------------- */
