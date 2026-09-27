@@ -20,16 +20,25 @@ $FONT_EA = "微软雅黑"
 $FONT_AS = "Segoe UI"
 $FONT_MONO = "Consolas"
 
+# 行内 span 正则（行内代码 / 粗体）。GFM 允许用「更多反引号」作定界符来包含反引号本身，
+# 例如 `` ④`需求文档\历史文件\` `` 是内容内含反引号的代码跨距；
+# 只识别单反引号会把 `` 与内层 ` 错配，结尾多出一个反引号当普通文本漏进 docx。
+function InlinePattern() {
+  return '(`{2,}[\s\S]+?`{2,}|\*\*.+?\*\*|`[^`]+`)'
+}
+
+$INLINE_PATTERN = InlinePattern
+
 # 段落内换行：Markdown 表格单元格无法写多行，作者用 <br> 分段。
 # 这里输出 Word 的行内换行 <w:br/>（同一段落内），**不拆段落** —— 拆段落会在表格单元格里引入多余间距。
 function Brk() {
   return "<w:r><w:br/></w:r>"
 }
 
-function Runs([string]$text, [int]$sz = 21, [bool]$boldAll = $false, [string]$color = "") {
+function Runs([string]$text, [int]$sz = 21, [bool]$boldAll = $false, [string]$color = "", [hashtable]$scope = $null) {
   $sb = New-Object System.Text.StringBuilder
   if ($null -eq $text) { return "" }
-  $pattern = '(\*\*.+?\*\*|`[^`]+`)'
+  $pattern = $INLINE_PATTERN
   # 先按 <br> / <br/> / <br /> 切段（大小写不敏感、允许中间空格），再逐段做行内解析；
   # 注意：字面 &lt;br&gt; 是转义形式，不被 -split 命中，仍由 Esc() 原样输出。
   $segs = $text -split '(?i)<br\s*/?>'
@@ -41,13 +50,27 @@ function Runs([string]$text, [int]$sz = 21, [bool]$boldAll = $false, [string]$co
       $isBold = $boldAll
       $isCode = $false
       $content = $p
-      if ($p -match '^\*\*(.+)\*\*$') { $content = $Matches[1]; $isBold = $true }
-      elseif ($p -match '^`(.+)`$') { $content = $Matches[1]; $isCode = $true }
+      $face = $FONT_AS
+      $szv = $sz
+      $col = $color
+      if ($p -match '^\*\*(.+)\*\*$') {
+        $content = $Matches[1]
+        $isBold = $true
+        # E26 修法①：粗体段内若还嵌着行内代码，必须递归解析后再输出 ——
+        #   否则 `x` 的分隔反引号会当普通文本漏进 docx（本次就是「为过出口自检而剥反引号」的根因）。
+        if ($content.Contains([char]0x60)) {
+          $innerScope = @{ Face = $FONT_AS; Bold = $true; Color = $color; Sz = $sz }
+          [void]$sb.Append((Runs $content $sz $true $color $innerScope))
+          continue
+        }
+      }
+      elseif (($p.Length -ge 2) -and $p.StartsWith('`') -and $p.EndsWith('`')) { $content = $p.Trim('`'); $isCode = $true }
       $t = Esc $content
-      $rf = if ($isCode) { "<w:rFonts w:ascii=`"$FONT_MONO`" w:hAnsi=`"$FONT_MONO`" w:eastAsia=`"$FONT_EA`"/>" } else { "<w:rFonts w:ascii=`"$FONT_AS`" w:hAnsi=`"$FONT_AS`" w:eastAsia=`"$FONT_EA`"/>" }
+      if ($null -ne $scope) { $face = $scope.Face; $szv = $scope.Sz; $isBold = $scope.Bold; if ($scope.Color -ne "") { $col = $scope.Color } }
+      if ($isCode) { $face = $FONT_MONO; $szv = $sz - 1; if ($col -eq "") { $col = "A31515" } }
+      $rf = "<w:rFonts w:ascii=`"$face`" w:hAnsi=`"$face`" w:eastAsia=`"$FONT_EA`"/>"
       $b = if ($isBold) { "<w:b/>" } else { "" }
-      $c = if ($color -ne "") { "<w:color w:val=`"$color`"/>" } elseif ($isCode) { "<w:color w:val=`"A31515`"/>" } else { "" }
-      $szv = if ($isCode) { $sz - 1 } else { $sz }
+      $c = if ($col -ne "") { "<w:color w:val=`"$col`"/>" } else { "" }
       [void]$sb.Append("<w:r><w:rPr>$rf$b$c<w:sz w:val=`"$szv`"/><w:szCs w:val=`"$szv`"/></w:rPr><w:t xml:space=`"preserve`">$t</w:t></w:r>")
     }
   }
