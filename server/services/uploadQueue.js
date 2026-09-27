@@ -37,10 +37,21 @@ const DEFAULT_LIST_LIMIT = 200;
  *  （＝"待补传条数 ≥ 该值即告警"，NFR-13 口径：报不上去就要让人看见；真源现值 1）。
  *  **不要**在此写死字面量：前端 `src/services/api.js` 的 `getStatus().queueAlert` 读同一键，
  *  写死即两侧口径漂移（R26-P3-4 立案原因：前端曾按"容量 × 90%"算、服务端缺省 1，两判相反）。
- *  取不到配置键时的兜底与真源同值（1）—— 改一处必须同步另一处。 */
+ *  取不到配置键时的兜底与真源同值（1）—— 改一处必须同步另一处。
+ *
+ *  为什么还留一个模块级常量（R26-P3-4 的 `DEFAULT_WARN_THRESHOLD`）：它是**导入期快照**，
+ *  `tests/contract-check.js` 拿它与配置真源做"逐值对账"（跨实现一致性断言）。
+ *  **运行期**的缺省值走 `configWarnThreshold()`（每次读配置），这样"改配置即改判据"
+ *  在同一个进程里也成立（否则改配置要重启才生效，判据与真源会短暂两判）。 */
 const DEFAULT_WARN_THRESHOLD =
   (boardConfig.mes && boardConfig.mes.queueWarnThreshold !== undefined)
     ? boardConfig.mes.queueWarnThreshold : 1;
+
+/** 运行期读取告警阈值真源（配置缺项/非法时回落到与真源同值的兜底 1） */
+function configWarnThreshold() {
+  const v = boardConfig.mes && boardConfig.mes.queueWarnThreshold;
+  return (typeof v === 'number' && Number.isFinite(v)) ? v : DEFAULT_WARN_THRESHOLD;
+}
 
 /**
  * 队列已满：**拒绝新键入队**（不再静默丢弃最旧报文）。
@@ -107,7 +118,7 @@ function createUploadQueue(options = {}) {
   const ifaceDefault = options.interface || 'report/receiveReport';
   const capacity = normalizeCapacity(options.capacity);
   const listLimit = options.listLimit === undefined ? DEFAULT_LIST_LIMIT : options.listLimit;
-  const warnThreshold = options.warnThreshold === undefined ? DEFAULT_WARN_THRESHOLD : options.warnThreshold;
+  const warnThreshold = options.warnThreshold === undefined ? configWarnThreshold() : options.warnThreshold;
   const logger = options.logger || null;
 
   /* 待补传条数缓存：COUNT 查询本身很便宜，但界面/自检会高频读，故缓存；
@@ -130,9 +141,9 @@ function createUploadQueue(options = {}) {
     return {
       warn: pending >= warnThreshold,
       pendingCount: pending,
-      capacity,
+      capacity: queue.capacity,
       text: pending > 0 ? `MES 上报队列：待补传 ${pending} 条` : 'MES 上报队列：无待补传',
-      overflow: pending >= capacity
+      overflow: pending >= queue.capacity
     };
   }
 
@@ -208,6 +219,55 @@ function createUploadQueue(options = {}) {
         persisted: true, created: wrote.created,
         uploadId: wrote.uploadId, interface: iface, pendingCount: pending, alert
       };
+    },
+
+    /**
+     * ①' **成功留痕**（IF-B.10 的"结果"栏）：把一次**成功**的上报记进 `upload_log`。
+     *
+     * 与 `enqueueFailed()` 共用同一行幂等键 `(uploadId, interface)`：
+     *   · 新键 ⇒ 插一行 `成功`；已存在（首发失败过 / 人工重报过）⇒ **覆盖为成功**；
+     *   · 覆盖时**保留 `retry_count`**（那是"人工重报了几次"的审计信息，不该被抹掉）；
+     *   · 成功后该条**不再计入待补传**（`state='成功'` 不落在 `IN ('待补传','失败')` 里）。
+     * 容量上限对本函数**不适用**：成功的报文不是"待补传积压"，没有拒收理由。
+     *
+     * @param {{uploadId:string, interface?:string, serviceName?:string, methodName?:string,
+     *          requestBody:any, responseCode?:string, responseBody?:any, elapsedMs?:number, at?:Date}} entry
+     * @returns {{persisted:boolean, created:boolean, uploadId:string, interface:string,
+     *            pendingCount:number, alert:object}}
+     */
+    recordSuccess(entry) {
+      if (!entry || !entry.uploadId) {
+        throw new TypeError('uploadQueue.recordSuccess: entry 必须含 uploadId（DR-11 幂等键）');
+      }
+      const iface = entry.interface || [entry.serviceName || 'report', entry.methodName || 'receiveReport'].join('/');
+      /* 先看这条当前是不是待办：只有"待办 → 成功"才改变待补传条数（避免无谓作废缓存） */
+      const wasPending = repo.isPending(db, entry.uploadId, iface);
+      const at = entry.at === undefined ? nowIso() : fmtNow(entry.at);
+      const wrote = repo.recordSuccess(db, {
+        uploadId: entry.uploadId,
+        interface: iface,
+        requestBody: entry.requestBody,
+        responseCode: entry.responseCode,
+        responseBody: entry.responseBody,
+        elapsedMs: entry.elapsedMs
+      }, at);
+      if (wasPending) invalidate();
+      const pending = computePending();
+      const alert = buildAlert(pending);
+      if (logger) {
+        logger.info('[上报队列] 上报成功已留痕', {
+          uploadId: wrote.uploadId, interface: iface, pending, created: wrote.created, fromPending: wasPending
+        });
+      }
+      return {
+        persisted: true, created: wrote.created,
+        uploadId: wrote.uploadId, interface: iface, pendingCount: pending, alert
+      };
+    },
+
+    /** 该 (uploadId, interface) 是否**仍待人工补传**（已成功的条目返回 false ⇒ 重报口据此幂等跳过） */
+    isPending(uploadId, iface) {
+      return repo.isPending(db, uploadId, iface === undefined ? ifaceDefault : iface);
     },
 
     /**
@@ -328,6 +388,7 @@ module.exports = {
   DEFAULT_CAPACITY,
   DEFAULT_LIST_LIMIT,
   DEFAULT_WARN_THRESHOLD,
+  configWarnThreshold,
   UploadQueueFullError,
   createUploadQueue
 };

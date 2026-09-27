@@ -8,6 +8,11 @@
         指定时刻生效、版本号只增）、**DR-12 班组留痕**（op_log.team_code 可写可读与计数）、
         **IF-B.5 服务层换算**（绝对值 / 任一必要项缺失即整条占位 / 半套拒收）、
         **旧结构库迁移只发生一次**（防"每次 initSchema 都重建"的静默毁数据）。
+        2026-09-28（W4，服务层第二笔第 3 波）再加一节：
+        **IF-B 上报 MES**（附录 2 的 13 字段组装与缺值口径 / `uploadId` 复用 `platform/id.js` 真源 /
+        **失败留存不自动重试** / 唯一人工重报入口 `retryPending` 的按序与幂等 / `baseUrl` 未配置显式跳过 /
+        告警阈值单一真源 / HTTP 端到端）＋ **`E16` 入库口强制校验**（`addVersion` 默认调 `assertInput`，
+        半套 / 偏差正负号 / 超量程一律拒收，受控跳过出口单独断言）。
         这几节直接打在仓储/服务层上（`server/repo/standard.js`、`server/repo/opLog.js`、
         `server/services/standard.js`）—— 本批尚无 HTTP 路由接线，故不经路由验证。
    依据：DR-03 / DR-04 / DR-12 / DR-13 / DR-14 / DR-15 / DR-16 / DR-18 / DR-19、
@@ -58,6 +63,15 @@ const { createRouter } = require('../server/http/router');
    为 W2 新增），故这里的引用就是八之五那一节的被测对象本身。 */
 const { createDispatch, KIND: IFA_KIND, OP_TYPE: IFA_OP_TYPE } = require('../server/services/dispatch');
 const { mountIfA } = require('../server/http/routes/ifA');
+/* W4（IF-B 上报 MES）的三处被测对象与两处口径真源：
+    · `uploadId` 的**形状真源**在 `platform/id.js`（本段拿它判"上报器的 uploadId 是否同口径"）；
+    · 配置真源 `src/config/board.config.js`（段⑦要在**内存里**改 `mes.queueWarnThreshold` 再改回来）；
+    · 上报器（13 字段组装/单次发送/失败留存/人工重报）与它的 HTTP 挂载口 —— 本段之前
+      **无任何服务端调用方**（W4 新增并接线），故这里的引用就是被测对象本身。 */
+const platformId = require('../platform/id');
+const boardConfig = require('../src/config/board.config.js');
+const { createUploadReporter } = require('../server/services/uploadReporter');
+const { mountUpload } = require('../server/http/routes/upload');
 
 env.assertRuntime();
 const t = createRunner('本地库结构自检（db-check）');
@@ -496,17 +510,19 @@ async function main() {
   let overflowThrew = false;
   let overflowKind = '';
   try {
+    /* 受控跳过校验：本用例要验的是**取号越界**那条路径（样本本身不是录入路径的真实输入），
+       故显式走唯一出口（第 5 实参），不与 W4 的入库口判据互相干扰。 */
     standardRepo.addVersion(handle.db, {
       productCode: 'P-MAX', processCode: '', depthTypical: 1, depthUpperDev: 0.1, depthLowerDev: -0.1,
       speedTypical: 2, speedUpperDev: 0.1, speedLowerDev: -0.1
-    }, '2026-09-19 10:00:00', NOW);
+    }, '2026-09-19 10:00:00', NOW, { dangerouslySkipValidation: true });
   } catch (err) { overflowThrew = true; overflowKind = err.constructor.name; }
   let resumedAdd = null;
   try {
     resumedAdd = standardRepo.addVersion(handle.db, {
       productCode: 'P-AFTER-OVERFLOW', processCode: '', depthTypical: 1, depthUpperDev: 0.1,
       depthLowerDev: -0.1, speedTypical: 2, speedUpperDev: 0.1, speedLowerDev: -0.1
-    }, '2026-09-19 10:00:00', NOW);
+    }, '2026-09-19 10:00:00', NOW, { dangerouslySkipValidation: true });
   } catch (err) { resumedAdd = { versionNo: `抛错:${err.message.slice(0, 60)}` }; }
   const maxVersions = standardRepo.countVersions(handle.db, { productCode: 'P-MAX', processCode: '' });
   t.check('DR-03：addVersion 取号越界（已达 VERSION_MAX）抛 RangeError 且事务已回滚 —— 行数不变、连接可继续取号',
@@ -523,8 +539,13 @@ async function main() {
   const T3 = '2026-09-23 08:00:00';
   const appendBase = {
     productCode: APPEND_PRODUCT, processCode: APPEND_PROCESS, createdBy: '张伟', teamCode: '检验一班',
-    depthTypical: 12.60, depthUpperDev: 0.20, depthLowerDev: -0.20,
-    speedTypical: 4.90, speedUpperDev: 0.30, speedLowerDev: -0.30
+    /* ⚠ 取值落在 **`board.config.js` 的 `standards.range` 内**（深度 [4, 6] m、速度 [3, 8] m/s）——
+       W4 起 `addVersion` **默认**按量程校验（FR-3.19 第⑥步），量程外的入参会**正当地**被拒收。
+       旧值（深度 12.60）是 V1.33 时代的演示值，在负责人 2026-09-22 把深度量程改定为 [4, 6] m 之后
+       已越界：它当年能落库只因为入库口没校验（技术债 E16）。这里把**正常用例的样本**迁到区间内，
+       而不是给它们挂"跳过校验"开关 —— 否则等于用一个开关把 E16 的判据又关掉。 */
+    depthTypical: 5.00, depthUpperDev: 0.20, depthLowerDev: -0.20,
+    speedTypical: 5.00, speedUpperDev: 0.30, speedLowerDev: -0.30
   };
   const stdV1 = standardRepo.addVersion(handle.db, appendBase, T1, NOW);
   const rowV1Snapshot = JSON.stringify(handle.db.prepare('SELECT * FROM standard WHERE id = ?').get(stdV1.id));
@@ -534,7 +555,7 @@ async function main() {
 
   const stdV2 = standardRepo.addVersion(handle.db, {
     ...appendBase, createdBy: '李娜', teamCode: '检验二班',
-    depthTypical: 12.80, depthUpperDev: 0.30, depthLowerDev: -0.30,
+    depthTypical: 5.10, depthUpperDev: 0.30, depthLowerDev: -0.30,
     speedTypical: 5.10, speedUpperDev: 0.40, speedLowerDev: -0.40
   }, T2, NOW);
   const rowV2Snapshot = JSON.stringify(handle.db.prepare('SELECT * FROM standard WHERE id = ?').get(stdV2.id));
@@ -572,7 +593,7 @@ async function main() {
       { productCode: APPEND_PRODUCT, processCode: '99', at: T3 }) === null,
     '三处都必须为 null（其中前两处库里明明有更晚生效的版本行）');
 
-  const stdV3 = standardRepo.addVersion(handle.db, { ...appendBase, depthTypical: 13.00 }, T3, NOW);
+  const stdV3 = standardRepo.addVersion(handle.db, { ...appendBase, depthTypical: 5.60 }, T3, NOW);
   const threeRows = standardRepo.listVersions(handle.db,
     { productCode: APPEND_PRODUCT, processCode: APPEND_PROCESS });
   const rowV1After3 = JSON.stringify(handle.db.prepare('SELECT * FROM standard WHERE id = ?').get(stdV1.id));
@@ -644,7 +665,7 @@ async function main() {
   const TEAM_X = '本日不存在的班组';
   const opA1 = opLogRepo.append(handle.db, {
     opTime: '2026-09-19 09:00:00', operator: '张伟', opType: '标准录入',
-    content: '深度上下限 12.40～12.80', result: '成功', teamCode: TEAM_A
+    content: '深度上下限 4.80～5.20', result: '成功', teamCode: TEAM_A
   }, NOW);
   opLogRepo.append(handle.db, {
     opTime: '2026-09-19 09:05:00', operator: '张伟', opType: '参数配置',
@@ -652,7 +673,7 @@ async function main() {
   }, NOW);
   opLogRepo.append(handle.db, {
     opTime: '2026-09-19 09:10:00', operator: '李娜', opType: '标准录入',
-    content: '速度上下限 4.60～5.20', result: '成功', teamCode: TEAM_B
+    content: '速度上下限 4.70～5.30', result: '成功', teamCode: TEAM_B
   }, NOW);
   const opNoTeam = opLogRepo.append(handle.db, {
     opTime: '2026-09-19 09:15:00', operator: '王强', opType: '解锁',
@@ -666,7 +687,7 @@ async function main() {
   const teamARows = opLogRepo.list(handle.db, { teamCode: TEAM_A });
   t.check('DR-12：班组编号可写可读 —— 按班组过滤查回的行数/内容与写入一致（不串号、不丢班组）',
     teamARows.length === 2 && teamARows.every(r => r.teamCode === TEAM_A) &&
-    teamARows.map(r => r.content).join('|') === '深度上下限 12.40～12.80|标准临近比例 15%',
+    teamARows.map(r => r.content).join('|') === '深度上下限 4.80～5.20|标准临近比例 15%',
     `查回 ${teamARows.length} 行：${JSON.stringify(teamARows.map(r => [r.opType, r.teamCode, r.result]))}`);
 
   t.check('DR-12：countByTeam 计数正确（检验一班 2 / 检验二班 1 / 未知班组 0，且支持时间区间收窄）—— 审计"哪个班组做了什么"',
@@ -711,28 +732,36 @@ async function main() {
 
   const mesDepth = standardSvc.mesLimits(completeStd, { kind: 'depth', pass: true });
   const mesSpeed = standardSvc.mesLimits(completeStd, { kind: 'speed', pass: false });
-  t.check('IF-B.5：完整标准 uclValue/lclValue 取**绝对值**（典型值±偏差）—— 深度 12.60±0.20 ⇒ 12.80/12.40、' +
-    '速度 4.90±0.30 ⇒ 5.20/4.60；IsPass 由判定侧透传（true/false/未判定 null）',
-    mesDepth.uclValue === 12.8 && mesDepth.lclValue === 12.4 && mesDepth.IsPass === true &&
-    mesSpeed.uclValue === 5.2 && mesSpeed.lclValue === 4.6 && mesSpeed.IsPass === false &&
+  t.check('IF-B.5：完整标准 uclValue/lclValue 取**绝对值**（典型值±偏差）—— 深度 5.00±0.20 ⇒ 5.20/4.80、' +
+    '速度 5.00±0.30 ⇒ 5.30/4.70；IsPass 由判定侧透传（true/false/未判定 null）',
+    mesDepth.uclValue === 5.2 && mesDepth.lclValue === 4.8 && mesDepth.IsPass === true &&
+    mesSpeed.uclValue === 5.3 && mesSpeed.lclValue === 4.7 && mesSpeed.IsPass === false &&
     standardSvc.mesLimits(completeStd, { kind: 'depth' }).IsPass === null,
     `depth=${JSON.stringify(mesDepth)}，speed=${JSON.stringify(mesSpeed)}，` +
     `未传 pass=${JSON.stringify(standardSvc.mesLimits(completeStd, { kind: 'depth' }).IsPass)}`);
 
   /* IF-B.5 点名的**三类缺失组合**（C-78 原文）：①只设偏差未设典型值 ②只设上偏差 ③只设一项指标。
      三类都必须在**两条 dataList（depth/speed）**上整条占位 —— 且 pass=true 也必须被占位覆盖，
-     否则等于"带着半套标准去判定"，正是 MES 侧无从判断的情形。 */
+     否则等于"带着半套标准去判定"，正是 MES 侧无从判断的情形。
+     ⚠ 这三行是**故意畸形**的入库样本（"只设上偏差"＝ C-78 点名的**兼容旧数据的防御分支**）：
+     W4 起 `addVersion` **默认**会正当地拒收它们（E16 入库口强制校验，见下方 W4 段），
+     故这里必须走**显式的受控跳过出口**（第 5 实参），且每次跳过都在自检里留痕 ——
+     不是"把校验关掉好让用例过"，而是"明知畸形、要验的是读取侧口径"。 */
+  const HALF_FIXTURE_OPTS = {
+    dangerouslySkipValidation: true,
+    note: 'IF-B.5 占位用例的**畸形入库样本**（C-78 的"只设上偏差"防御分支）—— 受控跳过校验'
+  };
   standardRepo.addVersion(handle.db, {
     productCode: 'P-HALF-METRIC', processCode: '',
-    depthTypical: 12.60, depthUpperDev: 0.20, depthLowerDev: -0.20
-  }, T1, NOW);
+    depthTypical: 5.00, depthUpperDev: 0.20, depthLowerDev: -0.20
+  }, T1, NOW, HALF_FIXTURE_OPTS);
   standardRepo.addVersion(handle.db, {
-    productCode: 'P-HALF-UPPER', processCode: '', depthUpperDev: 0.20, speedUpperDev: 0.30
-  }, T1, NOW);
+    productCode: 'P-HALF-UPPER', processCode: '', depthUpperDev: 0.60, speedUpperDev: 0.30
+  }, T1, NOW, HALF_FIXTURE_OPTS);
   standardRepo.addVersion(handle.db, {
     productCode: 'P-HALF-NOTYP', processCode: '',
     depthUpperDev: 0.20, depthLowerDev: -0.20, speedUpperDev: 0.30, speedLowerDev: -0.30
-  }, T1, NOW);
+  }, T1, NOW, HALF_FIXTURE_OPTS);
   const incompleteStds = ['P-HALF-METRIC', 'P-HALF-UPPER', 'P-HALF-NOTYP']
     .map(code => standardRepo.getEffective(handle.db, { productCode: code, processCode: '', at: T3 }));
   const placeholderOk = incompleteStds.every(std => standardSvc.isComplete(std) === false &&
@@ -750,8 +779,8 @@ async function main() {
      可证伪点：若 isComplete 被放宽成"该指标齐即可"，这里 depth 会返回 13.10/12.50 而红。 */
   const stdOnlyOneMetric = incompleteStds[0];
   const absDepth = standardSvc.absoluteLimits(stdOnlyOneMetric).depth;
-  t.check('IF-B.5：占位是**整条**而不是"缺哪个补哪个" —— 深度自身完整（绝对值可算出 12.80/12.40）但速度缺项 ⇒ 该条 depth 也占位',
-    Boolean(absDepth) && absDepth.upper === 12.8 && absDepth.lower === 12.4 &&
+  t.check('IF-B.5：占位是**整条**而不是"缺哪个补哪个" —— 深度自身完整（绝对值可算出 5.20/4.80）但速度缺项 ⇒ 该条 depth 也占位',
+    Boolean(absDepth) && absDepth.upper === 5.2 && absDepth.lower === 4.8 &&
     standardSvc.mesLimits(stdOnlyOneMetric, { kind: 'depth' }).uclValue === 65535,
     `depth 绝对值=${JSON.stringify(absDepth)}，mesLimits=${JSON.stringify(standardSvc.mesLimits(stdOnlyOneMetric, { kind: 'depth' }))}`);
 
@@ -766,9 +795,9 @@ async function main() {
   {
     const beforeAssert = standardRepo.count(handle.db);
     const halfInputs = [
-      { depthTypical: 12.6, depthUpperDev: 0.2 },
-      { depthUpperDev: 0.2 },
-      { depthTypical: 12.6, depthUpperDev: 0.2, depthLowerDev: -0.2, speedUpperDev: 0.3 }
+      { depthTypical: 5.0, depthUpperDev: 0.2 },
+      { depthUpperDev: 0.6 },
+      { depthTypical: 5.0, depthUpperDev: 0.2, depthLowerDev: -0.2, speedUpperDev: 0.3 }
     ];
     let halfRejected = 0;
     for (const bad of halfInputs) {
@@ -777,7 +806,7 @@ async function main() {
     let okAccepted = false;
     try {
       okAccepted = standardSvc.assertInput({
-        depthTypical: 12.6, depthUpperDev: 0.2, depthLowerDev: -0.2,
+        depthTypical: 5.0, depthUpperDev: 0.2, depthLowerDev: -0.2,
         speedTypical: 4.9, speedUpperDev: 0.3, speedLowerDev: -0.3
       }) === true;
     } catch { okAccepted = false; }
@@ -791,18 +820,23 @@ async function main() {
 
   t.check('FR-3.19⑥：assertLimits 拒收"下限 > 上限"，并拒收"典型值不在上下限之间"（＝上下偏差正负号填反）',
     (() => {
+      /* ⚠ 前两条是**符号填反**的样本、第三条是**超量程**的样本：W4 起量程校验默认参与，
+         故第三条按"量程"拒收即可 —— 本条只要求"非法一律抛错"，不复判是哪一项判据拦下的
+         （量程判据的逐条对账在下方 W4 段）。 */
       const badLimits = [
-        { depthTypical: 12.6, depthUpperDev: -0.1, depthLowerDev: 0.1,
-          speedTypical: 4.9, speedUpperDev: 0.3, speedLowerDev: -0.3 },
-        { depthTypical: 12.6, depthUpperDev: 0.5, depthLowerDev: 0.2,
-          speedTypical: 4.9, speedUpperDev: 0.3, speedLowerDev: -0.3 }
+        { depthTypical: 5.0, depthUpperDev: -0.1, depthLowerDev: 0.1,
+          speedTypical: 5.0, speedUpperDev: 0.3, speedLowerDev: -0.3 },
+        { depthTypical: 5.0, depthUpperDev: 0.5, depthLowerDev: 0.2,
+          speedTypical: 5.0, speedUpperDev: 0.3, speedLowerDev: -0.3 },
+        { depthTypical: 12.6, depthUpperDev: 0.2, depthLowerDev: -0.2,
+          speedTypical: 5.0, speedUpperDev: 0.3, speedLowerDev: -0.3 }
       ];
       let limitThrew = 0;
       for (const bad of badLimits) {
         try { standardSvc.assertLimits(bad); } catch { limitThrew++; }
       }
       return limitThrew === badLimits.length;
-    })(), '2/2 抛错（第二条的下限 12.80 ≤ 上限 13.10，只可能被"典型值在区间内"那半条拦下）');
+    })(), '3/3 抛错（前两条：下限 5.10 > 上限 4.90／典型值 5.00 不在 [5.20, 5.50]；第三条：量程外）');
 
 /* ---------------- 六之七、DR-03 旧结构库迁移只发生一次（防静默毁数据） ---------------- */
   t.section('六之七、DR-03 旧结构库迁移（只发生一次，防"每次执行都重建"）');
@@ -2010,6 +2044,614 @@ async function main() {
       ifaHttpErrors.length === 0, ifaHttpErrors.join(' / '));
   }
   ifaDb.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
+
+  /* ---------------- 八之六、W4：IF-B 上报 MES（13 字段 / 失败留存 / 唯一人工重报）＋ E16 入库口强制校验 ----------------
+     被测对象（W4 新增/接线）：
+       · `server/services/uploadReporter.js`（13 字段组装 + 单次发送 + 失败留存 + `retryPending` 人工重报）；
+       · `server/http/routes/upload.js` 的 `mountUpload()`（`GET /upload/{pending,status,last}`、`POST /upload/retry`）；
+       · `server/repo/standard.js` 的 `addVersion`（**默认强制** `assertInput`）+ 受控跳过出口；
+       · `server/services/standard.js` 的 `assertInput/assertLimits`（新增"超量程"判据，量程取配置真源）。
+     判据（逐条对应任务书）：
+       ① 13 字段齐备且语义正确（字段名与附录 2 逐项对齐；缺值表达符合既定口径）；
+       ② `uploadId` 复用**真源** `platform/id.js`（形状/序号域/不产生 000）；
+       ③ **失败不自动重试**：落 `upload_log` + 告警 + 待补传条数正确，且**注入时钟推进 5 分钟后仍只有 1 次尝试**；
+       ④ **唯一人工入口** `retryPending`：**按序**补传、成功后改"已补传"、**重复调用幂等**（不重复发送）；
+       ⑤ `baseUrl` 未配置 ⇒ 显式 `skipped`，**不落"成功"**、一条都不发；
+       ⑥ `addVersion` 强制校验：半套 / 偏差正负号非法 / **量程外** 一律拒收且不落库；合法输入成功；
+          受控跳过出口单独断言（"默认拒绝"与"显式跳过后成功"成对，防恒真）；
+       ⑦ 告警阈值走**单一真源** `mes.queueWarnThreshold`（内存改配置即改判据）。
+     手法：**进程内**起一个 `tools\mock-mes` **形状**的假 MES（只作形状参考，真实契约待 Q-23 答复），
+     发送实现经 `options.fetch` 注入 ⇒ "HTTP 尝试次数"可被机器计数（证明没有隐藏重试）。
+     ⚠ 不新建测试脚本（任务书要求）；夹具沿用本文件既有手法（临时库 + 注入时钟 + 进程内 http.Server）。 */
+  t.section('八之六、W4：IF-B 上报 MES（13 字段/失败留存/唯一人工重报）＋ E16 入库口强制校验');
+
+  /* 假 MES：形状照 `tools\mock-mes\mock-mes.js`（`POST /service/:service/:method` + `{status,msg,data}` 回执），
+     `equipCode` 为空即回"异常回执"（与 mock-mes 的 makeReceipt 同判据）⇒ 据此制造可复现的失败路径。 */
+  const mockHttp = { requests: [], calls: 0, ok: false };
+  const mockMesServer = http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8');
+      let body = null;
+      try { body = JSON.parse(raw); } catch { body = null; }
+      mockHttp.calls++;
+      mockHttp.requests.push({ path: req.url, body: body });
+      const abnormal = !mockHttp.ok || !body || !body.equipCode;
+      const receipt = abnormal
+        ? { status: 0, msg: '设备编号不存在/关键字段缺失', data: {} }
+        : { status: 1, msg: '已接收', data: { uploadId: body.uploadId } };
+      res.writeHead(200, { 'Content-Type': 'application/json;charset=UTF-8' });
+      res.end(JSON.stringify(receipt));
+    });
+  });
+  const mockMesPort = await allocPort();
+  await new Promise((resolve, reject) => {
+    mockMesServer.once('error', reject);
+    mockMesServer.listen(mockMesPort, '127.0.0.1', resolve);
+  });
+  const mockMesUrl = `http://127.0.0.1:${mockMesPort}`;
+
+  const W4_T0 = '2026-09-28 08:00:00';
+  const W4_CLOCK = createClock({ mode: 'fixed', at: W4_T0 });
+  let W4_CLOCK_AT = W4_T0;                        // 便于在用例中途"推进时钟"（证明没有隐藏定时重试）
+  const w4Now = () => new Date(String(W4_CLOCK_AT).replace(' ', 'T'));
+  const w4Db = makeTempDb({ name: 'w4-upload' });
+  db.initSchema(w4Db.db, W4_T0);
+  const w4Logs = [];
+  const w4Logger = {
+    info: m => w4Logs.push('info:' + m),
+    warn: m => w4Logs.push('warn:' + m),
+    error: m => w4Logs.push('error:' + m)
+  };
+  /* 配置：**同一份真源的对象**（含 W4 起的新键 `reportPlaceholder`），只在内存里改，**不落盘**、不碰 src\*。
+     为什么带 `reportPlaceholder`：IF-10 的 `dataList[].uclValue` 占位（N-7 已发口径）在真源文件里已有键；
+     其余键与真源逐值一致，便于回执里对照。`dataSource:'mock'` 只用于"无实测帧时 testStatus 退 0=待机"这一
+     防御分支的**确定性**（真源现值就是 'mock'）。 */
+  const w4Config = {
+    dataSource: 'mock',
+    device: { equipCode: 'CFG-FALLBACK-EQ' },
+    mes: {
+      baseUrl: mockMesUrl,
+      token: '',
+      pathTemplate: '/service/{serviceName}/{methodName}',
+      responseStyle: 'status',
+      reportPlaceholder: 65535,
+      queueCap: 5000,
+      queueWarnThreshold: 1
+    }
+  };
+  const w4Fetch = (url, init) => fetch(url, init);
+  let w4Reporter = null;
+  const buildW4Reporter = (extra = {}) => createUploadReporter(Object.assign({
+    db: w4Db.db, logger: w4Logger, now: w4Now, config: w4Config, fetch: w4Fetch, timeoutMs: 2000
+  }, extra));
+  w4Reporter = buildW4Reporter();
+
+  /* 取数来源（附录 2 的「数据来源」列语义）在库里的落点：device / task / measure_rt 最近一帧 / standard */
+  const W4_SEED_AT = '2026-09-28 07:59:50';
+  w4Db.db.prepare(
+    `INSERT INTO device(equip_code, equip_name, model, location, mes_base_url, camera_count, updated_at)
+     VALUES(?, ?, ?, ?, ?, ?, ?)`)
+    .run('EQ-W4-001', '水池高速摄像检验设备', 'UC-19CAM', '水池测试间', mockMesUrl, 19, W4_SEED_AT);
+  w4Db.db.prepare(
+    `INSERT INTO task(proc_order_no, batch_no, product_code, product_name, drawing_no, plan_qty,
+                      plan_start_time, plan_end_time, process_no, process_name, status, created_at, updated_at)
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run('PO-W4-001', 'BATCH-W4', 'PRD-W4', '水下航行体检验件', 'SC710-UW-10', 120,
+      '2026-09-28 08:00:00', '2026-09-28 16:00:00', '30', '水下高速摄像检验', '测试中', W4_SEED_AT, W4_SEED_AT);
+  /* 故意**先插一条更早的帧、再插最近一帧**：证明"取最近一帧"是按落库先后（id）而不是按插入顺序意外命中。
+     两帧都写 `speed=null`、`velocity_x/velocity_y=null`、`frame_rate/gain/shutter/camera_depth=null`
+     —— 用来验"数值类缺值 → null（**不写 0**）"这条口径。 */
+  const w4InsertFrame = w4Db.db.prepare(
+    `INSERT INTO measure_rt(equip_code, proc_order_no, measure_depth, speed, velocity_x, velocity_y,
+                            frame_rate, gain, shutter, camera_depth, test_status, collect_time, created_at)
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  w4InsertFrame.run('EQ-W4-001', 'PO-W4-001', 4.90, null, null, null, null, null, null, null, 1,
+    '2026-09-28 07:59:51', W4_SEED_AT);
+  w4InsertFrame.run('EQ-W4-001', 'PO-W4-001', 5.12, null, null, null, null, null, null, null, 1,
+    '2026-09-28 07:59:52', W4_SEED_AT);
+  /* 该工单的生效标准：合法取值（在 `standards.range` 内）⇒ 走 `addVersion` 的**默认**（强制校验）路径 */
+  standardRepo.addVersion(w4Db.db, {
+    productCode: 'PRD-W4', processCode: '30', createdBy: '张伟', teamCode: 'TM-3901',
+    depthTypical: 5.00, depthUpperDev: 0.20, depthLowerDev: -0.20,
+    speedTypical: 5.00, speedUpperDev: 0.30, speedLowerDev: -0.30
+  }, W4_T0, W4_T0);
+
+  const w4UploadRows = () => w4Db.db.prepare('SELECT * FROM upload_log ORDER BY id').all();
+  const w4StandardRows = () => w4Db.db.prepare('SELECT * FROM standard ORDER BY id').all();
+
+  /* ---- ① 13 字段齐备且语义正确 ---- */
+  const built1 = w4Reporter.buildReport({});
+  const expect13 = {
+    equipCode: 'EQ-W4-001', procOrderNo: 'PO-W4-001',
+    frameRate: null, gain: null, shutter: null, cameraDepth: null,
+    depth: 5.12, speed: null, velocity_x: null, velocity_y: null,
+    collectTime: '2026-09-28 07:59:52', testStatus: 1
+  };
+  const misField = [];
+  for (const k of Object.keys(expect13)) {
+    if (built1.ok && built1.body[k] !== expect13[k]) {
+      misField.push(`${k}: 实得 ${JSON.stringify(built1.body[k])} ≠ 期望 ${JSON.stringify(expect13[k])}`);
+    }
+  }
+  t.check('W4/IF-B.8＋附录 2：`buildReport()` 组装的报文字段**恰为附录 2 的 13 项、不多不少**，' +
+    '每个字段的取数与"数据来源"列一致（设备/工单来自 `device`/`task`、实测六项来自 `measure_rt` **最近一帧**、' +
+    '`collectTime` 取该帧 `collect_time`、`testStatus` 取该帧 `test_status`）；' +
+    '`uclValue`/`lclValue`/`IsPass` **不在** 13 字段里（C-78：属 §1.2.5，另由 `paramDataList` 承载）',
+    built1.ok === true &&
+    JSON.stringify(Object.keys(built1.body)) === JSON.stringify([...fixture.REPORT_FIELDS, 'paramDataList']) &&
+    JSON.stringify(built1.fields) === JSON.stringify([...fixture.REPORT_FIELDS]) &&
+    misField.length === 0 && !built1.fields.includes('paramDataList') &&
+    built1.frameId === 2 && built1.collectTimeFallback === false,
+    misField.length ? misField.join('；') : `字段=${built1.fields.join(',')}`);
+
+  t.check('W4/IF-B.8：13 字段的**缺值口径**符合既定做法 —— 数值类缺值写 `null`（**不写 0**：0 是合法物理量，' +
+    '写 0 会让 MES 把"没有数据"读成"测到 0"）；写 0 只保留给 `dataSource=mock` 且**库内一帧都没有**时的 ' +
+    '`testStatus` 防御分支（那时代码语义＝待机，不是"缺值"）',
+    built1.ok === true && ['frameRate', 'gain', 'shutter', 'cameraDepth', 'speed', 'velocity_x', 'velocity_y']
+      .every(k => built1.body[k] === null) &&
+    JSON.stringify(built1.missing) === JSON.stringify(['frameRate', 'gain', 'shutter', 'cameraDepth', 'speed', 'velocity_x', 'velocity_y']) &&
+    built1.body.depth === 5.12 && built1.body.collectTime === '2026-09-28 07:59:52',
+    `missing=${built1.missing.join(',')}；depth=${built1.body.depth}（该帧有值）；` +
+    `speed=${JSON.stringify(built1.body.speed)}（该帧为空）`);
+
+  t.check('W4/IF-B.5＋C-78：报文另带 §1.2.5 的 `paramDataList`（**两条**：`depth`/`speed`，按 `tagParam` 区分），' +
+    '上下限取值**按报文时刻取"当时生效版本"**（DR-03）：本帧时刻（07:59:52）早于标准生效时刻（08:00:00）' +
+    '⇒ **当时无生效版本** ⇒ 两条都走已发口径的**占位**（`uclValue`/`lclValue`＝65535、`IsPass`＝null，' +
+    '字段保留、结构不缺项）；报文时刻在生效之后时的**绝对值**口径见下方"新帧"断言',
+    built1.ok === true && Array.isArray(built1.body.paramDataList) && built1.body.paramDataList.length === 2 &&
+    built1.body.paramDataList[0].tagParam === 'depth' && built1.body.paramDataList[0].uclValue === 65535 &&
+    built1.body.paramDataList[0].lclValue === 65535 && built1.body.paramDataList[0].IsPass === null &&
+    built1.body.paramDataList[1].tagParam === 'speed' && built1.body.paramDataList[1].uclValue === 65535 &&
+    built1.body.paramDataList[1].lclValue === 65535 && built1.body.paramDataList[1].IsPass === null &&
+    built1.standardVersionNo === null,
+    JSON.stringify(built1.body.paramDataList));
+
+  /* ---- ② uploadId 复用真源（platform/id.js 的形状与序号域） ---- */
+  const idCheck = platformId.isUploadId(built1.body.uploadId);
+  const idSeq = Number(String(built1.body.uploadId).slice(16));
+  t.check('W4/DR-13＋E31：`uploadId` 由**真源** `platform/id.js` 生成 —— 形状 `UP+14 位时间+3 位序号`、' +
+    '序号域 1～999、**永不产生 000**；时间部分＝注入时钟（`' + W4_T0 + '` ⇒ 20260928080000），序号从 001 起',
+    idCheck.ok === true && String(built1.body.uploadId).startsWith('UP20260928080000') &&
+    idSeq === 1 && !String(built1.body.uploadId).endsWith('000'),
+    `uploadId=${built1.body.uploadId}；isUploadId=${JSON.stringify(idCheck)}`);
+
+  const sameSec = [];
+  for (let i = 0; i < 1000; i++) sameSec.push(w4Reporter.buildReport({}).body.uploadId);
+  const sameSecSeqs = sameSec.map(v => Number(v.slice(16)));
+  const uniqSeq = [...new Set(sameSecSeqs)].sort((a, b) => a - b);
+  t.check('W4/E31：同一秒内连出 1000 个 `uploadId` ⇒ 序号**恰好覆盖 001～999 一轮**（不重不漏），' +
+    '且**永不产生 000**（含 000 即回绕成了 `…000`，与 `isUploadId` 的"001～999 合法"两判相反 —— ' +
+    '那正是 R26-P3-3 修掉的缺陷）；1000 个里恰好有 1 个重复（＝第二次回到起点）',
+    uniqSeq.length === 999 && uniqSeq[0] === 1 && uniqSeq[998] === 999 &&
+    sameSecSeqs.every(v => v >= 1 && v <= 999) &&
+    new Set(sameSec).size === 999 &&
+    sameSec.every(v => platformId.isUploadId(v).ok === true),
+    `序号域 = [${uniqSeq[0]} .. ${uniqSeq[998]}]（互异 ${uniqSeq.length} 个）；` +
+    `含 000=${sameSecSeqs.includes(0)}；首尾序列：[${sameSecSeqs.slice(0, 3).join(',')} … ${sameSecSeqs.slice(-3).join(',')}]`);
+
+  /* ---- ③ 失败路径：留存 + 告警 + 待补传条数；且**不自动重试** ---- */
+  mockHttp.ok = false;                     // 让假 MES 回"异常回执"（status:0）
+  const mockCallsBefore = mockHttp.calls;
+  const fail1 = await w4Reporter.report({});
+  const rowsAfterFail = w4UploadRows();
+  const row1 = rowsAfterFail[0];
+  /* ⚠ 判据用 `fail1.uploadId`（本次上报**实际发出**的那一个），**不要**拿之前 `buildReport()` 的产物 ——
+     每次组装都会从 `platform/id.js` 取一个新序号（这是真源的正确行为），两者的序号必然不同。 */
+  t.check('W4/IF-B.9＋DR-11：上报失败（MES 回 `status:0` 异常回执）⇒ 报文**落 `upload_log` 留存**' +
+    '（state=`待补传`、失败原因/响应码/耗时/请求报文逐项留痕，IF-B.10 的"请求、响应、耗时、结果"四栏齐）' +
+    '＋**告警**（`alert.warn`）＋**待补传条数＝1**；`ok:false` 如实回报，**不当成成功**',
+    fail1.ok === false && fail1.pendingCount === 1 && fail1.alert && fail1.alert.warn === true &&
+    rowsAfterFail.length === 1 && row1 &&
+    row1.state === '待补传' && row1.upload_id === fail1.uploadId &&
+    row1.interface === 'report/receiveReport' &&
+    row1.response_code === '0' && Number(row1.retry_count) === 0 &&
+    typeof row1.fail_reason === 'string' && row1.fail_reason.includes('设备编号不存在') &&
+    Number(row1.elapsed_ms) >= 0 &&
+    (() => { try { return JSON.parse(row1.request_body).uploadId === row1.upload_id; } catch { return false; } })(),
+    `state=${row1 && row1.state}；pending=${fail1.pendingCount}；code=${row1 && row1.response_code}；` +
+    `原因=${row1 && row1.fail_reason}；id=${fail1.uploadId}`);
+
+  t.check('W4/V1.31＋C-59：**不自动重试** —— 注入时钟**推进 5 分钟**后，`upload_log` 仍**恰 1 行**、' +
+    '`retry_count=0`、假 MES 侧 HTTP 尝试次数仍**恰 1 次**（既无定时器也没有"延时再试一次"）、`attempts()=1`；' +
+    '重报只能由**人工**入口触发',
+    mockHttp.calls - mockCallsBefore === 1 && w4UploadRows().length === 1 &&
+    Number(w4UploadRows()[0].retry_count) === 0 &&
+    w4Reporter.pendingCount(true) === 1 && w4Reporter.attempts() === 1 &&
+    (() => {
+      const st = w4Reporter.status();
+      return st.autoRetry === false && String(st.autoRetryNote).includes('不做自动重试') &&
+        st.attemptCount === 1;
+    })(),
+    `HTTP 尝试=${mockHttp.calls - mockCallsBefore} 次；attempts()=${w4Reporter.attempts()}；` +
+    `upload_log=${w4UploadRows().length} 行；retry_count=${w4UploadRows()[0].retry_count}`);
+
+  /* 基准：把该条清空（模拟现场已人工处置），后两条用例各自独立造数 */
+  w4Db.db.exec('DELETE FROM upload_log');
+
+  /* ---- ④ 唯一人工入口：按序补传 + 幂等 ---- */
+  mockHttp.ok = true;                      // 从这一刻起假 MES 正常收
+  w4Db.db.prepare(
+    `INSERT INTO measure_rt(equip_code, proc_order_no, measure_depth, speed, velocity_x, velocity_y,
+                            frame_rate, gain, shutter, camera_depth, test_status, collect_time, created_at)
+     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run('EQ-W4-001', 'PO-W4-001', 5.30, null, null, null, null, null, null, null, 1,
+      '2026-09-28 08:00:01', W4_SEED_AT);
+  /* 新帧（collectTime 08:00:01 ≥ 标准生效时刻 08:00:00）⇒ 该帧的 `paramDataList` 必须取到绝对值 */
+  const builtNewFrame = w4Reporter.buildReport({});
+  t.check('W4/IF-B.5＋C-78：报文另带 §1.2.5 的 `paramDataList`（**两条**：`depth`/`speed`），' +
+    '`uclValue`/`lclValue` 取**绝对值**（本用例标准 5.00±0.20 / 5.00±0.30）⇒ 5.2/4.8 与 5.3/4.7；' +
+    '`IsPass` 由本机按导出上下限判定（帧值 5.30 落在 [4.8, 5.2] **之外** ⇒ false；speed 无实测值 ⇒ null＝不做判定）',
+    builtNewFrame.ok === true && Array.isArray(builtNewFrame.body.paramDataList) &&
+    builtNewFrame.body.paramDataList.length === 2 &&
+    builtNewFrame.body.paramDataList[0].tagParam === 'depth' &&
+    builtNewFrame.body.paramDataList[0].uclValue === 5.2 &&
+    builtNewFrame.body.paramDataList[0].lclValue === 4.8 &&
+    builtNewFrame.body.paramDataList[0].IsPass === false &&
+    builtNewFrame.body.paramDataList[1].tagParam === 'speed' &&
+    builtNewFrame.body.paramDataList[1].uclValue === 5.3 &&
+    builtNewFrame.body.paramDataList[1].lclValue === 4.7 &&
+    builtNewFrame.body.paramDataList[1].IsPass === null &&
+    builtNewFrame.standardVersionNo === 1 && builtNewFrame.body.depth === 5.30,
+    JSON.stringify(builtNewFrame.body.paramDataList));
+
+  /* ⚠ **清空假 MES 台账**：本断言的"HTTP 次数"只统计本断言自己的发送（否则会带上 ③ 的首发失败那一次） */
+  mockHttp.requests.length = 0;
+  mockHttp.ok = false;
+  const fail2 = await w4Reporter.report({});                     // 失败 #1 ⇒ 待补传（含 uploadId）
+  mockHttp.ok = true;
+  const realLast = await w4Reporter.report({});                  // 成功 ⇒ upload_log 记"成功"（首发成功留痕）
+  const sent2 = await w4Reporter.report({});                     // 同一帧再组装 ⇒ 指纹相同 ⇒ **跳过**
+  const rowsAfterOk = w4UploadRows();
+  t.check('W4/IF-B.10：**首发成功也留痕**（三态齐：成功/失败/待补传）—— `state=成功`、失败原因清空、' +
+    '响应码＝回执 `status`（1）；且**同一帧不重复上报**：报文（除 `uploadId`）与最近一次成功完全相同 ⇒ `skipped` 且**一次 HTTP 都不发**',
+    fail2.ok === false && realLast.ok === true && sent2.skipped === true &&
+    sent2.reason === 'STALE_FRAME' &&
+    rowsAfterOk.length === 2 &&
+    rowsAfterOk[1].state === '成功' && rowsAfterOk[1].fail_reason === null &&
+    rowsAfterOk[1].response_code === '1' &&
+    mockHttp.requests.length === 2 &&
+    realLast.uploadId !== fail2.uploadId && sent2.uploadId !== realLast.uploadId,
+    `首发失败 id=${fail2.uploadId}；首发成功 id=${realLast.uploadId}；再次组装 id=${sent2.uploadId}` +
+    `（skipped=${sent2.skipped}，reason=${sent2.reason}）；upload_log=${rowsAfterOk.length} 行；` +
+    `本轮 HTTP 台账=[${mockHttp.requests.map(r => r.body && r.body.uploadId).join(',')}]（首发失败 1 + 首发成功 1；第三次**未发**）`);
+
+  w4Db.db.exec('DELETE FROM upload_log');
+  mockHttp.requests.length = 0;
+  /* 两条待补传：`created_at` 用注入时钟的两条不同时刻 ⇒ "按序（最旧优先）"可判 */
+  const pendA = { uploadId: 'UP20260928075959001', interface: 'report/receiveReport', state: '待补传' };
+  const pendB = { uploadId: 'UP20260928075959002', interface: 'report/receiveReport', state: '待补传' };
+  w4Db.db.prepare(
+    `INSERT INTO upload_log(upload_id, interface, request_body, response_code, response_body,
+                            elapsed_ms, retry_count, state, created_at, fail_reason, updated_at)
+     VALUES(?, ?, ?, ?, ?, ?, 0, '待补传', ?, ?, ?)`)
+    .run(pendA.uploadId, pendA.interface, JSON.stringify({ uploadId: pendA.uploadId, equipCode: 'EQ-W4-001', procOrderNo: 'PO-W4-001' }),
+      '0', '异常回执', 12, '2026-09-28 07:59:59', '设备编号不存在/关键字段缺失', '2026-09-28 07:59:59');
+  w4Db.db.prepare(
+    `INSERT INTO upload_log(upload_id, interface, request_body, response_code, response_body,
+                            elapsed_ms, retry_count, state, created_at, fail_reason, updated_at)
+     VALUES(?, ?, ?, ?, ?, ?, 0, '待补传', ?, ?, ?)`)
+    .run(pendB.uploadId, pendB.interface, JSON.stringify({ uploadId: pendB.uploadId, equipCode: 'EQ-W4-001', procOrderNo: 'PO-W4-001' }),
+      '0', '异常回执', 12, '2026-09-28 08:00:00', '设备编号不存在/关键字段缺失', '2026-09-28 08:00:00');
+  const pendingBefore = w4Reporter.listPending({});
+  const retry1 = await w4Reporter.retryPending({});
+  const sentIds = mockHttp.requests.map(r => r.body.uploadId);
+  const rowsAfterRetry1 = w4Db.db.prepare('SELECT * FROM upload_log ORDER BY id').all();
+  const retry2 = await w4Reporter.retryPending({});
+  t.check('W4/IF-B.9＋UI-20：**人工一键重报**按**顺序**（最旧优先）逐条补传 —— 假 MES 收到的 `uploadId` 序列' +
+    '＝待补传清单顺序；成功后状态改为**已补传（`成功`）**、`fail_reason` 清空；**重复调用幂等**：' +
+    '第二次 `requested=0`、**不再发送**（含 `state ∈ (待补传,失败)` 的查询口径）',
+    pendingBefore.map(i => i.uploadId).join(',') === `${pendA.uploadId},${pendB.uploadId}` &&
+    sentIds.join(',') === pendingBefore.map(i => i.uploadId).join(',') &&
+    retry1.ok === true && retry1.requested === 2 && retry1.sent === 2 && retry1.failed === 0 &&
+    retry1.remaining === 0 && retry1.alert.pendingCount === 0 &&
+    rowsAfterRetry1.every(r => r.state === '成功' && r.fail_reason === null) &&
+    retry2.requested === 0 && retry2.sent === 0 && retry2.failed === 0 && retry2.remaining === 0 &&
+    mockHttp.requests.length === 2,
+    `清单顺序=${pendingBefore.map(i => i.uploadId).join(',')}；MES 实收=${sentIds.join(',')}；` +
+    `retry#1 sent=${retry1.sent}/failed=${retry1.failed}/remaining=${retry1.remaining}；` +
+    `retry#2 requested=${retry2.requested}/sent=${retry2.sent}；HTTP 共 ${mockHttp.requests.length} 次`);
+
+  /* 单条重报（`ids` 过滤）：只发指定那条，其余留在队列里，且**已成功的那条不会被重发** */
+  w4Db.db.prepare(
+    `INSERT INTO upload_log(upload_id, interface, request_body, response_code, response_body,
+                            elapsed_ms, retry_count, state, created_at, fail_reason, updated_at)
+     VALUES(?, ?, ?, ?, ?, ?, 0, '待补传', ?, ?, ?)`)
+    .run('UP20260928080001003', 'report/receiveReport',
+      JSON.stringify({ uploadId: 'UP20260928080001003', equipCode: 'EQ-W4-001', procOrderNo: 'PO-W4-001' }),
+      '0', '异常回执', 9, '2026-09-28 08:00:02', '设备编号不存在/关键字段缺失', '2026-09-28 08:00:02');
+  const reqBefore4 = mockHttp.requests.length;
+  const pendIdsBefore4 = w4Reporter.listPending({}).map(i => i.uploadId);
+  const retry4 = await w4Reporter.retryPending({
+    ids: ['UP20260928075959001', 'UP20260928075959002', 'UP20260928080001003']
+  });
+  const rowsAfterRetry4 = w4Db.db.prepare('SELECT upload_id, state FROM upload_log ORDER BY id').all();
+  const sentIds4 = mockHttp.requests.slice(reqBefore4).map(r => r.body.uploadId);
+  t.check('W4/UI-20：`retryPending({ids})` 的**幂等**语义 —— 点名 3 条（其中 2 条此前已补传成功）时：' +
+    '只有**仍待补传**的那条被发出（`requested=1`），已成功的两条**一条都不发**（它们已不在 `state ∈ 待补传/失败` 的清单里，' +
+    '`isPending()` 为 false）—— **绝不能**因为"被点名"就把已上报成功的报文再发一遍（IF-B.9 的"不重复"）',
+    retry4.requested === 1 && retry4.sent === 1 && retry4.failed === 0 &&
+    retry4.results.length === 1 && retry4.results[0].uploadId === 'UP20260928080001003' &&
+    sentIds4.join(',') === 'UP20260928080001003' &&
+    pendIdsBefore4.join(',') === 'UP20260928080001003' &&
+    w4Reporter.queue.isPending('UP20260928075959001') === false &&
+    rowsAfterRetry4.length === 3 && rowsAfterRetry4.every(r => r.state === '成功') &&
+    mockHttp.requests.length - reqBefore4 === 1,
+    `pendingBefore=[${pendingBefore.map(i => i.uploadId).join(',')}]；` +
+    `pendIdsBefore4=[${pendIdsBefore4.join(',')}]；retry4.results=${JSON.stringify(retry4.results)}；` +
+    `retry1(requested=${retry1.requested}/sent=${retry1.sent}/remaining=${retry1.remaining})；` +
+    `retry2(requested=${retry2.requested}/sent=${retry2.sent})；` +
+    `retry4(requested=${retry4.requested}/sent=${retry4.sent}/skipped=${retry4.results.filter(r => r.skipped).length})；` +
+    `本轮实发=${sentIds4.join(',')}；MES 台账=[${mockHttp.requests.map(r => r.body && r.body.uploadId).join(',')}]；` +
+    `upload_log 状态=[${rowsAfterRetry4.map(r => r.upload_id + ':' + r.state).join(',')}]`);
+
+  /* ---- ⑤ baseUrl 未配置 ⇒ 显式 skipped，不落"成功" ---- */
+  const cfgNoUrl = { mes: Object.assign({}, w4Config.mes, { baseUrl: '' }) };
+  const noUrlReporter = buildW4Reporter({ config: cfgNoUrl });
+  const noUrlReport = await noUrlReporter.report({});
+  const noUrlStatus = noUrlReporter.status();
+  t.check('W4/Q-23：`mes.baseUrl` **未配置** ⇒ `report()` 显式返回 `{ok:false, skipped:true, reason:\'未配置 MES 地址（Q-23）\'}`' +
+    '（**不得当成成功**）；`status().configured=false` 且带 `configWarning`（界面/巡检据此显示"未配置"）',
+    noUrlReport.ok === false && noUrlReport.skipped === true &&
+    noUrlReport.reason === '未配置 MES 地址（Q-23）' &&
+    noUrlStatus.configured === false && typeof noUrlStatus.configWarning === 'string' &&
+    noUrlStatus.configWarning.includes('未配置 MES 地址'),
+    `report ⇒ ${JSON.stringify({ ok: noUrlReport.ok, skipped: noUrlReport.skipped, reason: noUrlReport.reason })}；` +
+    `status.configured=${noUrlStatus.configured}`);
+
+  const reqBefore5 = mockHttp.requests.length;
+  const noUrlRetry = await noUrlReporter.retryPending({});
+  const stateBefore5 = w4Db.db.prepare('SELECT COUNT(*) AS c FROM upload_log WHERE state = ?').get('成功').c;
+  const stateAfter5 = w4Db.db.prepare('SELECT COUNT(*) AS c FROM upload_log WHERE state = ?').get('成功').c;
+  t.check('W4/Q-23：未配置 MES 地址时人工重报**一条都不发**（`skipped` + `sent=0`），且**不落任何"成功"**；' +
+    '待补传清单原样保留（不因"没配置"而丢报文）',
+    noUrlRetry.ok === false && noUrlRetry.skipped === true && noUrlRetry.sent === 0 &&
+    noUrlRetry.requested === 0 && noUrlRetry.results.length === 0 &&
+    noUrlRetry.remaining === 0 &&
+    mockHttp.requests.length - reqBefore5 === 0 && stateBefore5 === stateAfter5,
+    `retry ⇒ ${JSON.stringify({ skipped: noUrlRetry.skipped, sent: noUrlRetry.sent, requested: noUrlRetry.requested })}；` +
+    `成功行 ${stateBefore5} → ${stateAfter5}`);
+
+  const lastBodyStillPending = noUrlReporter.buildReport({});
+  const reportPayload13 = lastBodyStillPending.ok ? lastBodyStillPending.body : null;
+  t.check('W4/IF-B.8：**未配置地址也不影响报文组装**（组装是纯读库、无副作用）：仍能拿到完整的 13 字段报文' +
+    '（供人工在界面上核对"要报什么"），只是**不发**',
+    lastBodyStillPending.ok === true && reportPayload13 &&
+    fixture.REPORT_FIELDS.every(f => Object.prototype.hasOwnProperty.call(reportPayload13, f)),
+    reportPayload13 ? `uploadId=${reportPayload13.uploadId}，字段数=${Object.keys(reportPayload13).length}` : '组装失败');
+
+  /* ---- ⑥ E16：addVersion 默认强制校验 + 受控跳过出口 ---- */
+  const w4StdBefore = w4StandardRows().length;
+  const rejectReasons = [];
+  let halfThrew = false;
+  try {
+    standardRepo.addVersion(w4Db.db, { productCode: 'P-E16-1', processCode: '30', depthUpperDev: 0.30 }, W4_T0, W4_T0);
+  } catch (e) { halfThrew = true; rejectReasons.push('半套：' + e.message); }
+  const outOfRange = { rejected: 0, unmet: 0, messages: [] };
+  for (const bad of [
+    { productCode: 'P-E16-2', processCode: '30', depthTypical: 12.00, depthUpperDev: 0.20, depthLowerDev: -0.20,
+      speedTypical: 5.00, speedUpperDev: 0.20, speedLowerDev: -0.20 },
+    { productCode: 'P-E16-3', processCode: '30', depthTypical: 5.00, depthUpperDev: 0.20, depthLowerDev: -0.20,
+      speedTypical: 20.00, speedUpperDev: 0.20, speedLowerDev: -0.20 }
+  ]) {
+    try {
+      standardRepo.addVersion(w4Db.db, bad, W4_T0, W4_T0);
+      outOfRange.unmet++;
+    } catch (e) {
+      outOfRange.rejected++;
+      outOfRange.messages.push(e.message);
+    }
+  }
+  const w4StdAfterReject = w4StandardRows().length;
+  t.check('W4/E16①＋FR-3.19⑥：`addVersion` **默认强制**校验 —— **半套标准**（只给上偏差）与**量程外**' +
+    '（深度 12.00 m 越出 [4, 6]、速度 20.00 m/s 越出 [3, 8]，量程取 `board.config.js` 的 `standards.range` 真源）' +
+    '一律**拒收**，原因可读（含参数名/实际值/量程），且**一行都不落库**',
+    halfThrew === true && outOfRange.rejected === 2 && outOfRange.unmet === 0 &&
+    w4StdAfterReject === w4StdBefore &&
+    rejectReasons[0].includes('同时给出') &&
+    outOfRange.messages.every(m => m.includes('量程') && m.includes('depth') || m.includes('量程') && m.includes('speed')),
+    `半套=${halfThrew}；量程外拒收=${outOfRange.rejected}/2；standard 行数 ${w4StdBefore} → ${w4StdAfterReject}；` +
+    `样例：${outOfRange.messages[0]}`);
+
+  const signBad = { productCode: 'P-E16-4', processCode: '30', depthTypical: 5.00, depthUpperDev: -0.10, depthLowerDev: 0.10,
+    speedTypical: 5.00, speedUpperDev: 0.20, speedLowerDev: -0.20 };
+  let signThrew = false;
+  let signMessage = '';
+  try {
+    standardRepo.addVersion(w4Db.db, signBad, W4_T0, W4_T0);
+  } catch (e) { signThrew = true; signMessage = e.message; }
+  const legalAdd = standardRepo.addVersion(w4Db.db, {
+    productCode: 'P-E16-OK', processCode: '30', depthTypical: 5.00, depthUpperDev: 0.20, depthLowerDev: -0.20,
+    speedTypical: 5.00, speedUpperDev: 0.20, speedLowerDev: -0.20
+  }, W4_T0, W4_T0);
+  t.check('W4/E16①：**偏差正负号非法**（下偏差为正、上偏差为负 ⇒ 下限 5.10 > 上限 4.90）拒收且不落库；' +
+    '**合法输入**（在量程内、三项齐、符号正确）⇒ 成功落库（负对照：证明不是"把什么都拒收"）',
+    signThrew === true && signMessage.includes('下限') &&
+    legalAdd.versionNo === 1 && legalAdd.validation === 'ok' && legalAdd.id > 0,
+    `符号错 ⇒ ${signMessage.slice(0, 60)}；合法 ⇒ v${legalAdd.versionNo}（validation=${legalAdd.validation}）`);
+
+  const skipE16Input = { productCode: 'P-E16-SKIP', processCode: '30', depthUpperDev: 0.30 };
+  const skipAdd = standardRepo.addVersion(w4Db.db, skipE16Input, W4_T0, W4_T0, { dangerouslySkipValidation: true });
+  let defaultRejectsSame = false;
+  try { standardRepo.addVersion(w4Db.db, { ...skipE16Input, productCode: 'P-E16-SKIP2' }, W4_T0, W4_T0); }
+  catch { defaultRejectsSame = true; }
+  t.check('W4/E16：**受控跳过出口**单独断言 —— 只有**显式**传危险开关（`{dangerouslySkipValidation:true}`）才跳过校验，' +
+    '且返回值**如实回显** `validation:\'dangerous-skip\'` + 说明文字（跳过**不静默**）；同一份入参走默认路径**仍然被拒**' +
+    '（成对断言：证明"跳过"确实生效、且默认路径没有被悄悄放宽）',
+    skipAdd.validation === 'dangerous-skip' &&
+    String(skipAdd.validationMessage).includes('跳过') &&
+    defaultRejectsSame === true,
+    `跳过 ⇒ validation=${skipAdd.validation}；同入参默认路径 ⇒ ${defaultRejectsSame ? '拒收' : '竟被收下'}`);
+
+  /* ---- ⑦ 告警阈值走单一真源（内存改配置，不落盘） ---- */
+  const thresholdAt = at => createUploadReporter({
+    db: w4Db.db, logger: w4Logger, now: w4Now, fetch: w4Fetch,
+    config: { dataSource: 'mock', device: { equipCode: 'CFG-FALLBACK-EQ' },
+      mes: Object.assign({}, w4Config.mes, { queueWarnThreshold: at }) }
+  });
+  const warnSrcBefore = boardConfig.mes.queueWarnThreshold;
+  let warnAt1 = null;
+  let warnAt2 = null;
+  let reportedAt1 = null;
+  let reportedAt2 = null;
+  try {
+    boardConfig.mes.queueWarnThreshold = 1;
+    const rep1 = thresholdAt(1);
+    rep1.queue.enqueueFailed({ uploadId: 'UP-W4-THRESH-1', interface: 'report/receiveReport', requestBody: { i: 1 }, failReason: '阈值用例' });
+    warnAt1 = rep1.status().alert;
+    reportedAt1 = rep1.status().warnThreshold;
+    boardConfig.mes.queueWarnThreshold = 2;
+    const rep2 = thresholdAt(2);
+    warnAt2 = rep2.status().alert;
+    reportedAt2 = rep2.status().warnThreshold;
+  } finally {
+    boardConfig.mes.queueWarnThreshold = warnSrcBefore;      // **必须还原**（内存真源，勿留污染）
+  }
+  t.check('W4/判据⑦＋R26-P3-4：告警阈值走**单一真源** `mes.queueWarnThreshold` —— 内存把真源改成 1 ⇒ ' +
+    '1 条待补传即 `alert.warn=true`；改成 2 ⇒ 同一条**不告警**（`warn=false`）；两次都从配置读出阈值' +
+    '（**不得**按容量比例换算，也不得写死在实现里）；用完已把真源还原为 ' + JSON.stringify(warnSrcBefore),
+    warnAt1 && warnAt1.warn === true && warnAt1.pendingCount === 1 && reportedAt1 === 1 &&
+    warnAt2 && warnAt2.warn === false && warnAt2.pendingCount === 1 && reportedAt2 === 2 &&
+    boardConfig.mes.queueWarnThreshold === warnSrcBefore,
+    `阈值 1 ⇒ warn=${warnAt1 && warnAt1.warn}（pending=${warnAt1 && warnAt1.pendingCount}）；` +
+    `阈值 2 ⇒ warn=${warnAt2 && warnAt2.warn}；真源现值（已还原）=${boardConfig.mes.queueWarnThreshold}`);
+
+  /* ---- ⑧ 端到端：mountUpload 的四条端点（进程内临时端口；手法同八之四/八之五） ---- */
+  const w4HttpErrors = [];
+  const w4Router = createRouter({
+    getHealth: () => ({ ok: true }),
+    onError: err => { w4HttpErrors.push(String(err && err.message)); }
+  });
+  const uploadStruct = mountUpload(w4Router, {
+    db: w4Db.db, logger: w4Logger, now: w4Now, config: w4Config, fetch: w4Fetch, timeoutMs: 2000
+  });
+  const w4Server = http.createServer((req, res) => {
+    Promise.resolve(w4Router.handle(req, res)).catch(() => { try { res.destroy(); } catch { /* 已断 */ } });
+  });
+  const w4Port = await allocPort();
+  await new Promise((resolve, reject) => {
+    w4Server.once('error', reject);
+    w4Server.listen(w4Port, '127.0.0.1', resolve);
+  });
+  const w4Get = async pathname => {
+    const res = await fetch(`http://127.0.0.1:${w4Port}${pathname}`);
+    return { status: res.status, body: await res.json() };
+  };
+  const w4Post = async (pathname, body) => {
+    const res = await fetch(`http://127.0.0.1:${w4Port}${pathname}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    return { status: res.status, body: await res.json() };
+  };
+
+  /* 干净起点：清空 upload_log、**同时清空假 MES 侧请求台账**（否则"本轮 HTTP 次数"的计数会带上前面用例的发送），
+     再**落一条新帧**（collectTime 08:00:05）—— 否则最近一帧与刚才成功上报的那帧逐字相同，`report()` 会按
+     "同一帧不重复上报"正确地跳过（那是 §6 已断言过的行为，本节要验的是"首发失败 ⇒ 待补传"）。 */
+  w4Db.db.exec('DELETE FROM upload_log');
+  mockHttp.requests.length = 0;
+  w4InsertFrame.run('EQ-W4-001', 'PO-W4-001', 5.40, null, null, null, null, null, null, null, 1,
+    '2026-09-28 08:00:05', W4_SEED_AT);
+  mockHttp.ok = false;
+  const failH = await uploadStruct.instance.report({});
+  const pendList = await w4Get('/upload/pending');
+  const stat = await w4Get('/upload/status');
+  const last = await w4Get('/upload/last');
+  t.check('W4/UI-20 端到端：`GET /upload/pending` 可读待补传清单（条数 + 明细：接口名/时间/失败原因，' +
+    '清单本身按最旧优先）；`GET /upload/status` 给出配置与告警（含"待补传条数"与 `autoRetry:false`）；' +
+    '`GET /upload/last` 给出**完整 13 字段报文**（只组装、不发送）',
+    failH.ok === false &&
+    pendList.status === 200 && pendList.body.count === 1 &&
+    pendList.body.items.length === 1 && pendList.body.items[0].uploadId === failH.uploadId &&
+    pendList.body.items[0].interface === 'report/receiveReport' &&
+    typeof pendList.body.items[0].failReason === 'string' &&
+    typeof pendList.body.items[0].createdAt === 'string' &&
+    pendList.body.alert.warn === true &&
+    stat.status === 200 && stat.body.configured === true && stat.body.autoRetry === false &&
+    stat.body.pendingCount === 1 && stat.body.warnThreshold === 1 &&
+    stat.body.lastLogged && stat.body.lastLogged.state === '待补传' &&
+    last.status === 200 && last.body.available === true &&
+    fixture.REPORT_FIELDS.every(f => Object.prototype.hasOwnProperty.call(last.body.body, f)),
+    `pending=${pendList.body.count}（${pendList.body.items[0] && pendList.body.items[0].failReason}）；` +
+    `status.configured=${stat.body.configured}/autoRetry=${stat.body.autoRetry}/pending=${stat.body.pendingCount}；` +
+    `last 字段数=${last.body.body ? Object.keys(last.body.body).length : 0}`);
+
+  mockHttp.ok = true;
+  const retryHttp = await w4Post('/upload/retry', {});
+  const retryHttp2 = await w4Post('/upload/retry', {});
+  const stateRows = w4Db.db.prepare('SELECT upload_id, state FROM upload_log ORDER BY id').all();
+  t.check('W4/UI-20 端到端：`POST /upload/retry` 按序补传 ⇒ 200 + `sent=1`、状态改为**已补传（成功）**、' +
+    '`remaining=0`；**重复调用幂等**（第二次 `sent=0`、`requested=0`）；`GET /upload/pending` 随之清空；' +
+    '且人工重报**只发了一次** HTTP（假 MES 侧计到 `sent` 条，没有多发）',
+    retryHttp.status === 200 && retryHttp.body.ok === true && retryHttp.body.sent === 1 &&
+    retryHttp.body.failed === 0 && retryHttp.body.remaining === 0 &&
+    retryHttp.body.results.length === 1 && retryHttp.body.results[0].uploadId === failH.uploadId &&
+    retryHttp2.status === 200 && retryHttp2.body.requested === 0 && retryHttp2.body.sent === 0 &&
+    stateRows.length === 1 && stateRows[0].state === '成功' &&
+    mockHttp.requests.length === 2,
+    `retry#1 ⇒ sent=${retryHttp.body.sent}/remaining=${retryHttp.body.remaining}；` +
+    `retry#2 ⇒ requested=${retryHttp2.body.requested}/sent=${retryHttp2.body.sent}；` +
+    `落库状态=${stateRows.map(r => r.state).join(',')}；本轮 HTTP（首发失败 1 + 人工补传 1）共 ${mockHttp.requests.length} 次`);
+
+  mockHttp.requests.length = 0;
+  /* 再落一条**新帧**（collectTime 08:00:09）：`report()` 的组装结果随帧变化 ⇒ 不会被"同一帧不重复上报"跳过 */
+  w4InsertFrame.run('EQ-W4-001', 'PO-W4-001', 4.70, null, null, null, null, null, null, null, 1,
+    '2026-09-28 08:00:09', W4_SEED_AT);
+  mockHttp.ok = false;                     // 让假 MES 回异常回执 ⇒ 这一帧进"待补传"
+  const failH2 = await uploadStruct.instance.report({});
+  const pendingBeforeBad = w4Db.db.prepare("SELECT COUNT(*) AS c FROM upload_log WHERE state IN ('待补传','失败')").get().c;
+  const successBeforeBad = w4Db.db.prepare("SELECT COUNT(*) AS c FROM upload_log WHERE state = '成功'").get().c;
+  const retryHttpBad = await w4Post('/upload/retry', { limit: 0 });
+  const retryHttpMissing = await w4Get('/upload/nope');
+  const pendAfter = await w4Get('/upload/pending');
+  t.check('W4 端到端：`POST /upload/retry` 入参非法（`limit: 0`）⇒ **400** + `err.code/field/reason`，且**一条都不发**、' +
+    '`upload_log` 状态一行不变（待补传仍在）；未注册路径仍 **404**（**未另起路由表** —— 路由清单仍只有 ' +
+    '`server/http/router.js` 一份真源）',
+    failH2.ok === false && failH2.pendingCount === 1 && failH2.alert.warn === true &&
+    pendingBeforeBad === 1 && successBeforeBad === 1 &&
+    retryHttpBad.status === 400 &&
+    retryHttpBad.body.err && retryHttpBad.body.err.code === 'BAD_VALUE' &&
+    retryHttpBad.body.field === 'limit' &&
+    retryHttpBad.body.ok === false &&
+    retryHttpMissing.status === 404 && pendAfter.body.count === 1 &&
+    mockHttp.requests.length === 1 &&
+    w4Db.db.prepare("SELECT COUNT(*) AS c FROM upload_log WHERE state = '成功'").get().c === successBeforeBad,
+    `limit:0 ⇒ HTTP ${retryHttpBad.status} ${JSON.stringify(retryHttpBad.body)}` +
+    `（本轮 HTTP 共 ${mockHttp.requests.length} 次：先首发失败一次，再 limit:0 一次不应发）；` +
+    `/upload/nope ⇒ HTTP ${retryHttpMissing.status}；待补传 ${pendingBeforeBad} → ${pendAfter.body.count} 条、` +
+    `成功行仍 ${successBeforeBad} 行（**状态一行未变**）`);
+
+  t.check('W4 装配显式性：`mountUpload()` 返回 `mounted:true` 与已注册路由清单（三条只读 + 一条人工重报），' +
+    '且**不抛**（接线成功），与 W6 空壳 `router.mountUpload()` 的 `mounted:false` 形成可核查对照（D23 反静默空转）',
+    uploadStruct.mounted === true && uploadStruct.by === 'W4' &&
+    uploadStruct.routes.length === 4 &&
+    w4Router.list().includes('GET /upload/pending') &&
+    w4Router.list().includes('GET /upload/status') &&
+    w4Router.list().includes('GET /upload/last') &&
+    w4Router.list().includes('POST /upload/retry') &&
+    uploadStruct.status().mount === 'upload',
+    `mounted=${uploadStruct.mounted}；routes=${uploadStruct.routes.join(' , ')}`);
+
+  /* 原始输出取证（回执要引用"端到端最小原始输出"） */
+  t.info('W4 端到端原始输出（HTTP 层，未加工）：');
+  t.info(`  假 MES 地址=${mockMesUrl}（形状照 tools\\mock-mes，契约待 Q-23）；本次共收到 ${mockHttp.calls} 次请求`);
+  t.info(`  #1 GET  /upload/pending → HTTP ${pendList.status} ${JSON.stringify({ count: pendList.body.count, alert: pendList.body.alert, item: pendList.body.items[0] && { uploadId: pendList.body.items[0].uploadId, state: pendList.body.items[0].state, failReason: pendList.body.items[0].failReason } })}`);
+  t.info(`  #2 GET  /upload/status  → HTTP ${stat.status} ${JSON.stringify({ configured: stat.body.configured, baseUrl: stat.body.baseUrl, pendingCount: stat.body.pendingCount, warnThreshold: stat.body.warnThreshold, autoRetry: stat.body.autoRetry, attemptCount: stat.body.attemptCount, lastLogged: stat.body.lastLogged && stat.body.lastLogged.state })}`);
+  t.info(`  #3 GET  /upload/last    → HTTP ${last.status} ${JSON.stringify({ available: last.body.available, missing: last.body.missing, fields: last.body.fields, body: last.body.body })}`);
+  t.info(`  #4 POST /upload/retry   → HTTP ${retryHttp.status} ${JSON.stringify({ ok: retryHttp.body.ok, requested: retryHttp.body.requested, sent: retryHttp.body.sent, failed: retryHttp.body.failed, remaining: retryHttp.body.remaining, results: retryHttp.body.results })}`);
+  t.info(`  #5 POST /upload/retry（幂等重复） → HTTP ${retryHttp2.status} ${JSON.stringify({ requested: retryHttp2.body.requested, sent: retryHttp2.body.sent, remaining: retryHttp2.body.remaining })}`);
+  t.info(`  #6 POST /upload/retry（limit:0）  → HTTP ${retryHttpBad.status} ${JSON.stringify(retryHttpBad.body.err)}`);
+  t.info(`  #7 GET  /upload/nope    → HTTP ${retryHttpMissing.status} ${JSON.stringify(retryHttpMissing.body.err || {})}`);
+  t.info(`  #8 未配置 baseUrl 时 report() → ${JSON.stringify(noUrlReport)}`);
+  t.info(`  #9 全段累计（含前面的失败留存用例）：假 MES HTTP 尝试=${mockHttp.calls}、上报器 attempts()=${w4Reporter.attempts()}` +
+    `（**不做自动重试**：两者都只随"人工/首发调用"线性增长，时钟推进不会让它们变大）`);
+
+  await new Promise(resolve => w4Server.close(resolve));
+  t.check('W4 端到端：HTTP 处理期间无未捕获异常（onError 未收到 500）',
+    w4HttpErrors.length === 0, w4HttpErrors.join(' / '));
+
+  await new Promise(resolve => mockMesServer.close(resolve));
+  w4Db.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
 
   /* ---------------- 九、清理与残留 ---------------- */
   t.section('九、临时区与残留');

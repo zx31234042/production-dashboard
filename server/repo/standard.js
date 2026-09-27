@@ -22,6 +22,9 @@
          standard.team_code        录入时当前生效班次的班组编号（与 FR-1.6 同一真源）
          standard.created_at       落库时间
    单位口径：速度 **m/s**、深度 **m**，库内**存数值**（偏差可为负）；两位小数由上层换算。
+   入库口校验（W4 / E16，负责人 2026-09-27 裁定⑥）：`addVersion` **默认强制**校验
+        （半套标准 / 偏差正负号 / 超量程一律拒收，见下方 `DANGEROUS_VALIDATE_FALSE_FLAGS` 的说明）；
+        唯一的跳过出口是显式的**危险开关**，返回值里如实回显 `validation`。
    用法：
      const repo = require('./repo/standard');
      const now = '2026-09-22 09:00:00';                     // 当前时刻（第 4 实参，必填；由调用方注入的时钟给出）
@@ -38,6 +41,20 @@
    ========================================================================== */
 'use strict';
 
+/* 校验真源：**复用** `server/services/standard.js` 的 `assertInput`（半套 / 偏差正负号 / 超量程
+   三项判据只有一份实现），不在这里另写一套。
+   为什么仓储层要"向上"引用服务层：E16 的裁定就是**入库口强制校验** —— 校验必须发生在
+   `INSERT` 之前，而 `addVersion` 正是那个入库口。若只在服务层校验，绕过服务层直调仓储
+   （现场脚本/后续路由）仍能把半套标准写进库，等于判据形同虚设。
+   ⚠ **必须延迟 require**（写在函数体内，不写文件顶部）：`services/standard.js` 在文件顶部
+   `require` 了本模块（循环依赖）。若本模块在**加载期**就取服务层的导出，取决于先加载谁，
+   `services/standard` 可能拿到本模块**尚未赋值**的 `module.exports`（`{}`），于是
+   `repo.getEffective is not a function` —— 已实测：`node tests/db-check.js` 直接复现。
+   延迟到**调用期**取，那时两个模块都已加载完成，引用必然完整。 */
+function standardSvcOf() {
+  return require('../services/standard');
+}
+
 /* DR-16 时间格式：yyyy-MM-dd HH:mm:ss（恰好 19 字符）。
    为什么在**入库口**校验（与 server/repo/measure.js 同一铁律）：`standard` 的"指定时刻生效版本"
    是靠 `effective_from <= at` 的**文本比较**实现的，一旦混入带毫秒/带 T/带时区的时间，
@@ -52,6 +69,30 @@ const VERSION_MAX = 1_000_000;
 
 /** 文本列最大长度（产品号/工序号/录入人/班组编号；超长一律拒收而不是截断，避免悄悄改名） */
 const TEXT_MAX = 200;
+
+/** 校验模式词（`addVersion` 返回值里如实回显，供自检与调用方核对"这次到底校没校"） */
+const VALIDATION = {
+  /** 默认：完整校验（半套 / 偏差正负号 / 超量程），非法直接拒收 */
+  CHECKED: 'ok',
+  /** 受控跳过：仅在显式参数下出现（见 DANGEROUS_VALIDATE_FALSE_FLAGS） */
+  SKIPPED: 'dangerous-skip'
+};
+
+/** 明确命名的"危险开关"：跳过校验。**故意起长名字**，避免被当成常规参数随手传。 */
+const DANGEROUS_VALIDATE_FALSE_FLAGS = ['dangerouslySkipValidation', 'skipValidation'];
+
+/** 校验开关归一：默认强制校验；只有显式"危险开关"才跳过。
+ *  为什么还要接受 `false`/`0`/`'false'` 这类写法：它们语义等同于"关掉校验"，属同一类危险动作，
+ *  一律**显式**归一为"跳过"（绝不静默当成默认值），并同样回显 `dangerous-skip`。 */
+function validationModeOf(options) {
+  if (!options || typeof options !== 'object') return VALIDATION.CHECKED;
+  for (const flag of DANGEROUS_VALIDATE_FALSE_FLAGS) {
+    if (options[flag] === true) return VALIDATION.SKIPPED;
+  }
+  const v = options.validate;
+  if (v === false || v === 0 || v === 'false') return VALIDATION.SKIPPED;
+  return VALIDATION.CHECKED;
+}
 
 /** 数值列（行对象键 → 库列名），顺序即 INSERT 参数顺序的一部分 */
 const NUMERIC_FIELDS = [
@@ -146,18 +187,41 @@ const INSERT_SQL =
  * ⚠ 刻意**不提供**"覆盖既有版本"的接口：任何"改标准"都必须是新版本行，
  * 否则"历史判定不追溯"立刻失效（旧判定引用的行被改写，回查不到当时的阈值）。
  *
+ * **入库口强制校验（W4 落地技术债 E16；负责人 2026-09-27 裁定⑥）**：
+ *   · **默认**在 `normalizeInput` 之后、`BEGIN` 之前调用 `services/standard.assertInput` ——
+ *     半套标准（只有上偏差 / 缺下偏差 / 单指标半套）、偏差正负号非法（下限 > 上限、
+ *     典型值不在上下限之间）、**超量程**（导出上/下限越出 `board.config.js` 的
+ *     `standards.range[kind]`）一律**拒收**并给出可读原因；**一行不写**（校验早于事务）。
+ *   · 确需跳过（**只用于回放当年录入的畸形旧数据**这类受控场景）只能走**显式危险开关**：
+ *     `addVersion(db, input, effectiveFrom, now, { dangerouslySkipValidation: true })`
+ *     —— 返回值里 `validation: 'dangerous-skip'` + `validationMessage` 如实回显，
+ *     调用点必须自己再做断言/说明（见 `tests/db-check.js` 的受控出口断言）。
+ *     传 `{ validate: false }` 语义相同，同样回显 `dangerous-skip`（不会静默变成默认值）。
+ *
  * @param {object} db 数据库句柄
  * @param {object} input 见 normalizeInput：productCode / processCode / 六个数值 / createdBy / teamCode
  * @param {string} [effectiveFrom] 生效时间（'yyyy-MM-dd HH:mm:ss'）；缺省＝now
  * @param {string} now 当前时刻（'yyyy-MM-dd HH:mm:ss'，由调用方注入时钟给出）
- * @returns {{id:number, productCode:string, processCode:string, versionNo:number, effectiveFrom:string}}
+ * @param {{dangerouslySkipValidation?:boolean, skipValidation?:boolean, validate?:boolean}} [options]
+ *        第 5 个位置参数：**唯一**的校验跳过出口（默认不传＝强制校验）
+ * @returns {{id:number, productCode:string, processCode:string, versionNo:number, effectiveFrom:string,
+ *            validation:'ok'|'dangerous-skip', validationMessage:string}}
  */
-function addVersion(db, input, effectiveFrom, now) {
+function addVersion(db, input, effectiveFrom, now, options) {
   const row = normalizeInput(input);
   const at = assertTime(now, 'now');
   const effective = effectiveFrom === undefined || effectiveFrom === null || effectiveFrom === ''
     ? at
     : assertTime(effectiveFrom, 'effectiveFrom');
+  /* 入库口强制校验：**必须在 BEGIN 之前**（校验失败连事务都不该开） */
+  const mode = validationModeOf(options);
+  let validationMessage = '';
+  if (mode === VALIDATION.SKIPPED) {
+    validationMessage = '已按调用方显式要求**跳过**入库校验（半套/符号/量程三项均未校）—— ' +
+      '只允许用于受控回放场景，调用方须自行断言（E16 受控出口）';
+  } else {
+    standardSvcOf().assertInput(row);
+  }
 
   db.exec('BEGIN');
   try {
@@ -181,7 +245,9 @@ function addVersion(db, input, effectiveFrom, now) {
       productCode: row.productCode,
       processCode: row.processCode,
       versionNo,
-      effectiveFrom: effective
+      effectiveFrom: effective,
+      validation: mode,
+      validationMessage
     };
   } catch (err) {
     db.exec('ROLLBACK');
@@ -315,6 +381,8 @@ module.exports = {
   NUMERIC_ABS_LIMIT,
   VERSION_MAX,
   TEXT_MAX,
+  VALIDATION,
+  DANGEROUS_VALIDATE_FALSE_FLAGS,
   assertTime,
   addVersion,
   getEffective,

@@ -1,7 +1,8 @@
 /* ==========================================================================
    上报队列仓储（server/repo/uploadQueue.js）
-   作用：**上报失败待补传队列的落库读写**（技术债 E10）—— 把失败的上报报文写进
-        `upload_log`（DR-11），进程重启后由 `listPending()` 原样读回，不再"重启即丢"。
+   作用：**上报流水与失败待补传队列的落库读写**（技术债 E10 / IF-B.10）—— 把失败的上报报文写进
+        `upload_log`（DR-11），进程重启后由 `listPending()` 原样读回，不再"重启即丢"；
+        成功上报由 `recordSuccess()` 记同一张表（三态留痕：成功 / 失败 / 待补传）。
         **只做 SQL，不做业务判断**（容量上限、告警、重报流程在 server/services/uploadQueue.js）。
    依据：IF-B.9（上报失败本地缓存）、NFR-13（数据不丢失）、DR-11（MES 上传日志表）、
         DR-16（时间格式 yyyy-MM-dd HH:mm:ss）、ADR-0002 D11（不碰平台专有行为）。
@@ -139,6 +140,69 @@ function hasUploadId(db, uploadId, iface) {
   return Boolean(row);
 }
 
+/**
+ * 该 (uploadId, interface) 是否**还等着人工补传**（`待补传` 或 `失败`）。
+ * 供人工重报口判"这条到底还算不算待办"（幂等：已成功的条目不再是待办，不该被重复发送）。
+ * @returns {boolean}
+ */
+function isPending(db, uploadId, iface) {
+  const row = db.prepare(
+    'SELECT 1 AS hit FROM upload_log WHERE upload_id = ? AND interface = ? AND state IN (?, ?) LIMIT 1'
+  ).get(String(uploadId), String(iface), STATE.PENDING, STATE.FAILED);
+  return Boolean(row);
+}
+
+const INSERT_SUCCESS_SQL =
+  `INSERT INTO upload_log(upload_id, interface, request_body, response_code, response_body,
+                          elapsed_ms, retry_count, state, created_at, fail_reason, updated_at)
+   VALUES(?, ?, ?, ?, ?, ?, 0, '成功', ?, NULL, ?)
+   ON CONFLICT(upload_id, interface) DO UPDATE SET
+     request_body = excluded.request_body,
+     response_code = excluded.response_code,
+     response_body = excluded.response_body,
+     elapsed_ms = excluded.elapsed_ms,
+     state = excluded.state,
+     fail_reason = NULL,
+     updated_at = excluded.updated_at`;
+
+/**
+ * **记一条上报成功**（IF-B.10 的"成功/失败/回执三态留痕"里缺的那一态）。
+ *
+ * 为什么必须有它：`upload_log` 原先只有"失败入队"一条写入路径（`enqueueFailed`），
+ * 一次**成功**的首发不留任何痕迹 ⇒ ①IF-B.10 要求的"结果"栏没有正样本；
+ * ②人工重报也无从核对"这条到底报上去没有"。本函数把成功态补上，与失败态共用同一行
+ * 幂等键 `(upload_id, interface)`：
+ *   · 新键 ⇒ 插入一行 `state='成功'`（`retry_count=0`）；
+ *   · 已存在（首发失败过、或人工重报过）⇒ **覆盖为成功**、清空失败原因与响应，
+ *     **但 `retry_count` 保留**（它记的是"人工重报了几次"，是审计信息，不该被抹掉）；
+ *   · `created_at` 保持首次落库时间不变（`DO UPDATE` 分支不改该列）—— 成功时刻看 `updated_at`。
+ *
+ * @param {object} db
+ * @param {{uploadId:string, interface:string, requestBody:any, responseCode?:string,
+ *          responseBody?:any, elapsedMs?:number}} entry
+ * @param {string} nowIso 'yyyy-MM-dd HH:mm:ss'（由调用方注入时钟给出）
+ * @returns {{uploadId:string, interface:string, created:boolean}} created=false 表示覆盖了已有行
+ */
+function recordSuccess(db, entry, nowIso) {
+  if (!entry || !entry.uploadId || !entry.interface) {
+    throw new TypeError('uploadQueue.recordSuccess: entry 必须含 uploadId 与 interface');
+  }
+  const at = assertTime(nowIso, 'nowIso');
+  const uploadId = String(entry.uploadId);
+  const iface = String(entry.interface);
+  const existed = hasUploadId(db, uploadId, iface);
+  db.prepare(INSERT_SUCCESS_SQL).run(
+    uploadId, iface,
+    normalizeBody(entry.requestBody),
+    entry.responseCode === undefined ? null : String(entry.responseCode),
+    normalizeBody(entry.responseBody),
+    normalizeElapsed(entry.elapsedMs),
+    at,
+    at
+  );
+  return { uploadId, interface: iface, created: !existed };
+}
+
 /** 行 → 对象（列名转小驼峰，供业务层与人工重报界面使用） */
 function hydrate(row) {
   return {
@@ -190,6 +254,20 @@ function countPendingAll(db) {
 /** 队列总条数（含已成功/已失败，供运维核对与保留策略） */
 function countAll(db) {
   return db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c;
+}
+
+/**
+ * 已成功记录（**最近优先**）。供上报器判"这一帧是不是已经报上去过"（防同一帧重复发送）
+ * 与运维核对上报流水；与 `listPending` 一样只做 SQL。
+ * @param {{limit?:number, iface?:string}} [query] limit 缺省不限
+ */
+function listSucceeded(db, query = {}) {
+  const args = [STATE.SUCCESS];
+  let sql = 'SELECT * FROM upload_log WHERE state = ?';
+  if (query.iface) { sql += ' AND interface = ?'; args.push(String(query.iface)); }
+  sql += ' ORDER BY updated_at DESC, id DESC';
+  if (Number.isInteger(query.limit) && query.limit > 0) { sql += ' LIMIT ?'; args.push(query.limit); }
+  return db.prepare(sql).all(...args).map(hydrate);
 }
 
 /** 按 uploadId 取一条（回执核对与人工重报前的确认） */
@@ -301,8 +379,11 @@ module.exports = {
   STATE,
   FAIL_REASON_MAX,
   enqueueFailed,
+  recordSuccess,
   hasUploadId,
+  isPending,
   listPending,
+  listSucceeded,
   countPending,
   countPendingAll,
   countFailed,

@@ -24,6 +24,11 @@
 'use strict';
 
 const repo = require('../repo/standard');
+/* 量程真源（FR-3.19 第⑥步"超量程须拒绝"；数值由负责人 2026-09-22 确认）：
+   `standards.range.{depth,speed}` —— **实现里不写死任何量程**，改配置即改判据（NFR-19）。
+   W4：`assertInput` 起**默认**按它做"超量程"校验（此前该判据只在前端 `TaskPanel.js` 有，
+   服务端入库口没有 ⇒ 绕过界面直接调 `addVersion` 可以把量程外的标准写进库）。 */
+const boardConfig = require('../../src/config/board.config.js');
 
 /**
  * MES 占位口径（N-7，**接口契约级**，不得随意改）：
@@ -149,13 +154,55 @@ function toDisplayStandard(std) {
 }
 
 /**
- * 校验"下限 ≤ 上限"与"典型值在上下限之间"（FR-3.19 第 6 步）。
+ * 该指标的量程（FR-3.19 第⑥步"超量程"判据的**单一真源**）。
+ * 取 `board.config.js` 的 `standards.range[kind]`；配置缺项/非法 ⇒ 返回 null
+ * （＝本项校验不参与，**实现里不写死任何量程数字**；与前端 `TaskPanel.rangeOf()` 同款）。
+ * @param {'depth'|'speed'} kind
+ * @returns {{min:number|null, max:number|null}|null}
+ */
+function rangeOf(kind) {
+  const seg = (boardConfig && boardConfig.standards && boardConfig.standards.range) || null;
+  const r = seg && seg[kind];
+  if (!r || typeof r !== 'object') return null;
+  const min = typeof r.min === 'number' && Number.isFinite(r.min) ? r.min : null;
+  const max = typeof r.max === 'number' && Number.isFinite(r.max) ? r.max : null;
+  if (min === null && max === null) return null;
+  return { min, max };
+}
+
+/**
+ * 超量程校验（FR-3.19 第⑥步）：录入得到的**导出上限/下限绝对值**不得越出量程。
+ * 为什么按"绝对值"而不是"偏差"判：需求原文就是"按导出的上/下限绝对值判定"（C-91/C-93④）。
+ * @throws {RangeError} 越界时抛出，消息里点明参数名 + 实际值 + 量程（可读、可核对）
+ */
+function assertRange(raw) {
+  const limits = absoluteLimits(raw);
+  for (const kind of METRICS) {
+    const lim = limits[kind];
+    if (!lim) continue;                        // 该指标未算得出上下限（半套/未录入）⇒ 本项不参与
+    const range = rangeOf(kind);
+    if (!range) continue;                      // 配置无量程 ⇒ 不写死兜底，跳过
+    for (const [name, v] of [['上限', lim.upper], ['下限', lim.lower]]) {
+      const over = (range.min !== null && v < range.min) || (range.max !== null && v > range.max);
+      if (over) {
+        throw new RangeError(
+          `standard: ${kind} 的${name} ${v} 超出量程 [${range.min}, ${range.max}] —— 拒绝写入（FR-3.19 第⑥步"超量程"）`);
+      }
+    }
+  }
+  return true;
+}
+
+/**
+ * 校验"下限 ≤ 上限"、"典型值在上下限之间"与"不超量程"（FR-3.19 第 6 步）。
  * 输入可以是服务层的 `{ depthTypical, depthUpperDev, ... }`，也可以是直接传入的库行
  * （`metricOf` 会同时认小驼峰与下划线两种键名）。
  * @param {object} raw
- * @param {{requireComplete?:boolean, checkTypical?:boolean}} [options]
+ * @param {{requireComplete?:boolean, checkTypical?:boolean, checkRange?:boolean}} [options]
  *   requireComplete=true 时，指标"半套"（只填了三个必要项的一部分）也判非法；
- *   checkTypical=false 时跳过"典型值在区间内"（供"典型值未设定"的历史数据回放使用）。
+ *   checkTypical=false 时跳过"典型值在区间内"（供"典型值未设定"的历史数据回放使用）；
+ *   checkRange **缺省即校验**（`!== false`，W4 起）—— 超量程按 FR-3.19⑥ 拒收。显式传
+ *   `false` 只用于"配置无量程的旧数据回放"这类**受控**场景，调用点必须写明理由。
  * @returns {boolean} 合法即 true；非法抛错
  */
 function assertLimits(raw, options = {}) {
@@ -194,13 +241,22 @@ function assertLimits(raw, options = {}) {
         '请检查上下偏差的正负号（下偏差默认负、上偏差默认正）');
     }
   }
+  /* 超量程（默认参与；受控场景可显式关掉）：放在"符号"校验之后 —— 符号填反这类错误
+     更根本，先报它，调用方修完再看量程，错误信息不会互相掩盖。 */
+  if (options.checkRange !== false) assertRange(raw);
   return true;
 }
 
-/** 录入前的完整校验（FR-3.19 第 6 步）：非法即抛错，**绝不写入**（"修改前不做任何变更"） */
-function assertInput(input) {
+/** 录入前的完整校验（FR-3.19 第 6 步）：非法即抛错，**绝不写入**（"修改前不做任何变更"）
+ *
+ *  三项判据**默认全开**：半套标准（`requireComplete`）、偏差正负号（`checkTypical`）、
+ *  超量程（`checkRange`）。关掉任何一项都必须**显式传参**且自带理由 —— W4 的入库口
+ *  （`repo/standard.addVersion` 与 `repo/standard` 的调用方）正是靠"默认全开"做到
+ *  「宁可拒收，也不落脏标准」。 */
+function assertInput(input, options = {}) {
   /* 只认标准自身的字段：更宽的对象（如整份 state）也能通过，多余键不参与判定也不落库。 */
-  return assertLimits(input, { requireComplete: true, checkTypical: true });
+  return assertLimits(input, Object.assign(
+    { requireComplete: true, checkTypical: true, checkRange: true }, options));
 }
 
 /** 便捷函数：上面两个函数的组合（供调用方一次性拿到"绝对值 + MES 字段"） */
@@ -229,6 +285,8 @@ module.exports = {
   isComplete,
   mesLimits,
   toDisplayStandard,
+  rangeOf,
+  assertRange,
   assertLimits,
   assertInput,
   limitsOf,

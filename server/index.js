@@ -41,6 +41,10 @@ const { createRouter } = require('./http/router');
 const { mountIfD } = require('./http/routes/ifD');
 /* W2 的挂载口（`server/http/routes/ifA.js`）：IF-A 接收（MES 派工/物料/工艺/设备）的唯一接线点，见下方 6c 段 */
 const { mountIfA } = require('./http/routes/ifA');
+/* W4 的挂载口（`server/http/routes/upload.js`）：IF-B 上报的**人工重报/待补传状态**接口（UI-20）
+   的唯一接线点，见下方 6d 段。**本文件只接一次线**，路由登记全部在 mountUpload() 里完成
+   （不在入口另起路由表 —— 否则路由清单会分叉成两份真源，见 `router.js` 挂载位的说明）。 */
+const { mountUpload } = require('./http/routes/upload');
 
 /* 注入出口（ADR-0003 D17 / E42）：本文件的时间**一律**经 platformClock 取，不裸写 `new Date()` /
    `Date.now()`；形态与 `server/http/router.js`、`server/services/dispatch.js` 及下方 IF-D/IF-A
@@ -488,6 +492,26 @@ async function start(options = {}) {
   logger.info(`[路由] IF-A 接收已接线（${ifa.by}）：${ifa.routes.join(' , ')}；` +
     `幂等口径=task 按 proc_order_no 幂等（不覆盖）/ device 按 equip_code 后到覆盖 / 物料·工艺按报文签名幂等；` +
     `留痕=op_log（成功与失败都留，幂等命中不追加）；访问控制=${ifa.status().auth.enabled ? '已启用' : '未配置（放行+告警）'}`);
+
+  /* ---- 6d. W4 业务挂载：IF-B 上报的**人工重报/待补传状态**接口（UI-20 的消费口） ----
+     依据 `server/http/router.js` 挂载位的指引（"实现这些包时，请把注册写进对应函数体"），
+     注册动作在 `server/http/routes/upload.js` 的 `mountUpload()` 里完成，本处**只接一次线**
+     （不在此另起路由表，避免路由清单分叉成两份真源）。
+     职责边界（重要）：本挂载**只提供"上报状态 + 待补传清单 + 人工一键重报"**——
+       · `GET /upload/pending` / `GET /upload/status` / `GET /upload/last`：给 UI-20 与巡检读；
+       · `POST /upload/retry`：**唯一**会再次发送待补传报文的入口（人工触发）。
+     **本包不做定时上报、不做自动重试**（IF-B.9 / V1.31 / C-59）：周期触发与前端切真实源属 W5；
+     上报器（`services/uploadReporter.js`）的 `report()` 一次调用只发一次，失败即落 `upload_log`
+     等人工补传，**不起任何定时器/退避**。`mes.baseUrl` 未配置（Q-23 未答）时所有端点都会
+     如实返回"未配置"，不当作成功（见回执"未决"）。 */
+  const upload = mountUpload(router, {
+    db: state.db,
+    logger,
+    now: currentClock().source()
+  });
+  logger.info(`[路由] IF-B 上报接口已接线（${upload.by}）：${upload.routes.join(' , ')}；` +
+    `不做自动重试（V1.31/C-59）：失败落 upload_log 留存 + 告警，重报只能经 POST /upload/retry 人工触发；` +
+    `MES 地址=${upload.status().configured ? upload.status().baseUrl : '未配置（Q-23，端点会显式 skipped）'}`);
 
   const server = http.createServer((req, res) => {
     /* 统一入口；路由器内部已经把异常收敛成稳定的 JSON 错误体，这里再兜一层"连响应都发不出去"的情况 */
