@@ -24,8 +24,16 @@ window.Components.ShiftPanel = (function () {
     return seq.indexOf(key) < seq.indexOf(current);
   }
 
+  /* E38（★★，2026-09-27）：缺口帧里"班次进行到哪"这类**时刻派生量**无法计算，
+     数据层以 `state.shift.noData = true` 显式标出（见 src/main.js 的 noteShiftGap 与
+     src/services/mockData.js 的 tick）。这里只认这一位：无数据 ⇒ 输出该页既有占位"—"，
+     不再显示 `0%` / `00:00:00`（那会把"没法算"读成"班次才开始"）。
+     班次**开始/结束时刻**与"当班人员"卡来自配置/上一帧，与时刻无关 ⇒ 照常显示。 */
+  const NO_DATA = '—';
+
   function render(state) {
     const sh = state.shift;
+    const noData = sh.noData === true;
     const rows = shiftRows(sh.list);
     const seq = (sh.list || []).map(s => s.name);
 
@@ -52,13 +60,15 @@ window.Components.ShiftPanel = (function () {
     ].map(([k, v]) => `<div class="kv-row"><span class="k">${k}</span><span class="v">${v}</span></div>`).join(''));
 
     /* 当班时间进度 */
-    setText('shProgressPct', sh.pct.toFixed(0) + '%');
-    setStyle('shProgressBar', 'width', sh.pct.toFixed(1) + '%');
+    setText('shProgressPct', noData ? NO_DATA : sh.pct.toFixed(0) + '%');
+    /* 进度条：无数据时**不动**（沿用上一帧的宽度）。
+       刻意不写 0% —— 写 0 等于宣称"班次刚 0% "，改前缺口帧就是这么"显示成零"的；
+       而"—"状态由 `#shProgressPct` 与其下两个"—"时长位显式表达，条本身停在上次有效宽度。 */
     setText('shStart', sh.start);
     // 中班结束时刻是次日 00:00，显示为 24:00 更符合现场习惯
     setText('shEnd', sh.total === 8 * 3600 && sh.end === '00:00' ? '24:00' : sh.end);
-    setText('shElapsed', window.Format.clock(sh.elapsed));
-    setText('shRemaining', window.Format.clock(sh.total - sh.elapsed));
+    setText('shElapsed', noData ? NO_DATA : window.Format.clock(sh.elapsed));
+    setText('shRemaining', noData ? NO_DATA : window.Format.clock(sh.total - sh.elapsed));
   }
 
   return { render };

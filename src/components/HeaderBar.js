@@ -27,16 +27,25 @@ window.Components.HeaderBar = (function () {
        （`src/main.js` 的 `step()`）捕获后置 `state.shiftAlert` —— 本组件只负责**呈现**：
        头屏班次位显示「班次配置异常」，其余人员/班组位显示"—"，与"上位机断连"同一类降级写法
        （复用既有节点与样式变量，不新增节点、不改 index.html）。无缺口时走下方原路径逐字不变。 */
-    if (state.shiftAlert) {
+    const shiftAlert = !!state.shiftAlert;
+    /* E37（★，2026-09-27 真机验证查出）：班次徽标的 class 必须**两个分支都写**。
+       改前只有缺口分支 `setClass('hdrShift','chip chip-err')`，正常分支只 `setText` ⇒
+       缺口恢复自愈后**文本回来了、class 仍是 `chip chip-err`**（真机实测 className 与
+       computed color 都停在红色，`index.html:32` 的初始类 `shift-badge` 再也回不来）。
+       这里把 class 的**唯一真源**提成下方一条三元：正常分支恢复为「与初始一致的非错误样式」
+       （`shift-badge`，逐字取自 index.html，**不改 index.html / 不改 CSS 变量**）。 */
+    const shiftClass = shiftAlert ? 'chip chip-err' : 'shift-badge';
+    if (shiftAlert) {
       setText('hdrShift', '班次配置异常');
       setText('hdrShiftTime', '—');
-      setClass('hdrShift', 'chip chip-err');
+      setClass('hdrShift', shiftClass);
       setText('hdrTeam', '—');
       setText('hdrOperator', '—');
       setText('hdrLeader', '—');
       return;
     }
     setText('hdrShift', state.shift.name);
+    setClass('hdrShift', shiftClass);
     setText('hdrShiftTime', state.shift.range);
     setText('hdrTeam', state.shift.team);
     setText('hdrOperator', state.shift.operator);

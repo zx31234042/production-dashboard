@@ -210,7 +210,10 @@ window.MockData = (function () {
       fpsRaw: DEVICE_NOMINAL.fps, gainRaw: DEVICE_NOMINAL.gain, shutterRaw: DEVICE_NOMINAL.shutter,
       unitIndex: 1, progress: 0, result: '测试中', lastResult: '合格', planQty: CFG.planQty
     },
-    stats: {},
+    /* 统计：加载期为"未算过"（空对象），首帧 `tick()` 写入 `computeStats()` 的结果；
+       `noData` 是**显式状态位**（E38）：true ⇒ 本帧的统计值**不成立**（班次配置缺口 ⇒ 时刻无法归属），
+       渲染层据此显示"无数据"占位，而不是把"算不出来"当成"产量为零"（0 / 0.0%）。 */
+    stats: { noData: true },
     alarm: { active: null, queue: [], ledger: [] },
     warnings: [],
     maint: { last: CFG.maintLast, next: '', cycle: CFG.maintCycleDays, warnDays: CFG.maintWarnDays,
@@ -247,8 +250,36 @@ window.MockData = (function () {
       runSec, idleSec, avgTest,
       capacity: (done / P) * 100,
       oee: elapsed > 0 ? (runSec / elapsed) * 100 : 0,
-      shiftElapsed: elapsed, shiftTotal: total
+      shiftElapsed: elapsed, shiftTotal: total,
+      /* 显式状态位（E38）：本帧统计值**成立** —— 与 `noDataStats()` 的键集逐键相同，
+         渲染层只认这一位，不需要（也不得）靠"值是不是 0"去猜。 */
+      noData: false
     };
+  }
+
+  /**
+   * "统计无数据"快照（E38）—— **结构性占位**，不是一份手写的键集。
+   *
+   * 立案：`shiftOf()` 在 `tick()` 里**最先**执行且缺口时**显式抛错**（P3-5 口径，绝不静默兜底），
+   * 于是本帧 `state.stats` 拿不到 `computeStats()` 的结果。改前由渲染循环（`src/main.js`）
+   * **按既有字段名手写**一份全 0 兜底 —— 那份手写体既与 `computeStats()` 形成无人守的隐性契约
+   * （改统计字段 → 只在缺口帧炸），又**已经漏掉了 `plan` 键**（实测 `#sPlan` 被写成 `undefined`），
+   * 还把"无法计算"显示成"零产量"（`0.0%`），违背"不得伪造数据"。
+   *
+   * 现改为**由数据层给出显式状态**：键集**从 `computeStats()` 在运行期取**（`Object.keys`），
+   * 数值一律置 0 且**恒带 `noData: true`** ⇒ ①键集不可能漂移（无需任何人"记得同步"）；
+   * ②渲染层读 `noData` 显示"—"，不去解读 0；③真实 0 与"无数据"在状态上可区分。
+   * @returns {object} 与正常帧**同键集**的统计快照，逐键标为无数据
+   */
+  function noDataStats() {
+    const shape = computeStats(0, 0);
+    const out = {};
+    Object.keys(shape).forEach(k => { out[k] = 0; });
+    /* ⚠ `noData` 必须**最后**赋值：上面的 `shape` 里也有这个键（`computeStats()` 的正常分支恒给
+       `noData:false`），先置位会被循环里的 0 覆盖成 `0`（实测踩过：`s.noData === true` 恒假 ⇒
+       缺口帧照旧显示 0.0%）。 */
+    out.noData = true;
+    return out;
   }
 
   /* ---------------- 累计运行时长 ----------------
@@ -536,7 +567,12 @@ window.MockData = (function () {
     };
     state.lastRefresh = state.clock.time;
 
-    /* 班次 */
+    /* 班次列表（时间无关）**先写**：`shiftOf()` 缺口时会显式抛错，抛点之后的写入一律不执行，
+       故与时刻无关的产物必须提前到它之前 —— 这样缺口帧的 `state.shift` 自身是完整的
+       （E36：渲染层不必再"手写补键"），缺的只是"哪一班、进行到哪"这类**时刻派生**字段。 */
+    state.shift.list = SHIFTS;              // 供班次页按配置渲染（P3-1）
+
+    /* 班次（时刻派生）：缺口时 `shiftOf()` 显式抛错 ⇒ 本块不执行，`state.shift` 保留上一帧 */
     const sh = shiftOf(now);
     const elapsed = clamp((now - sh.start) / 1000, 0, sh.total);
     state.shift = {
@@ -547,7 +583,9 @@ window.MockData = (function () {
       end: `${pad(sh.def.end === 24 ? 0 : sh.def.end)}:00`,
       team: CFG.team, operator: CFG.operator, operatorId: CFG.operatorId,
       leader: CFG.leader, leaderId: CFG.leaderId,
-      elapsed, total: sh.total, pct: (elapsed / sh.total) * 100
+      elapsed, total: sh.total, pct: (elapsed / sh.total) * 100,
+      /* 显式状态位（E38）：班次**时刻派生量**（pct/elapsed/剩余）本帧成立 */
+      noData: false
     };
 
     /* 统计 */
@@ -701,6 +739,9 @@ window.MockData = (function () {
   })();
 
   return { state, tick, toggleLink, injectAlarm, setUnlocked, pushLog, closeActiveAlarm, clearCurve, CFG, DEVICE_NOMINAL,
+           /* 供渲染层在"统计不成立"的帧上取**同键集**的无数据快照（E38 / E36）：
+              键集由 `computeStats()` 运行期给出，调用方不得（也不需要）手写键集 */
+           noDataStats,
            /* 供界面与自检复用：三态判据与标准取值的**唯一实现**（TaskPanel.levelOf 直接转发本函数） */
            standardLevel, standardSpecOf };
 })();

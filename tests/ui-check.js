@@ -50,6 +50,17 @@ function readText(rel) {
   return fs.readFileSync(path.join(ROOT, rel), 'utf8');
 }
 
+/* E37/D9：`index.html` 里某元素的**初始 class**（真源就是这份静态文档）。
+   为什么要读它：E37 的判据是"自愈后 `#hdrShift` 的 className 回到**与初始一致**的非错误样式"，
+   而桩 DOM 的节点初始 `className` 是空串、根本不体现 index.html 的 `shift-badge` —— 照抄桩件的
+   基线会把断言判成假红（实测）。返回 null ＝ 取不到（断言随之变红）。 */
+function initialClassOf(id) {
+  const tag = new RegExp(`<[^>]*\\bid="${id}"[^>]*>`).exec(readText('index.html'));
+  if (!tag) return null;
+  const cls = /\bclass="([^"]*)"/.exec(tag[0]);
+  return cls ? cls[1] : null;
+}
+
 /* ---------------- 轻量 CSS 解析（本项目无 @media/@keyframes，规则不嵌套） ---------------- */
 /** 解析 CSS 文本 → Map(选择器, { 属性: 值 })；后出现的同名选择器覆盖前者 */
 function parseCss(text) {
@@ -166,6 +177,12 @@ function lastText(out, id) {
 function lastHtml(out, id) {
   const hits = out.filter(e => e.kind === 'html' && e.id === id);
   return hits.length ? hits[hits.length - 1].value : null;
+}
+
+/** 节点当前可见值的快照（E37/E38/D9）：textContent 与 className 一起取，便于"三态前后比对" */
+function snapId(fx, id) {
+  const n = fx.node(id);
+  return { text: String(n.textContent || ''), cls: String(n.className || '') };
 }
 
 /* ---------------- F-02 护栏用的源码读数工具（ADR-0004 D23：比数值，不比字符串写法） ----------------
@@ -524,7 +541,9 @@ function loadFrameFixture(componentRels, search) {
     const classes = new Set();
     const handlers = {};
     const o = {
-      __id: id, hidden: false, disabled: false, value: '', className: '', style: {}, dataset: {},
+      /* `className` 初值取 `index.html` 的同名 id 初始 class（取不到则空串）：
+         E37 要判"是否回到初始样式"，桩件必须先把"初始"表示出来（真 DOM 由 index.html 提供）。 */
+      __id: id, hidden: false, disabled: false, value: '', className: initialClassOf(id) || '', style: {}, dataset: {},
       classList: {
         add: c => classes.add(c),
         remove: c => classes.delete(c),
@@ -598,9 +617,11 @@ function loadFrameFixture(componentRels, search) {
     $: node,
     setText: (id, v) => { out.push({ kind: 'text', id, value: String(v) }); node(id).__text = String(v); },
     setHTML: (id, v) => { out.push({ kind: 'html', id, value: String(v) }); node(id).__html = String(v); },
-    setClass: (id, v) => out.push({ kind: 'class', id, value: String(v) }),
-    setStyle: (id, prop, value) => out.push({ kind: 'style', id, prop, value: String(value) }),
-    toggleClass: (id, cls, on) => out.push({ kind: 'class', id, value: cls + ':' + on })
+    /* setClass **真的写进 `node.className`**（与真 `Dom.setClass` 的无条件 `e.className = v` 同语义）：
+       E37 的判据是"正常分支是否把 class 复原"，只记录不落地就观察不到（实测：改前也能"绿"）。 */
+    setClass: (id, v) => { out.push({ kind: 'class', id, value: String(v) }); node(id).className = String(v); },
+    setStyle: (id, prop, value) => { out.push({ kind: 'style', id, prop, value: String(value) }); node(id).style[prop] = String(value); },
+    toggleClass: (id, cls, on) => { out.push({ kind: 'class', id, value: cls + ':' + on }); }
   };
   run('src/services/mockData.js');
   run('src/services/api.js');
@@ -3321,6 +3342,16 @@ async function main() {
       { name: '中班', start: 16, end: 24 }
     ];
     const countText = (o, id) => o.filter(e => e.kind === 'text' && e.id === id).length;
+    /* 缺口帧"无数据"表达涉及的统计位（覆盖统计页四个分区）与班次进度位（E38） */
+    const E38_STAT_IDS = ['sPlan', 'sStarted', 'sNotStarted', 'sDone', 'sDoing', 'sTodo',
+      'sQualified', 'sUnqualified', 'sRecheck', 'sFpy', 'sRunTime', 'sIdleTime', 'sAvgTime', 'sCapacity', 'sOee'];
+    const E38_SHIFT_IDS = ['shProgressPct', 'shElapsed', 'shRemaining'];
+    const NO_DATA = '—';
+    /** 判"这一格是不是显式无数据表达"：等于占位符，且**不是** 0 / 0.0% / 空串 / undefined 文本 */
+    const isNoData = v => v === NO_DATA && !/^(0(\.0+)?%?|)$/.test(v);
+    const snapAll = (fx, ids) => ids.reduce((a, id) => (a[id] = String(fx.node(id).textContent || ''), a), {});
+    /** 基线里那几格的真实值（自愈后须逐字回到这些值，而不是"非占位就算过"） */
+    const E38_BACK_IDS = ['sPlan', 'sFpy', 'sOee', 'shProgressPct', 'shElapsed'];
     const FE = { gapErr: null, r: null };
 
     try {
@@ -3328,6 +3359,14 @@ async function main() {
              再用"连续 5 帧的调用增量"证明计数器本身是可用的（否则下面对照组会很可疑） */
       const base = loadFrameFixture(FRAME_COMPONENTS);
       base.frame();
+      const baseline = {
+        statsKeys: Object.keys(base.w.MockData.state.stats).sort().join(','),
+        noData: base.w.MockData.state.stats.noData,
+        stats: snapAll(base, E38_STAT_IDS),
+        shiftIds: snapAll(base, E38_SHIFT_IDS),
+        shiftKeys: Object.keys(base.w.MockData.state.shift).sort().join(','),
+        hdrShift: snapId(base, 'hdrShift')
+      };
       base.resetCalls();
       const baseThrew = [0, 1, 2, 3, 4].map(() => base.frame().threw).filter(Boolean).length;
       const baseCalls = Object.assign({}, base.calls);
@@ -3336,6 +3375,11 @@ async function main() {
              "冻结"的表现就是后续帧再也不刷新，与实测现象一致） */
       const gap = loadFrameFixture(FRAME_COMPONENTS);
       gap.frame();                                   /* 首帧（正常配置）+1 s 稳态 */
+      const gapBaseline = {                           /* 缺口前的正常帧快照（E37/E38 的"基线值"） */
+        hdrShift: snapId(gap, 'hdrShift'),
+        stats: snapAll(gap, E38_STAT_IDS),
+        shiftIds: snapAll(gap, E38_SHIFT_IDS)
+      };
       gap.setShiftList(GAP_LIST);                    /* 内存覆盖 ⇒ 下一帧起 `shiftOf()` 抛缺口 */
       gap.resetCalls();
       const before = {
@@ -3359,7 +3403,14 @@ async function main() {
         statsRendered: gap.calls['StatsPanel.render'],
         shiftPanelRendered: gap.calls['ShiftPanel.render'],
         shiftListText: String(gap.node('shShiftList').innerHTML || ''),
-        clockRenders: countText(gap.out, 'hdrClock')
+        clockRenders: countText(gap.out, 'hdrClock'),
+        /* ---- E36 / E38（D9）：缺口帧的状态位、统计值、键集 ---- */
+        statsNoData: gap.w.MockData.state.stats.noData,
+        shiftNoData: gap.w.MockData.state.shift.noData,
+        statsKeys: Object.keys(gap.w.MockData.state.stats).sort().join(','),
+        shiftKeys: Object.keys(gap.w.MockData.state.shift).sort().join(','),
+        stats: snapAll(gap, E38_STAT_IDS),
+        shiftIds: snapAll(gap, E38_SHIFT_IDS)
       };
       const gapErrors = gap.errors('error');
       const clockRefreshed = after.clock !== before.clock && after.clock.length > 0;
@@ -3367,7 +3418,7 @@ async function main() {
          故还用 C 组的时钟文本反证"本夹具真的能观察刷新" */
       const baseCallsAllOne = base.CALL_KEYS.every(([n, m]) => baseCalls[n + '.' + m] === 5);
       FE.r = {
-        baseThrew, clockRefreshed, before, after, threwCount, gapErrors, baseCallsAllOne,
+        baseline, gapBaseline, baseThrew, clockRefreshed, before, after, threwCount, gapErrors, baseCallsAllOne,
         frameErr: frames.map(f => f.message).filter(Boolean)[0] || null
       };
     } catch (e) {
@@ -3415,6 +3466,57 @@ async function main() {
         FE.gapErr ? `夹具执行异常：${FE.gapErr}` : r === null ? '（无观察值）' :
           `console.error ${r.after.errors} 条（判据 ≤1）；原文=${JSON.stringify(r.gapErrors.map(m => m.split('\n')[0]))}`
       );
+
+      /* ---- E36 / E38（D9）：缺口帧的"无数据"必须显式，且**不得**再手写 state.stats 的键集 ----
+         立案：真机验证（`tests\._verify\b1\probe-e34-browser.js`）实测缺口帧 `#sPlan=""`、
+         `#sFpy=0.0%`、`#sOee=0.0%`（基线 180 / 92.9% / 79.0%）⇒ 把"无法计算"显示成了"零产量"，
+         违背"不得伪造数据"。源码层根因有两处：①`src/main.js` 的缺口兜底**按既有字段名手写**了
+         一份 `state.stats`（与 `computeStats()` 形成无人守的隐性契约，且**已经漏了 `plan` 键** ——
+         实测把 `#sPlan` 写成了 `undefined`）；②渲染层照原样格式化 ⇒ 全 0。
+         修法：键集由数据层在**运行期**从 `computeStats()` 取（`MockData.noDataStats()`），
+         渲染层只认显式状态位 `stats.noData === true` 显示占位"—"。
+         判据一律**行为**判据：键集比对、状态位、节点文本，不做源码字符串匹配（ADR-0004 D23）。 ---- */
+      check(
+        'E36（D9）缺口帧产物键集 ＝ 正常帧键集：`state.stats`/`state.shift` 的键集逐字相等' +
+        '（"无数据"由显式状态位 stats.noData / shift.noData 表达，渲染循环不再手写任何键集 ⇒ 键集不会漂移）',
+        FE.gapErr === null && r !== null &&
+        r.baseline.noData === false && r.after.statsNoData === true &&
+        r.baseline.statsKeys === r.after.statsKeys &&
+        r.baseline.shiftKeys === r.after.shiftKeys &&
+        r.after.shiftNoData === true,
+        FE.gapErr ? `夹具执行异常：${FE.gapErr}` : r === null ? '（无观察值）' :
+          `正常帧 stats 键集＝${r.baseline.statsKeys}；缺口帧 stats 键集＝${r.after.statsKeys}` +
+          `（相等=${r.baseline.statsKeys === r.after.statsKeys}）；` +
+          `正常帧 shift 键集＝${r.baseline.shiftKeys}；缺口帧 shift 键集＝${r.after.shiftKeys}` +
+          `（相等=${r.baseline.shiftKeys === r.after.shiftKeys}）；` +
+          `stats.noData ${JSON.stringify(r.baseline.noData)} → ${JSON.stringify(r.after.statsNoData)}、` +
+          `shift.noData → ${JSON.stringify(r.after.shiftNoData)}`
+      );
+
+      const statBad = E38_STAT_IDS.filter(id => !isNoData(r.after.stats[id]));
+      const shiftBad = E38_SHIFT_IDS.filter(id => !isNoData(r.after.shiftIds[id]));
+      check(
+        'E38（D9）缺口帧"统计/计划"位显示**显式无数据**（"'+ NO_DATA +'"）：15 个统计位与 3 个班次进度位' +
+        '一律为占位，**不得**是 0 / 0.0% / 空串（不把"无法计算"显示成"零产量"）',
+        FE.gapErr === null && r !== null && statBad.length === 0 && shiftBad.length === 0,
+        FE.gapErr ? `夹具执行异常：${FE.gapErr}` : r === null ? '（无观察值）' :
+          `统计位＝${JSON.stringify(r.after.stats)}；不合判据的位=${JSON.stringify(statBad)}；` +
+          `班次进度位＝${JSON.stringify(r.after.shiftIds)}；不合判据的位=${JSON.stringify(shiftBad)}`
+      );
+
+      const backBad = E38_BACK_IDS.filter(id => {
+        const key = E38_SHIFT_IDS.includes(id) ? 'shiftIds' : 'stats';
+        return r.after[key][id] !== r.gapBaseline[key][id];
+      });
+      check(
+        'E38b（D9）缺口帧的统计位/班次进度位**确实是被本帧改写过的**（不等于缺口前基线的真实值）：' +
+        '证明断言观察到的是"无数据"状态本身，而不是"节点压根没被渲染/没被写"',
+        FE.gapErr === null && r !== null && backBad.length === E38_BACK_IDS.length,
+        FE.gapErr ? `夹具执行异常：${FE.gapErr}` : r === null ? '（无观察值）' :
+          `缺口前基线＝${JSON.stringify(Object.assign({}, r.gapBaseline.stats, r.gapBaseline.shiftIds))}；` +
+          `缺口帧＝${JSON.stringify(Object.assign({}, r.after.stats, r.after.shiftIds))}；` +
+          `仍等于基线的位=${JSON.stringify(E38_BACK_IDS.filter(id => !backBad.includes(id)))}（应全不同）`
+      );
     }
   }
 
@@ -3434,27 +3536,42 @@ async function main() {
     ];
     let healErr = null;
     let heal = null;
+    /* E38（D9）：自愈帧要逐字回到**缺口前的真实值**（不是"非占位即算过"）；E37：class 一起复原 */
+    const HEAL_BACK_IDS = ['sPlan', 'sFpy', 'sOee', 'shProgressPct', 'shElapsed', 'shRemaining'];
+    const INITIAL_HDR_SHIFT_CLASS = initialClassOf('hdrShift');
     try {
       const fx = loadFrameFixture(COMPONENTS);
       fx.frame();
+      const beforeGap = {
+        stats: HEAL_BACK_IDS.reduce((a, id) => (a[id] = String(fx.node(id).textContent || ''), a), {}),
+        hdrShift: snapId(fx, 'hdrShift')
+      };
       fx.setShiftList(GAP);
       fx.frame();
       fx.frame();
       const during = {
         hdrShift: String(fx.node('hdrShift').textContent || ''),
+        hdrShiftClass: String(fx.node('hdrShift').className || ''),
         alert: fx.w.MockData.state.shiftAlert,
-        errors: fx.errorCount()
+        errors: fx.errorCount(),
+        statsNoData: fx.w.MockData.state.stats.noData,
+        noDataCells: HEAL_BACK_IDS.reduce((a, id) => (a[id] = String(fx.node(id).textContent || ''), a), {})
       };
       fx.setShiftList(FULL);                       /* 就地改回正常配置（同一个数组引用） */
       fx.frame();
       heal = {
+        beforeGap,
         during,
+        initialClass: INITIAL_HDR_SHIFT_CLASS,
         after: {
           hdrShift: String(fx.node('hdrShift').textContent || ''),
+          hdrShiftClass: String(fx.node('hdrShift').className || ''),
           hdrShiftTime: String(fx.node('hdrShiftTime').textContent || ''),
           hdrTeam: String(fx.node('hdrTeam').textContent || ''),
           alert: fx.w.MockData.state.shiftAlert,
-          errors: fx.errorCount()
+          errors: fx.errorCount(),
+          statsNoData: fx.w.MockData.state.stats.noData,
+          backCells: HEAL_BACK_IDS.reduce((a, id) => (a[id] = String(fx.node(id).textContent || ''), a), {})
         }
       };
     } catch (e) {
@@ -3473,6 +3590,65 @@ async function main() {
         `console.error ${heal.during.errors} 条；恢复后 #hdrShift=${JSON.stringify(heal.after.hdrShift)}、` +
         `#hdrShiftTime=${JSON.stringify(heal.after.hdrShiftTime)}、#hdrTeam=${JSON.stringify(heal.after.hdrTeam)}、` +
         `shiftAlert=${JSON.stringify(heal.after.alert)}、console.error 仍 ${heal.after.errors} 条`
+    );
+
+    /* ---- E37（★，真机验证查出）：自愈后**样式也要复原** ----
+       真机三态实测：基线 `className="shift-badge"`／`color=rgb(159,216,255)` → 缺口态 `chip chip-err`／
+       `rgb(255,0,0)` → **自愈后仍是 `chip chip-err`／`rgb(255,0,0)`**。
+       根因：`src/components/HeaderBar.js` 只在缺口分支 `setClass('hdrShift','chip chip-err')`，
+       正常分支只 `setText` 不重置 class，而 `index.html:32` 的初始类是 `shift-badge`。
+       判据＝三态比对：基线 class＝`index.html` 的初始类 → 缺口 class 含 `chip-err` →
+       自愈 class **逐字回到初始类**。颜色在同一条 class 上从样式表推出，故 class 复原即颜色复原
+       （真机 computed color 由浏览器侧探针 `tests\._verify\b1\probe-e34-browser.js` 复核）。 ---- */
+    check(
+      'E37（D9）自愈后班次徽标样式复原：缺口态 class 含 chip-err，配置改回后 #hdrShift 的 className' +
+      '**逐字回到 index.html 的初始类**（与基线一致的非错误样式、颜色随之复原，不靠改 index.html/CSS）',
+      healErr === null && heal !== null &&
+      heal.initialClass !== null && /shift-badge/.test(heal.initialClass) &&
+      heal.beforeGap.hdrShift.cls === heal.initialClass &&
+      /chip-err/.test(heal.during.hdrShiftClass) &&
+      heal.after.hdrShiftClass === heal.initialClass &&
+      !/chip-err/.test(heal.after.hdrShiftClass),
+      healErr ? `夹具执行异常：${healErr}` : heal === null ? '（无观察值）' :
+        `index.html 初始 class=${JSON.stringify(heal.initialClass)}；` +
+        `基线 className=${JSON.stringify(heal.beforeGap.hdrShift.cls)} → ` +
+        `缺口态 className=${JSON.stringify(heal.during.hdrShiftClass)} → ` +
+        `自愈后 className=${JSON.stringify(heal.after.hdrShiftClass)}`
+    );
+
+    /* ---- E38b（D9）：自愈后统计/进度位回到缺口前的真实值 ----
+       与上面 E38 配对：那条防"把无数据显示成 0"，这条防"把无数据当成常态/占位回不来"。
+       分两类判据（缺口期到自愈跨越 3 帧 ⇒ 真实时钟往前走了 3 秒）：
+         · **离散位**（计划数、合格率、稼动率、班次进度百分数）逐字相等；
+         · **时长位**（已进行/剩余）跨度不能逐字相等 —— 改为"合法 HH:MM:SS + 相对基线的位移 ≤ 10 s"
+           （真值确实在走），既排除占位"—"，也不把正常推进判成假红。 ---- */
+    const STRICT_BACK_IDS = ['sPlan', 'sFpy', 'sOee', 'shProgressPct'];
+    const CLOCK_BACK_IDS = ['shElapsed', 'shRemaining'];
+    const secsOf = v => {
+      const m = /^(\d{2}):(\d{2}):(\d{2})$/.exec(v || '');
+      return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : null;
+    };
+    const strictBad = heal === null ? STRICT_BACK_IDS.slice()
+      : STRICT_BACK_IDS.filter(id => heal.after.backCells[id] !== heal.beforeGap.stats[id]);
+    const clockBad = heal === null ? CLOCK_BACK_IDS.slice()
+      : CLOCK_BACK_IDS.filter(id => {
+        const a = secsOf(heal.beforeGap.stats[id]);
+        const b = secsOf(heal.after.backCells[id]);
+        return a === null || b === null || Math.abs(b - a) > 10;
+      });
+    const duringBad = heal === null ? HEAL_BACK_IDS.slice()
+      : HEAL_BACK_IDS.filter(id => heal.during.noDataCells[id] !== '—');
+    check(
+      'E38b（D9）自愈后统计/班次进度位回到缺口前的真实值：离散位（#sPlan/#sFpy/#sOee/#shProgressPct）逐字相等、' +
+      '时长位（#shElapsed/#shRemaining）为合法 HH:MM:SS 且相对基线位移 ≤10 s；' +
+      '缺口期这六格均为显式无数据"—"（无数据不是常态、也不靠"非占位"蒙过）',
+      healErr === null && heal !== null && strictBad.length === 0 && clockBad.length === 0 && duringBad.length === 0 &&
+      heal.during.statsNoData === true && heal.after.statsNoData === false,
+      healErr ? `夹具执行异常：${healErr}` : heal === null ? '（无观察值）' :
+        `缺口前基线＝${JSON.stringify(heal.beforeGap.stats)}；缺口期＝${JSON.stringify(heal.during.noDataCells)}` +
+        `（非"—"的位=${JSON.stringify(duringBad)}）；自愈后＝${JSON.stringify(heal.after.backCells)}` +
+        `（离散位未回到基线=${JSON.stringify(strictBad)}；时长位不合法或位移>10s=${JSON.stringify(clockBad)}）；` +
+        `stats.noData ${JSON.stringify(heal.during.statsNoData)} → ${JSON.stringify(heal.after.statsNoData)}`
     );
   }
 

@@ -97,26 +97,19 @@
       const changed = (msg || '') !== prev;                 // 去重判据＝题述变化（含恢复正常）
       state.shiftAlert = msg || null;
       if (msg) {
-        /* `M.tick()` 是在**写满 `state.shift` / `state.stats` 之前**抛的（`shiftOf()` 在 tick 里最先
-           调用），于是本帧这两块只剩初始值 ⇒ 班次页 `sh.pct.toFixed`、统计页 `s.firstPass.toFixed`
-           各自崩一次（实测改后仍每帧 2 条组件级 console.error，与"不刷屏"冲突）。
-           缺口帧按**既有字段名**补成"时间无法判定"的冻结值（不新增字段、不猜当班班次）：
-             · `state.shift.list` 取配置表本身（时间无关，班次页照旧列出全部班次时段）；
-             · `shift.pct/elapsed/total = 0`、`stats.* = 0` ⇒ 班次页/统计页显示 0% 冻结值；
-             · `state.shift` 的 `name/range/...` **沿用上一帧**（不伪造），异常由头屏
-               「班次配置异常」显式表达（`HeaderBar.render()`）。
-           ⚠ 遗留耦合：`state.stats` 的键集若在 `mockData.js` 里增删，这里须同步 —— 本处置的
-             首选修法其实是让 `tick()` 把 `shiftOf()` 之后才写的那几块也提前/兜住（见回执"未决"）。 */
-        state.shift.list = CFG.shift.list;
-        state.shift.pct = 0;
-        state.shift.elapsed = 0;
-        state.shift.total = 0;
-        state.stats = {
-          plan: CFG.planQty, started: 0, notStarted: CFG.planQty,
-          done: 0, testing: 0, pending: 0, qualified: 0, unqualified: 0, recheck: 0,
-          firstPass: 0, runSec: 0, idleSec: 0, avgTest: 0,
-          capacity: 0, oee: 0, shiftElapsed: 0, shiftTotal: 0
-        };
+        /* `M.tick()` 是在写 `state.shift`（时刻派生量）与 `state.stats` **之前**抛的
+           （`shiftOf()` 在 tick 里最先调用）。缺口的"无数据"表达**全部由数据层给**：
+             · `state.shift.list` 已由 `tick()` 提前写入（与时刻无关，班次页照旧列出全部班次时段）；
+             · `state.shift` 的 `name/range/...` **沿用上一帧**（不伪造当班班次），本处置只把
+               **显式状态位** `noData` 置位 ⇒ 时刻派生量（进度/已进行/剩余）由班次页显示占位；
+             · `state.stats = M.noDataStats()` ⇒ **同键集**的无数据快照（键集在数据层由
+               `computeStats()` 运行期给出，本文件**不再罗列任何统计键**）＋ `noData: true`
+               ⇒ 统计页显示占位，不再把"算不出来"显示成 0 / 0.0%；
+             · 异常本身由头屏「班次配置异常」显式表达（`HeaderBar.render()`）。
+           ⚠ E36：这里**不得**再手写 `state.stats` 的键集 —— 改前那版手写体漏了 `plan` 键
+             （实测把 `#sPlan` 写成了 `undefined`），正是"隐性同步契约"的实证。 */
+        state.shift.noData = true;
+        state.stats = M.noDataStats();
       }
       HeaderBar.render(state);
       if (changed && msg) console.error('[看板] 班次配置异常（已兜底渲染，不再逐帧重复上报）：' + msg);
