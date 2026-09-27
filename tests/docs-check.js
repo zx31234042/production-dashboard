@@ -9,6 +9,9 @@
          D3 项目记录（当前状态快照 / 工作日志）与仓库现状一致性
          D4 对外文档（输出文件/）与实现一致性
          D5 PROJECT_RULES 条款抽查（编码、缩进、无第三方库、归档规则、9.8 变更表、md↔docx 同源）
+         D6 需求清单"改名升级版本"必修项抽查（文末版本串 token = 文件名版本、变更记录首段
+            `### V<前一版> → V<当前版>`、同名同版本 docx 存在且根目录无其他版本 docx、
+            页首「编制日期」行已登记当前版本并加粗）
    依赖：仅 Node 内置模块；会调用本机 PowerShell 5.1 跑 tools/ 下的两个 .ps1。
    运行：node tests/docs-check.js
    退出码：0 = 全部通过；1 = 有断言失败；2 = 脚本自身异常。
@@ -456,6 +459,73 @@ async function main() {
     if (missing.length) stale.push(`${path.relative(ROOT, docxFile)} 缺 ${missing.length} 个标题（如「${missing[0]}」）`);
   }
   check(`有 .docx 的 .md 与其 Word 版本内容同源（共 ${pairs.length} 对）`, stale.length === 0, stale.join('；'));
+
+  /* ===== D6 需求清单"改名升级版本"必修项 ===== */
+  /* 立案原因（2026-09-27 补）：需求清单是"改名升版本"的交付物。V1.34→V1.35、V1.35→V1.36、V1.36→V1.37
+     三次改名都把文件名与正文升了，却三次漏改文末「本文档为 **V<版本>**」的 token（第三次由主代理人工发现
+     `…-V1.37.md:905` 仍写 V1.36）—— 同一类缺陷连发 3 次，而 tests\ 里没有任何断言把它与文件名绑定
+     （规范 9.5 的 D23「静态防空洞」）。本段只把"改名必修项"逐项绑定到**文件名版本**，
+     不做全文版本号扫描（变更记录里的历史版本号是合法出现的）。 */
+  section('D6 需求清单"改名升级版本"必修项（文末版本串／变更记录首段／同名 docx／编制日期）');
+  const REQ_LIST_RE = /^(.+)-详细需求清单-V(\d+)\.(\d+)\.md$/;
+  const REQ_DOCX_RE = /^(.+)-详细需求清单-V(\d+\.\d+)\.docx$/;
+  const reqListNames = fs.readdirSync(path.join(ROOT, '需求文档')).filter(n => REQ_LIST_RE.test(n));
+  /* 需求清单必须唯一，版本只从**文件名**取：这正是"改名忘改正文"能被打红的前提 */
+  const reqListM = reqListNames.length === 1 ? reqListNames[0].match(REQ_LIST_RE) : null;
+  const reqListRel = reqListM ? path.join('需求文档', reqListNames[0]) : '';
+  const reqListText = reqListM ? readText(reqListRel) : '';
+  const reqListVer = reqListM ? `${reqListM[2]}.${reqListM[3]}` : undefined;
+  const reqLine = i => reqListText.slice(0, i).split('\n').length;
+  const NO_REQ_MD = reqListNames.length
+    ? `需求文档\\ 下有 ${reqListNames.length} 个「…-详细需求清单-V<主>.<次>.md」：${reqListNames.join('、')}`
+    : '需求文档\\ 下找不到形如「…-详细需求清单-V<主>.<次>.md」的需求清单';
+
+  /* ① 文末版本串 token ＝ 文件名版本（本次立案的那一处；取最后一次匹配，即文末） */
+  const tailHits = [...reqListText.matchAll(/本文档为\s*\*\*V(\d+\.\d+)\*\*/g)];
+  const tailHit = tailHits.length ? tailHits[tailHits.length - 1] : null;
+  check('需求清单文末版本串 token = 文件名版本（改名必修项）',
+    reqListM !== null && tailHit !== null && tailHit[1] === reqListVer,
+    !reqListM ? NO_REQ_MD
+      : tailHit === null ? `正文找不到形如「本文档为 **V<主>.<次>**」的文末版本串（${reqListRel}）`
+        : `文末版本串 V${tailHit[1]} ≠ 文件名 V${reqListVer}（${reqListRel}:${reqLine(tailHit.index)}）—— 改名升版本时这一处 token 漏改`);
+
+  /* ② 变更记录首段标题 ＝ ### V<前一版> → V<当前版>（升版时须在变更记录最前面加一节） */
+  const changeLogAt = reqListText.indexOf('## 变更记录');
+  const changeLog = changeLogAt < 0 ? '' : reqListText.slice(changeLogAt);
+  const firstLog = changeLog.match(/^###\s+V(\d+\.\d+)\s*→\s*V(\d+\.\d+)\s*$/m);
+  /* 次版本号减 1 即前一版（1.37 ⇒ 1.36）；次版本号为 0 时退化为"首段标题的目标版本 = 文件名版本" */
+  const curMinor = reqListM ? Number(reqListM[3]) : -1;
+  const wantLog = reqListM && curMinor >= 1 ? `### V${reqListM[2]}.${curMinor - 1} → V${reqListM[2]}.${reqListM[3]}` : null;
+  check('需求清单变更记录首段标题 = ### V<前一版> → V<当前版>（改名必修项）',
+    wantLog !== null ? (firstLog !== null && firstLog[0].trim() === wantLog) : (firstLog !== null && firstLog[2] === reqListVer),
+    !reqListM ? NO_REQ_MD
+      : changeLogAt < 0 ? `正文找不到「## 变更记录」章节（${reqListRel}）`
+        : firstLog === null ? `「## 变更记录」后找不到形如「### V<前一版> → V<当前版>」的首段标题（${reqListRel}）`
+          : `首个变更记录标题「${firstLog[0].trim()}」（${reqListRel}:${reqLine(changeLogAt + firstLog.index)}）≠ 期望「${wantLog || `### V<前一版> → V${reqListVer}`}」`);
+
+  /* ③ .md 与 .docx 成对：同名同版本存在，且根目录不留其他版本（归档规则废止后只放当前有效版本） */
+  const reqDocxNames = fs.readdirSync(path.join(ROOT, '需求文档')).filter(n => n.endsWith('.docx'));
+  const wantDocx = reqListM ? reqListNames[0].replace(/\.md$/, '.docx') : undefined;
+  check('需求文档\\ 下存在与需求清单同版本同名的 .docx（改名必修项）',
+    wantDocx !== undefined && reqDocxNames.includes(wantDocx),
+    wantDocx === undefined ? NO_REQ_MD : `缺 ${wantDocx}（实际 .docx：${reqDocxNames.join('、') || '无'}）`);
+  const otherDocx = wantDocx === undefined ? [] : reqDocxNames.filter(n => REQ_DOCX_RE.test(n) && n !== wantDocx);
+  check('需求文档\\ 下不存在其他版本的需求清单 .docx（只留当前有效版本）',
+    wantDocx !== undefined && otherDocx.length === 0,
+    wantDocx === undefined ? NO_REQ_MD : `多出 ${otherDocx.join('、')}；应只留 ${wantDocx}`);
+
+  /* ④ 页首「编制日期」行的同类必修项：当前版本必须已登记且加粗（三次改名都改对了这一处，一并锁住） */
+  const dateRowM = reqListText.match(/^\|\s*编制日期\s*\|([^\n]*)\|\s*$/m);
+  const dateRow = dateRowM ? dateRowM[1] : '';
+  const datedVers = [...dateRow.matchAll(/V(\d+\.\d+)\s*修订于/g)].map(m => m[1]);
+  const verCmp = (a, b) => { const x = a.split('.').map(Number), y = b.split('.').map(Number); return x[0] - y[0] || x[1] - y[1]; };
+  const latestDated = datedVers.length ? datedVers.slice().sort(verCmp).pop() : undefined;
+  const curBold = reqListVer !== undefined && new RegExp(`\\*\\*V${reqListVer.replace('.', '\\.')}\\s+修订于`).test(dateRow);
+  check('需求清单页首「编制日期」行已登记当前版本并加粗（改名必修项）',
+    dateRow !== '' && latestDated === reqListVer && curBold,
+    !reqListM ? NO_REQ_MD
+      : dateRow === '' ? `找不到「| 编制日期 |」行（${reqListRel}）`
+        : `最新登记 V${latestDated || '（无）'} ≠ 文件名 V${reqListVer}${curBold ? '' : `；且当前版本未写成「**V${reqListVer} 修订于 …**」`}（行内登记：${datedVers.join('、') || '无'}）`);
 
   /* ---------------- 汇总 ---------------- */
   console.log('\n=== 汇总 ===');
