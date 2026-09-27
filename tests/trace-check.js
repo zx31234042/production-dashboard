@@ -239,7 +239,7 @@ const MAP = [
        · `IF-B.5：三类缺失组合（只设一项指标 / 只设上偏差 / 只设偏差未设典型值）在 depth 与 speed 两条 dataList 上`
          （断言名首段，原式在源文件里跨行拼接）
        · `IF-B.5：标准整条不存在（null）时同样整条占位，且结构不缺项（恰好三个键）` */
-  ['IF-B.5', 'covered-indirect', 'db-check.js', 'IF-B.5：占位是**整条**而不是"缺哪个补哪个" —— 深度自身完整（绝对值可算出 12.80/12.40）但速度缺项 ⇒ 该条 depth 也占位'],
+  ['IF-B.5', 'covered-indirect', 'db-check.js', 'IF-B.5：占位是**整条**而不是"缺哪个补哪个" —— 深度自身完整（绝对值可算出 5.20/4.80）但速度缺项 ⇒ 该条 depth 也占位'],
   ['IF-B.8', 'covered-direct', 'contract-check.js', '上报报文含附录 2 全部 13 个字段'],
   /* V1.31（C-58）改判证据：原「补传：链路恢复后 flushPending 补齐队列」已随需求废止
      （flushPending 现在**只刷新状态、不发送**；发送只走人工入口 retryPending）。
