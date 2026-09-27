@@ -34,8 +34,15 @@ window.Api = (function () {
   /* 上报失败待补传队列（浏览器侧内存态：仅用于自检与状态展示；
      持久化由服务端 server/services/uploadQueue.js 落 upload_log，见文件头 E10 说明） */
   let pending = [];
-  /* 上报流水号序号，保证同一秒内多次上报也不重复 */
+  /* 上报流水号状态：**按日重置**的当日序号（域 1～999，永不产生 000）。
+     口径真源是 `platform/id.js` 的 `createUploadIdGenerator()`；本文件在浏览器 file:// 下
+     无 require、不能直接共用该模块，故为**逐条对齐同一规则的等价实现** —— 改任一侧必须同步另一侧。
+     R26-P3-3（2026-09-26 第三轮审查）：旧实现 `(uploadSeq + 1) % 1000` 第 1000 次起产 `…000`、
+     且模块生命周期内从不按日重置，与 `platform/id.js` 的 `isUploadId`（判 001～999 合法）
+     **两判相反**，使附录 2 的 uploadId 去重与回执核对（DR-13）语义漂移；已统一。 */
   let uploadSeq = 0;
+  /* 当前序号所属日期（yyyyMMdd）——与另一侧 fmtDate 同一"本地日期"边界 */
+  let uploadSeqDate = null;
   /* 上位机数据源定时器 */
   let upperTimer = null;
   /* 最近一次成功收到上位机数据的时刻 */
@@ -88,11 +95,28 @@ window.Api = (function () {
   /** 补零（本地实现，避免依赖 utils/format.js 的加载顺序） */
   function pad(n) { return String(n).padStart(2, '0'); }
 
-  /** 生成上传流水号：UP + yyyyMMddHHmmss + 3 位序号 */
+  /** 日期键（yyyyMMdd，本地日期）——与 platform/id.js 的 fmtDate 同一跨日边界 */
+  function dayKey(t) {
+    return t.getFullYear() + pad(t.getMonth() + 1) + pad(t.getDate());
+  }
+
+  /**
+   * 生成上传流水号：UP + yyyyMMddHHmmss + 3 位当日序号
+   *
+   * **与 `platform/id.js` 的 `createUploadIdGenerator().next()` 同步的口径（R26-P3-3）**：
+   *   ①**按日重置** —— 日期前缀变化即序号归零（改口径前本处从不重置）；
+   *   ②**序号域 1～999** —— `(seq % 999) + 1`，**永不产生 `000`**（改口径前 `% 1000` 会产）；
+   *   ③格式同 `UP` + 14 位时间 + 3 位序号，故 `platform/id.js` 的 `isUploadId()` 判本处产物
+   *      必合法 —— 两侧对同一输入序列产出**逐字节相同**的 id（`tests/platform-check.js`
+   *      有跨界对账断言；日志与回执核对（DR-13）依赖这一点）。
+   */
   function nextUploadId(d) {
     const t = d || new Date();
-    uploadSeq = (uploadSeq + 1) % 1000;
-    return 'UP' + t.getFullYear() + pad(t.getMonth() + 1) + pad(t.getDate()) +
+    const day = dayKey(t);
+    if (uploadSeqDate !== day) { uploadSeqDate = day; uploadSeq = 0; }
+    /* 序号域 1～999：(seq % 999) + 1 使 +1 后落在 001，回绕后仍不产生 000 */
+    uploadSeq = (uploadSeq % 999) + 1;
+    return 'UP' + day +
            pad(t.getHours()) + pad(t.getMinutes()) + pad(t.getSeconds()) +
            String(uploadSeq).padStart(3, '0');
   }

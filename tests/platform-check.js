@@ -6,7 +6,10 @@
          就是这么漏过去的。按 ADR-0004 D19（断言即证据），"没被测过"不能靠"数字好看"掩盖。
    覆盖：①路径与三套环境隔离 ②uploadId 形状与跨日序号 ③日志分级/按日滚动/保留清理
         ④平台专有字样防线（D11）
-   依赖：仅 Node 内置模块。
+   R26-P3-3 追加：②段补"序号域 1～999 / 永不产 000 / 跨日重置"的生成侧断言、`isUploadId` 与
+        生成口径的一一对应断言，以及 **id.js ↔ api.js 的跨界对账**（api.js 真源码在 vm 里跑）；
+        立案原因＝两侧曾**两判相反**（api.js `%1000` 产 `000` 且不按日重置）。
+   依赖：仅 Node 内置模块（跨界对账用 node:vm）。
    运行：node tests/platform-check.js
    退出码：0 = 全部通过；1 = 有断言失败。
    ========================================================================== */
@@ -14,6 +17,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const env = require('./env');
 const { createRunner } = require('./lib/assert');
@@ -34,6 +38,25 @@ function loadPathsUnder(envName) {
     if (prev === undefined) delete process.env.DSH_ENV; else process.env.DSH_ENV = prev;
     delete require.cache[abs];
   }
+}
+
+/**
+ * 在独立 vm 上下文里按浏览器脚本方式加载 `src/services/api.js`（R26-P3-3 跨界对账用）。
+ * 手法与 `tests/ui-check.js` 的夹具一致（`vm.createContext` + 假 `window`）：api.js 是
+ * `window.Api = (function(){...})()` 的 IIFE，只依赖 `window.BoardConfig` / `window.FieldMap`，
+ * **不碰 DOM**，故无需桩件即可跑**真源码** —— 跨界对账要的是浏览器侧真实现，不能靠读源码猜。
+ * 每次调用返回**全新实例**（序号状态是模块级闭包变量，跨用例复用会互相干扰）。
+ */
+function loadBrowserApi() {
+  const sandbox = { console };
+  sandbox.window = sandbox;
+  vm.createContext(sandbox);
+  const run = rel => vm.runInContext(fs.readFileSync(path.join(ROOT, rel), 'utf8'), sandbox,
+    { filename: path.join(ROOT, rel) });
+  run('src/config/board.config.js');
+  run('src/config/fieldMap.js');
+  run('src/services/api.js');
+  return sandbox.window.Api;
 }
 
 /* ---------------- 一、路径与三套环境隔离 ---------------- */
@@ -100,6 +123,83 @@ t.section('二、uploadId 生成与校验（附录 2 / IF-B 去重与回执核�
   t.check('localId 带前缀且两次调用不重复',
     localId('probe', clock).startsWith('probe-') && localId('probe', clock) !== localId('probe', clock),
     localId('probe', clock));
+
+  /* ---------------- R26-P3-3：口径统一后的守线断言 ---------------- */
+  /* 立案事实（`项目记录\审查报告-2026-09-26.md` P3-3）：id.js 按日重置、域 1～999、判 `000` 非法；
+     api.js 用 `%1000` 第 1000 次起产 `…000` 且不按日重置 ⇒ 同一系统两个生成器形状不完全互换、
+     声明"保持一致"不实。下方三条分别守住：生成侧、判定侧、跨界对账。 */
+
+  /** 取 uploadId 的 3 位序号（UP + 14 位时间 = 前 16 字符） */
+  const seqOf = id => Number(String(id).slice(16));
+
+  /* ① 生成侧：连跑 1000 次（跨过 999 回绕点）不出现 000、序号恒在 1～999 */
+  const walk = createUploadIdGenerator({ clock });
+  const ids = [];
+  for (let i = 0; i < 1000; i++) ids.push(walk.next());
+  const zeroSeq = ids.filter(id => seqOf(id) === 0);
+  const outOfDomain = ids.filter(id => !(seqOf(id) >= 1 && seqOf(id) <= 999));
+  t.info(`实测：id.js 连跑 1000 次 —— 后缀 …000 出现 ${zeroSeq.length} 次；序号越界 ${outOfDomain.length} 次；` +
+    `示例 ${ids[0]} / 第 999 次 ${ids[998]} / 第 1000 次（回绕）${ids[999]}`);
+  t.check('①id.js 连跑 1000 次不产生 000 后缀、序号恒在 1～999（含第 1000 次回绕）',
+    ids.length === 1000 && zeroSeq.length === 0 && outOfDomain.length === 0,
+    `…000 ${zeroSeq.length} 次、越界 ${outOfDomain.length} 次`);
+
+  /* ① 跨日重置：可注入时钟直接跨过零点（不靠"等一天"） */
+  let dayMs = new Date('2026-09-19T23:59:59').getTime();
+  const dayGen = createUploadIdGenerator({ clock: { now: () => new Date(dayMs) } });
+  const beforeDay = [dayGen.next(), dayGen.next()];
+  dayMs = new Date('2026-09-20T00:00:00').getTime();
+  const afterDay = [dayGen.next(), dayGen.next()];
+  t.check('①跨日自动重置：跨日前续号、跨日后首号回到 001（日期前缀同步换日）',
+    seqOf(beforeDay[1]) === 2 && afterDay[0] === 'UP20260920000000001' && seqOf(afterDay[1]) === 2,
+    `${beforeDay[1]} → ${afterDay[0]}（次号 ${afterDay[1]}）`);
+
+  /* ② 判定侧：isUploadId 与生成口径一一对应（生成的必合法；人工构造的 …000 必非法） */
+  t.check('②isUploadId 与生成口径一一对应：生成的 1000 个全部判合法',
+    ids.every(id => isUploadId(id).ok === true),
+    `首个不合法样本：${ids.find(id => !isUploadId(id).ok) || '（无）'}`);
+  t.check('②序号域逐项核对：001～999 全部判合法、000 判非法（与"永不产生 000"同一条线）',
+    Array.from({ length: 999 }, (_, i) => String(i + 1).padStart(3, '0'))
+      .every(s => isUploadId(`UP20260919102030${s}`).ok === true) &&
+    isUploadId('UP20260919102030000').ok === false,
+    `000 的判定：${isUploadId('UP20260919102030000').reason}`);
+
+  /* ③ 跨界对账：把浏览器侧 api.js 的**真源码**在 vm 里跑起来（夹具见文件上方 loadBrowserApi） */
+  const Api = loadBrowserApi();
+  if (t.requires('浏览器侧 api.js 能在 vm 里加载并暴露 nextUploadId（无 DOM 依赖）',
+    !!Api && typeof Api.nextUploadId === 'function', 'Api.nextUploadId 缺失（契约被改？）')) {
+    const apiIds = [];
+    for (let i = 0; i < 1000; i++) apiIds.push(Api.nextUploadId(fixed));
+    const apiZero = apiIds.filter(id => seqOf(id) === 0);
+    const apiOutOfDomain = apiIds.filter(id => !(seqOf(id) >= 1 && seqOf(id) <= 999));
+    t.info(`实测：api.js（vm 真源码）连跑 1000 次 —— 后缀 …000 出现 ${apiZero.length} 次；` +
+      `序号越界 ${apiOutOfDomain.length} 次；示例 ${apiIds[0]} / 第 1000 次（回绕）${apiIds[999]}`);
+
+    let firstDiff = -1;
+    for (let i = 0; i < ids.length; i++) if (apiIds[i] !== ids[i]) { firstDiff = i; break; }
+    t.check('③跨实现对账：两侧对同一输入序列产出**逐字节相同**的 uploadId（格式与序号规则同源）',
+      firstDiff === -1,
+      firstDiff === -1 ? `1000/1000 逐字节相同（样例 ${apiIds[0]}）`
+        : `第 ${firstDiff + 1} 次不同：id.js=${ids[firstDiff]} vs api.js=${apiIds[firstDiff]}`);
+    t.check('③浏览器侧同样不产生 000、序号恒在 1～999（连跑 1000 次）',
+      apiZero.length === 0 && apiOutOfDomain.length === 0,
+      `…000 ${apiZero.length} 次、越界 ${apiOutOfDomain.length} 次`);
+
+    /* 跨日重置：另起一个全新 api.js 实例（序号状态是模块级闭包，不能与上面的 1000 次共用） */
+    const ApiDay = loadBrowserApi();
+    const apiDayBefore = [ApiDay.nextUploadId(new Date('2026-09-19T23:59:59')),
+      ApiDay.nextUploadId(new Date('2026-09-19T23:59:59'))];
+    const apiDayAfter = [ApiDay.nextUploadId(new Date('2026-09-20T00:00:00')),
+      ApiDay.nextUploadId(new Date('2026-09-20T00:00:00'))];
+    t.check('③浏览器侧按日重置：与 id.js 同一跨日边界，次日首号回到 001',
+      seqOf(apiDayBefore[1]) === 2 && apiDayAfter[0] === 'UP20260920000000001' &&
+      seqOf(apiDayAfter[1]) === 2,
+      `${apiDayBefore[1]} → ${apiDayAfter[0]}（次号 ${apiDayAfter[1]}）`);
+    t.check('③浏览器侧产物全部通过 id.js 的 isUploadId（去重与回执核对同一判据）',
+      apiIds.every(id => isUploadId(id).ok === true) &&
+      apiDayAfter.every(id => isUploadId(id).ok === true),
+      `首个不合法样本：${apiIds.find(id => !isUploadId(id).ok) || '（无）'}`);
+  }
 }
 
 /* ---------------- 三、日志：分级 / 按日滚动 / 保留 ---------------- */
