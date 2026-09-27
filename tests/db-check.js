@@ -21,10 +21,13 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+/* W1 新增：IF-D 端到端那一段要在**进程内**起一个临时端口的 http.Server（最小验证，见八之四的说明） */
+const http = require('node:http');
 
 const env = require('./env');
 const { createRunner } = require('./lib/assert');
-const { makeTempDb } = require('./lib/harness');
+const { makeTempDb, allocPort } = require('./lib/harness');
+const { createClock } = require('./lib/clock');
 const fixture = require('./lib/fixture');
 const db = require('../server/db');
 /* 结构版本的**单一真源**：`server/db/index.js` 导出的 `SCHEMA_VERSION`
@@ -45,6 +48,16 @@ const standardSvc = require('../server/services/standard');
    本批补校验。这里的引用**不是**"为了跑被测对象"—— 而是拿同层的 `uploadQueue.deleteSettledBefore`
    当**口径对照尺**（它本来就带 `assertTime`）：同类脏串必须两边同判，否则又是"同层三把尺子"。 */
 const uploadQueueRepo = require('../server/repo/uploadQueue');
+/* W1（IF-D 采集接入）的两处被测对象：服务层（校验/去重/1 s 采样落库/断连）与 HTTP 挂载口。
+   它们在此之前**无任何服务端调用方**（本批新增），故这里的引用就是本节的被测对象本身。 */
+const { createIngest } = require('../server/services/ingest');
+const { mountIfD } = require('../server/http/routes/ifD');
+const { createRouter } = require('../server/http/router');
+/* W2（IF-A 接收）的两处被测对象：服务层（校验 / 幂等 / 权威与不一致提示 / op_log 留痕 / 访问控制）
+   与 HTTP 挂载口。二者在本批之前**不存在**（`server/services/dispatch.js`、`server/http/routes/ifA.js`
+   为 W2 新增），故这里的引用就是八之五那一节的被测对象本身。 */
+const { createDispatch, KIND: IFA_KIND, OP_TYPE: IFA_OP_TYPE } = require('../server/services/dispatch');
+const { mountIfA } = require('../server/http/routes/ifA');
 
 env.assertRuntime();
 const t = createRunner('本地库结构自检（db-check）');
@@ -1198,6 +1211,805 @@ async function main() {
     }
   }
   cutDb.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
+
+  /* ---------------- 八之四、IF-D 采集接入（W1：校验拒收 / 频率口径 / 幂等 / 退路口径 / 断连 / HTTP） ----------------
+     被测对象＝`server/services/ingest.js` + `server/http/routes/ifD.js`（W1 新增）：
+       ①脏帧拒收（缺字段/类型错/时间非法含毫秒与秒级/超量程）⇒ 拒收 + 可读原因 + **一行未落库**；
+       ②频率口径（ADR-0001 D7）：1 s 采样落库、500 ms 原始帧**不落库**（只进内存）；
+       ③幂等/去重（DR-13 主口径四字段）：同一键重复送 ⇒ **不产生第二行、也不改写既有行**；
+       ④退路口径标注：无 seq 的帧走退路口径且返回值里**有明确标注**（同时带出误判风险，不隐藏）；
+       ⑤断连状态（FR-2.6 / IF-D.9）：喂一帧 ⇒ 在线；**推进注入时钟** >5 s ⇒ 离线（不真等 5 s）；
+       ⑥端到端（HTTP 那一层的**最小**验证）：起一个**进程内**临时端口的 http.Server，
+          把同一 router 挂上去，POST 一帧断言落库、POST 脏帧断言 400 且不落库。
+     ⚠ 为什么"进程内起 HTTP"而不是子进程起 `server/index.js`：`tests/harness-check.js`
+       （**别的脚本**，本包不得改也不得跑）已经在验"子进程起停服务"。本包只需证明
+       "`mountIfD` 注册的路由真的能被 HTTP 送到 ingest 上"，进程内起停最小、不与其交叉。
+     判据口径（**幂等**的选择依据）：DR-13 原文允许"幂等 / 后到覆盖先到"二者之一；
+       本实现选**幂等**，因为落库出口 `server/repo/measure.js` 用 `INSERT OR IGNORE` + 库层唯一索引
+       `ux_measure_rt(equip_code, proc_order_no, collect_time)`，且该文件自述"只做 SQL、不做业务判断"
+       —— 若在后到覆盖需另写 UPDATE，等于**在库唯一索引之外另起第二套去重真源**（任务书明令禁止）。
+       故下面第 ③ 条断言的是"**行数不变 + 字段未被覆盖**"，依据即库层现状（本包不得改 repo/db）。 */
+  t.section('八之四、IF-D 采集接入（校验拒收 / 1 s 采样 / 幂等去重 / 退路口径 / 断连 / HTTP）');
+
+  const IFD_T0 = '2026-09-25 09:00:00';
+  const ifdDb = makeTempDb({ name: 'ifd-ingest' });
+  db.initSchema(ifdDb.db, NOW);
+  /* 注入时钟（`tests/lib/clock.js`）：断连判据要"推进 5 s 以后"，不能真等 —— 这正是 D17 的用处 */
+  const ifdClock = createClock({ mode: 'fixed', at: IFD_T0 });
+  const ifdLogs = [];
+  const ifdLogger = {
+    info: m => ifdLogs.push('info:' + m),
+    warn: m => ifdLogs.push('warn:' + m),
+    error: m => ifdLogs.push('error:' + m)
+  };
+  const ingestSvc = createIngest({ db: ifdDb.db, now: ifdClock.source(), logger: ifdLogger });
+  const ifdRows = () => ifdDb.db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+  /** 取某键在库中的行（断言"字段未被覆盖"用） */
+  const ifdRowOf = (equipCode, procOrderNo, collectTime) => ifdDb.db.prepare(
+    'SELECT * FROM measure_rt WHERE equip_code = ? AND proc_order_no = ? AND collect_time = ?'
+  ).get(equipCode, procOrderNo, collectTime);
+
+  if (t.requires('八之四前提：采集服务已接线（createIngest 可用）且临时库为空',
+    typeof createIngest === 'function' && typeof ingestSvc.ingestFrame === 'function' && ifdRows() === 0,
+    `measure_rt ${ifdRows()} 行`)) {
+
+    /* ---- ① 脏帧拒收：缺字段 / 类型错 / 时间非法（毫秒与秒级两种输入的预期）/ 超量程 ---- */
+    const GOOD = fixture.makeFrame({ at: IFD_T0, i: 7000 });
+    /* ⚠ 这三条"缺字段"的构帧用了 IIFE，**最后一句必须是 `return f;` 且前一句以 `;` 收尾**：
+       写成 `delete f.equipCode`（无分号）换行再接 `return f;` 时，ASI 不会补分号
+       （`return` 是关键字、不构成续行风险，但上一句会被解析成 `delete f.equipCode(return f)`）
+       —— 实测后果是 `frame` 变成一个**函数**，一律命中 `FRAME_NOT_OBJECT`，
+       于是"缺字段"这条判据被另一个原因冒充（本包首轮自检即踩到，见回执）。 */
+    const dropField = name => { const f = Object.assign({}, GOOD); delete f[name]; return f; };
+    const dirtyCases = [
+      { name: '缺 equipCode', frame: dropField('equipCode'), code: 'MISSING_FIELD', field: 'equipCode' },
+      { name: '缺 procOrderNo', frame: dropField('procOrderNo'), code: 'MISSING_FIELD', field: 'procOrderNo' },
+      { name: '缺 collectTime', frame: dropField('collectTime'), code: 'MISSING_FIELD', field: 'collectTime' },
+      { name: 'equipCode 类型错（数字）', frame: Object.assign({}, GOOD, { equipCode: 12345 }),
+        code: 'BAD_TYPE', field: 'equipCode' },
+      { name: 'depth 类型错（字符串）', frame: Object.assign({}, GOOD, { depth: '5.00' }),
+        code: 'BAD_TYPE', field: 'depth' },
+      { name: 'testStatus 非附录 2 码（9）', frame: Object.assign({}, GOOD, { testStatus: 9 }),
+        code: 'BAD_TEST_STATUS', field: 'testStatus' },
+      { name: '时间非法：带 T', frame: Object.assign({}, GOOD, { collectTime: '2026-09-25T09:00:00' }),
+        code: 'BAD_COLLECT_TIME', field: 'collectTime' },
+      { name: '时间非法：非法月日 2026-13-45', frame: Object.assign({}, GOOD, { collectTime: '2026-13-45 09:00:00' }),
+        code: 'BAD_COLLECT_TIME', field: 'collectTime' },
+      { name: '时间非法：空串', frame: Object.assign({}, GOOD, { collectTime: '' }),
+        code: 'BAD_TYPE', field: 'collectTime' },
+      { name: '时间非法：数字时间戳', frame: Object.assign({}, GOOD, { collectTime: 1789000000000 }),
+        code: 'BAD_TYPE', field: 'collectTime' },
+      { name: '超量程：帧率 1201（UI-08 量程 0～1200）', frame: Object.assign({}, GOOD, { frameRate: 1201 }),
+        code: 'OUT_OF_RANGE', field: 'frameRate' },
+      { name: '超量程：深度 -1', frame: Object.assign({}, GOOD, { depth: -1 }),
+        code: 'OUT_OF_RANGE', field: 'depth' },
+      { name: '超精度：深度 12.345（两位小数口径）', frame: Object.assign({}, GOOD, { depth: 12.345 }),
+        code: 'OUT_OF_RANGE', field: 'depth' },
+      { name: '非对象：字符串帧', frame: 'not-a-frame', code: 'FRAME_NOT_OBJECT', field: '(frame)' }
+    ];
+    /* ⚠ detail 字符串里**不得**再调 `ingestFrame()`：那会改动运行态计数（`rejectedFrames`），
+       让紧随其后的"计数 = 脏帧数"断言莫名变红。下面这条 detail 只用上面循环留下的结果。 */
+    const dirtyProblems = [];
+    const dirtySeen = [];
+    for (const c of dirtyCases) {
+      const r = ingestSvc.ingestFrame(c.frame);
+      dirtySeen.push(r);
+      if (r.outcome !== 'rejected') { dirtyProblems.push(`${c.name} → 竟被收下（${r.outcome}）`); continue; }
+      if (!r.error || r.error.code !== c.code || r.error.field !== c.field) {
+        dirtyProblems.push(`${c.name} → ${r.error && r.error.code}/${r.error && r.error.field}` +
+          `（期望 ${c.code}/${c.field}）`);
+      }
+      if (typeof r.error.reason !== 'string' || r.error.reason.length < 8) {
+        dirtyProblems.push(`${c.name} → 拒收原因不可读：${JSON.stringify(r.error && r.error.reason)}`);
+      }
+    }
+    t.check('IF-D 校验：缺字段 / 类型错 / 时间非法（带 T、非法月日、空串、数字）/ 超量程（帧率>1200、深度<0、超两位小数）/ 非对象 ' +
+      `共 ${dirtyCases.length} 类脏帧**全部拒收**，且每类都给出可读原因（code + field + reason）`,
+      dirtyProblems.length === 0,
+      dirtyProblems.length ? dirtyProblems.join('；')
+        : `${dirtyCases.length}/${dirtyCases.length} 拒收，样例：${String(dirtySeen[6].error.reason)}`);
+
+    t.check('IF-D 校验：脏帧**一行未落库**（拒收挡在落库之前，不留半条）—— 表内仍 0 行，且计数 rejected = ' +
+      `${dirtyCases.length}`,
+      ifdRows() === 0 && ingestSvc.stats().rejectedFrames === dirtyCases.length,
+      `measure_rt ${ifdRows()} 行；rejected=${ingestSvc.stats().rejectedFrames}`);
+
+    t.check('IF-D 时间口径（DR-16 + C-101③）：**秒级与毫秒级两种输入都收**，落库前一律截断到秒 —— ' +
+      '秒级输入原样、毫秒输入丢掉毫秒位（`…09:00:01.500` ⇒ `…09:00:01`）',
+      (() => {
+        const sec = ingestSvc.validate(Object.assign({}, GOOD, { collectTime: '2026-09-25 09:10:00', seq: 1 }));
+        const ms = ingestSvc.validate(Object.assign({}, GOOD, { collectTime: '2026-09-25 09:10:01.500', seq: 2 }));
+        const ms1 = ingestSvc.validate(Object.assign({}, GOOD, { collectTime: '2026-09-25 09:10:01.5', seq: 2 }));
+        const bad = ingestSvc.validate(Object.assign({}, GOOD, { collectTime: '2026-09-25 09:10:01.5.5' }));
+        return sec.ok && sec.collectTimeSec === '2026-09-25 09:10:00' && sec.collectMs === 0 &&
+          ms.ok && ms.collectTimeSec === '2026-09-25 09:10:01' && ms.collectMs === 500 &&
+          ms1.ok && ms1.collectTimeSec === '2026-09-25 09:10:01' && ms1.collectMs === 500 &&
+          bad.ok === false;
+      })(),
+      (() => {
+        const ms = ingestSvc.validate(Object.assign({}, GOOD, { collectTime: '2026-09-25 09:10:01.500' }));
+        return `毫秒输入 ⇒ sec=${ms.collectTimeSec} ms=${ms.collectMs}`;
+      })());
+
+    /* 设备编号不一致**默认不拒收**：IF-D.12 的口径是"原样使用 / 以 IF-A 为准并给出可见提示"，
+       拒收会丢掉真实测量数据（配置号与 MES 号不一致是**配置问题**，不是帧脏）。
+       "可见提示"归 IF-A 包（W2）；本包只把它做成**显式可开启**的判据，不在缺省路径上拦数据。 */
+    t.check('IF-D 设备编号（IF-D.12）：帧内 equipCode 与本机配置不一致时**默认收下**（不拒收、不丢真实测量数据）；' +
+      '仅在 `enforceEquipCode:true` 显式开启时才拒收并给出 `EQUIP_CODE_MISMATCH`（该"可见提示"归 IF-A 包）',
+      (() => {
+        const other = Object.assign({}, GOOD, { equipCode: 'EQ-OTHER-999', collectTime: '2026-09-25 09:20:00', seq: 1 });
+        const lenient = ingestSvc.validate(other);
+        const strict = createIngest({ db: ifdDb.db, now: ifdClock.source(), enforceEquipCode: true })
+          .validate(other);
+        return lenient.ok === true && strict.ok === false && strict.code === 'EQUIP_CODE_MISMATCH';
+      })(),
+      `默认=${ingestSvc.validate(Object.assign({}, GOOD, { equipCode: 'EQ-OTHER-999' })).ok ? '收下' : '拒收'}；` +
+      `enforceEquipCode=true 时拒收码=EQUIP_CODE_MISMATCH`);
+
+    /* ---- ② 频率口径（ADR-0001 D7）：1 s 采样落库、500 ms 原始帧不落库 ---- */
+    /** 造帧：在 `fixture.makeFrame` 的既有框上加 DR-13 主口径第四字段 `seq`（不另造字段名） */
+    const frameWith = opts => Object.assign(fixture.makeFrame(opts), opts.seq === undefined ? {} : { seq: opts.seq });
+    /** 频率口径断言的**基准行数**：本段前面已因别的用例写过若干行，故一律用**增量**断言，
+     *  不写死绝对行数 —— 否则"前面多写一行"就会让本段变红，而那不是本段要证的事。
+     *  ⚠ 必须在**喂帧之前**取基准（首版把这一行写在了 map(ingestFrame) 之后，基准里已经含了
+     *  本段自己的 3 行，"净增 3 行"于是永远算不平 —— 这正是"基准取自喂帧之后"的典型错法）。 */
+    /* ⚠ 行数一律**先取快照再断言**（`rowsAfterSec` / `rowsAfterRaw`），不要在断言式里现读 `ifdRows()`：
+       断言式与 detail 是**两次独立求值**（`tests/lib/assert.js` 的 `t.check(name, ok, detail)` 收到的是
+       求值后的值，runner 不做重放 —— 已用 `tests\._verify\w1\probe-replay.js` 实测确认）。
+       把"随时可变"的读取分散写在两处，一旦中间又发生写库，两处就会读到不同的当刻值，
+       输出成"自相矛盾"的失败详情（本包首版即踩到这个坑，浪费了一轮排查）。
+       快照一次、断言与 detail 都用它，才谈得上可复核。 */
+    const rowsBeforeFreq = ifdRows();
+    const secFrames = [0, 1, 2].map(i => frameWith({
+      at: `2026-09-25 10:00:0${i}`, i: 7100 + i, depth: Number((5 + i * 0.1).toFixed(2)), seq: 100 + i
+    }));
+    const secResults = secFrames.map(f => ingestSvc.ingestFrame(f));
+    const rowsAfterSec = ifdRows();
+    const rawFrames = [
+      frameWith({ at: '2026-09-25 10:01:00.000', i: 7200, depth: 5.50, seq: 200 }),
+      frameWith({ at: '2026-09-25 10:01:00.500', i: 7201, depth: 5.80, seq: 201 })
+    ];
+    const rawResults = rawFrames.map(f => ingestSvc.ingestFrame(f));
+    const rowsAfterRaw = ifdRows();
+    t.check('IF-D 频率口径（ADR-0001 D7）：**1 s 采样**（间隔 1 s、seq 递增）3 帧**全部落库**' +
+      '（stored，净增 3 行）',
+      secResults.length === 3 && secResults.every(r => r.outcome === 'stored' && r.stored === true) &&
+      rowsAfterSec === rowsBeforeFreq + 3,
+      `outcomes=${secResults.map(r => r.outcome).join('/')}；measure_rt ${rowsBeforeFreq} → ${rowsAfterSec} 行`);
+
+    t.check('IF-D 频率口径（ADR-0001 D7）：**500 ms 原始帧**（同秒 `…10:01:00.000` 与 `…10:01:00.500`）' +
+      '**一帧都不落库**（第 1 帧落库、同秒第 2 帧 → raw-500ms 只进内存），净增仍为 4 行',
+      rawResults[0].outcome === 'stored' && rawResults[1].outcome === 'raw-500ms' &&
+      rawResults[1].stored === false && rowsAfterRaw === rowsBeforeFreq + 4 &&
+      ingestSvc.stats().rawFramesInMemory === 1,
+      `outcomes=${rawResults.map(r => r.outcome).join('/')}；measure_rt ${rowsBeforeFreq} → ${rowsAfterRaw} 行；` +
+      `原始帧内存计数=${ingestSvc.stats().rawFramesInMemory}`);
+
+    t.check('IF-D 频率口径：落库行的 collect_time 一律是**秒级 19 字符**（毫秒位不落库，DR-16）',
+      ifdDb.db.prepare("SELECT COUNT(*) AS c FROM measure_rt WHERE length(collect_time) <> 19").get().c === 0,
+      '');
+
+    /* ---- ③ 幂等/去重（DR-13 主口径四字段）：**幂等** —— 行数不变且字段未被覆盖 ---- */
+    const rowsBeforeDup = ifdRows();
+    const dupFrame = Object.assign(fixture.makeFrame({ at: '2026-09-25 11:00:00', i: 7300, depth: 5.11 }),
+      { seq: 300, speed: 4.44 });
+    const dupKeyB = Object.assign({}, dupFrame);
+    const dupA = ingestSvc.ingestFrame(dupFrame);
+    const dupB = ingestSvc.ingestFrame(dupKeyB);
+    /* 同一四字段键、但**内容不同**的一帧：用来证明"幂等（不改写）"而不是"后到覆盖" */
+    const overwriteTry = ingestSvc.ingestFrame(Object.assign({}, dupFrame, { depth: 9.99, speed: 9.99 }));
+    const dupRowsA = ifdRows();
+    const dupRow = ifdRowOf(dupFrame.equipCode, dupFrame.procOrderNo, '2026-09-25 11:00:00');
+    t.check('IF-D 去重（DR-13 主口径四字段 equipCode+procOrderNo+collectTime+seq）：同一键连送 2 次 —— ' +
+      '第 1 次 stored、第 2 次 duplicate，**净增恰好 1 行**（不产生第二条记录）',
+      dupA.outcome === 'stored' && dupA.dedup.basis === 'primary-4field' &&
+      dupB.outcome === 'duplicate' && dupB.stored === false &&
+      dupRowsA === rowsBeforeDup + 1,
+      `A=${dupA.outcome}(${dupA.dedup.basis}) / B=${dupB.outcome}；行数 ${rowsBeforeDup} → ${dupRowsA}，` +
+      `键=${dupA.dedup.key}`);
+
+    t.check('IF-D 去重口径＝**幂等**（不是"后到覆盖"）：同一键改内容再送 ⇒ 仍 `duplicate`，' +
+      '且既有行的 depth/speed **未被改写**（依据：库层 `INSERT OR IGNORE` + 唯一索引 ux_measure_rt，' +
+      'repo 层"只做 SQL 不做业务判断"，本包不得另起第二套去重真源）',
+      overwriteTry.outcome === 'duplicate' && dupRowsA === rowsBeforeDup + 1 &&
+      Number(dupRow.measure_depth) === 5.11 && Number(dupRow.speed) === 4.44,
+      `第三次=${overwriteTry.outcome}；行内 depth=${dupRow && dupRow.measure_depth} speed=${dupRow && dupRow.speed}` +
+      `（送的是 9.99/9.99）；行数仍 ${dupRowsA}`);
+
+    /* ---- ④ 退路口径标注：无 seq 的帧必须走退路口径并**在返回里明确标注** ---- */
+    const noSeqFrame = fixture.makeFrame({ at: '2026-09-25 12:00:00', i: 7400, depth: 5.22 });
+    delete noSeqFrame.seq;
+    const fb = ingestSvc.ingestFrame(noSeqFrame);
+    t.check('IF-D 退路口径（DR-13 / 函件 U-5）：**无 seq** 的帧正常收下落库，但返回值里 ' +
+      '`dedup.basis=fallback-3field`、`dedup.fallback=true`，并**带出跨工单同秒误判风险**（不隐藏）',
+      fb.outcome === 'stored' && fb.dedup.basis === 'fallback-3field' && fb.dedup.fallback === true &&
+      typeof fb.dedup.risk === 'string' && fb.dedup.risk.includes('退路口径') && fb.dedup.risk.includes('误判风险') &&
+      fb.dedup.key === [noSeqFrame.equipCode, noSeqFrame.procOrderNo, '2026-09-25 12:00:00', ''].join('|'),
+      `basis=${fb.dedup.basis} risk="${String(fb.dedup.risk).slice(0, 46)}…"`);
+
+    t.check('IF-D 退路口径 ≠ 主口径：同一时刻若**带 seq** 则键里含 seq（两种口径的键必须可区分，' +
+      '否则"标注"就成了空话）',
+      (() => {
+        const withSeq = ingestSvc.validate(Object.assign({}, noSeqFrame, { seq: 7 }));
+        const without = ingestSvc.validate(noSeqFrame);
+        return withSeq.ok && withSeq.seq === 7 && without.ok && without.seq === null;
+      })(), `带 seq ⇒ seq=7；不带 ⇒ seq=null`);
+
+    /* ---- ⑤ 断连状态（FR-2.6 / IF-D.9）：喂帧 ⇒ 在线；推进注入时钟 >5 s ⇒ 离线 ---- */
+    const offlineDb = makeTempDb({ name: 'ifd-link' });
+    db.initSchema(offlineDb.db, NOW);
+    const linkClock = createClock({ mode: 'fixed', at: IFD_T0 });
+    const linkSvc = createIngest({ db: offlineDb.db, now: linkClock.source() });
+    const linkBefore = linkSvc.linkState();
+    const linkFrame = Object.assign(fixture.makeFrame({ at: IFD_T0, i: 7500 }), { seq: 400 });
+    const linkStored = linkSvc.ingestFrame(linkFrame);
+    const linkOnline = linkSvc.linkState();
+    /* 推进到"恰好阈值"（5 s）与"超过阈值"（5.001 s）：≤5 s 判在线、>5 s 判离线 */
+    linkClock.advanceSec(5);
+    const linkAt = linkSvc.linkState();
+    linkClock.advanceMs(1);
+    const linkAfter = linkSvc.linkState();
+    t.check('IF-D 断连（FR-2.6 / IF-D.9，阈值真源＝board.config.js 的 upper.staleMs=5000）：' +
+      '未收帧 ⇒ offline；喂一帧（有效）⇒ **online**；**推进注入时钟 5 s** ⇒ 仍 online（≤5 s 口径）；' +
+      '再推进 1 ms（>5 s）⇒ **offline**（用注入时钟，不真等 5 s）',
+      linkBefore.state === 'offline' && linkBefore.ageMs === null &&
+      linkStored.outcome === 'stored' && linkOnline.state === 'online' && linkOnline.online === true &&
+      linkOnline.staleMs === 5000 && linkAt.state === 'online' && linkAt.ageMs === 5000 &&
+      linkAfter.state === 'offline' && linkAfter.ageMs === 5001,
+      `未收帧=${linkBefore.state}；喂帧后=${linkOnline.state}；+5 s=${linkAt.state}(age=${linkAt.ageMs})；` +
+      `+5.001 s=${linkAfter.state}(age=${linkAfter.ageMs})`);
+
+    /* 脏帧**不得**刷新"最近有效帧"：否则断连判据会被脏帧喂活、永远显示在线（FR-2.6 就成了摆设）。
+       单独一份时钟 + 单独实例，与上一条互不干扰。 */
+    const dirtyClock = createClock({ mode: 'fixed', at: IFD_T0 });
+    const dirtySvc = createIngest({ db: offlineDb.db, now: dirtyClock.source() });
+    dirtySvc.ingestFrame(frameWith({ at: IFD_T0, i: 7600, seq: 500 }));
+    const acceptedBeforeDirty = dirtySvc.stats().lastAcceptedAt;
+    dirtyClock.advanceSec(6);
+    const dirtyResult = dirtySvc.ingestFrame({ equipCode: 'X', collectTime: 'bogus' });
+    const afterDirty = dirtySvc.linkState();
+    t.check('IF-D 断连：**脏帧不刷新"最近有效帧"** —— 喂一帧脏帧后 `lastAcceptedAt` 未被改动、' +
+      '状态仍随注入时钟走到 offline（否则断连判据会被脏帧喂活、永远显示在线）',
+      dirtyResult.outcome === 'rejected' &&
+      dirtySvc.stats().lastAcceptedAt === acceptedBeforeDirty &&
+      afterDirty.state === 'offline' && afterDirty.ageMs === 6000,
+      `脏帧=${dirtyResult.outcome}；lastAcceptedAt 未变=${dirtySvc.stats().lastAcceptedAt === acceptedBeforeDirty}；` +
+      `link=${afterDirty.state}(age=${afterDirty.ageMs})`);
+    offlineDb.close();
+
+    /* ---- ⑥ 端到端（HTTP 那一层的**最小**验证）：进程内临时端口起 http.Server ----
+       `getHealth` 里带上 IF-D 子集，是为了顺手断言"断连状态可被 `/health` 读到"这条留位要求；
+       下面的 ifdMount 在回调**执行时**才被读，故 const 声明在后仍成立（回调晚于本行执行）。 */
+    const ifdHttpErrors = [];
+    const httpRouter = createRouter({
+      getHealth: () => ({ ok: true, ifd: ifdMount.status() }),
+      onError: err => { ifdHttpErrors.push(String(err && err.message)); }
+    });
+    const ifdMount = mountIfD(httpRouter, { ingest: ingestSvc });
+    const ifdServer = http.createServer((req, res) => {
+      Promise.resolve(httpRouter.handle(req, res)).catch(() => { try { res.destroy(); } catch { /* 已断 */ } });
+    });
+    const httpPort = await allocPort();
+    await new Promise((resolve, reject) => {
+      ifdServer.once('error', reject);
+      ifdServer.listen(httpPort, '127.0.0.1', resolve);
+    });
+    const httpPost = async (pathname, body) => {
+      const res = await fetch(`http://127.0.0.1:${httpPort}${pathname}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const rowsBeforeHttp = ifdRows();
+    const e2eFrame = Object.assign(fixture.makeFrame({ at: '2026-09-25 13:00:00', i: 7800 }), { seq: 700 });
+    const e2eOk = await httpPost('/ifd/frame', e2eFrame);
+    const rowsAfterOk = ifdRows();
+    const e2eDup = await httpPost('/ifd/frame', Object.assign({}, e2eFrame));
+    const rowsAfterDup = ifdRows();
+    const e2eBad = await httpPost('/ifd/frame', Object.assign({}, e2eFrame, { collectTime: '2026-09-25T13:00:00' }));
+    const rowsAfterBad = ifdRows();
+    const e2eNoPath = await fetch(`http://127.0.0.1:${httpPort}/ifd/nope`);
+    const e2eStatus = await (await fetch(`http://127.0.0.1:${httpPort}/ifd/status`)).json();
+    const e2eHealth = await (await fetch(`http://127.0.0.1:${httpPort}/health`)).json();
+    await new Promise(resolve => ifdServer.close(resolve));
+
+    t.check('IF-D 端到端（进程内临时端口，**最小**验证）：HTTP POST 一帧 ⇒ 200 / outcome=stored ' +
+      '⇒ **库里多了一行**（HTTP 这一层确实落库，不是只回了个 200）',
+      e2eOk.status === 200 && e2eOk.body.outcome === 'stored' && e2eOk.body.stored === true &&
+      rowsAfterOk === rowsBeforeHttp + 1,
+      `HTTP ${e2eOk.status} ${e2eOk.body.outcome}；measure_rt ${rowsBeforeHttp} → ${rowsAfterOk} 行`);
+
+    t.check('IF-D 端到端：同一键再 POST ⇒ 200（DR-13"重复不算错误"）但 **outcome=duplicate、行数不变**',
+      e2eDup.status === 200 && e2eDup.body.outcome === 'duplicate' && rowsAfterDup === rowsAfterOk,
+      `HTTP ${e2eDup.status} ${e2eDup.body.outcome}；行数 ${rowsAfterOk} → ${rowsAfterDup}`);
+
+    t.check('IF-D 端到端：POST 脏帧（collectTime 带 T）⇒ **400** + `ok:false` + error.code/field/reason，' +
+      '且**一行都没落库**',
+      e2eBad.status === 400 && e2eBad.body.ok === false && e2eBad.body.outcome === 'rejected' &&
+      e2eBad.body.err && e2eBad.body.err.code === 'BAD_COLLECT_TIME' &&
+      e2eBad.body.err.field === 'collectTime' && typeof e2eBad.body.err.message === 'string' &&
+      rowsAfterBad === rowsAfterOk,
+      `HTTP ${e2eBad.status} ${e2eBad.body.err && e2eBad.body.err.code}；行数 ${rowsAfterOk} → ${rowsAfterBad}；` +
+      `body=${JSON.stringify(e2eBad.body).slice(0, 200)}`);
+
+    t.check('IF-D 端到端：`GET /ifd/status` 可读到断连状态与 source 启用情况（推送 enabled=true、' +
+      '轮询 enabled=false —— 形态待 U-0.1 答复），`GET /health` 亦带 IF-D 子集；未注册路径仍 404（**未另起路由表**）',
+      e2eStatus.ok === true && e2eStatus.link && ['online', 'offline'].includes(e2eStatus.link.state) &&
+      e2eStatus.sources.push.enabled === true && e2eStatus.sources.poller.enabled === false &&
+      e2eStatus.sources.poller.implemented === true &&
+      e2eHealth.ifd && e2eHealth.ifd.link && typeof e2eHealth.ifd.link.state === 'string' &&
+      e2eNoPath.status === 404,
+      `status.link=${e2eStatus.link && e2eStatus.link.state}；poller.enabled=${e2eStatus.sources.poller.enabled}；` +
+      `/ifd/nope ⇒ ${e2eNoPath.status}`);
+
+    t.check('IF-D 装配显式性：`mountIfD()` 返回 `mounted:true` 与已注册路由清单，且**不抛**（接线成功），' +
+      '与 W6 空壳 `router.mountIfD()` 的 `mounted:false` 形成可核查对照（D23 反静默空转）',
+      ifdMount.mounted === true && ifdMount.by === 'W1' && ifdMount.routes.length === 3 &&
+      httpRouter.list().includes('POST /ifd/frame') &&
+      httpRouter.list().includes('GET /ifd/status'),
+      `mounted=${ifdMount.mounted}；routes=${ifdMount.routes.join(' , ')}`);
+
+    /* 轮询形态：**已实现、默认未启用**（形态不确定性 U-0.1 的留位）。不启定时器、不接线，
+       但能力必须真的在（`pollOnce` 在未配 url 时给出**可读**失败原因，而不是抛异常或静默）。 */
+    const poller = ingestSvc.createPoller({ intervalMs: 10 });
+    const pollResult = await poller.pollOnce();
+    t.check('IF-D 轮询形态（`createPoller`）**已实现但默认未启用**（`enabled=false`、无定时器在跑）：' +
+      '不接线也不抛；未配 `upper.url` 时 `pollOnce()` 返回**可读**失败原因（形态待 U-0.1 答复，留位而非静默）',
+      poller.enabled === false && poller.running() === false &&
+      pollResult.ok === false && pollResult.error && pollResult.error.code === 'NO_URL' &&
+      typeof pollResult.error.reason === 'string' && pollResult.error.reason.length > 4,
+      `poller.enabled=${poller.enabled}；pollOnce ⇒ ${pollResult.error && pollResult.error.code}`);
+
+    /* 拒收必须**留痕**（不得静默收脏数据）：上面喂过的脏帧应在日志里留下 warn（由注入的 logger 收集） */
+    t.check('IF-D 留痕（D23 反静默）：每一帧拒收都写了 warn 日志（注入 logger 收集到 ≥ 脏帧数 条 ' +
+      'IF-D 拒收记录）—— 现场不会出现"界面没数据、日志里也什么都没有"',
+      ifdLogs.filter(l => l.startsWith('warn:') && l.includes('帧被拒收')).length >= dirtyCases.length,
+      `warn 日志 ${ifdLogs.filter(l => l.includes('帧被拒收')).length} 条（脏帧 ${dirtyCases.length} 类）`);
+  }
+  ifdDb.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
+
+  /* ---------------- 八之五、IF-A 接收（幂等 / 权威与不一致提示 / 访问控制 / 失败日志 / HTTP 最小端到端） ----------------
+     被测对象＝`server/services/dispatch.js` + `server/http/routes/ifA.js`（W2 新增）：
+       ①**幂等**（逐类声明口径，返回值里带 `idempotency.{mode,key,basis}` 可读）：
+          派工同 `procOrderNo` 重复下发**不产生第二行、也不改写既有行** —— 依据：库层主键
+          `task.proc_order_no`（`schema.sql` DR-02）＋ `INSERT … ON CONFLICT DO NOTHING`；
+          且 `task` 的 `status`/`actual_start`/`actual_end` 属**本机进度列**，"后到覆盖"会把本机进度抹掉，
+          故不选覆盖（与 `repo/measure.js` 的 `INSERT OR IGNORE`、DR-13"幂等"口径同一先例）；
+          物料/工艺以 `op_log(op_type ＋ 规范化报文签名)` 为幂等键（V1.38 §7 无物料表、`DR-03 standard`
+          自 V1.33 起为深度/速度偏差版本模型 ⇒ 不新建表，以 DR-12 `op_log` 作可查询留痕）；
+          设备（IF-A.4）按 `device.equip_code` **后到覆盖**（DR-01 的口径＝整套系统 1 个编号）。
+       ②**权威与不一致提示**（FR-1.2 / IF-D.12 / C-100 / C-102）：IF-A 与本机配置 / IF-D 侧值冲突时
+          响应带 `warnings[]`、`GET /ifa/status` 的 `authority` 段有状态位、且落一条 `op_log`
+          （`op_type='IF-A权威不一致'`）；同时断言"**以 IF-A 为准**"真的生效（device 表恰 1 行＝IF-A 的编号）
+          —— **不得静默以一侧为准**。
+       ③**访问控制**（负责人 2026-09-27 裁定①）：未配置 ⇒ 放行 + 明确告警（挂载时 warn 与 error 各一次）；
+          配置后 ⇒ 无令牌 401 / 错令牌 403，**鉴权先于报文校验**（脏报文 + 无令牌 ⇒ 401 而非 400），
+          失败落 `op_log`（`result='失败'`）且**业务表一行不动**。
+       ④**失败日志**：脏入站（缺字段 / 类型错 / 数量非法 / 时间非法 / 无可用业务内容 / 非对象 / 未知种类）
+          ⇒ 全部拒收 + 可读原因（code + field + reason）+ 落 `op_log`；与 ③ 的成功留痕按 `op_type`/`result` 可区分。
+       ⑤**HTTP 最小端到端**（进程内临时端口，手法同八之四）：三类各一次"成功 ＋ 幂等重复"，并打印原始输出。
+     ⚠ 不新建测试脚本（任务书要求）；夹具沿用本文件既有手法（临时库 + 注入时钟 + 进程内 http.Server）。 */
+  t.section('八之五、IF-A 接收（幂等 / 权威与不一致提示 / 访问控制 / 失败日志 / HTTP 最小端到端）');
+
+  const IFA_T0 = '2026-09-27 09:00:00';
+  const IFA_LOCAL_CODE = 'LOCAL-FALLBACK-001';   // 本机配置侧兜底编号（FR-8.6）
+  const IFA_IFA_CODE = 'MES-EQ-9';               // IF-A 权威编号
+  const IFA_TOKEN = 'W2-SECRET-TOKEN-9f3a';      // 自检注入的令牌：**只存在于测试**，业务代码不硬编码任何口令
+  const ifaDb = makeTempDb({ name: 'ifa-dispatch' });
+  db.initSchema(ifaDb.db, NOW);
+  const ifaClock = createClock({ mode: 'fixed', at: IFA_T0 });
+  const ifaLogs = [];
+  const ifaLogger = {
+    info: m => ifaLogs.push('info:' + m),
+    warn: m => ifaLogs.push('warn:' + m),
+    error: m => ifaLogs.push('error:' + m)
+  };
+  /** IF-D 侧"仅比对与展示"的取值快照（初始 null＝还没有可比对象；比对逻辑对 null 静默跳过，
+      因为"没有可比对象"不等于"一致"）。 */
+  let ifaIfdSnap = null;
+  const ifaSvc = createDispatch({
+    db: ifaDb.db,
+    logger: ifaLogger,
+    now: ifaClock.source(),
+    auth: { enabled: false, token: '' },   // ③①：未配置 ⇒ 放行 + 告警
+    localEquipCode: IFA_LOCAL_CODE,
+    ifd: () => ifaIfdSnap
+  });
+  const ifaTaskRows = () => ifaDb.db.prepare('SELECT COUNT(*) AS c FROM task').get().c;
+  const ifaDeviceRows = () => ifaDb.db.prepare('SELECT equip_code, equip_name FROM device ORDER BY equip_code').all();
+  const ifaOpRows = opType => opLogRepo.list(ifaDb.db, { opType }, { limit: 200 });
+  /* 基准报文（字段名＝需求 IF-A.1～A.3 的字段清单；形状与 `tools\mock-mes` 的 `/dispatch` 一致，
+     真实契约待 Q-23 答复 —— 见回执"未决"）。 */
+  const ifaDispatchA = {
+    techNoticeNo: 'TJ20260927001', batchNo: 'PC20260927-01', procOrderNo: 'MES-2026-0001',
+    productCode: 'CP-2026-A17', drawingNo: 'SJ-4471-02', productName: '水下振动测试件',
+    heatBatchNo: 'LB20260927', processNo: '30', processName: '水下高速摄像检验', unit: '件',
+    dispatchQty: 180, processRoute: 'RT-A17-01', processNum: '01',
+    planStartTime: '2026-09-27 08:00:00', planEndTime: '2026-09-27 20:00:00',
+    dispatchTarget: '检验一班/1#工位', equipCode: IFA_IFA_CODE, equipName: 'MES 主设备'
+  };
+  const ifaMaterialA = {
+    techNoticeNo: 'TJ20260927001', batchNo: 'PC20260927-01', procOrderNo: 'MES-2026-0001',
+    processNo: '30', processName: '水下高速摄像检验', materialCode: 'M-0001',
+    materialName: '水下密封圈', materialType: '耗材', materialBatch: 'MB-2026-09',
+    specModel: 'O-52×3.5', materialDesc: '耐压 2 MPa', qty: 12, unit: '件'
+  };
+  const ifaProcessA = {
+    procOrderNo: 'MES-2026-0001', productCode: 'CP-2026-A17', drawingNo: 'SJ-4471-02',
+    productName: '水下振动测试件', processNo: '30', processName: '水下高速摄像检验',
+    processRoute: 'RT-A17-01', bomInstance: 'BOM-A17-01', workInstruction: 'WI-30-02',
+    setDepth: 4.6, setGain: 3.5, setFrameRate: 500, setShutter: 2000
+  };
+
+  if (t.requires('八之五前提：IF-A 服务已接线（createDispatch / mountIfA 可用）且临时库为空',
+    typeof createDispatch === 'function' && typeof mountIfA === 'function' &&
+    typeof ifaSvc.receive === 'function' && typeof ifaSvc.authorize === 'function' &&
+    ifaTaskRows() === 0 && opLogRepo.count(ifaDb.db) === 0,
+    `task ${ifaTaskRows()} 行；op_log ${opLogRepo.count(ifaDb.db)} 行`)) {
+
+    /* 先落一行"本机配置侧兜底"的 device 行（模拟 FR-8.6 已配、尚未收到 IF-A 的现场）；
+       随后 IF-A 以**不同**编号下发 ⇒ 该兜底行必须让位（以 IF-A 为准），且旧编号只在 op_log 里可查。 */
+    db.seedInitialData(ifaDb.db, { equipCode: IFA_LOCAL_CODE, equipName: '本机兜底设备名' }, NOW);
+    const ifaDeviceSeeded = ifaDeviceRows();
+
+    /* ---- ① 幂等：派工（IF-A.1 → DR-02 task） ---- */
+    const ifaD1 = ifaSvc.receive(IFA_KIND.DISPATCH, ifaDispatchA);
+    const ifaTaskAfterFirst = ifaTaskRows();
+    /* 第 2 次**故意改内容**再送：只有"改内容也不改写既有行"才谈得上幂等（否则与"后到覆盖"不可区分） */
+    const ifaD2 = ifaSvc.receive(IFA_KIND.DISPATCH,
+      Object.assign({}, ifaDispatchA, { productName: '改名-不应覆盖', planQty: 999 }));
+    const ifaTaskAfterSecond = ifaTaskRows();
+    const ifaTaskRow = ifaDb.db.prepare('SELECT * FROM task WHERE proc_order_no = ?').get(ifaDispatchA.procOrderNo);
+    t.check('IF-A 幂等（派工 / IF-A.1 → DR-02 `task`）：同一 `procOrderNo` 连送 2 次（第 2 次故意改产品名与数量）' +
+      '⇒ 第 1 次 `stored`、第 2 次 `duplicate`，**行数不变（恰 1 行）且既有行未被改写**；口径＝**幂等**（不是后到覆盖）',
+      ifaD1.outcome === 'stored' && ifaD1.stored === true &&
+      ifaD2.outcome === 'duplicate' && ifaD2.stored === false &&
+      ifaTaskAfterFirst === 1 && ifaTaskAfterSecond === 1 &&
+      ifaTaskRow && ifaTaskRow.product_name === ifaDispatchA.productName &&
+      Number(ifaTaskRow.plan_qty) === ifaDispatchA.dispatchQty,
+      `A=${ifaD1.outcome} / B=${ifaD2.outcome}；task ${ifaTaskAfterFirst} → ${ifaTaskAfterSecond} 行；` +
+      `行内 product_name=${ifaTaskRow && ifaTaskRow.product_name}（送的是「改名-不应覆盖」）、` +
+      `plan_qty=${ifaTaskRow && ifaTaskRow.plan_qty}（送的是 999）`);
+
+    t.check('IF-A 幂等依据**可被调用方读到**（不是只写在注释里）：返回值带 `idempotency.{mode,key,basis}`，' +
+      '且派工＝幂等 @ `task.proc_order_no`（依据=库层主键 + ON CONFLICT DO NOTHING + 本机进度列不可被覆盖）',
+      ifaD1.idempotency && ifaD1.idempotency.mode === 'idempotent' &&
+      ifaD1.idempotency.key === 'task.proc_order_no' &&
+      typeof ifaD1.idempotency.basis === 'string' &&
+      ifaD1.idempotency.basis.includes('proc_order_no') &&
+      ifaD1.idempotency.basis.includes('本机进度'),
+      `mode=${ifaD1.idempotency && ifaD1.idempotency.mode}；key=${ifaD1.idempotency && ifaD1.idempotency.key}`);
+
+    /* ---- ② 幂等：物料（IF-A.2）/ 工艺（IF-A.3）——DR 无专属表 ⇒ op_log 留痕 + 报文签名幂等键 ---- */
+    const ifaM1 = ifaSvc.receive(IFA_KIND.MATERIAL, ifaMaterialA);
+    const ifaM2 = ifaSvc.receive(IFA_KIND.MATERIAL, Object.assign({}, ifaMaterialA));
+    const ifaMats = ifaOpRows(IFA_OP_TYPE.MATERIAL);
+    const ifaP1 = ifaSvc.receive(IFA_KIND.PROCESS, ifaProcessA);
+    const ifaP2 = ifaSvc.receive(IFA_KIND.PROCESS, Object.assign({}, ifaProcessA));
+    const ifaProcs = ifaOpRows(IFA_OP_TYPE.PROCESS);
+    t.check('IF-A 幂等（物料 / IF-A.2）：同一报文连送 2 次 ⇒ `stored` → `duplicate`，`op_log` 中该类留痕**恰 1 行**、' +
+      '且该行 `result=成功`（可 `opLogRepo.list(db,{opType})` 直接查询）',
+      ifaM1.outcome === 'stored' && ifaM2.outcome === 'duplicate' && ifaMats.length === 1 &&
+      ifaMats[0].result === '成功' && String(ifaMats[0].content).includes('sig='),
+      `A=${ifaM1.outcome} / B=${ifaM2.outcome}；op_log(${IFA_OP_TYPE.MATERIAL}) ${ifaMats.length} 行；` +
+      `sig=${ifaM1.sig}（两次相同=${ifaM1.sig === ifaM2.sig}）`);
+
+    t.check('IF-A 幂等（工艺 / IF-A.3）：同一报文连送 2 次 ⇒ `stored` → `duplicate`，`op_log` 中该类留痕**恰 1 行**；' +
+      '幂等键＝`op_log(op_type, content 签名)`（返回值 `idempotency` 明示）',
+      ifaP1.outcome === 'stored' && ifaP2.outcome === 'duplicate' && ifaProcs.length === 1 &&
+      ifaP1.idempotency.mode === 'idempotent' && ifaP1.idempotency.key.includes('op_log'),
+      `A=${ifaP1.outcome} / B=${ifaP2.outcome}；op_log(${IFA_OP_TYPE.PROCESS}) ${ifaProcs.length} 行；` +
+      `key=${ifaP1.idempotency.key}`);
+
+    const ifaMVariant = ifaSvc.receive(IFA_KIND.MATERIAL, Object.assign({}, ifaMaterialA, { qty: 13 }));
+    const ifaMatsAfterVariant = ifaOpRows(IFA_OP_TYPE.MATERIAL);
+    t.check('IF-A 幂等键**不是"按 procOrderNo 一刀切"**（否则改内容也会被当成重复、真变更被静默丢掉）：' +
+      '同一工单的物料改一个字段（qty 12 → 13）再送 ⇒ 新签名 ⇒ `stored` 且留痕 1 → 2 行',
+      ifaMVariant.outcome === 'stored' && ifaMatsAfterVariant.length === ifaMats.length + 1 &&
+      ifaMVariant.sig !== ifaM1.sig,
+      `outcome=${ifaMVariant.outcome}；op_log 行数 ${ifaMats.length} → ${ifaMatsAfterVariant.length}；` +
+      `sig ${ifaM1.sig} → ${ifaMVariant.sig}`);
+
+    /* ---- ③ 权威与不一致提示：IF-A vs 本机配置（FR-1.2 / IF-D.12 / C-100） ---- */
+    const ifaMismatchRows = ifaOpRows(IFA_OP_TYPE.MISMATCH);
+    const ifaWarnCodes = (ifaD1.warnings || []).map(w => w.code);
+    const ifaDeviceAfter = ifaDeviceRows();
+    const ifaMismatchRow = ifaMismatchRows.find(r => String(r.content).includes(IFA_LOCAL_CODE) &&
+      String(r.content).includes(IFA_IFA_CODE));
+    t.check('IF-A 权威不一致**不静默**（FR-1.2 / IF-D.12）：IF-A 的 `equipCode`＝' + IFA_IFA_CODE +
+      ' 与本机配置＝' + IFA_LOCAL_CODE + ' 冲突时 ⇒ ①响应带可见警告 `warnings[]`（code=EQUIP_CODE_MISMATCH，' +
+      '含两侧取值与人可读说明）②落一条 `op_log`（op_type=IF-A权威不一致，正文含两个编号）③`/ifa/status` 的 ' +
+      '`authority.equipCode.conflict=true`（状态位）',
+      ifaWarnCodes.includes('EQUIP_CODE_MISMATCH') &&
+      ifaD1.warnings.some(w => w.authoritative === IFA_IFA_CODE && w.localConfig === IFA_LOCAL_CODE) &&
+      typeof ifaD1.warning === 'string' && ifaD1.warning.includes(IFA_LOCAL_CODE) &&
+      Boolean(ifaMismatchRow) && ifaMismatchRow.result === '成功' &&
+      ifaSvc.status().authority.equipCode.conflict === true &&
+      ifaSvc.status().authority.equipCode.localConfig === IFA_LOCAL_CODE,
+      `warnings=[${ifaWarnCodes.join(',')}]；mismatch 留痕 ${ifaMismatchRows.length} 条；` +
+      `status.conflict=${ifaSvc.status().authority.equipCode.conflict}`);
+
+    t.check('IF-A 权威**真的以 IF-A 为准**（不是只给个提示就两边都留着）：device 表原有一行本机兜底编号 ' +
+      IFA_LOCAL_CODE + '，收到 IF-A 的 ' + IFA_IFA_CODE + ' 后 ⇒ 该行**让位**（主键改写、不删行不增行），' +
+      '表内恰 1 行且编号＝IF-A；旧编号只在 `op_log` 的权威不一致记录里可查',
+      ifaDeviceSeeded.length === 1 && ifaDeviceSeeded[0].equip_code === IFA_LOCAL_CODE &&
+      ifaDeviceAfter.length === 1 && ifaDeviceAfter[0].equip_code === IFA_IFA_CODE &&
+      ifaD1.device && ifaD1.device.superseded.length === 1 &&
+      ifaD1.device.superseded[0] === IFA_LOCAL_CODE && Boolean(ifaMismatchRow),
+      `落库前 device=[${ifaDeviceSeeded.map(r => r.equip_code).join(',')}] → 落库后 ` +
+      `device=[${ifaDeviceAfter.map(r => r.equip_code).join(',')}]；让位=${JSON.stringify(ifaD1.device && ifaD1.device.superseded)}`);
+
+    /* ---- ③' 权威与不一致提示：IF-A vs IF-D 侧值（C-100 / C-102：IF-D 仅比对与展示） ---- */
+    ifaIfdSnap = {
+      equipCode: 'IFD-EQ-7', procOrderNo: 'IFD-ORDER-X',
+      frameRate: 400, gain: 3.0, shutter: 2000, cameraDepth: 4.60
+    };
+    const ifaMismatchBeforeIfd = ifaOpRows(IFA_OP_TYPE.MISMATCH).length;
+    const ifaProcessB = Object.assign({}, ifaProcessA, { procOrderNo: 'MES-2026-0002', setFrameRate: 500 });
+    const ifaD3 = ifaSvc.receive(IFA_KIND.PROCESS, ifaProcessB);
+    const ifaMismatchAfterIfd = ifaOpRows(IFA_OP_TYPE.MISMATCH);
+    const ifaWarnIfd = (ifaD3.warnings || []).map(w => w.code);
+    t.check('IF-A 权威 vs **IF-D 侧值**（C-100 / C-102：IF-D 仅比对与展示）：IF-D 最近帧的 `procOrderNo`／' +
+      '`frameRate`（设定值）与 IF-A 工艺信息不一致 ⇒ 逐项给出可见警告（IFD_PROC_ORDER_MISMATCH / ' +
+      'IFD_STANDARD_MISMATCH，含两侧取值）并各落一条 `op_log`；IF-A 仍被收下（`stored`），**不收 IF-D 侧的值**',
+      ifaD3.outcome === 'stored' &&
+      ifaWarnIfd.includes('IFD_PROC_ORDER_MISMATCH') && ifaWarnIfd.includes('IFD_STANDARD_MISMATCH') &&
+      ifaD3.warnings.some(w => w.code === 'IFD_STANDARD_MISMATCH' && w.authoritative === 500 && w.ifd === 400) &&
+      ifaMismatchAfterIfd.length >= ifaMismatchBeforeIfd + 2,
+      `warnings=[${ifaWarnIfd.join(',')}]；mismatch 留痕 ${ifaMismatchBeforeIfd} → ${ifaMismatchAfterIfd.length} 条；` +
+      `收下=${ifaD3.outcome}`);
+
+    /* ---- ④ 访问控制 ---- */
+    const ifaAuthWarns = ifaLogs.filter(l => l.includes('IF-A 访问控制告警'));
+    t.check('IF-A 访问控制①**未配置**（本实例注入 enabled:false）⇒ **放行**（本节 ①～③ 的收下动作已证明）' +
+      '且**明确告警**：挂载时 warn 与 error 各一次（W6「对外监听告警」同风格）、响应体与 `/ifa/status` 都带 ' +
+      '`auth.warning`、`auth.degraded=true` —— 绝不静默放行',
+      ifaSvc.auth.enabled === false && ifaSvc.auth.degraded === true &&
+      ifaAuthWarns.filter(l => l.startsWith('warn:')).length >= 1 &&
+      ifaAuthWarns.filter(l => l.startsWith('error:')).length >= 1 &&
+      typeof ifaSvc.auth.warning === 'string' && ifaSvc.auth.warning.includes('未配置') &&
+      ifaSvc.status().auth.degraded === true &&
+      ifaSvc.authorize({}, { path: '/ifa/dispatch' }).auth.degraded === true,
+      `auth.enabled=${ifaSvc.auth.enabled}；告警日志=${ifaAuthWarns.length} 条（warn ` +
+      `${ifaAuthWarns.filter(l => l.startsWith('warn:')).length} / error ` +
+      `${ifaAuthWarns.filter(l => l.startsWith('error:')).length}）`);
+
+    const authSvc = createDispatch({
+      db: ifaDb.db, logger: ifaLogger, now: ifaClock.source(),
+      auth: { enabled: true, token: IFA_TOKEN },
+      localEquipCode: '',        // 本机配置比对留空：本节只验鉴权，避免与 ③ 的告警混在一起
+      ifd: () => null
+    });
+    const ifaAuthLogBefore = ifaOpRows(IFA_OP_TYPE.AUTH).length;
+    const authNoToken = authSvc.authorize({}, { path: '/ifa/dispatch', kind: 'dispatch' });
+    const authBadToken = authSvc.authorize({ 'x-if-token': 'WRONG-TOKEN' },
+      { path: '/ifa/dispatch', kind: 'dispatch' });
+    const authGoodToken = authSvc.authorize({ authorization: 'Bearer ' + IFA_TOKEN },
+      { path: '/ifa/dispatch', kind: 'dispatch' });
+    const ifaAuthLogAfter = ifaOpRows(IFA_OP_TYPE.AUTH);
+    t.check('IF-A 访问控制②**配置令牌后**：无令牌 ⇒ 401／`AUTH_TOKEN_MISSING`，错令牌 ⇒ 403／`AUTH_TOKEN_INVALID`，' +
+      '正确令牌（`Authorization: Bearer` 或 `X-IF-Token`）⇒ 放行；两次失败各落一条 `op_log`（op_type=IF-A访问控制、' +
+      'result=失败），**且正文里不出现令牌本身**（不得把口令写进审计台账）',
+      authNoToken.ok === false && authNoToken.httpStatus === 401 &&
+      authNoToken.code === 'AUTH_TOKEN_MISSING' &&
+      authBadToken.ok === false && authBadToken.httpStatus === 403 &&
+      authBadToken.code === 'AUTH_TOKEN_INVALID' &&
+      authGoodToken.ok === true &&
+      ifaAuthLogAfter.length === ifaAuthLogBefore + 2 &&
+      ifaAuthLogAfter.every(r => r.result === '失败') &&
+      ifaAuthLogAfter.every(r => !String(r.content).includes(IFA_TOKEN)),
+      `无令牌=${authNoToken.httpStatus}/${authNoToken.code}；错令牌=${authBadToken.httpStatus}/${authBadToken.code}；` +
+      `对令牌 ok=${authGoodToken.ok}；留痕 ${ifaAuthLogBefore} → ${ifaAuthLogAfter.length} 条`);
+
+    /* ---- ⑤ 失败日志：脏入站 ⇒ 拒收 + 可读原因 + op_log（与成功留痕可区分） ---- */
+    const ifaRejectBefore = ifaOpRows(IFA_OP_TYPE.REJECT).length;
+    const ifaTaskBeforeDirty = ifaTaskRows();
+    const ifaDirtyCases = [
+      { name: '缺必填 procOrderNo', kind: IFA_KIND.DISPATCH, body: { batchNo: 'PC-1' },
+        code: 'MISSING_FIELD', field: 'procOrderNo' },
+      { name: 'procOrderNo 类型错（数字）', kind: IFA_KIND.DISPATCH, body: { procOrderNo: 20260927 },
+        code: 'BAD_TYPE', field: 'procOrderNo' },
+      { name: '派工数量非法（负数）', kind: IFA_KIND.DISPATCH, body: { procOrderNo: 'MES-X', dispatchQty: -5 },
+        code: 'BAD_VALUE', field: 'dispatchQty' },
+      { name: '派工数量非法（小数）', kind: IFA_KIND.DISPATCH, body: { procOrderNo: 'MES-X', dispatchQty: 1.5 },
+        code: 'BAD_VALUE', field: 'dispatchQty' },
+      { name: '计划开工时间非法（带 T）', kind: IFA_KIND.DISPATCH,
+        body: { procOrderNo: 'MES-X', planStartTime: '2026-09-27T08:00:00' }, code: 'BAD_TIME', field: 'planStartTime' },
+      { name: '物料缺物料标识（代码/名称都没有）', kind: IFA_KIND.MATERIAL, body: { procOrderNo: 'MES-X' },
+        code: 'MISSING_CONTENT', field: 'materialCode' },
+      { name: '工艺无任何工艺内容字段', kind: IFA_KIND.PROCESS, body: { procOrderNo: 'MES-X' },
+        code: 'MISSING_CONTENT', field: 'processNo' },
+      { name: '设备缺 equipCode', kind: IFA_KIND.DEVICE, body: { equipName: 'X' },
+        code: 'MISSING_FIELD', field: 'equipCode' },
+      { name: '报文体是数组', kind: IFA_KIND.DISPATCH, body: [1, 2], code: 'BODY_NOT_OBJECT', field: '(body)' },
+      { name: '未知入站种类', kind: 'nope', body: {}, code: 'UNKNOWN_KIND', field: '(kind)' }
+    ];
+    const ifaDirtyProblems = [];
+    const ifaDirtySeen = [];
+    for (const c of ifaDirtyCases) {
+      const r = ifaSvc.receive(c.kind, c.body, { path: '/ifa/' + c.kind });
+      ifaDirtySeen.push({ name: c.name, result: r });
+      if (r.ok !== false || r.outcome !== 'rejected') {
+        ifaDirtyProblems.push(`${c.name} → 竟被收下（${r.outcome}）`); continue;
+      }
+      if (!r.error || r.error.code !== c.code || r.error.field !== c.field) {
+        ifaDirtyProblems.push(`${c.name} → ${r.error && r.error.code}/${r.error && r.error.field}` +
+          `（期望 ${c.code}/${c.field}）`);
+      }
+      if (!r.error || typeof r.error.reason !== 'string' || r.error.reason.length < 8) {
+        ifaDirtyProblems.push(`${c.name} → 拒收原因不可读：${JSON.stringify(r.error && r.error.reason)}`);
+      }
+      if (!r.error || r.error.httpStatus !== 400) {
+        ifaDirtyProblems.push(`${c.name} → HTTP 状态码应为 400，实为 ${r.error && r.error.httpStatus}`);
+      }
+    }
+    t.check(`IF-A 失败日志：缺字段 / 类型错 / 数量非法（负数与小数）/ 时间非法 / 无可用业务内容 / 非对象 / 未知种类 ` +
+      `共 ${ifaDirtyCases.length} 类脏报文**全部拒收（400）**，每类都给出可读原因（code + field + reason）`,
+      ifaDirtyProblems.length === 0,
+      ifaDirtyProblems.length ? ifaDirtyProblems.join('；')
+        : `${ifaDirtyCases.length}/${ifaDirtyCases.length} 拒收；样例：${ifaDirtySeen[4].result.error.field}／` +
+          `${String(ifaDirtySeen[4].result.error.reason).slice(0, 40)}`);
+
+    const ifaRejectRows = ifaOpRows(IFA_OP_TYPE.REJECT);
+    t.check('IF-A 失败日志：**每一次拒收都留痕**（op_type=IF-A报文拒收、result=失败、正文含 code/field/原因），' +
+      '且**业务表一行未变**；与成功留痕（IF-A派工接收 result=成功）按 op_type/result 可区分 —— ' +
+      '这就是把技术债 E16 的"`op_log` 零调用方"接上的那一半',
+      ifaRejectRows.length === ifaRejectBefore + ifaDirtyCases.length &&
+      ifaRejectRows.every(r => r.result === '失败') &&
+      ifaRejectRows.every(r => String(r.content).includes('code=') && String(r.content).includes('原因=')) &&
+      ifaTaskRows() === ifaTaskBeforeDirty &&
+      ifaOpRows(IFA_OP_TYPE.DISPATCH).some(r => r.result === '成功'),
+      `拒收留痕 ${ifaRejectBefore} → ${ifaRejectRows.length} 条（脏报文 ${ifaDirtyCases.length} 类）；` +
+      `task ${ifaTaskBeforeDirty} → ${ifaTaskRows()} 行；成功留痕 ` +
+      `${ifaOpRows(IFA_OP_TYPE.DISPATCH).filter(r => r.result === '成功').length} 条`);
+
+    /* ---- ⑥ HTTP 最小端到端（进程内临时端口；手法同八之四） ---- */
+    const ifaHttpErrors = [];
+    const ifaRouter = createRouter({
+      getHealth: () => ({ ok: true }),
+      onError: err => { ifaHttpErrors.push(String(err && err.message)); }
+    });
+    const ifaMount = mountIfA(ifaRouter, { dispatch: ifaSvc });
+    const ifaServer = http.createServer((req, res) => {
+      Promise.resolve(ifaRouter.handle(req, res)).catch(() => { try { res.destroy(); } catch { /* 已断 */ } });
+    });
+    const ifaAuthRouter = createRouter({ getHealth: () => ({ ok: true }) });
+    const ifaAuthMount = mountIfA(ifaAuthRouter, { dispatch: authSvc });
+    const ifaAuthServer = http.createServer((req, res) => {
+      Promise.resolve(ifaAuthRouter.handle(req, res)).catch(() => { try { res.destroy(); } catch { /* 已断 */ } });
+    });
+    const ifaPort = await allocPort();
+    const ifaAuthPort = await allocPort();
+    await new Promise((resolve, reject) => {
+      ifaServer.once('error', reject);
+      ifaServer.listen(ifaPort, '127.0.0.1', resolve);
+    });
+    await new Promise((resolve, reject) => {
+      ifaAuthServer.once('error', reject);
+      ifaAuthServer.listen(ifaAuthPort, '127.0.0.1', resolve);
+    });
+    const ifaHttpPost = async (port, pathname, body, headers) => {
+      const res = await fetch(`http://127.0.0.1:${port}${pathname}`, {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}),
+        body: JSON.stringify(body)
+      });
+      return { status: res.status, body: await res.json() };
+    };
+    const ifaHttpGet = async (port, pathname) => {
+      const res = await fetch(`http://127.0.0.1:${port}${pathname}`);
+      return { status: res.status, body: await res.json() };
+    };
+
+    const ifaHttpDispatch = { procOrderNo: 'MES-2026-HTTP-1', productCode: 'CP-2026-A17', batchNo: 'PC-HTTP-1',
+      dispatchQty: 60, planStartTime: '2026-09-27 08:00:00', planEndTime: '2026-09-27 20:00:00' };
+    const ifaHttpMaterial = { procOrderNo: 'MES-2026-HTTP-1', materialCode: 'M-HTTP-1', materialName: '测试耗材',
+      qty: 3, unit: '件' };
+    const ifaHttpProcess = { procOrderNo: 'MES-2026-HTTP-1', processNo: '30', processName: '水下高速摄像检验',
+      processRoute: 'RT-HTTP-1', workInstruction: 'WI-HTTP-1' };
+
+    const ifaTaskBeforeHttp = ifaTaskRows();
+    const ifaMatBeforeHttp = ifaOpRows(IFA_OP_TYPE.MATERIAL).length;
+    const ifaProcBeforeHttp = ifaOpRows(IFA_OP_TYPE.PROCESS).length;
+    const ifaH1 = await ifaHttpPost(ifaPort, '/ifa/dispatch', ifaHttpDispatch);
+    const ifaH1Rows = ifaTaskRows();
+    const ifaH2 = await ifaHttpPost(ifaPort, '/ifa/dispatch', Object.assign({}, ifaHttpDispatch));
+    const ifaH2Rows = ifaTaskRows();
+    t.check('IF-A 端到端（进程内临时端口）：`POST /ifa/dispatch` 第 1 次 ⇒ 200/`stored` 且 **task 真的多一行**；' +
+      '同键第 2 次 ⇒ 200/`duplicate` 且**行数不变**（重复不算错误：MES 不会因此重发）',
+      ifaH1.status === 200 && ifaH1.body.outcome === 'stored' && ifaH1Rows === ifaTaskBeforeHttp + 1 &&
+      ifaH2.status === 200 && ifaH2.body.outcome === 'duplicate' && ifaH2Rows === ifaH1Rows,
+      `#1 HTTP ${ifaH1.status}/${ifaH1.body.outcome} → task ${ifaTaskBeforeHttp}→${ifaH1Rows} 行；` +
+      `#2 HTTP ${ifaH2.status}/${ifaH2.body.outcome} → task ${ifaH1Rows}→${ifaH2Rows} 行`);
+
+    const ifaH3 = await ifaHttpPost(ifaPort, '/ifa/material', ifaHttpMaterial);
+    const ifaH4 = await ifaHttpPost(ifaPort, '/ifa/material', Object.assign({}, ifaHttpMaterial));
+    const ifaMatAfterHttp = ifaOpRows(IFA_OP_TYPE.MATERIAL).length;
+    const ifaH5 = await ifaHttpPost(ifaPort, '/ifa/process', ifaHttpProcess);
+    const ifaH6 = await ifaHttpPost(ifaPort, '/ifa/process', Object.assign({}, ifaHttpProcess));
+    const ifaProcAfterHttp = ifaOpRows(IFA_OP_TYPE.PROCESS).length;
+    t.check('IF-A 端到端：`POST /ifa/material` 与 `POST /ifa/process` 各"成功 + 幂等重复" ⇒ 两类留痕各**只多 1 行**' +
+      '（`stored` 后 `duplicate` 不追加），HTTP 状态码一律 200',
+      ifaH3.status === 200 && ifaH3.body.outcome === 'stored' && ifaH4.body.outcome === 'duplicate' &&
+      ifaMatAfterHttp === ifaMatBeforeHttp + 1 &&
+      ifaH5.status === 200 && ifaH5.body.outcome === 'stored' && ifaH6.body.outcome === 'duplicate' &&
+      ifaProcAfterHttp === ifaProcBeforeHttp + 1,
+      `物料 HTTP ${ifaH3.body.outcome}/${ifaH4.body.outcome} → op_log ${ifaMatBeforeHttp}→${ifaMatAfterHttp} 行；` +
+      `工艺 HTTP ${ifaH5.body.outcome}/${ifaH6.body.outcome} → op_log ${ifaProcBeforeHttp}→${ifaProcAfterHttp} 行`);
+
+    const ifaTaskBeforeHttpBad = ifaTaskRows();
+    const ifaH7 = await ifaHttpPost(ifaPort, '/ifa/dispatch',
+      { procOrderNo: 'MES-2026-HTTP-2', planStartTime: '2026-09-27T08:00:00' });
+    const ifaH8 = await ifaHttpGet(ifaPort, '/ifa/status');
+    const ifaH9 = await ifaHttpGet(ifaPort, '/ifa/nope');
+    t.check('IF-A 端到端：`POST /ifa/dispatch` 脏报文（时间带 T）⇒ **400** + `ok:false` + `err.code/field/reason`，' +
+      '且**一行未落库**；`GET /ifa/status` 可读到计数 / 访问控制状态 / 权威侧与冲突；未注册路径仍 404（**未另起路由表**）',
+      ifaH7.status === 400 && ifaH7.body.ok === false && ifaH7.body.outcome === 'rejected' &&
+      ifaH7.body.err && ifaH7.body.err.code === 'BAD_TIME' && ifaH7.body.err.field === 'planStartTime' &&
+      ifaTaskRows() === ifaTaskBeforeHttpBad &&
+      ifaH8.status === 200 && ifaH8.body.mount === 'ifA' && ifaH8.body.mounted === true &&
+      ifaH8.body.counts && typeof ifaH8.body.counts.received === 'number' &&
+      ifaH8.body.auth && typeof ifaH8.body.auth.enabled === 'boolean' &&
+      ifaH8.body.authority && ifaH8.body.authority.equipCode &&
+      ifaH8.body.authority.equipCode.authoritative === IFA_IFA_CODE &&
+      ifaH9.status === 404,
+      `脏报文 HTTP ${ifaH7.status}/${ifaH7.body.err && ifaH7.body.err.code}；task ${ifaTaskBeforeHttpBad} → ` +
+      `${ifaTaskRows()} 行；/ifa/status=${ifaH8.status}（counts.received=${ifaH8.body.counts && ifaH8.body.counts.received}）；` +
+      `/ifa/nope=${ifaH9.status}`);
+
+    const ifaAuthTaskBefore = ifaTaskRows();
+    const ifaAuthLogBeforeHttp = ifaOpRows(IFA_OP_TYPE.AUTH).length;
+    /* ⚠ 用**另一个** procOrderNo：与 ⑥ 的成功用例区分开，否则这里拿到的是 `duplicate`，
+       会把"鉴定通过 ⇒ 正常处理"误判成失败（同库同键）。 */
+    const ifaAuthDispatch = Object.assign({}, ifaHttpDispatch, { procOrderNo: 'MES-2026-HTTP-AUTH-1' });
+    const ifaH10 = await ifaHttpPost(ifaAuthPort, '/ifa/dispatch', ifaAuthDispatch);
+    const ifaH11 = await ifaHttpPost(ifaAuthPort, '/ifa/dispatch', ifaAuthDispatch, { 'X-IF-Token': 'WRONG' });
+    /* ⚠ 鉴权先于报文校验：脏报文 + 无令牌必须回 **401**（而不是 400）—— 拒绝原因＝鉴权，不是参数（W2 判据②） */
+    const ifaH12 = await ifaHttpPost(ifaAuthPort, '/ifa/dispatch', { batchNo: 'no-proc-order-no' });
+    const ifaH13 = await ifaHttpPost(ifaAuthPort, '/ifa/dispatch', ifaAuthDispatch,
+      { Authorization: 'Bearer ' + IFA_TOKEN });
+    const ifaAuthTaskAfter = ifaTaskRows();
+    t.check('IF-A 端到端（访问控制）：配置令牌后 无令牌 ⇒ **401**、错令牌 ⇒ **403**，两者**都不落业务表**且各落一条 ' +
+      '`op_log`；**脏报文 + 无令牌 ⇒ 401 而不是 400**（鉴权先于参数校验，W2 判据②）；正确令牌 ⇒ 200 且正常落库',
+      ifaH10.status === 401 && ifaH10.body.err.code === 'AUTH_TOKEN_MISSING' &&
+      ifaH11.status === 403 && ifaH11.body.err.code === 'AUTH_TOKEN_INVALID' &&
+      ifaH12.status === 401 && ifaH12.body.err.code === 'AUTH_TOKEN_MISSING' &&
+      ifaH13.status === 200 && ifaH13.body.outcome === 'stored' &&
+      ifaAuthTaskAfter === ifaAuthTaskBefore + 1 &&
+      ifaOpRows(IFA_OP_TYPE.AUTH).length === ifaAuthLogBeforeHttp + 3,
+      `无令牌=${ifaH10.status}/${ifaH10.body.err && ifaH10.body.err.code}；错令牌=${ifaH11.status}/` +
+      `${ifaH11.body.err && ifaH11.body.err.code}；脏报文无令牌=${ifaH12.status}/` +
+      `${ifaH12.body.err && ifaH12.body.err.code}；对令牌=${ifaH13.status}/${ifaH13.body.outcome}；` +
+      `task ${ifaAuthTaskBefore} → ${ifaAuthTaskAfter} 行`);
+
+    t.check('IF-A 装配显式性：`mountIfA()` 返回 `mounted:true` 与已注册路由清单（四类入站 + 状态端点），' +
+      '且**不抛**（接线成功），与 W6 空壳 `router.mountIfA()` 的 `mounted:false` 形成可核查对照（D23 反静默空转）',
+      ifaMount.mounted === true && ifaMount.by === 'W2' && ifaMount.routes.length === 5 &&
+      ifaRouter.list().includes('POST /ifa/dispatch') && ifaRouter.list().includes('GET /ifa/status') &&
+      ifaAuthMount.mounted === true,
+      `mounted=${ifaMount.mounted}；routes=${ifaMount.routes.join(' , ')}`);
+
+    /* 原始输出取证（回执要引用"三类各一次成功 + 一次幂等重复"的原始响应） */
+    t.info('IF-A 端到端原始输出（HTTP 层，未加工）：');
+    t.info(`  #1 POST /ifa/dispatch  → HTTP ${ifaH1.status} ${JSON.stringify({ outcome: ifaH1.body.outcome, stored: ifaH1.body.stored, key: ifaH1.body.key, table: ifaH1.body.table })}`);
+    t.info(`  #2 POST /ifa/dispatch  → HTTP ${ifaH2.status} ${JSON.stringify({ outcome: ifaH2.body.outcome, stored: ifaH2.body.stored, key: ifaH2.body.key })}`);
+    t.info(`  #3 POST /ifa/material  → HTTP ${ifaH3.status} ${JSON.stringify({ outcome: ifaH3.body.outcome, sig: ifaH3.body.sig, table: ifaH3.body.table })}`);
+    t.info(`  #4 POST /ifa/material  → HTTP ${ifaH4.status} ${JSON.stringify({ outcome: ifaH4.body.outcome, sig: ifaH4.body.sig })}`);
+    t.info(`  #5 POST /ifa/process   → HTTP ${ifaH5.status} ${JSON.stringify({ outcome: ifaH5.body.outcome, sig: ifaH5.body.sig, table: ifaH5.body.table })}`);
+    t.info(`  #6 POST /ifa/process   → HTTP ${ifaH6.status} ${JSON.stringify({ outcome: ifaH6.body.outcome, sig: ifaH6.body.sig })}`);
+    t.info(`  #7 POST /ifa/dispatch  → HTTP ${ifaH7.status} ${JSON.stringify(ifaH7.body.err || ifaH7.body)}`);
+    t.info(`  #8 GET  /ifa/status    → HTTP ${ifaH8.status} ${JSON.stringify({ counts: ifaH8.body.counts, auth: { enabled: ifaH8.body.auth.enabled, degraded: ifaH8.body.auth.degraded }, authority: ifaH8.body.authority.equipCode })}`);
+    t.info(`  #9 POST /ifa/dispatch（无令牌） → HTTP ${ifaH10.status} ${JSON.stringify(ifaH10.body.err || ifaH10.body)}`);
+    t.info(`  #10 POST /ifa/dispatch（错令牌）→ HTTP ${ifaH11.status} ${JSON.stringify(ifaH11.body.err || ifaH11.body)}`);
+    t.info(`  #11 POST /ifa/dispatch（脏报文+无令牌）→ HTTP ${ifaH12.status} ${JSON.stringify(ifaH12.body.err || ifaH12.body)}`);
+    t.info(`  #12 POST /ifa/dispatch（正确令牌）   → HTTP ${ifaH13.status} ${JSON.stringify({ outcome: ifaH13.body.outcome, stored: ifaH13.body.stored })}`);
+
+    await new Promise(resolve => ifaServer.close(resolve));
+    await new Promise(resolve => ifaAuthServer.close(resolve));
+    t.check('IF-A 端到端：HTTP 处理期间无未捕获异常（onError 未收到 500）',
+      ifaHttpErrors.length === 0, ifaHttpErrors.join(' / '));
+  }
+  ifaDb.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
 
   /* ---------------- 九、清理与残留 ---------------- */
   t.section('九、临时区与残留');

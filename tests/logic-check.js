@@ -20,6 +20,9 @@ const { createClock, BOUNDARIES } = require('./lib/clock');
 const cfg = require('../src/config/board.config.js');
 const { createShiftRules } = require('../server/services/shift');
 const stats = require('../server/services/stats');
+/* W3（判定引擎）：服务端权威实现 ＋ 与前端演示实现对账用的标准换算（**只读复用**，不另写取数） */
+const judgeSvc = require('../server/services/judge');
+const standardSvc = require('../server/services/standard');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -44,7 +47,8 @@ function mixed(spec) {
    加载手法与 `tests/ui-check.js` 的 `loadUi()`／`tests/contract-check.js` 的
    `createIsolatedHarness()` **完全一致**（vm.createContext ＋ 按 index.html 顺序 run 源码），
    此处只取本用例需要的最小加载集（config → fieldMap → format → mockData），**不另造框架**。 */
-function loadFrontEnd(list) {
+function loadFrontEnd(list, options) {
+  const opts = options || {};
   const sandbox = { console };
   sandbox.window = sandbox;
   vm.createContext(sandbox);
@@ -52,18 +56,69 @@ function loadFrontEnd(list) {
     { filename: path.join(ROOT, rel) });
   run('src/config/board.config.js');
   /* 班次定义在 mockData.js **加载时**就快照进 SHIFTS ⇒ 必须先改配置再加载
-     （与 contract-check 的 `mutate` 钩子同一个原因） */
+     （与 contract-check 的 `mutate` 钩子同一个原因）；`queueDepth` 同理（W3 的工单超时用例
+     需要一个"待测队列 > 阈值"的演示现场，而它也是加载期快照） */
   sandbox.window.BoardConfig.shift.list = list;
+  if (typeof opts.queueDepth === 'number') sandbox.window.BoardConfig.production.queueDepth = opts.queueDepth;
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
   run('src/services/mockData.js');
+  const M = sandbox.window.MockData;
+  const ctxMath = vm.runInContext('Math', sandbox);   // 上下文内 `Math` 的**同一份**对象（冻结随机游走用）
   return {
+    /** 该实例自己的配置对象（W3 的"阈值可配"用例只在内存里改它，不落盘） */
+    config: sandbox.window.BoardConfig,
+    mockData: M,
     /** 驱动一次 tick，返回头屏消费的 state.shift 字段（异常原样抛出，供"必须显式抛错"用例断言） */
     tickAt(iso) {
       sandbox.window.MockData.tick(vm.runInContext(`new Date(${JSON.stringify(iso)})`, sandbox));
       const s = sandbox.window.MockData.state.shift;
       return { name: s.name, start: s.start, end: s.end, range: s.range,
         elapsed: s.elapsed, total: s.total, pct: s.pct };
+    },
+    /**
+     * W3 用：**冻结随机游走**后走一帧，返回前端演示实现的判定与预警现场。
+     *   · `Math.random` 顶成 0.5 ⇒ 步长恒 0 ⇒ 实测值不再游走，判据完全确定（与 ui-check 的
+     *     R26-P2-2 用例同一手法），不依赖"碰巧扫到某一帧"；
+     *   · 只写**运行时真源** `state.task.standard`（FR-3.19 现场录入）与 `state.task.real`（实测），
+     *     再由 `tick()` 触发重算 —— 走的正是 `buildParamWarnings()` / `buildWarnings()` 真路径
+     *     （它们未导出：public surface 只有 standardLevel / standardSpecOf / tick / state）；
+     *   · 速度只能由 vx/vy 合成（令 vy=0 ⇒ speed = |vx|），故用例的实测值都取在演示 clamps 内；
+     *   · `finally` 无条件还原 `Math.random` 与标准（后续用例不受影响）。
+     * @returns {{real:{depth:number,speed:number}, levels:Array, ctx:object, warnings:Array}}
+     */
+    freezeTick(iso, standard, real) {
+      const savedRandom = ctxMath.random;
+      const savedStandard = M.state.task.standard;
+      try {
+        ctxMath.random = () => 0.5;
+        M.state.task.standard = standard;
+        if (real && typeof real === 'object') {
+          if (real.depth !== undefined) M.state.task.real.depth = real.depth;
+          if (real.speed !== undefined) { M.state.task.real.vx = real.speed; M.state.task.real.vy = 0; }
+        }
+        M.tick(vm.runInContext(`new Date(${JSON.stringify(iso)})`, sandbox));
+        const got = { depth: M.state.task.real.depth, speed: M.state.task.real.speed };
+        return {
+          real: got,
+          levels: ['depth', 'speed'].map(kind => {
+            const spec = M.standardSpecOf(kind);
+            return { kind, lv: M.standardLevel(got[kind], spec) };
+          }),
+          ctx: {
+            maintDaysLeft: M.state.maint.daysLeft,
+            maintNext: M.state.maint.next,
+            /* 耗材累计点亮时长＝演示基准 + 已完成任务数（与 mockData 的演示算式同源；
+               基准从 MockData.CFG 读，**不在断言里另写一份 780**） */
+            lampHours: M.CFG.lampBaseline + Math.floor(M.state.stats.done || 0),
+            pending: M.state.stats.pending
+          },
+          warnings: (M.state.warnings || []).map(x => ({ title: x.title, lv: x.lv, detail: x.detail }))
+        };
+      } finally {
+        ctxMath.random = savedRandom;
+        M.state.task.standard = savedStandard;
+      }
     }
   };
 }
@@ -439,6 +494,530 @@ t.section('六、与 board.config.js 的一致性（前后端同一份口径）'
   t.check('班次名称与配置列表逐项一致',
     shifts.names().join('|') === cfg.shift.list.map(s => s.name).join('|'),
     shifts.names().join(' / '));
+}
+
+/* ---------------- 七、判定引擎（服务端权威实现）：标准导出 / 三态 / 闭边界 ----------------
+   本段与以下三段（八 / 九 / 十）是 **W3（服务层第二笔·第 1 波）** 的判据：
+     · 判定对象＝**深度与速度的测试标准上下限**（FR-3.14 / C-75）；相机参数不参与（C-84④）；
+     · 上下限由「典型值 ± 上/下偏差」导出（FR-3.18 / FR-3.19 / C-90），**取数复用
+       `server/services/standard.js`**（不在判定引擎里重写第二套）；
+     · 三态闭边界（FR-3.18）：**压线（恰等于上下限）不算超范围**、**距边界恰等于带宽算临近**；
+     · 标准未设定 / 实测缺测 ⇒ idle，**不判合格、不判超范围、不出参数类预警**；
+     · 五态（FR-3.13）：待测试 / 测试中 / 合格 / 不合格 / 待复检（进入条件见 §八的说明）。
+   期望值一律由**配置真源**（`board.config.js` 的 standards / maintenance / warnings）推出，
+   不写手算魔数 —— 改配置后本段期望值自动跟随。 */
+t.section('七、判定引擎：标准上下限导出与三态闭边界（FR-3.13 / FR-3.14 / FR-3.18）');
+{
+  const STD = cfg.standards;
+  const GRID = 1 / Math.pow(10, STD.digits);          // 显示精度一格（两位小数 ⇒ 0.01）
+  const dSpec = STD.default.depth;                    // 演示默认标准：深度典型值 5.00、偏差 +0.30/−0.20
+  const sSpec = STD.default.speed;
+  /** 由"典型值 ± 偏差"导出上下限与临近带宽（**只用于构造用例输入**，不是被测实现） */
+  const bandOf = spec => {
+    const upper = standardSvc.round2(spec.typical + spec.upperDev);
+    const lower = standardSvc.round2(spec.typical + spec.lowerDev);
+    const tol = (upper - lower) * STD.nearRatio;
+    return { upper, lower, tol, k: Math.max(1, Math.ceil(tol / GRID - 1e-9)) };
+  };
+  const dB = bandOf(dSpec);
+  const sB = bandOf(sSpec);
+  /** 对称带（上下偏差等值）：跨度恰为**整数格**的倍数 ⇒ 可做"距边界**恰等于**带宽"的值级用例 */
+  const symSpec = { unit: dSpec.unit, digits: STD.digits,
+    typical: dSpec.typical, upperDev: dSpec.upperDev, lowerDev: -dSpec.upperDev };
+  const symB = bandOf(symSpec);
+
+  const judgeOk = t.requires('判定引擎入口可用（judge.standardLevel / limits / buildParamWarnings / taskResult）',
+    !!judgeSvc && typeof judgeSvc.standardLevel === 'function' && typeof judgeSvc.limits === 'function' &&
+    typeof judgeSvc.buildParamWarnings === 'function' && typeof judgeSvc.taskResult === 'function', '');
+  t.requires('标准真源齐备：standards.default 的深度/速度三格与 nearRatio / digits 均为有限数',
+    ['depth', 'speed'].every(k => STD.default[k] &&
+      ['typical', 'upperDev', 'lowerDev'].every(f => Number.isFinite(STD.default[k][f]))) &&
+    Number.isFinite(STD.nearRatio) && Number.isFinite(STD.digits),
+    `digits=${STD.digits} nearRatio=${STD.nearRatio}`);
+  const symExact = t.requires('用例前提：对称带的临近带宽恰为整数格（值级"等号"用例才成立）',
+    Math.abs(symB.tol - symB.k * GRID) < 1e-9,
+    `对称带 [${symB.lower}, ${symB.upper}] 跨度 ${symB.upper - symB.lower} ⇒ 带宽 ${symB.tol} = ${symB.k} 格`);
+
+  /* ① 上下限导出（FR-3.18：上限＝典型值＋上偏差、下限＝典型值＋下偏差） */
+  const limD = judgeSvc.limits({ depth: dSpec });
+  const limS = judgeSvc.limits({ speed: sSpec });
+  t.check('FR-3.18 深度上下限＝典型值＋上偏差／下偏差（导出值，典型值不参与判定）',
+    !!judgeOk && limD.depth && limD.depth.upper === standardSvc.round2(dSpec.typical + dSpec.upperDev) &&
+    limD.depth.lower === standardSvc.round2(dSpec.typical + dSpec.lowerDev),
+    `实测上限 ${limD.depth && limD.depth.upper}、下限 ${limD.depth && limD.depth.lower}` +
+    `（配置典型值 ${dSpec.typical}、上偏差 ${dSpec.upperDev}、下偏差 ${dSpec.lowerDev}）`);
+  t.check('FR-3.18 速度上下限＝典型值＋上偏差／下偏差（同口径）',
+    !!judgeOk && limS.speed && limS.speed.upper === standardSvc.round2(sSpec.typical + sSpec.upperDev) &&
+    limS.speed.lower === standardSvc.round2(sSpec.typical + sSpec.lowerDev),
+    `实测上限 ${limS.speed && limS.speed.upper}、下限 ${limS.speed && limS.speed.lower}`);
+  /* 复用证据（而不是"看起来一样"）：DR-03 库行形态与运行期真源形态导出**同一组**上下限，
+     且与 `services/standard.js` 的 `absoluteLimits()` 逐值相同 ⇒ 判定引擎没有第二套取数。 */
+  const rowForm = { depthTypical: dSpec.typical, depthUpperDev: dSpec.upperDev, depthLowerDev: dSpec.lowerDev,
+    speedTypical: sSpec.typical, speedUpperDev: sSpec.upperDev, speedLowerDev: sSpec.lowerDev };
+  const limRow = judgeSvc.limits(rowForm);
+  const absRow = standardSvc.absoluteLimits(rowForm);
+  t.check('上下限取数**复用** services/standard.js：库行形态与运行期形态导出同一组值（非第二套实现）',
+    !!judgeOk && ['depth', 'speed'].every(k => limRow[k] && absRow[k] &&
+      limRow[k].upper === absRow[k].upper && limRow[k].lower === absRow[k].lower &&
+      limRow[k].upper === (k === 'depth' ? limD.depth.upper : limS.speed.upper)),
+    `库行形态 ${JSON.stringify(limRow)} vs absoluteLimits ${JSON.stringify(absRow)}`);
+  t.check('FR-3.18 必要项缺一即"标准未设定"（导出 null ⇒ 不判定、不预警）',
+    judgeSvc.limits({ depth: { typical: dSpec.typical, upperDev: dSpec.upperDev } }).depth === null &&
+    judgeSvc.limits({ depth: { unit: dSpec.unit } }).depth === null &&
+    judgeSvc.limits({ depth: { typical: dSpec.typical, upperDev: dSpec.upperDev, lowerDev: dSpec.lowerDev } }).depth !== null,
+    '半套（缺下偏差）与空套都判未设定；三格齐则给出上下限');
+
+  /* ② 三态与**闭边界**（FR-3.18）—— 每一条都同时给出"判据"与"前一格/后一格"的对照 */
+  t.check('FR-3.18 压线不算超范围：实测**恰等于上限** ⇒ ok',
+    judgeSvc.standardLevel(dB.upper, dSpec).lv === 'ok',
+    `实测 ${dB.upper}（＝上限）、标准带 [${dB.lower}, ${dB.upper}] ⇒ ${judgeSvc.standardLevel(dB.upper, dSpec).lv}`);
+  t.check('FR-3.18 压线不算超范围：实测**恰等于下限** ⇒ ok',
+    judgeSvc.standardLevel(dB.lower, dSpec).lv === 'ok',
+    `实测 ${dB.lower}（＝下限）⇒ ${judgeSvc.standardLevel(dB.lower, dSpec).lv}`);
+  const lineWarnings = judgeSvc.buildParamWarnings({ real: { depth: dB.upper, speed: dB.lower }, standard: { depth: dSpec, speed: sSpec } });
+  t.check('压线帧不产生任何参数类预警（恰等于上/下限时不进 err、也不进 warn）',
+    lineWarnings.length === 1 && lineWarnings[0].lv === 'ok' && !/判(超范围|临近)/.test(lineWarnings[0].detail),
+    `压线帧参数类 ${lineWarnings.length} 条：${lineWarnings.map(w => `${w.title}/${w.lv}`).join('、')}`);
+  t.check('FR-3.18 临近带**闭边界**：距上限恰等于带宽（' + dB.k + ' 格，值 ' + standardSvc.round2(dB.k * GRID) + '）⇒ warn',
+    judgeSvc.standardLevel(standardSvc.round2(dB.upper - dB.k * GRID), dSpec).lv === 'warn',
+    `实测 ${standardSvc.round2(dB.upper - dB.k * GRID)} 距上限 ${dB.k} 格（带宽 ${dB.tol} ⇒ ${dB.k} 格）⇒ ` +
+    `${judgeSvc.standardLevel(standardSvc.round2(dB.upper - dB.k * GRID), dSpec).lv}`);
+  t.check('FR-3.18 临近带**再外一格**（' + (dB.k + 1) + ' 格）⇒ ok（不得把带宽放大一格）',
+    judgeSvc.standardLevel(standardSvc.round2(dB.upper - (dB.k + 1) * GRID), dSpec).lv === 'ok',
+    `实测 ${standardSvc.round2(dB.upper - (dB.k + 1) * GRID)} 距上限 ${dB.k + 1} 格 ⇒ ` +
+    `${judgeSvc.standardLevel(standardSvc.round2(dB.upper - (dB.k + 1) * GRID), dSpec).lv}`);
+  t.check('FR-3.18 值级等号（带宽恰为整数格）：实测距上限**恰等于** (上限−下限)×nearRatio ⇒ warn',
+    symExact && judgeSvc.standardLevel(standardSvc.round2(symB.upper - symB.tol), symSpec).lv === 'warn',
+    symExact ? `实测 ${standardSvc.round2(symB.upper - symB.tol)}（＝上限 ${symB.upper} − 带宽 ${symB.tol}）⇒ ` +
+      `${judgeSvc.standardLevel(standardSvc.round2(symB.upper - symB.tol), symSpec).lv}`
+      : '前提不成立（带宽非整数格，本用例无从成立）');
+  t.check('FR-3.18 值级等号**再外一格**：距上限＝带宽＋一格 ⇒ ok',
+    symExact && judgeSvc.standardLevel(standardSvc.round2(symB.upper - symB.tol - GRID), symSpec).lv === 'ok',
+    symExact ? `实测 ${standardSvc.round2(symB.upper - symB.tol - GRID)} ⇒ ` +
+      `${judgeSvc.standardLevel(standardSvc.round2(symB.upper - symB.tol - GRID), symSpec).lv}`
+      : '前提不成立');
+  t.check('FR-3.18 上限外一格 ⇒ err（超范围）',
+    judgeSvc.standardLevel(standardSvc.round2(dB.upper + GRID), dSpec).lv === 'err' &&
+    judgeSvc.standardLevel(standardSvc.round2(sB.upper + GRID), sSpec).lv === 'err',
+    `深度 ${standardSvc.round2(dB.upper + GRID)}（上限 ${dB.upper}）、速度 ${standardSvc.round2(sB.upper + GRID)}（上限 ${sB.upper}）均判 err`);
+  t.check('FR-3.18 下限外一格 ⇒ err（下侧与上侧同规则）',
+    judgeSvc.standardLevel(standardSvc.round2(dB.lower - GRID), dSpec).lv === 'err',
+    `实测 ${standardSvc.round2(dB.lower - GRID)}（下限 ${dB.lower}）⇒ ${judgeSvc.standardLevel(standardSvc.round2(dB.lower - GRID), dSpec).lv}`);
+  t.check('FR-3.18 三态区间上下对称：同距离格数的上/下侧判到同一个态',
+    [0, 1, 2, dB.k, dB.k + 1, dB.k + 5].every(n =>
+      judgeSvc.standardLevel(standardSvc.round2(dB.upper - n * GRID), dSpec).lv ===
+      judgeSvc.standardLevel(standardSvc.round2(dB.lower + n * GRID), dSpec).lv),
+    `上侧与下侧各取 ${[0, 1, 2, dB.k, dB.k + 1, dB.k + 5].join('/')} 格：` +
+    [0, 1, 2, dB.k, dB.k + 1, dB.k + 5].map(n =>
+      `${n}格→${judgeSvc.standardLevel(standardSvc.round2(dB.upper - n * GRID), dSpec).lv}`).join('、'));
+
+  /* ③ idle（标准未设定 / 实测缺测）—— 不得误判成合格或超范围 */
+  t.check('idle：标准未设定（典型值缺失）⇒ 不判合格、不判超范围',
+    judgeSvc.standardLevel(dB.upper, { unit: dSpec.unit }).lv === 'idle' &&
+    judgeSvc.standardLevel(0, null).lv === 'idle',
+    'spec 缺三格 ⇒ idle（与"实测恰在标准外"无关，判据本身不成立）');
+  t.check('idle：实测缺测（NaN / null / undefined / 字符串）⇒ idle',
+    [NaN, null, undefined, '5.00'].every(v => judgeSvc.standardLevel(v, dSpec).lv === 'idle'),
+    '非有限数一律不判定（含字符串，避免"看着像数"就判）');
+  t.check('C-84④ 相机参数不参与判定：把帧率/增益/快门塞进实测与标准也不改变参数类结论',
+    (() => {
+      const base = { real: { depth: dB.upper + GRID, speed: sSpec.typical }, standard: { depth: dSpec, speed: sSpec } };
+      const withCam = { real: Object.assign({}, base.real, { fps: 999, gain: 9.9, shutter: 1, cameraDepth: 99 }),
+        standard: Object.assign({}, base.standard, { fps: { typical: 400, upperDev: 1, lowerDev: -1 } }) };
+      const a = judgeSvc.buildParamWarnings(base), b = judgeSvc.buildParamWarnings(withCam);
+      return a.length === b.length && a.every((w, i) => w.title === b[i].title && w.lv === b[i].lv && w.detail === b[i].detail);
+    })(),
+    `判定对象恰为 [${judgeSvc.PARAMS.join(', ')}]（相机参数既不出条、也不改判据）`);
+}
+
+/* ---------------- 八、单任务五态（FR-3.13） ----------------
+   "待复检"的进入条件是本实现的选择：需求 FR-3.13 只列出五个状态、**全篇未定义进入规则**
+   （FR-4.9 只说"复检数＝当班进入复检流程的任务数"，DR-05 只有"复检次数"）。
+   本实现选择"**我方判定依据不成立（标准未设定 / 实测缺测）时进复检**"，理由：
+     ① FR-3.18/C-93 与 FR-5.8 明写"标准未设定 ⇒ 不判定、不预警" ⇒ 此时既不能判合格也不能判不合格，
+        必须有一个显式待处理状态（否则默认成合格＝伪造判定）；
+     ② FR-3.19 允许现场补录标准 ⇒ 补录后可**不重测**直接复判，正是"复检"语义；
+     ③ 实测缺测同理（拿不到实测值就判不了）。
+   **临近（warn）不进复检**：FR-3.14 只规定"黄=临近"高亮，红才是"超标" ⇒ 临近仍判合格。
+   ⚠ 若负责人日后要求"临近即复检"，只需改 `judge.taskResult()` 一处（本包只报告，不代替拍板）。 */
+t.section('八、单任务五态：待测试 / 测试中 / 合格 / 不合格 / 待复检（FR-3.13）');
+{
+  const STD = cfg.standards;
+  const GRID = 1 / Math.pow(10, STD.digits);
+  const dSpec = STD.default.depth;
+  const sSpec = STD.default.speed;
+  const upper = standardSvc.round2(dSpec.typical + dSpec.upperDev);
+  const lower = standardSvc.round2(dSpec.typical + dSpec.lowerDev);
+  const tol = (upper - lower) * STD.nearRatio;
+  const k = Math.max(1, Math.ceil(tol / GRID - 1e-9));
+  const nearVal = standardSvc.round2(upper - k * GRID);          // 上侧临近带的闭边界
+  const std = { depth: dSpec, speed: sSpec };
+  const okReal = { depth: dSpec.typical, speed: sSpec.typical };
+  const idlish = { depth: { unit: dSpec.unit }, speed: { unit: sSpec.unit } };
+  const T = input => judgeSvc.taskResult(input);
+
+  t.check('FR-3.13 待测试：进度 0（未开工）⇒ 待测试',
+    T({ progress: 0, real: okReal, standard: std }).result === '待测试' &&
+    T({ progress: undefined, real: okReal, standard: std }).result === '待测试' &&
+    T({ progress: null, real: okReal, standard: std }).result === '待测试',
+    'progress 0 / undefined / null ⇒ 待测试（判定不成立时不得凭空给出结论）');
+  t.check('FR-3.13 测试中：0 < 进度 < 1 ⇒ 测试中（含 1 之前的最后一个刻度）',
+    T({ progress: 0.01, real: okReal, standard: std }).result === '测试中' &&
+    T({ progress: 0.5, real: okReal, standard: std }).result === '测试中' &&
+    T({ progress: 0.9999, real: okReal, standard: std }).result === '测试中',
+    '进度未到 100% 一律"测试中"（不提前给判定结论）');
+  t.check('FR-3.13 合格：进度 1（可判定）且深度/速度都在标准闭区间内 ⇒ 合格',
+    T({ progress: 1, real: okReal, standard: std }).result === '合格',
+    `实测 深度 ${okReal.depth}、速度 ${okReal.speed}；标准带 [${lower}, ${upper}]`);
+  t.check('FR-3.13 合格（压线边界）：实测恰等于上限 ⇒ 合格（压线不算超范围）',
+    T({ progress: 1, real: { depth: upper, speed: sSpec.typical }, standard: std }).result === '合格',
+    `深度 ${upper}（＝上限）⇒ ${T({ progress: 1, real: { depth: upper, speed: sSpec.typical }, standard: std }).result}`);
+  t.check('FR-3.13 合格（临近不改变结论）：实测落临近带 ⇒ 仍合格，但会出「参数阈值临近预警」',
+    T({ progress: 1, real: { depth: nearVal, speed: sSpec.typical }, standard: std }).result === '合格' &&
+    judgeSvc.buildParamWarnings({ real: { depth: nearVal, speed: sSpec.typical }, standard: std })
+      .some(w => w.title === '参数阈值临近预警' && w.lv === 'warn'),
+    `深度 ${nearVal} ⇒ ${T({ progress: 1, real: { depth: nearVal, speed: sSpec.typical }, standard: std }).result}` +
+    '（黄=临近只高亮＋联动预警，红=超标才不合格）');
+  t.check('FR-3.13 不合格：进度 1 且任一参数超范围 ⇒ 不合格',
+    T({ progress: 1, real: { depth: standardSvc.round2(upper + GRID), speed: sSpec.typical }, standard: std }).result === '不合格' &&
+    T({ progress: 1, real: { depth: sSpec.typical, speed: standardSvc.round2(sSpec.typical + sSpec.upperDev + GRID) }, standard: std }).result === '不合格',
+    '深度越上限、速度越上限各自都能单独判"不合格"');
+  const retest = T({ progress: 1, real: okReal, standard: idlish });
+  t.check('FR-3.13 待复检：标准未设定（必要项缺失）⇒ 待复检（不得默认成合格）',
+    retest.result === '待复检' &&
+    retest.undetermined.length === 2 &&
+    retest.undetermined.every(u => u.why === '标准未设定'),
+    `${retest.result} —— ${retest.reason}`);
+  const missing = T({ progress: 1, real: { depth: NaN, speed: sSpec.typical }, standard: std });
+  t.check('FR-3.13 待复检：实测缺测（单参数 NaN）⇒ 待复检，且只有缺测的那个参数未判定',
+    missing.result === '待复检' && missing.undetermined.length === 1 &&
+    missing.undetermined[0].kind === 'depth' && missing.undetermined[0].why === '实测缺测',
+    `${missing.result} —— ${missing.reason}`);
+  t.check('FR-3.13/FR-3.14 判定对象只有深度与速度：五态产物里不含任何相机参数',
+    ['depth', 'speed'].every(kind => T({ progress: 1, real: okReal, standard: std })
+      .levels.some(l => l.kind === kind)) &&
+    T({ progress: 1, real: okReal, standard: std }).levels.length === 2 &&
+    T({ progress: 1, real: Object.assign({}, okReal, { fps: 1, gain: 1, cameraDepth: 1 }), standard: std })
+      .levels.length === 2,
+    'levels 恰两项（深度/速度）；往实测里塞相机参数也不进判定');
+}
+
+/* ---------------- 九、跨实现对账：服务端 judge ≡ 前端 mockData ----------------
+   为什么必须对账：`src/services/mockData.js` 的判定/预警是**浏览器侧的第二份同类实现**
+   （演示用，本包一行不得改），服务端 `judge.js` 是**权威实现**；两份一旦分叉，现场看到的
+   三态/预警与上报 MES 的口径就会各说各话。本段用**同一组输入序列**（15 组：正常 / 临近 /
+   超范围 / 压线（上、下）/ 临近带外一格 / 同态 err / 同态 warn / 混态 / idle / 缺测 /
+   跨零点班次 / 单参数 idle / 工单超时 / 耗材更换）逐条比对。
+   前端侧走**真路径**：只写运行时真源 `state.task.standard` / `state.task.real` 后 `tick()`
+   （冻结 `Math.random` ⇒ 实测值确定，不靠随机命中）；服务端侧把**前端回读的同一组输入**
+   （实测值、标准、now、耗材累计时长、待测队列件数）喂给 `judge.buildWarnings()`。
+   **比较规则**（选定理由随附）：
+     ① 硬判据 ＝ 逐条、按序、**逐字**相等：**条数 / 顺序 / 名称 / 等级** —— 这是 C-88
+        「名称与等级色一一对应」与「同态独立成条」的载体，容不得任何格式宽松；
+     ② **参与参数**＝每条 detail 中出现的参数名个数（深度/速度），两侧必须相等（参数错配即红）；
+     ③ detail 的**数值与单位**：按"数值多重集（容差半格 0.005）＋ 单位记号多重集"比对，
+        **允许格式微差**（空格 / 连接符 / 全半角 / 千分位等）—— 需求只规定判据数值与单位表述、
+        不规定文案排版；容差取半格，是因为显示精度为两位小数（0.01），小于半格不可能是有意差异；
+     ④ **加严项（非需求要求，本实现下已成立）**：detail 全文**逐字一致**，另立一条断言钉住，
+        将来任一侧文案单改会立刻变红，提示口径漂移。
+   输入序列的实测值都取在前端演示 clamps 内（深度 [4.77,5.33]、vx [4.78,5.22]，速度由 vx/vy 合成），
+   否则前端 `tick()` 会把值夹回去，"同一组输入"就不成立（这也是本段所有取值都由配置推导的原因）。 */
+t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（15 组输入序列）');
+{
+  const STD = cfg.standards;
+  const GRID = 1 / Math.pow(10, STD.digits);
+  const r2 = standardSvc.round2;
+  const dSpec = STD.default.depth;
+  const sSpec = STD.default.speed;
+  const bandOf = spec => {
+    const upper = r2(spec.typical + spec.upperDev);
+    const lower = r2(spec.typical + spec.lowerDev);
+    const tol = (upper - lower) * STD.nearRatio;
+    return { upper, lower, tol, k: Math.max(1, Math.ceil(tol / GRID - 1e-9)) };
+  };
+  const dB = bandOf(dSpec);
+  const sB = bandOf(sSpec);
+  /** 量程下沿 + 3 格、偏差 ±1 格 ⇒ 导出上下限远低于实测 ⇒ 必为超范围（落在量程内的合法行） */
+  const errSpec = kind => ({ unit: kind === 'depth' ? 'm' : 'm/s', digits: STD.digits,
+    typical: STD.range[kind].min + 3 * GRID, upperDev: GRID, lowerDev: -GRID });
+
+  const CASES = [
+    { id: 'C01', name: '正常（两参数均 ok）', fe: 'default', iso: '2026-09-18T15:30:00',
+      depth: dSpec.typical, speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C02', name: '深度临近（距上限恰等于带宽 ' + dB.k + ' 格）', fe: 'default', iso: '2026-09-18T15:30:01',
+      depth: r2(dB.upper - dB.k * GRID), speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C03', name: '深度超范围（上限外一格）', fe: 'default', iso: '2026-09-18T15:30:02',
+      depth: r2(dB.upper + GRID), speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C04', name: '压线（实测恰等于上限）', fe: 'default', iso: '2026-09-18T15:30:03',
+      depth: dB.upper, speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C05', name: '压线（实测恰等于下限）', fe: 'default', iso: '2026-09-18T15:30:04',
+      depth: dB.lower, speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C06', name: '临近带外一格（' + (dB.k + 1) + ' 格 ⇒ ok）', fe: 'default', iso: '2026-09-18T15:30:05',
+      depth: r2(dB.upper - (dB.k + 1) * GRID), speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C07', name: '同态 err（深/速同时超范围）', fe: 'default', iso: '2026-09-18T15:30:06',
+      depth: dSpec.typical, speed: sSpec.typical, standard: { depth: errSpec('depth'), speed: errSpec('speed') } },
+    { id: 'C08', name: '同态 warn（深/速同时临近）', fe: 'default', iso: '2026-09-18T15:30:07',
+      depth: r2(dB.upper - dB.k * GRID), speed: r2(sB.upper - sB.k * GRID),
+      standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C09', name: '混态（深度临近 + 速度超范围）', fe: 'default', iso: '2026-09-18T15:30:08',
+      depth: r2(dB.upper - dB.k * GRID), speed: sSpec.typical,
+      standard: { depth: dSpec, speed: errSpec('speed') } },
+    { id: 'C10', name: 'idle（两参数标准均未设定）', fe: 'default', iso: '2026-09-18T15:30:09',
+      depth: dSpec.typical, speed: sSpec.typical,
+      standard: { depth: { unit: dSpec.unit }, speed: { unit: sSpec.unit } } },
+    { id: 'C11', name: '缺测（深度实测缺失 ⇒ idle，速度临近）', fe: 'default', iso: '2026-09-18T15:30:10',
+      depth: NaN, speed: r2(sB.upper - sB.k * GRID), standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C12', name: '跨零点班次（22→6 的 03:00，深度临近）', fe: 'night', iso: '2026-09-20T03:00:00',
+      depth: r2(dB.upper - dB.k * GRID), speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C13', name: '单参数 idle（深度未设定）+ 速度正常', fe: 'default', iso: '2026-09-18T15:30:12',
+      depth: dSpec.typical, speed: sSpec.typical,
+      standard: { depth: { unit: dSpec.unit }, speed: sSpec } },
+    { id: 'C14', name: '工单超时（队列 > 配置阈值）', fe: 'queue', iso: '2026-09-18T00:00:30',
+      depth: dSpec.typical, speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    { id: 'C15', name: '耗材更换（点亮时长 > 配置阈值）', fe: 'default', iso: '2026-09-18T12:00:00',
+      depth: dSpec.typical, speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } }
+  ];
+  const NIGHT1 = [{ name: '夜班', start: 22, end: 6 }];
+  /* 队列用例要一个"待测队列 > 工单超时阈值"的演示现场：阈值取配置真源，队列深度加一档余量；
+     `production.queueDepth` 是 mockData 的**加载期快照** ⇒ 必须在加载前覆盖（内存，不落盘） */
+  const QUEUE_OVER = cfg.warnings.orderOverduePending + 40;
+
+  let FE = null;
+  const feOk = t.requires('对账前提：前端三实例可加载（默认班次 / 跨零点班次 / 大队列）且能冻结随机走帧',
+    (() => {
+      try {
+        FE = {
+          default: loadFrontEnd(cfg.shift.list.slice()),
+          night: loadFrontEnd(NIGHT1),
+          queue: loadFrontEnd(cfg.shift.list.slice(), { queueDepth: QUEUE_OVER })
+        };
+        return ['default', 'night', 'queue'].every(k => FE[k] && typeof FE[k].freezeTick === 'function');
+      } catch (e) { return false; }
+    })(), '');
+  t.requires('对账前提：用例序列 ≥ 10 组，且覆盖 压线/同态/混态/idle/缺测/跨零点班次',
+    CASES.length >= 10 &&
+    ['C04', 'C05', 'C07', 'C08', 'C09', 'C10', 'C11', 'C12'].every(id => CASES.some(c => c.id === id)),
+    `本次 ${CASES.length} 组`);
+
+  /** 逐条比对（规则见本节标题下的 ①②③）→ 返回不一致清单（空数组＝逐条一致） */
+  const numTokens = s => (String(s).match(/-?\d+(?:\.\d+)?/g) || []).map(Number).sort((a, b) => a - b);
+  const unitTokens = s => (String(s).match(/m\/s|m|h|件|天|%/g) || []).slice().sort();
+  const paramCount = s => ['深度', '速度'].filter(n => String(s).includes(n)).length;
+  const sameNums = (a, b) => a.length === b.length && a.every((v, i) => Math.abs(v - b[i]) <= GRID / 2);
+  const compareWarnings = (fe, sv) => {
+    const bad = [];
+    if (fe.length !== sv.length) bad.push(`条数 ${fe.length} ≠ ${sv.length}`);
+    for (let i = 0; i < Math.min(fe.length, sv.length); i++) {
+      if (fe[i].title !== sv[i].title) bad.push(`[${i + 1}] 名称「${fe[i].title}」≠「${sv[i].title}」`);
+      if (fe[i].lv !== sv[i].lv) bad.push(`[${i + 1}] 等级 ${fe[i].lv} ≠ ${sv[i].lv}`);
+      if (paramCount(fe[i].detail) !== paramCount(sv[i].detail)) {
+        bad.push(`[${i + 1}] 参与参数个数 ${paramCount(fe[i].detail)} ≠ ${paramCount(sv[i].detail)}`);
+      }
+      if (!sameNums(numTokens(fe[i].detail), numTokens(sv[i].detail))) {
+        bad.push(`[${i + 1}] detail 数值集 [${numTokens(fe[i].detail)}] ≠ [${numTokens(sv[i].detail)}]`);
+      }
+      if (unitTokens(fe[i].detail).join('|') !== unitTokens(sv[i].detail).join('|')) {
+        bad.push(`[${i + 1}] detail 单位集 [${unitTokens(fe[i].detail)}] ≠ [${unitTokens(sv[i].detail)}]`);
+      }
+    }
+    return bad;
+  };
+
+  const rows = [];
+  if (feOk) {
+    for (const c of CASES) {
+      const fe = FE[c.fe].freezeTick(c.iso, c.standard, { depth: c.depth, speed: c.speed });
+      const sv = judgeSvc.buildWarnings({ now: c.iso, real: fe.real, standard: c.standard,
+        consumableHours: fe.ctx.lampHours, pendingQty: fe.ctx.pending });
+      const mst = judgeSvc.maintenanceState(c.iso);
+      rows.push({
+        c, fe, sv, bad: compareWarnings(fe.warnings, sv),
+        lvSame: ['depth', 'speed'].every((kind, i) =>
+          judgeSvc.standardLevel(fe.real[kind], judgeSvc.specOf(c.standard, kind)).lv === fe.levels[i].lv.lv),
+        ctxSame: mst.daysLeft === fe.ctx.maintDaysLeft && mst.next === fe.ctx.maintNext
+      });
+    }
+    for (const r of rows) {
+      t.check(`九 · ${r.c.id} ${r.c.name}：服务端 judge ≡ 前端 mockData（条数/顺序/名称/等级/参与参数/数值/单位）`,
+        r.bad.length === 0 && r.fe.warnings.length >= 3 && r.sv.length >= 3,
+        r.bad.length ? `不一致：${r.bad.join('；')}` :
+          `两侧 ${r.sv.length} 条逐条一致：${r.sv.map(x => `${x.title}/${x.lv}`).join(' ｜ ')}` +
+          `（前端回读 深度 ${r.fe.real.depth}、速度 ${r.fe.real.speed}；三态一致 ${r.lvSame ? '✓' : '✗'}；` +
+          `维保日期推导一致 ${r.ctxSame ? '✓' : '✗'}）`);
+    }
+    t.check('九 · 三态判据逐参数一致（服务端 standardLevel ≡ 前端 standardLevel，15 组 × 2 参数）',
+      rows.every(r => r.lvSame),
+      rows.filter(r => !r.lvSame).map(r => r.c.id).join('、') || '30 个参数点全部一致');
+    t.check('九 · 维保剩余天数与下次维保日期的推导两侧一致（含跨零点班次用例）',
+      rows.every(r => r.ctxSame),
+      rows.filter(r => !r.ctxSame).map(r => r.c.id).join('、') || '15 组一致的 (daysLeft, next)');
+    t.check('九 · 加严项（非需求要求）：detail 全文**逐字**一致（任一侧文案单改即红）',
+      rows.every(r => r.fe.warnings.length === r.sv.length &&
+        r.fe.warnings.every((w, i) => w.detail === r.sv[i].detail)),
+      rows.filter(r => r.fe.warnings.some((w, i) => !r.sv[i] || w.detail !== r.sv[i].detail))
+        .map(r => r.c.id).join('、') || `${rows.length}/${rows.length} 组 detail 逐字相同`);
+
+    /* C-88 定向断言（在**确实构造出来的**形态上判，不是"碰巧扫到某帧"）：
+       同态 ⇒ 每个参数各一条、共 2 条、每条只含一个参数、且不得用「；」拼接两参数。
+       参数类的识别口径＝**建表顺序**（参数类在前，其后固定 3 条：维保 / 耗材 / 工单），
+       **不拿被测的名称当筛子**（否则改名后连"哪条是参数类"都判不出）。 */
+    const paramRows = warnings => warnings.slice(0, Math.max(0, warnings.length - 3));
+    const oneParamEach = warnings => paramRows(warnings).every(w =>
+      paramCount(w.detail) === 1 && !String(w.detail).includes('；'));
+    const sameErr = rows.find(r => r.c.id === 'C07');
+    const sameWarn = rows.find(r => r.c.id === 'C08');
+    const mixed = rows.find(r => r.c.id === 'C09');
+    t.check('C-88/R26-P2-2 同态 err（深/速同超范围）⇒ 参数类**恰 2 条**、名称/等级均「参数超范围预警」/err、每条只含一个参数',
+      !!sameErr && paramRows(sameErr.sv).length === 2 &&
+      paramRows(sameErr.sv).every(w => w.title === '参数超范围预警' && w.lv === 'err') && oneParamEach(sameErr.sv),
+      sameErr ? `参数类 ${paramRows(sameErr.sv).length} 条：` + paramRows(sameErr.sv).map(w => `${w.title}/${w.lv}｜${w.detail}`).join(' ／ ') : '用例缺失');
+    t.check('C-88/R26-P2-2 同态 warn（深/速同临近）⇒ 参数类**恰 2 条**、名称/等级均「参数阈值临近预警」/warn、每条只含一个参数',
+      !!sameWarn && paramRows(sameWarn.sv).length === 2 &&
+      paramRows(sameWarn.sv).every(w => w.title === '参数阈值临近预警' && w.lv === 'warn') && oneParamEach(sameWarn.sv),
+      sameWarn ? `参数类 ${paramRows(sameWarn.sv).length} 条：` + paramRows(sameWarn.sv).map(w => `${w.title}/${w.lv}｜${w.detail}`).join(' ／ ') : '用例缺失');
+    t.check('C-88 混态（深度临近 + 速度超范围）⇒ 恰 2 条、名称与等级色一一对应（err 在前）、每条只含一个参数',
+      !!mixed && paramRows(mixed.sv).length === 2 && oneParamEach(mixed.sv) &&
+      paramRows(mixed.sv)[0].title === '参数超范围预警' && paramRows(mixed.sv)[0].lv === 'err' &&
+      paramRows(mixed.sv)[1].title === '参数阈值临近预警' && paramRows(mixed.sv)[1].lv === 'warn',
+      mixed ? `参数类 ${paramRows(mixed.sv).length} 条：` + paramRows(mixed.sv).map(w => `${w.title}/${w.lv}`).join('、') : '用例缺失');
+    t.check('C-88 参数类**上界**（一个参数最多一条）：全部用例的参数类条数 ∈ {0,1,2}，且预警合计 ≤ 5 条',
+      rows.every(r => paramRows(r.sv).length <= 2 && r.sv.length <= 5),
+      rows.map(r => `${r.c.id}:${paramRows(r.sv).length}+3`).join(' '));
+    const idleRow = rows.find(r => r.c.id === 'C10');
+    const oneIdle = rows.find(r => r.c.id === 'C13');
+    t.check('idle 不误判：标准全未设定 ⇒ 参数类 **0 条**（不得默认成合格/超范围）',
+      !!idleRow && paramRows(idleRow.sv).length === 0,
+      idleRow ? `C10 参数类 ${paramRows(idleRow.sv).length} 条（预警合计 ${idleRow.sv.length} 条＝固定 3 条）` : '用例缺失');
+    t.check('idle 不误判：单参数标准未设定 ⇒ 该参数**不进任何一条**（仅另一参数成条/汇总）',
+      !!oneIdle && paramRows(oneIdle.sv).length === 1 && paramCount(paramRows(oneIdle.sv)[0].detail) === 1 &&
+      !String(paramRows(oneIdle.sv)[0].detail).includes('深度'),
+      oneIdle ? `C13 参数类 ${paramRows(oneIdle.sv).length} 条：${paramRows(oneIdle.sv)[0].detail}` : '用例缺失');
+    /* 覆盖度证据：三类非参数预警的 warn/err/ok 分支都在用例集里出现过（否则"对账"只对了一半） */
+    const otherLv = title => rows.map(r => (r.sv.find(w => w.title === title) || {}).lv);
+    t.check('九 · 用例覆盖度：维保 / 耗材 / 工单三类预警的 warn|ok|err 分支均被真实构造出来',
+      otherLv('设备维保到期预警').includes('warn') && otherLv('耗材更换预警').includes('warn') &&
+      otherLv('耗材更换预警').includes('ok') && otherLv('工单超时预警').includes('err') &&
+      otherLv('工单超时预警').includes('ok'),
+      `维保[${[...new Set(otherLv('设备维保到期预警'))]}] 耗材[${[...new Set(otherLv('耗材更换预警'))]}] 工单[${[...new Set(otherLv('工单超时预警'))]}]`);
+  }
+}
+
+/* ---------------- 十、预警阈值可配（改配置真源 ⇒ 判据随之变化） ----------------
+   立案：四类预警的阈值过去有一部分只活在前端演示实现的字面量里（工单超时 80），
+   服务端判定引擎若不读配置就无从"可配"（NFR-19 关键参数配置化）。
+   本段**在内存里覆盖配置真源**（跑完复查磁盘未变）后，逐类给出**改前 → 改后**的判据反转，
+   最后无条件还原并复验"回到基线"（不是"改完就不管了"）。 */
+t.section('十、预警阈值可配：改配置真源（内存覆盖，不落盘）后判据随之变化');
+{
+  const STD = cfg.standards;
+  const GRID = 1 / Math.pow(10, STD.digits);
+  const dSpec = STD.default.depth;
+  const sSpec = STD.default.speed;
+  const upper = standardSvc.round2(dSpec.typical + dSpec.upperDev);
+  const lower = standardSvc.round2(dSpec.typical + dSpec.lowerDev);
+  const k = Math.max(1, Math.ceil((upper - lower) * STD.nearRatio / GRID - 1e-9));
+  const nearVal = standardSvc.round2(upper - k * GRID);         // 现配置下的"临近带闭边界"值
+  const M = cfg.maintenance || {};
+  const C = (M.consumables || [])[0] || {};
+  const saved = {
+    order: cfg.warnings.orderOverduePending, warnDays: M.warnDays,
+    lamp: C.threshold, near: STD.nearRatio
+  };
+  const lvOf = (title, input) => {
+    const hit = judgeSvc.buildWarnings(input).find(w => w.title === title);
+    return hit ? hit.lv : null;
+  };
+  const input = {
+    now: '2026-09-18T15:30:00', real: { depth: dSpec.typical, speed: sSpec.typical },
+    standard: { depth: dSpec, speed: sSpec },
+    /* 两个外部计数取在**现阈值之上**，这样"阈值调大 ⇒ 判据反转"的对照才成立 */
+    consumableHours: C.threshold + 70, pendingQty: cfg.warnings.orderOverduePending + 40
+  };
+  const cfgOk = t.requires('阈值真源齐备：warnings.orderOverduePending / maintenance.warnDays / consumables[0].threshold / standards.nearRatio 都是配置里的有限数值',
+    Number.isFinite(saved.order) && Number.isFinite(saved.warnDays) && Number.isFinite(saved.lamp) &&
+    Number.isFinite(saved.near),
+    `orderOverduePending=${saved.order} warnDays=${saved.warnDays} lampThreshold=${saved.lamp} nearRatio=${saved.near}`);
+
+  try {
+    /* ① 工单超时：阈值现值 ⇒ 队列 阈值+40 判 err；阈值上调到 队列+1 ⇒ 同一队列判 ok */
+    const beforeOrder = lvOf('工单超时预警', input);
+    cfg.warnings.orderOverduePending = input.pendingQty + 1;
+    const afterOrder = lvOf('工单超时预警', input);
+    cfg.warnings.orderOverduePending = saved.order;
+    t.check('NFR-19 工单超时阈值可配：改 warnings.orderOverduePending（内存）⇒ 同一队列的判据反转，还原后回到基线',
+      beforeOrder === 'err' && afterOrder === 'ok' && lvOf('工单超时预警', input) === 'err',
+      `队列 ${input.pendingQty} 件：阈值 ${saved.order} ⇒ ${beforeOrder}；阈值 ${input.pendingQty + 1} ⇒ ${afterOrder}；还原后 ⇒ ${lvOf('工单超时预警', input)}`);
+
+    /* ② 维保到期：提前天数现值 ⇒ 剩余 9 天判 warn；收紧到"剩余天数 − 1" ⇒ 同一剩余天数判 ok */
+    const beforeMaint = lvOf('设备维保到期预警', input);
+    const daysLeft = judgeSvc.maintenanceState(input.now).daysLeft;
+    M.warnDays = Math.max(0, daysLeft - 1);
+    const afterMaint = lvOf('设备维保到期预警', input);
+    M.warnDays = saved.warnDays;
+    t.check('NFR-19 维保提前天数可配：改 maintenance.warnDays（内存）⇒ 同一剩余天数的判据反转，还原后回到基线',
+      beforeMaint === 'warn' && afterMaint === 'ok' && lvOf('设备维保到期预警', input) === 'warn',
+      `剩余 ${daysLeft} 天：阈值 ${saved.warnDays} ⇒ ${beforeMaint}；阈值 ${Math.max(0, daysLeft - 1)} ⇒ ${afterMaint}；还原后 ⇒ ${lvOf('设备维保到期预警', input)}`);
+
+    /* ③ 耗材更换：阈值现值 ⇒ 点亮 阈值+70 判 warn；上调到 点亮+1 ⇒ 同一点亮判 ok */
+    const beforeLamp = lvOf('耗材更换预警', input);
+    C.threshold = input.consumableHours + 1;
+    const afterLamp = lvOf('耗材更换预警', input);
+    C.threshold = saved.lamp;
+    t.check('NFR-19 耗材更换阈值可配：改 maintenance.consumables[0].threshold（内存）⇒ 同一点亮时长的判据反转，还原后回到基线',
+      beforeLamp === 'warn' && afterLamp === 'ok' && lvOf('耗材更换预警', input) === 'warn',
+      `点亮 ${input.consumableHours} h：阈值 ${saved.lamp} ⇒ ${beforeLamp}；阈值 ${input.consumableHours + 1} ⇒ ${afterLamp}；还原后 ⇒ ${lvOf('耗材更换预警', input)}`);
+
+    /* ④ 临近比例（FR-3.18 的判据参数）：现值 ⇒ 距上限 k 格判 warn；收紧到一半 ⇒ 同一实测判 ok */
+    const beforeNear = judgeSvc.standardLevel(nearVal, dSpec).lv;
+    STD.nearRatio = saved.near / 2;
+    const afterNear = judgeSvc.standardLevel(nearVal, dSpec).lv;
+    STD.nearRatio = saved.near;
+    t.check('FR-3.18/C-85 临近比例可配（standards.nearRatio）：收紧比例 ⇒ 临近带宽变窄、同一实测由 warn 变 ok，还原后回到基线',
+      beforeNear === 'warn' && afterNear === 'ok' && judgeSvc.standardLevel(nearVal, dSpec).lv === 'warn',
+      `实测 ${nearVal}（距上限 ${k} 格）：nearRatio ${saved.near} ⇒ ${beforeNear}；${saved.near / 2} ⇒ ${afterNear}；还原后 ⇒ ${judgeSvc.standardLevel(nearVal, dSpec).lv}`);
+  } finally {
+    cfg.warnings.orderOverduePending = saved.order;
+    M.warnDays = saved.warnDays;
+    C.threshold = saved.lamp;
+    STD.nearRatio = saved.near;
+  }
+
+  /* ⑤ 还原复验（**配置真源与判据都回到基线**） */
+  const restored = {
+    order: cfg.warnings.orderOverduePending === saved.order,
+    warnDays: M.warnDays === saved.warnDays,
+    lamp: C.threshold === saved.lamp,
+    near: STD.nearRatio === saved.near
+  };
+  t.check('阈值用例跑完**配置真源逐项还原**（内存覆盖不落盘，判据回到基线）',
+    restored.order && restored.warnDays && restored.lamp && restored.near &&
+    lvOf('工单超时预警', input) === 'err' && judgeSvc.standardLevel(nearVal, dSpec).lv === 'warn',
+    `order=${cfg.warnings.orderOverduePending} warnDays=${M.warnDays} lamp=${C.threshold} nearRatio=${STD.nearRatio}（均与用例前相同）`);
+
+  /* ⑥ 阈值可配（跨实现）：前端读的是**同一个配置键**（`standards.nearRatio` 现读）
+     ⇒ 改真源后两侧必须同步反转、且判据仍逐条一致（否则"可配"只配了一半）。 */
+  if (cfgOk) {
+    const fe = loadFrontEnd(cfg.shift.list.slice());
+    const std = { depth: dSpec, speed: sSpec };
+    const feBefore = fe.freezeTick('2026-09-18T15:30:20', std, { depth: nearVal, speed: sSpec.typical });
+    const svBefore = judgeSvc.buildParamWarnings({ real: feBefore.real, standard: std });
+    try {
+      STD.nearRatio = saved.near / 2;
+      fe.config.standards.nearRatio = saved.near / 2;     // 只改隔离实例的配置对象（仓库文件不动）
+      const feAfter = fe.freezeTick('2026-09-18T15:30:21', std, { depth: nearVal, speed: sSpec.typical });
+      const svAfter = judgeSvc.buildParamWarnings({ real: feAfter.real, standard: std });
+      const feWarnBefore = feBefore.warnings.find(w => w.title === '参数阈值临近预警');
+      const feWarnAfter = feAfter.warnings.find(w => w.title === '参数阈值临近预警');
+      t.check('阈值可配（跨实现）：nearRatio 改真源后**前端与服务端同步反转**，且两侧判据仍逐条一致',
+        !!feWarnBefore && feWarnBefore.lv === 'warn' && !!feWarnAfter && feWarnAfter.lv === 'ok' &&
+        svBefore.length === 1 && svBefore[0].lv === 'warn' && svAfter.length === 1 && svAfter[0].lv === 'ok',
+        `前端 ${feWarnBefore && feWarnBefore.lv} → ${feWarnAfter && feWarnAfter.lv}；` +
+        `服务端 ${svBefore.length ? svBefore[0].lv : '（0 条）'} → ${svAfter.length ? svAfter[0].lv : '（0 条）'}`);
+    } finally {
+      STD.nearRatio = saved.near;
+      fe.config.standards.nearRatio = saved.near;
+    }
+  }
 }
 
 t.finish();

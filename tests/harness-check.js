@@ -15,7 +15,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const os = require('node:os');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, spawn } = require('node:child_process');
 
 const env = require('./env');
 const { createRunner } = require('./lib/assert');
@@ -198,6 +198,336 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
   try { await fetch(`http://127.0.0.1:${p1}/health`); } catch { down = true; }
   t.check('stop() 之后端口不再响应（进程确实被停掉）', down, '');
   fs.rmSync(dir, { recursive: true, force: true });
+
+  /* ====================== W6：进程入口与运行骨架（server\index.js / server\http\router.js） ======================
+     本节原来只验"夹具自身能起停一个临时 mini-server"，验不到**真交付的进程入口**。
+     W6 落地后在这里扩断言：能起、能查、监听范围、能优雅退、SSE 骨架、异常不静默 —— 全部是**行为判据**
+     （真的起进程、真的打 HTTP 请求、真的读日志），不匹配源码字符串（D23）。
+     夹具脚本在本节内**写成文件**再以子进程运行（与本节上面的 mini-server 同一手法）：
+       · 为什么必须另起进程：优雅退出要验"进程退出码 + 端口释放 + 无残留进程"，进程内证明不了；
+       · 为什么结果走文件而不是 stdout：受限环境下子进程管道会 EPERM（见本节上方与 tests/env.js）；
+       · 为什么夹具写在 tests\._verify 之下：该目录已被 .gitignore 忽略（D16：测试产物只允许落这里）。 */
+  const w6Root = path.join(env.paths.root, 'server');
+  t.check('W6：进程入口文件存在（server\\index.js + server\\http\\router.js）',
+    fs.existsSync(path.join(w6Root, 'index.js')) && fs.existsSync(path.join(w6Root, 'http', 'router.js')),
+    path.relative(env.paths.root, w6Root));
+
+  if (fs.existsSync(path.join(w6Root, 'index.js'))) {
+    const w6 = require('../server/index.js');        // 只为读配置解析与挂载位（不起服务）
+    const { createRouter } = require('../server/http/router');
+
+    /* ---- 1. 配置解析：默认仅回环 + 可被环境变量/命令行覆盖 ---- */
+    {
+      const d = w6.resolveConfig({ argv: [], env: {}, boardConfig: {} });
+      t.check('W6：默认监听 127.0.0.1:8787（默认仅回环，遵 NFR-25/AC-09）',
+        d.host === '127.0.0.1' && d.port === 8787 && d.sources.host === 'default' && d.sources.port === 'default',
+        `${d.host}:${d.port}（来源 ${d.sources.host}/${d.sources.port}）`);
+
+      const e = w6.resolveConfig({ argv: [], env: { DSH_BOARD_PORT: '19001', DSH_BOARD_HOST: '127.0.0.2' }, boardConfig: {} });
+      t.check('W6：DSH_BOARD_PORT / DSH_BOARD_HOST 能覆盖默认值（来源被记录）',
+        e.port === 19001 && e.host === '127.0.0.2' && e.sources.port === 'env:DSH_BOARD_PORT',
+        `${e.host}:${e.port}（${e.sources.port}）`);
+
+      const c = w6.resolveConfig({ argv: ['--port', '19002'], env: { DSH_BOARD_PORT: '19001' }, boardConfig: {} });
+      t.check('W6：命令行 --port 覆盖环境变量（优先级＝默认＜配置＜环境变量＜命令行）',
+        c.port === 19002 && c.sources.port === 'cli', `port=${c.port}（${c.sources.port}）`);
+
+      let badPort = false;
+      try { w6.resolveConfig({ argv: ['--port', 'abc'], env: {}, boardConfig: {} }); } catch { badPort = true; }
+      t.check('W6：非法端口被显式拒绝（不静默回落到默认端口 —— 否则 `--prot 9000` 这类笔误会隐身）',
+        badPort, '--port abc 应抛错');
+    }
+
+    /* ---- 2. 挂载位：四个空壳注册位必须在，且必须**自报未挂载** ---- */
+    {
+      const r = createRouter({ getHealth: () => ({ ok: true }) });
+      const mounts = [r.mountIfA(), r.mountIfD(), r.mountUpload(), r.mountSSE()];
+      t.check('W6：四个挂载位（IF-A/IF-D/上传/SSE 推送）齐备且显式自报"未挂载"（本包不实现业务逻辑）',
+        mounts.every(m => m && m.mounted === false && typeof m.by === 'string' && m.by.length > 0) &&
+        mounts.map(m => m.mount).join(',') === 'ifA,ifD,upload,sse',
+        mounts.map(m => `${m.mount}→${m.by}`).join(' / '));
+      t.check('W6：本包只注册 /health 与 /events（业务路由留给 W1/W2/W4/W5，不越界）',
+        r.list().join(' , ') === 'GET /events , GET /health', r.list().join(' , '));
+    }
+
+    /* ---- 3~6. 起真服务做行为断言（子进程夹具） ---- */
+    const w6Tmp = harness.makeTempDir('w6-entry-skeleton');
+    const w6Scratch = path.join(env.paths.root, 'tests', '._verify', 'w6');
+    fs.mkdirSync(w6Scratch, { recursive: true });
+
+    const w6Write = (name, lines) => {
+      const full = path.join(w6Scratch, name);
+      fs.writeFileSync(full, lines.join('\r\n') + '\r\n', 'utf8');
+      return full;
+    };
+    const w6ReadResult = file => {
+      try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+    };
+    const w6LogPath = name => path.join(w6Tmp, name + '.log');
+    /** 原地起子进程（不删日志文件：调用方要读它）；stdout/stderr 一律落文件，避免管道 EPERM */
+    const w6Spawn = (script, name, extraEnv) => {
+      const logFile = w6LogPath(name);
+      const fd = fs.openSync(logFile, 'a');
+      const proc = spawn(process.execPath, [script], {
+        cwd: env.paths.root,
+        env: Object.assign({}, process.env, { DSH_ENV: 'test' }, extraEnv),
+        windowsHide: true,
+        stdio: ['ignore', fd, fd]
+      });
+      let settled = null;
+      proc.on('exit', (code, signal) => { settled = { code, signal }; });
+      return { proc, logFile, exitInfo: () => settled, log: () => { try { return fs.readFileSync(logFile, 'utf8'); } catch { return ''; } },
+        async waitDone(ms) {
+          const until = Date.now() + ms;
+          while (!settled && Date.now() < until) await new Promise(r => setTimeout(r, 100));
+          try { fs.closeSync(fd); } catch { /* 已关 */ }
+          return settled;
+        } };
+    };
+
+    /* ---------------- 一、能起 · 能查 · 监听范围 · 优雅退 · SSE（夹具①，单次跑完一并取证） ----------------
+       为什么要合成一个夹具：起停一次要真开库、真监听、真收尾 —— 每条断言各起一次会让门禁明显变慢；
+       下面这些 check 彼此独立，只是**共用同一份取证**。 */
+    const w6PortA = await harness.allocPort();
+    const w6DataA = path.join(w6Tmp, 'data-a');
+    const w6DbA = path.join(w6Tmp, 'custom-board.db');   // 用 --db-file 起，顺带验该覆盖项与 /health 的 dbFile
+    const w6ResAFile = path.join(w6Tmp, 'result-a.json');
+    const fA = w6Write('fixture-a.js', [
+      "'use strict';",
+      "/* 由 tests/harness-check.js 生成：起真服务 → 逐条打真请求 → 结果写 JSON 文件。 */",
+      "const fs = require('node:fs');",
+      "const net = require('node:net');",
+      "const path = require('node:path');",
+      "const ROOT = path.resolve(__dirname, '..', '..', '..');",
+      "process.env.DSH_ENV = 'test';",
+      "const entry = require(path.join(ROOT, 'server', 'index.js'));",
+      "const out = {};",
+      "const save = () => fs.writeFileSync(process.env.DSH_W6_RESULT, JSON.stringify(out), 'utf8');",
+      "const canBind = (host, port) => new Promise(resolve => {",
+      "  const s = net.createServer();",
+      "  s.once('error', err => resolve({ ok: false, code: err.code }));",
+      "  s.listen({ host, port }, () => s.close(() => resolve({ ok: true })));",
+      "});",
+      "const externalIPv4 = () => {",
+      "  for (const list of Object.values(require('node:os').networkInterfaces())) {",
+      "    for (const it of list || []) if (it.family === 'IPv4' && !it.internal) return it.address;",
+      "  }",
+      "  return null;",
+      "};",
+      "(async () => {",
+      "  const port = Number(process.env.DSH_W6_PORT);",
+      "  const base = 'http://127.0.0.1:' + port;",
+      "  const svc = await entry.start({",
+      "    argv: ['--port', String(port), '--data-dir', process.env.DSH_W6_DATA, '--db-file', process.env.DSH_W6_DB],",
+      "    installSignalHandlers: false,",
+      "    logConsole: false,",
+      "    heartbeatMs: 300,        // SSE 心跳周期：线上默认 15 s；这里调到 300 ms 才验得动（不改线上口径）",
+      "    testRoutes: true",     // 只多注册一个"读体回显"端点，用于 400/413 的行为判据
+      "  });",
+      "  out.listen = svc.listen;",
+      "  const hRes = await fetch(base + '/health');",
+      "  out.health = { status: hRes.status, body: await hRes.json() };",
+      "  const r404 = await fetch(base + '/no-such-endpoint');",
+      "  out.e404 = { status: r404.status, body: await r404.json() };",
+      "  const r405 = await fetch(base + '/health', { method: 'POST' });",
+      "  out.e405 = { status: r405.status, allow: r405.headers.get('allow'), body: await r405.json() };",
+      "  const r400 = await fetch(base + '/__w6/echo', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{' });",
+      "  out.e400 = { status: r400.status, body: await r400.json() };",
+      "  const r413 = await fetch(base + '/__w6/echo', { method: 'POST', headers: { 'Content-Type': 'application/json' },",
+      "    body: JSON.stringify({ data: 'x'.repeat(1024 * 1024 + 1024) }) });",   // 必须**超过**路由默认上限 1 MiB
+      "  out.e413 = { status: r413.status, body: await r413.json() };",
+      "  const ctl = new AbortController();",
+      "  const evRes = await fetch(base + '/events', { signal: ctl.signal });",
+      "  const reader = evRes.body.getReader();",
+      "  const dec = new TextDecoder();",
+      "  let sseText = '';",
+      "  const until = Date.now() + 8000;",
+      "  while (Date.now() < until && sseText.indexOf(': ping') < 0) {",
+      "    /* 读一帧，但**最多等 1500 ms**：`reader.read()` 挂起时不会有超时，",
+      "       不设上限的话这个 while 会把夹具拖到永远（本项目曾因此把一条断言拖成假绿）。 */",
+      "    const chunk = await Promise.race([",
+      "      reader.read(),",
+      "      new Promise(r => setTimeout(() => r({ timeout: true }), 1500))",
+      "    ]);",
+      "    if (chunk.timeout || chunk.done) break;",
+      "    sseText += dec.decode(chunk.value, { stream: true });",
+      "  }",
+      "  const streamsDuring = svc.router.streamCount();",
+      "  ctl.abort();",
+      "  try { await reader.cancel(); } catch { }",
+      "  await new Promise(r => setTimeout(r, 300));",
+      "  out.sse = { status: evRes.status, contentType: evRes.headers.get('content-type'),",
+      "    retryFrame: /retry:\\s*3000/.test(sseText), heartbeat: /: ping /.test(sseText),",
+      "    frames: sseText.split('\\n\\n').filter(Boolean).length, sample: sseText.slice(0, 200),",
+      "    streamsDuring, streamsAfter: svc.router.streamCount() };",
+      "  const ext = externalIPv4();",
+      "  out.externalIPv4 = ext;",
+      "  out.externalBind = ext ? await canBind(ext, port) : null;",
+      "  out.loopbackBind = await canBind('127.0.0.1', port);",
+      "  /* 先落盘，再 stop()：stop 的实现一变（比如直接 process.exit）也不至于让结果文件写不出来，",
+      "     否则「变异把断言改红」会退化成「夹具没结果」（D22 要的是**指名**，不是一团空）。 */",
+      "  save();",
+      "  out.stopResult = await entry.stop('harness-check 夹具');",
+      "  out.serverAfterStop = entry.state.server === null;",
+      "  out.dbAfterStop = entry.state.db === null;",
+      "  out.rebindAfterStop = await canBind('127.0.0.1', port);",
+      "  save();",
+      "})().catch(err => { out.error = String(err && err.stack ? err.stack : err); save(); process.exitCode = 1; });"
+    ]);
+    const runA = w6Spawn(fA, 'fixture-a', { DSH_W6_PORT: String(w6PortA), DSH_W6_DATA: w6DataA, DSH_W6_RESULT: w6ResAFile, DSH_W6_DB: w6DbA });
+    /* watchdog：夹具异常时不至于把门禁挂住（正常路径不会触发） */
+    const watchdogA = setTimeout(() => { try { runA.proc.kill(); } catch { /* 已退出 */ } }, 25000);
+    const exitA = await runA.waitDone(25000);
+    clearTimeout(watchdogA);
+    const A = w6ReadResult(w6ResAFile);
+    if (!t.requires('W6 夹具① 能取到结果文件（result-a.json）', Boolean(A), runA.log().slice(-400) || '无日志')) {
+      t.info('W6：夹具①未产出结果，本节相关断言按失败处理（不许把"跑不了"当通过）');
+    }
+    const a = A || {};
+
+    /* 能起：/health 200 且 JSON 含 ok/uptimeSec/dbWritable/version/listen，且库确实可写 */
+    const hb = (a.health && a.health.body) || {};
+    t.check('W6：GET /health 返回 200，且含 ok / uptimeSec / dbWritable / version / listen，dbWritable===true',
+      a.health && a.health.status === 200 && hb.ok === true && typeof hb.uptimeSec === 'number' &&
+      hb.dbWritable === true && typeof hb.version === 'string' && /:\d+$/.test(String(hb.listen)),
+      `status=${a.health && a.health.status} body=${JSON.stringify(hb).slice(0, 220)}`);
+    t.check('W6：/health 的 version 取自需求基线真源（board.config.js「需求版本：Vx.yz」）',
+      typeof hb.version === 'string' && /^V\d+(\.\d+)*$/.test(hb.version) && hb.version === w6.readBaselineVersion(),
+      `${hb.version}（readBaselineVersion()=${w6.readBaselineVersion()}）`);
+    t.check('W6：/health 的 dbFile 反映 --db-file 覆盖项（库路径与"库可写"同源，不是各自猜）',
+      path.resolve(String(hb.dbFile || '')) === path.resolve(w6DbA) && fs.existsSync(w6DbA),
+      `health.dbFile=${hb.dbFile}`);
+
+    /* 能查：404 / 405 / 400 / 413 形状稳定且带可读 message */
+    const e404 = a.e404 || {}; const e405 = a.e405 || {}; const e400 = a.e400 || {}; const e413 = a.e413 || {};
+    const errOf = r => (r && r.body && r.body.err) || {};
+    t.check('W6：未知路径 ⇒ 404，且错误体形状稳定（ok 包裹的 err.code/httpStatus/message + path/method）',
+      e404.status === 404 && errOf(e404).code === 'NOT_FOUND' && errOf(e404).httpStatus === 404 &&
+      typeof errOf(e404).message === 'string' && errOf(e404).message.length > 0 &&
+      e404.body.path === '/no-such-endpoint' && e404.body.method === 'GET',
+      JSON.stringify(e404.body));
+    t.check('W6：已知路径 + 不支持的方法 ⇒ 405（并给出 Allow，与 404 可区分）',
+      e405.status === 405 && e405.allow === 'GET' && errOf(e405).code === 'METHOD_NOT_ALLOWED',
+      `status=${e405.status} Allow=${e405.allow}`);
+    t.check('W6：坏 JSON 请求体 ⇒ 400（指名"不是合法 JSON"，不是笼统 500）',
+      e400.status === 400 && errOf(e400).code === 'BAD_JSON' && /JSON/.test(String(errOf(e400).message)),
+      JSON.stringify(e400.body).slice(0, 200));
+    t.check('W6：超大请求体 ⇒ 413（默认上限 1 MiB，附可读 message，不是把连接抛掉了事）',
+      e413.status === 413 && errOf(e413).code === 'PAYLOAD_TOO_LARGE' && /上限/.test(String(errOf(e413).message)),
+      JSON.stringify(e413.body).slice(0, 200));
+
+    /* 监听范围：默认只回环 —— 行为判据：回环同端口绑定失败（被占用），非回环地址同端口仍可绑定（无人监听） */
+    const extAddr = a.externalIPv4;
+    const onlyLoopback = a.loopbackBind && a.loopbackBind.ok === false &&
+      (!extAddr || (a.externalBind && a.externalBind.ok === true));
+    t.check('W6：默认只监听回环（回环同端口已被占用、非回环地址同端口仍可绑定 ⇒ 局域网不可达）',
+      onlyLoopback,
+      `回环绑定=${JSON.stringify(a.loopbackBind)}；外部地址 ${extAddr || '（本机无非回环 IPv4）'} 绑定=${JSON.stringify(a.externalBind)}；listen=${a.listen}`);
+
+    /* SSE 骨架：建连 + Content-Type + 心跳注释帧 + 关闭后连接数归零 */
+    const sse = a.sse || {};
+    t.check('W6：GET /events 建立 SSE 连接并收到心跳注释帧（Content-Type=text/event-stream，含 : ping 与 retry）',
+      sse.status === 200 && /^text\/event-stream/.test(String(sse.contentType)) && sse.heartbeat === true && sse.retryFrame === true,
+      `status=${sse.status} ctype=${sse.contentType} 帧数=${sse.frames} 原始帧=${JSON.stringify(sse.sample)}`);
+    t.check('W6：SSE 客户端断开后连接被释放（在途连接数 1 → 0，定时器不残留）',
+      sse.streamsDuring === 1 && sse.streamsAfter === 0,
+      `断开前 ${sse.streamsDuring} 条、断开后 ${sse.streamsAfter} 条`);
+
+    /* 优雅退出：stop() 返回 0 ⇒ 端口释放并可在同端口再次绑定 ⇒ 进程以 0 退出 ⇒ 无残留子进程 */
+    t.check('W6：优雅退出后端口被释放（stop() 返回 code=0，内部状态已清空，且同端口可再次绑定）',
+      a.stopResult && a.stopResult.code === 0 && a.serverAfterStop === true && a.dbAfterStop === true &&
+      a.rebindAfterStop && a.rebindAfterStop.ok === true,
+      `stop=${JSON.stringify(a.stopResult)} server=null:${a.serverAfterStop} db=null:${a.dbAfterStop} 再绑定=${JSON.stringify(a.rebindAfterStop)}`);
+    t.check('W6：优雅退出的进程以退出码 0 结束（自然排空事件循环，无信号残留/无未关句柄）',
+      exitA && exitA.code === 0,
+      `exit=${JSON.stringify(exitA)}` + (a.error ? ` 夹具异常：${String(a.error).slice(0, 200)}` : ''));
+
+    /* ---------------- 二、不静默：启动自检失败 ⇒ 退非零（夹具②） ----------------
+       夹具② 造的是**"只有自检能挡住"**的失败：在 `backupDir`（`<数据根>\backup`）这个**路径上**
+       放一个同名普通文件，于是自检往"备份目录"里写探针文件必然失败（ENOTDIR）。
+       为什么必须这样精确：若用"数据根不可用"或"库文件只读"当故障源，进程会在**更早**的
+       建日志 / `openDb`（`PRAGMA journal_mode` 需要写权限）处就退出 —— 那样即使把启动自检
+       整段删掉，退出码依然非零，断言会**假绿**（D22 变异 a 前两次就踩到了这两种"更早失败"）。
+       而 `backupDir` 的可写性**只由启动自检检查**：sqlite 不管它、日志不管它 ⇒
+       去掉自检后进程会一路起到监听（夹具随即以退出码 9 报"缺陷"），断言这才真的变红。 */
+    const w6PortB = await harness.allocPort();
+    const w6DataB = path.join(w6Tmp, 'data-b');
+    const fB = w6Write('fixture-b.js', [
+      "'use strict';",
+      "/* 启动自检②：backupDir 被同名**文件**占位（写探针必然失败 ENOTDIR）⇒ 自检必须挡住 ⇒ 退非零。 */",
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const ROOT = path.resolve(__dirname, '..', '..', '..');",
+      "process.env.DSH_ENV = 'test';",
+      "const entry = require(path.join(ROOT, 'server', 'index.js'));",
+      "const dataDir = process.env.DSH_W6_DATA;",
+      "const blocker = path.join(dataDir, 'backup');          // 备份目录路径上放一个**同名普通文件**",
+      "fs.rmSync(dataDir, { recursive: true, force: true });",
+      "fs.mkdirSync(dataDir, { recursive: true });",
+      "fs.writeFileSync(blocker, 'W6 夹具②：本文件占住“备份目录”这个路径（它本该是个目录）', 'utf8');",
+      "/* 反向自检：确认这个占位真的让“写探针文件”失败（否则夹具没造出目标场景，不许假绿） */",
+      "let blocked = false;",
+      "try { fs.writeFileSync(path.join(blocker, '.w6-write-probe-selfcheck'), 'ok', 'utf8'); } catch (e) { blocked = true; }",
+      "console.log('夹具②：备份目录写探针被挡住 = ' + blocked);",
+      "if (!blocked) { console.error('夹具②：没造出“备份目录不可写”的场景'); process.exit(5); }",
+      "const failFast = setTimeout(() => { console.error('W6 夹具②：10 s 内启动自检仍未拦住（缺陷）'); process.exit(9); }, 10000);",
+      "entry.start({ argv: ['--port', String(process.env.DSH_W6_PORT), '--data-dir', dataDir],",
+      "    installSignalHandlers: false, logConsole: true })",
+      "  .then(() => { clearTimeout(failFast); console.error('W6 夹具②：启动自检没有拦住不可写的备份目录 —— 服务照常起来了（缺陷）'); process.exit(9); })",
+      "  .catch(err => { clearTimeout(failFast); console.error('W6 夹具②：start() 抛出（可接受路径）：' + (err && err.message)); process.exit(8); });"
+    ]);
+    const runB = w6Spawn(fB, 'fixture-b', { DSH_W6_PORT: String(w6PortB), DSH_W6_DATA: w6DataB });
+    const watchdogB = setTimeout(() => { try { runB.proc.kill(); } catch { /* 已退出 */ } }, 20000);
+    const exitB = await runB.waitDone(20000);
+    clearTimeout(watchdogB);
+    const logB = runB.log();
+    if (exitB && exitB.code === 5) {
+      t.skip('W6：启动自检失败（备份目录不可写）⇒ 进程退非零且日志指名是哪一项，绝不"假活"（夹具②）',
+        '本机没能造出"备份目录不可写"的场景（占位文件下仍能写探针）—— 环境不支持该故障源');
+    } else {
+      t.check('W6：启动自检失败（备份目录不可写）⇒ 进程退非零且日志指名是哪一项，绝不"假活"（夹具②）',
+        Boolean(exitB) && exitB.code !== 0 && /启动自检未通过/.test(logB) && /backupDir/.test(logB),
+        `exit=${JSON.stringify(exitB)} 日志尾部=${logB.trim().split('\n').slice(-2).join(' ｜ ').slice(0, 240)}`);
+    }
+
+    /* ---------------- 三、不静默：未捕获异常/未处理 rejection ⇒ 退非零 + 日志有记录（夹具③） ---------------- */
+    for (const mode of ['uncaught', 'rejection']) {
+      const w6PortC = await harness.allocPort();
+      const w6DataC = path.join(w6Tmp, 'data-c-' + mode);
+      const fC = w6Write('fixture-c-' + mode + '.js', [
+        "'use strict';",
+        "const path = require('node:path');",
+        "const ROOT = path.resolve(__dirname, '..', '..', '..');",
+        "process.env.DSH_ENV = 'test';",
+        "const mode = process.env.DSH_W6_CRASH;",
+        "const entry = require(path.join(ROOT, 'server', 'index.js'));",
+        "entry.main({ argv: ['--port', String(process.env.DSH_W6_PORT), '--data-dir', process.env.DSH_W6_DATA, '--crash', mode],",
+        "  logConsole: true })",
+        "  .then(() => { console.log('W6 夹具③：已监听，等待注入的 ' + mode + ' 生效'); })",
+        "  .catch(err => { console.error('W6 夹具③：main() 失败：' + (err && err.message)); process.exit(7); });"
+      ]);
+      const runC = w6Spawn(fC, 'fixture-c-' + mode,
+        { DSH_W6_PORT: String(w6PortC), DSH_W6_DATA: w6DataC, DSH_W6_CRASH: mode });
+      /* 先证明"服务真的起来过"（否则"崩"可能只是没启动起来，断言会变成假的绿） */
+      let wasUp = false;
+      const readyUntil = Date.now() + 6000;
+      while (Date.now() < readyUntil && !wasUp) {
+        try { wasUp = (await fetch(`http://127.0.0.1:${w6PortC}/health`)).status === 200; }
+        catch { await new Promise(r => setTimeout(r, 120)); }
+      }
+      const exitC = await runC.waitDone(15000);
+      const logC = runC.log();
+      const kindText = mode === 'uncaught' ? '未捕获异常' : '未处理的 Promise rejection';
+      t.check(`W6：${kindText}不静默（服务确实起来过 ⇒ 注入后进程退非零 ⇒ 日志留痕，夹具③）`,
+        wasUp === true && Boolean(exitC) && exitC.code !== 0 && logC.includes(kindText),
+        `起来过=${wasUp} exit=${JSON.stringify(exitC)} 日志尾部=${logC.trim().split('\n').slice(-2).join(' ｜ ').slice(0, 200)}`);
+    }
+
+    try { fs.rmSync(w6Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    try { fs.rmSync(w6Scratch, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  } else {
+    t.info('W6：server\\index.js 不存在 —— 上述进程入口断言未执行（不许把"跑不了"当通过）');
+  }
 }
 
 /* ---------------- 五、临时区与清理 ---------------- */
