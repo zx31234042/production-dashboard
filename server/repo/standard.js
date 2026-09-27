@@ -24,14 +24,17 @@
    单位口径：速度 **m/s**、深度 **m**，库内**存数值**（偏差可为负）；两位小数由上层换算。
    用法：
      const repo = require('./repo/standard');
+     const now = '2026-09-22 09:00:00';                     // 当前时刻（第 4 实参，必填；由调用方注入的时钟给出）
      const added = repo.addVersion(db, {
        productCode: 'P-1001', processCode: '30', createdBy: '张伟', teamCode: '检验一班',
        depthUpperDev: 0.20, depthLowerDev: -0.20, depthTypical: 12.60,
-       speedUpperDev: 0.30, speedLowerDev: -0.30, speedTypical: 4.90,
-       effectiveFrom: '2026-09-22 08:00:00'
-     }, '2026-09-22 08:00:00');
+       speedUpperDev: 0.30, speedLowerDev: -0.30, speedTypical: 4.90
+     }, '2026-09-22 08:00:00', now);                       // 第 3 实参＝生效时间（可省，省＝now）；第 4 实参＝now
      repo.getEffective(db, { productCode: 'P-1001', processCode: '30', at: '2026-09-22 09:00:00' });
      repo.listVersions(db, { productCode: 'P-1001', processCode: '30' });   // 版本历史
+   注：生效时间只能走**第 3 个位置参数**；`input` 的键白名单＝productCode / processCode / createdBy /
+         teamCode 与六个数值列（见 normalizeInput），**effectiveFrom 不在白名单** —— 写进 `input`
+         会被**静默忽略**，不会报错，也不会生效。
    ========================================================================== */
 'use strict';
 
