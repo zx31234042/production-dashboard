@@ -361,16 +361,15 @@ window.MockData = (function () {
       const spec = standardSpecOf(kind);
       return { kind, spec, lv: standardLevel(real[kind], spec) };
     }).filter(r => r.lv.lv !== 'idle');        // 标准未设定 ⇒ 该参数不进任何一条
-    /* 同一三态可能同时出现在两个参数上：按"最坏态"排序后把**同态的参数**合并进同一条 ——
-       条数仍由"态"决定（最多 2 条），名称由态决定，故不会出现"既临近又超范围"的名字冲突。 */
+    /* **逐参数成条：同态也各出一条**（R26-P2-2 修）。旧实现按态 `groups.find(x => x.lv === r.lv.lv)`
+       把**同态的两参数合并进一条**（detail 以「；」拼接），与文档三处声明矛盾 —— 本文件头部 `:16-18`
+       「互不合并 ⇒ 参数类最多 2 条」、上面 docblock「深度与速度分别成条，一条预警里只含一个参数」、
+       `config/board.config.js:167-169`「一个参数＝一条预警，深度与速度各自独立成条」。现改为**条数由
+       「参数的个数」决定**（最多 2 条），名称仍由该参数自身的态择名 ⇒ 同态时出两条同名同类、
+       各自只含一个参数的预警。排序只为稳定展示顺序（err 在前、warn 在后；同态则维持 深度→速度）。 */
     const order = { err: 0, warn: 1, ok: 2 };
-    const sorted = rows.slice().sort((a, b) => order[a.lv.lv] - order[b.lv.lv]);
-    const groups = [];
-    sorted.forEach(r => {
-      if (r.lv.lv === 'ok') return;            // 正常态不单独成条（并入下方 ok 汇总提示）
-      const g = groups.find(x => x.lv === r.lv.lv);
-      if (g) g.rows.push(r); else groups.push({ lv: r.lv.lv, rows: [r] });
-    });
+    const sorted = rows.filter(r => r.lv.lv !== 'ok')     // 正常态不单独成条（并入下方 ok 汇总提示）
+      .sort((a, b) => order[a.lv.lv] - order[b.lv.lv]);
     const detailOf = r => {
       const d = typeof r.spec.digits === 'number' ? r.spec.digits : STD_DIGITS;
       const unit = r.spec.unit ? ' ' + r.spec.unit : '';
@@ -379,13 +378,13 @@ window.MockData = (function () {
       return PARAM_CN[r.kind] + ' ' + round2(real[r.kind]).toFixed(d) + unit +
         '（标准 ' + lower.toFixed(d) + '～' + upper.toFixed(d) + unit + '）判' + r.lv.text;
     };
-    const out = groups.map(g => ({
-      title: g.lv === 'err' ? '参数超范围预警' : '参数阈值临近预警',
-      detail: g.rows.map(detailOf).join('；') +
-        (g.lv === 'warn'
+    const out = sorted.map(r => ({
+      title: r.lv.lv === 'err' ? '参数超范围预警' : '参数阈值临近预警',
+      detail: detailOf(r) +
+        (r.lv.lv === 'warn'
           ? '（临近判据：实测距上/下限边界 ≤ (上限−下限)×' + nearRatio() + '）'
           : '（超出标准上下限闭区间，压线即合格）'),
-      lv: g.lv
+      lv: r.lv.lv
     }));
     /* 两参数都判正常时不需要预警；但为保持"参数类恒有回执"的旧展示形态（浅色 ok 条），
        仍给出唯一一条「参数阈值临近预警」ok 条：它不是预警（不计入 warnCount），文案明示均正常。 */

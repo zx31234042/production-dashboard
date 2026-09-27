@@ -1355,6 +1355,145 @@ async function main() {
                 (obs.stray.length ? `；**冒出第三个参数类名字**：${obs.stray.map(w => w.title).join('、')}` : ''))
       );
     }
+
+    /* V1.37（R26-P2-2 处置 · 负责人 2026-09-27 裁定正确侧＝「拆分（改实现）」）新增：
+       **同态 ⇒ 2 条**的定向断言（只增不减，上面两条一字未改）。
+       立案：第三轮审查 R-2026-09-26-01 的 P2-2 —— `buildParamWarnings()` 旧实现按态
+       `groups.find(x => x.lv === r.lv.lv)` 把**同态**（深度与速度**同为 err** 或**同为 warn**）的两参数
+       **合并成一条**（detail 以「；」拼接），与三处声明矛盾：本文件（mockData.js）头部 `:16-18`
+       「互不合并 ⇒ 参数类最多 2 条」、docblock `:350-355`「深度与速度分别成条，一条预警里只含一个参数」、
+       `config/board.config.js:167-169`「一个参数＝一条预警，深度与速度各自独立成条」。而上面那条 C-88
+       判据与 `:1243` 的渲染夹具**都只停在混态**（深度 err + 速度 warn）⇒ 同态形态从无断言，门禁全绿而
+       缺陷在（这正是 P2-2「静态证实、行为未复跑」的由来）。本组五条判据：
+         ① 同态 err ⇒ 参数类**恰 2 条**、每条 detail **只含一个参数**且不得用「；」拼接两参数；
+         ② 同态 warn ⇒ 同上（两条同名同类，各含一个参数）；
+         ③ 混态回归：深度 warn ＋ 速度 err **仍恰 2 条**（不得因本次改动变成 1 条或 3 条）；
+         ④ C-88 五判据（参数类 ≤2 / 无第三个名字 / 相机参数不参与 / 名称⇔等级色一一对应 / detail 非空）
+            在**同态**新用例下同样成立；
+         ⑤ 上界回归：参数类 ≤2 ⇒ `state.warnings` 合计 ≤5（同态时仍是 2 条、不是 4 条）。
+       驱动方式：`buildParamWarnings()` **未导出**（public surface 只有 standardLevel/standardSpecOf），
+       故按 C-88 既有口径走**真路径** —— 只写运行时真源 `state.task.standard`（FR-3.19 现场录入的标准行）
+       与 `state.task.real`（FR-3.19 实测行），再由 `tick()` 触发重算；**不碰源码、不碰配置**。
+       为什么必须"冻结游走"：深度/速度是随机游走，同态命中帧只能靠扫（上面那条 C-88 用例扫了 2000 帧才
+       命中混态）⇒ 判据会随随机数时绿时红。这里把**上下文内的 `Math.random`** 顶成常量 0.5
+       （宿主侧 `vm.runInContext('Math', W)` 取到的是同一份 Math 对象，见其返回值的可变性），步长恒 0
+       ⇒ 实测值不再游走；再把 `real` 显式钉到演示初值（深度 5.00 m；vx 5.00 / vy 0.10 ⇒ 合成速度 5.00 m/s，
+       与 mockData 头部「演示取值」口径一致），于是"标准怎么设、三态就怎么落"完全确定，
+       同态两种形态各在**同一帧**稳定命中，不依赖任何随机数。
+       失效保护：冻结没生效（或构造抛异常）⇒ 本组判红并明说冻结失效，**不静默退化成"碰巧命中"**；
+       `finally` 里无条件还原 `Math.random` / `state.task.standard` / `state.task.real`，后续用例不受影响。 */
+    {
+      const M = W.MockData;
+      const NON_PARAM = 3;                        // 参数类之后固定三条：维保 / 耗材 / 工单
+      const PARAM_TITLES = ['参数阈值临近预警', '参数超范围预警'];
+      const CAMERA_WORDS = ['帧率', '增益', '快门', '相机'];
+      const PARAM_NAMES = ['深度', '速度'];
+      const STD = W.BoardConfig.standards || {};
+      const RANGE = STD.range || {};
+      const grid = 1 / Math.pow(10, STD.digits);  // 显示精度一格（两位小数 ⇒ 0.01 m / 0.01 m/s）
+      const unitOf = kind => (kind === 'depth' ? 'm' : 'm/s');
+      /* 夹具标准（都落在各自量程内 ⇒ 是**合法可录入**的行，与 `:1317` 那条同一构造手法）：
+         · err ：典型值＝量程下沿 + 3 格、偏差 ±1 格 ⇒ 导出上限 4.04 m / 3.04 m/s；
+                 而实测被钉在 5.00 ⇒ 两参数**必然同为超范围**；
+         · warn：典型值 4.70、偏差 ±0.40 ⇒ 标准带 [4.30, 5.10]、跨度 0.8 ⇒ 临近带宽 0.8×0.15 = 0.12
+                 ⇒ 实测 5.00 ∈ [4.98, 5.10)（上侧临近带）⇒ 两参数**必然同为临近**。
+         两套夹具在深度量程 [4,6] m 与速度量程 [3,8] m/s 之内（上偏差 ≥ 0 ≥ 下偏差）。 */
+      const errSpec = kind => ({ unit: unitOf(kind), digits: STD.digits,
+        typical: RANGE[kind].min + 3 * grid, upperDev: grid, lowerDev: -grid });
+      const warnSpec = kind => ({ unit: unitOf(kind), digits: STD.digits,
+        typical: 4.70, upperDev: 0.40, lowerDev: -0.40 });
+      /* 参数类的识别口径与上面一致＝**buildWarnings 的建表顺序**（参数类在前，其后固定 3 条），
+         不拿被测的名称当筛子，故改名/漏条都会被如实量到。 */
+      const snap = () => {
+        const all = M.state.warnings || [];
+        const param = all.slice(0, Math.max(0, all.length - NON_PARAM));
+        return {
+          total: all.length, param,
+          titles: param.map(w => w.title), lvs: param.map(w => w.lv),
+          nameCounts: param.map(w => PARAM_NAMES.filter(n => String(w.detail).includes(n)).length),
+          semi: param.map(w => String(w.detail).includes('；')),
+          text: param.map(w => `${w.title}/${w.lv}：${w.detail}`).join(' ｜ ') || '（0 条）'
+        };
+      };
+      /* "一条预警里只含一个参数"的机器口径：detail 恰含**一个**参数名，且不含拼接用的「；」 */
+      const oneParamPerRow = s => s.param.length > 0 && s.param.every(w =>
+        PARAM_NAMES.filter(n => String(w.detail).includes(n)).length === 1 &&
+        !String(w.detail).includes('；'));
+      /* C-88 五判据（与 `:1270` 那条同口径）：至多 2 条 / 无第三个名字 / 相机参数不参与 / 名色对应 / detail 非空 */
+      const c88 = s => s.param.length <= 2 &&
+        s.param.every(w => PARAM_TITLES.includes(w.title)) &&
+        s.param.every(w => !CAMERA_WORDS.some(k => String(w.title).includes(k))) &&
+        s.param.every(w => (w.title === '参数超范围预警') === (w.lv === 'err')) &&
+        s.param.every(w => typeof w.detail === 'string' && w.detail.length > 0);
+      const base = new Date('2026-09-18T16:30:00').getTime();
+      const ctxMath = vm.runInContext('Math', W);  // src 运行期取到的是**同一份** Math（见下方 freezeOk 实证）
+      const savedRandom = ctxMath.random;
+      const savedStandard = M.state.task.standard;
+      const savedReal = Object.assign({}, M.state.task.real);
+      const probes = {};
+      let freezeOk = false, buildErr = null;
+      try {
+        ctxMath.random = () => 0.5;                // 步长恒 0 ⇒ 实测值不再游走
+        M.state.task.real.depth = 5.00;            // 与 mockData 头部「演示取值」一致的初值
+        M.state.task.real.vx = 5.00;
+        M.state.task.real.vy = 0.10;
+        M.state.task.standard = { depth: errSpec('depth'), speed: errSpec('speed') };
+        M.tick(new Date(base));                    // 本帧起 speed 由 vx/vy 重算（= 5.00）
+        const d1 = M.state.task.real.depth, s1 = M.state.task.real.speed;
+        M.tick(new Date(base + 1000));
+        freezeOk = d1 === 5.00 && s1 === 5.00 &&
+          M.state.task.real.depth === d1 && M.state.task.real.speed === s1;
+        probes.real = `depth=${d1} speed=${s1}`;
+        probes.bothErr = snap();
+        M.state.task.standard = { depth: warnSpec('depth'), speed: warnSpec('speed') };
+        M.tick(new Date(base + 2000));
+        probes.bothWarn = snap();
+        M.state.task.standard = { depth: warnSpec('depth'), speed: errSpec('speed') };
+        M.tick(new Date(base + 3000));
+        probes.mixed = snap();
+      } catch (e) {
+        buildErr = e;
+      } finally {
+        ctxMath.random = savedRandom;              // 还原全局随机源（后续用例照常游走）
+        M.state.task.standard = savedStandard;     // 还原运行时真源
+        Object.assign(M.state.task.real, savedReal);
+      }
+      const frozen = buildErr === null && freezeOk;
+      const pre = buildErr ? `构造/判定异常：${buildErr.message}`
+        : `实测 ${probes.real}（冻结游走 ${freezeOk ? '生效' : '**失效 ⇒ 本组判据不成立**'}）；`;
+      const line = s => s
+        ? `${s.param.length} 条、标题/等级=[${s.titles.map((t, i) => `${t}/${s.lvs[i]}`).join('、') || '无'}]、` +
+          `每行 detail 参数名个数=[${s.nameCounts.join(', ') || '无'}]、含「；」=[${s.semi.join(', ') || '无'}]、` +
+          `state.warnings 合计 ${s.total} 条；实算＝${s.text}`
+        : '（未取到）';
+      check('FR-5.8/C-88 同态预警独立成条（**同态应出 2 条**）：深度与速度**同为超范围（err）**⇒ 参数类恰 2 条、每条 detail 只含一个参数且不用「；」拼接两参数（R26-P2-2 修）',
+        frozen && probes.bothErr && probes.bothErr.param.length === 2 &&
+        probes.bothErr.lvs.every(l => l === 'err') &&
+        probes.bothErr.titles.every(t => t === '参数超范围预警') &&
+        oneParamPerRow(probes.bothErr),
+        pre + '同态 err 应出 2 条：' + line(probes.bothErr));
+      check('FR-5.8/C-88 同态预警独立成条（**同态应出 2 条**）：深度与速度**同为临近（warn）**⇒ 参数类恰 2 条、每条 detail 只含一个参数且不用「；」拼接两参数（R26-P2-2 修）',
+        frozen && probes.bothWarn && probes.bothWarn.param.length === 2 &&
+        probes.bothWarn.lvs.every(l => l === 'warn') &&
+        probes.bothWarn.titles.every(t => t === '参数阈值临近预警') &&
+        oneParamPerRow(probes.bothWarn),
+        pre + '同态 warn 应出 2 条：' + line(probes.bothWarn));
+      check('FR-5.8/C-88 同态改动后的**混态回归**：深度 warn ＋ 速度 err 仍恰 2 条（一临近一超范围、各含一个参数）',
+        frozen && probes.mixed && probes.mixed.param.length === 2 &&
+        probes.mixed.lvs.join(',') === 'err,warn' &&
+        PARAM_TITLES.every(n => probes.mixed.titles.includes(n)) &&
+        oneParamPerRow(probes.mixed),
+        pre + '混态应仍为 2 条（err 在前、warn 在后）：' + line(probes.mixed));
+      check('FR-5.8/C-88 五判据在**同态**用例下同样成立（至多 2 条 / 无第三个名字 / 相机参数不参与 / 名称⇔等级色 / detail 非空）',
+        frozen && c88(probes.bothErr) && c88(probes.bothWarn) && c88(probes.mixed),
+        pre + `同态 err：${line(probes.bothErr)} ｜ 同态 warn：${line(probes.bothWarn)}`);
+      check('FR-5.8 参数类**上界回归**：参数类最多 2 条 ⇒ state.warnings 合计最多 5 条（同态时仍是 2 条、不是 4 条）',
+        frozen && [probes.bothErr, probes.bothWarn, probes.mixed].every(s => s.param.length <= 2 && s.total <= 5) &&
+        probes.bothErr.param.length === 2 && probes.bothErr.total === 5 &&
+        probes.bothWarn.param.length === 2 && probes.bothWarn.total === 5,
+        pre + `合计 = 同态 err ${probes.bothErr ? probes.bothErr.total : '--'} 条 / 同态 warn ${probes.bothWarn ? probes.bothWarn.total : '--'} 条 ` +
+          `（参数类 2 + 维保/耗材/工单 3 = 5；若同态被合并则只剩 1+3=4）`);
+    }
     check('FR-5.12/FR-5.13/FR-5.14 当班异常台账按行渲染（时间/编号/描述/闭环状态）',
       (() => {
         ui.out.length = 0;
