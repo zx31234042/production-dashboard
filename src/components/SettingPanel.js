@@ -204,6 +204,12 @@ window.Components.SettingPanel = (function () {
     });
 
     $('setSyncBtn').addEventListener('click', () => {
+      /* FR-8.2 / C-84③：与上方三处保存**同一口径**的锁定守卫（E35）。
+         原先此处既无锁定判断也无 `flashEntry`：真机上 `#setSyncBtn` 的 `disabled` 使得本缺口当前
+         不可达，但把按钮改回可点（或键盘/脚本触发）就会在**锁定态**写下 `pushLog('时间同步')` 并
+         提示"NTP 同步完成" —— 属防御性缺口，按三处保存的既有处置补上（复用 `denyLocked()`，
+         不新造提示机制）。 */
+      if (!state.unlocked) { denyLocked('时间同步'); return; }
       msg.textContent = 'NTP 同步完成（模拟）';
       msg.className = 'pwd-msg ok';
       M.pushLog('时间同步', '手动触发 NTP 同步（模拟）');

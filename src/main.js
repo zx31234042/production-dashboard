@@ -13,6 +13,7 @@
   const M = window.MockData;
   const Api = window.Api;
   const CFG = window.BoardConfig;
+  const HeaderBar = window.Components.HeaderBar;
   const Dashboard = window.Pages.Dashboard;
   const state = M.state;
   const stage = document.getElementById('stage');
@@ -68,10 +69,74 @@
 
     /* 每秒推进一帧并整屏重绘（NFR-01）。
        upper 模式下**不能**再跑 mockData.tick()：否则报文值会被模拟数据覆盖（审查报告 P1-1②）。
-       同时把"数据冻结/取数失败"同步到界面判据（IF-D.9 / P2-5）。 */
+       同时把"数据冻结/取数失败"同步到界面判据（IF-D.9 / P2-5）。
+
+       ---- E34（★★★，2026-09-27 负责人裁定＝方案①）：渲染循环**兜底**，不静默、不冻结 ----
+       事实（座位 5 实测，`tests\._verify\c1\probe-new-frame-abort.js`）：P3-5 之后 `M.tick()` 在
+       **班次配置缺口**时按服务端口径**显式抛错**（"绝不静默"，这是要保留的语义）；而原先的 `step()`
+       无 try/catch ⇒ 本帧的 `syncLinkState()` 与 `renderAll()` **都不执行** ⇒ 看板冻结在上一帧、
+       每秒重抛一次（`Dashboard.renderAll` 内部的 per-component try/catch 兜不住：它压根没被调到）。
+       处置＝**保留抛错**，在**渲染循环层**兜住，并保证三件事：
+         ① 捕获后**仍执行**原本会跳过的 `syncLinkState()` 与 `renderAll()`（看板不冻结）；
+         ② 给出**显式、用户可见**的异常状态：`state.shiftAlert` 置为题述原文，头屏据此显示
+            「班次配置异常」（见 `HeaderBar.render()`，与"在线/断连"降级提示同一类状态位，
+            复用既有渲染路径与样式变量，**不新增节点、不新增依赖**；index.html 契约不改）；
+         ③ **不刷屏**：只在"缺口触发／题述变化／恢复正常"这三种**状态变化**时报一次
+            （每条 message 至多一次），连续缺口的后续帧一律不再往控制台写。 */
+
+    /** 缺口的题述原文 —— 既是留给头屏的提示，也是"不刷屏"去重的键 */
+    function shiftGapMessage(err) {
+      if (!err) return '';
+      const msg = err.message || String(err);
+      return /班次/.test(msg) ? msg : '';        // 只认班次缺口这一种；其余异常照常上抛
+    }
+
+    /** 缺口的页面呈现：补齐本帧产物 + 记录 + 头屏刷新 + 报一次（同 message 不重复报） */
+    function noteShiftGap(msg) {
+      const prev = state.shiftAlert || '';
+      const changed = (msg || '') !== prev;                 // 去重判据＝题述变化（含恢复正常）
+      state.shiftAlert = msg || null;
+      if (msg) {
+        /* `M.tick()` 是在**写满 `state.shift` / `state.stats` 之前**抛的（`shiftOf()` 在 tick 里最先
+           调用），于是本帧这两块只剩初始值 ⇒ 班次页 `sh.pct.toFixed`、统计页 `s.firstPass.toFixed`
+           各自崩一次（实测改后仍每帧 2 条组件级 console.error，与"不刷屏"冲突）。
+           缺口帧按**既有字段名**补成"时间无法判定"的冻结值（不新增字段、不猜当班班次）：
+             · `state.shift.list` 取配置表本身（时间无关，班次页照旧列出全部班次时段）；
+             · `shift.pct/elapsed/total = 0`、`stats.* = 0` ⇒ 班次页/统计页显示 0% 冻结值；
+             · `state.shift` 的 `name/range/...` **沿用上一帧**（不伪造），异常由头屏
+               「班次配置异常」显式表达（`HeaderBar.render()`）。
+           ⚠ 遗留耦合：`state.stats` 的键集若在 `mockData.js` 里增删，这里须同步 —— 本处置的
+             首选修法其实是让 `tick()` 把 `shiftOf()` 之后才写的那几块也提前/兜住（见回执"未决"）。 */
+        state.shift.list = CFG.shift.list;
+        state.shift.pct = 0;
+        state.shift.elapsed = 0;
+        state.shift.total = 0;
+        state.stats = {
+          plan: CFG.planQty, started: 0, notStarted: CFG.planQty,
+          done: 0, testing: 0, pending: 0, qualified: 0, unqualified: 0, recheck: 0,
+          firstPass: 0, runSec: 0, idleSec: 0, avgTest: 0,
+          capacity: 0, oee: 0, shiftElapsed: 0, shiftTotal: 0
+        };
+      }
+      HeaderBar.render(state);
+      if (changed && msg) console.error('[看板] 班次配置异常（已兜底渲染，不再逐帧重复上报）：' + msg);
+    }
+
     function step() {
-      if (sourceKind === 'none') M.tick(new Date());
-      Api.syncLinkState(state, new Date());
+      const now = new Date();
+      /* ① 数据推进：抛错时不吞、不静默，但**不阻断**下方两步（E34 方案①） */
+      try {
+        if (sourceKind === 'none') M.tick(now);
+        /* 恢复自愈：本帧数据推进成功即撤下异常提示（同样只在状态变化时报一次）。
+           必须在②③**之前**收敛，否则本帧头屏会先按旧状态多画一次（实测：恢复帧重复渲染头屏）。 */
+        if (state.shiftAlert) noteShiftGap('');
+      } catch (err) {
+        const gap = shiftGapMessage(err);
+        if (!gap) throw err;                                // 非班次缺口：维持原语义，让它冒出去
+        noteShiftGap(gap);                                  // 去重后恰好报一次
+      }
+      /* ② 链路判定与③整屏重绘：**无论上一步是否抛错都要执行**（看板不得冻结） */
+      Api.syncLinkState(state, now);
       Dashboard.renderAll(state);
     }
     step();

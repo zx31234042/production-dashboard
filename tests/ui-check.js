@@ -482,6 +482,192 @@ function loadBootFixture(search) {
 }
 
 /**
+ * E34（★★★，D8）渲染循环兜底夹具：按 index.html 顺序在 vm 里装配**真实**的一整套前端
+ * （config → services → components → pages → **main**），只把浏览器环境换成桩件。
+ *
+ * 与 `loadBootFixture` 的分工：那一个只关心"启动后的静态状态"（解锁位、登记了几个计时器），
+ * 本夹具要观察**逐帧行为**，故额外提供三件缺一不可的能力：
+ *   ① **可注入的时钟**（`Date` 桩件 + `advance()`）：`step()` 内是 `new Date()` —— 不换 Date
+ *      就只能靠"等真实时间"，那既慢又不可复现。换了之后"本帧是否真的刷新"有确定判据：
+ *      `#hdrClock` 的文本会随注入时刻变化，冻结帧则原封不动。
+ *   ② **`console.error` 捕获**（不回放，`errorCount()/errors()` 读它）：E34 的"不刷屏"判据要
+ *      数报错条数，且要求断言**不依赖真实 stderr**。
+ *   ③ **`Components.*.render` 调用计数**（`calls`）：在 `main.js` 跑完之后、首帧之前包一层计数器
+ *      ⇒ "渲染仍发生"有**行为**证据（调用次数增加），不是源码字符串匹配（ADR-0004 D23）。
+ *
+ * 用法（缺口配置一律走"内存覆盖 `BoardConfig.shift.list` 的**同一个数组**"，不落盘、
+ * 不改 `mockData.js` 的 `SHIFTS` 引用）：
+ *   const fx = loadFrameFixture(['src/components/HeaderBar.js', ...]);
+ *   fx.setShiftList([{ name:'晚班', start:0, end:8 }, { name:'中班', start:16, end:24 }]);
+ *   fx.frame();                    // 驱动**恰好一帧**（等价于 setInterval 那一跳）
+ *
+ * @param {string[]} componentRels 组件加载清单（顺序须与 index.html 一致）
+ * @param {string} [search] 查询串（默认空；`?unlock=1` 等旁路参数按需给）
+ * @returns {{w:object, nodes:Map<string,object>, node:Function, out:Array, calls:object,
+ *            intervals:Array, errors:Function, errorCount:Function, advance:Function,
+ *            setShiftList:Function, frame:Function, click:Function, type:Function,
+ *            currentShiftList:Function}}
+ */
+function loadFrameFixture(componentRels, search) {
+  const nodes = new Map();
+  const out = [];
+  const intervals = [];
+  const loggedErrors = [];
+  const timers = [];
+  const calls = {};
+  const clock = { ms: new Date('2026-09-27T10:20:30').getTime() };
+  let timerSeq = 0;
+  let intervalSeq = 0;
+
+  const node = id => {
+    if (nodes.has(id)) return nodes.get(id);
+    const classes = new Set();
+    const handlers = {};
+    const o = {
+      __id: id, hidden: false, disabled: false, value: '', className: '', style: {}, dataset: {},
+      classList: {
+        add: c => classes.add(c),
+        remove: c => classes.delete(c),
+        contains: c => classes.has(c),
+        toggle: (c, on) => {
+          if (on === undefined ? !classes.has(c) : on) classes.add(c);
+          else classes.delete(c);
+        }
+      },
+      addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); },
+      __fire: (type, ev) => (handlers[type] || []).forEach(fn => fn(ev || { key: 'Enter' })),
+      querySelector: sel => node(id + ' ' + sel),
+      appendChild: () => {},
+      remove: () => {},
+      closest: () => null
+    };
+    Object.defineProperty(o, 'textContent', {
+      get() { return o.__text || ''; },
+      set(v) { o.__text = String(v); out.push({ kind: 'text', id: o.__id, value: String(v) }); },
+      configurable: true
+    });
+    Object.defineProperty(o, 'innerHTML', {
+      get() { return o.__html || ''; },
+      set(v) { o.__html = String(v); out.push({ kind: 'html', id: o.__id, value: String(v) }); },
+      configurable: true
+    });
+    nodes.set(id, o);
+    return o;
+  };
+
+  /* Date 桩件：`new Date()` 一律取注入时刻；显式带参的 `new Date(x)` 照旧（组件里会用到） */
+  const RealDate = Date;
+  const FakeDate = function (...args) { return args.length ? new RealDate(...args) : new RealDate(clock.ms); };
+  FakeDate.now = () => clock.ms;
+  FakeDate.parse = RealDate.parse;
+  FakeDate.UTC = RealDate.UTC;
+  FakeDate.prototype = RealDate.prototype;
+
+  const sandbox = {
+    console: {
+      log: (...a) => console.log(...a),
+      warn: (...a) => { loggedErrors.push({ kind: 'warn', text: a.map(x => (x && x.message) ? x.message : String(x)).join(' ') }); },
+      error: (...a) => { loggedErrors.push({ kind: 'error', text: a.map(x => (x && x.message) ? x.message : String(x)).join(' ') }); }
+    },
+    Date: FakeDate,
+    location: { search: search || '' },
+    URLSearchParams,
+    innerWidth: 3840, innerHeight: 2160,
+    addEventListener: () => {}
+  };
+  sandbox.window = sandbox;
+  sandbox.setTimeout = (fn, delay) => { const id = ++timerSeq; timers.push({ id, delay, fn, fired: false, cancelled: false }); return id; };
+  sandbox.clearTimeout = id => { const t = timers.find(x => x.id === id); if (t) t.cancelled = true; };
+  sandbox.setInterval = (fn, delay) => { const id = ++intervalSeq; intervals.push({ id, delay, fn }); return id; };
+  sandbox.clearInterval = () => {};
+  sandbox.document = {
+    readyState: 'complete',                 /* 直接跑 start()，不必再触发 DOMContentLoaded */
+    getElementById: node,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    createElement: () => node('created-' + (++timerSeq)),
+    addEventListener: () => {}
+  };
+
+  vm.createContext(sandbox);
+  const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  run('src/config/board.config.js');
+  run('src/config/fieldMap.js');
+  run('src/utils/format.js');
+  sandbox.window.Dom = {
+    $: node,
+    setText: (id, v) => { out.push({ kind: 'text', id, value: String(v) }); node(id).__text = String(v); },
+    setHTML: (id, v) => { out.push({ kind: 'html', id, value: String(v) }); node(id).__html = String(v); },
+    setClass: (id, v) => out.push({ kind: 'class', id, value: String(v) }),
+    setStyle: (id, prop, value) => out.push({ kind: 'style', id, prop, value: String(value) }),
+    toggleClass: (id, cls, on) => out.push({ kind: 'class', id, value: cls + ':' + on })
+  };
+  run('src/services/mockData.js');
+  run('src/services/api.js');
+  componentRels.forEach(run);
+  run('src/pages/Dashboard.js');
+
+  /* 调用计数包在**真组件**上：必须在 main.js 之前包不了（main.js 依赖 Components 已装配），
+     但必须不晚于首帧 —— 而 main.js 一跑完就已经跑过首帧了，故计数器只能从"第二帧"起算。
+     这正是判据需要的：缺口场景下首帧本身就不该冻结，用例先 `frame()` 一帧把状态推进到稳态，
+     再清零计数、连驱 5 帧看增量（每帧每个组件都应 +1）。 */
+  const CALL_KEYS = [
+    ['HeaderBar', 'render'], ['TabsBar', 'renderLinkStatus'], ['DeviceStatusPanel', 'render'],
+    ['TaskPanel', 'render'], ['ShiftPanel', 'render'], ['StatsPanel', 'render'],
+    ['AlarmPanel', 'render'], ['MaintPanel', 'render'], ['NoticePanel', 'render'], ['SettingPanel', 'render']
+  ];
+  const wrapCalls = () => {
+    CALL_KEYS.forEach(([name, method]) => {
+      const key = name + '.' + method;
+      if (calls[key] === undefined) calls[key] = 0;
+      const comp = sandbox.window.Components[name];
+      const orig = comp[method];
+      comp[method] = function (...a) { calls[key]++; return orig.apply(this, a); };
+    });
+  };
+  const resetCalls = () => CALL_KEYS.forEach(([n, m]) => { calls[n + '.' + m] = 0; });
+
+  let startErr = null;
+  try { run('src/main.js'); } catch (e) { startErr = e.message; }
+  wrapCalls();
+
+  const stepRef = intervals.length ? intervals[0].fn : null;
+
+  return {
+    w: sandbox.window,
+    nodes,
+    node,
+    out,
+    calls,
+    intervals,
+    startErr,
+    CALL_KEYS,
+    resetCalls,
+    /** 捕获到的 console.warn/error 原文（不回放，避免把**预期内**的告警混进门禁输出） */
+    errors: kind => loggedErrors.filter(e => kind === undefined || e.kind === kind).map(e => e.text),
+    errorCount: () => loggedErrors.filter(e => e.kind === 'error').length,
+    /** 注入时钟前进 ms 毫秒 */
+    advance: ms => { clock.ms += ms; },
+    /** 就地改写班次配置（**同一个数组**，`mockData.js` 的 `SHIFTS` 与之同引用） */
+    setShiftList: arr => {
+      const list = sandbox.window.BoardConfig.shift.list;
+      list.splice(0, list.length, ...arr);
+      return list.slice();
+    },
+    currentShiftList: () => sandbox.window.BoardConfig.shift.list.slice(),
+    /** 驱动**恰好一帧**：注入时钟 +1 s 后调用真实的 `step()`（setInterval 那一跳）。返回顶层是否抛出 */
+    frame: () => {
+      if (!stepRef) return { threw: true, message: startErr || 'main.js 未登记 setInterval（start() 可能在首帧就中断了）' };
+      clock.ms += 1000;
+      try { stepRef(); return { threw: false, message: null }; }
+      catch (e) { return { threw: true, message: (e && e.message) || String(e) }; }
+    },
+    click: id => node(id).__fire('click'),
+    type: (id, key) => node(id).__fire('keydown', { key: key || 'a' })
+  };
+}
+
+/**
  * 任务数据页「测试标准区 / 相机二级菜单」夹具（FR-3.16 改写 / FR-3.18 / FR-3.19）。
  *
  * 为什么不能直接复用 `loadUi` 的记录型假 DOM：V1.33 的三条条款要的是**交互与注入行为**，
@@ -3100,6 +3286,247 @@ async function main() {
       propagated
         ? `StatsPanel 抛错后异常直接冒出 renderAll：${propagated}（其后的组件都不会再渲染）`
         : `未中断，但其后组件未渲染：${afterFailure.join('、') || '（无）'}`
+    );
+  }
+
+  /* ===== U7 班次配置缺口：渲染循环兜底（E34 ★★★）与设置页同步按钮锁定守卫（E35 ★） ===== */
+  section('U7 班次缺口兜底与设置页锁定守卫（E34 / E35）');
+
+  /* ---- E34：`step()` 必须兜住 `mockData.shiftOf()` 的缺口抛错，且**不得**冻结整帧 ----
+     立案（C 分区 N1 实测，`tests\._verify\c1\probe-new-frame-abort.js`）：P3-5 之后 `M.tick()` 在
+     班次**配置缺口**时按服务端口径显式抛错（该语义要保留，绝不静默兜底），而 `src/main.js` 的
+     `step()` 原先**无** try/catch ⇒ `syncLinkState()` 与 `renderAll()` 都不执行、看板冻结在上一帧。
+     负责人 2026-09-27 裁定＝方案①：保留抛错 + 渲染循环兜底 + 显式可见异常态 + 不刷屏。
+     判据一律是**行为**判据（真实 main.js 逐帧驱动、组件 render 调用计数、节点文本、捕获的
+     console.error 条数），不做源码字符串匹配（ADR-0004 D23）。 ---- */
+  {
+    const FRAME_COMPONENTS = [
+      'src/components/HeaderBar.js',
+      'src/components/TabsBar.js',
+      'src/components/CurveChart.js',
+      'src/components/DeviceStatusPanel.js',
+      'src/components/TaskPanel.js',
+      'src/components/ShiftPanel.js',
+      'src/components/StatsPanel.js',
+      'src/components/AlarmPanel.js',
+      'src/components/MaintPanel.js',
+      'src/components/NoticePanel.js',
+      'src/components/SettingPanel.js'
+    ];
+    /* 有缺口的三段班（挖掉 08:00-16:00）——**内存覆盖**，不落盘、不动 mockData.js */
+    const GAP_LIST = [{ name: '晚班', start: 0, end: 8 }, { name: '中班', start: 16, end: 24 }];
+    const FULL_LIST = [
+      { name: '晚班', start: 0, end: 8 },
+      { name: '早班', start: 8, end: 16 },
+      { name: '中班', start: 16, end: 24 }
+    ];
+    const countText = (o, id) => o.filter(e => e.kind === 'text' && e.id === id).length;
+    const FE = { gapErr: null, r: null };
+
+    try {
+      /* (a) 基线：**正常配置**下先跑一帧（首帧由 main.js 的 start() 自己跑掉），
+             再用"连续 5 帧的调用增量"证明计数器本身是可用的（否则下面对照组会很可疑） */
+      const base = loadFrameFixture(FRAME_COMPONENTS);
+      base.frame();
+      base.resetCalls();
+      const baseThrew = [0, 1, 2, 3, 4].map(() => base.frame().threw).filter(Boolean).length;
+      const baseCalls = Object.assign({}, base.calls);
+
+      /* (b) 缺口：同一路夹具，把班次表换成有缺口的配置（首帧已在正常配置下跑过 ⇒
+             "冻结"的表现就是后续帧再也不刷新，与实测现象一致） */
+      const gap = loadFrameFixture(FRAME_COMPONENTS);
+      gap.frame();                                   /* 首帧（正常配置）+1 s 稳态 */
+      gap.setShiftList(GAP_LIST);                    /* 内存覆盖 ⇒ 下一帧起 `shiftOf()` 抛缺口 */
+      gap.resetCalls();
+      const before = {
+        records: gap.out.length,
+        clock: String(gap.node('hdrClock').textContent || ''),
+        errors: gap.errorCount(),
+        hdrShift: String(gap.node('hdrShift').textContent || '')
+      };
+      const frames = [0, 1, 2, 3, 4].map(() => gap.frame());
+      const threwCount = frames.filter(f => f.threw).length;
+      const after = {
+        records: gap.out.length,
+        clock: String(gap.node('hdrClock').textContent || ''),
+        errors: gap.errorCount(),
+        hdrShift: String(gap.node('hdrShift').textContent || ''),
+        hdrShiftTime: String(gap.node('hdrShiftTime').textContent || ''),
+        hdrTeam: String(gap.node('hdrTeam').textContent || ''),
+        hdrLinkBadge: String(gap.node('hdrLinkBadge').textContent || ''),
+        settingsRendered: gap.calls['SettingPanel.render'],
+        alarmsRendered: gap.calls['AlarmPanel.render'],
+        statsRendered: gap.calls['StatsPanel.render'],
+        shiftPanelRendered: gap.calls['ShiftPanel.render'],
+        shiftListText: String(gap.node('shShiftList').innerHTML || ''),
+        clockRenders: countText(gap.out, 'hdrClock')
+      };
+      const gapErrors = gap.errors('error');
+      const clockRefreshed = after.clock !== before.clock && after.clock.length > 0;
+      /* `M.tick()` 抛在 `state.clock` 之后、`state.shift` 之前 ⇒ 时钟必然推进、班次必然不更新，
+         故还用 C 组的时钟文本反证"本夹具真的能观察刷新" */
+      const baseCallsAllOne = base.CALL_KEYS.every(([n, m]) => baseCalls[n + '.' + m] === 5);
+      FE.r = {
+        baseThrew, clockRefreshed, before, after, threwCount, gapErrors, baseCallsAllOne,
+        frameErr: frames.map(f => f.message).filter(Boolean)[0] || null
+      };
+    } catch (e) {
+      FE.gapErr = e.message;
+    }
+
+    {
+      const r = FE.r;
+      check(
+        'E34（D8）FR-1.9/FR-1.10 班次配置缺口下不冻结：真实 main.js 的 step() 连驱 5 帧**一次都不抛到顶层**，' +
+        '且整帧仍渲染（10 个组件各 +5 次 render 调用、Dom 写入记录增长、#hdrClock 从上一帧时刻刷新到新时刻）',
+        FE.gapErr === null && r !== null && r.frameErr === null && r.threwCount === 0 &&
+        r.baseCallsAllOne && r.clockRefreshed && r.after.records > r.before.records &&
+        r.after.settingsRendered === 5 && r.after.alarmsRendered === 5 && r.after.statsRendered === 5 &&
+        r.after.shiftPanelRendered === 5,
+        FE.gapErr ? `夹具执行异常：${FE.gapErr}` : r === null ? '（无观察值）' :
+          `抛出顶层 ${r.threwCount}/5 帧${r.frameErr ? '（原文：' + r.frameErr + '）' : ''}；` +
+          `Dom 记录 ${r.before.records} → ${r.after.records}；#hdrClock ${JSON.stringify(r.before.clock)} → ` +
+          `${JSON.stringify(r.after.clock)}（刷新=${r.clockRefreshed}）；` +
+          `缺口 5 帧调用增量 班次页=${r.after.shiftPanelRendered} 统计页=${r.after.statsRendered} ` +
+          `设置页=${r.after.settingsRendered} 异常页=${r.after.alarmsRendered}；` +
+          `正常配置对照组 5 帧 = 每组件 ${r.baseCallsAllOne ? 5 : '不等'} 次`
+      );
+
+      check(
+        'E34（D8）显式异常状态用户可见且其余区域照常刷新：缺口帧头屏班次位显示「班次配置异常」' +
+        '（起止与班组/操作员/班组长回落为「—」），同时联网标识仍按状态渲染、班次页照旧列出配置里的全部班次时段',
+        FE.gapErr === null && r !== null &&
+        /班次配置异常/.test(r.after.hdrShift) &&
+        r.after.hdrShiftTime === '—' && r.after.hdrTeam === '—' &&
+        /上位机/.test(r.after.hdrLinkBadge) &&
+        r.after.shiftListText.includes('晚班') && r.after.shiftListText.includes('中班'),
+        FE.gapErr ? `夹具执行异常：${FE.gapErr}` : r === null ? '（无观察值）' :
+          `#hdrShift=${JSON.stringify(r.after.hdrShift)}、#hdrShiftTime=${JSON.stringify(r.after.hdrShiftTime)}、` +
+          `#hdrTeam=${JSON.stringify(r.after.hdrTeam)}、#hdrLinkBadge=${JSON.stringify(r.after.hdrLinkBadge)}；` +
+          `#shShiftList 含晚班/中班=${r.after.shiftListText.includes('晚班')}/${r.after.shiftListText.includes('中班')}`
+      );
+
+      check(
+        'E34（D8）不刷屏：连续 5 帧缺口场景下 console.error 总数 ≤ 1（同一 message 只在状态变化时报一次），' +
+        '且报错原文带"班次配置异常"字样（去重生效，不是把异常吞掉）',
+        FE.gapErr === null && r !== null && r.after.errors <= 1 &&
+        r.gapErrors.length === r.after.errors &&
+        r.gapErrors.every(m => /班次配置异常/.test(m)),
+        FE.gapErr ? `夹具执行异常：${FE.gapErr}` : r === null ? '（无观察值）' :
+          `console.error ${r.after.errors} 条（判据 ≤1）；原文=${JSON.stringify(r.gapErrors.map(m => m.split('\n')[0]))}`
+      );
+    }
+  }
+
+  /* ---- E34 恢复自愈：配置改回正常 ⇒ 提示消失、班次正常显示、不再新增报错 ---- */
+  {
+    const COMPONENTS = [
+      'src/components/HeaderBar.js', 'src/components/TabsBar.js', 'src/components/CurveChart.js',
+      'src/components/DeviceStatusPanel.js', 'src/components/TaskPanel.js', 'src/components/ShiftPanel.js',
+      'src/components/StatsPanel.js', 'src/components/AlarmPanel.js', 'src/components/MaintPanel.js',
+      'src/components/NoticePanel.js', 'src/components/SettingPanel.js'
+    ];
+    const GAP = [{ name: '晚班', start: 0, end: 8 }, { name: '中班', start: 16, end: 24 }];
+    const FULL = [
+      { name: '晚班', start: 0, end: 8 },
+      { name: '早班', start: 8, end: 16 },
+      { name: '中班', start: 16, end: 24 }
+    ];
+    let healErr = null;
+    let heal = null;
+    try {
+      const fx = loadFrameFixture(COMPONENTS);
+      fx.frame();
+      fx.setShiftList(GAP);
+      fx.frame();
+      fx.frame();
+      const during = {
+        hdrShift: String(fx.node('hdrShift').textContent || ''),
+        alert: fx.w.MockData.state.shiftAlert,
+        errors: fx.errorCount()
+      };
+      fx.setShiftList(FULL);                       /* 就地改回正常配置（同一个数组引用） */
+      fx.frame();
+      heal = {
+        during,
+        after: {
+          hdrShift: String(fx.node('hdrShift').textContent || ''),
+          hdrShiftTime: String(fx.node('hdrShiftTime').textContent || ''),
+          hdrTeam: String(fx.node('hdrTeam').textContent || ''),
+          alert: fx.w.MockData.state.shiftAlert,
+          errors: fx.errorCount()
+        }
+      };
+    } catch (e) {
+      healErr = e.message;
+    }
+    check(
+      'E34（D8）恢复自愈：班次配置改回无缺口后，头屏「班次配置异常」消失、班次名/起止/班组恢复为真实班次，' +
+      'state.shiftAlert 收敛为 null，且恢复过程不新增 console.error',
+      healErr === null && heal !== null &&
+      /班次配置异常/.test(heal.during.hdrShift) && typeof heal.during.alert === 'string' && heal.during.alert.length > 0 &&
+      !/班次配置异常/.test(heal.after.hdrShift) && heal.after.hdrShift.length > 0 &&
+      heal.after.alert === null && heal.after.errors === heal.during.errors &&
+      heal.after.hdrShiftTime !== '—' && heal.after.hdrTeam !== '—',
+      healErr ? `夹具执行异常：${healErr}` : heal === null ? '（无观察值）' :
+        `缺口期 #hdrShift=${JSON.stringify(heal.during.hdrShift)}、shiftAlert 非空=${typeof heal.during.alert === 'string'}、` +
+        `console.error ${heal.during.errors} 条；恢复后 #hdrShift=${JSON.stringify(heal.after.hdrShift)}、` +
+        `#hdrShiftTime=${JSON.stringify(heal.after.hdrShiftTime)}、#hdrTeam=${JSON.stringify(heal.after.hdrTeam)}、` +
+        `shiftAlert=${JSON.stringify(heal.after.alert)}、console.error 仍 ${heal.after.errors} 条`
+    );
+  }
+
+  /* ---- E35（★）：`#setSyncBtn`（NTP 手动同步）缺锁定守卫 ----
+     与三处保存（维保/公告/参数，见 R26-P2-1 的 f3）**同一口径**：锁定态必须 `denyLocked('时间同步')`
+     —— 既不得写 `pushLog('时间同步')`，也不得只改 `#setMsg`（那是 `#setMsg` 而不是指定的反馈位），
+     而要在 `#entryMsg` 上给出可见反馈（复用该文件既有 `denyLocked()`，不新造提示机制）。
+     判据是行为判据：真 SettingPanel + 真 state，锁定态点击后看 `state.opLog` 有没有多出"时间同步"、
+     解锁态点击是否照旧留痕（防止"把守卫改成永远拒绝"也能过）。 ---- */
+  {
+    let syncErr = null;
+    let sync = null;
+    try {
+      const fx = loadAutoLockFixture();
+      const M = fx.w.MockData;
+      fx.w.Components.SettingPanel.bind(M.state, () => {});
+      const opLogHas = action => (M.state.opLog || []).some(o => o.action === action);
+      const syncLogs = () => (M.state.opLog || []).filter(o => o.action === '时间同步').length;
+
+      M.setUnlocked(false);                        /* 相当于自动锁定到点之后的锁定态 */
+      const entry = fx.node('entryMsg');
+      const beforeText = String(entry.textContent || '');
+      const beforeCount = syncLogs();
+      fx.click('setSyncBtn');
+      const locked = {
+        logs: syncLogs() - beforeCount,
+        msgText: String(fx.node('setMsg').textContent || ''),
+        entryText: String(entry.textContent || ''),
+        entryChanged: String(entry.textContent || '') !== beforeText
+      };
+
+      M.setUnlocked(true);                         /* 解锁态：真路径（#setUnlockBtn → tryUnlock）之外的等价置位 */
+      const beforeCount2 = syncLogs();
+      fx.click('setSyncBtn');
+      const unlocked = {
+        logs: syncLogs() - beforeCount2,
+        msgText: String(fx.node('setMsg').textContent || '')
+      };
+      sync = { locked, unlocked, hasAction: opLogHas('时间同步') };
+    } catch (e) {
+      syncErr = e.message;
+    }
+    check(
+      'E35（D8）FR-8.2/C-84③ 锁定态点击 NTP 同步按钮不写操作日志：不产生 pushLog(\'时间同步\')，' +
+      '且在 #entryMsg 给出可见反馈（复用 denyLocked()）；解锁态点击照旧留痕并提示"NTP 同步完成"',
+      syncErr === null && sync !== null &&
+      sync.locked.logs === 0 && sync.locked.entryChanged &&
+      /当前已锁定/.test(sync.locked.entryText) && /时间同步/.test(sync.locked.entryText) &&
+      sync.locked.msgText === '' &&                       /* 不再抢在守卫前写 #setMsg */
+      sync.unlocked.logs === 1 && /NTP 同步完成/.test(sync.unlocked.msgText),
+      syncErr ? `夹具执行异常：${syncErr}` : sync === null ? '（无观察值）' :
+        `锁定态：新增"时间同步"日志 ${sync.locked.logs} 条（应 0）、#entryMsg ${JSON.stringify(sync.locked.entryText)}、` +
+        `#setMsg=${JSON.stringify(sync.locked.msgText)}；解锁态：新增日志 ${sync.unlocked.logs} 条（应 1）、` +
+        `#setMsg=${JSON.stringify(sync.unlocked.msgText)}`
     );
   }
 
