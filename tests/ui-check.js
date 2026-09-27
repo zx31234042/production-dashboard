@@ -2866,6 +2866,196 @@ async function main() {
       );
     }
 
+    /* ---- R26-P2-1（D2）：设置页写操作/键入必须重挂**同一个** 5 分钟锁定计时 + 锁定后保存不静默 ----
+       立案（审查 R-2026-09-26 的 R26-P2-1）：`SettingPanel.bind` 收到的 onActivity 是
+       `Dashboard.resetIdleTimer`（FR-9.4 回首页计时，5 分 10 秒），而设置页的写操作与录入框键入
+       **只**刷新它 ⇒ FR-8.2 的锁定计时不刷新（改前实测：6/6 类活动 "未重挂"）；且各保存路径以
+       `if (!state.unlocked) return` 开头 ⇒ 锁定后保存静默失效（操作人不知道没保存成功）。
+       裁定（负责人 2026-09-27）＝**刷新**：与任务页 `TaskPanel.activity()` **同一口径**的双动作
+       （onActivity + armAutoLock；不新造计时逻辑、不新增第二个定时器），且锁定后保存必须给出可观察反馈。
+       判据一律是**行为**判据（存活定时器 id / 存活数 / clearTimeout 次数 / 节点文案），
+       不在源码里搜字符串（ADR-0004 D23）——
+       `armAutoLock()` 必先 clearTimeout 再 setTimeout ⇒ 真的重挂时**存活定时器的 id 必然变化**；
+       只调 onActivity() 时那个 id 原封不动，本段 4 条断言随之变红。 ---- */
+    if (constErr === null) {
+      /* 保存路径成功后会回调这两个面板的 render；本段只观察计时与提示，用空桩件顶替
+         （不动 loadAutoLockFixture 这个共享夹具，避免影响 F-02 既有用例）。 */
+      const stubSavePanels = w => {
+        w.Components.MaintPanel = { render: () => {} };
+        w.Components.NoticePanel = { render: () => {} };
+      };
+      const liveLock = fx => fx.timers.filter(x => x.delay === lockMs && !x.cancelled && !x.fired);
+      const deadLock = fx => fx.timers.filter(x => x.delay === lockMs && x.cancelled).length;
+      /** 一副"已解锁且已 arm"的设置页夹具（解锁走真路径：#setUnlockBtn → tryUnlock） */
+      const unlockedFixture = () => {
+        const fx = loadAutoLockFixture();
+        stubSavePanels(fx.w);
+        let idle = 0;
+        fx.w.Components.SettingPanel.bind(fx.w.MockData.state, () => { idle++; });
+        fx.nodes.get('setPwd').value = fx.w.MockData.CFG.unlockPassword;
+        fx.click('setUnlockBtn');
+        return { fx, M: fx.w.MockData, idle: () => idle };
+      };
+      /** 施加一次"设置页活动"，返回可证伪的观察值（重挂 ⇒ 存活计时器换新 id 且旧的被 clearTimeout） */
+      const observeActivity = (setup, act) => {
+        const c = unlockedFixture();
+        if (setup) setup(c);
+        const idBefore = (liveLock(c.fx)[0] || {}).id;
+        const aliveBefore = liveLock(c.fx).length;
+        const deadBefore = deadLock(c.fx);
+        const idleBefore = c.idle();
+        act(c);
+        const idAfter = (liveLock(c.fx)[0] || {}).id;
+        return {
+          idBefore, idAfter,
+          aliveAfter: liveLock(c.fx).length,
+          deadDelta: deadLock(c.fx) - deadBefore,
+          idleDelta: c.idle() - idleBefore,
+          rearmed: aliveBefore === 1 && idAfter !== undefined && idAfter !== idBefore
+        };
+      };
+
+      /* (f1) 每个写操作（维保保存 / 公告发布 / 参数保存 / NTP 同步 / 手动时间）都要重挂锁定计时 */
+      let opsErr = null;
+      let writeOps = [];
+      try {
+        writeOps = [
+          ['维保保存', c => { c.fx.nodes.get('maintContent').value = 'R26-P2-1 检修内容'; }, c => c.fx.click('maintSave')],
+          ['公告发布', c => { c.fx.nodes.get('noticeText').value = 'R26-P2-1 公告'; }, c => c.fx.click('noticeSave')],
+          ['参数保存', c => { c.fx.nodes.get('cfgEquipCode').value = 'R26-P2-1-CODE'; }, c => c.fx.click('cfgSaveBtn')],
+          ['NTP 同步', null, c => c.fx.click('setSyncBtn')],
+          ['手动时间', null, c => c.fx.click('setManualBtn')]
+        ].map(([name, setup, act]) => [name, observeActivity(setup, act)]);
+      } catch (e) {
+        opsErr = e.message;
+      }
+      check(
+        'R26-P2-1（D2）FR-8.2/FR-3.19⑧ 设置页每个写操作都按任务页同一口径刷新：既重置 FR-9.4 回首页计时（onActivity +1），' +
+        '又重挂 FR-8.2 的 5 分钟锁定计时（存活计时器换成新 id、恰 1 个、clearTimeout 恰 1 次）',
+        opsErr === null && writeOps.length === 5 &&
+        writeOps.every(([, o]) => o.rearmed && o.aliveAfter === 1 && o.deadDelta === 1 && o.idleDelta === 1),
+        opsErr ? `夹具执行异常：${opsErr}` : writeOps.map(([n, o]) => `${n}: 计时器 ${o.idBefore}→${o.idAfter}、存活 ${o.aliveAfter}、` +
+          `clearTimeout +${o.deadDelta}、onActivity +${o.idleDelta}${o.rearmed ? '' : ' ⇒ 未重挂'}`).join('；')
+      );
+
+      /* (f2) 每个录入框的键入（改前只有密码框绑了 keydown）都要重挂锁定计时 */
+      let typeErr = null;
+      let typed = [];
+      try {
+        typed = ['maintContent', 'maintOwner', 'noticeText',
+          'cfgEquipCode', 'cfgUpperUrl', 'cfgMesUrl', 'cfgWarnDays']
+          .map(id => [id, observeActivity(null, c => c.fx.node(id).__fire('keydown', { key: 'a' }))]);
+      } catch (e) {
+        typeErr = e.message;
+      }
+      check(
+        'R26-P2-1（D2）FR-8.2/FR-3.19⑧ 设置页录入框键入同样刷新：7 个录入框（维保内容/维保责任人/公告正文/参数四框）各派发一次 keydown ' +
+        '⇒ 每次都以新 id 重挂同一个锁定计时（不新增第二个定时器）',
+        typeErr === null && typed.length === 7 &&
+        typed.every(([, o]) => o.rearmed && o.aliveAfter === 1 && o.deadDelta === 1 && o.idleDelta === 1),
+        typeErr ? `夹具执行异常：${typeErr}` : typed.map(([id, o]) => `${id}: 计时器 ${o.idBefore}→${o.idAfter}、` +
+          `存活 ${o.aliveAfter}${o.rearmed ? '' : ' ⇒ 未重挂'}`).join('；')
+      );
+
+      /* (f3) 锁定后保存**不得静默失效**：三处保存路径都要给出可见反馈，且都不在锁定态写入状态 */
+      let lockErr = null;
+      let lockedSaves = [];
+      try {
+        lockedSaves = [
+          ['维保保存', 'maintSave', s => `${s.unlocked}|${s.maint.records.length}`],
+          ['公告发布', 'noticeSave', s => `${s.unlocked}|${s.notices.notices.length}`],
+          ['参数保存', 'cfgSaveBtn', s => `${s.unlocked}|${s.device.code}|${s.maint.warnDays}`]
+        ].map(([name, btn, snap]) => {
+          const fx = loadAutoLockFixture();
+          stubSavePanels(fx.w);
+          const M = fx.w.MockData;
+          fx.w.Components.SettingPanel.bind(M.state, () => {});
+          M.setUnlocked(false);                       /* 相当于自动锁定到点之后的锁定态 */
+          const entry = fx.node('entryMsg');
+          const before = String(entry.textContent || '');
+          const stateBefore = snap(M.state);
+          fx.click(btn);
+          const after = String(entry.textContent || '');
+          return {
+            name, before, after,
+            stateSame: snap(M.state) === stateBefore,
+            visible: after !== before && after.length > 0 && /锁定/.test(after) && /未保存/.test(after)
+          };
+        });
+      } catch (e) {
+        lockErr = e.message;
+      }
+      check(
+        'R26-P2-1（D2）FR-8.2/C-84③ 锁定后设置页保存给出可观察反馈（#entryMsg 变为"当前已锁定…未保存，请先输入解锁密码"），' +
+        '不是静默 return：三处保存路径既都可见、也都不在锁定态写入状态',
+        lockErr === null && lockedSaves.length === 3 && lockedSaves.every(r => r.visible && r.stateSame),
+        lockErr ? `夹具执行异常：${lockErr}` : lockedSaves.map(r => `${r.name}: #entryMsg ${JSON.stringify(r.before)} → ` +
+          `${JSON.stringify(r.after)}；可见反馈=${r.visible}；state 未写入=${r.stateSame}`).join('；')
+      );
+
+      /* (f4) 两页共用**同一个**计时器而非两套：8 次设置页活动 ⇒ 全局存活恰 1 个；
+         再走任务页那条入口（`TaskPanel.activity()` 调的导出 `armAutoLock()`）⇒ 它取消掉的正是这一个；
+         触发它 ⇒ 走 FR-8.2 自动锁定（置锁定 + 弹 #autoLockTip + 2 s 后隐藏）。 */
+      let shareErr = null;
+      let shared = null;
+      try {
+        const c = unlockedFixture();
+        const idleBefore = c.idle();
+        const deadBefore = deadLock(c.fx);
+        c.fx.nodes.get('maintContent').value = 'D2 2b 检修内容';
+        c.fx.click('maintSave');
+        c.fx.nodes.get('noticeText').value = 'D2 2b 公告';
+        c.fx.click('noticeSave');
+        c.fx.nodes.get('cfgEquipCode').value = 'D2-2B-CODE';
+        c.fx.click('cfgSaveBtn');
+        c.fx.click('setSyncBtn');
+        c.fx.click('setManualBtn');
+        ['maintContent', 'cfgWarnDays', 'noticeText'].forEach(id => c.fx.node(id).__fire('keydown', { key: 'a' }));
+        const bySettings = { alive: liveLock(c.fx).length, id: (liveLock(c.fx)[0] || {}).id, dead: deadLock(c.fx) };
+        const armed = c.fx.w.Components.SettingPanel.armAutoLock();   /* 任务页 activity() 的同一步 */
+        const byTask = { alive: liveLock(c.fx).length, id: (liveLock(c.fx)[0] || {}).id, dead: deadLock(c.fx) };
+        const tip = c.fx.node('autoLockTip');
+        tip.hidden = true;
+        c.fx.fire(lockMs);
+        shared = {
+          idleDelta: c.idle() - idleBefore,
+          deadDelta: bySettings.dead - deadBefore,
+          bySettings, byTask, armed,
+          unlockedAfter: c.M.state.unlocked,
+          tipShown: tip.hidden === false && tip.classList.contains('show'),
+          tipTimers: c.fx.timers.filter(x => x.delay === 2000 && !x.fired).length
+        };
+        c.fx.fire(2000);
+        shared.tipHidden = tip.hidden === true && !tip.classList.contains('show');
+      } catch (e) {
+        shareErr = e.message;
+      }
+      check(
+        'R26-P2-1（D2）FR-8.2/FR-3.19⑧ 设置页与任务页共用**同一个**5 分钟锁定计时器（非两套）：8 次设置页活动后全局仅 1 个存活计时器，' +
+        '任务页入口 armAutoLock() 取消的正是它（id 变化、存活仍 1），触发它即自动锁定并弹提示 → 2 s 后隐藏',
+        shareErr === null && shared !== null &&
+        shared.idleDelta === 8 && shared.deadDelta === 8 &&
+        shared.bySettings.alive === 1 && shared.byTask.alive === 1 &&
+        shared.byTask.id !== shared.bySettings.id && shared.byTask.dead === shared.bySettings.dead + 1 &&
+        shared.armed === true && shared.unlockedAfter === false && shared.tipShown &&
+        shared.tipTimers === 1 && shared.tipHidden === true,
+        shareErr ? `夹具执行异常：${shareErr}` : shared === null ? '（无观察值）' :
+          `8 次设置页活动：onActivity +${shared.idleDelta}、clearTimeout +${shared.deadDelta}；` +
+          `存活计时器 ${shared.bySettings.alive} 个（id ${shared.bySettings.id}）→ 任务页入口 arm 后 ` +
+          `${shared.byTask.alive} 个（id ${shared.byTask.id}）；触发后 unlocked=${shared.unlockedAfter}、` +
+          `弹窗显示=${shared.tipShown}、2000 ms 定时器 ${shared.tipTimers} 个、2 s 后隐藏=${shared.tipHidden}`
+      );
+
+      /* 通过时也把观察值播出来（失败时另见 detail）：门禁输出本身即可复核，不必重跑夹具 */
+      if (opsErr === null && typeErr === null && lockErr === null && shareErr === null && shared !== null) {
+        console.log(`        参考（真实 SettingPanel）：5 类写操作重挂 ${writeOps.filter(([, o]) => o.rearmed).length}/5、` +
+          `7 个录入框键入重挂 ${typed.filter(([, o]) => o.rearmed).length}/7、` +
+          `锁定后三处保存可见反馈 ${lockedSaves.filter(r => r.visible).length}/3、` +
+          `8 次设置页活动后存活 ${lockMs} ms 计时器 ${shared.bySettings.alive} 个` +
+          `（任务页入口 armAutoLock() 后 ${shared.byTask.alive} 个、clearTimeout 共 +${shared.deadDelta}）`);
+      }
+    }
+
     check(
       'FR-8.7 / NFR-15 解锁后的写操作留痕（真实操作日志）',
       /(opLog|operationLog|auditLog|state\.logs|操作日志\s*[:：]?\s*\[)/.test(allSrc) === true &&
