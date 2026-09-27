@@ -1211,6 +1211,186 @@ async function main() {
     }
   }
 
+  /* ===== N. 补传队列告警阈值：单一真源、两端同判（R26-P3-4 / E10 / IF-B.9） =====
+     立案：同一「补传队列告警」概念在两侧**语义相反** —— 前端 `src/services/api.js` 按
+     `max(1, floor(queueCap × 90%))` 算（容量 5000 ⇒ 要积压 **4500 条**才亮），
+     服务端 `server/services/uploadQueue.js` 的 `warnThreshold` 缺省 **1**（积压 1 条即 warn），
+     且 `board.config.js` 的 `mes` 段当时**只有 `queueCap`、没有共享阈值键** ⇒ 参数真源缺位，
+     接线后必然口径漂移。
+     本段按"断言即证据（D19）＋行为判据"钉住四件事：
+       ① **同一真源**：`board.config.js` 的 `mes.queueWarnThreshold` 存在且为数值；服务端
+          `queue.warnThreshold` **由它决定**（断言相等，且构造器缺省值取不到时兜底同值）；
+       ② **同一真源决定两端行为**：`pending = 阈值 − 1 / 阈值` 两点上，前端（vm 跑 `src/services/api.js`
+          真源码）与服务端（真 `uploadQueue` + 内存 `node:sqlite`）**同判**：不告警／告警；
+       ③ **旧分歧被消除**（行为判据优先）：默认容量 5000 下，`pending = 1`（远小于 90% 容量）
+          前端**必须已告警**；并静态守住"前端不再出现按容量比例推导告警线"这个写法；
+       ④ **阈值可配**：把隔离沙箱里的真源改成别的值（前端 1 个探针、服务端 2 个探针 + 显式传参），
+          两端判定**同步变化** —— 证明告警线真由该键决定，不是恰好等于默认值的巧合；
+       ⑤ **容量键仍在**：`queueCap` 语义未被破坏（前端仍用它做"满则拒入"，服务端仍用它拒新键）。
+     反证（ADR-0004 D22 定点变异，两组，均已实测）：(a) 把前端改回 `cap * 0.9` ⇒ ③(1 条) 与 ② 变红并点名；
+     (b) 把服务端缺省改回**独立字面量**（不读真源、且与真源不同值）⇒ ① 与 ② 变红并点名。 */
+  section('N. 补传队列告警阈值单一真源（R26-P3-4 / E10 / IF-B.9）');
+  {
+    /* 前置不成立时**记为失败并单列原因**（沿用 M 段 `requires` 语义，不是"环境不满足就跳过"） */
+    function requires(name, ok, detail) {
+      if (!ok) {
+        console.log(`  [UNMET] 前提不成立：${name} —— ${detail}`);
+        check(name, false, `${detail}（前提不成立，本段用例不成立、不计入通过）`);
+      }
+      return Boolean(ok);
+    }
+    /* 真源：一律从 board.config.js 读，阈值/容量都不在断言里写死（改真源即改期望，符合"参数只在配置"） */
+    const confNode = require('../src/config/board.config.js');
+    const capCfg = confNode.mes.queueCap;
+    const thrCfg = confNode.mes.queueWarnThreshold;
+    /* 真源同时驱动浏览器侧加载（contract-check 顶部 LOAD_ORDER 已加载同一份文件） */
+    const capScript = CFG.mes.queueCap;
+    const thrScript = CFG.mes.queueWarnThreshold;
+    const thrOk = requires('补传队列告警阈值的真源存在且为数值（board.config.js mes.queueWarnThreshold）',
+      typeof thrCfg === 'number' && Number.isFinite(thrCfg) && thrCfg >= 1 && capScript === capCfg &&
+      thrScript === thrCfg,
+      `require 侧 ${JSON.stringify(thrCfg)}（queueCap ${JSON.stringify(capCfg)}）；vm 加载侧 ` +
+      `${JSON.stringify(thrScript)}（queueCap ${JSON.stringify(capScript)}）—— ` +
+      '两侧读的是同一个文件，取不到或不是数值说明真源缺位/漂移');
+
+    /* 前端探针：vm 加载**真源码**（config → fieldMap → api.js，顺序同 index.html）。
+       fetch 用桩恒失败（离线，不联网）：走的就是 `uploadReport → queuePending` 这条真实入队路径。 */
+    function frontProbe(n, mutate) {
+      const sandbox = { console, setTimeout, clearTimeout, AbortSignal };
+      sandbox.window = sandbox;
+      sandbox.fetch = () => Promise.reject(new Error('contract-check N 段：故意失败，只入队不联网'));
+      vm.createContext(sandbox);
+      const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+      run('src/config/board.config.js');
+      if (typeof mutate === 'function') mutate(sandbox.window.BoardConfig);
+      run('src/config/fieldMap.js');
+      run('src/services/api.js');
+      const w = sandbox.window;
+      w.BoardConfig.mes.baseUrl = w.BoardConfig.mes.baseUrl || 'http://127.0.0.1:1/mes';   // 非空即够（fetch 是桩）
+      return (async () => {
+        const rs = [];
+        for (let i = 1; i <= n; i++) {
+          rs.push(await w.Api.uploadReport({ uploadId: 'UP2026092610000' + String(i).padStart(2, '0') }));
+        }
+        const st = w.Api.getStatus();
+        return { n, rs, st, cfg: w.BoardConfig };
+      })();
+    }
+
+    /* 服务端探针：真 uploadQueue + 内存库（node:sqlite），入库 n 条后取告警快照 */
+    function serverProbe(n, options) {
+      const { DatabaseSync } = require('node:sqlite');
+      const dbApi = require('../server/db');
+      const { createUploadQueue } = require('../server/services/uploadQueue');
+      const db = new DatabaseSync(':memory:');
+      dbApi.initSchema(db);
+      const q = createUploadQueue(Object.assign({
+        db, now: () => new Date('2026-09-26T10:00:00')
+      }, (options || {}).queueOptions));
+      let fullErr = null;
+      for (let i = 1; i <= n; i++) {
+        try {
+          q.enqueueFailed({ uploadId: 'UP2026092610000' + String(i).padStart(2, '0'), requestBody: { i } });
+        } catch (err) {
+          fullErr = err;   // 容量满（新键）时按设计抛错，探针如实记录
+          break;
+        }
+      }
+      const alert = q.alert();
+      const count = q.pendingCount();
+      db.close();
+      return { n, queue: q, alert, count, fullErr };
+    }
+
+    if (thrOk) {
+      /* ① 同一真源：服务端告警阈值由该键决定（构造器缺省即读它） */
+      const srvDefault = serverProbe(0);
+      check('R26-P3-4 ① 服务端 uploadQueue 的缺省告警阈值 = board.config.js 的 mes.queueWarnThreshold' +
+        '（单一真源；不得各自硬编码）',
+        srvDefault.queue.warnThreshold === thrCfg && thrCfg === srvDefault.queue.warnThreshold,
+        `服务端 warnThreshold=${srvDefault.queue.warnThreshold}，真源=${thrCfg}` +
+        '（若此处不等，说明服务端把阈值写成了独立字面量，接线后必然与前端漂移）');
+
+      /* ② 同一真源决定两端行为：pending = 阈值 − 1 / 阈值 两点，两侧同判 */
+      const belowFe = await frontProbe(Math.max(0, thrCfg - 1));
+      const belowBe = serverProbe(Math.max(0, thrCfg - 1));
+      const atFe = await frontProbe(thrCfg);
+      const atBe = serverProbe(thrCfg);
+      const belowSame = belowFe.st.queueAlert === false && belowBe.alert.warn === false &&
+        belowFe.st.pendingCount === Math.max(0, thrCfg - 1) && belowBe.alert.pendingCount === Math.max(0, thrCfg - 1);
+      const atSame = atFe.st.queueAlert === true && atBe.alert.warn === true &&
+        atFe.st.pendingCount === thrCfg && atBe.alert.pendingCount === thrCfg;
+      check(`R26-P3-4 ② 同一真源决定两端行为：pending = ${thrCfg - 1}（阈值 − 1）两点均**不告警**、` +
+        `pending = ${thrCfg}（阈值）两点均**告警**（前端 getStatus().queueAlert ↔ 服务端 alert().warn）`,
+        belowSame && atSame,
+        `pending=${Math.max(0, thrCfg - 1)}：前端 ${belowFe.st.queueAlert}（${belowFe.st.pendingCount} 条）` +
+        `／服务端 ${belowBe.alert.warn}（${belowBe.alert.pendingCount} 条）；` +
+        `pending=${thrCfg}：前端 ${atFe.st.queueAlert}（${atFe.st.pendingCount} 条）` +
+        `／服务端 ${atBe.alert.warn}（${atBe.alert.pendingCount} 条）`);
+
+      /* ③ 旧分歧被消除（**行为判据**，优先）：默认容量下 pending = 1 前端必须已告警 */
+      const fe1 = await frontProbe(1);
+      check('R26-P3-4 ③ 旧分歧消除（行为判据）：默认容量 ' + capCfg + ' 下 pendingCount = 1 时前端' +
+        '**必须已告警**（旧实现按容量 90% ⇒ 要积压 ' + Math.max(1, Math.floor(capCfg * 0.9)) + ' 条才亮，' +
+        '与服务端"积压 1 条即 warn"两判相反）',
+        fe1.st.pendingCount === 1 && fe1.st.queueAlert === true,
+        `pendingCount=${fe1.st.pendingCount}，queueAlert=${fe1.st.queueAlert}，queueFull=${fe1.st.queueFull}` +
+        `（容量 ${fe1.st.pendingCapacity}）；若为 false 即回到了"容量 × 90%"口径`);
+      const feAtOldLine = Math.max(1, Math.floor(capCfg * 0.9));
+      const feOldLine = await frontProbe(feAtOldLine);
+      check('R26-P3-4 ③b 前端不得再按容量比例推导告警线：pending = ' + feAtOldLine +
+        '（＝容量 ' + capCfg + ' 的 90%）时既不"因满而拒入"、也**不改变判定方向**' +
+        '（该点仍告警，且 queueFull 仍为 false —— 告警线 ≠ 容量线）',
+        feOldLine.st.pendingCount === feAtOldLine && feOldLine.st.queueAlert === true &&
+        feOldLine.st.queueFull === false,
+        `pendingCount=${feOldLine.st.pendingCount}，queueAlert=${feOldLine.st.queueAlert}，` +
+        `queueFull=${feOldLine.st.queueFull}（容量 ${feOldLine.st.pendingCapacity}）`);
+      /* 只在**代码行**上查（剔除以 `*`、`//`、`/*` 开头的注释行，`api.js` 的注释里会引用旧写法作对照） */
+      const apiCodeN = readText('src/services/api.js')
+        .split(/\r?\n/).filter(l => !/^\s*(\*|\/\*|\/\/)/.test(l)).join('\n');
+      check('R26-P3-4 ③c 静态守卫：src/services/api.js 的**代码**里不再出现"容量 × 0.9"这类隐藏阈值写法' +
+        '（行为判据见 ③/③b；本条只守住写法不回潮）',
+        !/cap\s*\*\s*0\.9/.test(apiCodeN) && !/0\.9\s*\*\s*cap/.test(apiCodeN),
+        'api.js 代码里仍有 `cap * 0.9`：告警线被容量按比例推导，不是配置阈值');
+
+      /* ④ 阈值可配：改真源 ⇒ 两端判定**同步**变化（不落盘任何临时改动）
+         · 前端：隔离沙箱里把 mes.queueWarnThreshold 改为 thrCfg + 2；同一 pending = thrCfg 必须**不再告警**
+           （若前端读的是缺省 1，或读死值，这一点会保持不变、断言即失败）；
+         · 服务端：真源本身不动仓库文件，改为**显式传参**覆盖（调用方保留传参能力），
+           同一 pending = thrCfg 也必须**不再告警**；阈值＝thrCfg + 2 时同一点**告警**。 */
+      const thrAlt = thrCfg + 2;
+      const feAlt = await frontProbe(thrCfg, cfg => {
+        cfg.mes.queueWarnThreshold = thrAlt;   // 只在隔离沙箱内改，仓库文件不动
+      });
+      const beAltBelow = serverProbe(thrCfg, { queueOptions: { warnThreshold: thrAlt } });
+      const beAltAt = serverProbe(thrAlt, { queueOptions: { warnThreshold: thrAlt } });
+      check(`R26-P3-4 ④ 阈值可配：真源改为 ${thrAlt} 时，同一 pending = ${thrCfg} 的判定同步反转为` +
+        '**不告警**；阈值到达时再告警（前端＝隔离沙箱改真源，服务端＝显式传参覆盖）',
+        feAlt.st.pendingCount === thrCfg && feAlt.st.queueAlert === false &&
+        beAltBelow.alert.pendingCount === thrCfg && beAltBelow.alert.warn === false &&
+        beAltAt.alert.pendingCount === thrAlt && beAltAt.alert.warn === true,
+        `前端（真源 ${thrAlt}）pending=${feAlt.st.pendingCount} → queueAlert=${feAlt.st.queueAlert}；` +
+        `服务端（显式 warnThreshold=${thrAlt}）pending=${beAltBelow.alert.pendingCount} → warn=${beAltBelow.alert.warn}，` +
+        `pending=${beAltAt.alert.pendingCount} → warn=${beAltAt.alert.warn}`);
+
+      /* ⑤ 容量键仍在：queueCap 语义未被阈值改动破坏（前端"满则拒入"、服务端拒新键，两侧同判） */
+      const capTight = Math.max(1, Math.min(3, capCfg));
+      const feFull = await frontProbe(capTight + 1, cfg => { cfg.mes.queueCap = capTight; });
+      const fullResults = feFull.rs || [];
+      const firstFull = fullResults.find(r => r.queueFull === true);
+      const beFull = serverProbe(capTight + 1, { queueOptions: { capacity: capTight } });
+      check('R26-P3-4 ⑤ 容量键仍生效且语义未被改动：前端仍按 queueCap「满则拒入」' +
+        '（不丢弃已缓存报文）、服务端仍拒新键并抛 UploadQueueFullError',
+        feFull.st.pendingCapacity === capTight && feFull.st.pendingCount === capTight &&
+        firstFull !== undefined && Boolean(beFull.fullErr) && beFull.fullErr.name === 'UploadQueueFullError' &&
+        beFull.count === capTight,
+        `前端（queueCap=${capTight}）入队 ${capTight + 1} 条 → pendingCount=${feFull.st.pendingCount}` +
+        `（满后拒绝：${firstFull !== undefined ? '已拒入' : '**未拒入**'}，queueFull=${firstFull && firstFull.queueFull}）；` +
+        `服务端 capacity=${capTight} → 入库 ${beFull.count} 条、第 ${capTight + 1} 条` +
+        `${beFull.fullErr ? '抛 ' + beFull.fullErr.name : '**未拒收**'}`);
+    }
+  }
+
   /* ---------------- 汇总 ---------------- */
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failed0()} 项，跳过 ${skipped} 项`);

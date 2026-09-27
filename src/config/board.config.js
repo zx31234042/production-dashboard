@@ -138,6 +138,15 @@ const BOARD_CONFIG = (function () {
          落库持久化在服务端 server/services/uploadQueue.js（写 upload_log，重启后从库读回），
          本项供浏览器侧适配层（src/services/api.js）自检与状态展示使用。 */
       queueCap: 5000,
+      /* 补传队列**告警阈值**（R26-P3-4）：**待补传条数 ≥ 该值即告警**，值 = 1
+         （IF-B.9「看板告警并显示待补传条数」：报不上去就要让人看见，积压 1 条即亮）。
+         · 本项是这一口径的**唯一真源** —— 浏览器侧 `src/services/api.js` 的 `getStatus().queueAlert`
+           与服务端 `server/services/uploadQueue.js` 的 `warnThreshold` 缺省值**都必须读它**，
+           **不得各自硬编码**（此前前端写死"容量 × 90%"＝积压 4500 条才亮、服务端缺省 1，两判相反）。
+         · 与 `queueCap` 分工：`queueCap` 是**容量上限**（满了拒绝入队，见上），
+           `queueWarnThreshold` 是"**该不该报警**"的门槛；两者语义不同，**不得互相推导**
+           （告警线不再由容量按比例算出）。 */
+      queueWarnThreshold: 1,
       /* 说明（E10，2026-09-20 已定决策）：**不做自动重试** —— 不实现指数退避、不加定时器；
          上报失败只做两件事：①告警/暴露待补传条数；②把失败报文落库留存。重报由**人工触发**
          （src/services/api.js 的 retryPending()；flushPending() 只刷新状态、不发送）。

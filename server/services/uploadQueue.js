@@ -23,6 +23,9 @@
 'use strict';
 
 const repo = require('../repo/uploadQueue');
+/* 配置真源（R26-P3-4）：`src/config/board.config.js` 同时支持浏览器（window.BoardConfig）
+   与 Node（module.exports），故服务端可直接 require 同一份配置 —— 不新造第二份阈值。 */
+const boardConfig = require('../../src/config/board.config.js');
 
 /** 队列容量缺省值（与原内存队列的 5000 条上限一致；改这里即改行为，不散落魔法数字） */
 const DEFAULT_CAPACITY = 5000;
@@ -30,8 +33,14 @@ const DEFAULT_CAPACITY = 5000;
 /** 待补传清单一次返回的最大条数（防止把几千条明细一次性吐给界面） */
 const DEFAULT_LIST_LIMIT = 200;
 
-/** 默认告警阈值：只要队列非空即告警（NFR-13 口径：报不上去就要让人看见） */
-const DEFAULT_WARN_THRESHOLD = 1;
+/** 默认告警阈值：**取自配置真源** `board.config.js` 的 `mes.queueWarnThreshold`
+ *  （＝"待补传条数 ≥ 该值即告警"，NFR-13 口径：报不上去就要让人看见；真源现值 1）。
+ *  **不要**在此写死字面量：前端 `src/services/api.js` 的 `getStatus().queueAlert` 读同一键，
+ *  写死即两侧口径漂移（R26-P3-4 立案原因：前端曾按"容量 × 90%"算、服务端缺省 1，两判相反）。
+ *  取不到配置键时的兜底与真源同值（1）—— 改一处必须同步另一处。 */
+const DEFAULT_WARN_THRESHOLD =
+  (boardConfig.mes && boardConfig.mes.queueWarnThreshold !== undefined)
+    ? boardConfig.mes.queueWarnThreshold : 1;
 
 /**
  * 队列已满：**拒绝新键入队**（不再静默丢弃最旧报文）。
@@ -83,7 +92,9 @@ function normalizeCapacity(value) {
  *   @param {string}    [options.interface]    缺省接口名，形如 `report/receiveReport`（serviceName/methodName）
  *   @param {number}    [options.capacity]     队列容量上限，缺省 5000；满了**拒绝入队**（抛 UploadQueueFullError）
  *   @param {number}    [options.listLimit]    清单一次最多返回条数，缺省 200
- *   @param {number}    [options.warnThreshold] 告警阈值（待补传条数 ≥ 该值即 warn），缺省 1
+ *   @param {number}    [options.warnThreshold] 告警阈值（待补传条数 ≥ 该值即 warn）；
+ *                        缺省＝`board.config.js` 的 `mes.queueWarnThreshold`（真源现值 1），
+ *                        **不由容量换算**（与 queueCap 分语义）；调用方仍可显式传参覆盖（R26-P3-4）
  *   @param {Function|Date} [options.now]      时钟注入：函数（推荐传 platform/clock.js 的 clock.source()）或 Date
  *   @param {object}    [options.logger]       日志器（platform/log.js 的 createLogger 产物）；不传则不写日志
  * @returns {object} 队列服务实例（见下方各方法注释）

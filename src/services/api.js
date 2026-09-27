@@ -67,6 +67,17 @@ window.Api = (function () {
     return CFG.mes.queueCap === undefined ? 5000 : CFG.mes.queueCap;
   }
 
+  /**
+   * 队列**告警阈值**（待补传条数 ≥ 该值即告警）。
+   * 真源＝`board.config.js` 的 `CFG.mes.queueWarnThreshold`（缺省值与真源同值 1，改一处必须同步另一处）；
+   * 服务端 `server/services/uploadQueue.js` 的 `DEFAULT_WARN_THRESHOLD` 读同一真源（R26-P3-4）。
+   * ⚠ **不得**再由容量按比例推导（旧实现取容量 queueCap 的 90% 当告警线：容量 5000 时要积压 4500 条才亮，
+   * 与服务端"积压 1 条即 warn"两判相反）。
+   */
+  function queueWarnThreshold() {
+    return CFG.mes.queueWarnThreshold === undefined ? 1 : CFG.mes.queueWarnThreshold;
+  }
+
   /* ---------------- 通用小工具 ---------------- */
 
   /** 按点号路径取深层属性，如 getPath(state,'task.real.depth') */
@@ -686,8 +697,9 @@ window.Api = (function () {
       mesUrl: CFG.mes.baseUrl || '（未配置，待 Q-23）',
       pendingCount: pendingCount,
       pendingCapacity: cap,
-      /* 队列接近/达到上限时置位，供界面与巡检**告警**（不再静默丢弃，见 E10） */
-      queueAlert: pendingCount >= Math.max(1, Math.floor(cap * 0.9)),
+      /* 待补传条数达到告警阈值即置位，供界面与巡检**告警**（不再静默丢弃，见 E10）。
+         阈值＝真源 CFG.mes.queueWarnThreshold（R26-P3-4：与容量 queueCap 分语义，不再按 90% 容量推导）。 */
+      queueAlert: pendingCount >= queueWarnThreshold(),
       queueFull: pendingCount >= cap,
       responseStyle: CFG.mes.responseStyle
     };
