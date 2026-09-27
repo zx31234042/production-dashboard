@@ -41,6 +41,10 @@ const curveRepo = require('../server/repo/curve');
 const standardRepo = require('../server/repo/standard');
 const opLogRepo = require('../server/repo/opLog');
 const standardSvc = require('../server/services/standard');
+/* R26-P3-2（D5）：`measure` / `curve` 的 `deleteBefore` 原来**零调用方且入口无时间校验**，
+   本批补校验。这里的引用**不是**"为了跑被测对象"—— 而是拿同层的 `uploadQueue.deleteSettledBefore`
+   当**口径对照尺**（它本来就带 `assertTime`）：同类脏串必须两边同判，否则又是"同层三把尺子"。 */
+const uploadQueueRepo = require('../server/repo/uploadQueue');
 
 env.assertRuntime();
 const t = createRunner('本地库结构自检（db-check）');
@@ -1037,6 +1041,163 @@ async function main() {
       const r = maintain.pruneBackups(backupDir, 1);
       return Number.isInteger(r.kept) && r.kept === 1 && r.removed.length === backupsBefore - 1;
     })(), '');
+
+  /* ---------------- 八之三、删除口的 cutoff 校验（R26-P3-2 / D5） ----------------
+     三把尺子对账：`uploadQueue.deleteSettledBefore` 有 `assertTime(cutoff,'cutoff')`、
+     `maintain.applyRetention` 自带 cutoff 格式断言，而 `measure` / `curve` 的 `deleteBefore`
+     原来**什么都没有** ⇒ 同层口径不一。危害不是理论：`collect_time < ?` / `finished_at < ?`
+     是**文本比较**，非时间文本（`'garbage'`、空串）让 `WHERE` 恒真 ⇒ **全表静默删除且照常
+     返回删除行数**（改前实测：measure_rt 30 → 0 行、task_curve 3 → 0 行，均未抛错）。
+     本段三分：①脏串拒绝（两处**分别**断言，因为表名/列名不同）；②合法 cutoff 只删该删的
+     （负对照，防"把什么都拒收"也算通过）；③与同层 `uploadQueue` 口径一致（同一份脏串必须
+     两边同判，且**只断言行为，不改 uploadQueue**）。 */
+  t.section('八之三、删除口 cutoff 时间校验（R26-P3-2 / D5）');
+
+  /* **一用例一库**（ADR-0003 D17）：本段必须自建库，不能在共享 `handle.db` 上做。
+     原因：`deleteBefore` 是**全表**清理口（`DELETE FROM <表> WHERE <时间列> < ?`，不带任务过滤），
+     共享库上别的用例早已埋了几十个任务的行 ⇒ 删除行数被它们左右，"只删该删的行"就证不出来
+     （首版即踩：deleted=73 而本用例只有 30 行）。独占库后全表行数＝本用例行数，判据才闭合。 */
+  const cutDb = makeTempDb({ name: 'delete-before-cutoff' });
+  db.initSchema(cutDb.db, NOW);
+  const CUT_T0 = '2026-09-20 09:00:00';
+  const CUT_T10 = '2026-09-20 09:00:10';
+  const CUT_T20 = '2026-09-20 09:00:20';
+  const CUT_T30 = '2026-09-20 09:00:30';
+  const cutFrames = [];
+  for (let i = 0; i < 30; i++) {
+    cutFrames.push(fixture.makeFrame({ at: `2026-09-20 09:00:${String(i).padStart(2, '0')}`, i: 9000 + i }));
+  }
+  const cutIns = measureRepo.insertFrames(cutDb.db, cutFrames, NOW);
+  const cutMeasure = () => cutDb.db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+  const cutCurves = () => curveRepo.count(cutDb.db);
+  const cutUpload = () => uploadQueueRepo.countAll(cutDb.db);
+
+  /* 脏串取样：非数字开头（文本比较下必然 < 任何 '2026-…'）／空串／缺秒／带 T／数字／null。
+     空串是**最危险**的一类：仓库里多处"非空即用"的写法会放它过，而 '' < '2026-…' 同样恒真。 */
+  const cutDirty = ['garbage', '2026-09-19', '', '2026-09-19T10:00:00', 20260919100000, null];
+  /* 前提（D20）：数据必须先真的在库里 —— 否则"脏串没删成"与"合法 cutoff 删了 10 行"都证明不了什么。
+     （曲线与已了结上报在各自小段前另行插、另行设前提；本句只管采样。） */
+  if (t.requires('八之三前提：独占库中已入库 30 行采样（脏串危害与合法删除的判据基准）',
+    cutIns.inserted === 30 && cutMeasure() === 30,
+    `插入=${JSON.stringify(cutIns)}，measure_rt ${cutMeasure()} 行`)) {
+    /* ① 脏串被拒 —— measure 侧 */
+    const mBadMsgs = [];
+    let mBadThrew = 0;
+    for (const bad of cutDirty) {
+      try { measureRepo.deleteBefore(cutDb.db, bad); mBadMsgs.push(`未抛错：${JSON.stringify(bad)}`); }
+      catch (err) {
+        const msg = String(err && err.message);
+        if (err instanceof TypeError && msg.includes('cutoff') && msg.includes(JSON.stringify(bad))) mBadThrew++;
+        else mBadMsgs.push(`${JSON.stringify(bad)} → ${msg.slice(0, 70)}`);
+      }
+    }
+    t.check('R26-P3-2：measure.deleteBefore 的脏串 cutoff（garbage／缺秒／空串／带 T／数字／null）一律拒收' +
+      '（TypeError，信息含参数名 cutoff 与实际值），且**一行都没被删** —— 不再出现"WHERE 恒真 ⇒ 全表静默删除"',
+      mBadThrew === cutDirty.length && mBadMsgs.length === 0 && cutMeasure() === 30,
+      mBadMsgs.length ? mBadMsgs.join('；')
+        : `${mBadThrew}/${cutDirty.length} 抛错且点明 cutoff，measure_rt 仍 ${cutMeasure()}/30 行`);
+
+    /* ② 合法 cutoff 正常删除且只删该删的行 —— measure 侧（负对照，防"什么都拒收"也算通过） */
+    const mRes = measureRepo.deleteBefore(cutDb.db, CUT_T10);
+    const mLeft = measureRepo.listByTask(cutDb.db, { procOrderNo: fixture.task.procOrderNo, from: CUT_T10, to: CUT_T30 }).length;
+    t.check('R26-P3-2：measure.deleteBefore 合法 cutoff 正常删除且只删该删的行（30 行中 [T0,T10) 共 10 行 ⇒ 剩 20 行、最小剩时恰为 cutoff）',
+      mRes.deleted === 10 && cutMeasure() === 20 && mLeft === 20 &&
+      measureRepo.timeRange(cutDb.db, fixture.task.procOrderNo).firstTime === CUT_T10,
+      `deleted=${mRes.deleted}，全表剩 ${cutMeasure()} 行，[T10,T30] 内 ${mLeft} 行，` +
+      `最早剩 ${measureRepo.timeRange(cutDb.db, fixture.task.procOrderNo).firstTime}`);
+
+    /* ── curve 侧：表/列名不同（finished_at），故**分别**断言，不抽公共函数（授权边界） ── */
+    const cutCurveRows = [
+      { u: 1, at: CUT_T10 },
+      { u: 2, at: CUT_T20 },
+      { u: 3, at: CUT_T30 }
+    ];
+    for (const r of cutCurveRows) {
+      curveRepo.saveCurve(cutDb.db, {
+        procOrderNo: fixture.task.procOrderNo, unitIndex: r.u, kind: 'depth',
+        samples: [1, 2, 3], intervalSec: 1, durationSec: 3, minValue: 1, maxValue: 3,
+        finishedAt: r.at
+      }, NOW);
+    }
+    if (t.requires('八之三前提：curve 侧 3 条曲线已入库（finished_at 分别 = T10/T20/T30）',
+      cutCurves() === 3, `task_curve ${cutCurves()} 行`)) {
+      const cBadMsgs = [];
+      let cBadThrew = 0;
+      for (const bad of cutDirty) {
+        try { curveRepo.deleteBefore(cutDb.db, bad); cBadMsgs.push(`未抛错：${JSON.stringify(bad)}`); }
+        catch (err) {
+          const msg = String(err && err.message);
+          if (err instanceof TypeError && msg.includes('cutoff') && msg.includes(JSON.stringify(bad))) cBadThrew++;
+          else cBadMsgs.push(`${JSON.stringify(bad)} → ${msg.slice(0, 70)}`);
+        }
+      }
+      t.check('R26-P3-2：curve.deleteBefore 的脏串 cutoff 一律拒收（TypeError，信息含参数名 cutoff 与实际值），' +
+        '且**一行都没被删**（与 measure 侧分别断言：两者的表名/时间列不同）',
+        cBadThrew === cutDirty.length && cBadMsgs.length === 0 && cutCurves() === 3,
+        cBadMsgs.length ? cBadMsgs.join('；')
+          : `${cBadThrew}/${cutDirty.length} 抛错且点明 cutoff，task_curve 仍 ${cutCurves()}/3 行`);
+
+      /* cutoff 是**严格小于**（`finished_at < ?`）：用 T30 才恰好命中 T10/T20 两条，
+         并顺手证明"等于 cutoff 的那一条**不**被删"（边界语义，与 measure 侧的 firstTime 断言同口径）。 */
+      const cRes = curveRepo.deleteBefore(cutDb.db, CUT_T30);
+      t.check('R26-P3-2：curve.deleteBefore 合法 cutoff 正常删除且只删该删的行（finished_at < T30 共 2 条被删 ⇒ 剩 1 条且是 T30 那条）',
+        cRes.deleted === 2 && cutCurves() === 1 &&
+        curveRepo.getCurve(cutDb.db, fixture.task.procOrderNo, 1, 'depth') === null &&
+        curveRepo.getCurve(cutDb.db, fixture.task.procOrderNo, 2, 'depth') === null &&
+        Boolean(curveRepo.getCurve(cutDb.db, fixture.task.procOrderNo, 3, 'depth')),
+        `deleted=${cRes.deleted}，剩 ${cutCurves()} 条（unit1/unit2 已删、unit3 仍在）`);
+
+      /* ③ 与同层 uploadQueue 口径一致：同一份脏串两边必须同判，且两表一行未删。
+         这里**只断言行为，uploadQueue.js 一个字节都不动**（超出本任务授权）。
+         upload_log 也要先有"可删的行"，否则"没删"是空谈（该表按 state=成功 才算已了结）。 */
+      for (const u of ['UP-CUT-1', 'UP-CUT-2']) {
+        uploadQueueRepo.enqueueFailed(cutDb.db, {
+          uploadId: u, interface: 'report/receiveReport', requestBody: '{}',
+          responseCode: '0000', elapsedMs: 5
+        }, NOW);
+        uploadQueueRepo.markRetrySuccess(cutDb.db, u, 'report/receiveReport', NOW);
+      }
+      const settledBefore = cutUpload();
+      if (t.requires('八之三前提：upload_log 中有 2 条已了结（成功）记录可被清理口删到',
+        settledBefore === 2, `upload_log ${settledBefore} 行`)) {
+        const parProblems = [];
+        const parBothRejected = [];
+        for (const bad of cutDirty) {
+          let mThrewBad = false;
+          let uThrewBad = false;
+          try { measureRepo.deleteBefore(cutDb.db, bad); } catch { mThrewBad = true; }
+          try { uploadQueueRepo.deleteSettledBefore(cutDb.db, bad); } catch { uThrewBad = true; }
+          /* 判据＝两边同判（都拒收）；任一边放行，紧随的行数检查就会抓到（脏串放行即删全表） */
+          if (mThrewBad && uThrewBad) parBothRejected.push(JSON.stringify(bad));
+          else parProblems.push(`${JSON.stringify(bad)}：measure=${mThrewBad ? '拒收' : '放行'} / ` +
+            `uploadQueue=${uThrewBad ? '拒收' : '放行'}`);
+        }
+        const parRowsOk = cutMeasure() === 20 && cutCurves() === 1 && cutUpload() === settledBefore;        /* 报错文案也须同形：裁掉前置「模块名＋参数名」段后必须**逐字相同** ——
+           两把尺子不能只在"抛不抛"上一致。 */
+        const shapeOf = fn => {
+          let msg = null;
+          try { fn(); } catch (err) { msg = String(err && err.message); }
+          if (msg === null) return { msg: null, shape: '未抛错' };
+          const at = msg.indexOf('（DR-16');
+          return { msg, shape: at < 0 ? msg : msg.slice(at) };
+        };
+        const mShape = shapeOf(() => measureRepo.deleteBefore(cutDb.db, 'garbage'));
+        const cShape = shapeOf(() => curveRepo.deleteBefore(cutDb.db, 'garbage'));
+        const uShape = shapeOf(() => uploadQueueRepo.deleteSettledBefore(cutDb.db, 'garbage'));
+        const shapeOk = mShape.msg !== null && cShape.msg !== null && uShape.msg !== null &&
+          mShape.shape === cShape.shape && cShape.shape === uShape.shape &&
+          [mShape, cShape, uShape].every(s => s.msg.includes('cutoff') && s.msg.includes('"garbage"'));
+        t.check('R26-P3-2：与同层 uploadQueue.deleteSettledBefore 口径一致 —— 同一份脏串三处（measure/curve/uploadQueue）' +
+          '同判为拒收、三表行数一行未变、报错文案除模块名前缀外逐字同形（只断言行为，未改 uploadQueue）',
+          parProblems.length === 0 && parRowsOk && shapeOk,
+          parProblems.length ? `口径不一：${parProblems.join('；')}`
+            : `脏串 ${parBothRejected.length}/${cutDirty.length} 三处同拒，行数不变` +
+              `（measure ${cutMeasure()}／curve ${cutCurves()}／upload_log ${cutUpload()}）；` +
+              `文案同形「…${uShape.shape.slice(0, 38)}…」`);
+      }
+    }
+  }
+  cutDb.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
 
   /* ---------------- 九、清理与残留 ---------------- */
   t.section('九、临时区与残留');

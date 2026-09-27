@@ -7,6 +7,22 @@
    ========================================================================== */
 'use strict';
 
+/* DR-16 时间格式：yyyy-MM-dd HH:mm:ss（恰好 19 字符）。
+   为什么删除口也要校验（与写入口 server/repo/measure.js 同一铁律、与同层
+   `server/repo/uploadQueue.js` 的 `assertTime(cutoff,'cutoff')` 同款、同参数名）：
+   `finished_at < ?` 是**文本比较**，一旦混入非时间文本（如 `'garbage'`、空串），
+   `WHERE` 恒真 ⇒ 整表静默删除且照常返回删除行数（本仓已实测）。故宁可拒收，也不删。 */
+const FINISHED_AT_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/;
+
+/** 校验时间文本格式（DR-16）；不合规即抛错并指出实际值 */
+function assertTime(value, field) {
+  if (typeof value !== 'string' || !FINISHED_AT_RE.test(value)) {
+    throw new TypeError(
+      `curve: ${field} 必须是「yyyy-MM-dd HH:mm:ss」（DR-16，19 字符），收到 ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 const INSERT_SQL =
   `INSERT INTO task_curve(proc_order_no, unit_index, kind, samples, sample_count,
                           interval_sec, duration_sec, min_value, max_value, finished_at, created_at)
@@ -88,8 +104,9 @@ function count(db, kind) {
   return db.prepare('SELECT COUNT(*) AS c FROM task_curve').get().c;
 }
 
-/** 删除某完成时间之前的曲线（DR-14 保留策略） */
+/** 删除某完成时间之前的曲线（DR-14 保留策略）。cutoff 必须是「yyyy-MM-dd HH:mm:ss」 */
 function deleteBefore(db, cutoff) {
+  assertTime(cutoff, 'cutoff');
   const r = db.prepare('DELETE FROM task_curve WHERE finished_at < ?').run(cutoff);
   return { deleted: r.changes };
 }

@@ -23,6 +23,18 @@ function assertCollectTime(value) {
   return value;
 }
 
+/** 校验时间文本格式（DR-16）；不合规即抛错并指出实际值。
+ *  与 `server/repo/uploadQueue.js` 的 `assertTime` 同款、同参数名（field='cutoff'）——
+ *  删除口的入参与写入口同罪：`collect_time < ?` 是**文本比较**，一旦混入非时间文本，
+ *  `WHERE` 的语义就不再是"某时刻之前"，而是"全部"（实测 `'garbage'` ⇒ 全表被删且照常返回行数）。 */
+function assertTime(value, field) {
+  if (typeof value !== 'string' || !COLLECT_TIME_RE.test(value)) {
+    throw new TypeError(
+      `measure: ${field} 必须是「yyyy-MM-dd HH:mm:ss」（DR-16，19 字符），收到 ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
 /** 行对象 → 语句参数（字段名与 schema 列一一对应；depth 映射到 measure_depth 以免与相机深度混淆） */
 function toParams(row, nowIso) {
   return [
@@ -130,8 +142,9 @@ function timeRange(db, procOrderNo) {
   return { firstTime: row.first_time, lastTime: row.last_time };
 }
 
-/** 删除某时间点之前的采样（DR-14 保留策略的基础能力） */
+/** 删除某时间点之前的采样（DR-14 保留策略的基础能力）。cutoff 必须是「yyyy-MM-dd HH:mm:ss」 */
 function deleteBefore(db, cutoff) {
+  assertTime(cutoff, 'cutoff');
   const r = db.prepare('DELETE FROM measure_rt WHERE collect_time < ?').run(cutoff);
   return { deleted: r.changes };
 }
