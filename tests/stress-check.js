@@ -7,14 +7,14 @@
          S4 整班次业务面：跨班次时 班次名/统计/曲线/待补传队列如何变化（**需 --hours 8**）
          S5 周期性负载：8 个页面轮一遍 + 两次断连/恢复（第 1 轮必跑，其后每小时一次）
    运行（**默认＝有限时长**，够门禁在一轮里跑完；整夜浸泡改为显式参数）：
-         node tests/stress-check.js                                   # 默认 20 分钟、预期 3 个采样点
+         node tests/stress-check.js                                   # 默认 5 分钟、预期 3 个采样点
          node tests/stress-check.js --soak                            # 整班次浸泡（＝ --hours 8）
          node tests/stress-check.js --hours 8                         # 显式浸泡小时数
          node tests/stress-check.js --minutes 2 --interval-min 0.5    # 快速自检（机制验证用，非门禁）
          node tests/stress-check.js --help                            # 用法
    可选环境变量（与 CLI 同时给时 **CLI 优先**）：
          DSH_STRESS_HOURS=8          浸泡小时数（**给了它就按浸泡跑**，与 CLI --hours 同义）
-         DSH_STRESS_INTERVAL_MIN=10  采样间隔（分钟；可为小数，便于快速自检）
+         DSH_STRESS_INTERVAL_MIN=2   采样间隔（分钟；可为小数，便于快速自检）
          DSH_STRESS_SIZE=3840x2160   视口尺寸
          DSH_STRESS_EDGE=<path>      指定 msedge.exe
    判据（**真断言计数**；runner 解析标准汇总行 `通过 N 项，失败 M 项，跳过 K 项`）：
@@ -54,8 +54,13 @@ const ROOT = path.resolve(__dirname, '..');
 const PAGE = pathToFileURL(path.join(ROOT, 'index.html')).href;
 const OUT = path.join(ROOT, 'tests', '._verify');
 
-/** 默认时长（分钟）：**有限时长**，门禁一轮跑得完；整夜浸泡走 `--soak` / `--hours 8` */
-const DEFAULT_MINUTES = 20;
+/** 默认时长（分钟）：**有限时长**，门禁一轮跑得完；整夜浸泡走 `--soak` / `--hours 8`。
+ * **为什么是 5 分钟**（2026-09-28 负责人裁定）：全量门禁的墙钟 **93% 耗在本脚本**（实测 1201.6 s／全轮约 1290 s），
+ * 而真正需要长跑的那 3 条判据**本来就只有 `--hours 8` 才生效**（默认下如实计跳过）⇒ 缩短默认只损失"更长的趋势观察"，
+ * 换来全量门禁 **21.5 min → 约 2.6 min**；默认间隔同比缩到 2 分钟 ⇒ **采样点数仍为 3**（与原先等价）。 */
+const DEFAULT_MINUTES = 5;
+/** 默认采样间隔（分钟）：与 `DEFAULT_MINUTES` 配套 ⇒ `floor(5/2)+1 = 3` 个采样点（原 20/10 同为 3 点，语义等价） */
+const DEFAULT_INTERVAL_MIN = 2;
 /* ⚠ 这一行必须保留 `DSH_STRESS_HOURS || 8` 的字面形态：tests\trace-check.js 的 AC-07 断言
    用正则 `DSH_STRESS_HOURS\s*\|\|\s*(\d+)` 从本文件取"浸泡默认时长"，据此判"8 h 不构成 7 天证据"。
    同时它也是本脚本的浸泡预设（`--soak` ≡ `--hours 8`）。 */
@@ -80,11 +85,11 @@ const EDGE_CANDIDATES = [
 
 const USAGE = [
   '用法：node tests/stress-check.js [选项]',
-  '  （无选项）                     默认 20 分钟、预期 3 个采样点（门禁用有限时长）',
+  '  （无选项）                     默认 5 分钟、预期 3 个采样点（门禁用有限时长；整班次浸泡走 --soak）',
   '  --soak                        整班次浸泡（＝ --hours 8）',
   '  --hours <N>                   浸泡 N 小时（如 --hours 8）',
   '  --minutes <N>                 只跑 N 分钟（快速自检用；与 --hours/--soak 互斥）',
-  '  --interval-min <N>            采样间隔（分钟，可为小数；缺省 10）',
+  '  --interval-min <N>            采样间隔（分钟，可为小数；缺省 2 —— 与默认 5 分钟配成 3 个采样点）',
   '  --help                        打印本用法',
   '环境变量：DSH_STRESS_HOURS / DSH_STRESS_INTERVAL_MIN / DSH_STRESS_SIZE / DSH_STRESS_EDGE（CLI 优先）',
   '判据：计划类 2 条 + 通用 8 条 + 长跑专属 3 条（默认时长下如实计入"跳过"）+ 自洽 1 条',
@@ -118,7 +123,7 @@ function resolvePlan(o = {}) {
     requestedMin = Number(o.envHours) * 60; source = 'env:DSH_STRESS_HOURS';
   } else { requestedMin = defaultMinutes; source = 'default(' + defaultMinutes + ' 分钟)'; }
   const intervalRaw = (o.envIntervalMin === null || o.envIntervalMin === undefined || o.envIntervalMin === '')
-    ? 10 : Number(o.envIntervalMin);
+    ? DEFAULT_INTERVAL_MIN : Number(o.envIntervalMin);
   if (!Number.isFinite(requestedMin) || requestedMin <= 0) {
     throw new Error('时长必须是正数（收到 ' + JSON.stringify(requestedMin) + '，来源 ' + source + '）');
   }

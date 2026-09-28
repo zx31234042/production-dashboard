@@ -534,7 +534,7 @@ const AC_MAP = [
   ['AC-05', 'backend-phase', '', '',
     'IF-D 与上位机、IF-A/IF-B 与 MES 的**联调通过**属三方现场联调（IF-B.1～B.7/B.10、IF-D.7/D.10/D.12 亦整段归 backend-phase）；现有机器证据只到**契约层**（13 字段上报报文、两种回执风格、失败进入待补传队列——contract-check），接口函数名有断言而实现整批 pending，不足以构成联调结论。'],
   ['AC-07', 'declared-gap', '', '',
-    '**⚠️ 唯一相关证据不构成满足**：验收要求"连续运行 ≥7 天无重启、无崩溃、无内存泄漏"（需求 :813），而现有唯一证据是 tests\\stress-check.js 的**浸泡预设 8 小时**整班次长跑（`--soak` / `--hours 8` 触发的浸泡预设；该脚本**默认运行只有 20 分钟**＝`DEFAULT_MINUTES = 20`，8 小时取自 `DSH_STRESS_HOURS || 8`，`stress-check.js`；tests\\README.md 的 5.3 节自己写明"**8 小时 ≠ 验收要求**"，另参照 NFR-05 的 72 h 与 NFR-06 的 30 天）；**且该脚本在本受限环境整脚本 SKIP**（`stress-check.js:252` 的 env.skipSuite；本环境禁命名管道 ⇒ 退出码 3，按项目口径"**跳过 ≠ 通过**"）。**浸泡预设 8 小时不得当 7 天、SKIP 不得当通过**：现有证据 0 条，故记 declared-gap。'],
+    '**⚠️ 唯一相关证据不构成满足**：验收要求"连续运行 ≥7 天无重启、无崩溃、无内存泄漏"（需求 :813），而现有唯一证据是 tests\\stress-check.js 的**浸泡预设 8 小时**整班次长跑（`--soak` / `--hours 8` 触发的浸泡预设；该脚本**默认运行只有 5 分钟**＝`DEFAULT_MINUTES = 5`，8 小时取自 `DSH_STRESS_HOURS || 8`，`stress-check.js`；tests\\README.md 的 5.3 节自己写明"**8 小时 ≠ 验收要求**"，另参照 NFR-05 的 72 h 与 NFR-06 的 30 天）；**且该脚本在本受限环境整脚本 SKIP**（`stress-check.js:252` 的 env.skipSuite；本环境禁命名管道 ⇒ 退出码 3，按项目口径"**跳过 ≠ 通过**"）。**浸泡预设 8 小时不得当 7 天、SKIP 不得当通过**：现有证据 0 条，故记 declared-gap。'],
   ['AC-11', 'declared-gap', '', '',
     '"看板软硬件成套实物交付 + 现场演示验收通过 + 与父项目 M6 对齐"属**商务与硬件交付**条款（与 DEP-12～DEP-15 同类），验收动作在现场/合同阶段，仓库内无对应机器证据，亦非纯软件可验。'],
   ['AC-12', 'declared-gap', '', '',
@@ -1200,7 +1200,7 @@ function main() {
     console.log(`    ${id}  ${status.padEnd(16)} ${(script || '无').padEnd(18)} ${basis}`);
   }
 
-  /* AC-07 专项如实标注：要求 ≥7 天，证据只有**浸泡预设 8 小时**（`--soak` / `--hours 8` 才跑 8 小时，默认仅 20 分钟）且整脚本跳过 —— 不构成满足。
+  /* AC-07 专项如实标注：要求 ≥7 天，证据只有**浸泡预设 8 小时**（`--soak` / `--hours 8` 才跑 8 小时，默认仅 5 分钟）且整脚本跳过 —— 不构成满足。
      为什么单独立一条：这是本次唯一"证据看着有、其实不成立"的条目，必须被定点变异之外的第二道机器检查钉住，
      否则以后很容易被写成"已有浸泡预设 8 小时长跑 ⇒ 基本满足"。⚠ 判据读的是**代码**里的字面量（`process.env.DSH_STRESS_HOURS || N`），不读注释里的示例。 */
   const ac07reqDays = Number((acUniverse.get('AC-07') || '').match(/≥\s*(\d+)\s*天/)?.[1] || 0);
@@ -1209,7 +1209,7 @@ function main() {
   t.check('AC-07 如实登记为无有效证据（≥7 天 vs 现有浸泡预设 8 小时且整脚本跳过，不构成满足）',
     ac07reqDays >= 7 && stressHours > 0 && stressHours < ac07reqDays * 24 &&
     ac07rec[0] === 'declared-gap' && !ac07rec[1] && /跳过/.test(ac07rec[3] || ''),
-    `AC-07 要求 ≥${ac07reqDays} 天、stress-check 浸泡预设 ${stressHours} 小时（默认运行仅 20 分钟，整脚本跳过）、登记状态 ${ac07rec[0]}, 证据脚本 ${ac07rec[1] || '无'}`);
+    `AC-07 要求 ≥${ac07reqDays} 天、stress-check 浸泡预设 ${stressHours} 小时（默认运行仅 5 分钟，整脚本跳过）、登记状态 ${ac07rec[0]}, 证据脚本 ${ac07rec[1] || '无'}`);
 
   /* AC 与需求条款两套分母的隔离：AC 段本身不得与主表的证据引用混同（同一个脚本名两侧都用得到，
      但"AC 覆盖率"绝不能改写主表口径）—— 这里只作提示，真正的隔离由本节的独立计数与
