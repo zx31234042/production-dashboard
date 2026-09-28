@@ -66,6 +66,7 @@ const crypto = require('node:crypto');
 const opLogRepo = require('../repo/opLog');
 const platformClock = require('../../platform/clock');
 const boardConfig = require('../../src/config/board.config.js');
+const { KIND: EVENT_KIND } = require('./eventBus');
 
 /* ---------------- 一、契约常量（全部可从需求原文追到出处） ---------------- */
 
@@ -448,6 +449,12 @@ function resolveAuthConfig(options = {}) {
 function createDispatch(options = {}) {
   const db = options.db || null;
   const logger = options.logger || null;
+  /* W5-① 事件总线（可选注入）：`task` 事件挂在**派工真正落库**的那一处（见 applyDispatch）。
+     不注入 ⇒ 行为与 W2 完全一致（幂等/留痕口径一行不动）。 */
+  const bus = options.bus || null;
+  if (bus && typeof bus.publish !== 'function') {
+    throw new TypeError('dispatch: options.bus 传了但不是事件总线（缺 publish）——见 services/eventBus.js');
+  }
   const nowFn = typeof options.now === 'function'
     ? options.now
     : platformClock.createClock({ mode: 'real' }).source();
@@ -750,6 +757,23 @@ function createDispatch(options = {}) {
     const stored = Number(r.changes) > 0;
     let device = null;
     if (typeof value.equipCode === 'string' && value.equipCode) device = writeDevice(value, at, warnings);
+    /* ---- W5-①：`task` 事件挂在**派工真正新增行**的这一刻 ----
+       为什么 `stored` 才发：`ON CONFLICT DO NOTHING` 命中时（duplicate）**没有任何状态变化**，
+       发出去只会让看板把"重复下发"误当成"任务切换"；payload 里的 `ifaKind` 说明它来自 IF-A 哪一类
+       （`task` 事件只覆盖派工/工单；物料/工艺/设备不是工单切换，故不发布）。 */
+    if (stored && bus) {
+      bus.publish(EVENT_KIND.TASK, {
+        ifaKind: KIND.DISPATCH,
+        procOrderNo: value.procOrderNo,
+        table: 'task',
+        outcome: OUTCOME.STORED,
+        productCode: value.productCode || null,
+        productName: value.productName || null,
+        processNo: value.processNo || null,
+        planQty: qty,
+        equipCode: value.equipCode || null
+      }, { at });
+    }
     return {
       outcome: stored ? OUTCOME.STORED : OUTCOME.DUPLICATE,
       key: value.procOrderNo,

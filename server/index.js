@@ -36,7 +36,7 @@ const platformPaths = require('../platform/paths');
 const platformClock = require('../platform/clock');
 const { createLogger } = require('../platform/log');
 const dbApi = require('./db');
-const { createRouter } = require('./http/router');
+const { createRouter, pathnameOf } = require('./http/router');
 /* W1 的挂载口（`server/http/routes/ifD.js`）：IF-D 采集接入的唯一接线点，见下方 6b 段 */
 const { mountIfD } = require('./http/routes/ifD');
 /* W2 的挂载口（`server/http/routes/ifA.js`）：IF-A 接收（MES 派工/物料/工艺/设备）的唯一接线点，见下方 6c 段 */
@@ -45,6 +45,21 @@ const { mountIfA } = require('./http/routes/ifA');
    的唯一接线点，见下方 6d 段。**本文件只接一次线**，路由登记全部在 mountUpload() 里完成
    （不在入口另起路由表 —— 否则路由清单会分叉成两份真源，见 `router.js` 挂载位的说明）。 */
 const { mountUpload } = require('./http/routes/upload');
+/* W5-③ 的挂载口（`server/http/routes/auth.js`）：ADR-0007「设置页口令与登录鉴权」的唯一接线点，
+   见下方 6d-2 段。**本文件只接一次线**，5 条 `/auth/*` 路由的登记全部在 `mountAuth()` 里完成
+   （不在入口另起路由表 —— 否则路由清单会分叉成两份真源）。 */
+const { mountAuth } = require('./http/routes/auth');
+/* W5-① 的两块：进程内事件总线（业务写入点 → 推送的唯一通道）与整机快照构造器
+   （`hello` 与 `GET /state` **同一构造函数**产出，禁两套拼装）。见下方 6e 段。 */
+const { createEventBus } = require('./services/eventBus');
+const { createStateSnapshot } = require('./services/stateSnapshot');
+/* W5-③ 的鉴权服务（`server/services/auth.js`）：scrypt 哈希 / 错误次数落库锁定 / 内存会话令牌 /
+   一次性初始化码。**纯逻辑**，HTTP 适配在 `routes/auth.js`，本处只建实例并接线（见 6d-2 段）。 */
+const { createAuth } = require('./services/auth');
+/* W5-① 追加（负责人 2026-09-28 裁定「选项 A」）：CORS（`file://` 的 `Origin: null` 与回环端口源）
+   与静态托管（同源入口 `GET /` + `GET /src/**`）。见下方 6f 段。 */
+const { createCors, isLoopbackHost } = require('./http/cors');
+const { mountSite } = require('./http/site');
 
 /* 注入出口（ADR-0003 D17 / E42）：本文件的时间**一律**经 platformClock 取，不裸写 `new Date()` /
    `Date.now()`；形态与 `server/http/router.js`、`server/services/dispatch.js` 及下方 IF-D/IF-A
@@ -64,11 +79,12 @@ const BASELINE_SOURCES = [
 ];
 /** 优雅退出的在途请求等待上限（毫秒）：到点即强制收尾，避免"等一个不响应的连接"卡住停机 */
 const SHUTDOWN_TIMEOUT_MS = 8000;
-/** 是否回环地址（本服务默认只允许这一类；对外地址必须显式配置并由负责人批准） */
-function isLoopbackHost(host) {
-  const h = String(host || '').toLowerCase();
-  return h === '127.0.0.1' || h === '::1' || h === 'localhost';
-}
+/** 停机期间**空闲连接回收**的间隔（毫秒）：见 `stop()` 的 F2 说明 —— 在途请求应答完会变成空闲
+ *  keep-alive 连接，只回收一次会漏掉它，`server.close()` 于是被对端 FIN 拖住。 */
+const SHUTDOWN_IDLE_SWEEP_MS = 50;
+/** 是否回环地址（本服务默认只允许这一类；对外地址必须显式配置并由负责人批准）
+ *  判据实现只有一份 = `server/http/cors.js` 的 `isLoopbackHost`（CORS 的"仅回环才回跨源头"用的
+ *  是同一条判据 —— 两处各写一遍必然漂移）。本处仅转发，导出名保持不变（既有自检在用）。 */
 
 /* ---------------- 一、配置读取与命令行解析 ---------------- */
 
@@ -268,7 +284,10 @@ const state = {
   clock: null,
   startedAt: 0,
   stopping: null,
-  lastError: null
+  lastError: null,
+  /** W5-①：事件总线与链路状态监控（优雅退出时都要收尾：退订/清定时器/释放缓冲） */
+  bus: null,
+  linkMonitor: null
 };
 
 /**
@@ -346,8 +365,14 @@ function fatal(logger, title, lines) {
  *   clock?:{now:Function, source?:Function}
  * }} [options]
  *   `clock` 是**时钟注入出口**（E42）：传了就全进程（路由 / IF-D / IF-A / `/health` 的
- *   `uptimeSec` / `lastError.at`）都用它，未传即 `platformClock.createClock({mode:'real'})`。
- * @returns {Promise<{host:string, port:number, listen:string, router:object, logger:object, health:Function}>}
+ *   `uptimeSec` / `lastError.at` / SSE 的 `at` 与注释帧）都用它，未传即 `platformClock.createClock({mode:'real'})`。
+ *   `heartbeatMs` / `linkIntervalMs` / `busCapacity` 是**自检用的注入位**（线上口径不变）：
+ *   SSE 心跳周期、链路状态轮询周期、事件总线环形缓冲容量。
+ * @returns {Promise<{host:string, port:number, listen:string, router:object, logger:object,
+ *                    health:Function, bus:object, snapshot:Function, linkMonitor:object,
+ *                    mounts:object}>}
+ *   `bus`/`snapshot`/`linkMonitor`/`mounts` 是**装配结果的自报**（自检与运维读"到底接了什么线"），
+ *   不构成第二条真源：它们就是本文件传给各挂载口的同一批对象。
  */
 async function start(options = {}) {
   if (state.running) throw new Error('start(): 进程内已有服务在运行（请先 stop()）');
@@ -391,7 +416,27 @@ async function start(options = {}) {
   const dbFile = cfg.dbFile || platformPaths.paths.dbFile;
   try {
     handle = dbApi.openDb(dbFile);
-    dbApi.initSchema(handle.db);
+    /* E18（W5-③）：`initSchema()` 在**破坏性迁移/结构变更之前**会强制备份（复用 `server/db/maintain.js`），
+       备份**失败即抛错中止**（业务数据一行不动），并把结果如实回报。这里把结果落到启动日志：
+        · 需要迁移 ⇒ "迁移前已备份：<path>（原因 …；体积；审计 op_log=…）"；
+        · 不需要迁移（新建库/重复初始化）⇒ "无破坏性迁移，未备份"（幂等：不会每次启动多产一份）。
+       `logger` 一并透传（**F17-3**）：审计留痕写不进去时由 db 层**就地** `logger.warn` 告警
+       （返回值同时带 `auditDegraded:true`），故这里不再重复告警一次（避免同一条警告打两遍）。
+       **F20**：极旧库（连 `op_log` 都没有）那一刻审计失败、但迁移后 db 层会**补写**（`auditBackfilled`）
+       ⇒ 日志必须如实分三种：`ok #<id>` / `写入失败→已 backfill #<id>` / `写入失败（已告警…）`
+       （改前此处一律打印第三种，与"其实已 backfill 成功"的事实不符）。 */
+    const schemaInfo = dbApi.initSchema(handle.db, undefined, { logger });
+    const pre = schemaInfo && schemaInfo.preMigrationBackup;
+    if (pre && pre.needed) {
+      logger.info(`[启动] E18 迁移前已备份：${pre.path}（原因 ${pre.reason}；${pre.bytes} 字节；` +
+        `engine=${pre.engine}；审计 op_log=${pre.audit && pre.audit.ok
+          ? 'ok #' + pre.audit.id
+          : (pre.auditBackfilled
+            ? '写入失败→已 backfill #' + (pre.backfillAudit && pre.backfillAudit.id)
+            : '写入失败（已告警，auditDegraded=true）')}）`);
+    } else {
+      logger.info(`[启动] E18 无破坏性迁移/结构变更，未产出迁移前备份（${pre ? pre.reason : '判据不可用'}）`);
+    }
   } catch (err) {
     try { if (handle && handle.db) handle.db.close(); } catch { /* 关不掉不掩盖原始错误 */ }
     fatal(logger, '[启动自检未通过]', [`数据库不可用（${dbFile}）：${err.message}`]);
@@ -442,6 +487,17 @@ async function start(options = {}) {
   }
   state.router = router;
 
+  /* ---- 6a. W5-① 事件总线（**先于各业务挂载创建**：业务写入点要拿它发布事件） ----
+     依据负责人裁定 #3「看板内部连接＝SSE」：业务写入点（IF-D 采样落库 / IF-A 派工落库 /
+     标准新增 / 上报队列状态迁移 / 判定产出）都只往这一条进程内总线发布，SSE 端点再从总线取数 ——
+     推送与业务之间**没有第二条真源**。容量可注入（自检要能逼出"缓冲溢出丢最旧 + dropped 计数"）。 */
+  const bus = createEventBus({
+    now: currentClock().source(),
+    logger,
+    capacity: Number.isInteger(options.busCapacity) && options.busCapacity > 0 ? options.busCapacity : undefined
+  });
+  state.bus = bus;
+
   /* ---- 6b. W1 业务挂载：IF-D 采集接入（上位机实时帧 → 校验 → 去重 → 1 s 采样落库） ----
      依据 `server/http/router.js` 挂载位的指引（"实现这些包时，请把注册写进对应函数体"），
      注册动作在 `server/http/routes/ifD.js` 的 `mountIfD()` 里完成，本处**只接一次线**
@@ -452,7 +508,9 @@ async function start(options = {}) {
   const ifd = mountIfD(router, {
     db: state.db,
     logger,
-    now: currentClock().source()
+    now: currentClock().source(),
+    /* W5-①：`frame` 事件在 ingest 的 **1 s 采样落库**点发布（500 ms 原始帧不发布） */
+    bus
   });
   /* 把 IF-D 状态快照挂到 router 上（**只挂一个只读函数**，不改 router.js）：
      `healthPayload()` 据此把断连状态一并暴露到 `GET /health`（FR-2.6 的"可被读取"），
@@ -473,6 +531,8 @@ async function start(options = {}) {
     db: state.db,
     logger,
     now: currentClock().source(),
+    /* W5-①：`task` 事件在 dispatch 的**派工落库**点发布（幂等命中不发布） */
+    bus,
     ifd: () => {
       /* IF-D 侧取值**仅供比对与展示**（C-100 / C-102）：取内存态最近一帧（`ingest.lastFrame()`，
          由 ifD 挂载结果暴露的 `instance` 读到；**不改 ifD.js、不加新真源**）。取不到就是 null，
@@ -507,13 +567,94 @@ async function start(options = {}) {
   const upload = mountUpload(router, {
     db: state.db,
     logger,
-    now: currentClock().source()
+    now: currentClock().source(),
+    /* W5-①：`upload` 事件在待补传队列（upload_log 的唯一写路径）的状态迁移点发布 */
+    bus
   });
   logger.info(`[路由] IF-B 上报接口已接线（${upload.by}）：${upload.routes.join(' , ')}；` +
     `不做自动重试（V1.31/C-59）：失败落 upload_log 留存 + 告警，重报只能经 POST /upload/retry 人工触发；` +
     `MES 地址=${upload.status().configured ? upload.status().baseUrl : '未配置（Q-23，端点会显式 skipped）'}`);
 
+  /* ---- 6d-2（W5-③）. 鉴权挂载：ADR-0007「设置页口令与登录鉴权」 ----
+     依据 `server/http/router.js` 挂载位的指引（"实现这些包时，请把注册写进对应函数体"），
+     注册动作在 `server/http/routes/auth.js` 的 `mountAuth()` 里完成，本处**只接一次线**
+     （不在此另起路由表，避免路由清单分叉成两份真源）。
+     三条口径（与 ADR-0007 一致，细则写在 `server/services/auth.js`）：
+       · **不设出厂默认口令**：无凭证行时 `createAuth()` 生成一次性初始化码（`randomBytes(6)`），
+         打印到控制台并写 `op_log`，**仅本机回环**可用、成功后立即作废、重启重新生成；
+       · **与 IF-A 静态令牌严格分开**：`server.ifAuth.token` 只给对外接口，本挂载的会话令牌只给看板解锁，
+         两套互不复用（`server/services/auth.js` 里没有任何一处读 `ifAuth.token`）；
+       · 时钟仍走**同一个注入出口** `currentClock().source()`（ADR-0003 D17），**不新造第二套时钟**。
+     位置：数据面挂载（IF-D/IF-A/IF-B）之后、SSE 之前 —— 路由必须在监听前全部注册完。 */
+  const auth = createAuth({ db: state.db, logger, now: currentClock().source() });
+  state.auth = auth;
+  const authMount = mountAuth(router, { auth, logger, now: currentClock().source() });
+  logger.info(`[路由] 鉴权已接线（${authMount.by}）：${authMount.routes.join(' , ')}；` +
+    `口令哈希=${auth.algorithm}（${auth.params}）；失败阈值=${auth.limits.maxFailures} 次 ⇒ 锁定 ` +
+    `${auth.limits.lockMinutes} 分钟；会话 TTL=${auth.limits.sessionHours} h（滑动续期，绝对上限 ` +
+    `${auth.limits.absoluteHours} h）；当前状态=${auth.status().initialized
+      ? '已初始化' : '未初始化（本机一次性初始化码已打印到控制台并写入 op_log）'}`);
+
+  /* ---- 6e. W5-① 业务挂载：SSE 业务推送（真实 `/events` ＋ `GET /state`） ----
+     依据 `server/http/router.js` 挂载位的指引（"实现这些包时，请把注册写进对应函数体"），
+     本处**只接一次线**：`router.mountSSE({bus, snapshot})` 内部完成 `GET /state` 的注册，
+     并把 `/events` 从 W6 的"空通道"切成真实推送（不在入口另起路由表，避免路由清单分叉）。
+     顺序：必须在 IF-D/IF-A/IF-B **之后**（快照要读它们的实例：最新采样帧、链路状态、上报队列）。
+     两件配套：
+       · **链路状态监控**：把 `ingest.linkState()` 的变化（在线↔离线，FR-2.6）发布成 `link` 事件；
+         定时器可注入、`stop()` 时清掉（**进程退出后不得有残留定时器**）。
+       · **快照构造器**：`hello` 与 `GET /state` 共用的**唯一**来源（禁两套拼装）。 */
+  const linkMonitor = ifd.instance.createLinkMonitor({
+    bus,
+    logger,
+    intervalMs: Number.isInteger(options.linkIntervalMs) && options.linkIntervalMs > 0
+      ? options.linkIntervalMs : undefined
+  });
+  linkMonitor.start();
+  state.linkMonitor = linkMonitor;
+
+  const snapshot = createStateSnapshot({
+    db: state.db,
+    now: currentClock().source(),
+    ingest: ifd.instance,
+    upload: upload.instance,
+    logger
+  });
+  const sse = router.mountSSE({ bus, snapshot, logger });
+  logger.info(`[路由] SSE 业务推送已接线（${sse.by}）：${sse.routes.join(' , ')}；` +
+    `事件种类=${require('./services/eventBus').KINDS.join('/')}；` +
+    `心跳=${options.heartbeatMs || '默认 15000'} ms；链路监控=${linkMonitor.intervalMs} ms（阈值真源＝upper.staleMs）；` +
+    `环形缓冲容量=${bus.capacity}（溢出丢最旧并计 dropped）`);
+
+  /* ---- 6f. W5-① 追加：静态托管（同源入口）＋ CORS（`file://` / 回环源） ----
+     依据负责人 2026-09-28 裁定「选项 A」：
+       · 前端仍可双击 `index.html`（`file://` ⇒ `Origin: null`）：**仅当绑定回环**时回
+         `Access-Control-Allow-Origin: null`；非回环绑定**一律不回任何 CORS 头**（守 NFR-25/AC-09）；
+       · 首选入口改为**服务端托管静态页**（同源，彻底免掉跨源）：
+         `GET /` ⇒ `index.html`，`GET /src/**` ⇒ `src\` 子树，**白名单式**（其余一律既有 JSON 404）。
+     注册方式仍是"只接一次线"：静态托管把处理器挂到 `router.fallback()`（**不写路由表**，
+     故 404/405 口径与路由清单都不变）；CORS 挂在 `http.Server` 的请求回调最前面。 */
+  const site = mountSite(router, { logger });
+  const cors = createCors({
+    logger,
+    bind: () => {
+      const addr = listenAddress();
+      return { host: addr.address, port: addr.port };
+    }
+  });
+  logger.info(`[路由] 静态托管已接线（${site.by}）：${site.routes.join(' , ')}（白名单式；` +
+    `其余路径仍走既有 JSON 404）；根=${site.root}`);
+  logger.info(`[路由] CORS 已接线：白名单=${cors.status().origins.join(' / ')}；` +
+    `方法=${cors.allowMethods}；请求头=${cors.allowHeaders}；凭证=${cors.status().allowCredentials}（不放开）；` +
+    `仅回环绑定才回跨源头`);
+
   const server = http.createServer((req, res) => {
+    /* CORS 先行：按来源决定要不要挂跨源头，并应答 OPTIONS 预检（已注册路径才应答；
+       未注册路径的 OPTIONS 继续走 router 的既有 404/405 口径）。命中即已应答，不再往下走。 */
+    if (cors.handle(req, res, {
+      path: pathnameOf(req),
+      knownPath: p => p !== null && (router.allowedMethods(p).length > 0 || site.isStaticPath(p))
+    })) return;
     /* 统一入口；路由器内部已经把异常收敛成稳定的 JSON 错误体，这里再兜一层"连响应都发不出去"的情况 */
     Promise.resolve(router.handle(req, res)).catch(err => {
       state.lastError = { message: err.message, at: isoNow() };
@@ -560,9 +701,10 @@ async function start(options = {}) {
   logger.info(`[启动完成] 监听 ${listenText}（pid=${process.pid}，DSH_ENV=${process.env.DSH_ENV || 'dev'}）`);
   logger.info(`[启动完成] 数据根=${platformPaths.paths.dataRoot}；库=${platformPaths.paths.dbFile}；` +
     `需求基线=${readBaselineVersion()}；配置来源=${JSON.stringify(cfg.sources)}`);
-  logger.info(`[路由] 已注册：${router.list().join(' , ')}；后续挂载位（本包未实现）：` +
-    [router.mountIfA(), router.mountIfD(), router.mountUpload(), router.mountSSE()]
-      .map(m => `${m.mount}(${m.by})`).join(' , '));
+  logger.info(`[路由] 已注册：${router.list().join(' , ')}；挂载位状态（空壳＝该包只留描述符、真实现由 ` +
+    `routes\\*.js 接线；SSE 自 W5-① 起、auth 自 W5-③ 起都是真实挂载）：` +
+    [router.mountIfA(), router.mountIfD(), router.mountUpload(), router.mountSSE(), authMount]
+      .map(m => `${m.mount}(${m.by})${m.mounted ? '已接线' : '空壳'}`).join(' , '));
 
   /* ⚠ 监听范围告警（NFR-25 / AC-09）：本系统**不得对外**提供服务。
      若把 --host 配成非回环地址（如 0.0.0.0 或本机局域网 IP），即为**对外暴露**，
@@ -596,7 +738,14 @@ async function start(options = {}) {
     listen: listenText,
     router,
     logger,
-    health: healthPayload
+    health: healthPayload,
+    /* W5-① 装配结果自报（自检/运维读"接了什么线"；不是第二条真源） */
+    bus,
+    snapshot,
+    linkMonitor,
+    cors,
+    site,
+    mounts: { ifd, ifa, upload, sse }
   };
 }
 
@@ -635,10 +784,13 @@ function stop(reason) {
 
     await new Promise(resolve => {
       let settled = false;
+      /** F2：周期性回收空闲连接的定时器（`done()` 里必须停掉，否则会空转到进程退出） */
+      let sweep = null;
       const done = why => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (sweep) clearInterval(sweep);
         if (why === 'timeout') log('warn', `[优雅退出] 等待在途请求超过 ${SHUTDOWN_TIMEOUT_MS} ms，强制收尾`);
         resolve();
       };
@@ -654,12 +806,51 @@ function stop(reason) {
       }
       if (state.router) {
         const n = state.router.closeAllStreams();
-        if (n) log('info', `[优雅退出] 已关闭 ${n} 条 SSE 连接（空通道，无业务数据在途）`);
+        if (n) log('info', `[优雅退出] 已关闭 ${n} 条 SSE 连接（已发结束信号并清掉心跳定时器）`);
+      }
+      /* SSE 收掉后，那些连接（以及其它 keep-alive 空闲连接）**对端可能迟迟不发 FIN**（实测：Node 的
+         fetch/undici 客户端会把它握到自己的 keep-alive 超时，约 2 s），而 `server.close()` 要等
+         "所有连接结束"才回调 —— 于是停机被对端拖住。这里**只回收空闲连接**（不碰正在处理请求的
+         连接，"等在途请求"的语义不变）：SSE 在 `res.end()` 之后即属空闲，可被立即回收。 */
+      /* 停机期间"空闲连接"会**反复产生**，必须**反复回收**（F2，独立审查立案）：
+         · SSE 被 `res.end()` 之后即属空闲；
+         · 更要紧的是**在途请求**：它在停机窗口内应答完就变成空闲 keep-alive 连接，而
+           "只在 server.close() 后立刻回收一次"的旧写法**再也碰不到它** ⇒ `server.close()`
+           只能等对端 FIN（审查实测被拖到 ~6.35 s；对端是 undici 时约 2 s）。
+         这里以 SHUTDOWN_IDLE_SWEEP_MS 的短间隔重复回收，直到 close 回调 / 内部截止
+         （与 SHUTDOWN_TIMEOUT_MS 共用同一个 timer）。**只回收空闲连接**
+         （`closeIdleConnections()` 的语义），正在处理请求的连接一律不碰 ——
+         "在途请求不被误伤"这条判据保持成立（审查已实测 200 + 落库）。 */
+      if (typeof server.closeIdleConnections === 'function') {
+        server.closeIdleConnections();
+        sweep = setInterval(() => {
+          if (settled) return;
+          if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
+        }, SHUTDOWN_IDLE_SWEEP_MS);
+        if (typeof sweep.unref === 'function') sweep.unref();
       }
     });
 
     if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
     if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+
+    /* W5-① 收尾：链路监控的定时器与事件总线的订阅/缓冲都必须清掉 ——
+       "进程退出后不得有残留定时器"是优雅退出的判据之一（定时器若还活着，事件循环就排不空）。 */
+    if (state.linkMonitor) {
+      try {
+        state.linkMonitor.stop();
+        log('info', '[优雅退出] 链路状态监控已停止（定时器已清除）');
+      } catch (err) { log('warn', `[优雅退出] 链路监控停止失败：${err.message}`); }
+      state.linkMonitor = null;
+    }
+    if (state.bus) {
+      try {
+        const subs = state.bus.close();
+        log('info', `[优雅退出] 事件总线已关闭（清掉 ${subs} 个订阅者、缓冲已释放，` +
+          `dropped=${state.bus.dropped()}）`);
+      } catch (err) { log('warn', `[优雅退出] 事件总线关闭失败：${err.message}`); }
+      state.bus = null;
+    }
 
     try {
       const cp = dbApi.flushWal(state.db);
@@ -741,5 +932,6 @@ module.exports = {
   DEFAULT_HOST,
   DEFAULT_PORT,
   SHUTDOWN_TIMEOUT_MS,
+  SHUTDOWN_IDLE_SWEEP_MS,
   state
 };

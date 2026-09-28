@@ -52,6 +52,7 @@
 const measureRepo = require('../repo/measure');
 const platformClock = require('../../platform/clock');
 const boardConfig = require('../../src/config/board.config.js');
+const { KIND: EVENT_KIND } = require('./eventBus');
 
 /* ---------------- 一、契约常量（全部可从配置/需求原文追到出处） ---------------- */
 
@@ -131,6 +132,11 @@ const OUTCOME = Object.freeze({
   RAW_500MS: 'raw-500ms',
   REJECTED: 'rejected'
 });
+
+/** 链路状态监控的缺省轮询周期（毫秒）。
+ *  为什么 1 s：断连阈值是 `upper.staleMs`（缺省 5000 ms），1 s 轮询 ⇒ 跨过阈值后 ≤1 s 内发布
+ *  `link` 事件，满足 FR-2.6 的"≤5 s 可察觉"。**阈值本身不在这里**（真源仍是 `linkState()`）。 */
+const DEFAULT_LINK_INTERVAL_MS = 1000;
 
 /** 去重口径标记（DR-13 主口径 / 退路口径 —— 返回值里**必须**带，不得隐藏） */
 const DEDUP = Object.freeze({
@@ -335,6 +341,23 @@ function validateFrame(frame, options = {}) {
 
 /* ---------------- 四、服务实例 ---------------- */
 
+/**
+ * 把"校验通过的帧"归一成**推送载荷**（形状＝上位机 `upper` 报文，前端 `applyUpperPayload()` 直接可消费）。
+ * 为什么复用原报文键名而不另造一套：IF-D 的字段名已是三方契约（`src/config/fieldMap.js` 的
+ * `upperToBoard` key），再造一套字段名会让前端切源时冒出第二份映射表（P2-4 那类"两份实现"）。
+ * 这里只做**两处归一**：① `collectTime` 归一到秒级（落库/去重口径，DR-16）；
+ * ② `seq` 归一为数字（原始报文常见把序号序列化成字符串）。
+ * 缺测字段**不编造**（保持缺省，JSON 序列化时自然省略）——与上位机报文同语义。
+ * @param {{frame:object, collectTimeSec:string, seq:number|null}} v `validateFrame()` 的通过结果
+ * @returns {object} 推送载荷（键名与 `upper` 报文一致）
+ */
+function framePayloadOf(v) {
+  const payload = Object.assign({}, v.frame, { collectTime: v.collectTimeSec });
+  if (v.seq === null) delete payload[FIELD.seq];
+  else payload[FIELD.seq] = v.seq;
+  return payload;
+}
+
 /** 取 `upper.staleMs`（FR-2.6 的"断连 ≤5 s"阈值真源＝`board.config.js`）；非法即抛，不静默兜底 */
 function resolveStaleMs(options) {
   const injected = options.staleMs;
@@ -370,6 +393,12 @@ function createIngest(options = {}) {
     throw new TypeError('ingest: options.db 传了但不是 SQLite 句柄');
   }
   const logger = options.logger || null;
+  /* W5-① 事件总线（可选注入）：`frame` 事件只挂在**1 s 采样落库**的那条帧上（见 ingestFrame 的 ④）。
+     不注入 ⇒ 行为与 W1 完全一致（本包不因此改变任何落库/去重口径）。 */
+  const bus = options.bus || null;
+  if (bus && typeof bus.publish !== 'function') {
+    throw new TypeError('ingest: options.bus 传了但不是事件总线（缺 publish）——见 services/eventBus.js');
+  }
   const staleMs = resolveStaleMs(options);
   /* 期望设备编号：默认＝配置真源 `device.equipCode`（仅用于**报告与显式开启的**一致性校验）；
      是否真的据此拒收由 `enforceEquipCode` 决定，缺省 false（理由见 validateFrame 的 docblock）。 */
@@ -406,7 +435,8 @@ function createIngest(options = {}) {
     lastCollectTime: null,      // 最近一次有效帧的采集时刻（秒级文本）
     lastStoredSecond: null,     // 最近一次**落库**的那一秒（1 s 采样去重：同一秒不再落第二行）
     lastStoredKey: null,        // 最近一次落库的四/三字段键（诊断与幂等证据）
-    lastFrame: null             // 最近一帧有效报文（**内存态**，供实时显示；500 ms 帧也更新它）
+    lastFrame: null,            // 最近一帧有效报文（**内存态**，供实时显示；500 ms 帧也更新它）
+    lastSampledFrame: null      // 最近一帧**1 s 采样落库**的帧（W5 快照用；500 ms 原始帧不更新它）
   };
 
   /** L1 采样去重（**同秒只留第一帧**）＝"500 ms 原始帧不落库"的落地判据。
@@ -543,6 +573,17 @@ function createIngest(options = {}) {
       state.storedFrames++;
       state.lastStoredSecond = v.collectTimeSec;
       state.lastStoredKey = key;
+      /* ---- ④ W5-①：把"**1 s 采样落库**的这条帧"发布到事件总线（`frame` 的**唯一**发布点） ----
+         为什么只发这里（三条口径，逐条对齐需求）：
+           · 「1 s 采样落库、500 ms 原始帧不落库」（ADR-0001 D7 / W1 判据③）——事件流若把 500 ms
+             原始帧也推给看板，等于从推送侧绕开"库里每秒只有一行"这条既定口径；
+           · `duplicate`（同键幂等命中、**未新增行**）与 `rejected`/`raw-500ms` 都不是状态变化，
+             不发布（判据③的负向断言据此成立）；
+           · 载荷形状＝上位机 `upper` 报文（见 `framePayloadOf`），前端 `applyUpperPayload()` 直接消费。
+         发布顺序：**落库成功之后**（先有事实、再有通知）。发布失败（总线已关闭等）不影响落库结果。 */
+      const sampled = framePayloadOf(v);
+      state.lastSampledFrame = sampled;
+      if (bus) bus.publish(EVENT_KIND.FRAME, sampled);
       if (logger) {
         logger.info('[IF-D] 采样落库（1 s 采样）', { key, collectTime: v.collectTimeSec, dedup: dedup.basis });
       }
@@ -618,6 +659,81 @@ function createIngest(options = {}) {
 
     /** 内存态最近一帧（供后续实时展示复用；**不落库、不是持久真源**） */
     lastFrame() { return state.lastFrame; },
+
+    /** 内存态**最新 1 s 采样帧**（形状＝`upper` 报文；W5 的 `snapshot.frame` 唯一来源）。
+     *  与 `lastFrame()` 的区别：500 ms 原始帧会更新 `lastFrame()`，**不**更新这里。 */
+    lastSampledFrame() { return state.lastSampledFrame; },
+
+    /**
+     * 链路状态变化监控（W5-①）：把 `linkState()` 的**变化**发布成 `link` 事件
+     * （在线→离线 / 离线→在线，FR-2.6）。
+     *   · **判据真源只有一个**＝`ingest.linkState()`（阈值＝`upper.staleMs`，缺省 5000 ms）；
+     *     本监控**不重写**阈值比较（两处阈值必然漂移）；
+     *   · 只在**状态变化**时发布；首次 tick 只建立基线（建连时的 `hello` 快照已承载当前状态）；
+     *   · 定时器可注入（`setIntervalImpl`/`clearIntervalImpl`，与 `createPoller` 同一对注入口），
+     *     `stop()`/`close()` 清掉 —— **进程退出后不得有残留定时器**（优雅退出的判据⑥）；
+     *   · `intervalMs` 只是**轮询周期**（缺省 1 s），与断连阈值是两件事。
+     * @param {{bus?:object, intervalMs?:number, logger?:object, setIntervalImpl?:Function,
+     *          clearIntervalImpl?:Function}} [cfg]
+     * @returns {{start:Function, stop:Function, close:Function, running:Function, tick:Function,
+     *            status:Function, intervalMs:number}}
+     */
+    createLinkMonitor(cfg = {}) {
+      const monitorBus = cfg.bus || bus;
+      const intervalMs = isNum(cfg.intervalMs) && cfg.intervalMs > 0
+        ? cfg.intervalMs : DEFAULT_LINK_INTERVAL_MS;
+      const setImpl = cfg.setIntervalImpl || setIntervalImpl;
+      const clearImpl = cfg.clearIntervalImpl || clearIntervalImpl;
+      const log = cfg.logger || logger;
+      let timer = null;
+      let lastOnline = null;          // null＝尚未建立基线（首次 tick 只记基线）
+      let transitions = 0;
+      let published = 0;
+      let lastEvent = null;
+
+      /** 走一次判定（**可单独调用**，供自检不起定时器也能验判据） */
+      function tick() {
+        const st = ingest.linkState();
+        if (lastOnline === null) { lastOnline = st.online; return null; }
+        if (st.online === lastOnline) return null;
+        lastOnline = st.online;
+        transitions++;
+        const payload = {
+          online: st.online, state: st.state, staleMs: st.staleMs,
+          ageMs: st.ageMs, lastAcceptedAt: st.lastAcceptedAt
+        };
+        lastEvent = payload;
+        if (monitorBus) { monitorBus.publish(EVENT_KIND.LINK, payload); published++; }
+        if (log) {
+          log.info(`[IF-D] 链路状态变化：${st.online ? '离线→在线' : '在线→离线'}`,
+            { ageMs: st.ageMs, staleMs: st.staleMs });
+        }
+        return payload;
+      }
+
+      const monitor = {
+        intervalMs,
+        tick,
+        start() {
+          if (timer !== null) return monitor;
+          timer = setImpl(tick, intervalMs);
+          if (timer && typeof timer.unref === 'function') timer.unref();
+          return monitor;
+        },
+        stop() {
+          if (timer !== null) { clearImpl(timer); timer = null; }
+          return monitor;
+        },
+        running: () => timer !== null,
+        /** 与 `stop()` 同义（优雅退出路径上的调用名与 eventBus.close() 对齐） */
+        close() { return monitor.stop(); },
+        status: () => ({
+          running: timer !== null, intervalMs, lastOnline, transitions, published, lastEvent,
+          staleMs: staleMs
+        })
+      };
+      return monitor;
+    },
 
     /* ---------------- 可插拔的入站 source（两种形态共用 ingestFrame） ---------------- */
 
@@ -720,6 +836,7 @@ module.exports = {
   createIngest,
   validateFrame,
   parseCollectTime,
+  framePayloadOf,
   FIELD,
   REQUIRED_FIELDS,
   REJECT,
@@ -732,5 +849,6 @@ module.exports = {
   STD_DIGITS,
   GAIN_DIGITS,
   COLLECT_TIME_SEC_RE,
-  COLLECT_TIME_MS_RE
+  COLLECT_TIME_MS_RE,
+  DEFAULT_LINK_INTERVAL_MS
 };

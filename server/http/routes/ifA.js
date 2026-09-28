@@ -51,7 +51,9 @@ function resolveDispatch(deps = {}) {
     ifd: deps.ifd,
     operator: deps.operator,
     teamCode: deps.teamCode,
-    env: deps.env
+    env: deps.env,
+    /* W5-①：事件总线透传（`task` 事件在 dispatch 的派工落库点发布） */
+    bus: deps.bus
   });
   if (db) pool.byDb.set(db, created); else pool.nullDb = created;
   return created;

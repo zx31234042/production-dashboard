@@ -28,8 +28,14 @@ const path = require('node:path');
  *       唯一键 `(product_code, process_code, version_no)`；旧库由本文件的 `migrateLegacyStandard()` 重建。
  *    ② `op_log` 增列 `team_code`（班组编号，来源＝当前生效班次，与 FR-1.6 同一真源，由
  *       `STRUCTURE_UPGRADES` 对旧库补列）。
- *    该表结构变化是**不兼容**的（旧列消失、新增唯一键），故必须升版；旧库升级路径见 schema.sql 注释。 */
-const SCHEMA_VERSION = '4';
+ *    该表结构变化是**不兼容**的（旧列消失、新增唯一键），故必须升版；旧库升级路径见 schema.sql 注释。
+ *  2026-09-28 由 '4' 升到 '5'（ADR-0007 D1 / D6.1，NFR-14 与 FR-8.4 的设置页口令表）：
+ *    `schema.sql` 新增 `auth_credential`（口令**派生值**与失败计数/锁定状态；**永不存明文**）。
+ *    该表是**纯新增**：`CREATE TABLE IF NOT EXISTS` 对旧库幂等生效，**不做重建迁移**；
+ *    升版仍是必须的（ADR-0006 D2：schema.sql 正文一变指纹即变，`verifySchemaConsistency()`
+ *    会以"指纹变了而结构版本没变"报错），且"旧库结构版本 ≠ 当前版本"正是 **E18 迁移前强制备份**
+ *    的判据之一（见 `planMigration()`）。 */
+const SCHEMA_VERSION = '5';
 
 /** 建表脚本位置（与本文件同目录） */
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
@@ -56,6 +62,45 @@ const STRUCTURE_UPGRADES = [
 ];
 
 /**
+ * `standard` 旧结构判据 —— **唯一一份**（`migrateLegacyStandard()` 与 `planMigration()` 共用）。
+ *
+ * 为什么要抽出来：E18 要求"**只有**本次初始化确实会做破坏性迁移时才预先备份"。若判据在这里写一份、
+ * 在那边再写一份，两边迟早漂移 —— 漂移的后果是"备份没做却真迁移了"（数据不可恢复）或
+ * "没迁移却天天备份"（幂等性破功）。故判据只此一处，两个调用方共用。
+ *
+ * @param {object} db 数据库句柄
+ * @returns {{state:'absent'|'current'|'legacy'|'unknown', tableExists:boolean, cols:string[], reason:string}}
+ *   `absent`  = 表还不存在（新建库，无需迁移）
+ *   `current` = 已是新结构（含 version_no/process_code）
+ *   `legacy`  = V1.33 之前的旧结构（会被重建，**判据成立即需要迁移前备份**）
+ *   `unknown` = 读不到 sqlite_master（库有问题，迁移与备份都要显式中止）
+ */
+function legacyStandardState(db) {
+  let tableExists = false;
+  try {
+    tableExists = Boolean(db.prepare(
+      "SELECT 1 AS hit FROM sqlite_master WHERE type = 'table' AND name = 'standard'"
+    ).get());
+  } catch (err) {
+    return { state: 'unknown', tableExists: false, cols: [], reason: `无法读取 sqlite_master：${err.message}` };
+  }
+  if (!tableExists) {
+    return { state: 'absent', tableExists: false, cols: [], reason: 'standard 表尚不存在（新建库，无需迁移）' };
+  }
+  /* 结构判据：`pragma_table_info` 里有没有新列 `version_no`（以及 `process_code`）。
+     为什么不用 `CREATE TEMP VIEW ... SELECT version_no` 探针：**SQLite 建视图时并不校验列**，
+     要等真正 SELECT 才报 `no such column`（已实测），拿它当判据会误判成"已是新结构"。 */
+  const cols = db.prepare("SELECT name FROM pragma_table_info('standard')").all().map(r => r.name);
+  if (cols.includes('version_no') && cols.includes('process_code')) {
+    return { state: 'current', tableExists: true, cols, reason: 'standard 已是新结构（含 version_no/process_code）' };
+  }
+  return {
+    state: 'legacy', tableExists: true, cols,
+    reason: `standard 是旧结构（缺 ${['version_no', 'process_code'].filter(c => !cols.includes(c)).join('/')}）`
+  };
+}
+
+/**
  * DR-03 旧结构迁移：把 V1.33 之前的 `standard` 表**重建**为「(产品,工序,版本) 追加式」。
  *
  * 为什么需要显式判据（而不是写在 schema.sql 里）：SQLite 写不出"条件 DDL" ——
@@ -72,26 +117,16 @@ const STRUCTURE_UPGRADES = [
  * （version_no 从 1 起、process_code=''、created_by='结构迁移'、偏差与典型值留 NULL
  * ⇒ 在服务层走"必要项缺失 ⇒ 占位"路径）。**不把设定值伪装成标准值**。
  *
+ * ⚠ E18：本函数会 `DROP TABLE standard_legacy` / `ALTER TABLE standard RENAME`（**破坏性**），
+ * 故 `initSchema()` 在调用它**之前**先做一次强制备份（不可跳过、失败即中止），见 `planMigration()`。
+ *
  * @param {object} db 已打开且在事务中的数据库句柄
  * @returns {{migrated:boolean, reason:string, rows:number}} 迁移结果（可审计）
  */
 function migrateLegacyStandard(db) {
-  let tableExists = false;
-  try {
-    tableExists = Boolean(db.prepare(
-      "SELECT 1 AS hit FROM sqlite_master WHERE type = 'table' AND name = 'standard'"
-    ).get());
-  } catch (err) {
-    return { migrated: false, reason: `无法读取 sqlite_master：${err.message}`, rows: 0 };
-  }
-  if (!tableExists) return { migrated: false, reason: 'standard 表尚不存在（新建库，无需迁移）', rows: 0 };
-
-  /* 结构判据：`pragma_table_info` 里有没有新列 `version_no`（以及 `process_code`）。
-     为什么不用 `CREATE TEMP VIEW ... SELECT version_no` 探针：**SQLite 建视图时并不校验列**，
-     要等真正 SELECT 才报 `no such column`（已实测），拿它当判据会误判成"已是新结构"。 */
-  const cols = db.prepare("SELECT name FROM pragma_table_info('standard')").all().map(r => r.name);
-  if (cols.includes('version_no') && cols.includes('process_code')) {
-    return { migrated: false, reason: 'standard 已是新结构（含 version_no/process_code）', rows: 0 };
+  const st = legacyStandardState(db);
+  if (st.state === 'unknown' || st.state === 'absent' || st.state === 'current') {
+    return { migrated: false, reason: st.reason, rows: 0 };
   }
 
   /* 旧结构：重建。整段沿用 schema.sql 里的新建结构（列定义两边必须一致）。 */
@@ -140,6 +175,268 @@ function migrateLegacyStandard(db) {
   db.exec('CREATE INDEX IF NOT EXISTS ix_standard_pair ON standard(product_code, process_code, effective_from DESC)');
   db.exec('CREATE INDEX IF NOT EXISTS ix_standard_product ON standard(product_code, effective_from)');
   return { migrated: true, reason: `旧结构重建完成（${before} 个产品号 → ${after} 版占位行）`, rows: Number(ins.changes) };
+}
+
+/* ==========================================================================
+   E18（技术债）：**迁移前强制备份** —— 不可跳过、失败即中止、可审计
+   --------------------------------------------------------------------------
+   立案原文（`项目记录\后续路线图.md` 第六节）：旧库迁移即 `DROP TABLE standard_legacy`，
+   旧设定值不可恢复 ⇒ 迁移前必须强制备份 + 可审计日志。
+   本段的**唯一入口**是 `initSchema()`：它先算 `planMigration()`，只有"本次确实会做破坏性迁移/
+   结构变更"时才备份（幂等：无迁移的第二次 initSchema **不产生**第二份备份）。
+   备份本体**复用 `server/db/maintain.js`**（本仓唯一的备份实现），不另起第二套。
+   ========================================================================== */
+
+/** 迁移前备份的留痕口径（`op_log.op_type`）：成功/失败都用它，`result` 区分；content 含路径与原因 */
+const PRE_MIGRATION_BACKUP_OP_TYPE = '迁移前备份';
+
+/** 备份留痕正文上限（`repo/opLog.js` 的 CONTENT_MAX ＝ 500；这里留一点余量避免边界抛错） */
+const BACKUP_LOG_CONTENT_MAX = 480;
+
+/** 取当前连接对应的**库文件路径**（`node:sqlite` 的 `location()`；内存库返回 null） */
+function dbFilePath(db) {
+  try {
+    if (db && typeof db.location === 'function') {
+      const loc = db.location();
+      return typeof loc === 'string' && loc && loc !== ':memory:' ? loc : null;
+    }
+  } catch { /* 取不到就按"无文件路径"处理，由调用方决定是否中止 */ }
+  return null;
+}
+
+/**
+ * 迁移前备份的**默认目录**：与被迁移的库**同目录树**下的 `backup/`。
+ * 为什么这样推而不写死盘符：ADR-0002 D11 禁止业务代码出现硬编码路径；而生产布局下
+ * `platform/paths.js` 的 `dbFile = <dataRoot>/board.db`、`backupDir = <dataRoot>/backup`，
+ * 本式结果与它**逐字相同**；自检用临时库时则自然落在临时目录里（不污染真实数据目录）。
+ * @param {string} dbPath 库文件路径
+ */
+function defaultBackupDir(dbPath) {
+  return path.join(path.dirname(path.resolve(dbPath)), 'backup');
+}
+
+/**
+ * **迁移计划**（E18 的判据）：本次 `initSchema()` 会不会做破坏性迁移 / 结构变更？
+ *
+ * 任一成立 ⇒ 需要迁移前备份（**不可跳过**）：
+ *  ① `standard` 旧结构判据成立（`migrateLegacyStandard()` 会 DROP 旧表，属破坏性）；
+ *  ② 库内结构版本 ≠ 当前 `SCHEMA_VERSION`（旧库升级会改结构：补列/建索引/新表）；
+ *  ③ 库里有业务表但**没有**结构版本记录（结构未知，按"可能要动结构"处理）。
+ * 反面（**必须为空才不备份**）：空库（一行业务表都没有）不需要备份 —— 没有可丢的数据，
+ * 且"新建库"每次首次启动都会走到这里，若也备份，就把"每次启动都产出一份备份"写进了默认路径。
+ *
+ * @param {object} db
+ * @returns {{needed:boolean, reasons:string[], reason:string, storedVersion:string|null,
+ *            schemaVersion:string, businessTables:number, legacyStandard:string}}
+ */
+function planMigration(db) {
+  const reasons = [];
+  const st = legacyStandardState(db);
+  if (st.state === 'unknown') {
+    /* 读不到结构就不敢说"不需要备份"：按需要处理（预检本身就是中止信号，见 initSchema） */
+    return {
+      needed: true, reasons: [st.reason], reason: st.reason,
+      storedVersion: null, schemaVersion: SCHEMA_VERSION, businessTables: -1, legacyStandard: st.state
+    };
+  }
+  const businessTables = listTables(db).filter(t => t !== 'schema_meta').length;
+  const storedVersion = getSchemaVersion(db);
+  if (st.state === 'legacy') reasons.push(`${st.reason} ⇒ 需重建 standard（会 DROP 旧表）`);
+  if (storedVersion !== null && storedVersion !== SCHEMA_VERSION) {
+    reasons.push(`结构版本升级 ${storedVersion} → ${SCHEMA_VERSION}`);
+  }
+  if (storedVersion === null && businessTables > 0) {
+    reasons.push(`库内有 ${businessTables} 张业务表但没有结构版本记录（结构未知）`);
+  }
+  return {
+    needed: reasons.length > 0,
+    reasons,
+    reason: reasons.length ? reasons.join('；') : '无破坏性迁移/结构变更（不需要迁移前备份）',
+    storedVersion, schemaVersion: SCHEMA_VERSION, businessTables, legacyStandard: st.state
+  };
+}
+
+/** 真实时钟的兜底出口（ADR-0003 D17）：**本文件只此一处**，且刻意写成**单参默认值**形态 ——
+ *  这是 `tests\docs-cross-check.js` 的 D17 门禁认的"注入出口"形态之一（`return new Date();` 会被判裸取时间）。 */
+function realNow(d = new Date()) { return d; }
+
+/** 备份时刻候选：`options.now` → 本次初始化的 `now` 文本（DR-16）→ 真实时钟。
+ *  注入时钟优先是自检可重复的前提（ADR-0003 D17）—— 备份文件名里的毫秒段同样要能被钉死。 */
+function resolveBackupWhen(options = {}, nowText) {
+  for (const cand of [options.now, nowText]) {
+    if (cand === undefined || cand === null || cand === '') continue;
+    const d = cand instanceof Date ? new Date(cand.getTime()) : new Date(cand);
+    if (Number.isFinite(d.getTime())) return d;
+  }
+  return realNow();
+}
+
+/** 写一条迁移前备份的留痕（`op_log`）；**审计失败不掩盖**原始错误，如实返回 {ok,error}。
+ *
+ *  ⚠ 为什么这里有一小段"兼容插入"：迁移前备份发生在 `schema.sql` 与 `STRUCTURE_UPGRADES`
+ *  **之前**，而 **V1.33 之前的旧库 `op_log` 还没有 `team_code` 列** —— 仓储层
+ *  `repo/opLog.append()` 的 INSERT 含该列，会报 `table op_log has no column named team_code`。
+ *  偏偏"旧库迁移"正是最需要这条留痕的场合，所以只在**这一种**错误上降级为"按迁移前的列集写同一行"
+ *  （`team_code` 留给补列后为 NULL，语义与 `repo/opLog.js` 的"不猜班组"一致）；
+ *  其它错误一律如实回报 `{ok:false, error}`，**不静默**。 */
+function appendBackupLog(db, entry, at) {
+  const content = String(entry.content).slice(0, BACKUP_LOG_CONTENT_MAX);
+  const payload = {
+    opTime: at, operator: '系统', opType: PRE_MIGRATION_BACKUP_OP_TYPE,
+    content, result: entry.result,
+    teamCode: null      // 与 opLog 同口径：班组来源是"当前生效班次"，这里没有班次上下文 ⇒ **不猜**
+  };
+  try {
+    const opLogRepo = require('../repo/opLog');
+    const r = opLogRepo.append(db, payload, at);
+    return { ok: true, id: r.id, error: '', compat: false };
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    if (!/no column named team_code/i.test(message)) return { ok: false, id: null, error: message, compat: false };
+    try {
+      const r = db.prepare(
+        'INSERT INTO op_log(op_time, operator, op_type, content, result, created_at) VALUES(?, ?, ?, ?, ?, ?)'
+      ).run(at, payload.operator, payload.opType, payload.content, payload.result, at);
+      return { ok: true, id: Number(r.lastInsertRowid), error: '', compat: true };
+    } catch (err2) {
+      return { ok: false, id: null, error: err2 && err2.message ? err2.message : String(err2), compat: true };
+    }
+  }
+}
+
+/**
+ * 执行迁移前**强制**备份：**不可跳过**、失败即抛错（调用方 `initSchema()` 据此中止迁移，
+ * **业务数据一行不动** —— 若库内已有 `op_log` 表，本函数会**追加 1 条** E18 失败留痕，
+ * 见 `tests\db-check.js` 九之②b/②c 的逐列快照断言）。
+ * 成功/失败都会写 `op_log`（含备份文件路径、原因、结果）。
+ *
+ * **F17-3（复核低危，已修）**：`op_log` 表可能**不存在**（极旧的库还没建该表）⇒ 审计写入必然失败。
+ * 旧写法把 `audit.ok===false` 静默吞掉（迁移照做、备份 1 份、0 行留痕、无任何日志出口）。
+ * 现在：审计失败时 ①经 `options.logger.warn`（缺省 `console.warn`）**显式告警**；
+ * ②返回值/抛出对象的 `.backup` 带 `auditDegraded:true`（调用方据此可断言/再告警）。
+ *
+ * @param {object} db
+ * @param {object} plan `planMigration()` 的产物
+ * @param {object} options `{backupDir?, backup?, now?, logger?}` —— `backup` 是**同步**备份函数注入出口
+ *        （自检用它制造"备份失败"，见 `tests\db-check.js` 第九章②）；`logger` 仅用于 F17-3 的告警出口
+ * @param {Date} when 备份时刻
+ * @returns {{needed:true, ok:true, path:string, name:string, dir:string, bytes:number,
+ *            engine:string|null, reason:string, at:string, audit:object, auditDegraded:boolean}}
+ */
+function runPreMigrationBackup(db, plan, options, when) {
+  const at = formatNow(when);
+  const reason = plan.reason;
+  /** F17-3 的告警出口：有 logger 就走 logger.warn，否则 console.warn（**绝不静默**） */
+  const warn = message => {
+    if (options.logger && typeof options.logger.warn === 'function') options.logger.warn(message);
+    else console.warn(message);
+  };
+  /**
+   * 统一收口：审计失败 ⇒ 告警 + `auditDegraded` 标记（返回值与抛出对象都带）。
+   *
+   * ⚠ **口径已由主代理裁定（2026-09-28，F17-3）：审计失败时"告警 + 标记 + 迁移照常"，不得改回"中止迁移"。**
+   * 裁定理由（照抄，免得后人再翻）：E18 的硬要求是"**破坏性迁移前必须备份**"；极旧库（连 `op_log`
+   * 表都没有）场景里**备份本身是成功的**，失败的只是"审计行写不进去"。若为此中止，那条库将**永远无法迁移**
+   * （死锁），代价远大于收益。故正确形态＝显式告警出口（本函数）＋ `auditDegraded:true` ＋ 迁移照常，
+   * 且告警**只打一条、可被判据观察到**（`tests\db-check.js` 的 `E18/F17-3` 断言注入 logger 数告警条数）。
+   * 要改成"中止"，须先改 ADR/E18 收口口径，不得在实现里单方面收紧。
+   */
+  const auditOrWarn = payload => {
+    const audit = appendBackupLog(db, payload, at);
+    if (!audit.ok) {
+      warn(`[⚠ E18 迁移前备份] 审计留痕写入失败（备份本身${payload.result === '成功' ? '已产出' : '未产出'}，` +
+        `但 op_log 里查不到 ⇒ 可审计性降级）：${audit.error}｜备份文件=${payload.content}`);
+    }
+    return audit;
+  };
+  /* 备份目录：显式注入优先；否则取"库文件同目录树下的 backup/"。
+     取不到库文件路径（内存库）时**宁可直接抛错**也不落到 cwd（那会把备份写进仓库工作目录）——
+     迁移前备份不可跳过，内存库要重建旧结构就只能显式给 backupDir。 */
+  let dir;
+  try {
+    if (options.backupDir) {
+      dir = path.resolve(String(options.backupDir));
+    } else {
+      const file = dbFilePath(db);
+      if (!file) throw new Error('无法确定库文件路径（内存库？）—— 迁移前备份不可跳过，请显式注入 backupDir');
+      dir = defaultBackupDir(file);
+    }
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    const audit = auditOrWarn({
+      result: '失败',
+      content: `迁移前备份（E18）｜结果=失败｜目录=（未确定）｜原因=${reason}｜错误=${message}`
+    });
+    const e = new Error(`迁移前强制备份失败（E18）：已**中止**本次初始化，业务数据一行不动` +
+      `（仅追加 1 条 E18 失败留痕）—— ${message}`);
+    e.code = 'PRE_MIGRATION_BACKUP_FAILED';
+    e.backup = { dir: null, reason, at, error: message, audit, auditDegraded: !audit.ok };
+    throw e;
+  }
+
+  const backupFn = typeof options.backup === 'function'
+    ? options.backup
+    /* 备份实现**只有一份**（server/db/maintain.js）；这里用它的**同步**形态 ——
+       理由（同步调用点 + 异步 backup API 的冲突）见 maintain.js 的 `backupToSync()` 注释。 */
+    : require('./maintain').backupToSync;
+
+  let result;
+  try {
+    result = backupFn(db, dir, { now: when, reason });
+    if (result && typeof result.then === 'function') {
+      throw new TypeError('迁移前备份**必须同步**（initSchema 是同步调用点）：注入的备份函数返回了 Promise');
+    }
+    if (!result || !result.path) throw new Error('备份函数没有返回落盘路径（无法审计 ⇒ 按失败处理）');
+    if (!fs.existsSync(result.path)) throw new Error(`备份函数报告成功但文件不存在：${result.path}`);
+    const bytes = fs.statSync(result.path).size;
+    if (!(bytes > 0)) throw new Error(`备份文件为空（0 字节）：${result.path}`);
+    result.bytes = bytes;
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    const audit = auditOrWarn({
+      result: '失败',
+      content: `迁移前备份（E18）｜结果=失败｜目录=${dir}｜原因=${reason}｜错误=${message}`
+    });
+    const e = new Error(`迁移前强制备份失败（E18）：已**中止**本次初始化，业务数据一行不动` +
+      `（仅追加 1 条 E18 失败留痕）—— ${message}`);
+    e.code = 'PRE_MIGRATION_BACKUP_FAILED';
+    e.backup = { dir, reason, at, error: message, audit, auditDegraded: !audit.ok };
+    throw e;
+  }
+
+  const audit = auditOrWarn({
+    result: '成功',
+    content: `迁移前备份（E18）｜结果=成功｜备份文件=${result.path}｜体积=${result.bytes} 字节｜原因=${reason}`
+  });
+  const out = {
+    needed: true, ok: true, path: result.path, name: result.name || path.basename(result.path),
+    dir, bytes: result.bytes, engine: result.engine || 'backup-api', reason, at, audit,
+    /** F17-3：审计写入降级标记（`true`＝备份成功但 `op_log` 里查不到，已同时告警） */
+    auditDegraded: !audit.ok,
+    /** F19-5：迁移后**补写**留痕的结果 —— 只有"此前 `audit.ok===false`"才会被 `initSchema()` 填上 */
+    auditBackfilled: false,
+    backfillAudit: null
+  };
+  return out;
+}
+
+/**
+ * **F19-5（结案复跑建议，主代理裁定"做"）**：破坏性迁移**成功之后**补写一条 E18 备份留痕。
+ *
+ * 背景：极旧库可能**连 `op_log` 表都没有**，迁移前那次审计必然写不进去 ⇒ 只能留下一条易失告警
+ * （`auditDegraded:true`），E18 的"可审计"在该形态下降级。而 `schema.sql` 执行**之后** `op_log`
+ * 已经存在，补写成本极低 —— 于是这里补一条，内容显式标注 `backfill（迁移后补写）`，并保留
+ * "原先写入失败"的原因，**不改变**"审计不了也不中止迁移"的既定口径（F17-3 裁定）。
+ *
+ * @param {object} db 已建表（`op_log` 已存在）的库句柄
+ * @param {object} pre `runPreMigrationBackup()` 的返回值
+ * @returns {{ok:boolean, id:number|null, error:string, backfilled:boolean}}
+ */
+function backfillBackupAudit(db, pre) {
+  const content = `迁移前备份（E18）｜结果=成功｜**backfill（迁移后补写）**｜备份文件=${pre.path}｜` +
+    `体积=${pre.bytes} 字节｜原因=${pre.reason}｜原先审计写入失败：${pre.audit && pre.audit.error ? pre.audit.error : '未知'}`;
+  const r = appendBackupLog(db, { result: '成功', content }, pre.at);
+  return { ok: r.ok, id: r.id, error: r.error, backfilled: true };
 }
 
 /** 读取建表脚本正文 */
@@ -209,10 +506,50 @@ function openDb(dbPath, options = {}) {
  *  —— 即"要么整套结构到位，要么一行不动"。
  *  ⚠ 因此**不要**绕过本函数直接 `db.exec(schema.sql)`：那样会失去这层原子性。
  *
- *  @returns {{schemaVersion:string, fingerprint:string, appliedAt:string, migration:object}}
+ *  ⚠ 2026-09-28（**E18**）：破坏性迁移**之前**强制备份，且**不可跳过**：
+ *   ① 先 `planMigration()` 判断本次是否真的会做破坏性迁移/结构变更（判据见该函数）；
+ *   ② 需要 ⇒ 调 `server/db/maintain.js` 的**同步**备份（`backupToSync`）落一份**迁移前**的库文件，
+ *      并把"路径/原因/结果"写进 `op_log`（`op_type='迁移前备份'`）；
+ *   ③ 备份**失败 ⇒ 抛错中止**（带 `code='PRE_MIGRATION_BACKUP_FAILED'`），**业务数据一行不动**
+ *      （若库内已有 `op_log` 表，会**追加 1 条** E18 失败留痕 —— 措辞按 F17-4 修正）——
+ *      迁移是 `DROP TABLE standard_legacy` 这一类不可逆动作，没有备份就不许继续（不得静默跳过）；
+ *   ④ 不需要（新库首建 / 无迁移的重复调用）⇒ **不产出任何备份**（幂等：不会"每次启动多一份"）。
+ *   ⑤ 审计写入失败（`op_log` 表不存在等）⇒ **显式告警**（`options.logger.warn` / `console.warn`）
+ *      并在返回值里带 `auditDegraded:true`（F17-3）。
+ *  备份发生在 `BEGIN` **之前**：事务里写备份会让快照语义含混（也可能因写事务被拒），
+ *  而"先备份后迁移"正是本条的语义；备份成功但迁移失败并回滚时，多出的那份备份无害（可审计为"未使用"）。
+ *
+ *  @param {object} db 数据库句柄
+ *  @param {string} [now] 当前时刻（DR-16 文本，由调用方注入时钟给出）
+ *  @param {{backupDir?:string, backup?:Function, now?:Date|string|number, logger?:object,
+ *           skipBackup?:boolean, skipPreMigrationBackup?:boolean}} [options]
+ *    `backupDir` —— 迁移前备份目录（缺省＝库文件同目录树下的 `backup/`）
+ *    `backup`    —— **同步**备份函数注入出口（自检制造失败用；缺省＝maintain.backupToSync）
+ *    `now`       —— 备份文件名/留痕用的时刻（缺省＝`now` 文本，再缺省＝真实时钟）
+ *    `logger`    —— F17-3 的告警出口（审计写入失败时 `logger.warn`；缺省退 `console.warn`）
+ *    `skipBackup` / `skipPreMigrationBackup` —— **只用于"拒绝跳过"**：传了就抛错（E18 不可跳过）
+ *
+ *  @returns {{schemaVersion:string, fingerprint:string, appliedAt:string, migration:object,
+ *             preMigrationBackup:object}}
  *    `migration` 为本次旧结构迁移的结果（`{migrated, reason, rows}`），供调用方审计；
- *    无迁移时 `migrated=false`。 */
-function initSchema(db, now) {
+ *    无迁移时 `migrated=false`。
+ *    `preMigrationBackup` 为本次迁移前备份的结果：`{needed, ok, path, name, dir, bytes, engine,
+ *    reason, at, audit, auditDegraded}`；`needed=false` 时 `path=null`（**没有产出备份**，这是幂等的可核查证据）。 */
+function initSchema(db, now, options = {}) {
+  if (options.skipBackup || options.skipPreMigrationBackup) {
+    /* 不提供"跳过"开关：旧库迁移会 DROP 旧表，跳过备份 = 不可恢复。显式拒绝优于"悄悄支持"。 */
+    throw new Error('initSchema: 迁移前备份**不可跳过**（E18 —— 旧库迁移会 DROP 旧表，无备份不可恢复）');
+  }
+  const plan = planMigration(db);
+  const when = resolveBackupWhen(options, now);
+  const preMigrationBackup = plan.needed
+    ? runPreMigrationBackup(db, plan, options, when)
+    : {
+      needed: false, ok: true, path: null, name: null,
+      dir: options.backupDir ? path.resolve(String(options.backupDir)) : null,
+      bytes: 0, engine: null, reason: plan.reason, at: formatNow(when), audit: null, auditDegraded: false
+    };
+
   const sql = readSchemaSql();
   db.exec('BEGIN');
   let migration;
@@ -243,7 +580,21 @@ function initSchema(db, now) {
   /* 同时落 schema 指纹（P3 表外 code-12）：让"改 schema 必须同步升 SCHEMA_VERSION"
      这条约定**可被机器校验** —— 见下方 verifySchemaConsistency()。 */
   stmt.run('schema_fingerprint', schemaFingerprint(), at);
-  return { schemaVersion: SCHEMA_VERSION, fingerprint: schemaFingerprint(), appliedAt: at, migration };
+
+  /* **F19-5**：迁移成功、且此前审计写入失败（典型＝极旧库连 `op_log` 表都没有）⇒ 此刻 `op_log`
+     已由 `schema.sql` 建好，**补写**一条 E18 备份留痕（内容标注 `backfill（迁移后补写）`）。
+     不改变"审计不了也不中止迁移"的既定口径，只是把"可审计"从易失告警补成落库事实。 */
+  if (preMigrationBackup && preMigrationBackup.needed && preMigrationBackup.audit &&
+      preMigrationBackup.audit.ok === false) {
+    const backfill = backfillBackupAudit(db, preMigrationBackup);
+    preMigrationBackup.auditBackfilled = backfill.ok === true;
+    preMigrationBackup.backfillAudit = backfill;
+  }
+
+  return {
+    schemaVersion: SCHEMA_VERSION, fingerprint: schemaFingerprint(), appliedAt: at,
+    migration, preMigrationBackup, migrationPlan: plan
+  };
 }
 
 /** 读取结构版本 */
@@ -359,12 +710,17 @@ module.exports = {
   SCHEMA_VERSION,
   SCHEMA_FILE,
   STRUCTURE_UPGRADES,
+  PRE_MIGRATION_BACKUP_OP_TYPE,
   readSchemaSql,
   schemaFingerprint,
   loadSqlite,
   openDb,
   initSchema,
   migrateLegacyStandard,
+  legacyStandardState,
+  planMigration,
+  defaultBackupDir,
+  dbFilePath,
   getSchemaVersion,
   getSchemaFingerprint,
   verifySchemaConsistency,

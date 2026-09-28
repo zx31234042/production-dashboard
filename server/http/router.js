@@ -4,19 +4,23 @@
          ①路由器：定长路径匹配（GET/POST）、JSON 请求体解析与大小上限、
            统一的 JSON 错误响应形状（400/404/405/413/500 形状稳定）；
          ②健康检查 `GET /health`（进程能起、能查的机器可读证据，含库可写与监听地址）；
-         ③后续工作包的**空壳挂载位**：`mountIfA` / `mountIfD` / `mountUpload` / `mountSSE`
-           （本包**不实现**任何业务逻辑，只把挂载点与调用契约钉住）；
-         ④SSE **空通道骨架**：`GET /events` 能建连、能发心跳注释帧、能优雅关闭，
-           **不推送任何业务数据**（业务推送属 W5）。
+         ③后续工作包的**挂载位**：`mountIfA` / `mountIfD` / `mountUpload` / `mountSSE`
+           （W1/W2/W4 已各自接线；`mountSSE` 自 **W5-①** 起也是**真实挂载**）；
+         ④SSE 通道：`GET /events`（W6 起能建连/心跳/优雅关闭；**W5-① 起推送业务事件**：
+           建连发 `hello` 快照，之后逐条 `id/event/data`，并支持 `Last-Event-ID` / `?since=` 断线续传）
+           ＋ `GET /state`（REST 快照，与 `hello` 的 `snapshot` **同一构造函数**产出）。
    依据：W6 任务边界（`项目记录\服务层第二笔-任务分解与排期.md` 第 65 行）、
+        W5 任务边界（同文件第 58～62 行）、负责人裁定 #3「看板内部连接＝SSE」与 #4「默认仅本机」、
         ADR-0001 D5/D1（HTTP 服务形态）、DR/IF 契约留待三方答复。
-   依赖：**仅 node: 内置模块** + 本项目 `platform/clock.js`（时间的唯一来源；仍零 npm 依赖）。
-         取时间一律走注入出口（ADR-0003 D17）：SSE 注释帧的 ready/ping 与 openedAt 都经 `options.now`，
+   依赖：**仅 node: 内置模块** + 本项目 `platform/clock.js`（时间的唯一来源；仍零 npm 依赖）
+        + `services/eventBus.js` 的 `normalizeSince`（**同一个** since 解析口径，不写第二份）。
+         取时间一律走注入出口（ADR-0003 D17）：SSE 注释帧的 ready/ping/bye 与 openedAt 都经 `options.now`，
          缺省＝真实时钟 —— **本文件不出现裸 `new Date()`**。
    用法：
      const { createRouter, errorBody, MAX_JSON_BODY_BYTES } = require('./http/router');
      const router = createRouter({ getHealth: () => ({ ok: true }) });
      router.attach(httpServer);            // 绑定到 server/index.js 创建的 http.Server
+     router.mountSSE({ bus, snapshot });   // W5：真实挂载（注册 GET /state，/events 转入真实推送）
      router.closeAllStreams();             // 优雅退出时先收掉在途 SSE
    ========================================================================== */
 'use strict';
@@ -25,6 +29,9 @@
    SSE 的注释帧时间戳是给运维看的，但"展示/协议层"同样不得裸取当前时间 —— 否则用例无法复现
    "这一帧发生在哪一刻"，门禁（`tests/docs-cross-check.js` 第六节的 D17 判据）也会判红。 */
 const platformClock = require('../../platform/clock');
+/* since 解析口径**只有一份**（`services/eventBus.js` 的 normalizeSince）：客户端游标既可能来自
+   `?since=` 也可能来自 `Last-Event-ID`，两处必须同判；在这里另写一份正则就是第二套口径（必然漂移）。 */
+const { normalizeSince, KINDS: EVENT_KINDS } = require('../services/eventBus');
 
 /** 路由允许的方法（本包只要 GET/POST；其余一律 405） */
 const METHODS = ['GET', 'POST'];
@@ -83,6 +90,12 @@ function createRouter(options = {}) {
   const maxBodyBytes = options.maxBodyBytes === undefined ? MAX_JSON_BODY_BYTES : options.maxBodyBytes;
   const heartbeatMs = Number(options.heartbeatMs) > 0 ? Number(options.heartbeatMs) : SSE_HEARTBEAT_MS;
   const onError = typeof options.onError === 'function' ? options.onError : null;
+  /** SSE 侧留痕（订阅者抛错由总线记；这里给的是"路由装配/快照失败"这类） */
+  let sseLogger = options.logger || null;
+  /* 心跳定时器注入出口（F8：心跳**条数**要能被确定性验证 —— 用真定时器只能测"大概几条"）。
+     命名与 `services/ingest.js` 的 `setIntervalImpl/clearIntervalImpl` 一致；缺省＝真定时器。 */
+  const setIntervalImpl = typeof options.setIntervalImpl === 'function' ? options.setIntervalImpl : setInterval;
+  const clearIntervalImpl = typeof options.clearIntervalImpl === 'function' ? options.clearIntervalImpl : clearInterval;
   /* 时钟注入出口（ADR-0003 D17）—— **本文件取当前时间的唯一出口**：
      `nowIso()` 把注入时钟的返回值（Date / 时间戳 / 可解析字符串都收）统一成 ISO 串，
      于是 ready / ping / openedAt 三处共用同一个出口，谁都不再直接碰 `new Date()`。 */
@@ -94,6 +107,62 @@ function createRouter(options = {}) {
   const routes = new Map();
   /** 在途 SSE 连接（优雅退出时要先收掉，避免 server.close() 一直等在途连接上） */
   const streams = new Set();
+  /**
+   * **兜底处理器**（可选）：精确路由全不命中时才调用，用来挂"路径是**前缀/任意**形态"的处理器
+   * （本仓目前只有静态托管 `server/http/site.js` 需要它 —— 路由表是定长匹配，`/src/**` 没法用
+   * 精确路由表达）。它**不写进路由表**，故不会影响既有 404/405 口径：
+   * 命中且返回 true 才算已应答，否则继续走 404。
+   */
+  let fallback = null;
+  /** SSE 业务推送的接线状态（`mountSSE()` 注入；未接线时 `/events` 仍是 W6 的"空通道"） */
+  const sse = { mounted: false, bus: null, snapshot: null };
+
+  /* ---------------- SSE 工具（本文件内部；口径与 eventBus 的 since 解析共用一份） ---------------- */
+
+  /** 客户端游标：`?since=<seq>` 优先；给了该键但值非法 ⇒ **按无 since 处理**（不回退请求头，口径唯一）。
+   *  没有该键时才看标准的 `Last-Event-ID` 头。两者都经 `normalizeSince`（同一份解析）。 */
+  function readSince(req) {
+    let hasQuerySince = false;
+    let querySince = null;
+    try {
+      const url = new URL(String(req && req.url ? req.url : '/'), 'http://127.0.0.1');
+      hasQuerySince = url.searchParams.has('since');
+      if (hasQuerySince) querySince = normalizeSince(url.searchParams.get('since'));
+    } catch {
+      hasQuerySince = false;   // 畸形 URL：当作没带 since（不得因此 500）
+    }
+    if (hasQuerySince) return querySince;
+    const headers = (req && req.headers) || {};
+    const header = headers['last-event-id'];
+    return normalizeSince(Array.isArray(header) ? header[0] : header);
+  }
+
+  /** 写一条业务事件帧：`id: <seq>` + `event: <kind>` + `data: <JSON>`（SSE 规范三段式） */
+  function writeEvent(res, evt) {
+    if (res.writableEnded || res.destroyed) return;
+    res.write(`id: ${evt.seq}\nevent: ${evt.kind}\ndata: ${JSON.stringify(evt.payload)}\n\n`);
+  }
+
+  /** `hello` 与 `GET /state` 的**同源**响应体（同一构造函数；`at`/`seq` 只在信封上，不进 snapshot） */
+  function stateBody() {
+    const seqNow = sse.bus && typeof sse.bus.seq === 'function' ? sse.bus.seq() : 0;
+    return { ok: true, at: nowIso(), seq: seqNow, snapshot: sse.snapshot() };
+  }
+
+  /** 挂载描述符（`mountSSE()` 无参调用与真实挂载后都返回它；`mounted` 反映**实际**状态） */
+  function sseDescriptor() {
+    return {
+      mount: 'sse',
+      mounted: sse.mounted,
+      by: 'W5',
+      routes: sse.mounted ? ['GET /events', 'GET /state'] : ['GET /events'],
+      note: sse.mounted
+        ? `SSE 业务推送已接线：事件种类 ${EVENT_KINDS.join(' / ')}；心跳 ${heartbeatMs} ms；` +
+          '断线续传＝`Last-Event-ID` 或 `?since=<seq>`（超缓冲退回 hello 快照）'
+        : 'SSE 业务推送**未接线**（当前只有 W6 的空通道 /events）—— 在 server/index.js 调 ' +
+          'mountSSE({bus, snapshot}) 接线；调用后本描述符的 mounted 即为 true'
+    };
+  }
 
   /** 记录一个处理器（方法必须是大写白名单内） */
   function route(method, pathname, handler) {
@@ -167,6 +236,7 @@ function createRouter(options = {}) {
 
     /**
      * 处理一条请求。`server/index.js` 只把它挂到 `http.Server` 的 `request` 事件上。
+     * 判定顺序：**精确路由 → 405（路径在、方法不对）→ 兜底处理器 → 404**。
      */
     async handle(req, res) {
       const path = pathnameOf(req);
@@ -175,47 +245,72 @@ function createRouter(options = {}) {
       }
       const method = String(req.method || '').toUpperCase();
 
-      const handler = routes.get(`${method} ${path}`);
-      if (!handler) {
-        const allow = router.allowedMethods(path);
-        if (allow.length) {
-          /* 路径存在、方法不对 ⇒ 405（并给出 Allow，避免前端靠猜） */
-          res.setHeader('Allow', allow.join(', '));
-          return router.fail(res, 405, 'METHOD_NOT_ALLOWED',
-            `${method} 不被 ${path} 支持，允许：${allow.join('/')}`, { path, method });
-        }
-        return router.fail(res, 404, 'NOT_FOUND', `未知路径：${path}`, { path, method });
-      }
-
-      try {
-        return await handler(req, res);
-      } catch (err) {
-        /* 业务处理器抛出的"带状态码"错误（如 readJson 的 400/413）按其声明回；其余 500。
-           500 必须**留痕**（onError）：否则现场只看到"界面报错"，日志里什么都没有。 */
+      /** 处理器（含兜底）抛错时的统一收敛：带状态码的按其声明回，其余 500 并留痕（onError） */
+      const failed = err => {
         const status = Number(err && err.status) || 500;
         const code = (err && err.code) || (status === 500 ? 'INTERNAL_ERROR' : 'BAD_REQUEST');
         if (status >= 500 && onError) onError(err, { path, method });
         if (res.headersSent) { try { res.end(); } catch { /* 已在关闭 */ } return false; }
         return router.fail(res, status, code, (err && err.message) || String(err), { path, method });
+      };
+
+      const handler = routes.get(`${method} ${path}`);
+      if (handler) {
+        try {
+          return await handler(req, res);
+        } catch (err) {
+          return failed(err);
+        }
       }
+      const allow = router.allowedMethods(path);
+      if (allow.length) {
+        /* 路径存在、方法不对 ⇒ 405（并给出 Allow，避免前端靠猜） */
+        res.setHeader('Allow', allow.join(', '));
+        return router.fail(res, 405, 'METHOD_NOT_ALLOWED',
+          `${method} 不被 ${path} 支持，允许：${allow.join('/')}`, { path, method });
+      }
+      if (typeof fallback === 'function') {
+        /* 兜底处理器（静态托管）：**不写路由表**；返回 true ＝已应答，否则继续走 404 */
+        try {
+          const done = await fallback(req, res, { path, method });
+          if (done) return done;
+        } catch (err) {
+          return failed(err);
+        }
+      }
+      return router.fail(res, 404, 'NOT_FOUND', `未知路径：${path}`, { path, method });
     },
 
-    /* ---------------- 后续工作包的空壳挂载位 ---------------- */
     /**
-     * 这四组函数是**挂载点占位**，本包（W6）**不实现任何业务逻辑**：
+     * 注册**兜底处理器**（精确路由全不命中时调用）。同一时刻只有一个：
+     * 重复注册直接抛错（静默覆盖会让"谁在处理这条路径"变成不可读的隐状态）。
+     * @param {(req:object, res:object, ctx:{path:string, method:string}) => (boolean|Promise<boolean>)} fn
+     */
+    fallback(fn) {
+      if (typeof fn !== 'function') throw new TypeError('router.fallback: 必须是函数');
+      if (fallback && fallback !== fn) throw new Error('router.fallback: 兜底处理器已注册（只允许一个）');
+      fallback = fn;
+      return router;
+    },
+
+    /** 是否已有兜底处理器（自检可读，避免"以为挂了其实没挂"） */
+    hasFallback: () => typeof fallback === 'function',
+
+    /* ---------------- 挂载位（W1/W2/W4 已接线；SSE 见下方 mountSSE） ---------------- */
+    /**
+     * 前三组是**空壳挂载位**（真实现分别在 `routes/ifD.js` / `routes/ifA.js` / `routes/upload.js`，
+     * 由 `server/index.js` 一次性接线）：
      *   `mountIfA`    —— W2：接收 MES 派工/物料/工艺（本机提供接口，IF-A）
      *   `mountIfD`    —— W1：接收上位机实时帧（IF-D，含 1 s 采样落库）
      *   `mountUpload` —— W4：IF-B 上报的**人工重报**入口与待补传清单状态接口（UI-20）
-     *   `mountSSE`    —— W5：看板内部 SSE **业务推送**（本包只留空通道 `/events`）
-     * 每个函数返回"未挂载"描述符而不是静默返回 undefined ——
-     * 这样"本包没实现"在代码与自检里都是**显式状态**，不会被当成"已接线"（D23 反静默空转）。
+     * 它们在**未接线**时如实自报 `mounted:false`（D23 反静默空转）；真实挂载后由各
+     * `mountX()` 的返回值给出 `mounted:true`，本处不再重复一份状态。
      * ⚠ 实现这些包时，请把注册写进对应函数体（**不要**在入口文件里另起一套路由表，
      *   否则路由清单会分叉成两份真源）。
      */
-    mountIfA() { return { mount: 'ifA', mounted: false, by: 'W2', note: 'IF-A 接收（MES 派工/物料/工艺）未实现' }; },
-    mountIfD() { return { mount: 'ifD', mounted: false, by: 'W1', note: 'IF-D 上位机帧接收未实现' }; },
-    mountUpload() { return { mount: 'upload', mounted: false, by: 'W4', note: 'IF-B 人工重报/待补传状态接口未实现' }; },
-    mountSSE() { return { mount: 'sse', mounted: false, by: 'W5', note: 'SSE 业务推送未实现（本包只有空通道 /events）' }; },
+    mountIfA() { return { mount: 'ifA', mounted: false, by: 'W2', note: 'IF-A 接收由 routes/ifA.js 的 mountIfA(router, deps) 接线（本处是空壳描述符）' }; },
+    mountIfD() { return { mount: 'ifD', mounted: false, by: 'W1', note: 'IF-D 接收由 routes/ifD.js 的 mountIfD(router, deps) 接线（本处是空壳描述符）' }; },
+    mountUpload() { return { mount: 'upload', mounted: false, by: 'W4', note: 'IF-B 上报接口由 routes/upload.js 的 mountUpload(router, deps) 接线（本处是空壳描述符）' }; },
 
     /* ---------------- 健康检查 ---------------- */
     async health(req, res) {
@@ -223,14 +318,42 @@ function createRouter(options = {}) {
       return router.json(res, 200, Object.assign({ ok: true }, payload));
     },
 
-    /* ---------------- SSE 空通道骨架 ---------------- */
+    /* ---------------- SSE 业务推送（W5-①） ---------------- */
     /**
-     * `GET /events`：建立 SSE 连接 → 立刻发一个 `retry:` 与一条就绪注释帧 →
-     * 之后的帧**只有心跳注释**（`: ping …`），**不含任何业务数据**。
-     * 关闭路径：客户端断开（`close`）或进程优雅退出时 `closeAllStreams()`；
-     * 两者都走同一个 `cleanup`，保证定时器与集合条目不残留。
+     * `GET /events`：建立 SSE 连接。
+     *   · **已接线**（`mountSSE({bus, snapshot})` 调过）：
+     *       ① 客户端带合法 `?since=`/`Last-Event-ID` 且缓冲区**补得齐** ⇒ 先按序补发 `seq > since`
+     *          的事件，**不重复、不丢**（`eventBus.subscribe` 同步注册 + 同步取补发清单，中间无空隙）；
+     *       ② 无 since（或缺省/非法/超缓冲） ⇒ 发 `event: hello`，`data` 是**完整快照**
+     *          （`{ok, at, seq, snapshot}`，与 `GET /state` **同一构造函数**产出）并带 `id: <seq>`；
+     *       ③ 之后逐条 `id: <seq>` + `event: <kind>` + `data: <JSON>`；`retry: 3000` 与
+     *          注释心跳（`: ping …`）保留（周期由 `options.heartbeatMs` 注入）。
+     *   · **未接线**（裸路由器）⇒ 仍是 W6 的空通道：`retry` + `: ready` + 心跳注释，无业务数据。
+     * 关闭路径：客户端断开（`close`）或进程优雅退出时 `closeAllStreams()` —— 两者走同一套 `cleanup`
+     * （清心跳定时器 + 退订总线 + 从集合移除），因此**不残留定时器**、`server.close()` 不被吊住。
      */
     events(req, res) {
+      const hasBus = Boolean(sse.bus) && typeof sse.bus.subscribe === 'function';
+      let sub = null;
+      let hello = null;
+      /* F10：**客户端原始报数**单独留存 —— `sub.since` 在 hello/领先模式下会被改写成"当前 seq"
+         （那是投递下界，不是客户端报的数）。排障时要看到的是"客户端报了 10、服务端当前 3"这种
+         领先幅度，故两值都要进日志。非法/缺省 ⇒ null（与 `readSince()` 的口径一致）。 */
+      const reportedSince = hasBus ? readSince(req) : null;
+      if (hasBus) {
+        /* 顺序很关键：**先订阅**（拿到补发清单即已开始收新事件），再取快照/写响应 ——
+           若反过来，两步之间发布的事件会既不在补发清单里、也不在订阅之后（＝丢事件）。 */
+        sub = sse.bus.subscribe(evt => writeEvent(res, evt), { since: reportedSince });
+        if (sub.mode !== 'replay') {
+          try {
+            hello = stateBody();
+          } catch (err) {
+            sub.unsubscribe();     // 快照失败 ⇒ 不留一条"挂在总线上"的空订阅
+            throw err;             // 交给 router.handle 收敛成 500 JSON（此时还没写响应头）
+          }
+        }
+      }
+
       res.writeHead(200, {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
@@ -241,8 +364,34 @@ function createRouter(options = {}) {
       res.write('retry: 3000\n\n');
       res.write(`: ready ${nowIso()}\n\n`);
 
-      const entry = { res, openedAt: nowIso(), heartbeats: 0, closed: false };
-      entry.timer = setInterval(() => {
+      const entry = {
+        res, openedAt: nowIso(), heartbeats: 0, closed: false,
+        since: sub ? sub.since : null, mode: sub ? sub.mode : 'none',
+        replayed: sub && sub.mode === 'replay' ? sub.replay.length : 0,
+        subscription: sub
+      };
+      if (sub) {
+        if (sub.mode === 'replay') {
+          /* 补发：**同步**写（此刻不可能有并发 publish 插进来，故顺序＝seq 顺序） */
+          for (const evt of sub.replay) writeEvent(res, evt);
+        } else {
+          /* 游标领先服务端（F1）：**必须留痕**，否则现场只看到"重连后没有数据"却不知为何。
+             F10：`reportedSince` ＝客户端**原始报数**（不是被改写后的投递下界），
+             `subSince` ＝改写后的投递下界（＝服务端当前 seq）—— 两个都打，领先幅度一眼可见。 */
+          if (sub.cursorAhead && sseLogger && typeof sseLogger.warn === 'function') {
+            sseLogger.warn('[SSE] 客户端游标领先服务端 ⇒ 改发 hello 快照重建游标（避免静默黑洞）',
+              {
+                reportedSince,
+                subSince: sub.since,
+                seq: hello.seq,
+                remote: (req && req.socket && req.socket.remotePort) || null
+              });
+          }
+          res.write(`id: ${hello.seq}\nevent: hello\ndata: ${JSON.stringify(hello)}\n\n`);
+        }
+      }
+
+      entry.timer = setIntervalImpl(() => {
         if (entry.closed || res.writableEnded) return;
         entry.heartbeats++;
         res.write(`: ping ${nowIso()}\n\n`);
@@ -250,22 +399,88 @@ function createRouter(options = {}) {
       /* unref：心跳本身不该让进程"无法退出"（真正的存活由监听套接字负责） */
       if (typeof entry.timer.unref === 'function') entry.timer.unref();
 
+      /** 同一套清理：清心跳定时器 → 退订总线 → 从集合移除 → 结束响应（幂等） */
+      const cleanup = () => {
+        if (entry.closed) return;
+        entry.closed = true;
+        clearIntervalImpl(entry.timer);
+        if (entry.subscription) {
+          try { entry.subscription.unsubscribe(); } catch { /* 总线已关闭 */ }
+        }
+        streams.delete(entry);
+      };
       entry.close = () => {
         if (entry.closed) return;
-        entry.closed = true;
-        clearInterval(entry.timer);
-        streams.delete(entry);
+        /* 先给客户端一个**结束信号**（`: bye`），再收尾：客户端据此能区分"服务端主动收"与"网络断" */
+        try { if (!res.writableEnded) res.write(`: bye ${nowIso()}\n\n`); } catch { /* 已断开 */ }
+        cleanup();
         try { res.end(); } catch { /* 已断开 */ }
+        /* SSE 是长连接：主动半关底层套接字，避免 keep-alive 下 server.close() 一直等这条连接
+           （Node 的 socket.end() 会先把已缓冲的数据发完再发 FIN，故 `: bye` 不会丢）。 */
+        try {
+          const sock = res.socket;
+          if (sock && !sock.destroyed) sock.end();
+        } catch { /* 已断开 */ }
       };
-      /* 客户端断开 / 连接被销毁 ⇒ 同一套清理（否则定时器与集合条目会残留） */
-      res.on('close', () => {
-        if (entry.closed) return;
-        entry.closed = true;
-        clearInterval(entry.timer);
-        streams.delete(entry);
-      });
+      /* 客户端断开 / 连接被销毁 ⇒ 同一套清理（否则定时器与订阅会残留） */
+      res.on('close', cleanup);
       streams.add(entry);
       return true;
+    },
+
+    /**
+     * `GET /state`：REST 快照（`{ok:true, at, seq, snapshot}`）。
+     * 与 `hello` 事件**同一构造函数**（`stateBody()`）—— 两套拼装会在前端切源时对不上。
+     * 未接线 ⇒ 503（不假装成功）。
+     */
+    state(req, res) {
+      if (!sse.mounted) {
+        return router.json(res, 503, Object.assign(
+          errorBody('SSE_NOT_MOUNTED', 'SSE 业务推送未接线（未调用 mountSSE({bus, snapshot})）—— /state 无快照可给', 503),
+          { mount: 'sse', mounted: false, path: '/state', method: 'GET' }));
+      }
+      return router.json(res, 200, stateBody());
+    },
+
+    /**
+     * **真实挂载** SSE 业务推送（W5-①）。
+     *   · 调用一次即接线：注册 `GET /state`，并把 `/events` 从"空通道"切到"真实推送"；
+     *   · **幂等**：重复调用返回同一描述符，不重复注册路由；
+     *   · 未传 `deps`（或没给 bus/snapshot）⇒ 返回**当前真实状态**的描述符（此时 `mounted:false`）——
+     *     这样 `server/index.js` 末尾那行"挂载位清单"在任何阶段都读得到、且不撒谎。
+     * @param {{bus:object, snapshot:Function, logger?:object}} deps
+     * @returns {{mount:'sse', mounted:boolean, by:'W5', routes:string[], note:string}}
+     */
+    mountSSE(deps) {
+      const d = deps || {};
+      const provided = Boolean(d.bus) || typeof d.snapshot === 'function';
+      if (!provided || sse.mounted) return sseDescriptor();
+      if (!d.bus || typeof d.bus.subscribe !== 'function' || typeof d.bus.publish !== 'function') {
+        throw new TypeError('mountSSE: 必须注入事件总线（需含 subscribe/publish，见 services/eventBus.js）');
+      }
+      if (typeof d.snapshot !== 'function') {
+        throw new TypeError('mountSSE: 必须注入 snapshot()（hello 与 GET /state 的**唯一同源**构造函数）');
+      }
+      sse.bus = d.bus;
+      sse.snapshot = d.snapshot;
+      if (d.logger) sseLogger = d.logger;
+      route('GET', '/state', (req, res) => router.state(req, res));
+      sse.mounted = true;
+      if (sseLogger && typeof sseLogger.info === 'function') {
+        sseLogger.info('[路由] SSE 业务推送已接线：GET /events（真实推送）＋ GET /state（同源快照）；' +
+          `事件种类 ${EVENT_KINDS.join(' / ')}；心跳 ${heartbeatMs} ms`);
+      }
+      return sseDescriptor();
+    },
+
+    /** SSE 接线状态与总线计数（自检/巡检可读；`bus` 段来自 `eventBus.stats()`） */
+    sseStatus() {
+      const desc = sseDescriptor();
+      return {
+        mount: 'sse', mounted: sse.mounted, by: 'W5', routes: desc.routes,
+        streams: streams.size, heartbeatMs,
+        bus: sse.bus && typeof sse.bus.stats === 'function' ? sse.bus.stats() : null
+      };
     },
 
     /** 在途 SSE 连接数（自检与运维可读） */
@@ -280,7 +495,8 @@ function createRouter(options = {}) {
     }
   };
 
-  /* 内建端点：健康检查与 SSE 空通道。挂载位（mountIfA 等）本包**不调用**。 */
+  /* 内建端点：健康检查与 SSE 通道。`/state` 由 `mountSSE()` 在接线时注册
+     （未接线时它**不该**存在 —— 否则 `/state` 会给出一个"没有快照来源"的假成功）。 */
   route('GET', '/health', (req, res) => router.health(req, res));
   route('GET', '/events', (req, res) => router.events(req, res));
 

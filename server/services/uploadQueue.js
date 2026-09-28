@@ -23,6 +23,7 @@
 'use strict';
 
 const repo = require('../repo/uploadQueue');
+const { KIND: EVENT_KIND } = require('./eventBus');
 /* 配置真源（R26-P3-4）：`src/config/board.config.js` 同时支持浏览器（window.BoardConfig）
    与 Node（module.exports），故服务端可直接 require 同一份配置 —— 不新造第二份阈值。 */
 const boardConfig = require('../../src/config/board.config.js');
@@ -120,6 +121,13 @@ function createUploadQueue(options = {}) {
   const listLimit = options.listLimit === undefined ? DEFAULT_LIST_LIMIT : options.listLimit;
   const warnThreshold = options.warnThreshold === undefined ? configWarnThreshold() : options.warnThreshold;
   const logger = options.logger || null;
+  /* W5-① 事件总线（可选注入）：`upload` 事件挂在**本模块的真实状态迁移点**上。
+     为什么挂在这里：`upload_log` 的写路径**全部**经本模块（上报器 `sendOnce` 也只调 recordSuccess /
+     enqueueFailed），故这里是"上报队列/回执状态"的唯一真源 —— 挂在别处就会另起一套状态观察。 */
+  const bus = options.bus || null;
+  if (bus && typeof bus.publish !== 'function') {
+    throw new TypeError('uploadQueue: options.bus 传了但不是事件总线（缺 publish）——见 services/eventBus.js');
+  }
 
   /* 待补传条数缓存：COUNT 查询本身很便宜，但界面/自检会高频读，故缓存；
      任何写操作后立即作废（**不做定时刷新** —— 本项目不引入定时器，见文件头背景决策）。 */
@@ -129,6 +137,32 @@ function createUploadQueue(options = {}) {
 
   /** 作废条数缓存（每次写操作后调用；**别省这一步**，否则告警数字会滞后） */
   function invalidate() { cachedCount = null; }
+
+  /**
+   * 把一次**真实状态迁移**发布成 `upload` 事件（W5-①）。
+   * 只在下面四个写路径里调用（enqueueFailed / recordSuccess / markRetried / markRetriedBatch），
+   * 也就是 `upload_log` 的**全部**写入点 —— 不在这里之外另造状态观察（真源只有一份）。
+   * @param {string} action 'enqueue-failed' | 'record-success' | 'retry-ok' | 'retry-fail' | 'retry-batch'
+   * @param {{uploadId:string, interface:string, state:string, pendingCount:number, alert:object,
+   *          created?:boolean, retryCount?:number|null, updated?:number}} detail
+   */
+  function publishUpload(action, detail) {
+    if (!bus) return null;
+    const payload = {
+      action,
+      uploadId: detail.uploadId === undefined ? null : detail.uploadId,
+      interface: detail.interface === undefined ? null : detail.interface,
+      state: detail.state,
+      created: detail.created === undefined ? null : detail.created,
+      retryCount: detail.retryCount === undefined ? null : detail.retryCount,
+      updated: detail.updated === undefined ? null : detail.updated,
+      pendingCount: detail.pendingCount,
+      capacity: queue.capacity,
+      warnThreshold: queue.warnThreshold,
+      alert: detail.alert
+    };
+    return bus.publish(EVENT_KIND.UPLOAD, payload);
+  }
 
   /** 直查待补传条数（含人工重报过仍失败的；带缓存，写操作后由 invalidate() 作废） */
   function computePending() {
@@ -215,6 +249,10 @@ function createUploadQueue(options = {}) {
         if (wrote.created) logger.warn('[上报队列] 上报失败已落库待补传', detail);
         else logger.info('[上报队列] 重复入队：覆盖更新失败原因（不新增行、不占额度）', detail);
       }
+      publishUpload('enqueue-failed', {
+        uploadId: wrote.uploadId, interface: iface, state: repo.STATE.PENDING,
+        created: wrote.created, pendingCount: pending, alert
+      });
       return {
         persisted: true, created: wrote.created,
         uploadId: wrote.uploadId, interface: iface, pendingCount: pending, alert
@@ -259,6 +297,10 @@ function createUploadQueue(options = {}) {
           uploadId: wrote.uploadId, interface: iface, pending, created: wrote.created, fromPending: wasPending
         });
       }
+      publishUpload('record-success', {
+        uploadId: wrote.uploadId, interface: iface, state: repo.STATE.SUCCESS,
+        created: wrote.created, pendingCount: pending, alert
+      });
       return {
         persisted: true, created: wrote.created,
         uploadId: wrote.uploadId, interface: iface, pendingCount: pending, alert
@@ -328,6 +370,11 @@ function createUploadQueue(options = {}) {
         if (result.ok) logger.info('[上报队列] 人工重报成功，已移出队列', detail);
         else logger.warn('[上报队列] 人工重报仍失败，保留在队列并累加重试次数', detail);
       }
+      publishUpload(result.ok ? 'retry-ok' : 'retry-fail', {
+        uploadId, interface: result.interface || ifaceDefault,
+        state: result.ok ? repo.STATE.SUCCESS : repo.STATE.FAILED,
+        retryCount: r.retryCount, updated: r.updated, pendingCount: pending, alert
+      });
       return { updated: r.updated, retryCount: r.retryCount, pendingCount: pending, alert };
     },
 
@@ -366,6 +413,12 @@ function createUploadQueue(options = {}) {
         logger.info('[上报队列] 批量重报结果已回写',
           { total: results.length, succeeded, stillFailed, skipped, pending });
       }
+      publishUpload('retry-batch', {
+        uploadId: null, interface: ifaceDefault, state: repo.STATE.PENDING,
+        updated: succeeded, pendingCount: pending, alert,
+        /* 批次明细另带两个计数（不进 `state`：批次里成功与仍失败并存，用单一 state 表达会失真） */
+        batch: { total: results.length, succeeded, stillFailed, skipped }
+      });
       return { total: results.length, succeeded, stillFailed, skipped, pendingCount: pending, alert, details };
     },
 

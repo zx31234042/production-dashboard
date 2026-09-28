@@ -33,6 +33,7 @@
        depthUpperDev: 0.20, depthLowerDev: -0.20, depthTypical: 12.60,
        speedUpperDev: 0.30, speedLowerDev: -0.30, speedTypical: 4.90
      }, '2026-09-22 08:00:00', now);                       // 第 3 实参＝生效时间（可省，省＝now）；第 4 实参＝now
+     repo.addVersion(db, {...}, undefined, now, { bus });   // 第 5 实参的 bus：新增成功后发布 `standard` 事件（W5-①）
      repo.getEffective(db, { productCode: 'P-1001', processCode: '30', at: '2026-09-22 09:00:00' });
      repo.listVersions(db, { productCode: 'P-1001', processCode: '30' });   // 版本历史
    注：生效时间只能走**第 3 个位置参数**；`input` 的键白名单＝productCode / processCode / createdBy /
@@ -53,6 +54,11 @@
    延迟到**调用期**取，那时两个模块都已加载完成，引用必然完整。 */
 function standardSvcOf() {
   return require('../services/standard');
+}
+
+/** W5-① 事件总线：**延迟 require**（理由同上：避免加载期循环依赖；只取一个纯常量表）。 */
+function eventKindOf() {
+  return require('../services/eventBus').KIND;
 }
 
 /* DR-16 时间格式：yyyy-MM-dd HH:mm:ss（恰好 19 字符）。
@@ -202,8 +208,11 @@ const INSERT_SQL =
  * @param {object} input 见 normalizeInput：productCode / processCode / 六个数值 / createdBy / teamCode
  * @param {string} [effectiveFrom] 生效时间（'yyyy-MM-dd HH:mm:ss'）；缺省＝now
  * @param {string} now 当前时刻（'yyyy-MM-dd HH:mm:ss'，由调用方注入时钟给出）
- * @param {{dangerouslySkipValidation?:boolean, skipValidation?:boolean, validate?:boolean}} [options]
- *        第 5 个位置参数：**唯一**的校验跳过出口（默认不传＝强制校验）
+ * @param {{dangerouslySkipValidation?:boolean, skipValidation?:boolean, validate?:boolean,
+ *          bus?:object}} [options]
+ *        第 5 个位置参数：**唯一**的校验跳过出口（默认不传＝强制校验）。
+ *        `bus`（W5-①，可选）＝`services/eventBus.js` 的总线：新增成功后发布一条 `standard` 事件。
+ *        它**不参与校验语义**（`validationModeOf()` 只认那两个危险开关）。
  * @returns {{id:number, productCode:string, processCode:string, versionNo:number, effectiveFrom:string,
  *            validation:'ok'|'dangerous-skip', validationMessage:string}}
  */
@@ -240,7 +249,7 @@ function addVersion(db, input, effectiveFrom, now, options) {
       effective, row.createdBy, row.teamCode, at
     );
     db.exec('COMMIT');
-    return {
+    const added = {
       id: Number(r.lastInsertRowid),
       productCode: row.productCode,
       processCode: row.processCode,
@@ -249,6 +258,25 @@ function addVersion(db, input, effectiveFrom, now, options) {
       validation: mode,
       validationMessage
     };
+    /* ---- W5-①：`standard` 事件挂在**新增版本真正提交之后**（COMMIT 之后）----
+       为什么在这里：本函数是 `standard` 表的唯一写入口（追加式模型），"新版本生效"这件事
+       只有这一处是真的。**被 `assertInput` 拒收的输入根本走不到这里**（校验早于 BEGIN），
+       故"脏/半套标准不得发布 standard 事件"这条负向判据由**代码位置**保证，不由调用方自觉。
+       走受控危险开关（`dangerouslySkipValidation`）写入的版本**也**发布：它确实新增了一行，
+       payload 的 `validation` 如实标 `dangerous-skip`（不粉饰）。 */
+    if (options && options.bus && typeof options.bus.publish === 'function') {
+      options.bus.publish(eventKindOf().STANDARD, {
+        id: added.id,
+        productCode: added.productCode,
+        processCode: added.processCode,
+        versionNo: added.versionNo,
+        effectiveFrom: added.effectiveFrom,
+        createdBy: row.createdBy,
+        teamCode: row.teamCode,
+        validation: added.validation
+      }, { at });
+    }
+    return added;
   } catch (err) {
     db.exec('ROLLBACK');
     throw err;

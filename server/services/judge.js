@@ -40,6 +40,7 @@
 const boardConfig = require('../../src/config/board.config.js');
 const { toDate, fmtDate, DAY_MS } = require('../../platform/clock');
 const standard = require('./standard');
+const { KIND: EVENT_KIND } = require('./eventBus');
 
 /** 判定对象（FR-3.14 / C-75：**只有深度与速度**；相机参数不参与，C-84④） */
 const PARAMS = Object.freeze(['depth', 'speed']);
@@ -429,13 +430,30 @@ function taskResult(input = {}) {
 
 /**
  * 一站式判定（供采集接入 / SSE 推送直接消费）：五态 + 参数类三态 + 四类预警一次给全。
- * @param {object} input 见 `taskResult()` 与 `buildWarnings()`（`progress` / `real` / `standard` /
- *        `now` / `consumableHours` / `pendingQty`）
+ *
+ * **W5-① 事件挂钩（可选、不破坏本文件的"纯函数"性质）**：传了 `options.bus` 时，把这一次的
+ * **判定/预警产出**（`{result, reason, levels, warnings}`）发布成一条 `warning` 事件。
+ * 为什么做成**显式可选**而不是默认发布：
+ *   · 本文件是判定口径的**纯函数实现**（不读系统时间、不碰 IO），前端演示实现要与之逐条对账
+ *     （见 `tests/logic-check.js` 第九节）——默认发布会让"算一次判定"这种纯调用产生副作用；
+ *   · 目前**尚无生产调用方**（W3 交付的是纯函数，接线到采集链路由后续包/负责人决定），
+ *     故这里只把**产出点**的挂钩备好：谁调用判定，谁决定要不要推给看板。
+ * `at` 取 `input.now`（业务上的"判定时刻"，由调用方注入）；未给则由总线用注入时钟兜底。
+ * @param {object} input 见 `taskResult()` 与 `buildWarnings()`
+ * @param {{bus?:object, publish?:boolean}} [options] `publish:false` 可显式关掉发布（默认：给了 bus 就发）
  * @returns {{result:string, reason:string, levels:object[], warnings:object[]}}
  */
-function evaluate(input = {}) {
+function evaluate(input = {}, options = {}) {
   const r = taskResult(input);
-  return { result: r.result, reason: r.reason, levels: r.levels, warnings: buildWarnings(input) };
+  const out = { result: r.result, reason: r.reason, levels: r.levels, warnings: buildWarnings(input) };
+  const bus = options.bus || null;
+  if (bus && options.publish !== false) {
+    if (typeof bus.publish !== 'function') {
+      throw new TypeError('judge.evaluate: options.bus 传了但不是事件总线（缺 publish）——见 services/eventBus.js');
+    }
+    bus.publish(EVENT_KIND.WARNING, out, input.now === undefined ? undefined : { at: input.now });
+  }
+  return out;
 }
 
 module.exports = {

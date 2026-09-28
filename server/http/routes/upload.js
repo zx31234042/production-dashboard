@@ -46,7 +46,9 @@ function resolveReporter(deps = {}) {
     methodName: deps.methodName,
     capacity: deps.capacity,
     warnThreshold: deps.warnThreshold,
-    timeoutMs: deps.timeoutMs
+    timeoutMs: deps.timeoutMs,
+    /* W5-①：事件总线透传（`upload` 事件在待补传队列的真实状态迁移点发布） */
+    bus: deps.bus
   });
   if (db) pool.byDb.set(db, created); else pool.nullDb = created;
   return created;
@@ -124,7 +126,7 @@ function badInputBody(err, path, method) {
  * @param {object} router `server/http/router.js` 的 createRouter() 产物
  * @param {{db?:object, reporter?:object, logger?:object, now?:Function, config?:object,
  *          fetch?:Function, queue?:object, serviceName?:string, methodName?:string,
- *          capacity?:number, warnThreshold?:number, timeoutMs?:number}} [deps]
+ *          capacity?:number, warnThreshold?:number, timeoutMs?:number, bus?:object}} [deps]
  * @returns {{mount:'upload', mounted:boolean, by:'W4', routes:string[], instance:object|null, status:Function}}
  *          `mounted:true` 才是"已接线"的**显式**状态（与 W6 空壳 `router.mountUpload()` 的
  *          `mounted:false` 形成可核查对照，D23 反静默空转）。

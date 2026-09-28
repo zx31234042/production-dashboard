@@ -277,3 +277,23 @@ CREATE TABLE IF NOT EXISTS task_curve (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_task_curve ON task_curve(proc_order_no, unit_index, kind);
 CREATE INDEX IF NOT EXISTS ix_task_curve_finished ON task_curve(finished_at);
+
+/* ---------------- NFR-14 / FR-8.4 设置页口令凭证表 ----------------
+   只存派生值与状态，**永不存明文**；本轮只有一行 username='admin'（设置页口令），
+   唯一键按 username 设计，为将来"操作人/管理员分权"留位，不提前实现。 */
+CREATE TABLE IF NOT EXISTS auth_credential (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  username     TEXT NOT NULL,                   -- 本轮恒为 'admin'
+  algo         TEXT NOT NULL,                   -- 'scrypt'
+  params       TEXT NOT NULL,                   -- 'N=16384,r=8,p=1,keylen=32'
+  salt         TEXT NOT NULL,                   -- 16 字节随机盐（hex）
+  hash         TEXT NOT NULL,                   -- 派生密钥（hex）
+  fail_count   INTEGER NOT NULL DEFAULT 0,      -- 连续失败次数（落库 ⇒ 重启不清零）
+  locked_until TEXT,                            -- 锁定截止（本机时间文本，DR-16；NULL=未锁定）
+  is_initial   INTEGER NOT NULL DEFAULT 0,      -- 1=由初始化码设置、人工尚未改过
+  created_at   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL,
+  changed_by   TEXT,
+  team_code    TEXT,                            -- 与 op_log 同源：改密时当前生效班次的班组
+  UNIQUE(username)
+);

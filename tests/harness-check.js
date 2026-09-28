@@ -238,7 +238,9 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
         badPort, '--port abc 应抛错');
     }
 
-    /* ---- 2. 挂载位：四个空壳注册位必须在，且必须**自报未挂载** ---- */
+    /* ---- 2. 挂载位：四个 W6 空壳注册位必须在，且必须**自报未挂载** ----
+       （W5-③ 口径推进见下面 2b：**总挂载位＝5**（4 个空壳 ＋ auth 真实挂载）；
+        本条的四个空壳断言**原样保留** —— 它是"未装配时不许假装已挂载"的裸 router 形态断言。） */
     {
       const r = createRouter({ getHealth: () => ({ ok: true }) });
       const mounts = [r.mountIfA(), r.mountIfD(), r.mountUpload(), r.mountSSE()];
@@ -250,14 +252,297 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
         r.list().join(' , ') === 'GET /events , GET /health', r.list().join(' , '));
     }
 
+    /* ---- 2b. W5-③ 挂载位**总数**：4 个 W6 空壳 ＋ auth 真实挂载 ＝ 5 ----
+       口径推进说明（回执要逐字交代）：原断言只数 W6 的 4 个空壳（`router.js` 内建描述符）。
+       auth **不是** `router.js` 的空壳 —— 本仓既有分工是"注册动作写进对应包的路由文件"
+       （见 `router.js` 挂载位注释与 6b/6c/6d 段的写法），故 `mountAuth()` 在 `routes/auth.js` 内部注册，
+       自报 `mounted:true` / `by:'W5-3'` / 5 条路由。这里**两条都留**：四个空壳仍必须自报未挂载（上面 2），
+       总清单必须是 5 且 auth 必须自报已接线（本条）—— "总数变 5"是推进，不是把空壳判据删掉换松的。 */
+    {
+      const mountDb = harness.makeTempDb({ name: 'w5-auth-mount' });
+      try {
+        const dbApi = require('../server/db');
+        dbApi.initSchema(mountDb.db, '2026-09-28 10:00:00');
+        const { createAuth } = require('../server/services/auth');
+        const { mountAuth } = require('../server/http/routes/auth');
+        const r5 = createRouter({ getHealth: () => ({ ok: true }) });
+        const authMount = mountAuth(r5, {
+          auth: createAuth({ db: mountDb.db, silent: true, now: () => new Date('2026-09-28T10:00:00') })
+        });
+        const slots = [r5.mountIfA(), r5.mountIfD(), r5.mountUpload(), r5.mountSSE(), authMount];
+        t.check('W5-③：挂载位清单共 **5** 个（W6 的 ifA/ifD/upload/SSE 四个空壳 ＋ auth 真实挂载 W5-3）；' +
+          'auth 自报 `mounted:true` 且注册 5 条 `/auth/*` 路由，四个空壳仍自报 `mounted:false`',
+          slots.length === 5 &&
+          slots.slice(0, 4).every(m => m.mounted === false) &&
+          authMount.mounted === true && authMount.by === 'W5-3' && authMount.routes.length === 5 &&
+          slots.map(m => m.mount).join(',') === 'ifA,ifD,upload,sse,auth' &&
+          r5.list().filter(p => p.includes('/auth/')).length === 5,
+          slots.map(m => `${m.mount}(${m.by})${m.mounted ? '已接线' : '空壳'}`).join(' , '));
+      } finally {
+        mountDb.close();
+      }
+    }
+
+    /* ---- 2c. W5-③（ADR-0007）**真起进程**的鉴权端到端 ----
+       为什么必须另起进程：ADR-0007 的判据横跨"启动期（初始化码登记到 op_log / E18 备份日志）→
+       HTTP 面（init/login/change/logout）→ 库内状态"，进程内建服务证明不了"装配真的生效"。
+       手法与本节上面一致：`harness.startService`（stdio 落文件，受限环境下管道会 EPERM）、
+       临时库/端口/目录全部唯一（门禁允许并发跑）。
+       前置造数：先按**当前**结构建库，再把 `schema_meta.schema_version` 改回 '4' ——
+       于是真进程启动时命中 E18 判据②"结构版本升级 4 → 5"，启动日志里的**迁移前备份行**
+       与磁盘上的备份文件都成为可断言的**行为**证据（不是匹配源码字符串）。 */
+    {
+      const authTmp = harness.makeTempDir('w5-auth-e2e');
+      const authDbFile = path.join(authTmp, 'board.db');
+      const authPort = await harness.allocPort();
+      const PW1 = 'W5E2E-Pass-1';
+      const PW2 = 'W5E2E-Pass-2';
+      const { DatabaseSync } = require('node:sqlite');
+      const dbApi = require('../server/db');
+      {
+        const seed = new DatabaseSync(authDbFile);
+        dbApi.initSchema(seed, '2026-09-28 10:00:00');
+        seed.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
+        seed.close();
+      }
+      let authSvc = null;
+      try {
+        authSvc = await harness.startService({
+          script: path.join(env.paths.root, 'server', 'index.js'),
+          args: ['--port', String(authPort), '--data-dir', authTmp, '--db-file', authDbFile],
+          port: authPort, readyPath: '/health', timeoutMs: 20000
+        });
+        const base = `http://127.0.0.1:${authSvc.port}`;
+        const call = async (method, p, body, headers) => {
+          const init = { method, headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}) };
+          if (method === 'POST') init.body = JSON.stringify(body === undefined ? {} : body);
+          const res = await fetch(base + p, init);
+          const text = await res.text();
+          let parsed = null;
+          try { parsed = JSON.parse(text); } catch { /* 非 JSON 正文 */ }
+          return { status: res.status, body: parsed, text };
+        };
+        const withDb = fn => {
+          const c = new DatabaseSync(authDbFile);
+          try { return fn(c); } finally { c.close(); }
+        };
+
+        /* ① 启动日志：E18 迁移前备份（判据②）＋ op_log 审计 ＋ 库内版本已升到 5 */
+        const health = await call('GET', '/health');
+        const logText = authSvc.output();
+        const backupLine = (logText.match(/\[启动\] E18 迁移前已备份：([^\r\n]+)/) || [])[1] || '';
+        const backupPath = backupLine.split('（')[0].trim();
+        const auditAfterStart = withDb(c => c.prepare(
+          "SELECT op_type, result, content FROM op_log WHERE op_type = '迁移前备份' ORDER BY id").all());
+        const versionAfterStart = withDb(c => c.prepare(
+          "SELECT value FROM schema_meta WHERE key = 'schema_version'").get().value);
+        t.check('W5-③ 端到端（真进程）：启动期命中 E18 判据②（库内版本 4 ≠ 5）⇒ 启动日志写明' +
+          '「迁移前已备份：<path>（原因 结构版本升级 4 → 5…）」、备份文件**真的落盘**且备份内是**迁移前**的库、' +
+          '`op_log` 有审计行（result=成功、含文件名）、启动后库内版本已升到 5；' +
+          '**F20 对照**：本库本来就有 `op_log`（审计一次成功）⇒ 该行必须是 `审计 op_log=ok #<id>` 且**不含** `backfill`',
+          health.status === 200 && backupPath !== '' && fs.existsSync(backupPath) &&
+          /结构版本升级 4 → 5/.test(backupLine) &&
+          auditAfterStart.length === 1 && auditAfterStart[0].result === '成功' &&
+          String(auditAfterStart[0].content).includes(path.basename(backupPath)) &&
+          versionAfterStart === dbApi.SCHEMA_VERSION &&
+          /审计 op_log=ok #\d+/.test(backupLine) && !backupLine.includes('backfill') &&
+          (() => {
+            const v = require('../server/db/maintain').verifyBackup(backupPath);
+            return v.ok && v.tables > 0;
+          })(),
+          `备份行=${backupLine || '(未出现)'}；审计=${JSON.stringify(auditAfterStart)}；版本=${versionAfterStart}`);
+
+        /* ② 挂载位清单（启动日志）与路由清单：5 项（含 auth(W5-3)已接线）＋ 5 条 /auth/* */
+        const routeLine = (logText.match(/\[路由\] 已注册：([^\r\n]+)/) || [])[1] || '';
+        const mountLine = (logText.match(/挂载位状态[^\r\n]*/) || [])[0] || '';
+        t.check('W5-③ 端到端（真进程）：启动日志的**挂载位清单共 5 项**（ifA/ifD/upload/SSE/auth，' +
+          'auth 自报 `auth(W5-3)已接线`），路由清单里 `/auth/*` 恰好 5 条（init/login/logout/change/status）',
+          (mountLine.match(/(?:ifA|ifD|upload|sse|auth)\((?:W\d(?:-\d)?)\)(?:已接线|空壳)/g) || []).length === 5 &&
+          mountLine.includes('auth(W5-3)已接线') &&
+          (routeLine.match(/\/auth\//g) || []).length === 5 &&
+          ['GET /auth/status', 'POST /auth/init', 'POST /auth/login', 'POST /auth/logout', 'POST /auth/change']
+            .every(p => routeLine.includes(p)),
+          `挂载位行=${mountLine.slice(0, 200)}；路由行含 /auth/* ${(routeLine.match(/\/auth\//g) || []).length} 条`);
+
+        /* ③ 未初始化态：status 200/不含秘密；login ⇒ 409；初始化码**从 op_log 读**（不依赖控制台） */
+        const st0 = await call('GET', '/auth/status');
+        const codeRow = withDb(c => c.prepare(
+          "SELECT content FROM op_log WHERE op_type = '口令初始化码' ORDER BY id DESC LIMIT 1").get());
+        const initCode = (/一次性初始化码=([0-9a-f]{12})/.exec(codeRow ? codeRow.content : '') || [])[1] || '';
+        const login0 = await call('POST', '/auth/login', { password: PW1 });
+        t.check('W5-③ 端到端（真进程）：未初始化 ⇒ `GET /auth/status` 200 且 `initialized=false`、' +
+          '**正文不含任何秘密**（无 salt/hash/token/初始化码）；`POST /auth/login` ⇒ 409 `not_initialized`；' +
+          '一次性初始化码**从 op_log 读得到**（12 位 hex，不依赖控制台打印）',
+          st0.status === 200 && st0.body && st0.body.ok === true && st0.body.initialized === false &&
+          !/"(salt|hash|token)"/.test(st0.text) && !st0.text.includes(initCode) &&
+          login0.status === 409 && login0.body && login0.body.error === 'not_initialized' &&
+          /^[0-9a-f]{12}$/.test(initCode),
+          `status=${st0.status}/initialized=${st0.body && st0.body.initialized}；login=${login0.status}/` +
+          `${login0.body && login0.body.error}；码形状=${/^[0-9a-f]{12}$/.test(initCode) ? '12 位 hex' : '异常'}`);
+
+        /* ④ init ⇒ 200；同码第二次 ⇒ 409（唯一入口只走一次）；库里只存派生值 */
+        const init1 = await call('POST', '/auth/init', { code: initCode, password: PW1 });
+        const init2 = await call('POST', '/auth/init', { code: initCode, password: PW2 });
+        const cred = withDb(c => c.prepare('SELECT username, algo, params, salt, hash FROM auth_credential').all());
+        t.check('W5-③ 端到端（真进程）：`POST /auth/init{code,password}` ⇒ **200**（且正文不回显码）；' +
+          '同码第二次 ⇒ **409** `already_initialized`；库里只有一行凭证且 **`salt`/`hash` ≠ 口令**、' +
+          '`algo=scrypt`、`params=N=16384,r=8,p=1,keylen=32`',
+          init1.status === 200 && init1.body && init1.body.initialized === true &&
+          !init1.text.includes(initCode) &&
+          init2.status === 409 && init2.body && init2.body.error === 'already_initialized' &&
+          cred.length === 1 && cred[0].algo === 'scrypt' &&
+          cred[0].params === 'N=16384,r=8,p=1,keylen=32' &&
+          cred[0].salt !== PW1 && cred[0].hash !== PW1 && !cred[0].hash.includes(PW1) &&
+          /^[0-9a-f]{64}$/.test(cred[0].hash) && /^[0-9a-f]{32}$/.test(cred[0].salt),
+          `init=${init1.status}；initAgain=${init2.status}；凭证=${JSON.stringify(cred.map(x => ({ u: x.username, algo: x.algo, params: x.params })))}`);
+
+        /* ⑤ 登录 200（64 位 hex 令牌）⇒ 改密 200 ⇒ 旧令牌立即失效（logout 401）⇒ 新口令登录 200、旧口令 401 */
+        const login1 = await call('POST', '/auth/login', { password: PW1 });
+        const token = login1.body && login1.body.token;
+        const wrong = await call('POST', '/auth/login', { password: 'definitely-wrong-1' });
+        const chg = await call('POST', '/auth/change', { oldPassword: PW1, newPassword: PW2 },
+          { Authorization: 'Bearer ' + token });
+        const outOld = await call('POST', '/auth/logout', {}, { Authorization: 'Bearer ' + token });
+        const loginNew = await call('POST', '/auth/login', { password: PW2 });
+        const loginOldPw = await call('POST', '/auth/login', { password: PW1 });
+        /* 改密后的**新**令牌再登出一次 ⇒ 200（留痕里才会出现"登出"这一类；上一条旧令牌登出按设计是 401） */
+        const outNew = await call('POST', '/auth/logout', {},
+          { Authorization: 'Bearer ' + String(loginNew.body && loginNew.body.token) });
+        t.check('W5-③ 端到端（真进程）：`POST /auth/login` ⇒ **200** 且 token 为 64 位 hex（含 `expiresAt`）；' +
+          '`POST /auth/change`（Bearer）⇒ **200** 并**强制清会话**（旧令牌 `logout` ⇒ **401**）；' +
+          '新口令登录 **200**（其令牌 `logout` ⇒ 200）、旧口令 **401**；错误口令 **401 且响应体不下发原因**',
+          login1.status === 200 && /^[0-9a-f]{64}$/.test(String(token)) &&
+          typeof (login1.body && login1.body.expiresAt) === 'string' &&
+          wrong.status === 401 && wrong.body && wrong.body.error === 'bad_credentials' &&
+          wrong.body.reason === undefined &&
+          chg.status === 200 && chg.body && chg.body.requireRelogin === true &&
+          outOld.status === 401 && outOld.body && outOld.body.error === 'unauthorized' &&
+          loginNew.status === 200 && /^[0-9a-f]{64}$/.test(String(loginNew.body && loginNew.body.token)) &&
+          loginOldPw.status === 401 && outNew.status === 200,
+          `login=${login1.status}(token ${String(token).length} hex)；wrong=${wrong.status}/${wrong.body && wrong.body.error}` +
+          `（reason 未下发=${wrong.body && wrong.body.reason === undefined}）；change=${chg.status}；` +
+          `旧令牌登出=${outOld.status}；新口令登录=${loginNew.status}（其令牌登出=${outNew.status}）；` +
+          `旧口令登录=${loginOldPw.status}`);
+
+        /* ⑥ 错误次数与锁定（HTTP 面）：连续失败达到阈值 ⇒ 423 `locked` + `retryAfterSec`；
+           此后**即使口令正确也 423**（ADR-0007 D2 —— 这一条在 HTTP 面也要能被看到，不能只在服务层验）。 */
+        const lockAttempts = [];
+        for (let i = 0; i < 5; i++) lockAttempts.push(await call('POST', '/auth/login', { password: 'lock-probe-' + i }));
+        const lockedRight = await call('POST', '/auth/login', { password: PW2 });
+        t.check('W5-③ 端到端（真进程）：连续失败达到阈值（`maxFailures`）后 ⇒ **423 `locked`** 且带 ' +
+          '`retryAfterSec`；锁定期间**口令正确也 423**（不是 200）—— ADR-0007 D2 的"锁定"在 HTTP 面同样成立',
+          lockAttempts.some(r => r.status === 423 && r.body && r.body.error === 'locked' &&
+            typeof r.body.retryAfterSec === 'number' && r.body.retryAfterSec > 0) &&
+          lockedRight.status === 423 && lockedRight.body && lockedRight.body.error === 'locked' &&
+          typeof lockedRight.body.retryAfterSec === 'number' && lockedRight.body.reason !== undefined,
+          `5 次错误口令的状态=${lockAttempts.map(r => r.status).join('/')}；` +
+          `正确口令在锁定中=${lockedRight.status}/${lockedRight.body && lockedRight.body.error}` +
+          `（retryAfterSec=${lockedRight.body && lockedRight.body.retryAfterSec}）`);
+
+        /* ⑦ 留痕与明文（真进程口径）：六类各≥1、含来源 IP；库里/op_log 里不含口令明文 */
+        const auditRows = withDb(c => c.prepare(
+          'SELECT op_type, result, content FROM op_log ORDER BY id').all());
+        const types = auditRows.map(r => r.op_type);
+        const dbBytes = fs.readFileSync(authDbFile);
+        t.check('W5-③ 端到端（真进程）：留痕含 **口令初始化码 / 口令初始化 / 解锁 / 解锁失败 / 账号锁定 / 改密 / 登出**，' +
+          '且带**来源 IP**（取自 socket）；库文件字节与 op_log 全量序列化里**都没有口令明文**',
+          ['口令初始化码', '口令初始化', '解锁', '解锁失败', '账号锁定', '改密', '登出'].every(k => types.includes(k)) &&
+          auditRows.filter(r => /来源=/.test(String(r.content))).length >= 5 &&
+          !dbBytes.includes(PW1) && !dbBytes.includes(PW2) &&
+          !JSON.stringify(auditRows).includes(PW1) && !JSON.stringify(auditRows).includes(PW2),
+          `留痕类型=${JSON.stringify(types)}；带来源 IP ${auditRows.filter(r => /来源=/.test(String(r.content))).length} 条`);
+
+        /* ⑦ 码**立即作废**（跨 HTTP 边界的直接证据）：把凭证行删掉回到未初始化态，再用**同一个码**初始化 ⇒ 401。
+           ⚠ 为什么必须这么造：只断言"第二次 init ⇒ 409"证明不了码已作废 —— 那一步在 `countCredentials()>0`
+           的"已初始化"检查上就短路了（服务层用例 `tests\db-check.js` 九之三用同一手法，这里补跨 HTTP 的同一证据）。 */
+        withDb(c => c.exec('DELETE FROM auth_credential'));
+        const stAfterDelete = await call('GET', '/auth/status');
+        const codeReuse = await call('POST', '/auth/init', { code: initCode, password: PW2 });
+        t.check('W5-③ 端到端（真进程）：一次性初始化码**成功后立即作废** —— 删掉凭证行回到未初始化态后，' +
+          '用**同一个码**再初始化 ⇒ **401 `bad_init_code`**（不是 200，也不是靠"已初始化"检查短路躲过去）',
+          stAfterDelete.status === 200 && stAfterDelete.body && stAfterDelete.body.initialized === false &&
+          codeReuse.status === 401 && codeReuse.body && codeReuse.body.error === 'bad_init_code',
+          `删行后 initialized=${stAfterDelete.body && stAfterDelete.body.initialized}；同码再初始化=` +
+          `${codeReuse.status}/${codeReuse.body && codeReuse.body.error}`);
+
+        /* ⑧ 真进程优雅停止：端口释放、服务日志目录随 stop() 清掉（不留残留） */
+        await authSvc.stop();
+        const logFileAfterStop = authSvc.logFile;
+        authSvc = null;
+        await new Promise(r => setTimeout(r, 150));
+        let stillUp = false;
+        try { await fetch(`${base}/health`); stillUp = true; } catch { /* 已停 */ }
+        t.check('W5-③ 端到端（真进程）：`stop()` 之后端口不再响应（服务真被停掉，无残留进程/句柄），' +
+          '且 `startService` 的临时日志目录随 stop() 一起清掉',
+          stillUp === false && !fs.existsSync(logFileAfterStop),
+          stillUp ? '仍在响应（缺陷）' : `已停止（日志目录已清=${!fs.existsSync(logFileAfterStop)}）`);
+      } finally {
+        if (authSvc) await authSvc.stop();
+        fs.rmSync(authTmp, { recursive: true, force: true });
+      }
+    }
+
+    /* ---- 2d. W5-③/**F20**：**极旧库（连 `op_log` 表都没有）**的启动日志必须如实标"已 backfill"（真起进程）----
+       造数：当前结构建库 → `DROP TABLE op_log` → 版本改回 '4' ⇒ 迁移前那次审计必然失败
+       （`no such table: op_log`），迁移后由 db 层**补写**（`backfill（迁移后补写）`）。
+       **改前复现**（F20 立案）：该行会打印"审计 op_log=写入失败（已告警，auditDegraded=true）"，
+       而库里其实已有 backfill 行 ⇒ **日志与事实不符**。改后应打印"写入失败→已 backfill #<id>"。
+       为什么单起一次进程：本判据的造数（无 `op_log` 表）与 2c 的库互斥，必须各起一个服务。 */
+    {
+      const f20Tmp = harness.makeTempDir('f20-backfill-log');
+      const f20DbFile = path.join(f20Tmp, 'board.db');
+      const f20Port = await harness.allocPort();
+      const { DatabaseSync } = require('node:sqlite');
+      const dbApi = require('../server/db');
+      {
+        const seed = new DatabaseSync(f20DbFile);
+        dbApi.initSchema(seed, '2026-09-28 10:00:00');
+        seed.exec('DROP TABLE op_log');       // 极旧库的形态：连 op_log 表都没有
+        seed.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
+        seed.close();
+      }
+      let f20Svc = null;
+      try {
+        f20Svc = await harness.startService({
+          script: path.join(env.paths.root, 'server', 'index.js'),
+          args: ['--port', String(f20Port), '--data-dir', f20Tmp, '--db-file', f20DbFile],
+          port: f20Port, readyPath: '/health', timeoutMs: 20000
+        });
+        const f20Line = (f20Svc.output().match(/\[启动\] E18 迁移前已备份：[^\r\n]*/) || [''])[0];
+        const f20Db = new DatabaseSync(f20DbFile);
+        const f20Rows = f20Db.prepare(
+          "SELECT id, result, content FROM op_log WHERE op_type = '迁移前备份'").all();
+        f20Db.close();
+        const f20LoggedId = Number((f20Line.match(/已 backfill #(\d+)/) || [])[1]);
+        t.check('W5-③/F20 端到端（真进程）：**极旧库（连 `op_log` 表都没有）** ⇒ 启动日志的审计子句必须如实标' +
+          '「写入失败→已 backfill #<id>」，且**不再打印**"（已告警，auditDegraded=true）"；' +
+          '同时库里确有该 backfill 行（**日志里的 id 与库内行 id 一致**）',
+          /审计 op_log=写入失败→已 backfill #\d+/.test(f20Line) &&
+          !f20Line.includes('（已告警，auditDegraded=true）') &&
+          f20Rows.length === 1 && String(f20Rows[0].content).includes('backfill') &&
+          f20LoggedId === Number(f20Rows[0].id) && f20Rows[0].result === '成功',
+          `日志行=${f20Line || '(未出现)'}；op_log=${JSON.stringify(f20Rows.map(r => ({ id: r.id, result: r.result })))}`);
+      } finally {
+        if (f20Svc) await f20Svc.stop();
+        fs.rmSync(f20Tmp, { recursive: true, force: true });
+      }
+    }
+
     /* ---- 3~6. 起真服务做行为断言（子进程夹具） ---- */
     const w6Tmp = harness.makeTempDir('w6-entry-skeleton');
     const w6Scratch = path.join(env.paths.root, 'tests', '._verify', 'w6');
     fs.mkdirSync(w6Scratch, { recursive: true });
+    /* ⚠ 夹具文件名带**本次运行的唯一标签**：门禁允许并发跑（E19 现实），固定文件名 + "收尾删整个目录"
+       会让两个 harness-check 互相删对方的夹具（实测：并发轮次里本轮在写 `fixture-b.js` 时目录已被
+       另一轮删掉 ⇒ ENOENT 崩在夹具中途）。只删自己写的文件，不删目录。 */
+    const w6RunTag = process.pid + '-' + Date.now().toString(36);
+    /** 本节点写过的夹具文件（收尾只删它们，不删共用目录） */
+    const w6Written = [];
 
     const w6Write = (name, lines) => {
       const full = path.join(w6Scratch, name);
       fs.writeFileSync(full, lines.join('\r\n') + '\r\n', 'utf8');
+      w6Written.push(full);
       return full;
     };
     const w6ReadResult = file => {
@@ -292,7 +577,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
     const w6DataA = path.join(w6Tmp, 'data-a');
     const w6DbA = path.join(w6Tmp, 'custom-board.db');   // 用 --db-file 起，顺带验该覆盖项与 /health 的 dbFile
     const w6ResAFile = path.join(w6Tmp, 'result-a.json');
-    const fA = w6Write('fixture-a.js', [
+    const fA = w6Write('fixture-a-' + w6RunTag + '.js', [
       "'use strict';",
       "/* 由 tests/harness-check.js 生成：起真服务 → 逐条打真请求 → 结果写 JSON 文件。 */",
       "const fs = require('node:fs');",
@@ -452,7 +737,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
        去掉自检后进程会一路起到监听（夹具随即以退出码 9 报"缺陷"），断言这才真的变红。 */
     const w6PortB = await harness.allocPort();
     const w6DataB = path.join(w6Tmp, 'data-b');
-    const fB = w6Write('fixture-b.js', [
+    const fB = w6Write('fixture-b-' + w6RunTag + '.js', [
       "'use strict';",
       "/* 启动自检②：backupDir 被同名**文件**占位（写探针必然失败 ENOTDIR）⇒ 自检必须挡住 ⇒ 退非零。 */",
       "const fs = require('node:fs');",
@@ -494,7 +779,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
     for (const mode of ['uncaught', 'rejection']) {
       const w6PortC = await harness.allocPort();
       const w6DataC = path.join(w6Tmp, 'data-c-' + mode);
-      const fC = w6Write('fixture-c-' + mode + '.js', [
+      const fC = w6Write('fixture-c-' + mode + '-' + w6RunTag + '.js', [
         "'use strict';",
         "const path = require('node:path');",
         "const ROOT = path.resolve(__dirname, '..', '..', '..');",
@@ -524,10 +809,1285 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
     }
 
     try { fs.rmSync(w6Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
-    try { fs.rmSync(w6Scratch, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    /* 只删本节点的夹具文件，不删整个 w6 目录（并发轮次共用该目录，见上方 w6RunTag 说明） */
+    for (const f of w6Written) { try { fs.rmSync(f, { force: true }); } catch { /* 忽略 */ } }
   } else {
     t.info('W6：server\\index.js 不存在 —— 上述进程入口断言未执行（不许把"跑不了"当通过）');
   }
+}
+
+/* ---------------- 四之②、W5-① 服务端 SSE 业务推送（快照同源／断线续传／六类事件／CORS／静态托管／优雅关闭） ----------------
+   覆盖 W5-① 的九条判据（①建连快照同源 ②断线续传 ③脏输入不发布 ④帧事件与采样表逐条对账 ⑤心跳可预测
+   ⑥优雅关闭 ⑦缓冲溢出计数 ⑧无裸时间 ⑨端口/监听）＋ 负责人 2026-09-28 裁定「选项 A」的 CORS 与静态托管。
+   手法沿用本节上半段：**真起进程、真打 HTTP、真读响应**（行为判据，不匹配源码字符串，遵 D23）。
+   夹具源码内联在本节（写成文件后以子进程跑）；产物一律落 tests\._verify\w5sse\（D16：测试只写这里）。 */
+t.section('四之②、W5-① 服务端 SSE 业务推送（快照同源／断线续传／六类事件／CORS／静态托管／优雅关闭）');
+{
+  /* 夹具源内联在这里（写成文件后以子进程真起服务）：**门禁只改本脚本一个文件**，
+     夹具不进仓库 —— 它们每次都重新写到 tests\._verify\w5sse\（已 gitignore）。
+     内联用 String.raw：夹具里的 `\n` / `\r\n` 等转义按字面写进文件（不在这里被解释）。 */
+  const W5_FIXTURE_SSE = String.raw`'use strict';
+/* W5-① 服务端 SSE 业务推送 —— 端到端夹具（由 tests/harness-check.js 生成到 tests/._verify/w5sse/）
+   真起服务（真 HTTP 回环）→ 逐条打真请求 → 结果写 JSON 文件；本文件**不做断言**（断言在 harness-check）。
+   阶段划分（每段一条连接，避免"哪些事件落在哪个窗口"含糊）：
+     ① hello 快照与 /state 同源   ② 心跳计数   ③ 帧事件（1 s 采样才发）＋链路在线
+     ④ 断线续传（?since= / Last-Event-ID）   ⑤ 链路离线（推进注入时钟）   ⑥ 其余四类事件
+     ⑦ 超缓冲退回 hello ＋ 非法 since   ⑧ 优雅关闭（先 closeAllStreams、再 stop） */
+const fs = require('node:fs');
+const path = require('node:path');
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+process.env.DSH_ENV = 'test';
+const entry = require(path.join(ROOT, 'server', 'index.js'));
+const { createUploadReporter } = require(path.join(ROOT, 'server', 'services', 'uploadReporter.js'));
+const stdRepo = require(path.join(ROOT, 'server', 'repo', 'standard.js'));
+const judge = require(path.join(ROOT, 'server', 'services', 'judge.js'));
+const boardConfig = require(path.join(ROOT, 'src', 'config', 'board.config.js'));
+
+const OUT = {};
+const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OUT, null, 1), 'utf8');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* 注入时钟：固定时刻 + 可手动推进（链路离线判据要能确定性地跨过 upper.staleMs = 5000） */
+let fixedMs = Date.parse('2026-09-19T10:00:00');
+const injectedAt = new Date(fixedMs).toISOString();
+const clock = {
+  now: () => new Date(fixedMs),
+  source: () => () => new Date(fixedMs),
+  advanceMs: ms => { fixedMs += ms; return fixedMs; }
+};
+
+/* ---- SSE 客户端：真 HTTP + 按 SSE 规范切块 ---- */
+function parseFrames(text) {
+  const out = [];
+  for (const block of String(text).split('\n\n')) {
+    if (!block.trim()) continue;
+    const f = { retry: null, comment: null, id: null, event: null, data: null };
+    const dataLines = [];
+    for (const line of block.split('\n')) {
+      if (line.startsWith(':')) f.comment = line.slice(1).trim();
+      else if (line.startsWith('retry:')) f.retry = line.slice(6).trim();
+      else if (line.startsWith('id:')) f.id = line.slice(3).trim();
+      else if (line.startsWith('event:')) f.event = line.slice(6).trim();
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+    }
+    if (dataLines.length) f.data = dataLines.join('\n');
+    out.push(f);
+  }
+  return out;
+}
+
+async function openStream(base, opts = {}) {
+  const ctl = new AbortController();
+  const res = await fetch(base + (opts.path || '/events'), { headers: opts.headers || {}, signal: ctl.signal });
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let text = '';
+  let done = false;
+  const chunks = [];
+  /* ⚠ 两条硬约束（都是实测踩出来的）：
+     ① 任何时刻**只允许一个在途 read()**：超时的 race 只能放弃"超时 promise"，绝不能让
+        「reader.read()」悬空 —— 悬空的读稍后 resolve 时它带回的字节没人接收，会**静默丢帧**；
+     ② 每个 read 都**预挂一个 catch**：「abort()」会让挂起的读以 AbortError 拒绝，
+        没挂 catch 时就是一条未处理拒绝 ⇒ 夹具进程直接崩（本夹具实测崩过一次）。 */
+  let reading = null;
+  const arm = () => { reading = reader.read(); reading.catch(() => { /* abort/重置：由 pump 收敛 */ }); };
+  arm();
+  async function pump(ms) {
+    const until = Date.now() + ms;
+    while (Date.now() < until && !done) {
+      let chunk;
+      try {
+        chunk = await Promise.race([
+          reading,
+          new Promise(r => setTimeout(() => r({ timeout: true }), Math.max(1, until - Date.now())))
+        ]);
+      } catch { done = true; break; }        // 连接被 abort/重置 ⇒ 当作流结束
+      if (chunk.timeout) break;
+      if (chunk.done) { done = true; break; }
+      text += dec.decode(chunk.value, { stream: true });
+      chunks.push({ at: Date.now(), len: text.length });
+      arm();
+    }
+    return text;
+  }
+  return {
+    status: res.status,
+    contentType: res.headers.get('content-type'),
+    pump,
+    text: () => text,
+    chunks: () => chunks.slice(),
+    finished: () => done,
+    frames: () => parseFrames(text),
+    events: () => parseFrames(text).filter(f => f.event).map(f => ({
+      id: Number(f.id), event: f.event, data: f.data ? JSON.parse(f.data) : null
+    })),
+    async close() { try { ctl.abort(); } catch { /* 已关 */ } try { await reader.cancel(); } catch { /* 已关 */ } }
+  };
+}
+
+/** 合法帧（字段名与 IF-D 契约一致） */
+function frame(i, collectTime) {
+  return {
+    equipCode: 'EQ-W5', procOrderNo: 'WO-W5-1', collectTime,
+    seq: i, depth: 5.0 + i / 100, speed: 5 + i / 100,
+    velocity_x: 3 + i / 100, velocity_y: 4 + i / 100,
+    frameRate: 1000, gain: 2.5, shutter: 500, cameraDepth: 12.5, testStatus: 1
+  };
+}
+
+async function post(base, p, body) {
+  const res = await fetch(base + p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  let parsed = null;
+  try { parsed = await res.json(); } catch { /* 非 JSON */ }
+  return { status: res.status, body: parsed };
+}
+const seqNow = async base => (await (await fetch(base + '/state')).json()).seq;
+
+const streams = [];
+(async () => {
+  const port = Number(process.env.DSH_W5_PORT);
+  const base = 'http://127.0.0.1:' + port;
+  const svc = await entry.start({
+    argv: ['--port', String(port), '--data-dir', process.env.DSH_W5_DATA, '--db-file', process.env.DSH_W5_DB],
+    installSignalHandlers: false,
+    logConsole: false,
+    heartbeatMs: 100,
+    linkIntervalMs: 100,
+    busCapacity: 8,          // 小容量：端到端也能验"超缓冲退回 hello"
+    clock
+  });
+  const db = entry.state.db;
+  const rowCount = () => db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+  /* 连接级取证：优雅退出时"到底是谁让 server.close() 等"必须看得见（否则只能猜） */
+  const conns = [];
+  const bySock = new Map();
+  entry.state.server.on('connection', sock => {
+    const rec = { openedAt: Date.now(), closedAt: null, remote: sock.remotePort, urls: [] };
+    conns.push(rec);
+    bySock.set(sock, rec);
+    sock.on('close', () => { rec.closedAt = Date.now(); });
+  });
+  entry.state.server.on('request', (req) => {
+    const rec = bySock.get(req.socket);
+    if (rec) rec.urls.push(req.method + ' ' + req.url);
+  });
+
+  OUT.listen = svc.listen;
+  OUT.injectedAt = injectedAt;
+  OUT.mountSSE = svc.router.mountSSE();          // 无参：接线后必须自报**真实**状态
+  OUT.routes = svc.router.list();
+  OUT.config = { defaultHost: entry.DEFAULT_HOST, defaultPort: entry.DEFAULT_PORT, heartbeatMs: 100, busCapacity: svc.bus.capacity };
+
+  /* ================= ① 建连快照：/state 与 hello 同源 ================= */
+  const state0Res = await fetch(base + '/state');
+  const state0Text = await state0Res.text();
+  OUT.state0 = {
+    status: state0Res.status, contentType: state0Res.headers.get('content-type'),
+    text: state0Text, body: JSON.parse(state0Text)
+  };
+  const sHello = await openStream(base);
+  streams.push(sHello);
+  OUT.hello0 = { status: sHello.status, contentType: sHello.contentType, text: await sHello.pump(400), events: sHello.events() };
+  await sHello.close();
+
+  /* ================= ② 心跳：注入 100 ms，观测 2000 ms（公式 E=floor(D/H)） ================= */
+  if (!String(process.env.W5_SKIP || '').includes('hb')) {
+  const sHb = await openStream(base);
+  streams.push(sHb);
+  const hbStart = Date.now();
+  const hbText = await sHb.pump(2000);
+  OUT.heartbeat = {
+    windowMs: 2000, heartbeatMs: 100, elapsedMs: Date.now() - hbStart,
+    text: hbText, chunks: sHb.chunks()
+  };
+  await sHb.close();
+  } else { OUT.heartbeat = { skipped: true }; }
+
+  /* ================= ③ 帧事件（1 s 采样才发；500 ms 原始帧与脏帧都不发）＋链路在线 ================= */
+  const sFrames = await openStream(base);
+  streams.push(sFrames);
+  await sleep(150);                                   // 让链路监控建立基线（首次 tick 只记基线）
+  const rowsBefore = rowCount();
+  OUT.frames = { rowsBefore, posts: [] };
+  OUT.frames.posts.push(await post(base, '/ifd/frame', frame(1, '2026-09-19 10:00:00')));   // stored
+  OUT.frames.posts.push(await post(base, '/ifd/frame', frame(2, '2026-09-19 10:00:00')));   // 同秒异键 ⇒ raw-500ms
+  const dirty = frame(3, '2026-09-19 10:01:00');
+  delete dirty.procOrderNo;                                                                  // 脏帧 ⇒ 400
+  OUT.frames.posts.push(await post(base, '/ifd/frame', dirty));
+  await sFrames.pump(500);                             // 覆盖：帧事件 + 链路"离线→在线"
+  OUT.frames.rowsAfter = rowCount();
+  OUT.frames.stream = { text: sFrames.text(), events: sFrames.events() };
+  await sFrames.close();
+
+  /* ================= ④ 断线续传：?since= / Last-Event-ID（此时链路在线 ⇒ 窗口内只有帧事件） ================= */
+  const cursorBase = await seqNow(base);               // = 帧事件与链路在线事件的最大 seq
+  for (let i = 0; i < 3; i++) {
+    OUT.frames.posts.push(await post(base, '/ifd/frame', frame(10 + i, '2026-09-19 10:00:1' + i)));
+  }
+  OUT.replay = { cursorBase, expectedFrames: ['2026-09-19 10:00:10', '2026-09-19 10:00:11', '2026-09-19 10:00:12'] };
+  const sReplay = await openStream(base, { path: '/events?since=' + cursorBase });
+  streams.push(sReplay);
+  OUT.replay.byQuery = { status: sReplay.status, text: await sReplay.pump(400) };
+  OUT.replay.byQuery.events = sReplay.events();
+  await sReplay.close();
+  const sHeader = await openStream(base, { headers: { 'Last-Event-ID': String(cursorBase + 1) } });
+  streams.push(sHeader);
+  OUT.replay.byHeader = { status: sHeader.status, text: await sHeader.pump(400) };
+  OUT.replay.byHeader.events = sHeader.events();
+  await sHeader.close();
+
+  /* ================= ⑤ 链路"在线→离线"：注入时钟推进 6 s（> upper.staleMs = 5000） ================= */
+  const sLink = await openStream(base);
+  streams.push(sLink);
+  await sLink.pump(150);
+  clock.advanceMs(6000);
+  OUT.afterAdvanceAt = new Date(fixedMs).toISOString();   // 注释帧时间戳只允许取这两个注入值之一（D17 判据）
+  OUT.link = { afterAdvance: await sLink.pump(450) };
+  OUT.link.events = sLink.events();
+  OUT.link.state = (await (await fetch(base + '/state')).json()).snapshot.link;
+  await sLink.close();
+
+  /* ================= ⑥ 其余三类事件（task / standard / upload）＋ 「warning」（**夹具直调** judge） =================
+     ⚠ F12：「warning」 的**唯一发布点**（「judge.evaluate」）在全仓没有生产调用方，这里是**夹具直调** ——
+     它证明的是"挂钩可用"，不是"挂在真实写入点"（生产发布点待接线：技术债 E45）。 */
+  const sOther = await openStream(base);
+  streams.push(sOther);
+  OUT.inproc = [];                                    // 进程内旁证：同一总线上的订阅者收到了什么
+  const probe = svc.bus.subscribe(e => OUT.inproc.push(e.seq + ':' + e.kind));
+  OUT.other = { task: [], standard: {}, upload: {}, warning: {} };
+  OUT.other.task.push(await post(base, '/ifa/dispatch',
+    { procOrderNo: 'WO-W5-9', productCode: 'P-W5', processNo: '30', planQty: 12, equipCode: 'EQ-W5' }));
+  OUT.other.task.push(await post(base, '/ifa/dispatch',
+    { procOrderNo: 'WO-W5-9', productCode: 'P-W5', processNo: '30', planQty: 12, equipCode: 'EQ-W5' })); // 幂等命中
+
+  const nowText = '2026-09-19 10:00:06';
+  OUT.other.standard.added = stdRepo.addVersion(db, {
+    productCode: 'P-W5', processCode: '30', depthUpperDev: 0.2, depthLowerDev: -0.2, depthTypical: 5,
+    speedUpperDev: 0.3, speedLowerDev: -0.3, speedTypical: 5
+  }, undefined, nowText, { bus: svc.bus });
+  OUT.other.standard.rejected = { threw: false, message: null };
+  try {
+    stdRepo.addVersion(db, { productCode: 'P-W5', processCode: '30', depthUpperDev: 0.2 }, undefined, nowText, { bus: svc.bus });
+  } catch (err) {
+    OUT.other.standard.rejected.threw = true;
+    OUT.other.standard.rejected.message = String(err && err.message).slice(0, 200);
+  }
+  OUT.other.standard.versions = stdRepo.countVersions(db, { productCode: 'P-W5', processCode: '30' });
+
+  const failingFetch = async () => { throw new Error('W5 夹具注入的网络错误'); };
+  const rep = createUploadReporter({
+    db, bus: svc.bus, now: clock.source(), fetch: failingFetch,
+    config: Object.assign({}, boardConfig, { mes: Object.assign({}, boardConfig.mes, { baseUrl: 'http://127.0.0.1:9/x' }) })
+  });
+  OUT.other.upload.report = await rep.report({});
+  OUT.other.upload.pendingCount = rep.pendingCount(true);
+
+  OUT.other.warning.result = judge.evaluate({
+    now: new Date(fixedMs),
+    real: { depth: 5.22, speed: 5 },
+    standard: {
+      depth: { typical: 5, upperDev: 0.3, lowerDev: -0.2, unit: 'm' },
+      speed: { typical: 5, upperDev: 0.3, lowerDev: -0.2, unit: 'm/s' }
+    },
+    consumableHours: 10, pendingQty: 1
+  }, { bus: svc.bus });
+
+  await sOther.pump(500);
+  OUT.other.stream = { text: sOther.text(), events: sOther.events() };
+  OUT.other.sseStatus = svc.router.sseStatus();
+  svc.bus.unsubscribe(probe);
+  await sOther.close();
+  OUT.stateFinal = await (await fetch(base + '/state')).json();
+  OUT.uploadStatus = await (await fetch(base + '/upload/status')).json();
+
+  /* ================= ⑦ 超缓冲退回 hello ＋ 非法 since 不得 500 ================= */
+  for (let i = 0; i < 10; i++) {
+    OUT.frames.posts.push(await post(base, '/ifd/frame', frame(20 + i, '2026-09-19 10:01:' + String(i).padStart(2, '0'))));
+  }
+  const sOverflow = await openStream(base, { path: '/events?since=' + (cursorBase + 3) });
+  streams.push(sOverflow);
+  OUT.replay.overflow = { status: sOverflow.status, text: await sOverflow.pump(400) };
+  OUT.replay.overflow.events = sOverflow.events();
+  OUT.replay.busStats = svc.bus.stats();
+  await sOverflow.close();
+
+  OUT.replay.invalid = {};
+  for (const bad of ['abc', '-5', '1.5', '']) {
+    const s = await openStream(base, { path: '/events?since=' + encodeURIComponent(bad) });
+    streams.push(s);
+    const text = await s.pump(250);
+    OUT.replay.invalid[bad === '' ? '(空串)' : bad] = { status: s.status, text };
+    await s.close();
+  }
+  const sBadHeader = await openStream(base, { headers: { 'Last-Event-ID': 'xyz' } });
+  streams.push(sBadHeader);
+  OUT.replay.invalid.header = { status: sBadHeader.status, text: await sBadHeader.pump(250) };
+  await sBadHeader.close();
+
+  /* ================= ⑦b CORS 与静态托管（裁定「选项 A」） ================= */
+  const net = require('node:net');
+  const probeHttp = async (p, opts = {}) => {
+    const r = await fetch(base + p, opts);
+    const buf = Buffer.from(await r.arrayBuffer());      // 按**字节**计数（文本/二进制都准）
+    const ct = r.headers.get('content-type') || '';
+    const all = buf.toString('utf8');
+    const textual = /^text\/|json|javascript|xml/.test(ct);
+    const h = k => r.headers.get(k);
+    return {
+      status: r.status,
+      acao: h('access-control-allow-origin'),
+      acam: h('access-control-allow-methods'),
+      acah: h('access-control-allow-headers'),
+      acac: h('access-control-allow-credentials'),
+      maxAge: h('access-control-max-age'),
+      vary: h('vary'),
+      contentType: ct,
+      cacheControl: h('cache-control'),
+      len: buf.length,
+      textual,
+      /* 二进制（png）不入结果文件：留 64 字符样本即可，否则账本里会塞进几百 KB 乱码 */
+      text: textual ? all : all.slice(0, 64)
+    };
+  };
+  /** 原始请求行探针：反斜杠/编码穿越这类形态 fetch 会先做 URL 归一，必须用裸 socket 才测得准。
+   *  返回**状态码 + body 指纹**（便于断言"同一文件不因拼写产生两种判定"：200 的 body 哈希必须相等）。 */
+  const rawGet = p => new Promise(resolve => {
+    const sock = net.connect(port, '127.0.0.1', () => {
+      sock.write('GET ' + p + ' HTTP/1.1\r\nHost: 127.0.0.1:' + port + '\r\nConnection: close\r\n\r\n');
+    });
+    let data = '';
+    sock.setEncoding('utf8');
+    sock.on('data', c => { data += c; });
+    sock.on('close', () => {
+      const text = String(data);
+      const i = text.indexOf('\r\n\r\n');
+      const head = i < 0 ? text : text.slice(0, i);
+      const body = i < 0 ? '' : text.slice(i + 4);
+      resolve({
+        statusLine: head.split('\r\n')[0],
+        status: Number((/^HTTP\/1\.1 (\d+)/.exec(head) || [])[1] || 0),
+        bodyLen: body.length,
+        bodyHash: require('node:crypto').createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 16),
+        bodyHasIndexJs: /启动自检|createRouter|module\.exports/.test(text),
+        bodyTail: text.slice(-200),
+        text
+      });
+    });
+    sock.on('error', err => resolve({ statusLine: 'ERR ' + err.message, status: 0, bodyLen: 0, bodyHash: '', bodyHasIndexJs: false, bodyTail: '', text: '' }));
+  });
+
+  OUT.cors = {};
+  OUT.cors.nullOrigin = await probeHttp('/state', { headers: { Origin: 'null' } });
+  OUT.cors.loopbackOrigin = await probeHttp('/state', { headers: { Origin: 'http://127.0.0.1:' + port } });
+  OUT.cors.localhostOrigin = await probeHttp('/state', { headers: { Origin: 'http://localhost:' + port } });
+  OUT.cors.otherPort = await probeHttp('/state', { headers: { Origin: 'http://127.0.0.1:' + (port + 1) } });
+  OUT.cors.evilOrigin = await probeHttp('/state', { headers: { Origin: 'http://evil.example' } });
+  OUT.cors.noOrigin = await probeHttp('/state');
+  OUT.cors.preflightNull = await probeHttp('/upload/retry', {
+    method: 'OPTIONS',
+    headers: {
+      Origin: 'null', 'Access-Control-Request-Method': 'POST',
+      'Access-Control-Request-Headers': 'Content-Type, Authorization'
+    }
+  });
+  OUT.cors.preflightEvil = await probeHttp('/upload/retry', { method: 'OPTIONS', headers: { Origin: 'http://evil.example' } });
+  OUT.cors.preflightUnknown = await probeHttp('/no-such-path', { method: 'OPTIONS', headers: { Origin: 'null' } });
+  OUT.cors.optionsNoOrigin = await probeHttp('/state', { method: 'OPTIONS' });
+  /* F6：未注册路径**一个 CORS 头都不挂**（含 GET 形态；旧写法会在 404 上带 ACAO，口径不自洽） */
+  OUT.cors.getUnknownWithOrigin = await probeHttp('/no-such-path', { headers: { Origin: 'null' } });
+  OUT.cors.status = svc.cors.status();
+
+  OUT.site = {};
+  OUT.site.root = await probeHttp('/');
+  OUT.site.indexHtml = await probeHttp('/index.html');
+  OUT.site.js = await probeHttp('/src/main.js');
+  OUT.site.config = await probeHttp('/src/config/board.config.js');
+  OUT.site.css = await probeHttp('/src/styles/global.css');
+  OUT.site.png = await probeHttp('/src/assets/screenshots/01-%E8%AE%BE%E5%A4%87%E7%8A%B6%E6%80%81-%E4%BB%BB%E5%8A%A1%E6%9B%B2%E7%BA%BF.png');
+  OUT.site.served = svc.site.status().served;
+
+  /* 白名单外 + 穿越（fetch 形态） */
+  const deniedPaths = [
+    '/server/index.js', '/server/http/router.js', '/tests/README.md', '/tools/mock-upper/mock-upper.js',
+    '/%E9%A1%B9%E7%9B%AE%E8%AE%B0%E5%BD%95/%E5%B7%A5%E4%BD%9C%E6%97%A5%E5%BF%97.md',
+    '/.git/config', '/data/dev/board.db', '/%E9%9C%80%E6%B1%82%E6%96%87%E6%A1%A3/', '/no-such-endpoint',
+    '/src/../server/index.js', '/src/%2e%2e%2fserver/index.js', '/src/%2E%2E/server/index.js',
+    '/%2e%2e%2fserver/index.js', '/src/config/../../../server/index.js', '/src/nope.js', '/src/'
+  ];
+  OUT.site.denied = {};
+  for (const p of deniedPaths) OUT.site.denied[p] = await probeHttp(p);
+
+  /* 穿越（裸 socket 形态：反斜杠 / 双斜杠 / 绝对路径） */
+  OUT.raw = {};
+  for (const p of ['/src\\..\\server\\index.js', '/src\\..%5cserver\\index.js', '//server/index.js',
+    '/src/%252e%252e%252fserver/index.js', '/C:/Windows/win.ini', '/src/%00index.html']) {
+    const text = await rawGet(p);
+    OUT.raw[p] = {
+      statusLine: text.statusLine,
+      bodyHasIndexJs: text.bodyHasIndexJs,
+      bodyTail: text.bodyTail
+    };
+  }
+
+  /* F7：**规范化拼写**口径（裸 socket，绕开客户端 URL 归一）——同一文件不得因拼写给出两种判定 */
+  OUT.canonical = {};
+  for (const p of ['/index.html', '/index.HTML', '/index.html/', '/src/main.js', '/src/main.js/',
+    '//index.html', '/./index.html', '/src/MAIN.JS', '/src//main.js', '//src/main.js']) {
+    const r = await rawGet(p);
+    OUT.canonical[p] = { status: r.status, bodyLen: r.bodyLen, bodyHash: r.bodyHash, bodyTail: r.bodyTail };
+  }
+
+  /* F4/F9：**realpath 复核**的两种越界（都在临时根里做，**不往仓库 src\ 里建任何链接**）：
+     · 「serve/src/linkdir」  → junction → 「tmpRoot/outside」（**出根**）        ⇒ 必须 404（F4）
+     · 「serve/src/inrepo」   → junction → 「serve/inRoot」（**在 serve 根之内、但在 serve/src 之外**）
+       —— 这正是 F9 的形态（仓库内 「src\x -> tests」）：realpath 上界若仍是"根"，它会被托管出去。
+     拆链接只用 「cmd /c rmdir <link>」（**绝不** 「fs.rmSync(recursive)」：那可能顺链接删到目标目录），
+     并逐个确认目标目录仍在（把安全动作也留成证据）。 */
+  OUT.realpathProbe = { junctionCreated: false, note: '' };
+  try {
+    const os = require('node:os');
+    const httpRaw = require('node:http');
+    const { spawnSync } = require('node:child_process');
+    const { createRouter: createRouter2 } = require(path.join(ROOT, 'server', 'http', 'router.js'));
+    const { mountSite } = require(path.join(ROOT, 'server', 'http', 'site.js'));
+    const tmpRoot = path.join(os.tmpdir(), 'w5-serve-' + process.pid + '-' + Date.now());
+    const outside = path.join(tmpRoot, 'outside');                 // 根之外（F4）
+    const serveRoot = path.join(tmpRoot, 'serve');
+    const inRoot = path.join(serveRoot, 'inRoot');                 // **根之内、但在 root/src 之外**（F9 的形态）
+    const linkOut = path.join(serveRoot, 'src', 'linkdir');
+    const linkIn = path.join(serveRoot, 'src', 'inrepo');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.mkdirSync(inRoot, { recursive: true });
+    fs.mkdirSync(path.join(serveRoot, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(serveRoot, 'src', 'ok.js'), 'window.W5_PROBE_OK = 1;\n', 'utf8');
+    fs.writeFileSync(path.join(outside, 'secret.js'), 'window.W5_SECRET = "OUTSIDE-SECRET-MARKER";\n', 'utf8');
+    fs.writeFileSync(path.join(inRoot, 'tests-like.js'), 'window.W5_INREPO = "IN-ROOT-BUT-OUTSIDE-SRC-MARKER";\n', 'utf8');
+    fs.symlinkSync(outside, linkOut, 'junction');
+    fs.symlinkSync(inRoot, linkIn, 'junction');
+    OUT.realpathProbe.junctionCreated = true;
+    const probeLogs = [];
+    const r2 = createRouter2({});
+    mountSite(r2, {
+      root: serveRoot,
+      logger: { warn: (m, x) => probeLogs.push({ msg: String(m), reason: x && x.reason }), info: () => {}, error: () => {} }
+    });
+    const srv2 = httpRaw.createServer((rq, rs) => {
+      Promise.resolve(r2.handle(rq, rs)).catch(() => { try { rs.destroy(); } catch { /* 已断 */ } });
+    });
+    const port2 = await new Promise(res => srv2.listen(0, '127.0.0.1', () => res(srv2.address().port)));
+    const g2 = async p => {
+      const r = await fetch('http://127.0.0.1:' + port2 + p);
+      const t = await r.text();
+      return {
+        status: r.status, len: t.length,
+        hasSecret: t.includes('OUTSIDE-SECRET-MARKER'),
+        hasInRepoMarker: t.includes('IN-ROOT-BUT-OUTSIDE-SRC-MARKER'),
+        hasOk: t.includes('W5_PROBE_OK')
+      };
+    };
+    OUT.realpathProbe.normalFile = await g2('/src/ok.js');
+    OUT.realpathProbe.escapedLink = await g2('/src/linkdir/secret.js');          // 出根（F4）
+    OUT.realpathProbe.inRepoLink = await g2('/src/inrepo/tests-like.js');        // 根内、src 之外（F9）
+    OUT.realpathProbe.indexMissing = await g2('/');                              // 临时根没有 index.html ⇒ 404
+    OUT.realpathProbe.resolveSaysEscape = JSON.stringify(
+      require(path.join(ROOT, 'server', 'http', 'site.js')).resolvePath('/src/linkdir/secret.js'));
+    OUT.realpathProbe.resolveSaysInRepo = JSON.stringify(
+      require(path.join(ROOT, 'server', 'http', 'site.js')).resolvePath('/src/inrepo/tests-like.js'));
+    OUT.realpathProbe.reasons = probeLogs.map(x => x.reason).filter(Boolean);
+    await new Promise(res => srv2.close(res));
+    /* 只拆"链接本身"（rmdir），再确认目标目录仍在，最后才删临时根 */
+    const rmdir = p => spawnSync('cmd', ['/c', 'rmdir', p], { stdio: 'ignore', windowsHide: true });
+    rmdir(linkOut); rmdir(linkIn);
+    OUT.realpathProbe.cleanup = {
+      linkOutGone: !fs.existsSync(linkOut),
+      linkInGone: !fs.existsSync(linkIn),
+      outsideStillThere: fs.existsSync(path.join(outside, 'secret.js')),
+      inRepoStillThere: fs.existsSync(path.join(inRoot, 'tests-like.js'))
+    };
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  } catch (err) {
+    OUT.realpathProbe.note = 'junction/符号链接实验不可用：' + ((err && err.code) || (err && err.message) || String(err)) +
+      '（本机 EPERM：Windows 建链接需开发者模式或管理员）—— realpath 防护为**代码级**，此路未做实验';
+  }
+
+  /* ================= ⑦c F1：客户端游标**领先服务端**不得变成静默黑洞 ================= */
+  const cursorNow = await seqNow(base);
+  OUT.cursorAhead = { cursorNow, probes: {} };
+  let probeSeq = 0;
+  for (const k of [1, 7, 999]) {
+    probeSeq++;
+    const s = await openStream(base, { path: '/events?since=' + (cursorNow + k) });
+    streams.push(s);
+    const helloText = await s.pump(250);
+    /* 连上之后**立刻发一条新帧**：旧实现在这里会把新事件全滤掉（黑洞），故这是判据的核心一步 */
+    OUT.frames.posts.push(await post(base, '/ifd/frame',
+      frame(40 + probeSeq, '2026-09-19 10:30:0' + probeSeq)));
+    const afterText = await s.pump(350);
+    OUT.cursorAhead.probes[k] = {
+      since: cursorNow + k, status: s.status, helloText,
+      afterText, events: s.events()
+    };
+    await s.close();
+  }
+  /* F10：读**日志文件**，取"游标领先"那条留痕（验证打的是客户端原始报数） */
+  OUT.cursorAhead.logLines = (() => {
+    try {
+      const dir = path.join(process.env.DSH_W5_DATA, 'log');
+      return fs.readdirSync(dir).filter(f => f.endsWith('.log'))
+        .map(f => fs.readFileSync(path.join(dir, f), 'utf8'))
+        .join('\n').split(/\r?\n/).filter(l => l.includes('游标领先'));
+    } catch (err) { return ['ERR:' + ((err && err.code) || err.message)]; }
+  })();
+
+  /* ================= ⑧ 优雅关闭 ================= */
+  const sA = await openStream(base);
+  streams.push(sA);
+  await sA.pump(150);
+  const closedCount = svc.router.closeAllStreams();
+  const textA1 = await sA.pump(250);                   // 应收敛到「: bye」+ 连接结束
+  const before = sA.text();
+  await sA.pump(500);                                  // 5×心跳周期：不应再有任何新字节
+  OUT.close = {
+    closedCount, textA1, sawBye: /: bye /.test(textA1), streamDone: sA.finished(),
+    afterByeBytes: sA.text().length - before.length,
+    streamsAfterCloseAll: svc.router.streamCount()
+  };
+  await sA.close();
+
+  /* F2：**在途 keep-alive POST + 停机**（旧实现只在 server.close() 后回收一次空闲连接，
+     在途请求应答完变空闲后就再没人回收 ⇒ 只能等对端 FIN，审查实测被拖到 ~6.35 s）。
+     构造：裸 socket 先送请求头 + 一半 body（服务端已开始处理 ⇒ 在途），停机窗口内补齐 body。 */
+  const sB = await openStream(base);
+  streams.push(sB);
+  const inflightBody = Buffer.from(JSON.stringify(frame(88, '2026-09-19 10:40:00')), 'utf8');
+  const postSock = net.connect(port, '127.0.0.1');
+  let postResponse = '';
+  let postClosedAt = null;
+  postSock.setEncoding('utf8');
+  postSock.on('data', c => { postResponse += c; });
+  postSock.on('close', () => { postClosedAt = Date.now(); });
+  await new Promise(r => postSock.on('connect', r));
+  const rowsBeforeInflight = rowCount();
+  postSock.write('POST /ifd/frame HTTP/1.1\r\nHost: 127.0.0.1:' + port + '\r\n' +
+    'Content-Type: application/json\r\nContent-Length: ' + inflightBody.length + '\r\n' +
+    'Connection: keep-alive\r\n\r\n' + inflightBody.slice(0, 8).toString('utf8'));
+  await sleep(60);                                     // 让服务端确实读到请求头（进入"在途"）
+  const t0 = Date.now();
+  OUT.close.connsBeforeStop = conns.filter(c => c.closedAt === null).length;
+  /* 停机各阶段的墙钟留痕（自检用：把"到底卡在哪一步"变成可读证据） */
+  const marks = [];
+  const lg = entry.state.logger;
+  if (lg && typeof lg.info === 'function') {
+    const orig = lg.info.bind(lg);
+    lg.info = (m, x) => { marks.push((Date.now() - t0) + 'ms ' + String(m).slice(0, 70)); return orig(m, x); };
+  }
+  const origWarn = lg && typeof lg.warn === 'function' ? lg.warn.bind(lg) : null;
+  if (lg && origWarn) lg.warn = (m, x) => { marks.push((Date.now() - t0) + 'ms [warn] ' + String(m).slice(0, 70)); return origWarn(m, x); };
+  /* 停机开始后再补齐 body（此时请求处于在途；停机**不得**把它打断） */
+  const finishBody = setTimeout(() => { try { postSock.write(inflightBody.slice(8)); } catch { /* 已断 */ } }, 120);
+  OUT.close.stopResult = await entry.stop('w5 夹具：优雅退出（含在途 keep-alive POST）');
+  OUT.close.stopMs = Date.now() - t0;
+  OUT.close.marks = marks;
+  clearTimeout(finishBody);
+  await sleep(250);                                    // 收尾读响应
+  OUT.close.inflight = {
+    responseStatusLine: String(postResponse).split('\r\n')[0],
+    responseOutcome: ((/\"outcome\":\"([a-z0-9-]+)\"/.exec(postResponse) || [])[1]) || null,
+    bodyCompletedAt: null,
+    closedAfterStop: postClosedAt === null ? null : postClosedAt - t0,
+    rowsBefore: rowsBeforeInflight,
+    rowsAfter: (() => {
+      try {                                       // 库已关：另开**只读**连接数行数（单源对账）
+        const { DatabaseSync } = require('node:sqlite');
+        const d2 = new DatabaseSync(process.env.DSH_W5_DB, { readOnly: true });
+        const c = d2.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+        d2.close();
+        return c;
+      } catch (err) { return 'ERR:' + ((err && err.code) || err.message); }
+    })()
+  };
+  OUT.close.conns = conns.map(c => ({
+    openedAfterStop: c.openedAt - t0,
+    closedAfterStop: c.closedAt === null ? null : c.closedAt - t0,
+    urls: c.urls
+  }));
+  await sB.pump(300);
+  OUT.close.streamB = { text: sB.text(), done: sB.finished(), sawBye: /: bye /.test(sB.text()) };
+  OUT.close.afterStop = {
+    streams: svc.router.streamCount(),
+    serverNull: entry.state.server === null,
+    dbNull: entry.state.db === null,
+    busClosed: svc.bus.isClosed(),
+    busSubscribers: svc.bus.stats().subscribers,
+    busDropped: svc.bus.dropped(),
+    linkRunning: svc.linkMonitor.running(),
+    sseStatus: svc.router.sseStatus()
+  };
+  try { postSock.destroy(); } catch { /* 已断 */ }
+  await sB.close();
+  for (const s of streams) await s.close();
+
+  OUT.done = true;
+  SAVE();
+})().catch(err => {
+  OUT.error = String(err && err.stack ? err.stack : err);
+  SAVE();
+  process.exitCode = 1;
+});
+`;
+  const W5_FIXTURE_NONLOOP = String.raw`'use strict';
+/* W5-① 追加（裁定「选项 A」）：**非回环绑定**下不得回任何 CORS 头（守 NFR-25 / AC-09）。
+   为什么必须另起一个夹具进程：监听地址只在「start()」时定，一个进程内改不了。 */
+const fs = require('node:fs');
+const path = require('node:path');
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+process.env.DSH_ENV = 'test';
+const entry = require(path.join(ROOT, 'server', 'index.js'));
+
+const OUT = {};
+const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OUT, null, 1), 'utf8');
+
+(async () => {
+  const port = Number(process.env.DSH_W5_PORT);
+  const base = 'http://127.0.0.1:' + port;         // 从回环侧去连（服务确实绑在 0.0.0.0）
+  const svc = await entry.start({
+    argv: ['--host', '0.0.0.0', '--port', String(port), '--data-dir', process.env.DSH_W5_DATA, '--db-file', process.env.DSH_W5_DB],
+    installSignalHandlers: false,
+    logConsole: false
+  });
+  const probe = async (p, opts = {}) => {
+    const r = await fetch(base + p, opts);
+    const text = await r.text();
+    return {
+      status: r.status,
+      acao: r.headers.get('access-control-allow-origin'),
+      acac: r.headers.get('access-control-allow-credentials'),
+      len: text.length,
+      text: text.slice(0, 120)
+    };
+  };
+  OUT.listen = svc.listen;
+  OUT.bind = entry.listenAddress();
+  OUT.corsStatus = svc.cors.status();
+  OUT.nullOrigin = await probe('/state', { headers: { Origin: 'null' } });
+  OUT.loopbackOrigin = await probe('/state', { headers: { Origin: 'http://127.0.0.1:' + port } });
+  OUT.evilOrigin = await probe('/state', { headers: { Origin: 'http://evil.example' } });
+  OUT.preflightNull = await probe('/upload/retry', {
+    method: 'OPTIONS',
+    headers: { Origin: 'null', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'Content-Type' }
+  });
+  OUT.siteRoot = await probe('/');
+  OUT.stopResult = await entry.stop('w5 非回环夹具');
+  SAVE();
+})().catch(err => {
+  OUT.error = String(err && err.stack ? err.stack : err);
+  SAVE();
+  process.exitCode = 1;
+});
+`;
+
+  /* ============ 一、进程内事件总线（有界环形缓冲 / seq / since / 隔离 / close） ============ */
+  const { createEventBus, KIND: SSE_KIND, KINDS: SSE_KINDS } = require('../server/services/eventBus');
+  const busClock = createClock({ mode: 'fixed', at: '2026-09-19T10:00:00' });
+  const injectedBusAt = busClock.now().toISOString();
+  const busLog = { errors: [], warns: [], infos: [] };
+  const busLogger = {
+    error: (m, d) => busLog.errors.push([String(m), d]),
+    warn: (m, d) => busLog.warns.push([String(m), d]),
+    info: (m, d) => busLog.infos.push([String(m), d])
+  };
+  const bus = createEventBus({ capacity: 3, now: busClock.source(), logger: busLogger });
+  const pHolder = { a: 1, b: '二' };
+  const e1 = bus.publish(SSE_KIND.FRAME, pHolder);
+  const e2 = bus.publish(SSE_KIND.FRAME, pHolder);
+  const e3 = bus.publish(SSE_KIND.FRAME, pHolder);
+  const e4 = bus.publish(SSE_KIND.LINK, { online: false });
+  const e5 = bus.publish(SSE_KIND.TASK, { procOrderNo: 'WO-1' });
+  t.check('W5：事件总线 `seq` 从 1 起、逐条 +1，且 `at` 一律取自**注入时钟**（不是裸 new Date）',
+    [e1, e2, e3, e4, e5].every((e, i) => e && e.seq === i + 1 && e.at === injectedBusAt) &&
+    e5.kind === SSE_KIND.TASK && e5.payload.procOrderNo === 'WO-1',
+    `seq=${e1.seq}..${e5.seq} at=${e1.at}（注入=${injectedBusAt}）`);
+
+  t.check('W5-⑦：有界环形缓冲（容量 3）溢出 ⇒ **丢最旧**且 `dropped` 如实计数（不得静默丢）',
+    bus.dropped() === 2 && bus.stats().buffered === 3 && bus.stats().capacity === 3 &&
+    bus.range().oldest === 3 && bus.range().newest === 5,
+    `dropped=${bus.dropped()} buffered=${bus.stats().buffered} oldest=${bus.range().oldest} newest=${bus.range().newest}`);
+
+  const subReplay = bus.subscribe(() => { /* 只验补发清单 */ }, { since: 2 });
+  const subHole = bus.subscribe(() => { /* 只验补不齐 */ }, { since: 1 });
+  t.check('W5-②：`subscribe(since)` 补得齐 ⇒ replay 按序不重不漏；补不齐（超出缓冲）⇒ 退回 hello 且 `missed` 如实',
+    subReplay.mode === 'replay' && subReplay.replay.map(e => e.seq).join(',') === '3,4,5' &&
+    subHole.mode === 'hello' && subHole.missed === 1 && subHole.replay.length === 0,
+    `可补：mode=${subReplay.mode} seq=[${subReplay.replay.map(e => e.seq).join(',')}]；补不齐：mode=${subHole.mode} missed=${subHole.missed}`);
+  t.check('W5-②：非法 `since`（非数字／负数／小数／空串）一律按"无 since"处理 ⇒ hello（不抛错、不 500）',
+    [null, undefined, '', 'abc', '-5', '1.5', 1.5, -1, '9e9'].every(v => {
+      const h = bus.subscribe(() => { /* 探针 */ }, { since: v });
+      const ok = h.mode === 'hello';
+      h.unsubscribe();
+      return ok;
+    }),
+    '九种非法/缺省取值全部得到 hello 模式');
+  t.check('W5：未知事件种类直接抛 `RangeError`（种类固定，防"同义名"在前后端分叉）',
+    (() => {
+      let threw = false;
+      try { bus.publish('frame2', {}); } catch (err) { threw = err instanceof RangeError; }
+      return threw && SSE_KINDS.join(',') === 'frame,link,task,standard,upload,warning';
+    })(), `固定种类=${SSE_KINDS.join(',')}`);
+
+  const order = [];
+  bus.subscribe(() => { throw new Error('W5 夹具注入的订阅者错误'); }, { since: 5 });
+  bus.subscribe(evt => order.push(evt.seq), { since: 5 });
+  let publishThrew = false;
+  let e6 = null;
+  try { e6 = bus.publish(SSE_KIND.WARNING, { lv: 'warn' }); } catch { publishThrew = true; }
+  t.check('W5：订阅者抛错**逐订阅者隔离**（其它订阅者照收、发布方不抛），且**不吞**（logger.error + 计数留痕）',
+    publishThrew === false && e6 && e6.seq === 6 && order.join(',') === '6' &&
+    bus.stats().handlerErrors === 1 && bus.stats().errors.length === 1 &&
+    busLog.errors.length === 1 && /订阅者抛错/.test(busLog.errors[0][0]) &&
+    busLog.errors[0][1].seq === 6 && /注入的订阅者错误/.test(busLog.errors[0][1].message),
+    `handlerErrors=${bus.stats().handlerErrors} logger.error=${busLog.errors.length} 其它订阅者收到=[${order.join(',')}]`);
+
+  const subsBeforeClose = bus.size();
+  const closedCount = bus.close();
+  const afterCloseEvent = bus.publish(SSE_KIND.FRAME, { i: 9 });
+  t.check('W5：`close()` 清空订阅者与缓冲；关闭后 publish **不静默**（返回 null + 计数 + 日志）',
+    subsBeforeClose === 4 && closedCount === subsBeforeClose && bus.size() === 0 && afterCloseEvent === null &&
+    bus.stats().afterClose === 1 && bus.stats().buffered === 0 && busLog.warns.length === 1 &&
+    /总线已关闭/.test(busLog.warns[0][0]),
+    `关前订阅者=${subsBeforeClose} 清掉=${closedCount} 关后 size=${bus.size()} afterClose=${bus.stats().afterClose} warn=${busLog.warns.length}`);
+
+  /* ============ 二、夹具①：真起服务跑完整 SSE 流程（含 CORS 与静态托管） ============ */
+  const w5Scratch = path.join(env.paths.root, 'tests', '._verify', 'w5sse');
+  fs.mkdirSync(w5Scratch, { recursive: true });
+  const w5Tmp = harness.makeTempDir('w5-sse');
+  /* ⚠ 夹具文件名带**本次运行的唯一标签**（pid＋时间戳）：本仓门禁允许并发跑（E19 现实），
+     固定文件名会让两个 harness-check 互相覆盖/互删（实测：并发轮次里 W6 段的共享临时目录被
+     另一轮删掉，直接以 ENOENT 崩在夹具中途）。只删自己写的文件，不删目录。 */
+  const w5RunTag = process.pid + '-' + Date.now().toString(36);
+  const w5Write = (name, text) => {
+    const full = path.join(w5Scratch, name);
+    fs.writeFileSync(full, text, 'utf8');
+    return full;
+  };
+  const w5Read = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
+  /** 原地起子进程（stdout/stderr 落文件：受限沙箱下管道会 EPERM；日志留给失败排查） */
+  const w5Spawn = (script, name, extraEnv) => {
+    const logFile = path.join(w5Tmp, name + '.log');
+    const fd = fs.openSync(logFile, 'a');
+    const proc = spawn(process.execPath, [script], {
+      cwd: env.paths.root,
+      env: Object.assign({}, process.env, { DSH_ENV: 'test' }, extraEnv),
+      windowsHide: true,
+      stdio: ['ignore', fd, fd]
+    });
+    let settled = null;
+    proc.on('exit', (code, signal) => { settled = { code, signal }; });
+    return {
+      proc, logFile, exitInfo: () => settled,
+      log: () => { try { return fs.readFileSync(logFile, 'utf8'); } catch { return ''; } },
+      async waitDone(ms) {
+        const until = Date.now() + ms;
+        while (!settled && Date.now() < until) await new Promise(r => setTimeout(r, 100));
+        try { fs.closeSync(fd); } catch { /* 已关 */ }
+        return settled;
+      }
+    };
+  };
+
+  const fSse = w5Write('fixture-sse-' + w5RunTag + '.js', W5_FIXTURE_SSE);
+  const fNonLoop = w5Write('fixture-nonloopback-' + w5RunTag + '.js', W5_FIXTURE_NONLOOP);
+
+  const w5Port = await harness.allocPort();
+  const w5Data = path.join(w5Tmp, 'data-sse');
+  const w5Result = path.join(w5Tmp, 'sse-result.json');
+  const runSse = w5Spawn(fSse, 'fixture-sse', {
+    DSH_W5_PORT: String(w5Port), DSH_W5_DATA: w5Data,
+    DSH_W5_DB: path.join(w5Data, 'board.db'), DSH_W5_RESULT: w5Result
+  });
+  const w5Watchdog = setTimeout(() => { try { runSse.proc.kill(); } catch { /* 已退出 */ } }, 90000);
+  const w5Exit = await runSse.waitDone(90000);
+  clearTimeout(w5Watchdog);
+  const S = w5Read(w5Result);
+  if (!t.requires('W5 夹具① 能取到结果文件（sse-result.json）', Boolean(S), runSse.log().slice(-500) || '无日志')) {
+    t.info('W5：夹具①未产出结果，本节相关断言按失败处理（不许把"跑不了"当通过）');
+  }
+  const s = S || {};
+  const evts = o => (o && Array.isArray(o.events) ? o.events : []);
+  const kindsOf = (o, k) => evts(o).filter(e => e.event === k);
+  const idsOf = o => evts(o).map(e => e.id);
+
+  /* ---- 判据①：建连 hello 与 GET /state 逐字节同源 ---- */
+  const helloEv = evts(s.hello0).find(e => e.event === 'hello');
+  t.check('W5-①：`GET /state` 200（**不是** 503 未接线）且响应体与 `hello` 事件的 data **逐字节相等**（同一构造函数产出）',
+    s.state0 && s.state0.status === 200 && Boolean(helloEv) &&
+    JSON.stringify(helloEv.data) === s.state0.text &&
+    /^text\/event-stream/.test(String(s.hello0 && s.hello0.contentType)),
+    `state0.status=${s.state0 && s.state0.status}；hello.data≡state0.body：${JSON.stringify(helloEv && helloEv.data) === s.state0.text}；` +
+    `ctype=${s.hello0 && s.hello0.contentType}`);
+  t.check('W5-①：`snapshot` 键集齐备（link/task/device/frame/stats/standard/upload）＋ 信封含 ok/at/seq —— W5-② 切源按此表消费',
+    Boolean(s.state0 && s.state0.body && s.state0.body.snapshot) &&
+    ['link', 'task', 'device', 'frame', 'stats', 'standard', 'upload'].every(k => k in s.state0.body.snapshot) &&
+    s.state0.body.ok === true && typeof s.state0.body.at === 'string' && typeof s.state0.body.seq === 'number',
+    `snapshot.keys=${s.state0 && s.state0.body ? Object.keys(s.state0.body.snapshot).join(',') : '(无)'}`);
+
+  /* ---- 判据④：frame 事件数 == 采样表新增行数；500 ms 原始帧与脏帧都不发布 ---- */
+  const frameEvents = kindsOf(s.frames && s.frames.stream, 'frame');
+  const rowsAdded = s.frames ? s.frames.rowsAfter - s.frames.rowsBefore : -1;
+  t.check('W5-④：`frame` 事件数 == 同时段 `measure_rt` **新增行数**（单一真源逐条对账：1 行 = 1 条事件）',
+    rowsAdded === 1 && frameEvents.length === 1 &&
+    frameEvents[0].data.collectTime === '2026-09-19 10:00:00' && frameEvents[0].data.seq === 1,
+    `采样表新增 ${rowsAdded} 行，frame 事件 ${frameEvents.length} 条（collectTime=${frameEvents.map(e => e.data.collectTime).join('/')}）`);
+  t.check('W5-④：**500 ms 原始帧不产生 frame 事件**（同秒异键 ⇒ raw-500ms）＋ 脏帧被拒（400）后同样不发布（负向）',
+    Boolean(s.frames && s.frames.posts[1] && s.frames.posts[1].body && s.frames.posts[1].body.outcome === 'raw-500ms') &&
+    Boolean(s.frames && s.frames.posts[2] && s.frames.posts[2].status === 400) &&
+    frameEvents.length === 1 && frameEvents.every(e => e.data.seq === 1),
+    `post1=${s.frames && s.frames.posts[1] && s.frames.posts[1].body && s.frames.posts[1].body.outcome}；` +
+    `post2=${s.frames && s.frames.posts[2] && s.frames.posts[2].status}；frame 事件 seq=[${frameEvents.map(e => e.data.seq).join(',')}]`);
+
+  /* ---- 判据③：assertInput 拒收的标准版本不发布（负向）＋ 合法录入发布（正向） ---- */
+  const stdEvents = kindsOf(s.other && s.other.stream, 'standard');
+  const std = (s.other && s.other.standard) || {};
+  t.check('W5-③：`assertInput` 拒收的标准版本 ⇒ **0 条** standard 事件（负向）＋ 合法录入 ⇒ **恰 1 条**（正向），库内也只 1 版',
+    Boolean(std.rejected && std.rejected.threw === true) && std.versions === 1 && stdEvents.length === 1 &&
+    stdEvents[0].data.versionNo === 1 && stdEvents[0].data.validation === 'ok' &&
+    stdEvents[0].data.productCode === 'P-W5',
+    `拒收=${std.rejected && std.rejected.threw}；库内版本=${std.versions}；standard 事件=${stdEvents.length}`);
+
+  /* ---- 判据②：断线续传（按序/不重/不漏、超缓冲退回 hello、非法 since 不 500） ---- */
+  const base = s.replay ? s.replay.cursorBase : -1;
+  const qIds = idsOf(s.replay && s.replay.byQuery);
+  const hIds = idsOf(s.replay && s.replay.byHeader);
+  t.check('W5-②：`?since=<seq>` 续传**按序、不重、不漏**（只补发 seq > since，且不发 hello），载荷与源帧逐条一致',
+    JSON.stringify(qIds) === JSON.stringify([base + 1, base + 2, base + 3]) &&
+    !/event: hello/.test(String(s.replay && s.replay.byQuery.text)) &&
+    s.replay.byQuery.status === 200 &&
+    kindsOf(s.replay.byQuery, 'frame').map(e => e.data.collectTime).join(',') === String((s.replay.expectedFrames || []).join(',')),
+    `since=${base} ⇒ ids=[${qIds.join(',')}]（期望 ${[base + 1, base + 2, base + 3].join(',')}）；` +
+    `collectTime=${kindsOf(s.replay.byQuery, 'frame').map(e => e.data.collectTime).join(',')}`);
+  t.check('W5-②：标准 `Last-Event-ID` 头与 `?since=` **同一口径**（同样按序不重不漏、不发 hello）',
+    JSON.stringify(hIds) === JSON.stringify([base + 2, base + 3]) &&
+    !/event: hello/.test(String(s.replay && s.replay.byHeader.text)),
+    `Last-Event-ID=${base + 1} ⇒ ids=[${hIds.join(',')}]`);
+  t.check('W5-②：超出环形缓冲 ⇒ **退回 hello 快照**（不得假装补上、也不得 500；其后只允许是**新**事件）',
+    (() => {
+      const ov = evts(s.replay && s.replay.overflow);
+      /* 首帧必须是 hello；请求的补发区间（since+1 .. 缓冲最旧-1）里一条都不许出现 ——
+         那一段已被环形缓冲丢掉，只能靠快照补齐（"假装补上"就是把丢的那段编出来）。 */
+      return ov.length >= 1 && ov[0].event === 'hello' &&
+        Boolean(ov[0].data && ov[0].data.snapshot && ov[0].data.snapshot.frame) &&
+        s.replay.overflow.status === 200 &&
+        ov.slice(1).every(e => e.id > ov[0].id) &&
+        !ov.slice(1).some(e => e.id <= base + 3) &&
+        !/event: (frame|task|standard|upload|warning|link)/.test(String(s.replay.overflow.text).split('event: hello')[0]);
+    })(),
+    `since=${base + 3} ⇒ 帧序=[${evts(s.replay && s.replay.overflow).map(e => e.id + ':' + e.event).join(',')}]` +
+    `（缓冲最旧 seq=${s.replay && s.replay.busStats && s.replay.busStats.oldestSeq}）`);
+  t.check('W5-②：非法 `since`（非数字/负数/小数/空串）与非法 `Last-Event-ID` ⇒ 按无 since 处理（200 + hello，绝不 500）',
+    ['abc', '-5', '1.5', '(空串)', 'header'].every(k => s.replay && s.replay.invalid && s.replay.invalid[k] &&
+      s.replay.invalid[k].status === 200 && /event: hello/.test(s.replay.invalid[k].text)),
+    Object.keys((s.replay && s.replay.invalid) || {}).map(k =>
+      `${k}=${s.replay.invalid[k].status}${/event: hello/.test(s.replay.invalid[k].text) ? '/hello' : '/无hello'}`).join(' '));
+
+  /* ---- 判据⑤：心跳注释帧条数可预测（公式 E=floor(D/H)） ---- */
+  const pings = ((s.heartbeat && s.heartbeat.text) || '').match(/: ping /g) || [];
+  const hbExpect = s.heartbeat ? Math.floor(s.heartbeat.windowMs / s.heartbeat.heartbeatMs) : -1;
+  t.check('W5-⑤/F8：真定时器下的心跳实测**在预期带内**（H=100 ms、D=2000 ms ⇒ E=20；**条数等式**由下方"注入定时器"那条钉死，这条只给真实调度下的分布）',
+    pings.length >= 5 && pings.length <= hbExpect + 2 && hbExpect === 20 && pings.length <= s.heartbeat.chunks.length + 1,
+    `实测 ${pings.length} 条 / ${s.heartbeat && s.heartbeat.elapsedMs} ms（E=${hbExpect}；H=${s.heartbeat && s.heartbeat.heartbeatMs} ms）——` +
+    '真实定时器在窗口边界与事件循环负载下会少 0–2 条，故这里只断言"必须是 100 ms 级而非 15 s 级"的下界与上界，' +
+    '条数与"关闭时清定时器"的确定性判据在 F8 那条断言里');
+
+  /* ---- 判据⑧：无裸时间（at 与注释帧时间戳只允许是注入时钟的两个取值） ---- */
+  const allowedAt = [s.injectedAt, s.afterAdvanceAt];
+  const commentStamps = (String((s.frames && s.frames.stream && s.frames.stream.text) || '') +
+    String((s.heartbeat && s.heartbeat.text) || ''))
+    .match(/: (?:ready|ping|bye) ([0-9T:.\-Z]+)/g);
+  const stamps = (commentStamps || []).map(x => x.replace(/^: (?:ready|ping|bye) /, ''));
+  t.check('W5-⑧：SSE 注释帧时间戳与 `hello`/`/state` 的 `at` **全部来自注入时钟**（固定 2026-09-19T10:00:00 ⇒ 只允许注入值或其推进值）',
+    stamps.length >= 5 && stamps.every(v => allowedAt.includes(v)) &&
+    Boolean(helloEv && helloEv.data && allowedAt.includes(helloEv.data.at)) &&
+    Boolean(s.state0 && allowedAt.includes(s.state0.body.at)),
+    `允许值=${allowedAt.join(' / ')}；注释帧样本=${[...new Set(stamps)].join(' / ')}；hello.at=${helloEv && helloEv.data && helloEv.data.at}`);
+
+  /* ---- 六类事件全覆盖 ＋ link 双向 ＋ task/upload/warning 载荷 ---- */
+  const linkEvtsAll = [].concat(kindsOf(s.frames && s.frames.stream, 'link'), kindsOf(s.link, 'link'));
+  const onlineEv = linkEvtsAll.find(e => e.data && e.data.online === true);
+  const offlineEv = linkEvtsAll.find(e => e.data && e.data.online === false);
+  /* ⚠ F3（独立审查立案）：这里原写"六类事件全部挂在真实写入点"，**表述过强** ——
+     `warning` 的唯一发布点（`judge.evaluate`）在全仓**没有生产调用方**，本夹具是**直调**它。
+     故：
+       · "五类来自真实写入点"由上方的 F3 断言承担（frame/link/task/standard/upload 各有写入点证据）；
+       · "六类**挂钩**都可用"由下方这条承担，标题里明写 warning 的来源是夹具直调（不冒充生产链路）。 */
+  t.check('W5/F3：六类事件**挂钩**都可用（frame / link / task / standard / upload 来自真实写入点；**warning 由夹具直调**）',
+    ['frame', 'link', 'task', 'standard', 'upload', 'warning'].every(k =>
+      [].concat(evts(s.frames && s.frames.stream), evts(s.link), evts(s.other && s.other.stream))
+        .some(e => e.event === k)),
+    `实收种类=${[...new Set([].concat(evts(s.frames && s.frames.stream), evts(s.link), evts(s.other && s.other.stream)).map(e => e.event))].join(',')}`);
+  t.check('W5：`link` 覆盖**双向**变化（离线→在线 / 在线→离线），离线判据＝`ingest.linkState()`（推进注入时钟 6 s > upper.staleMs）',
+    Boolean(onlineEv) && Boolean(offlineEv) && offlineEv.data.staleMs === 5000 && offlineEv.data.ageMs >= 5000 &&
+    s.link && s.link.state && s.link.state.online === false,
+    `online 事件=${Boolean(onlineEv)}；offline 事件=${JSON.stringify(offlineEv && offlineEv.data)}；快照 link=${JSON.stringify(s.link && s.link.state)}`);
+  const taskEv = kindsOf(s.other && s.other.stream, 'task')[0];
+  const uploadEv = kindsOf(s.other && s.other.stream, 'upload')[0];
+  const warnEv = kindsOf(s.other && s.other.stream, 'warning')[0];
+  t.check('W5：`task`／`upload` 载荷来自**真实写入点**（幂等命中不重发／真失败留存待补传）；`warning` 载荷形状由**夹具直调** judge 产出（生产调用方待接线 E45）',
+    Boolean(taskEv) && taskEv.data.procOrderNo === 'WO-W5-9' && taskEv.data.table === 'task' &&
+    kindsOf(s.other && s.other.stream, 'task').length === 1 &&
+    Boolean(uploadEv) && uploadEv.data.action === 'enqueue-failed' && uploadEv.data.state === '待补传' &&
+    uploadEv.data.pendingCount === 1 && Boolean(uploadEv.data.alert) &&
+    Boolean(s.other && s.other.upload && s.other.upload.pendingCount === 1) &&
+    Boolean(warnEv) && Array.isArray(warnEv.data.warnings) && warnEv.data.warnings.length >= 3 &&
+    typeof warnEv.data.result === 'string',
+    `task=${JSON.stringify(taskEv && taskEv.data)}；upload=${JSON.stringify(uploadEv && uploadEv.data && { action: uploadEv.data.action, pending: uploadEv.data.pendingCount })}；` +
+    `warning（夹具直调）result=${warnEv && warnEv.data.result} warnings=${warnEv && warnEv.data.warnings && warnEv.data.warnings.length}`);
+
+  /* ---- 判据①：snapshot 的 frame / upload 与各自真源同源 ---- */
+  t.check('W5-①：`snapshot.frame` 是**最新 1 s 采样帧**（与 frame 事件同源，不是另拼一份字段）',
+    Boolean(s.stateFinal && s.stateFinal.snapshot && s.stateFinal.snapshot.frame) &&
+    s.stateFinal.snapshot.frame.collectTime === '2026-09-19 10:00:12' &&
+    s.stateFinal.snapshot.frame.depth === 5.12 &&
+    ['equipCode', 'procOrderNo', 'collectTime', 'seq', 'depth', 'speed', 'velocity_x', 'velocity_y',
+      'frameRate', 'gain', 'shutter', 'cameraDepth', 'testStatus'].every(k => k in s.stateFinal.snapshot.frame),
+    JSON.stringify(s.stateFinal && s.stateFinal.snapshot && s.stateFinal.snapshot.frame));
+  t.check('W5-①：`snapshot.upload` 与 W4 的 `GET /upload/status` **同源**（pendingCount/capacity/warnThreshold/alert 逐项相等）',
+    Boolean(s.uploadStatus && s.stateFinal && s.stateFinal.snapshot && s.stateFinal.snapshot.upload) &&
+    s.uploadStatus.pendingCount === s.stateFinal.snapshot.upload.pendingCount &&
+    s.uploadStatus.pendingOnly === s.stateFinal.snapshot.upload.pendingOnly &&
+    s.uploadStatus.capacity === s.stateFinal.snapshot.upload.capacity &&
+    s.uploadStatus.warnThreshold === s.stateFinal.snapshot.upload.warnThreshold &&
+    JSON.stringify(s.uploadStatus.alert) === JSON.stringify(s.stateFinal.snapshot.upload.alert),
+    `/upload/status.pending=${s.uploadStatus && s.uploadStatus.pendingCount}；snapshot.upload.pending=${s.stateFinal && s.stateFinal.snapshot && s.stateFinal.snapshot.upload && s.stateFinal.snapshot.upload.pendingCount}`);
+
+  /* ---- 判据⑥：优雅关闭（在途流收尾 / 定时器清零 / stop 按时返回 / 进程自然退出码 0） ---- */
+  const cl = s.close || {};
+  const sseMark = ((cl.marks || []).find(x => /SSE 连接/.test(x)) || '');
+  const sseMarkMs = sseMark ? Number(String(sseMark).split('ms')[0]) : -1;
+  t.check('W5-⑥：`closeAllStreams()` 让每条在途流收到结束信号（`: bye`）并结束、流计数归零；其后 5×心跳周期**再无新字节**（心跳定时器已清）',
+    cl.closedCount === 1 && cl.sawBye === true && cl.streamDone === true &&
+    cl.afterByeBytes === 0 && cl.streamsAfterCloseAll === 0,
+    `closed=${cl.closedCount} 收到bye=${cl.sawBye} 流已结束=${cl.streamDone} 之后新增字节=${cl.afterByeBytes} 流计数=${cl.streamsAfterCloseAll}`);
+  t.check('W5-⑥：`stop()` **按时返回**（在途 SSE 收尾留痕 ≤1 s；总耗时 < 4 s，远低于 8 s 上限）且夹具进程**自然退出码 0**（无残留句柄）',
+    Boolean(cl.stopResult) && cl.stopResult.code === 0 && cl.stopMs < 4000 && sseMarkMs >= 0 && sseMarkMs <= 1000 &&
+    Boolean(w5Exit) && w5Exit.code === 0,
+    `exit=${JSON.stringify(w5Exit)}；stopMs=${cl.stopMs}；收尾留痕=${sseMark || '(无)'}；在途流B收到bye=${cl.streamB && cl.streamB.sawBye}`);
+  t.check('W5-⑥：stop 后**无残留**：在途流 0 / 监听已关 / 库已关 / 事件总线已关闭（订阅者 0、缓冲释放）/ 链路监控定时器已停',
+    Boolean(cl.afterStop) && cl.afterStop.streams === 0 && cl.afterStop.serverNull === true &&
+    cl.afterStop.dbNull === true && cl.afterStop.busClosed === true &&
+    cl.afterStop.busSubscribers === 0 && cl.afterStop.linkRunning === false,
+    JSON.stringify(cl.afterStop && {
+      streams: cl.afterStop.streams, serverNull: cl.afterStop.serverNull, dbNull: cl.afterStop.dbNull,
+      busClosed: cl.afterStop.busClosed, subscribers: cl.afterStop.busSubscribers, linkRunning: cl.afterStop.linkRunning
+    }));
+  t.check('W5-⑦：端到端也能验缓冲溢出——容量 8 时 `dropped = seq − capacity`，`oldestSeq = seq − capacity + 1`（如实计数）',
+    Boolean(s.replay && s.replay.busStats) && s.replay.busStats.capacity === 8 &&
+    s.replay.busStats.dropped === s.replay.busStats.seq - s.replay.busStats.capacity &&
+    s.replay.busStats.oldestSeq === s.replay.busStats.seq - s.replay.busStats.capacity + 1,
+    JSON.stringify(s.replay && s.replay.busStats));
+
+  /* ---- 判据⑨：监听范围不变 ---- */
+  t.check('W5-⑨：监听仍**只回环**（夹具实际绑定 127.0.0.1）且默认仍是 127.0.0.1:8787（本单未改端口口径）',
+    /^127\.0\.0\.1:\d+$/.test(String(s.listen)) &&
+    Boolean(s.config) && s.config.defaultHost === '127.0.0.1' && s.config.defaultPort === 8787,
+    `listen=${s.listen}；默认=${s.config && s.config.defaultHost}:${s.config && s.config.defaultPort}`);
+
+  /* ---- 追加（裁定「选项 A」）：CORS ---- */
+  const c = s.cors || {};
+  t.check('CORS①：回环绑定 + `Origin: null`（双击 index.html 的 file://）⇒ 回 `Access-Control-Allow-Origin: null`',
+    Boolean(c.nullOrigin) && c.nullOrigin.acao === 'null' && c.nullOrigin.status === 200,
+    `acao=${c.nullOrigin && c.nullOrigin.acao} status=${c.nullOrigin && c.nullOrigin.status}`);
+  t.check('CORS②：回环源 `http://127.0.0.1:<实际端口>` 与 `http://localhost:<实际端口>` ⇒ 回显该源（端口取**实际监听端口**，不是写死 8787）',
+    Boolean(c.loopbackOrigin) && c.loopbackOrigin.acao === `http://127.0.0.1:${w5Port}` &&
+    c.localhostOrigin.acao === `http://localhost:${w5Port}` &&
+    Boolean(c.status) && !c.status.origins.includes('http://127.0.0.1:8787'),
+    `127.0.0.1 ⇒ ${c.loopbackOrigin && c.loopbackOrigin.acao}；localhost ⇒ ${c.localhostOrigin && c.localhostOrigin.acao}；白名单=${JSON.stringify(c.status && c.status.origins)}`);
+  t.check('CORS③：非白名单源（`http://evil.example`、**同主机异端口**）⇒ **不回**任何 `Access-Control-Allow-Origin`；`Origin` 缺失（同源/curl）行为不变',
+    Boolean(c.evilOrigin) && c.evilOrigin.acao === null && c.otherPort && c.otherPort.acao === null &&
+    c.noOrigin && c.noOrigin.acao === null && c.noOrigin.status === 200,
+    `evil=${c.evilOrigin && c.evilOrigin.acao}；异端口=${c.otherPort && c.otherPort.acao}；无 Origin=${c.noOrigin && c.noOrigin.acao}`);
+  t.check('CORS⑤：预检 ⇒ 204 + 允许方法/允许头/Max-Age 正确，且**绝不**回 `Access-Control-Allow-Credentials`',
+    Boolean(c.preflightNull) && c.preflightNull.status === 204 &&
+    c.preflightNull.acao === 'null' && c.preflightNull.acam === 'GET, POST, OPTIONS' &&
+    c.preflightNull.acah === 'Content-Type, Authorization' && c.preflightNull.maxAge === '600' &&
+    c.preflightNull.acac === null && c.nullOrigin.acac === null,
+    JSON.stringify(c.preflightNull && {
+      status: c.preflightNull.status, acao: c.preflightNull.acao, methods: c.preflightNull.acam,
+      headers: c.preflightNull.acah, maxAge: c.preflightNull.maxAge, credentials: c.preflightNull.acac
+    }));
+  t.check('CORS：非白名单源的预检 ⇒ 403 且**一个 CORS 头都不回**；未注册路径的 OPTIONS 仍走既有 404/405 口径',
+    Boolean(c.preflightEvil) && c.preflightEvil.status === 403 && c.preflightEvil.acao === null &&
+    c.preflightUnknown && c.preflightUnknown.status === 404 &&
+    c.optionsNoOrigin && c.optionsNoOrigin.status === 405,
+    `evil 预检=${c.preflightEvil && c.preflightEvil.status}/acao=${c.preflightEvil && c.preflightEvil.acao}；` +
+    `未注册路径 OPTIONS=${c.preflightUnknown && c.preflightUnknown.status}；无 Origin 的 OPTIONS=${c.optionsNoOrigin && c.optionsNoOrigin.status}`);
+
+  /* ---- 追加：非回环绑定 ⇒ 任何源都无 CORS 头（另起一个夹具进程，监听地址进程内改不了） ---- */
+  const w5PortB = await harness.allocPort();
+  const w5DataB = path.join(w5Tmp, 'data-nonloop');
+  const w5ResultB = path.join(w5Tmp, 'nonloop-result.json');
+  const runNB = w5Spawn(fNonLoop, 'fixture-nonloopback', {
+    DSH_W5_PORT: String(w5PortB), DSH_W5_DATA: w5DataB,
+    DSH_W5_DB: path.join(w5DataB, 'board.db'), DSH_W5_RESULT: w5ResultB
+  });
+  const nbWatchdog = setTimeout(() => { try { runNB.proc.kill(); } catch { /* 已退出 */ } }, 40000);
+  const nbExit = await runNB.waitDone(40000);
+  clearTimeout(nbWatchdog);
+  const N = w5Read(w5ResultB);
+  if (!t.requires('W5 夹具②（非回环绑定）能取到结果文件', Boolean(N), runNB.log().slice(-400) || '无日志')) {
+    t.info('W5：夹具②未产出结果，CORS④ 断言按失败处理（不许把"跑不了"当通过）');
+  }
+  const n = N || {};
+  t.check('CORS④：**非回环绑定**（0.0.0.0）⇒ 任何源都无 CORS 头（含 `null`）、预检 403；静态首页仍可托管（守 NFR-25/AC-09）',
+    /^0\.0\.0\.0:/.test(String(n.listen)) && n.corsStatus && n.corsStatus.loopback === false &&
+    n.nullOrigin && n.nullOrigin.acao === null && n.loopbackOrigin && n.loopbackOrigin.acao === null &&
+    n.evilOrigin && n.evilOrigin.acao === null && n.preflightNull && n.preflightNull.acao === null &&
+    n.preflightNull.status === 403 && n.siteRoot && n.siteRoot.status === 200 &&
+    Boolean(nbExit) && nbExit.code === 0,
+    `listen=${n.listen} loopback=${n.corsStatus && n.corsStatus.loopback}；null源 acao=${n.nullOrigin && n.nullOrigin.acao}；` +
+    `预检=${n.preflightNull && n.preflightNull.status}/acao=${n.preflightNull && n.preflightNull.acao}；exit=${JSON.stringify(nbExit)}`);
+
+  /* ---- 追加（裁定「选项 A」）：静态托管（白名单式 + 路径穿越） ---- */
+  const idxText = fs.readFileSync(path.join(env.paths.root, 'index.html'), 'utf8');
+  t.check('静态⑥：`GET /`（与 `/index.html`）返回**仓库根 index.html 本体**——内容与磁盘文件逐字节相等，不是只看状态码；并带 `Cache-Control: no-store`',
+    Boolean(s.site && s.site.root) && s.site.root.status === 200 && s.site.root.text === idxText &&
+    /text\/html/.test(String(s.site.root.contentType)) && s.site.root.cacheControl === 'no-store' &&
+    s.site.indexHtml.text === idxText,
+    `status=${s.site && s.site.root && s.site.root.status} 内容相等=${Boolean(s.site && s.site.root && s.site.root.text === idxText)} ` +
+    `长度=${s.site && s.site.root && s.site.root.text.length}/${idxText.length} cache=${s.site && s.site.root && s.site.root.cacheControl}`);
+  t.check('静态⑦：`GET /src/**` 能取到前端真实文件并按扩展名给正确 `Content-Type`（.js 含 javascript / .css / .png）',
+    Boolean(s.site) && s.site.config.status === 200 && /javascript/.test(String(s.site.config.contentType)) &&
+    s.site.js.status === 200 && /javascript/.test(String(s.site.js.contentType)) &&
+    /text\/css/.test(String(s.site.css.contentType)) &&
+    /image\/png/.test(String(s.site.png.contentType)) && s.site.png.len > 1000 &&
+    s.site.config.text.includes('window.BoardConfig'),
+    `board.config.js: ${s.site && s.site.config && s.site.config.status}/${s.site && s.site.config && s.site.config.contentType}；` +
+    `main.js: ${s.site && s.site.js && s.site.js.status}/${s.site && s.site.js && s.site.js.contentType}；` +
+    `global.css: ${s.site && s.site.css && s.site.css.contentType}；png: ${s.site && s.site.png && s.site.png.len}B`);
+  t.check('静态⑧：白名单外路径（server / tests / tools / .git / data / 项目记录 / 需求文档 / 未知路径）一律 404＋JSON 形状，且响应体**不含**被禁文件内容（按真实文件的 40 字符指纹逐条比对）',
+    (() => {
+      const d = (s.site && s.site.denied) || {};
+      /* 指纹取自**磁盘上的真实文件**（不是手写字面量）：这样"禁文件内容没被回"是硬判据，
+         也不会被 404 响应体里回显的**路径**误判（上一版用 'mock-upper' 当特征串就踩了这个坑）。 */
+      const targets = ['server/index.js', 'server/http/router.js', 'tests/README.md',
+        'tools/mock-upper/mock-upper.js', '.git/config', '项目记录/工作日志.md'];
+      const fingerprints = targets.map(rel => {
+        try {
+          const text = fs.readFileSync(path.join(env.paths.root, rel), 'utf8').replace(/\s+/g, '');
+          return { rel, marker: text.slice(24, 64) };
+        } catch { return null; }
+      }).filter(x => x && x.marker.length === 40);
+      const bodies = Object.values(d).map(v => String(v.text || '').replace(/\s+/g, ''));
+      const all404Json = Object.keys(d).length >= 14 &&
+        Object.values(d).every(v => v.status === 404 && /application\/json/.test(String(v.contentType)));
+      const noLeak = fingerprints.length >= 4 &&
+        fingerprints.every(f => bodies.every(b => !b.includes(f.marker)));
+      const jsonShape = Boolean(d['/no-such-endpoint']) && (() => {
+        try { return JSON.parse(d['/no-such-endpoint'].text).err.code === 'NOT_FOUND'; } catch { return false; }
+      })();
+      const dbMagic = Boolean(d['/data/dev/board.db']) &&
+        !String(d['/data/dev/board.db'].text).includes('SQLite format 3');
+      return all404Json && noLeak && jsonShape && dbMagic;
+    })(),
+    `受访 ${Object.keys((s.site && s.site.denied) || {}).length} 条路径（全部 404+JSON）；` +
+    `指纹比对条数=${['server/index.js', 'server/http/router.js', 'tests/README.md', 'tools/mock-upper/mock-upper.js', '.git/config', '项目记录/工作日志.md'].length}；` +
+    `db 魔数未泄露=${!/SQLite format 3/.test(String((s.site && s.site.denied && s.site.denied['/data/dev/board.db'] || {}).text || ''))}`);
+  t.check('静态⑧b：**路径穿越**（`/src/../server/index.js`、`%2e%2e%2f`、`%2E%2E`、绝对路径、反斜杠、双重编码、`%00`）一律 404 且绝不返回文件内容',
+    (() => {
+      const d = (s.site && s.site.denied) || {};
+      const fetchCases = ['/src/../server/index.js', '/src/%2e%2e%2fserver/index.js', '/src/%2E%2E/server/index.js',
+        '/%2e%2e%2fserver/index.js', '/src/config/../../../server/index.js'];
+      const fetchOk = fetchCases.every(p => d[p] && d[p].status === 404 &&
+        !String(d[p].text).includes('createRouter') && !String(d[p].text).includes('启动自检'));
+      const raw = (s.raw) || {};
+      const rawKeys = Object.keys(raw);
+      const rawOk = rawKeys.length === 6 && rawKeys.every(k =>
+        / 404 /.test(String(raw[k].statusLine)) && raw[k].bodyHasIndexJs === false);
+      return fetchOk && rawOk;
+    })(),
+    `fetch 形态穿越=${(() => {
+      const d = (s.site && s.site.denied) || {};
+      return ['/src/../server/index.js', '/src/%2e%2e%2fserver/index.js', '/src/%2E%2E/server/index.js',
+        '/%2e%2e%2fserver/index.js', '/src/config/../../../server/index.js']
+        .map(p => `${p}=${d[p] && d[p].status}`).join(' ');
+    })()}；裸 socket 形态=${Object.keys(s.raw || {}).map(k => `${k}=${String(s.raw[k].statusLine).split(' ')[1]}`).join(' ')}`);
+
+  /* ============ 三、F1～F8 修复回归（独立审查 R-2026-09-28-01） ============ */
+
+  /* F1：客户端游标**领先服务端** ⇒ 必须回 hello 且**重置投递下界**（旧实现的静默黑洞） */
+  {
+    /* 用一条**新总线**（上面那条已按"close() 语义"关掉了，不能拿来发事件） */
+    const busAhead = createEventBus({ now: busClock.source(), capacity: 8 });
+    for (let i = 0; i < 3; i++) busAhead.publish(SSE_KIND.FRAME, { i });
+    const seqNowBus = busAhead.seq();
+    const aheadSub = busAhead.subscribe(() => { /* 只验模式 */ }, { since: seqNowBus + 7 });
+    const aheadGot = [];
+    const aheadSub2 = busAhead.subscribe(evt => aheadGot.push(evt.seq), { since: seqNowBus + 999 });
+    const aheadEvt = busAhead.publish(SSE_KIND.LINK, { online: true });
+    t.check('W5-②/F1：客户端游标**领先服务端**（since > seq）⇒ 回 hello 且**投递下界重置为当前 seq**（旧实现：无 hello、此后新事件全被 `seq <= since` 滤掉＝静默黑洞）',
+      aheadSub.mode === 'hello' && aheadSub.cursorAhead === true && aheadSub.since === seqNowBus &&
+      aheadSub2.mode === 'hello' && aheadSub2.cursorAhead === true && aheadSub2.since === seqNowBus &&
+      Boolean(aheadEvt) && aheadEvt.seq === seqNowBus + 1 && aheadGot.join(',') === String(aheadEvt.seq) &&
+      busAhead.unsubscribe(aheadSub) === true && busAhead.unsubscribe(aheadSub2) === true &&
+      busAhead.size() === 0 && busAhead.stats().buffered === 4,
+      `seq=${seqNowBus}（已发 3 条）；since=${seqNowBus + 7} ⇒ mode=${aheadSub.mode}/cursorAhead=${aheadSub.cursorAhead}/subSince=${aheadSub.since}；` +
+      `随后新事件 seq=${aheadEvt && aheadEvt.seq} 收到=[${aheadGot.join(',')}]；退订后订阅者=${busAhead.size()}`);
+  }
+  t.check('W5-②/F1：真 HTTP 上「游标领先」也不是黑洞（`?since=seq+k`，k=1/7/999 ⇒ 收到 hello **且随后新帧事件可达**）',
+    [1, 7, 999].every(k => {
+      const pr = s.cursorAhead && s.cursorAhead.probes ? s.cursorAhead.probes[String(k)] : null;
+      if (!pr) return false;
+      const ev = pr.events || [];
+      return pr.status === 200 && ev.length >= 2 && ev[0].event === 'hello' && ev[0].data && ev[0].data.snapshot &&
+        ev.slice(1).some(e => e.event === 'frame' && e.id > ev[0].id);
+    }),
+    [1, 7, 999].map(k => {
+      const pr = (s.cursorAhead && s.cursorAhead.probes && s.cursorAhead.probes[String(k)]) || {};
+      return `k=${k}: [${(pr.events || []).map(e => e.id + ':' + e.event).join(',')}]`;
+    }).join('；') + `（服务端 seq=${s.cursorAhead && s.cursorAhead.cursorNow}）`);
+
+  /* F2：停机窗口内的**在途 keep-alive 请求**不得被误伤，且 stop() 不得被它拖住 */
+  t.check('W5-⑥/F2：停机窗口内**在途 keep-alive 请求**不被误伤（200 + outcome=stored + 采样表 +1 行）且 `stop()` ≤ 1000 ms（旧实现只回收一次空闲连接 ⇒ 被拖到 ~6.35 s）',
+    Boolean(cl.inflight) && /200 OK/.test(String(cl.inflight.responseStatusLine)) &&
+    cl.inflight.responseOutcome === 'stored' &&
+    typeof cl.inflight.rowsAfter === 'number' && cl.inflight.rowsAfter === cl.inflight.rowsBefore + 1 &&
+    cl.stopMs <= 1000,
+    `响应=${cl.inflight && cl.inflight.responseStatusLine}／outcome=${cl.inflight && cl.inflight.responseOutcome}；` +
+    `采样表 ${cl.inflight && cl.inflight.rowsBefore}→${cl.inflight && cl.inflight.rowsAfter}；stopMs=${cl.stopMs}；` +
+    `在途连接关闭于 stop+${cl.inflight && cl.inflight.closedAfterStop} ms`);
+
+  /* F3：如实表述 —— 前五类来自真实写入点，`warning` 是"挂钩可用、生产调用方待接线" */
+  const seenKinds = [...new Set([].concat(evts(s.frames && s.frames.stream), evts(s.link), evts(s.other && s.other.stream))
+    .map(e => e.event))];
+  t.check('W5/F3：**五类来自真实写入点**（frame←1 s 采样落库 / link←linkState / task←派工落库 / standard←addVersion 成功路径 / upload←上报失败留存）在真 HTTP 连接上全部实测可见',
+    ['frame', 'link', 'task', 'standard', 'upload'].every(k => seenKinds.includes(k)),
+    `实收种类=${seenKinds.join(',')}（各类的写入点证据见上面 5 条断言）`);
+  t.check('W5/F3：`warning` 仅证明**挂钩可用**——本夹具**直调** `judge.evaluate(input,{bus})`（生产发布点**待接线**：技术债 E45，负责人 2026-09-28 裁定本轮不接）',
+    seenKinds.includes('warning') && Boolean(s.other && s.other.warning && s.other.warning.result),
+    `warning 事件在连接上可见=${seenKinds.includes('warning')}；夹具直调 judge.evaluate(...,{bus}) 返回 result=` +
+    `${s.other && s.other.warning && s.other.warning.result && s.other.warning.result.result}（**不是**生产调用方）`);
+
+  /* F4：realpath 复核（root 之内指向 root 之外的 junction ⇒ 拒）＋ 普通文件不误伤
+     F9：realpath 的**上界**必须是"被托管的那一层"（资源 ⇒ `<root>\src`，首页 ⇒ 恰好 index.html） */
+  const rp = s.realpathProbe || {};
+  t.check('静态/F4：静态托管对**普通文件**仍正常（realpath 复核没有误伤正常路径）',
+    Boolean(rp.normalFile) && rp.normalFile.status === 200 && rp.normalFile.hasOk === true,
+    JSON.stringify(rp.normalFile));
+  if (rp.junctionCreated) {
+    t.check('静态/F4：root 之内指向 root 之外的 **junction（目录联接）** ⇒ 404 且**不泄露**被指向文件的内容（realpath 复核可达、可被变异证伪）',
+      Boolean(rp.escapedLink) && rp.escapedLink.status === 404 && rp.escapedLink.hasSecret === false &&
+      /"ok":true/.test(String(rp.resolveSaysEscape)),
+      `越界联接 ⇒ ${rp.escapedLink && rp.escapedLink.status}／含外部标记=${rp.escapedLink && rp.escapedLink.hasSecret}；` +
+      `解析层认为路径合法（${rp.resolveSaysEscape}）⇒ 拦截确实发生在 realpath 复核`);
+    t.check('静态/F9：**仓库内** junction（`src` 之内 → 根内但 `src` 之外，等价于审查实测的 `src\\x -> tests`）⇒ 404 且不泄露（上界必须是 `<root>\\src`，不是仓库根）',
+      Boolean(rp.inRepoLink) && rp.inRepoLink.status === 404 && rp.inRepoLink.hasInRepoMarker === false &&
+      /"ok":true/.test(String(rp.resolveSaysInRepo)) &&
+      Array.isArray(rp.reasons) && rp.reasons.filter(r => r === 'OUTSIDE_SRC_REALPATH').length >= 2,
+      `根内-越 src 联接 ⇒ ${rp.inRepoLink && rp.inRepoLink.status}／含被禁标记=${rp.inRepoLink && rp.inRepoLink.hasInRepoMarker}；` +
+      `解析层认为路径合法（${rp.resolveSaysInRepo}）；拒收原因=${JSON.stringify(rp.reasons)}`);
+    t.check('静态/F9 · 正对照：`/index.html`、`/src/main.js`、`/src/config/board.config.js` 仍 200 且与磁盘内容一致（不是把静态口一起关了）',
+      Boolean(s.site && s.site.root) && s.site.root.status === 200 && s.site.root.text === idxText &&
+      s.site.js.status === 200 && s.site.config.status === 200 && s.site.config.text.includes('window.BoardConfig') &&
+      rp.normalFile.status === 200,
+      `index ${s.site && s.site.root && s.site.root.status}（内容相等=${Boolean(s.site && s.site.root && s.site.root.text === idxText)}）；` +
+      `main.js ${s.site && s.site.js && s.site.js.status}；board.config.js ${s.site && s.site.config && s.site.config.status}`);
+    t.check('静态/F9 · 清理安全：junction 用 `rmdir` 拆掉后**目标目录仍在**（禁止 `fs.rmSync(recursive)` —— 那可能顺链接删到目标）',
+      Boolean(rp.cleanup) && rp.cleanup.linkOutGone === true && rp.cleanup.linkInGone === true &&
+      rp.cleanup.outsideStillThere === true && rp.cleanup.inRepoStillThere === true,
+      JSON.stringify(rp.cleanup));
+  } else {
+    t.skip('静态/F4+F9：越界/根内 junction ⇒ 404 且不泄露（本机不能建链接：EPERM）',
+      String(rp.note || '未做实验 —— realpath 防护为**代码级**，此路未做实验'));
+  }
+
+  /* F10：领先游标留痕必须打**客户端原始报数**（`sub.since` 已被改成投递下界，不能用它） */
+  t.check('W5-②/F10：`cursorAhead` 日志里带**客户端原始报数**（`reportedSince` ＝ 请求里报的那个数）＋ 服务端当前 `seq` ＋ 改写后的 `subSince` —— 领先幅度可读',
+    (() => {
+      const lines = (s.cursorAhead && s.cursorAhead.logLines) || [];
+      const reported = lines.map(l => (/"reportedSince":(\d+)/.exec(l) || [])[1]).filter(Boolean).map(Number);
+      const wanted = [1, 7, 999].map(k => (s.cursorAhead && s.cursorAhead.cursorNow) + k);
+      return lines.length >= 3 && wanted.every(v => reported.includes(v)) &&
+        lines.every(l => /"seq":\d+/.test(l) && /"subSince":\d+/.test(l)) &&
+        /游标领先/.test(lines[0]);
+    })(),
+    ((s.cursorAhead && s.cursorAhead.logLines) || []).map(l => l.replace(/^\[[^\]]+\] /, '')).join(' ｜ ').slice(0, 300));
+
+  /* F5：新文件的换行/BOM 口径（仓库既有 73/76 为 CRLF-only） */
+  t.check('文件卫生/F5：本单 4 个新文件统一 **CRLF 且无 BOM**（与仓库既有换行口径一致；BOM 仍为 false）',
+    ['server/services/eventBus.js', 'server/services/stateSnapshot.js', 'server/http/cors.js', 'server/http/site.js']
+      .every(f => {
+        const b = fs.readFileSync(path.join(env.paths.root, f));
+        if (b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) return false;
+        const txt = b.toString('utf8');
+        return txt.includes('\r\n') && !/(^|[^\r])\n/.test(txt);
+      }),
+    '逐个读字节：4 个新文件均含 CRLF、无孤立 LF、无 BOM');
+
+  /* F6：未注册路径**一个 CORS 头都不挂**（与"非白名单源一个头都不回"口径自洽） */
+  t.check('CORS/F6：未注册路径**不挂任何 CORS 头**（`GET /no-such-path` + `Origin: null` ⇒ 404 且无 `Access-Control-Allow-Origin`），与"非白名单源一个头都不回"口径自洽',
+    Boolean(c.getUnknownWithOrigin) && c.getUnknownWithOrigin.status === 404 && c.getUnknownWithOrigin.acao === null &&
+    Boolean(c.preflightUnknown) && c.preflightUnknown.status === 404 && c.preflightUnknown.acao === null,
+    `GET 未知路径：${c.getUnknownWithOrigin && c.getUnknownWithOrigin.status}/acao=${c.getUnknownWithOrigin && c.getUnknownWithOrigin.acao}；` +
+    `OPTIONS 未知路径：${c.preflightUnknown && c.preflightUnknown.status}/acao=${c.preflightUnknown && c.preflightUnknown.acao}`);
+
+  /* F7：规范化拼写口径（同一文件不因大小写/尾随斜杠给出两种判定） */
+  t.check('静态/F7：**规范化拼写**口径自洽——`/index.HTML`≡`/index.html`（同 body 哈希）／`/index.html/`、`/src/main.js/` 一律 404／`/src/MAIN.JS`≡`/src/main.js`（本机 NTFS 不区分大小写）；`//src/main.js` **不是**首页（落到 404）',
+    (() => {
+      const C = s.canonical || {};
+      const st = p => (C[p] || {}).status;
+      const h = p => (C[p] || {}).bodyHash;
+      return st('/index.html') === 200 && st('/index.HTML') === 200 && Boolean(h('/index.html')) &&
+        h('/index.html') === h('/index.HTML') &&
+        st('/index.html/') === 404 && st('/src/main.js/') === 404 &&
+        st('/src/main.js') === 200 && st('/src/MAIN.JS') === 200 && h('/src/main.js') === h('/src/MAIN.JS') &&
+        st('/src//main.js') === 404 &&
+        h('//index.html') === h('/index.html') && h('/./index.html') === h('/index.html') &&
+        st('//src/main.js') === 404 && h('//src/main.js') !== h('/index.html');
+    })(),
+    Object.keys(s.canonical || {}).map(p => `${p}=${s.canonical[p].status}${s.canonical[p].bodyHash ? '/' + s.canonical[p].bodyHash : ''}`).join(' ') +
+    '（F11 更正成因：`//index.html` 之所以落回首页，是因为 `//x` 被当作**协议相对 URL** —— ' +
+    '`new URL("//index.html","http://127.0.0.1")` 解析为 host=`index.html`、path=`/`，服务端收到的 pathname 就是 `/`；' +
+    '`/./index.html` 才是"路径归一"（去掉 `.` 段）。两者都不是服务端给出两种判定；' +
+    '`//src/main.js` 同理会变成 path=`/main.js` ⇒ 未注册路径 ⇒ 404，可作区分性对照）');
+
+  /* F8：心跳条数**确定性**判据（注入定时器）＋ 关闭时 clearInterval 的确定性证据 */
+  {
+    const { createRouter: createRouterForHeartbeat } = require('../server/http/router');
+    const hv = { ticks: [], cleared: [], written: [] };
+    const hbClock = createClock({ mode: 'fixed', at: '2026-09-19T10:00:00' });
+    const routerH = createRouterForHeartbeat({
+      heartbeatMs: 100,
+      now: hbClock.source(),
+      setIntervalImpl: (fn, ms) => { const t = { fn, ms }; hv.ticks.push(t); return t; },
+      clearIntervalImpl: t => { hv.cleared.push(t); }
+    });
+    const busH = createEventBus({ now: hbClock.source(), capacity: 8 });
+    routerH.mountSSE({ bus: busH, snapshot: () => ({ probe: true }) });
+    const resH = {
+      headersSent: false, writableEnded: false, destroyed: false, socket: null,
+      writeHead() { this.headersSent = true; }, setHeader() { /* 头内容不是本条判据 */ },
+      write(s) { hv.written.push(String(s)); return true; },
+      end() { this.writableEnded = true; },
+      on() { /* 不模拟客户端断开 */ }
+    };
+    routerH.events({ url: '/events', method: 'GET', headers: {} }, resH);
+    for (let i = 0; i < 5; i++) hv.ticks[0].fn();          // 手动驱动 5 个周期
+    const pingCount = (hv.written.join('').match(/: ping /g) || []).length;
+    const streamsBefore = routerH.streamCount();
+    const closedN = routerH.closeAllStreams();
+    t.check('W5-⑤/F8：心跳定时器**可注入** ⇒ 条数完全确定（驱动 k 次恰得 k 条 `: ping`，时间戳＝注入时钟），且 `closeAllStreams()` 真的调了 `clearInterval`（定时器清零的确定性证据）',
+      hv.ticks.length === 1 && hv.ticks[0].ms === 100 && pingCount === 5 &&
+      hv.written.join('').includes(': ping ' + hbClock.now().toISOString()) &&
+      streamsBefore === 1 && closedN === 1 && hv.cleared.length === 1 && hv.cleared[0] === hv.ticks[0] &&
+      resH.writableEnded === true && routerH.streamCount() === 0,
+      `注册定时器 ${hv.ticks.length} 个（周期 ${hv.ticks[0] && hv.ticks[0].ms} ms）；驱动 5 次 ⇒ ping ${pingCount} 条；` +
+      `closeAllStreams 清掉 ${hv.cleared.length} 个定时器；在途 ${streamsBefore}→${routerH.streamCount()}`);
+  }
+
+  try { fs.rmSync(w5Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  /* 只删本节点名的**夹具文件**，不删整个 tests\._verify\w5sse\：
+     该目录是同座位复核/定点变异的工作区（整目录 rm 会把别人的临时产物一并清掉）。 */
+  for (const f of [fSse, fNonLoop]) { try { fs.rmSync(f, { force: true }); } catch { /* 忽略 */ } }
 }
 
 /* ---------------- 五、临时区与清理 ---------------- */

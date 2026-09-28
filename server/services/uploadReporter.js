@@ -167,6 +167,7 @@ async function httpSend(deps, req) {
  *  @param {object}   [options.config]       配置覆盖（缺省＝`board.config.js`；自检可用内存副本改阈值）
  *  @param {Function} [options.fetch]        发送实现覆盖（**自检注入用**；缺省＝全局 fetch）
  *  @param {object}   [options.queue]        复用既有队列服务实例（缺省按 db 自建）
+ *  @param {object}   [options.bus]          W5-① 事件总线（透传给自建队列，供 `upload` 事件发布）
  *  @param {object}   [options.idGenerator]  uploadId 生成器覆盖（缺省＝`platform/id.js` 的真源）
  *  @param {string}   [options.serviceName]  服务名（缺省 `report`）
  *  @param {string}   [options.methodName]   方法名（缺省 `receiveReport`）
@@ -203,7 +204,10 @@ function createUploadReporter(options = {}) {
     capacity: options.capacity,
     warnThreshold: options.warnThreshold,
     now,
-    logger
+    logger,
+    /* W5-①：`upload` 事件由队列的**真实状态迁移点**发布（启用/成功/重报），上报器只把总线透传下去。
+       本文件**不另发**一遍（那会让一次上报产生两条同义事件，前端还要自己去重）。 */
+    bus: options.bus
   });
 
   /** 每次真正尝试发送的次数（人工重报也计；供自检证明"没有隐藏重试"） */

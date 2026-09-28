@@ -15,8 +15,14 @@
         半套 / 偏差正负号 / 超量程一律拒收，受控跳过出口单独断言）。
         这几节直接打在仓储/服务层上（`server/repo/standard.js`、`server/repo/opLog.js`、
         `server/services/standard.js`）—— 本批尚无 HTTP 路由接线，故不经路由验证。
+        2026-09-28（W5-③，服务层第二笔）再加三节（**九 / 九之二 / 九之三**，原"临时区与残留"顺延为十）：
+        **E18 迁移前强制备份**（不可跳过 / 失败即中止 / 无迁移不备份 / `op_log` 可审计）、
+        **E44 备份文件名同秒不覆盖**（毫秒 + 冲突递增探测；5 次同秒备份 ⇒ 5 个文件）、
+        **ADR-0007 鉴权**（scrypt 哈希非明文 / 错误次数锁定 / 内存会话令牌 / 本机一次性初始化 /
+        与 IF-A 静态令牌互不通用 / 六类留痕含来源 IP / `POST /auth/*` 的 HTTP 端到端）。
    依据：DR-03 / DR-04 / DR-12 / DR-13 / DR-14 / DR-15 / DR-16 / DR-18 / DR-19、
-        FR-3.19、IF-B.5（需求 V1.33）；ADR-0003（一用例一库）。
+        FR-3.19、IF-B.5（需求 V1.33）；ADR-0003（一用例一库）、ADR-0007（鉴权形态）、
+        ADR-0006（改 schema 必须同步升版本）、技术债 E18 / E44。
    句柄约定：全程使用 `handle.db`；需要换连接时**必须**用 `handle.adopt()`，
              否则夹具自建连接不被跟踪 → Windows 上临时目录删不掉（曾实际踩到）。
    运行：node tests/db-check.js
@@ -31,7 +37,7 @@ const http = require('node:http');
 
 const env = require('./env');
 const { createRunner } = require('./lib/assert');
-const { makeTempDb, allocPort } = require('./lib/harness');
+const { makeTempDb, makeTempDir, allocPort } = require('./lib/harness');
 const { createClock } = require('./lib/clock');
 const fixture = require('./lib/fixture');
 const db = require('../server/db');
@@ -72,6 +78,14 @@ const platformId = require('../platform/id');
 const boardConfig = require('../src/config/board.config.js');
 const { createUploadReporter } = require('../server/services/uploadReporter');
 const { mountUpload } = require('../server/http/routes/upload');
+/* W5-③（服务层第二笔）的三处被测对象：
+    · `server/services/auth.js`（scrypt 哈希 / 错误次数锁定 / 内存会话令牌 / 一次性初始化码）；
+    · `server/http/routes/auth.js`（`mountAuth(router,{auth,logger,now})` 的 HTTP 适配）；
+    · `server/db/index.js` 的 E18 迁移前强制备份 + `server/db/maintain.js` 的 E44 备份命名。
+   三者在本批之前**不存在**（auth 服务/路由为 W5-③ 新增，另外两处是既有实现的技术债收口），
+   故这里的引用就是九 / 九之二 / 九之三 三节的被测对象本身。 */
+const authSvc = require('../server/services/auth');
+const { mountAuth } = require('../server/http/routes/auth');
 
 env.assertRuntime();
 const t = createRunner('本地库结构自检（db-check）');
@@ -82,7 +96,10 @@ const NOW = '2026-09-19 10:00:00';
  *  **表数与表清单一律不写死** —— 期望表集由 `server/db/schema.sql` 的建表清单推导（见 parseSchemaTables）。 */
 const REQUIRED_TABLES = [
   'device', 'task', 'standard', 'measure_rt', 'result', 'shift_stat',
-  'alarm', 'warning', 'maintenance', 'notice', 'upload_log', 'op_log', 'task_curve'
+  'alarm', 'warning', 'maintenance', 'notice', 'upload_log', 'op_log', 'task_curve',
+  /* ADR-0007 D1（NFR-14 / FR-8.4）：设置页口令凭证表。它是**需求点名**的新表，
+     故必须登记进来 —— 否则第一章的"schema.sql 多出需求未登记的表"判据会把它当成"私自加表"。 */
+  'auth_credential'
 ];
 
 /** 关键列（列名缺失即视为不满足对应 DR）。
@@ -120,7 +137,10 @@ const REQUIRED_COLUMNS = {
     'retry_count', 'state'],
   op_log: ['op_time', 'operator', 'op_type', 'content', 'result'],
   task_curve: ['proc_order_no', 'unit_index', 'kind', 'samples', 'sample_count',
-    'interval_sec', 'duration_sec', 'min_value', 'max_value', 'finished_at']
+    'interval_sec', 'duration_sec', 'min_value', 'max_value', 'finished_at'],
+  /* ADR-0007 D1 的 DDL **逐字**（列名与唯一键都按原文）：口令只存派生值与状态，永不存明文。 */
+  auth_credential: ['username', 'algo', 'params', 'salt', 'hash', 'fail_count', 'locked_until',
+    'is_initial', 'created_at', 'updated_at', 'changed_by', 'team_code']
 };
 
 /** 需求 V1.33 明确要求**消失**的列（列名仍在即视为走了回头路）。
@@ -941,23 +961,36 @@ async function main() {
       `表=[${legacyTables.join(', ')}]`);
 
     /* DR-12 的旧库升级路径：`team_code` 靠 STRUCTURE_UPGRADES 补列（schema.sql 对旧表是空操作）。
-       判据＝列真的补上了 **且旧留痕行一行没丢、原字段原样、新列为 NULL**（补列不是重建表）。 */
+       判据＝列真的补上了 **且旧留痕行一行没丢、原字段原样、新列为 NULL**（补列不是重建表）。
+       ⚠ W5-③（E18）后旧库会**多出一条**留痕：迁移前的强制备份会写 `op_type='迁移前备份'` 的审计行
+       （补列在它之后，故那条走的是兼容插入、`team_code` 同样是 NULL）。故行数由 1 变 2 —— 这里把
+       "多出来的那条**只能是** E18 审计行"一并钉住（这是**加强**而不是放宽：原来只数行数，现在逐条点名）。 */
     const legacyOpLogCols = db.listColumns(legacy.db, 'op_log');
     const legacyOpLogRows = legacy.db.prepare('SELECT * FROM op_log ORDER BY id').all();
+    const legacyAuditRows = opLogRepo.list(legacy.db, { opType: db.PRE_MIGRATION_BACKUP_OP_TYPE });
+    const legacyFirst = legacyOpLogRows[0];
     const legacyTeamIndex = Boolean(legacy.db.prepare(
       "SELECT 1 AS hit FROM sqlite_master WHERE type = 'index' AND name = 'ix_op_log_team'").get());
-    t.check('DR-12：旧库（op_log 无 team_code）经 initSchema 后列补齐且索引起来，旧留痕行一行不丢、原字段原样、team_code 为 NULL',
+    t.check('DR-12：旧库（op_log 无 team_code）经 initSchema 后列补齐且索引起来，**迁移前就存在的那条**留痕一行不丢、' +
+      '原字段原样、team_code 为 NULL；新增的只允许是 E18「迁移前备份」审计行（故行数 1 → 2，逐条点名而非只数行数）',
       legacyOpLogCols.includes('team_code') && legacyTeamIndex &&
-      legacyOpLogRows.length === 1 && legacyOpLogRows[0].op_type === '解锁' &&
-      legacyOpLogRows[0].content === '旧库留痕行（无班组列）' &&
-      legacyOpLogRows[0].operator === '张伟' && legacyOpLogRows[0].team_code === null,
-      `列=[${legacyOpLogCols.join(', ')}]，索引=${legacyTeamIndex}，行=${JSON.stringify(legacyOpLogRows)}`);
+      legacyOpLogRows.length === 2 &&
+      legacyFirst.op_type === '解锁' &&
+      legacyFirst.content === '旧库留痕行（无班组列）' &&
+      legacyFirst.operator === '张伟' && legacyFirst.team_code === null &&
+      legacyAuditRows.length === 1 && legacyAuditRows[0].result === '成功' &&
+      legacyOpLogRows[1].op_type === db.PRE_MIGRATION_BACKUP_OP_TYPE,
+      `列=[${legacyOpLogCols.join(', ')}]，索引=${legacyTeamIndex}，` +
+      `行=[${legacyOpLogRows.map(r => r.op_type).join(' / ')}]`);
   }
   legacy.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
 
 /* ---------------- 七、备份（DR-15 / DEP-08） ---------------- */
   t.section('七、备份与校验（DR-15 / DEP-08）');
-  const backupDir = path.join(env.paths.tempRoot, 'backup-case');
+  /* E44（2026-09-28）：备份目录改为**每次运行独占**（原来是 `tempRoot/backup-case` 这个固定名）。
+     固定名 + 秒级文件名 ⇒ 两个 db-check 并发跑（压测）时互相覆盖同一个文件，
+     于是下面「保留策略只保留最近 N 份」偶发红 —— 根因是"同秒同名覆盖"，不是保留策略本身。 */
+  const backupDir = makeTempDir('backup-case');
   const bk = await maintain.backupTo(handle.db, backupDir,
     { name: maintain.backupName(new Date(2026, 8, 19, 10, 0, 0)) });
   t.check('在线备份生成文件且体积 > 0', fs.existsSync(bk.path) && bk.bytes > 0,
@@ -969,14 +1002,20 @@ async function main() {
   t.check('备份前做了 WAL checkpoint（备份自包含）',
     bk.checkpoint.ok === true, bk.checkpoint.error || '');
 
-  for (let i = 1; i <= 3; i++) {
-    await maintain.backupTo(handle.db, backupDir,
-      { name: maintain.backupName(new Date(2026, 8, 19, 10, 0, i)) });
+  /* **在同一秒内**再做 5 次备份（注入时刻连毫秒都相同）—— 正是 E44 的复现条件：
+     改前（秒级文件名）这 5 次会落到同一个名字上、互相覆盖，`listBackups` 只会数到 1 份。 */
+  const sameSecondAt = new Date(2026, 8, 19, 10, 0, 0);
+  for (let i = 0; i < 5; i++) {
+    await maintain.backupTo(handle.db, backupDir, { now: sameSecondAt });
   }
+  const backupsBeforePrune = maintain.listBackups(backupDir);
   const pruned = maintain.pruneBackups(backupDir, 2);
-  t.check('保留策略只保留最近 N 份并删除其余',
-    maintain.listBackups(backupDir).length === 2 && pruned.removed.length === 2,
-    `保留 ${maintain.listBackups(backupDir).length} 份，删除 ${pruned.removed.length} 份`);
+  t.check('保留策略只保留最近 N 份并删除其余（E44：**同一秒内连做 5 次备份 ⇒ 5 个不同文件**，' +
+    '不再互相覆盖；连同前面 1 次共 6 份 ⇒ 保留 2、删除 4）',
+    backupsBeforePrune.length === 6 && new Set(backupsBeforePrune.map(b => b.name)).size === 6 &&
+    maintain.listBackups(backupDir).length === 2 && pruned.removed.length === 4,
+    `备份 6 份：[${backupsBeforePrune.map(b => b.name).join(', ')}] ⇒ 保留 ${maintain.listBackups(backupDir).length} 份，` +
+    `删除 ${pruned.removed.length} 份`);
 
   /* ---------------- 八、保留策略（DR-14 保留 1 年） ---------------- */
   t.section('八、数据保留策略（DR-14）');
@@ -2653,8 +2692,1024 @@ async function main() {
   await new Promise(resolve => mockMesServer.close(resolve));
   w4Db.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
 
-  /* ---------------- 九、清理与残留 ---------------- */
-  t.section('九、临时区与残留');
+  /* ---------------- 九、E18 迁移前强制备份（不可跳过 / 失败即中止 / 可审计） ----------------
+     技术债 E18 原文（`项目记录\后续路线图.md` 第六节）：旧库迁移即 `DROP TABLE standard_legacy`，
+     旧设定值不可恢复 ⇒ 迁移前必须**强制**备份 + 可审计日志。
+     本节四条判据（逐条对应验收要求）：
+       ① 迁移前**确实生成**备份，且备份内容含**迁移前**的数据（可证伪："迁移后才备份"必红）；
+       ② 备份失败（注入故障 / 目录不可写）⇒ **抛错中止迁移**且旧数据完整（不得静默继续）；
+       ③ 无迁移时**不产生**备份（幂等：重复 initSchema 不会每次多一份）；
+       ④ `op_log` 有对应留痕（含备份文件路径、原因、结果），可查询。
+     **一用例一库**：本节自带旧结构库，与六之七那个旧库用例互不复用（那边验"迁移后的结构"）。 */
+  t.section('九、E18 迁移前强制备份（不可跳过 / 失败即中止 / 无迁移不备份 / 可审计）');
+  const E18_INS = `INSERT INTO standard(product_code, set_depth, set_gain, set_frame_rate, set_shutter,
+                                          effective_from, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)`;
+  const seedLegacyStandard = (conn, rows) => {
+    const stmt = conn.prepare(E18_INS);
+    for (const r of rows) stmt.run(...r);
+  };
+  const LEGACY_ROWS = [
+    ['P-E18-A', 12.5, 8, 60, 100, '2026-01-01 08:00:00', '2026-01-01 08:00:00'],
+    ['P-E18-A', 13.5, 9, 50, 90, '2026-03-01 08:00:00', '2026-03-01 08:00:00'],
+    ['P-E18-B', 7.25, 6, 30, 200, '2026-02-01 08:00:00', '2026-02-01 08:00:00']
+  ];
+  const e18Clock = createClock({ mode: 'fixed', at: '2026-09-19T10:00:00' });
+
+  const e18Keep = makeTempDb({ name: 'e18-legacy', initSql: [LEGACY_STANDARD_SQL, LEGACY_OPLOG_SQL] });
+  seedLegacyStandard(e18Keep.db, LEGACY_ROWS);
+  const e18BackupDir = path.join(e18Keep.dir, 'backup');
+  const e18Plan = db.planMigration(e18Keep.db);
+  if (t.requires('E18 前提：旧库被判为"需要迁移前备份"（standard 旧结构 + 无结构版本记录），' +
+    '且确有 3 行旧设定值可丢（否则"备份成功"证明不了什么）',
+    e18Plan.needed === true && e18Plan.legacyStandard === 'legacy' &&
+    e18Plan.reasons.length >= 1 &&
+    db.listColumns(e18Keep.db, 'standard').includes('set_depth') &&
+    e18Keep.db.prepare('SELECT COUNT(*) AS c FROM standard').get().c === 3,
+    JSON.stringify(e18Plan))) {
+    const e18Init = db.initSchema(e18Keep.db, NOW, { backupDir: e18BackupDir, now: e18Clock.now() });
+    const e18Pre = e18Init.preMigrationBackup;
+    const e18Files = maintain.listBackups(e18BackupDir);
+    /* 判据①：备份确实发生，且 initSchema 把"路径/体积/原因/引擎"如实回报（可审计的前提）。
+       ⚠ 这里对 `path`/`audit` 做**类型守卫**（`fs.existsSync(null)` 会抛 ERR_INVALID_ARG_TYPE）：
+       变异取证时"备份根本没做"必须表现为**一条变红的断言**，而不是把整个自检脚本崩掉。
+       D22 变异点：把 `initSchema()` 里 `plan.needed ? runPreMigrationBackup(...)` 改成恒 false ⇒ 本行变红。 */
+    const e18PathOk = typeof e18Pre.path === 'string' && e18Pre.path !== '' && fs.existsSync(e18Pre.path);
+    t.check('E18①：破坏性迁移**之前确实生成了备份** —— `initSchema()` 回报 `needed/ok/path/bytes/reason`，' +
+      '备份目录里恰好 1 份文件，且本次迁移确实发生（migrated=true）',
+      e18Pre.needed === true && e18Pre.ok === true && e18Files.length === 1 &&
+      e18PathOk && e18Pre.bytes > 0 &&
+      /standard 是旧结构/.test(String(e18Pre.reason)) &&
+      e18Init.migration.migrated === true &&
+      Boolean(e18Pre.audit) && e18Pre.audit.ok === true,
+      `备份=${e18Pre.name}（${e18Pre.bytes} 字节，engine=${e18Pre.engine}）；原因=${e18Pre.reason}；` +
+      `migration=${JSON.stringify(e18Init.migration)}；audit=${JSON.stringify(e18Pre.audit)}`);
+
+    /* 判据①b：备份**内容**是迁移前的旧库 —— 把备份当独立库打开：
+       旧列（set_depth 等）还在、`version_no` 还没有、3 行旧设定值一行不丢。
+       D22 变异点：把备份调用挪到 `initSchema()` 的事务 COMMIT **之后** ⇒ 这里会看到新结构（set_depth 消失）
+       ⇒ 本行变红（这正是"证明是迁移前而不是迁移后"的可证伪点）。 */
+    let e18BkpCols = [];
+    let e18BkpRows = [];
+    let e18BkpProblem = e18PathOk ? '' : `备份文件不存在或路径非法（path=${JSON.stringify(e18Pre.path)}）`;
+    if (e18PathOk) {
+      const e18Backup = db.openDb(e18Pre.path, { journalMode: 'DELETE' });
+      try {
+        e18BkpCols = db.listColumns(e18Backup.db, 'standard');
+        e18BkpRows = e18Backup.db.prepare('SELECT * FROM standard ORDER BY id').all();
+      } catch (err) {
+        e18BkpProblem = `打开备份库失败：${err.message}`;
+      } finally {
+        e18Backup.db.close();   // 独立句柄必须自己关（否则 Windows 上临时目录删不掉）
+      }
+    }
+    t.check('E18①b：备份内容是**迁移前**的旧库 —— 备份内 `standard` 仍含 set_depth/set_gain/set_frame_rate/set_shutter、' +
+      '**没有** version_no/process_code，且 3 行旧设定值原样（12.5 / 13.5 / 7.25）',
+      e18BkpProblem === '' &&
+      e18BkpCols.includes('set_depth') && e18BkpCols.includes('set_shutter') &&
+      !e18BkpCols.includes('version_no') && !e18BkpCols.includes('process_code') &&
+      e18BkpRows.length === 3 &&
+      e18BkpRows[0].set_depth === 12.5 && e18BkpRows[1].set_depth === 13.5 && e18BkpRows[2].set_depth === 7.25 &&
+      e18BkpRows[2].product_code === 'P-E18-B',
+      e18BkpProblem || `备份内 standard 列=[${e18BkpCols.join(', ')}]，行数=${e18BkpRows.length}，` +
+      `set_depth=${e18BkpRows.map(r => r.set_depth).join('/')}`);
+
+    /* 备份**不挡路**：迁移照常完成（当前库已是新结构）—— 否则"备份"就成了新的阻断源 */
+    const e18LiveCols = db.listColumns(e18Keep.db, 'standard');
+    t.check('E18①c：备份**不挡路** —— 备份之后迁移照常完成（当前库已是新结构、旧列消失、结构版本＝SCHEMA_VERSION）',
+      e18LiveCols.includes('version_no') && e18LiveCols.includes('process_code') &&
+      !e18LiveCols.includes('set_depth') && db.getSchemaVersion(e18Keep.db) === SCHEMA_VERSION,
+      `当前库列=[${e18LiveCols.join(', ')}]，版本=${db.getSchemaVersion(e18Keep.db)}`);
+
+    /* 判据④：可审计 —— `op_log` 里能查到"备份文件路径 + 原因 + 结果"。
+       注意：旧库的 `op_log` 在备份发生时**还没有 team_code 列**（补列在 schema.sql 之后），
+       故这条留痕走的是 `db/index.js` 的兼容插入路径（`audit.compat=true`）—— 断言把它一并锁住：
+       "最需要留痕的场合（旧库迁移）留痕不得丢"。 */
+    const e18Audit = opLogRepo.list(e18Keep.db, { opType: db.PRE_MIGRATION_BACKUP_OP_TYPE }, { limit: 20 });
+    t.check('E18④：备份动作与结果写 `op_log`（`op_type=迁移前备份`；content 含**备份文件路径、原因、结果**），可查询；' +
+      '且这条留痕在"旧库 op_log 尚无 team_code"时也写得进去（兼容路径 compat=true，team_code 留 NULL）',
+      e18Audit.length === 1 && e18Audit[0].result === '成功' &&
+      String(e18Audit[0].content).includes(e18Pre.name) &&
+      String(e18Audit[0].content).includes('standard 是旧结构') &&
+      String(e18Audit[0].content).includes('结果=成功') &&
+      e18Audit[0].teamCode === null &&
+      e18Pre.audit.compat === true &&
+      /* F19-5 对照：本来就有 `op_log` 表的库 ⇒ 迁移前那次审计成功 ⇒ **不得**再补写（仍恰 1 行、无 backfill） */
+      e18Pre.auditBackfilled === false && e18Pre.backfillAudit === null &&
+      !String(e18Audit[0].content).includes('backfill'),
+      `op_log=#${e18Audit[0] && e18Audit[0].id}｜${e18Audit[0] && e18Audit[0].opType}｜${e18Audit[0] && e18Audit[0].result}｜` +
+      `auditBackfilled=${e18Pre.auditBackfilled}｜${e18Audit[0] && e18Audit[0].content}`);
+
+    /* 判据③：无迁移时**不再**产出备份（幂等）。
+       D22 变异点：把触发判据改成"无条件备份"（去掉 `plan.needed` 分支）⇒ 本行变红（目录会变成 2 份）。 */
+    const e18Second = db.initSchema(e18Keep.db, NOW, { backupDir: e18BackupDir, now: e18Clock.now() });
+    const e18SecondPre = e18Second.preMigrationBackup;
+    t.check('E18③：**无迁移时的再次 initSchema 不产生备份**（幂等）—— 第二次 `needed=false`/`path=null`/' +
+      '`migration.migrated=false`，目录里仍是那 1 份',
+      e18SecondPre.needed === false && e18SecondPre.path === null &&
+      maintain.listBackups(e18BackupDir).length === 1 &&
+      e18Second.migration.migrated === false && e18SecondPre.audit === null,
+      `第二次 needed=${e18SecondPre.needed}、path=${JSON.stringify(e18SecondPre.path)}、` +
+      `目录 ${maintain.listBackups(e18BackupDir).length} 份、migration=${JSON.stringify(e18Second.migration)}`);
+  }
+  e18Keep.close();
+
+  /* ③b：**空库首建**也不需要备份（没有可丢的数据）—— 否则"每次首次启动都多一份备份" */
+  const e18Fresh = makeTempDb({ name: 'e18-fresh' });
+  const e18FreshDir = path.join(e18Fresh.dir, 'backup');
+  const e18Fresh1 = db.initSchema(e18Fresh.db, NOW, { backupDir: e18FreshDir, now: e18Clock.now() });
+  const e18Fresh2 = db.initSchema(e18Fresh.db, NOW, { backupDir: e18FreshDir, now: e18Clock.now() });
+  t.check('E18③b：**空库首建**不需要迁移前备份（没有可丢的数据）—— 首建 `needed=false` 且**目录根本没被创建**；' +
+    '紧接着的重复初始化同样不产出备份',
+    e18Fresh1.preMigrationBackup.needed === false && e18Fresh2.preMigrationBackup.needed === false &&
+    (!fs.existsSync(e18FreshDir) || maintain.listBackups(e18FreshDir).length === 0) &&
+    e18Fresh1.migration.migrated === false,
+    `首建 needed=${e18Fresh1.preMigrationBackup.needed}、目录存在=${fs.existsSync(e18FreshDir)}`);
+
+  /* 判据②：备份失败 ⇒ **抛错中止**（两种造错方式：注入备份函数 / 备份目录不可写） */
+  const e18Fail = makeTempDb({ name: 'e18-legacy-fail', initSql: [LEGACY_STANDARD_SQL, LEGACY_OPLOG_SQL] });
+  seedLegacyStandard(e18Fail.db, LEGACY_ROWS);
+  const e18FailSnapshot = () => JSON.stringify({
+    cols: db.listColumns(e18Fail.db, 'standard'),
+    rows: e18Fail.db.prepare('SELECT * FROM standard ORDER BY id').all(),
+    tables: db.listTables(e18Fail.db).slice().sort(),
+    version: db.getSchemaVersion(e18Fail.db)
+  });
+  const e18Before = e18FailSnapshot();
+  let e18Threw = null;
+  try {
+    db.initSchema(e18Fail.db, NOW, {
+      backupDir: path.join(e18Fail.dir, 'backup'), now: e18Clock.now(),
+      backup: () => { throw new Error('注入的备份故障（自检用）'); }
+    });
+  } catch (err) { e18Threw = err; }
+  t.check('E18②：备份失败 ⇒ **抛错并中止迁移**（`code=PRE_MIGRATION_BACKUP_FAILED`，信息写明"已中止、业务数据一行不动' +
+    '（仅追加 1 条 E18 失败留痕）" —— 措辞按 F17-4 修正），**不是**"写不出就跳过备份继续迁移"',
+    Boolean(e18Threw) && e18Threw.code === 'PRE_MIGRATION_BACKUP_FAILED' &&
+    /已\*\*中止\*\*/.test(e18Threw.message) && /注入的备份故障/.test(e18Threw.message),
+    e18Threw ? `${e18Threw.code}｜${e18Threw.message}` : '（竟未抛错 —— 缺陷）');
+  t.check('E18②b：中止后**业务数据原样完整** —— `standard` 仍是旧结构、3 行一行不丢（逐列快照相等）、' +
+    '无 standard_legacy 残表、结构版本未升（`op_log` 里则**追加了 1 条** E18 失败留痕，见下一条）',
+    e18FailSnapshot() === e18Before &&
+    !db.listTables(e18Fail.db).includes('standard_legacy') &&
+    db.getSchemaVersion(e18Fail.db) === null,
+    `中止前后快照相同=${e18FailSnapshot() === e18Before}；表=[${db.listTables(e18Fail.db).join(', ')}]；` +
+    `版本=${JSON.stringify(db.getSchemaVersion(e18Fail.db))}`);
+  t.check('E18②c：备份**失败也留痕**（`op_log` 里 `result=失败` + 错误原因），审计不因中止而缺失',
+    (() => {
+      const rows = opLogRepo.list(e18Fail.db, { opType: db.PRE_MIGRATION_BACKUP_OP_TYPE }, { limit: 20 });
+      return rows.length === 1 && rows[0].result === '失败' &&
+        String(rows[0].content).includes('注入的备份故障') &&
+        String(rows[0].content).includes('结果=失败');
+    })(),
+    JSON.stringify(opLogRepo.list(e18Fail.db, { opType: db.PRE_MIGRATION_BACKUP_OP_TYPE }, { limit: 20 })
+      .map(r => ({ result: r.result, content: r.content }))));
+  /* 第二种造错方式：备份目录**不可写**（路径被同名文件占位 ⇒ mkdir ENOTDIR/EEXIST）。
+     D22 变异点：把 `backupToSync` 的 `fs.mkdirSync` 去掉、或让 `runPreMigrationBackup` 吞掉异常 ⇒ 本行变红。 */
+  const e18NotADir = path.join(e18Fail.dir, 'not-a-dir');
+  fs.writeFileSync(e18NotADir, 'occupies the path');
+  let e18DirThrew = null;
+  try {
+    db.initSchema(e18Fail.db, NOW, { backupDir: e18NotADir, now: e18Clock.now() });
+  } catch (err) { e18DirThrew = err; }
+  t.check('E18②d：备份**目录不可写**（路径被同名文件占位）同样**中止迁移**，且业务数据仍未被改动（快照不变）',
+    Boolean(e18DirThrew) && e18DirThrew.code === 'PRE_MIGRATION_BACKUP_FAILED' &&
+    /EEXIST|ENOTDIR|not a directory|already exists/i.test(e18DirThrew.message) &&
+    e18FailSnapshot() === e18Before,
+    e18DirThrew ? e18DirThrew.message : '（竟未抛错 —— 缺陷）');
+
+  /* 第三种造错方式：**库文件路径推导不出来**（内存库）—— 迁移前备份不可跳过，这时宁可中止，
+     也**不得**退化成"备份到当前工作目录"（那会把备份文件写进仓库工作目录，比不备份更糟）。
+     D22 变异点：把 `runPreMigrationBackup()` 里"取不到库文件路径就抛错"改成 `dir = '.'` ⇒ 本行变红。 */
+  {
+    const { DatabaseSync } = require('node:sqlite');
+    const mem = new DatabaseSync(':memory:');
+    mem.exec(LEGACY_STANDARD_SQL);
+    mem.exec(LEGACY_OPLOG_SQL);
+    seedLegacyStandard(mem, LEGACY_ROWS.slice(0, 2));
+    const before = JSON.stringify({
+      cols: mem.prepare("SELECT name FROM pragma_table_info('standard')").all().map(r => r.name),
+      rows: mem.prepare('SELECT * FROM standard ORDER BY id').all()
+    });
+    let memThrew = null;
+    try { db.initSchema(mem, NOW, { now: e18Clock.now() }); } catch (err) { memThrew = err; }
+    const after = JSON.stringify({
+      cols: mem.prepare("SELECT name FROM pragma_table_info('standard')").all().map(r => r.name),
+      rows: mem.prepare('SELECT * FROM standard ORDER BY id').all()
+    });
+    t.check('E18②e：**库文件路径推导不出来**（内存库）时同样**中止迁移**，且**不把备份落到当前工作目录**' +
+      '（错误信息指明"无法确定库文件路径"）；旧数据原样',
+      Boolean(memThrew) && memThrew.code === 'PRE_MIGRATION_BACKUP_FAILED' &&
+      /无法确定库文件路径/.test(memThrew.message) && before === after,
+      memThrew ? `${memThrew.code}｜${memThrew.message.slice(0, 120)}` : '（竟未抛错 —— 缺陷）');
+    mem.close();
+  }
+  /* "不可跳过"本身也是判据：显式要求跳过 ⇒ 抛错（拒绝"关掉备份让迁移过去"） */
+  t.check('E18：迁移前备份**不可跳过** —— 显式传 `skipBackup:true` 即抛错（该开关**只用于拒绝**，不是后门）',
+    (() => {
+      try { db.initSchema(e18Fresh.db, NOW, { skipBackup: true }); return false; }
+      catch (err) { return /不可跳过/.test(err.message); }
+    })(),
+    'skipBackup:true ⇒ 抛错「迁移前备份**不可跳过**」');
+
+  /* **F17-3 ＋ F19-5**：极旧的库里可能**连 `op_log` 表都还没有** ⇒ 迁移前那次审计必然失败。
+     · F17-3：db 层**就地** `logger.warn` 告警 ＋ 返回值带 `auditDegraded:true`（不得静默），**迁移照常**；
+     · F19-5：迁移成功、`op_log` 表建好之后，**补写**一条留痕（内容标注 `backfill（迁移后补写）`），
+       把"可审计"从易失告警补成落库事实。
+     D22 变异点（副本上做）：①`auditOrWarn()` 换回裸 `appendBackupLog()` ⇒ 告警丢；
+     ②把 `initSchema()` 里的补写分支改成 `if (false)` ⇒ 补写行丢（两个方向各一组）。 */
+  {
+    const e18NoLog = makeTempDb({ name: 'e18-no-oplog', initSql: [LEGACY_STANDARD_SQL] });
+    seedLegacyStandard(e18NoLog.db, LEGACY_ROWS.slice(0, 2));
+    const e18Warns = [];
+    let e18NoLogInfo = null;
+    let e18NoLogThrew = null;
+    try {
+      e18NoLogInfo = db.initSchema(e18NoLog.db, NOW, {
+        backupDir: path.join(e18NoLog.dir, 'backup'), now: e18Clock.now(),
+        logger: { warn: m => e18Warns.push(String(m)) }
+      });
+    } catch (err) { e18NoLogThrew = err; }
+    const e18NoLogPre = e18NoLogInfo && e18NoLogInfo.preMigrationBackup;
+    /* 迁移后 `op_log` 已存在 ⇒ 应恰有 1 条补写行，且内容含 backfill */
+    const e18BackfillRows = e18NoLogThrew ? [] : opLogRepo.list(
+      e18NoLog.db, { opType: db.PRE_MIGRATION_BACKUP_OP_TYPE }, { limit: 20 });
+    t.check('E18/F17-3：库内**没有 `op_log` 表**（极旧库）⇒ 迁移前审计写入必然失败，此时必须**显式告警出口**' +
+      '（注入的 `logger.warn` 收到告警、返回值带 `auditDegraded:true`）—— 不得静默吞掉；' +
+      '同时备份与迁移**照常完成**（"审计不了"不等于"不许迁移"）',
+      e18NoLogThrew === null && Boolean(e18NoLogPre) &&
+      e18NoLogPre.ok === true && e18NoLogPre.audit.ok === false && e18NoLogPre.auditDegraded === true &&
+      /no such table|op_log/i.test(String(e18NoLogPre.audit.error)) &&
+      e18Warns.length === 1 && /审计留痕写入失败/.test(e18Warns[0]) &&
+      Boolean(e18NoLogInfo.migration) && e18NoLogInfo.migration.migrated === true &&
+      fs.existsSync(e18NoLogPre.path) && e18NoLogPre.bytes > 0,
+      e18NoLogThrew ? `抛异常（缺陷）：${e18NoLogThrew.message}`
+        : `audit=${JSON.stringify(e18NoLogPre && e18NoLogPre.audit)}｜auditDegraded=${e18NoLogPre && e18NoLogPre.auditDegraded}｜` +
+          `migration=${JSON.stringify(e18NoLogInfo && e18NoLogInfo.migration)}｜告警=${JSON.stringify(e18Warns)}`);
+    t.check('E18/F19-5：迁移成功且**迁移前审计失败**时 ⇒ `initSchema()` 在 `op_log` 建好后**补写**一条 E18 留痕：' +
+      '返回值 `auditBackfilled=true` ＋ `backfillAudit.ok=true`，库里**恰 1 行** `迁移前备份` 且 `content` 含 `backfill`' +
+      '（把"可审计"从易失告警补成落库事实；不改变"审计不了也不中止迁移"的既定口径）',
+      e18NoLogThrew === null && Boolean(e18NoLogPre) &&
+      e18NoLogPre.auditBackfilled === true &&
+      Boolean(e18NoLogPre.backfillAudit) && e18NoLogPre.backfillAudit.ok === true &&
+      Number.isInteger(e18NoLogPre.backfillAudit.id) &&
+      e18BackfillRows.length === 1 && e18BackfillRows[0].result === '成功' &&
+      String(e18BackfillRows[0].content).includes('backfill') &&
+      String(e18BackfillRows[0].content).includes(String(e18NoLogPre.name)),
+      e18NoLogThrew ? `抛异常（缺陷）：${e18NoLogThrew.message}`
+        : `auditBackfilled=${e18NoLogPre && e18NoLogPre.auditBackfilled}｜` +
+          `backfillAudit=${JSON.stringify(e18NoLogPre && e18NoLogPre.backfillAudit)}｜` +
+          `补写行=${JSON.stringify(e18BackfillRows.map(r => ({ op: r.opType, result: r.result, content: String(r.content).slice(0, 90) })))}`);
+    e18NoLog.close();
+  }
+  e18Fail.close();
+  e18Fresh.close();
+
+  /* ---------------- 九之二、E44 备份文件名同秒不覆盖 ----------------
+     技术债 E44 原文：`db-check` 的「保留策略只保留最近 N 份」在压测下偶发红，根因＝备份文件名**秒级**
+     （同一秒内多次备份**同名互相覆盖**，于是"连做 N 次"实际只剩 1 份）。
+     本节判据：同一秒（连毫秒都相同）内连做 5 次备份 ⇒ **5 个不同文件**，保留策略仍只保留最近 N 份；
+     并且**两条备份路径（异步 `backupTo` / 同步 `backupToSync`）都要满足** —— 只修一条 = 另一条照样覆盖。 */
+  t.section('九之二、E44 备份文件名同秒不覆盖（毫秒 + 冲突递增探测）');
+  const e44Dir = makeTempDir('e44-backup');
+  const e44Same = new Date(2026, 8, 19, 10, 0, 0);      // 同一秒、同一毫秒
+  const e44Names = [];
+  for (let i = 0; i < 5; i++) {
+    const b = await maintain.backupTo(handle.db, e44Dir, { now: e44Same });
+    e44Names.push(b.name);
+  }
+  t.check('E44①：**同一秒（同一毫秒）内连做 5 次备份 ⇒ 5 个不同文件**，5 份都真的落盘 ' +
+    '（改前实测：秒级命名下这 5 次只剩 1 份 ⇒ `listBackups` 只数到 1）',
+    new Set(e44Names).size === 5 && maintain.listBackups(e44Dir).length === 5 &&
+    e44Names.every(n => fs.existsSync(path.join(e44Dir, n))),
+    `5 次备份文件名=[${e44Names.join(', ')}]；目录内 ${maintain.listBackups(e44Dir).length} 份`);
+  t.check('E44②：文件名带**毫秒**段 `board-YYYYMMDD-HHmmss-SSS.db`，且 **字典序＝时间序**' +
+    '（保留策略按名字倒排删除，"删最旧"才删得对）；同毫秒冲突按 1 ms **递增探测**而不是加序号后缀',
+    e44Names.every(n => maintain.BACKUP_FILE_RE.test(n)) &&
+    JSON.stringify(e44Names.slice().sort()) === JSON.stringify(e44Names) &&
+    e44Names[0] === 'board-20260919-100000-000.db' &&
+    e44Names[1] === 'board-20260919-100000-001.db' &&
+    e44Names[4] === 'board-20260919-100000-004.db',
+    `名字=${e44Names.join(', ')}`);
+  const e44Pruned = maintain.pruneBackups(e44Dir, 2);
+  const e44Kept = maintain.listBackups(e44Dir).map(b => b.name).sort();
+  t.check('E44③：保留策略**仍只保留最近 N 份**（5 份 ⇒ 保留 2 份、删除 3 份），且删掉的正是**最旧**的 3 份' +
+    '（同秒内按毫秒序判定，不是随机删）',
+    e44Pruned.kept === 2 && e44Pruned.removed.length === 3 &&
+    JSON.stringify(e44Pruned.removed.slice().sort()) === JSON.stringify(e44Names.slice(0, 3).sort()) &&
+    JSON.stringify(e44Kept) === JSON.stringify(e44Names.slice(3).sort()),
+    `保留=[${e44Kept.join(', ')}]；删除=[${e44Pruned.removed.join(', ')}]`);
+
+  /* 同步形态（E18 迁移前备份走的那条路）必须同样满足：只修异步那条 = 迁移前备份照样同秒覆盖。
+     逐次 try/catch：`VACUUM INTO` 遇到已存在的目标会**直接报错**（这是它天然不覆盖的一面），
+     故"覆盖缺陷"在这一路会表现为**异常**而不是静默少一份 —— 断言把它转成可指的 FAIL，
+     不让整个自检脚本崩在异常上（"跳过不是通过"，崩溃更不是）。 */
+  const e44SyncDir = makeTempDir('e44-sync');
+  const e44SyncNames = [];
+  const e44SyncErrors = [];
+  for (let i = 0; i < 5; i++) {
+    try { e44SyncNames.push(maintain.backupToSync(handle.db, e44SyncDir, { now: e44Same }).name); }
+    catch (err) { e44SyncErrors.push(err && err.message ? err.message : String(err)); }
+  }
+  t.check('E44④：`backupToSync`（E18 的同步形态）同样"同秒 5 次 ⇒ 5 个不同文件"（两条备份路径不得只修一条）',
+    new Set(e44SyncNames).size === 5 && maintain.listBackups(e44SyncDir).length === 5 &&
+    e44SyncErrors.length === 0 && e44SyncNames.every(n => maintain.BACKUP_FILE_RE.test(n)),
+    `同步形态 5 次=[${e44SyncNames.join(', ')}]${e44SyncErrors.length ? '｜异常：' + e44SyncErrors.join(' / ') : ''}`);
+
+  /* 两种形态**产物等价可用**（都完整、表集相同）：佐证"同步形态不是第二套备份实现"，而是同一套能力的同步入口。
+     ⚠ 两次调用都 try/catch：同步形态用的是 `VACUUM INTO`，**目标已存在时它直接抛错**（正是它"不覆盖"的一面），
+     故"冲突探测被改坏"这组变异会在这里抛异常而不是静默少一份 —— 断言把它收成可指的 FAIL，
+     绝不让整个自检脚本崩在异常上（D22 取证时"崩溃"会把汇总行一起丢掉）。 */
+  const e44EqDir = makeTempDir('e44-eq');
+  const e44EqErrors = [];
+  let e44AsyncOne = null;
+  let e44SyncOne = null;
+  try { e44AsyncOne = await maintain.backupTo(handle.db, e44EqDir, { now: e44Same }); }
+  catch (err) { e44EqErrors.push('异步：' + (err && err.message ? err.message : String(err))); }
+  try { e44SyncOne = maintain.backupToSync(handle.db, e44EqDir, { now: e44Same }); }
+  catch (err) { e44EqErrors.push('同步：' + (err && err.message ? err.message : String(err))); }
+  const e44VerifyAsync = e44AsyncOne ? maintain.verifyBackup(e44AsyncOne.path) : { ok: false, detail: '未生成备份', tables: 0 };
+  const e44VerifySync = e44SyncOne ? maintain.verifyBackup(e44SyncOne.path) : { ok: false, detail: '未生成备份', tables: 0 };
+  t.check('E44⑤/交付说明：`backupTo`（异步内置 backup API）与 `backupToSync`（同步 VACUUM INTO）**产物等价可用** —— ' +
+    '两份备份都能打开、`integrity_check=ok`、表数相同且覆盖需求点名的表；两者落在**同一目录**也不互相覆盖（E44 在两条路径上都生效）',
+    e44EqErrors.length === 0 && e44VerifyAsync.ok && e44VerifySync.ok &&
+    e44VerifyAsync.tables === e44VerifySync.tables &&
+    e44VerifySync.tables >= REQUIRED_TABLES.length &&
+    Boolean(e44AsyncOne) && Boolean(e44SyncOne) &&
+    e44AsyncOne.name !== e44SyncOne.name && maintain.listBackups(e44EqDir).length === 2,
+    `异步=${JSON.stringify(e44VerifyAsync)}；同步=${JSON.stringify(e44VerifySync)}；` +
+    `同目录两份=${e44AsyncOne && e44AsyncOne.name} / ${e44SyncOne && e44SyncOne.name}` +
+    `${e44EqErrors.length ? '｜异常：' + e44EqErrors.join(' / ') : ''}`);
+
+  /* 历史（秒级）文件名仍被识别：升级不得把旧备份变成"看不见"的文件（既不清也不列） */
+  const e44LegacyDir = makeTempDir('e44-legacy-name');
+  if (e44SyncOne) fs.copyFileSync(e44SyncOne.path, path.join(e44LegacyDir, 'board-20260919-100000.db'));
+  t.check('E44⑥：历史**秒级**备份名 `board-YYYYMMDD-HHmmss.db` 仍被 `listBackups` / 保留策略识别' +
+    '（旧备份不因升级而失联）',
+    maintain.listBackups(e44LegacyDir).length === 1 &&
+    maintain.pruneBackups(e44LegacyDir, 5).kept === 1,
+    `历史名目录内 ${maintain.listBackups(e44LegacyDir).length} 份`);
+
+  /* **F17-1**（复核中危）：`backupToSync` 的失败清理原来是**无条件** `rmSync(target)` ——
+     在"显式传 `name` 且同名文件已存在"这条路径上会把**既有备份删掉**（复核实测：预置一份 → VACUUM 报
+     `output file already exists` → catch 删掉了它，目录 1 份 → 0 份）。现在：目标已存在 ⇒ **拒绝且不碰**。
+     D22 变异点（副本上做）：把 `backupToSync()` 的 `existedBefore` 早退去掉、恢复无条件 rmSync ⇒ 本行变红。 */
+  const e44PreDir = makeTempDir('e44-preexisting');
+  const e44PreName = 'board-20260919-100000-000.db';
+  const e44PreFile = path.join(e44PreDir, e44PreName);
+  {
+    /* 预置一份**合法的 SQLite 库**（带标记表 `mark`）—— 不能用随便一段文本：
+       异步 `backup()` 会把目标当库打开（首版用文本 ⇒ 报 `file is not a database`），
+       而"合法库 + 标记表"能在下面确定性证明"异步确实**覆盖**了它"（标记表消失）。 */
+    const { DatabaseSync: PreDb } = require('node:sqlite');
+    const pre = new PreDb(e44PreFile);
+    pre.exec('CREATE TABLE mark(x INTEGER)');
+    pre.exec('INSERT INTO mark(x) VALUES(1)');
+    pre.close();
+  }
+  const e44PreBytes = fs.readFileSync(e44PreFile);
+  let e44PreThrew = null;
+  try {
+    maintain.backupToSync(handle.db, e44PreDir, { name: e44PreName, now: e44Same });
+  } catch (err) { e44PreThrew = err; }
+  const e44PreAfter = fs.existsSync(e44PreFile) ? fs.readFileSync(e44PreFile) : null;
+  t.check('E44/F17-1：`backupToSync` 遇到**已存在的同名文件** ⇒ 抛错**拒绝覆盖**，且那份既有备份' +
+    '**逐字节原样仍在**（旧写法在 catch 里无条件 `rmSync` ⇒ 会把它删掉：目录 1 份 → 0 份）',
+    Boolean(e44PreThrew) && /拒绝覆盖既有文件/.test(e44PreThrew.message) &&
+    e44PreAfter !== null && e44PreAfter.equals(e44PreBytes) &&
+    maintain.listBackups(e44PreDir).length === 1,
+    e44PreThrew ? `${e44PreThrew.message.slice(0, 130)}｜既有文件字节不变=${Boolean(e44PreAfter && e44PreAfter.equals(e44PreBytes))}`
+      : '（竟未抛错 —— 缺陷）');
+  /* 对照（同名语义**故意不同**，两条都写死在 maintain.js 注释里）：异步 `backupTo` 命中同名 ⇒ 按原样覆盖。
+     判据用"标记表 `mark` 消失 + 覆盖后是可用备份"来证，而不是比字节（同一逻辑状态产出的备份可能逐字节相同）。 */
+  const e44Overwrite = await maintain.backupTo(handle.db, e44PreDir, { name: e44PreName, now: e44Same });
+  const e44OverwriteCheck = (() => {
+    const { DatabaseSync: PostDb } = require('node:sqlite');
+    const c = new PostDb(e44PreFile);
+    try {
+      const mark = c.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='mark'").get().c;
+      const oplog = c.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table' AND name='op_log'").get().c;
+      return { mark: Number(mark), oplog: Number(oplog) };
+    } finally { c.close(); }
+  })();
+  t.check('E44/F17-1（对照）：异步 `backupTo` 显式同名 ⇒ **按原样覆盖**（预置的标记表 `mark` 消失、' +
+    '覆盖后是可用备份）—— 两条路径的同名语义不同且都在注释里写死，避免"以为两边一样"',
+    e44Overwrite.name === e44PreName && maintain.verifyBackup(e44Overwrite.path).ok &&
+    e44OverwriteCheck.mark === 0 && e44OverwriteCheck.oplog === 1,
+    `覆盖后 mark 表=${e44OverwriteCheck.mark}、op_log 表=${e44OverwriteCheck.oplog}、` +
+    `verifyBackup=${maintain.verifyBackup(e44Overwrite.path).ok}`);
+
+  /* **F17-5**（复核低危）：同一秒内"**秒级名（历史）vs 毫秒名（当前）**"混排时，次序键必须**优先 mtime** ——
+     名字归一化会把秒级名当"最新"（SSS=999），只看名字就会**把真正最新的毫秒名那份删掉**。
+     本用例刻意造出"名字序 与 mtime 序**相反**"：毫秒名（名字更旧）落盘**更晚**、秒级名（名字更新）落盘更早。
+     D22 变异点（副本上做）：把 `listBackups()` 的排序改回"只按 `backupOrderKey`" ⇒ 本行变红
+     （会保留名字新的秒级名、删掉真正最新的毫秒名 —— 正是复核实测的那条危害）。 */
+  const e44MixDir = makeTempDir('e44-mixed-order');
+  const e44MixLegacy = path.join(e44MixDir, 'board-20260919-100000.db');        // 名字序＝最新（秒级，SSS 归一 999）
+  const e44MixMs = path.join(e44MixDir, 'board-20260919-100000-000.db');        // 名字序＝最旧（毫秒段 000）
+  fs.copyFileSync(e44SyncOne.path, e44MixLegacy);
+  fs.copyFileSync(e44SyncOne.path, e44MixMs);
+  const e44MixT0 = new Date(Date.now() - 5000);          // 夹具层用真实时间：mtime 必须与"刚刚"有可辨差距
+  fs.utimesSync(e44MixLegacy, e44MixT0, e44MixT0);       // 秒级名：**更早**落盘
+  fs.utimesSync(e44MixMs, new Date(), new Date());       // 毫秒名：**刚刚**落盘（真正最新）
+  const e44MixList = maintain.listBackups(e44MixDir);
+  const e44MixPruned = maintain.pruneBackups(e44MixDir, 1);
+  const e44MixKept = maintain.listBackups(e44MixDir).map(b => b.name);
+  t.check('E44/F17-5：同一秒内**秒级名（历史）与毫秒名（当前）混排**时，保留策略按 **mtime** 判新旧 —— ' +
+    '毫秒名虽"名字更旧"但落盘更晚 ⇒ 必须**保留它、删掉落盘更早的秒级名那份**' +
+    '（只看名字会反过来删掉真正最新的备份，即复核实测的那条危害）',
+    e44MixList[0] && e44MixList[0].name === 'board-20260919-100000-000.db' &&
+    e44MixKept.length === 1 && e44MixKept[0] === 'board-20260919-100000-000.db' &&
+    e44MixPruned.removed.length === 1 && e44MixPruned.removed[0] === 'board-20260919-100000.db',
+    `排序后首份=${e44MixList[0] && e44MixList[0].name}；保留=[${e44MixKept.join(', ')}]；` +
+    `删除=[${e44MixPruned.removed.join(', ')}]`);
+
+  /* **F19-3**（结案复跑残留）：**mtime 回拨**时不得误删"名字更新"的那份 —— 复跑实测反证：
+     只按 mtime 排序时，"名字更新（…100001-000）但 mtime 更早"的备份会被 `pruneBackups(dir,1)` 删掉。
+     现在次序键＝`max(mtime, 名字声称时刻)` ⇒ **名字新**与**落盘新**任一为真都算新（两个方向都不误删）。
+     D22 变异点（副本上做）：把 `backupOrderMs()` 退回纯 `entry.mtimeMs` ⇒ 本行变红。 */
+  const e44RollDir = makeTempDir('e44-mtime-rollback');
+  const e44RollNow = new Date();
+  const e44RollNewName = maintain.backupName(new Date(e44RollNow.getTime() + 2000));   // 名字声称：+2 s
+  const e44RollOldName = maintain.backupName(new Date(e44RollNow.getTime() + 1000));   // 名字声称：+1 s
+  fs.copyFileSync(e44SyncOne.path, path.join(e44RollDir, e44RollNewName));
+  fs.copyFileSync(e44SyncOne.path, path.join(e44RollDir, e44RollOldName));
+  const e44RollBack = new Date(e44RollNow.getTime() - 10000);   // 把"名字更新"的那份 mtime **回拨 10 s**
+  fs.utimesSync(path.join(e44RollDir, e44RollNewName), e44RollBack, e44RollBack);
+  fs.utimesSync(path.join(e44RollDir, e44RollOldName), e44RollNow, e44RollNow);
+  const e44RollList = maintain.listBackups(e44RollDir);
+  const e44RollPruned = maintain.pruneBackups(e44RollDir, 1);
+  const e44RollKept = maintain.listBackups(e44RollDir).map(b => b.name);
+  t.check('E44/F19-3：**mtime 回拨**（名字更新但落盘更早）⇒ 保留策略仍必须**保留名字更新的那份**' +
+    '（次序键＝max(mtime, 名字声称时刻)：只看 mtime 会删掉它 —— 复跑反证的那条）',
+    e44RollList[0] && e44RollList[0].name === e44RollNewName &&
+    e44RollKept.length === 1 && e44RollKept[0] === e44RollNewName &&
+    e44RollPruned.removed.length === 1 && e44RollPruned.removed[0] === e44RollOldName &&
+    maintain.backupNameTimeMs(e44RollNewName) > maintain.backupNameTimeMs(e44RollOldName),
+    `名字新=${e44RollNewName}（mtime 回拨 10 s）｜名字旧=${e44RollOldName}（mtime 现在）；` +
+    `保留=[${e44RollKept.join(', ')}]；删除=[${e44RollPruned.removed.join(', ')}]`);
+
+  /* 本段收尾：自建的备份目录用完即删 —— `makeTempDir()` 只建不回收（能回收的是 `makeTempDb` 的句柄），
+     不删就会在临时区里堆 e44-* 目录（与第十节"临时区与残留"的口径一致）。 */
+  const e44OwnDirs = [e44Dir, e44SyncDir, e44EqDir, e44LegacyDir, e44PreDir, e44MixDir, e44RollDir];
+  for (const d of e44OwnDirs) {
+    try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* 删不掉要能看见，故下面单独断言 */ }
+  }
+  t.check('E44：本段自建的备份目录（含同秒 5 份的那几个）用完即删，临时区不留 e44-* 残留',
+    e44OwnDirs.every(d => !fs.existsSync(d)),
+    e44OwnDirs.map(d => `${path.basename(d)}=${fs.existsSync(d) ? '仍在' : '已删'}`).join('，'));
+
+  /* ---------------- 九之三、鉴权（ADR-0007：scrypt 哈希 / 错误次数锁定 / 内存会话令牌 / 本机一次性初始化） ----------------
+     本节覆盖 ADR-0007 **D6.2** 点名的五类判据（①哈希非明文 ②错误次数 ③令牌 ④未初始化态 ⑤与 IF-A 静态令牌
+     互不通用）＋ D6.3 的留痕口径（六类各一条、含来源 IP），并补 `POST /auth/*` 的 HTTP 端到端最小集。
+     全部走**注入时钟**（ADR-0003 D17）：本节的锁定到期、令牌过期、滑动续期都靠 `clock.advanceXxx()` 复现，
+     不读真实墙钟 ⇒ 任何时刻跑都稳定。**一用例一库**：鉴权用独立临时库（服务端模式口径）。 */
+  t.section('九之三、鉴权（ADR-0007：scrypt / 错误次数锁定 / 内存会话令牌 / 一次性初始化）');
+  const AUTH_DB = makeTempDb({ name: 'auth' });
+  db.initSchema(AUTH_DB.db, NOW);
+  const authClock = createClock({ mode: 'fixed', at: '2026-09-19T10:00:00' });
+  const authLogLines = [];
+  const authLogger = {
+    info: m => authLogLines.push('info ' + m),
+    warn: m => authLogLines.push('warn ' + m),
+    error: m => authLogLines.push('error ' + m)
+  };
+  const AUTH_PW = 'W5-Auth-2026';
+  const AUTH_PW2 = 'W5-Auth-Second-2026';
+  const createAuthSvc = (over = {}) => authSvc.createAuth(Object.assign({
+    db: AUTH_DB.db, logger: authLogger, now: authClock.source()
+  }, over));
+  const authUserId = authSvc.DEFAULT_USERNAME;
+  let auth = createAuthSvc();
+
+  /* ---- ④ 未初始化态（D4）：无凭证行；init 才可建立；非回环/错码一律拒 ---- */
+  const authStatus0 = auth.status();
+  const authCode0 = auth.initCode();
+  t.check('鉴权④：无凭证行 ⇒ **未初始化**态（`status.initialized=false`、`login` 一律 409 `not_initialized`）；' +
+    '服务对象创建时生成一次性初始化码（`randomBytes(6)` ⇒ 12 位 hex），且 **status 不下发码本身**',
+    authStatus0.initialized === false && authStatus0.initCodePending === true &&
+    auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).httpStatus === 409 &&
+    auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).error === 'not_initialized' &&
+    typeof authCode0 === 'string' && /^[0-9a-f]{12}$/.test(authCode0) &&
+    !JSON.stringify(authStatus0).includes(authCode0),
+    `initialized=${authStatus0.initialized}，initCodePending=${authStatus0.initCodePending}，` +
+    `码形状=${/^[0-9a-f]{12}$/.test(authCode0) ? '12 位 hex' : '异常'}`);
+  t.check('鉴权④：一次性初始化码**登记进 `op_log`**（`op_type=口令初始化码`，content 含码）—— 与"打印到控制台"同为 D4 的两条登记路径',
+    opLogRepo.list(AUTH_DB.db, { opType: authSvc.OP_TYPE.INIT_CODE }).length === 1,
+    `op_log 口令初始化码条数=${opLogRepo.list(AUTH_DB.db, { opType: authSvc.OP_TYPE.INIT_CODE }).length}`);
+  const initNonLoop = auth.init({ code: authCode0, password: AUTH_PW, remote: '192.168.1.20' });
+  t.check('鉴权④：**非回环即使带对码也拒**（403 `not_loopback`）—— 来源一律取 `req.socket.remoteAddress`、不信任何请求头',
+    initNonLoop.httpStatus === 403 && initNonLoop.error === 'not_loopback',
+    `HTTP ${initNonLoop.httpStatus} ${initNonLoop.error}`);
+  const initBadCode = auth.init({ code: 'deadbeefdead', password: AUTH_PW, remote: '127.0.0.1' });
+  const initBadPolicy = auth.init({ code: authCode0, password: 'ab', remote: '127.0.0.1' });
+  t.check('鉴权④：错码拒（401 `bad_init_code`）；码正确但口令不符合口径（2 位）拒（400 `bad_password`）',
+    initBadCode.httpStatus === 401 && initBadCode.error === 'bad_init_code' &&
+    initBadPolicy.httpStatus === 400 && initBadPolicy.error === 'bad_password' &&
+    !String(initBadPolicy.reason).includes('ab'),
+    `错码=${initBadCode.httpStatus}/${initBadCode.error}；短口令=${initBadPolicy.httpStatus}/${initBadPolicy.error}`);
+  const initOk = auth.init({ code: authCode0, password: AUTH_PW, remote: '::ffff:127.0.0.1' });
+  const authRow0 = AUTH_DB.db.prepare('SELECT * FROM auth_credential WHERE username = ?').get(authUserId);
+  /* ⚠ 以下三条对 `authRow0` 先做存在性守卫：变异取证时"凭证行没落库"必须表现为**变红的断言**，
+     而不是 `undefined.salt` 把自检脚本崩掉（首版在 AUTH-1/AUTH-10 两组变异上各崩过一次）。 */
+  const authRow0Salt = authRow0 ? authRow0.salt : '';
+  const authRow0Hash = authRow0 ? authRow0.hash : '';
+  t.check('鉴权①：对码 + 合法口令 ⇒ 成功（200）并落**一行**凭证：`algo=scrypt`、`params=N=16384,r=8,p=1,keylen=32`' +
+    '（**逐字**照 ADR-0007 D1）、`is_initial=1`、`fail_count=0`、`team_code` 取当前生效班次',
+    initOk.ok === true && initOk.initialized === true && Boolean(authRow0) &&
+    authRow0.algo === 'scrypt' && authRow0.params === 'N=16384,r=8,p=1,keylen=32' &&
+    authRow0.is_initial === 1 && authRow0.fail_count === 0 && authRow0.locked_until === null &&
+    AUTH_DB.db.prepare('SELECT COUNT(*) AS c FROM auth_credential').get().c === 1,
+    `列=${JSON.stringify({ algo: authRow0 && authRow0.algo, params: authRow0 && authRow0.params, is_initial: authRow0 && authRow0.is_initial, team_code: authRow0 && authRow0.team_code })}`);
+  t.check('鉴权①：库里 `salt`/`hash` **≠ 口令本身**（也不含口令子串）；`hash`＝32 字节派生值 hex、`salt`＝16 字节随机盐 hex；' +
+    '结构版本已升到 ' + SCHEMA_VERSION + ' 且新表为**纯新增**（旧库 `CREATE TABLE IF NOT EXISTS` 幂等生效）',
+    Boolean(authRow0) &&
+    authRow0Salt !== AUTH_PW && authRow0Hash !== AUTH_PW &&
+    !authRow0Hash.includes(AUTH_PW) && !authRow0Salt.includes(AUTH_PW) &&
+    /^[0-9a-f]{64}$/.test(authRow0Hash) && /^[0-9a-f]{32}$/.test(authRow0Salt) &&
+    db.getSchemaVersion(AUTH_DB.db) === SCHEMA_VERSION,
+    `salt=${authRow0Salt}（${authRow0Salt.length} hex），hash=${authRow0Hash}（${authRow0Hash.length} hex）`);
+  t.check('鉴权①：**同盐同口令派生可复现**（确定性函数，不是随机占位）；换口令则派生值不同',
+    Boolean(authRow0) &&
+    authSvc.derive(AUTH_PW, authRow0Salt) === authRow0Hash &&
+    authSvc.derive(AUTH_PW, authRow0Salt) === authSvc.derive(AUTH_PW, authRow0Salt) &&
+    authSvc.derive(AUTH_PW + 'X', authRow0Salt) !== authRow0Hash,
+    `derive(同口令,同盐) 与库内 hash 相同=${Boolean(authRow0) && authSvc.derive(AUTH_PW, authRow0Salt) === authRow0Hash}`);
+  t.check('鉴权①：口令明文**不在库文件字节里**（原始文件扫描）—— ADR-0007 D1"任何位置不得出现明文"',
+    !fs.readFileSync(AUTH_DB.path).includes(AUTH_PW) && !fs.readFileSync(AUTH_DB.path).includes(AUTH_PW2),
+    `扫描 ${fs.statSync(AUTH_DB.path).size} 字节：未出现口令串`);
+
+  /* ④ 续：码**成功后立即作废**。直接证据＝把凭证行删掉回到未初始化态，再用**同一个码**初始化 ⇒ 必须拒。
+     若只断言"第二次 init 返回 409"，那只证明了"已初始化"，证明不了"码已作废"（本用例就是为此设计的）。 */
+  AUTH_DB.db.exec('DELETE FROM auth_credential');     // D4 的"重置＝删行 + 重启"里的删行半步
+  const codeReuse = auth.init({ code: authCode0, password: AUTH_PW2, remote: '127.0.0.1' });
+  t.check('鉴权④：初始化码**成功后立即作废** —— 删行回到未初始化态后，同一个码再初始化 ⇒ 401 `bad_init_code`' +
+    '（不是"码还能再用一次"）',
+    codeReuse.httpStatus === 401 && codeReuse.error === 'bad_init_code',
+    `HTTP ${codeReuse.httpStatus} ${codeReuse.error}`);
+  /* 重启（新实例）⇒ 重新生成一次性初始化码；旧码在新实例上无效 */
+  auth = createAuthSvc({ silent: true });
+  const authCode1 = auth.initCode();
+  const oldCodeOnNew = auth.init({ code: authCode0, password: AUTH_PW, remote: '127.0.0.1' });
+  t.check('鉴权④：初始化码**仅内存、重启重新生成** —— 新实例的码 ≠ 旧实例的码，且**旧码在新实例上无效**（401）',
+    typeof authCode1 === 'string' && authCode1 !== authCode0 &&
+    /^[0-9a-f]{12}$/.test(authCode1) &&
+    oldCodeOnNew.httpStatus === 401 && oldCodeOnNew.error === 'bad_init_code',
+    `新码≠旧码=${authCode1 !== authCode0}；旧码在新实例=${oldCodeOnNew.httpStatus}/${oldCodeOnNew.error}`);
+  const initOk1 = auth.init({ code: authCode1, password: AUTH_PW, remote: '::1' });
+  t.check('鉴权④：新实例用**新码** + 合法口令 ⇒ 成功（回环三种写法 `::1` 亦可）；已初始化后再 init ⇒ 409 `already_initialized`',
+    initOk1.ok === true &&
+    (() => {
+      const again = auth.init({ code: authCode1, password: AUTH_PW2, remote: '127.0.0.1' });
+      return again.httpStatus === 409 && again.error === 'already_initialized';
+    })(),
+    `初始化=${initOk1.httpStatus}；二次 init=409 already_initialized`);
+
+  /* ---- ②/③ 登录、错误次数、锁定 ---- */
+  const authLogin1 = auth.login({ password: AUTH_PW, remote: '127.0.0.1' });
+  /* F17-7（复核低危）：原来这里带一句 `authSvc.TOKEN_BYTES === 32` —— 那是**实现常量自比**，
+     提供不了任何行为证据（改常量时断言跟着一起变，永远绿）。已删；token 的**行为证据**是下面
+     `/^[0-9a-f]{64}$/`（256 bit ⇒ 64 位 hex，来自真实登录返回）。 */
+  t.check('鉴权③：口令正确 ⇒ 200 `{token, username, expiresAt}`；令牌是 `randomBytes(32)` 的 hex（**64 位**，行为判据）；' +
+    'TTL 默认 12 h（`expiresAt` 由注入时钟算出）',
+    authLogin1.ok === true && authLogin1.username === authUserId &&
+    /^[0-9a-f]{64}$/.test(authLogin1.token) &&
+    authLogin1.expiresAt === '2026-09-19 22:00:00',
+    `token 长度=${String(authLogin1.token || '').length} hex，expiresAt=${authLogin1.expiresAt}`);
+  const authLogin2 = auth.login({ password: AUTH_PW, remote: '127.0.0.1' });
+  /* 详情一律 `String(x || '')` 兜底：变异取证时"登录失败 ⇒ token 为 undefined"必须是**一条变红的断言**，
+     而不是把自检脚本崩在 `.slice` 上（首版就崩过一次，取证日志因此丢了汇总行）。 */
+  t.check('鉴权③：两次登录的 token **不同**（真随机，不是固定串/可预测）',
+    authLogin1.token !== authLogin2.token,
+    `#1=${String(authLogin1.token || '').slice(0, 12)}… #2=${String(authLogin2.token || '').slice(0, 12)}…`);
+  const authWrong = auth.login({ password: 'definitely-wrong', remote: '10.20.30.40' });
+  const authUnknown = auth.login({ username: 'not-exist', password: AUTH_PW, remote: '10.20.30.40' });
+  t.check('鉴权②：口令错与**用户不存在**对外**不可区分**（都 401 `bad_credentials`，且不区分原因的字段都不出现）',
+    authWrong.httpStatus === 401 && authWrong.error === 'bad_credentials' &&
+    authUnknown.httpStatus === 401 && authUnknown.error === 'bad_credentials' &&
+    authUnknown.failCount === undefined,
+    `口令错=${authWrong.httpStatus}/${authWrong.error}；用户不存在=${authUnknown.httpStatus}/${authUnknown.error}`);
+  /* 4 次失败后正确口令仍可登录并**清零**（ADR-0007 D6.2 原文口径） */
+  for (let i = 0; i < 3; i++) auth.login({ password: 'wrong-' + i, remote: '127.0.0.1' });
+  t.check('鉴权②：连续 **4** 次失败仍未锁定（`fail_count=4`、`locked=false`）—— 阈值是"第 5 次触发锁定"',
+    auth.status().failCount === 4 && auth.status().locked === false,
+    `failCount=${auth.status().failCount}，locked=${auth.status().locked}`);
+  const authLoginAfter4 = auth.login({ password: AUTH_PW, remote: '127.0.0.1' });
+  t.check('鉴权②：第 5 次用**正确口令** ⇒ 登录成功且失败计数**清零**（D2："成功即清零"）',
+    authLoginAfter4.ok === true && auth.status().failCount === 0 && auth.status().locked === false,
+    `登录=${authLoginAfter4.httpStatus}，清零后 failCount=${auth.status().failCount}`);
+  /* 连续 5 次失败 ⇒ 第 5 次即锁定（423 + retryAfterSec 由注入时钟算出） */
+  const authFive = [];
+  for (let i = 0; i < 5; i++) authFive.push(auth.login({ password: 'bad-' + i, remote: '10.20.30.40' }));
+  t.check('鉴权②：连续 5 次失败 ⇒ 前 4 次 401、**第 5 次即触发锁定**（423 `locked` + `retryAfterSec=300` = `lockMinutes×60`）',
+    authFive.slice(0, 4).every(r => r.httpStatus === 401 && r.error === 'bad_credentials') &&
+    authFive[4].httpStatus === 423 && authFive[4].error === 'locked' &&
+    authFive[4].retryAfterSec === 300 && authFive[4].lockedUntil === '2026-09-19 10:05:00',
+    `前 4 次=${authFive.slice(0, 4).map(r => r.httpStatus).join('/')}；第 5 次=${authFive[4].httpStatus} ` +
+    `retryAfterSec=${authFive[4].retryAfterSec} lockedUntil=${authFive[4].lockedUntil}`);
+  const authLockedRight = auth.login({ password: AUTH_PW, remote: '127.0.0.1' });
+  const authLockSnapshot = AUTH_DB.db.prepare('SELECT fail_count, locked_until FROM auth_credential').get();
+  t.check('鉴权②：锁定期间**口令正确也拒**（423 + 剩余秒数）；且锁定期间的尝试**不再放大**失败计数（不会被无限延长）',
+    authLockedRight.httpStatus === 423 && authLockedRight.error === 'locked' &&
+    authLockedRight.retryAfterSec === 300 &&
+    authLockSnapshot.fail_count === 5 && authLockSnapshot.locked_until === '2026-09-19 10:05:00',
+    `正确口令在锁定中=${authLockedRight.httpStatus}（剩余 ${authLockedRight.retryAfterSec} s）；库内 fail_count=${authLockSnapshot.fail_count}`);
+  /* 重启不清零：**新建服务实例**（同一个库、新的内存会话表） */
+  const authRestart = createAuthSvc({ silent: true });
+  const authRestartLogin = authRestart.login({ password: AUTH_PW, remote: '127.0.0.1' });
+  t.check('鉴权②：**新建服务实例（模拟进程重启）计数不清零** —— `fail_count`/`locked_until` 落库，重启后仍锁定、' +
+    '正确口令仍被拒',
+    authRestart.status().failCount === 5 && authRestart.status().locked === true &&
+    authRestartLogin.httpStatus === 423 && authRestartLogin.retryAfterSec === 300,
+    `重启后 failCount=${authRestart.status().failCount}、locked=${authRestart.status().locked}、` +
+    `正确口令=${authRestartLogin.httpStatus}`);
+  /* 注入时钟推进 ⇒ 恢复；顺带锁住一条**口径细化**：锁定期满≠计数清零（只有"成功"才清零） */
+  authClock.advanceMin(6);
+  const authWrongAfterExpiry = auth.login({ password: 'still-wrong', remote: '127.0.0.1' });
+  t.check('鉴权②：锁定**到期后**的单次失败会立刻再次锁定（口径细化：`fail_count` 只有"登录成功"才清零 —— ' +
+    'ADR-0007 D2 原文"成功即清零"，没有别的清零路径）',
+    authWrongAfterExpiry.httpStatus === 423 && authWrongAfterExpiry.error === 'locked' &&
+    authWrongAfterExpiry.retryAfterSec === 300,
+    `到期后错一次=${authWrongAfterExpiry.httpStatus}/${authWrongAfterExpiry.error}（剩余 ${authWrongAfterExpiry.retryAfterSec} s）`);
+  authClock.advanceMin(6);
+  const authRecover = auth.login({ password: AUTH_PW, remote: '127.0.0.1' });
+  t.check('鉴权②：锁定到期（注入时钟推进 > `lockMinutes`）+ **口令正确** ⇒ 恢复登录并清零 `fail_count`',
+    authRecover.ok === true && auth.status().failCount === 0 && auth.status().locked === false,
+    `恢复登录=${authRecover.httpStatus}，failCount=${auth.status().failCount}`);
+
+  /* ---- ③ 令牌：滑动续期 / 绝对上限 / 登出 / 重启 / 缺失与伪造 ---- */
+  authClock.reset();
+  const authTokSlide = auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).token;
+  /* ⚠ 必须**两次续期**才走得到绝对上限（TTL 12 h < 绝对 24 h，单次登录后 12 h 内必然先过期）：
+     登录(10:00, 到期 22:00) → 11 h 后(21:00) 续到次日 09:00 → 再 11 h(次日 08:00) 续到
+     `min(08:00+12h, 上限次日 10:00)` ＝ **次日 10:00（＝绝对上限）**。
+     第二步就是"不设上限就会一直续期"的可证伪点（不设上限会得到次日 20:00）。
+     D22 变异点：把 `verify()` 里 `Math.min(now + TTL, absoluteExpiresAtMs)` 的 `Math.min` 去掉 ⇒ 变红。 */
+  authClock.advanceSec(11 * 3600);
+  const authSlide1 = auth.verify(authTokSlide);
+  authClock.advanceSec(11 * 3600);
+  const authSlide2 = auth.verify(authTokSlide);
+  t.check('鉴权③：会话 TTL **滑动续期** —— 连续两次续期把到期时间一路推到 **24 h 绝对上限**，' +
+    '而不是"每次 +12 h"（第二次若不设上限会得到次日 20:00）',
+    authSlide1.ok === true && authSlide1.expiresAt === '2026-09-20 09:00:00' &&
+    authSlide2.ok === true && authSlide2.expiresAt === '2026-09-20 10:00:00' &&
+    authSlide2.expiresAt === authSlide2.absoluteExpiresAt,
+    `第一次续期后=${authSlide1.expiresAt}；第二次续期后=${authSlide2.expiresAt}（绝对上限=${authSlide2.absoluteExpiresAt}）`);
+  authClock.advanceSec(2 * 3600);
+  const authAbsolute = auth.verify(authTokSlide);
+  t.check('鉴权③：绝对上限 **24 h** 到点即失效（滑动续期也不能越过；会话被立即移除）',
+    authAbsolute.httpStatus === 401 && authAbsolute.error === 'unauthorized' &&
+    auth.verify(authTokSlide).httpStatus === 401,
+    `24 h 后=${authAbsolute.httpStatus}/${authAbsolute.error}（${authAbsolute.reason}）`);
+  authClock.reset();
+  const authTokExpire = auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).token;
+  authClock.advanceSec(12 * 3600);
+  const authExpired = auth.verify(authTokExpire);
+  t.check('鉴权③：TTL 到点（不续期即整 12 h）⇒ 401 `unauthorized`（"登录已过期"）',
+    authExpired.httpStatus === 401 && authExpired.error === 'unauthorized' && /过期/.test(String(authExpired.reason)),
+    `12 h 后=${authExpired.httpStatus}：${authExpired.reason}`);
+  authClock.reset();
+  const authTokOut = auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).token;
+  const authLogout = auth.logout({ token: authTokOut, remote: '127.0.0.1' });
+  t.check('鉴权③：`logout` ⇒ 200 且令牌**立刻失效**（再校验 401）；重复登出同样 401（不假装成功）',
+    authLogout.ok === true && authLogout.requireRelogin === true &&
+    auth.verify(authTokOut).httpStatus === 401 &&
+    auth.logout({ token: authTokOut, remote: '127.0.0.1' }).httpStatus === 401,
+    `登出=${authLogout.httpStatus}，登出后校验=${auth.verify(authTokOut).httpStatus}`);
+  const authTokRestart = auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).token;
+  const authAfterRestart = createAuthSvc({ silent: true });
+  t.check('鉴权③：**进程重启即全部失效**（会话表只在内存：新实例里任何旧令牌都不存在）+ 缺失/伪造令牌一律 401',
+    authAfterRestart.verify(authTokRestart).httpStatus === 401 &&
+    auth.verify('').httpStatus === 401 && auth.verify('f'.repeat(64)).httpStatus === 401 &&
+    auth.verify(undefined).httpStatus === 401,
+    `重启后旧令牌=${authAfterRestart.verify(authTokRestart).httpStatus}；缺失=${auth.verify('').httpStatus}；` +
+    `伪造=${auth.verify('f'.repeat(64)).httpStatus}`);
+
+  /* ---- 改密（FR-8.4）：同口令两次改密盐与派生值都不同；改密后强制清会话 ---- */
+  authClock.reset();
+  const authTokCh = auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).token;
+  const authChWrongOld = auth.change({ token: authTokCh, oldPassword: 'not-the-old-one', newPassword: AUTH_PW2, remote: '127.0.0.1' });
+  t.check('鉴权(改密)：原口令错 ⇒ 401 `bad_credentials`，且**会话不清**（可继续用同一令牌）',
+    authChWrongOld.httpStatus === 401 && authChWrongOld.error === 'bad_credentials' &&
+    auth.verify(authTokCh).ok === true,
+    `原口令错=${authChWrongOld.httpStatus}/${authChWrongOld.error}；令牌仍有效=${auth.verify(authTokCh).ok}`);
+  const authChSame = auth.change({ token: authTokCh, oldPassword: AUTH_PW, newPassword: AUTH_PW, remote: '127.0.0.1' });
+  const authChUser = auth.change({ token: authTokCh, oldPassword: AUTH_PW, newPassword: authUserId, remote: '127.0.0.1' });
+  const authChLong = auth.change({ token: authTokCh, oldPassword: AUTH_PW, newPassword: 'x'.repeat(65), remote: '127.0.0.1' });
+  t.check('鉴权(改密)：**新口令不得与原口令相同**、**不得与用户名相同**、长度 ≤64 ⇒ 400 `bad_password`（提示不含明文）',
+    authChSame.httpStatus === 400 && authChSame.error === 'bad_password' &&
+    authChUser.httpStatus === 400 && authChUser.error === 'bad_password' &&
+    authChLong.httpStatus === 400 && authChLong.error === 'bad_password' &&
+    !String(authChSame.reason).includes(AUTH_PW) && !String(authChLong.reason).includes('xxx'),
+    `同旧=${authChSame.httpStatus}/${authChSame.reason}；同用户名=${authChUser.httpStatus}；超长=${authChLong.httpStatus}`);
+  const authRowBeforeCh = AUTH_DB.db.prepare('SELECT salt, hash FROM auth_credential').get();
+  const authChOk = auth.change({ token: authTokCh, oldPassword: AUTH_PW, newPassword: AUTH_PW2, remote: '127.0.0.1' });
+  const authRowAfterCh1 = AUTH_DB.db.prepare('SELECT salt, hash, is_initial, changed_by FROM auth_credential').get();
+  const authRowAfterCh1Salt = authRowAfterCh1 ? authRowAfterCh1.salt : '';
+  const authRowBeforeChSalt = authRowBeforeCh ? authRowBeforeCh.salt : '';
+  t.check('鉴权(改密)：改密成功 ⇒ 200 + `requireRelogin=true`，且**强制清当前会话**（原令牌立刻 401）；' +
+    '`is_initial` 由 1 变 0、`changed_by` 记为设置页改密；库内 salt/hash 已换新',
+    authChOk.ok === true && authChOk.requireRelogin === true &&
+    auth.verify(authTokCh).httpStatus === 401 &&
+    Boolean(authRowAfterCh1) && Boolean(authRowBeforeCh) &&
+    authRowAfterCh1.is_initial === 0 && authRowAfterCh1.changed_by === '设置页改密' &&
+    authRowAfterCh1Salt !== authRowBeforeChSalt &&
+    authRowAfterCh1.hash !== authRowBeforeCh.hash,
+    `改密=${authChOk.httpStatus}；原令牌=${auth.verify(authTokCh).httpStatus}；` +
+    `清会话数=${authChOk.sessionsCleared}；is_initial=${authRowAfterCh1 && authRowAfterCh1.is_initial}`);
+  t.check('鉴权(改密)：改密后**旧口令失效、新口令可登录**（换盐换派生值，不是"改了个标记"）',
+    auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).httpStatus === 401 &&
+    auth.login({ password: AUTH_PW2, remote: '127.0.0.1' }).ok === true,
+    `旧口令=${auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).httpStatus}；` +
+    `新口令=${auth.login({ password: AUTH_PW2, remote: '127.0.0.1' }).httpStatus}`);
+  /* 同口令**两次改密**（A→B→A）：两次的盐与派生值都必须不同 —— 证明"每口令独立随机盐"（D1） */
+  const authTokCh2 = auth.login({ password: AUTH_PW2, remote: '127.0.0.1' }).token;
+  const authChBack = auth.change({ token: authTokCh2, oldPassword: AUTH_PW2, newPassword: AUTH_PW, remote: '127.0.0.1' });
+  const authRowAfterCh2 = AUTH_DB.db.prepare('SELECT salt, hash FROM auth_credential').get();
+  const authRowAfterCh2Salt = authRowAfterCh2 ? authRowAfterCh2.salt : '';
+  t.check('鉴权①：**同口令两次改密盐与派生值都不同**（A→B→A：回到同一口令，但 salt 与 hash 都不等于首次）—— ' +
+    '每口令独立随机盐（ADR-0007 D1）',
+    authChBack.ok === true && Boolean(authRowAfterCh2) &&
+    authRowAfterCh2Salt !== authRowBeforeChSalt &&
+    authRowAfterCh2.hash !== authRowBeforeCh.hash &&
+    authRowAfterCh2Salt !== authRowAfterCh1Salt &&
+    authRowAfterCh2.hash !== authRowAfterCh1.hash,
+    `首次(A) salt=${authRowBeforeChSalt.slice(0, 8)}… / 改后(B) ${authRowAfterCh1Salt.slice(0, 8)}… / ` +
+    `改回(A) ${authRowAfterCh2Salt.slice(0, 8)}…`);
+
+  /* ---- ⑤ 与 IF-A 静态令牌**严格分开**（D3）：互不复用、互不替代 ---- */
+  const AUTH_STATIC_IF = 'STATIC-IF-TOKEN-W5-SELFCHECK';
+  const authTokForIfa = auth.login({ password: AUTH_PW, remote: '127.0.0.1' }).token;
+  const authDispatch = createDispatch({
+    db: AUTH_DB.db, now: authClock.source(), auth: { enabled: true, token: AUTH_STATIC_IF }
+  });
+  const ifaWithSession = authDispatch.authorize({ authorization: 'Bearer ' + authTokForIfa });
+  const ifaWithStatic = authDispatch.authorize({ authorization: 'Bearer ' + AUTH_STATIC_IF });
+  const authWithStatic = auth.verify(AUTH_STATIC_IF);
+  t.check('鉴权⑤：两套令牌**互不通用** —— 会话令牌调 IF-A 被拒（403，鉴权先于报文）、静态令牌调 `/auth/*` 被判 401；' +
+    '而静态令牌调 IF-A **正常通过**（正对照，证明不是"两边都一律拒"的假绿）',
+    ifaWithSession.ok === false && ifaWithStatic.ok === true &&
+    authWithStatic.httpStatus === 401 && authWithStatic.error === 'unauthorized' &&
+    authTokForIfa !== AUTH_STATIC_IF,
+    `会话令牌→IF-A：${ifaWithSession.ok ? '通过(缺陷)' : '拒(' + ifaWithSession.code + ')'}；` +
+    `静态令牌→IF-A：${ifaWithStatic.ok ? '通过' : '拒'}；静态令牌→/auth：${authWithStatic.httpStatus}/${authWithStatic.error}`);
+
+  /* ---- ⑥ 留痕（D6.3）：六类各至少一条、含来源 IP、且**不含口令明文** ---- */
+  const authLogs = opLogRepo.list(AUTH_DB.db, {}, { limit: 500 });
+  const authLogCount = {};
+  for (const r of authLogs) authLogCount[r.opType] = (authLogCount[r.opType] || 0) + 1;
+  const AUTH_REQUIRED_OPS = [authSvc.OP_TYPE.INIT, authSvc.OP_TYPE.LOGIN, authSvc.OP_TYPE.LOGIN_FAIL,
+    authSvc.OP_TYPE.LOCKED, authSvc.OP_TYPE.CHANGE, authSvc.OP_TYPE.LOGOUT];
+  t.check('鉴权⑥：留痕**六类各至少一条**（口令初始化 / 解锁 / 解锁失败 / 账号锁定 / 改密 / 登出），' +
+    '且每条都带**来源 IP**（取自 socket，不是请求头）',
+    AUTH_REQUIRED_OPS.every(k => authLogCount[k] >= 1) &&
+    authLogs.filter(r => /来源=/.test(String(r.content))).length >= AUTH_REQUIRED_OPS.length &&
+    authLogs.some(r => /来源=10\.20\.30\.40/.test(String(r.content))) &&
+    authLogs.some(r => /来源=192\.168\.1\.20/.test(String(r.content))),
+    `各类条数=${JSON.stringify(authLogCount)}；带来源 IP 的 ${authLogs.filter(r => /来源=/.test(String(r.content))).length} 条`);
+  t.check('鉴权①：`op_log` 里**任何一行都不含口令明文**（初始化/改密/失败/锁定各条都查）—— ' +
+    'ADR-0007 D1"日志里、op_log.content 里不得出现明文"',
+    !JSON.stringify(authLogs).includes(AUTH_PW) && !JSON.stringify(authLogs).includes(AUTH_PW2),
+    `${authLogs.length} 条留痕全量序列化后未出现口令串`);
+  t.check('鉴权①：**错误信息里**也不含口令明文（口令口径/原口令错/锁定三类响应正文都不含口令串）',
+    [authChSame, authChLong, authChWrongOld, authLockedRight, initBadPolicy]
+      .every(r => !String(r.reason).includes(AUTH_PW) && !String(r.reason).includes(AUTH_PW2)),
+    [authChSame, authChLong, authChWrongOld, authLockedRight, initBadPolicy]
+      .map(r => r.error + ':' + r.reason).join(' ｜ '));
+
+  /* ---- **F17-2**（复核中危）：库内 `locked_until` 是**脏值**时不得 500，从严按"锁定未知"处理 ----
+     旧写法 `platformClock.toDate(row.locked_until)` 直接抛 `clock: 无法解析时间` ⇒ `login()`/`status()`
+     冒未捕获异常 ⇒ **HTTP 500**（`Number.isFinite` 那道守卫永远到不了，是死守卫）。裁定口径（从严）：
+     `login` ⇒ **423**（`retryAfterSec = lockMinutes×60` 保守值、`lockedUnknown=true`、`lockedUntil=null`）；
+     `status()` ⇒ **200** 且 `{locked:true, lockedUntil:null, lockedUnknown:true}`；并写一条含库内原值片段的留痕。
+     D22 变异点（副本上做）：把 `lockedState()` 的 try/catch 去掉（恢复直接 `toDate`）⇒ 本行变红（抛异常）。
+     放在本节末尾：脏值写入后立即恢复干净状态（`locked_until=NULL, fail_count=0`），不影响后续/复跑。 */
+  {
+    AUTH_DB.db.prepare("UPDATE auth_credential SET locked_until = '这不是时间' WHERE username = ?").run(authUserId);
+    let authDirtyLogin = null;
+    let authDirtyStatus = null;
+    let authDirtyThrew = null;
+    try {
+      authDirtyLogin = auth.login({ password: AUTH_PW, remote: '127.0.0.1' });
+      authDirtyStatus = auth.status();
+    } catch (err) { authDirtyThrew = err; }
+    const authDirtyAudit = opLogRepo.list(AUTH_DB.db, { opType: authSvc.OP_TYPE.LOGIN_FAIL }, { limit: 500 })
+      .filter(r => /不可解析/.test(String(r.content)));
+    t.check('鉴权②/F17-2：库内 `locked_until` **不可解析**（脏值）⇒ **不得冒异常（500）**；' +
+      '`login` 从严按锁定 **423**（`retryAfterSec=300=lockMinutes×60`、`lockedUnknown=true`、`lockedUntil=null`）；' +
+      '`status()` **200** 且 `{locked:true, lockedUntil:null, lockedUnknown:true}`；并留一条含库内原值片段的留痕',
+      authDirtyThrew === null &&
+      Boolean(authDirtyLogin) && authDirtyLogin.httpStatus === 423 && authDirtyLogin.error === 'locked' &&
+      authDirtyLogin.retryAfterSec === 300 && authDirtyLogin.lockedUnknown === true &&
+      authDirtyLogin.lockedUntil === null &&
+      Boolean(authDirtyStatus) && authDirtyStatus.ok === true && authDirtyStatus.locked === true &&
+      authDirtyStatus.lockedUntil === null && authDirtyStatus.lockedUnknown === true &&
+      authDirtyAudit.length === 1 && String(authDirtyAudit[0].content).includes('这不是时间'),
+      authDirtyThrew ? `抛异常（缺陷）：${authDirtyThrew.message}`
+        : `login=${authDirtyLogin.httpStatus}/retry=${authDirtyLogin.retryAfterSec}/` +
+          `lockedUnknown=${authDirtyLogin.lockedUnknown}/lockedUntil=${JSON.stringify(authDirtyLogin.lockedUntil)}；` +
+          `status=${authDirtyStatus.locked}/${JSON.stringify(authDirtyStatus.lockedUntil)}/${authDirtyStatus.lockedUnknown}；` +
+          `留痕=${authDirtyAudit.length} 条`);
+    /* 恢复干净状态（供后续/复跑；脏值只在本用例内存在） */
+    AUTH_DB.db.prepare('UPDATE auth_credential SET locked_until = NULL, fail_count = 0 WHERE username = ?').run(authUserId);
+  }
+
+  /* ---- **F19-1**（结案复跑残留）：`locked_until` 的"**纪元 0**"必须按**已过期放行**，不能当成"锁定未知"----
+     旧写法用真值判断区分解析失败（`if (!untilMs)`），而 `1970-01-01 08:00:00`（UTC+8 纪元 0）解析出的毫秒数
+     **恰是 0**，被误判成"锁定未知"⇒ 一律 423；SQLite 的 TEXT 亲和还会把数字 0 存成 `'0.0'`。
+     现在用**显式布尔 `parsed`**，且 `'0.0'` 这类纯数字串按"毫秒时间戳"解释（TEXT 亲和兼容口径）。
+     D22 变异点（副本上做）：把 `if (!parsed)` 改回 `if (!untilMs)`（真值判断）⇒ 本行变红。 */
+  {
+    const e19Cases = [
+      { raw: '1970-01-01 08:00:00', label: 'UTC+8 纪元 0（毫秒数恰为 0）' },
+      { raw: '0.0', label: "TEXT 亲和存的数字 0（'0.0'）" }
+    ];
+    const e19Results = [];
+    for (const c of e19Cases) {
+      AUTH_DB.db.prepare('UPDATE auth_credential SET locked_until = ?, fail_count = 0 WHERE username = ?')
+        .run(c.raw, authUserId);
+      const login = auth.login({ password: AUTH_PW, remote: '127.0.0.1' });
+      const st = auth.status();
+      e19Results.push({ raw: c.raw, label: c.label, login: login.httpStatus, err: login.error, locked: st.locked, unknown: st.lockedUnknown });
+    }
+    t.check('鉴权②/F19-1：`locked_until` 的**纪元 0**（`1970-01-01 08:00:00`，毫秒数恰好为 0）与 **`\'0.0\'`**' +
+      '（TEXT 亲和存的数字 0）⇒ **按已过期放行**（`login` 200、`status.locked=false`）—— ' +
+      '不得因为"毫秒数是 0"被真值判断误判成"锁定未知"而一律 423',
+      e19Results.every(r => r.login === 200 && r.err === '' && r.locked === false && r.unknown === false),
+      e19Results.map(r => `${r.raw}（${r.label}）⇒ login=${r.login}、locked=${r.locked}、lockedUnknown=${r.unknown}`).join('；'));
+    AUTH_DB.db.prepare('UPDATE auth_credential SET locked_until = NULL, fail_count = 0 WHERE username = ?').run(authUserId);
+  }
+
+  /* ---- **F19-2**（结案复跑残留，主代理裁定"从严"）：`NULL` ＝未设置；**非 NULL 但不可解析（含空串 `''`）** ---- 
+     ⇒ 一律"锁定未知"（423 / status 200 + lockedUnknown）。理由：只有一条规则更好守，库被写坏时应拒绝而非放行。
+     D22 变异点（副本上做）：把"NULL 判定"从 `raw === null || raw === undefined` 改回 `!row.locked_until`
+     ⇒ 空串会 fail-open（本行变红）。 */
+  {
+    const runOne = raw => {
+      AUTH_DB.db.prepare('UPDATE auth_credential SET locked_until = ?, fail_count = 0 WHERE username = ?')
+        .run(raw, authUserId);
+      const login = auth.login({ password: AUTH_PW, remote: '127.0.0.1' });
+      const st = auth.status();
+      return { login: login.httpStatus, err: login.error, unknown: login.lockedUnknown, locked: st.locked, stUnknown: st.lockedUnknown };
+    };
+    const emptyCase = runOne('');
+    const nullCase = runOne(null);
+    t.check('鉴权②/F19-2：**空串 `locked_until` ⇒ 从严"锁定未知"**（`login` 423 + `lockedUnknown=true`、' +
+      '`status` 200 且 `locked=true/lockedUnknown=true`）；**成对**：`locked_until=NULL` ⇒ 未设置（`login` 200、`status.locked=false`）' +
+      '—— 只有 NULL 是"未设置"，非 NULL 而不可解析一律从严',
+      emptyCase.login === 423 && emptyCase.err === 'locked' && emptyCase.unknown === true &&
+      emptyCase.locked === true && emptyCase.stUnknown === true &&
+      nullCase.login === 200 && nullCase.locked === false && nullCase.stUnknown === false,
+      `空串 ⇒ login=${emptyCase.login}/${emptyCase.err}/lockedUnknown=${emptyCase.unknown}、status.locked=${emptyCase.locked}/${emptyCase.stUnknown}；` +
+      `NULL ⇒ login=${nullCase.login}、status.locked=${nullCase.locked}/${nullCase.stUnknown}`);
+    AUTH_DB.db.prepare('UPDATE auth_credential SET locked_until = NULL, fail_count = 0 WHERE username = ?').run(authUserId);
+  }
+
+  /* ---- **F19-4**（结案复跑残留）：内部字段**结构化**隔离 —— `toPublic()` 是唯一对外出口 ---- */
+  {
+    const rawFail = auth.login({ password: 'definitely-wrong-9', remote: '127.0.0.1' });
+    const pubFail = authSvc.toPublic(rawFail);
+    /* ok 分支也要过一遍：`toPublic()` 不得误伤正常对外字段（token/username/...） */
+    const pubOk = authSvc.toPublic({ ok: true, error: '', token: 'x', username: authUserId, expiresAt: '2026-09-19 22:00:00' });
+    t.check('鉴权/F19-4：服务层内部字段已挪进 `__internal`（原始返回里 `__internal.failCount` 存在，' +
+      '顶层不再有 `failCount`/`remainingAttempts`）；`toPublic()` 输出**不含** `__internal`/`failCount`/`remainingAttempts`，' +
+      '其余对外字段原样保留 —— 适配器只许输出 `toPublic()` 结果（结构层防护，不再只靠注释）',
+      Boolean(rawFail.__internal) && Number.isInteger(rawFail.__internal.failCount) &&
+      Number.isInteger(rawFail.__internal.remainingAttempts) &&
+      rawFail.failCount === undefined && rawFail.remainingAttempts === undefined &&
+      authSvc.INTERNAL_FIELDS.includes('failCount') &&
+      pubFail.__internal === undefined && pubFail.failCount === undefined && pubFail.remainingAttempts === undefined &&
+      pubFail.ok === false && pubFail.error === 'bad_credentials' && pubFail.httpStatus === 401 &&
+      JSON.stringify(pubFail) === JSON.stringify({ ok: false, error: 'bad_credentials', httpStatus: 401, reason: '用户名或口令不正确' }) &&
+      pubOk.token === 'x' && pubOk.username === authUserId && pubOk.expiresAt === '2026-09-19 22:00:00',
+      `原始 __internal=${JSON.stringify(rawFail.__internal)}；toPublic=${JSON.stringify(pubFail)}；` +
+      `ok 分支保留字段=${JSON.stringify(Object.keys(pubOk))}`);
+    AUTH_DB.db.prepare('UPDATE auth_credential SET locked_until = NULL, fail_count = 0 WHERE username = ?').run(authUserId);
+  }
+
+  /* ---- HTTP 端到端（进程内 `createRouter()` + `mountAuth()`；阶段二已接进 server/index.js，真进程断言在 harness-check） ---- */
+  const AUTH_HTTP_DB = makeTempDb({ name: 'auth-http' });
+  db.initSchema(AUTH_HTTP_DB.db, NOW);
+  const authHttp = authSvc.createAuth({ db: AUTH_HTTP_DB.db, logger: authLogger, now: authClock.source() });
+  const authRouter = createRouter({ getHealth: () => ({ ok: true }), onError: err => authLogLines.push('500 ' + err.message) });
+  const authMount = mountAuth(authRouter, { auth: authHttp, logger: authLogger, now: authClock.source() });
+  const authServer = http.createServer((req, res) => {
+    Promise.resolve(authRouter.handle(req, res)).catch(() => { try { res.destroy(); } catch { /* 已断 */ } });
+  });
+  const authPort = await allocPort();
+  await new Promise((resolve, reject) => {
+    authServer.once('error', reject);
+    authServer.listen(authPort, '127.0.0.1', resolve);
+  });
+  const authCall = async (method, pathname, payload, headers, rawBody) => {
+    const init = { method, headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}) };
+    if (method === 'POST') init.body = rawBody === undefined ? JSON.stringify(payload === undefined ? {} : payload) : rawBody;
+    const res = await fetch(`http://127.0.0.1:${authPort}${pathname}`, init);
+    const text = await res.text();
+    let body = null;
+    try { body = JSON.parse(text); } catch { body = { raw: text.slice(0, 80) }; }
+    return { status: res.status, body };
+  };
+  const authHttpGet = (p, h) => authCall('GET', p, undefined, h);
+  const authHttpPost = (p, payload, h, rawBody) => authCall('POST', p, payload, h, rawBody);
+  try {
+    /* ⚠ 码要**先取下来存进局部变量**：`authHttp.initCode()` 在初始化成功后返回 null，
+       而 `'...'.includes(null)` 会退化成"搜字符串 'null'"（JSON 里的 `null` 字段到处都是）——
+       首版就是这么写出了一个恒假的条件。 */
+    const authHttpCode = authHttp.initCode();
+    const hStatus0 = await authHttpGet('/auth/status');
+    const hLoginBefore = await authHttpPost('/auth/login', { password: AUTH_PW });
+    /* ⚠ 本机 fetch 的来源恒为回环，**造不出**"非回环请求"（那一条由服务层探针覆盖，见九之三开头）；
+       故这里不再发"伪非回环"请求 —— 它在 HTTP 面其实是一次**成功**的初始化（首版就是这么写错的）。 */
+    const hInit = await authHttpPost('/auth/init', { code: authHttpCode, password: AUTH_PW });
+    const hInitAgain = await authHttpPost('/auth/init', { code: authHttpCode, password: AUTH_PW2 });
+    const hLogin = await authHttpPost('/auth/login', { password: AUTH_PW });
+    const hLoginWrong = await authHttpPost('/auth/login', { password: 'nope-1234' });
+    const hChangeNoToken = await authHttpPost('/auth/change', { oldPassword: AUTH_PW, newPassword: AUTH_PW2 });
+    const hLogout = await authHttpPost('/auth/logout', {}, { Authorization: 'Bearer ' + hLogin.body.token });
+    const hLogoutAgain = await authHttpPost('/auth/logout', {}, { Authorization: 'Bearer ' + hLogin.body.token });
+    /* 改密用一个**新**会话；随后用**该会话**登出 ⇒ 必须 401（证明"改密即清当前会话"在 HTTP 面同样生效） */
+    const hChangeSession = (await authHttpPost('/auth/login', { password: AUTH_PW })).body.token;
+    const hChange = await authHttpPost('/auth/change', { oldPassword: AUTH_PW, newPassword: AUTH_PW2 },
+      { Authorization: 'Bearer ' + hChangeSession });
+    const hLogoutAfterChange = await authHttpPost('/auth/logout', {}, { Authorization: 'Bearer ' + hChangeSession });
+    const hStatus = await authHttpGet('/auth/status');
+    const hNope = await authHttpGet('/auth/nope');
+    /* **F17-8①**：服务层对"用户不存在"会带回 `failCount`（`remainingAttempts` 同理）—— 那是**内部分支**，
+       一旦被适配器转发，ADR-0007 D2 的"对外不区分原因"就被绕过（可枚举用户名）。HTTP 适配器的白名单里
+       刻意没有这两个键；这里实测"两种失败的对外正文**逐字节同形状**"（时钟注入固定 ⇒ `at` 也相同）。 */
+    const hWrongPw = hLoginWrong;                                   // 已存在用户 + 错口令
+    const hUnknownUser = await authHttpPost('/auth/login', { username: 'no-such-user', password: AUTH_PW });
+    /* 畸形请求的前置读数：两次畸形请求**都不该进到业务逻辑** ⇒ 失败计数必须一动不动 */
+    const hFailBeforeMalformed = authHttp.status().failCount;
+    const hBig = await authHttpPost('/auth/login', undefined, undefined, JSON.stringify({ password: 'x'.repeat(1024 * 1024 + 64) }));
+    const hBadJson = await authHttpPost('/auth/login', undefined, undefined, '{not-json');
+    const hFailAfterMalformed = authHttp.status().failCount;
+    t.check('鉴权(HTTP)：`GET /auth/status` 在未初始化时返回 `{ok:true, initialized:false}`（**不含任何秘密**：无 hash/salt/token/初始化码）；' +
+      '未初始化时 `POST /auth/login` ⇒ 409 `not_initialized`',
+      hStatus0.status === 200 && hStatus0.body.ok === true && hStatus0.body.initialized === false &&
+      hStatus0.body.initCodePending === true && hStatus0.body.token === undefined &&
+      typeof authHttpCode === 'string' && authHttpCode.length === 12 &&
+      !JSON.stringify(hStatus0.body).includes(authHttpCode) &&
+      hLoginBefore.status === 409 && hLoginBefore.body.error === 'not_initialized',
+      `status=${hStatus0.status}/initialized=${hStatus0.body.initialized}；login=${hLoginBefore.status}/${hLoginBefore.body.error}；` +
+      `status 正文含初始化码=${JSON.stringify(hStatus0.body).includes(authHttpCode)}`);
+    t.check('鉴权(HTTP)：`POST /auth/init` 对码成功 200、重复 init 409（幂等拒绝）；`POST /auth/login` 200 且返回 ' +
+      'token/expiresAt；错口令 401 且**只回 error、不回原因**（不区分口令错与用户不存在）',
+      hInit.status === 200 && hInit.body.ok === true && hInit.body.username === authUserId &&
+      hInitAgain.status === 409 && hInitAgain.body.error === 'already_initialized' &&
+      hLogin.status === 200 && /^[0-9a-f]{64}$/.test(hLogin.body.token) &&
+      typeof hLogin.body.expiresAt === 'string' &&
+      hLoginWrong.status === 401 && hLoginWrong.body.error === 'bad_credentials' &&
+      hLoginWrong.body.reason === undefined,
+      `init=${hInit.status}，initAgain=${hInitAgain.status}，login=${hLogin.status}，` +
+      `loginWrong=${hLoginWrong.status}/${hLoginWrong.body.error}（reason 未下发=${hLoginWrong.body.reason === undefined}）`);
+    t.check('鉴权(HTTP)/F17-8①：**用户不存在**与**口令错**的对外正文**逐字节同形状**（都 401 `bad_credentials`，' +
+      '都不带 `reason`/`failCount`/`remainingAttempts`）—— 服务层那两个"只对真实用户出现"的字段**任何适配器都不得转发**',
+      hWrongPw.status === 401 && hUnknownUser.status === 401 &&
+      hWrongPw.body.error === 'bad_credentials' && hUnknownUser.body.error === 'bad_credentials' &&
+      hWrongPw.body.reason === undefined && hUnknownUser.body.reason === undefined &&
+      hWrongPw.body.failCount === undefined && hUnknownUser.body.failCount === undefined &&
+      hWrongPw.body.remainingAttempts === undefined && hUnknownUser.body.remainingAttempts === undefined &&
+      JSON.stringify(hWrongPw.body) === JSON.stringify(hUnknownUser.body),
+      `口令错=${JSON.stringify(hWrongPw.body)}；用户不存在=${JSON.stringify(hUnknownUser.body)}`);
+    t.check('鉴权(HTTP)：`POST /auth/change` 缺 Bearer ⇒ 401 `unauthorized`；带 Bearer ⇒ 200 且**清当前会话**' +
+      '（随后用**同一个**令牌登出 ⇒ 401，证明会话真被清了，不是"只回了个 ok"）',
+      hChangeNoToken.status === 401 && hChangeNoToken.body.error === 'unauthorized' &&
+      hChange.status === 200 && hChange.body.requireRelogin === true &&
+      hLogoutAfterChange.status === 401 && hLogoutAfterChange.body.error === 'unauthorized',
+      `change 无令牌=${hChangeNoToken.status}；change=${hChange.status}；改密后同令牌 logout=${hLogoutAfterChange.status}`);
+    t.check('鉴权(HTTP)：`POST /auth/logout`（Bearer）⇒ 200；重复登出 ⇒ 401；`GET /auth/nope` ⇒ 404（**未另起路由表**，' +
+      '仍是 `server/http/router.js` 的 404 口径）；`mountAuth()` 显式自报 `mounted:true` 与 5 条路由',
+      authMount.mounted === true && authMount.routes.length === 5 &&
+      authRouter.list().includes('GET /auth/status') && authRouter.list().includes('POST /auth/init') &&
+      authRouter.list().includes('POST /auth/login') && authRouter.list().includes('POST /auth/logout') &&
+      authRouter.list().includes('POST /auth/change') &&
+      hLogout.status === 200 && hLogout.body.ok === true && hLogoutAgain.status === 401 &&
+      hNope.status === 404 && hNope.body.err && hNope.body.err.code === 'NOT_FOUND' &&
+      hStatus.status === 200 && hStatus.body.initialized === true && hStatus.body.isInitial === false &&
+      hStatus.body.username === authUserId && hStatus.body.sessions !== undefined,
+      `挂载 routes=${authMount.routes.join(' , ')}；logout=${hLogout.status}；重复 logout=${hLogoutAgain.status}；` +
+      `/auth/nope=${hNope.status}；status=${JSON.stringify({ initialized: hStatus.body.initialized, isInitial: hStatus.body.isInitial })}`);
+    /* readJson 的既有口径不得被本单改动：超 1 MiB ⇒ 413、非法 JSON ⇒ 400（两者都在**鉴权/业务之前**） */
+    t.check('鉴权(HTTP)：`readJson` 既有口径不变 —— 请求体超 1 MiB ⇒ **413** `PAYLOAD_TOO_LARGE`、非法 JSON ⇒ **400** `BAD_JSON`' +
+      '（且两者都没进到业务逻辑：`/auth/login` 的失败计数**一动不动**）',
+      hBig.status === 413 && hBig.body.err && hBig.body.err.code === 'PAYLOAD_TOO_LARGE' &&
+      hBadJson.status === 400 && hBadJson.body.err && hBadJson.body.err.code === 'BAD_JSON' &&
+      hFailAfterMalformed === hFailBeforeMalformed,
+      `1 MiB+ ⇒ ${hBig.status}/${hBig.body.err && hBig.body.err.code}；坏 JSON ⇒ ${hBadJson.status}/` +
+      `${hBadJson.body.err && hBadJson.body.err.code}；失败计数 ${hFailBeforeMalformed} → ${hFailAfterMalformed}`);
+    t.check('鉴权(HTTP)：整段 HTTP 处理期间**无未捕获异常**（router 的 onError 未收到 500）',
+      authLogLines.filter(l => l.startsWith('500 ')).length === 0,
+      authLogLines.filter(l => l.startsWith('500 ')).join(' / '));
+  } finally {
+    await new Promise(resolve => authServer.close(resolve));
+  }
+  /* 收尾：本节自建的库与连接全部关闭（Windows 上不关会锁住临时目录；ADR-0003 D17） */
+  AUTH_DB.close();
+  AUTH_HTTP_DB.close();
+
+  /* ---------------- 十、清理与残留 ---------------- */
+  t.section('十、临时区与残留');
   const strayDb = fs.readdirSync(env.paths.tempRoot).filter(n => /\.db(-wal|-shm)?$/.test(n));
   t.check('临时库文件都不在临时区根目录（各用例自有子目录，不会互相干扰）',
     strayDb.length === 0, strayDb.slice(0, 3).join(', '));
