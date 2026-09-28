@@ -275,6 +275,14 @@ window.MockData = (function () {
     const shape = computeStats(0, 0);
     const out = {};
     Object.keys(shape).forEach(k => { out[k] = 0; });
+    /* ⚠ **逐键由 `0` 改 `null`**（W4 / ADR-0008 D3，2026-09-28 口径统一）：
+       改前这里逐键写 0，于是"缺口帧"在**数据层**就已经把"算不出来"表达成了"零产量/零时长"——
+       只有渲染层读 `noData` 那一位才不显示 0（`StatsPanel`/`ShiftPanel`/`TaskPanel`/`DeviceStatusPanel`
+       四处各自读一次，任一处漏读就把 0 显示出去）。改成 `null` 后，**即使**某个渲染点忘了读状态位，
+       它也只会显示"—"或不显示，而**不会**显示一个看起来合法的 `0`（"不得伪造数据"落到数据结构上）。
+       为什么不用 `undefined`：`undefined` 在 `||`、模板串、JSON 里会退化成空串/0，语义不如 `null` 明确。
+       `noData` 本身是**布尔状态位**，保持最后赋值（见下方 ⚠）。 */
+    Object.keys(out).forEach(k => { if (k !== 'noData') out[k] = null; });
     /* ⚠ `noData` 必须**最后**赋值：上面的 `shape` 里也有这个键（`computeStats()` 的正常分支恒给
        `noData:false`），先置位会被循环里的 0 覆盖成 `0`（实测踩过：`s.noData === true` 恒假 ⇒
        缺口帧照旧显示 0.0%）。 */

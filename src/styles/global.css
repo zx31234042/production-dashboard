@@ -114,9 +114,115 @@ html, body {
 #panel-alarm   { grid-template-columns: 1.05fr 1fr 1.25fr; }
 #panel-maint   { grid-template-columns: 1fr 1fr 1.35fr; }
 #panel-notice  { grid-template-columns: 1.15fr 1fr 1fr; }
-#panel-setting { grid-template-columns: 1fr 1fr 1fr; grid-template-rows: auto 1fr; }
+/* `#panel-setting` 的轨道声明（F16-1 起为**三行**：`auto 1fr auto`）。
+   ⚠ **第三条轨道必须是 `auto`、不能是固定 px**（F16-1 的关键，也是 F13/F14 两次踩过的坑）：
+     演示模式（默认源）下 UI-20 卡片 `display:none` ⇒ **第三行没有任何网格项**
+     ⇒ 该 `auto` 轨道**塌缩为 0** ⇒ 第 2 行 `1fr` 分到的空间与改动前（两行 `auto 1fr`）
+     **完全相同**。若写成固定 `320px`，演示模式也会预留 320px ⇒ 10 张截图基准集体漂移。
+   服务端模式下三行分别为：第 1 行 `auto`、第 2 行 `1fr`（操作日志 / 录入发布，恢复整行高）、
+   第 3 行 `auto`（= UI-20 卡片自身 `height: 320px`）。 */
+#panel-setting { grid-template-columns: 1fr 1fr 1fr; grid-template-rows: auto 1fr auto; }
+/* W5-② / UI-20：待补传清单与人工重报卡片。
+   位置＝设置页（需求原文："在**设置页**提供…"）。
+
+   ★ **默认演示模式零版面变化**（这是本节设计的硬约束，不是巧合）：
+     · 卡片在 `index.html` 里带 `hidden`（静态兜底），`UploadPanel.render()` 在演示/回退模式下
+       把 `hidden` 置回 true 并 `style.display='none'`；
+     · CSS 的 `display: none` 元素**不生成盒子、不参与布局**（CSS Display 规范）⇒ 对
+       网格自动放置而言它等价于**不存在**：它不被放置、不占用任何行/列、也**不参与网格轨道尺寸
+       计算**（`auto`/`1fr` 行都不看它）；
+     · 且**既有卡片/操作日志/录入发布的 CSS 一字不动**（`.log-card` 仍 `(1,2)`、
+       `.entry-card` 仍 `(2/-1,2)`、三列定义未动）；`#panel-setting` 的轨道由
+       `auto 1fr` 变为 **`auto 1fr auto`**，但那**唯一的差别（第三条 `auto` 轨道）在演示模式下
+       塌缩为 0**（第三行没有网格项）⇒ 第 2 行 `1fr` 分到的空间与改动前完全相同。
+     ⇒ **演示模式（默认源）下 `#panel-setting` 的渲染结果与改动前逐像素一致**，
+        10 张截图基准（含 `08-操作设置`）不受影响；`tests/screenshot-diff.js` 无需重拍。
+
+   ★ **服务端模式下的排版（F16-1 定稿：UI-20 独占一行、高 320px）**：
+     本卡片**不写任何 `grid-column` / `grid-row`** ⇒ 完全由**自动放置**定位；第 2 行三格被
+     显式放置项 `.log-card`(1,2) 与 `.entry-card`(2/-1,2) 占满 ⇒ 卡片自动落入**第 3 行第 1 列**
+     （该行由上面的第三条 `auto` 轨道承载），并因自身 `height: 320px` 而**独占整行、只有 320px 高**：
+       第 1 行 `auto` ：看板输入解锁 │ 系统时间设置 │ 系统状态自检（≈812px，与 F14 时同）
+       第 2 行 `1fr`  ：操作日志（留痕） │ 录入 / 发布 / 参数配置（≈498px，**不再被压成细条**）
+       第 3 行 `auto` ：**本卡片**（3 列 1fr 的网格项跨到第 1 列；宽 = 1249.33px @4K、高 320px）
+     4K 账（3840×2160，#stage 内距 22px ⇒ `#board-main` 可用 3796×1678，三列各 **1249.33px**；
+     行/列 `gap: 24px`，两条行距 48px）：812 + 498 + 320 + 48 = **1678px** ⇒ 恰好铺满、**无溢出**。
+     为什么卡片只有 1 列宽（而不是跨 2 列）：F13 的跨列实测把第 2 行压到 103px（见下），
+     而"失败原因读全"这一原始目标**由列宽 + 换行独立达成**（1 列下该列约 397px，
+     `td.up-reason` 走 `white-space:normal; overflow-wrap:anywhere` ⇒ **换行而非省略号**），
+     故无需跨列；卡片内部清单靠既有 `flex:1; min-height:0` 自行滚动。
+   ⚠ 行高 812/498 是按 CSS 值估算的**渲染值**，非测量值（本环境无头 Edge 的 CDP 端口不可达 ⇒
+     `overlap-check`/`browser-check` 整脚本跳过）；**测量口径与三档分辨率由
+     `tests/overlap-check.js` 与主代理的真机复测负责**。 */
+/* ⚠ 以下两条是**既有卡片的原始 grid-area**，逐字取自本包改动前的 HEAD
+   （`git show HEAD:src/styles/global.css`）—— F13 的第一版编辑曾误删它们（`git diff` 的
+   `-2` 就是这两行），导致 `.log-card`/`.entry-card` 退回自动放置、第 2 行整体重排。
+   现已**逐字恢复**；`git diff` 从此对这两行不显示任何增删（与 HEAD 完全一致）。
+   F16-1 **依旧不动这两行**（`.log-card` 仍 `(1,2)`、`.entry-card` 仍 `(2/-1,2)`）。 */
 #panel-setting .log-card   { grid-column: 1; grid-row: 2; }
 #panel-setting .entry-card { grid-column: 2 / -1; grid-row: 2; }
+/* ★ F13→F14 的历史（保留作"不要跨列"的立案记录）：
+   曾给本卡片加过 `grid-column: span 2`；主代理 4K 真机实测：跨 2 列的卡片在第 2 行放不下，
+   浏览器创建**隐式第 3 行（`auto`，本卡片内容约 663px）**⇒ 总需求 864+663+间距 > 可用高
+   ⇒ `1fr` 第 2 行被压到 **103px**（`操作日志 [22,1160,1249,103]`、`录入 [1295,1160,2523,103]`、
+   `upCard [22,1287,2523,663]`；1920/1366 同形）。故**跨列已撤**（F14），
+   F16-1 改为"显式第三条 `auto` 轨道 + 卡片自身 320px"—— 用**受控的行**替代"隐式行"。 */
+/* F16-1：卡片自身高度 320px（**演示模式该卡片 `display:none`，故这条对演示模式零影响**；
+   服务端模式下它把承载它的第三条 `auto` 轨道定为 320px）。 */
+#panel-setting .upload-card { height: 320px; }
+#panel-setting .upload-card > .card-title { font-size: 50px; padding-bottom: 12px; margin-bottom: 16px; }
+#panel-setting .upload-card > .card-title .title-note { font-size: 34px; }
+#panel-setting .upload-head { display: flex; align-items: center; gap: 20px; flex: none; }
+#panel-setting .upload-count { font-size: 56px; font-weight: 700; }
+#panel-setting .upload-progress { font-size: 40px; color: var(--accent); }
+#panel-setting .upload-list { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 12px; margin-top: 10px; }
+#panel-setting .upload-table { display: block; overflow: auto; }
+#panel-setting .upload-table thead, #panel-setting .upload-table tbody { display: block; }
+#panel-setting .upload-table tr { display: flex; }
+#panel-setting .upload-table th, #panel-setting .upload-table td { flex: none; }
+/* 内边距收到 6px/8px（与任务页测试标准区 `.std-limits` 的 U-4 口径同量级）：
+   4 列各让出 ≈24px ⇒ 前 3 列合计再省 ≈72px，全部给第 ④ 列"失败原因"。 */
+#panel-setting .upload-table th { padding: 0 8px 10px; }
+#panel-setting .upload-table td { padding: 12px 8px; }
+/* ★ F13 关键修复：把"百分比分配"换成**内容驱动宽度**。
+   为什么百分比分配修不好截断（这是 F13 立案的真因，不只是"卡片偏窄"）：
+     改前四列 = 34 / 24 / 26 / **16%**，容器 = 卡片内宽。
+       1 列（4K）内宽 1177px ⇒ 失败原因列只有 **188px**；
+       跨 2 列后内宽 2451px ⇒ 失败原因列 392px —— **仍然**装不下一段真实失败原因
+       （例：`模拟：MES 未接受报文（回执 status=0）` 在 40px 字号下约 520px，
+        最长情形是带 `网络错误：` 前缀的传输层原因，可达上千 px）
+     ⇒ **单靠"跨 2 列"并不能消除截断**，必须同时让"失败原因"列**吃掉全部剩余宽度**。
+   现口径：前 3 列按内容给**上限宽度**（配合 2px/6px 内边距、40px 字号）：
+       ① 上传流水号 `UP+yyyyMMddHHmmss+3位` = 17 字符 ≈ 13.1em ＋ 内边距 ⇒ **14em**
+       ② 接口名     `report/receiveReport` = 22 字符 ≈ 10.3em ＋ 内边距 ⇒ **11.5em**
+       ③ 时间       `2026-09-28 09:58:01`  = 19 字符 ≈ 10.3em ＋ 内边距 ⇒ **11.5em**（`mono` 等宽）
+       ④ 失败原因   **不设宽度** ⇒ 自动吃掉剩余（4K 跨 2 列下 ≈ 1670px，是改前的 8.9 倍）
+   三列合计 ≈ 37em ≈ 1480px（@40px 字号），二者都在"1 列 1177px"之上 ⇒ 本表在 1 列宽度下就会
+   触发横向滚动（`overflow:auto` 兜住，不溢出卡片、不遮其它卡片）；跨 2 列后完全不滚动。
+   ⚠ 我**没有**改用 `table-layout: fixed`：那会让 `width` 从"上限"变成"硬性配额"，
+     长失败原因会被压成多行（列宽恒定）而不是让表格横向滚动 —— 现场阅读体验更差。
+   保留 `ellipsis`：万一前 3 列被压，也给出可辨识的截断提示而不是硬切。 */
+#panel-setting .upload-table th:nth-child(1), #panel-setting .upload-table td:nth-child(1) { width: 14em; }
+#panel-setting .upload-table th:nth-child(2), #panel-setting .upload-table td:nth-child(2) { width: 11.5em; }
+#panel-setting .upload-table th:nth-child(3), #panel-setting .upload-table td:nth-child(3) { width: 11.5em; }
+/* 第 ④ 列（失败原因）**刻意不写 width** ⇒ 吃掉剩余宽度；且允许换行（`overflow-wrap:anywhere`），
+   故"失败原因"在任何宽度下都是**完整可读**的，不存在被截断的情形。 */
+#panel-setting .upload-table td { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#panel-setting .upload-table td.up-reason { white-space: normal; overflow-wrap: anywhere; }
+#panel-setting #upPendingEmpty[hidden] { display: none; }
+#panel-setting .upload-list .list-item { flex: none; }
+
+/* 服务端源降级提示（W5-② / ADR-0008 D4）：复用 `.degraded-banner` 的位置与配色。
+   位置比 UI-10 的上位机断连横幅**再高一点**（bottom 300px）—— 两者可能同时出现
+   （服务端源回退 + 上位机确实断连），错开高度避免文字相互压住；
+   并且 `src/services/boardSource.js` 保证"回退提示**只出现一条**"（按 id + class 双重去重）。
+   ⚠ **F16-2（类名同步）**：F15-1 把降级横幅的**专用类**从 `source-fallback` 改成了
+   `source-fallback-banner`（为了让 `Dashboard.renderDegraded()` 的链路横幅查找能把它排除掉），
+   而本行选择器当时没跟着改 ⇒ **该规则不再命中**（横幅回落到 `.degraded-banner` 的 `bottom: 210px`）。
+   现同步为 `source-fallback-banner`，把"与 UI-10 横幅错开高度"的设计意图**恢复生效**
+   —— 即便当前回退态下只显示一条横幅（F15-1 已保证不叠加），保留错位在"将来两条同时出现"
+   （例如服务端源降级 + 上位机确实断连被别的路径重新呈现）时更稳，且不留"看起来该生效却没生效"的隐规则。 */
+.degraded-banner.source-fallback-banner { bottom: 300px; }
 
 .span-2 { grid-column: 1 / -1; }
 

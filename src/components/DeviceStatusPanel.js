@@ -20,6 +20,23 @@ window.Components.DeviceStatusPanel = (function () {
      自愈后 `tick()` 重新写入带 `noData:false` 的真实统计 ⇒ 本分支自动退出、回到真实时长。 */
   const NO_DATA = '—';
 
+  /**
+   * 缺失值口径（W4 / ADR-0008 D3，2026-09-28 收口）：数值缺失一律显示**显式无数据 `—`**，
+   * **绝不 `.toFixed()` 一个 `null`**（那会抛 `TypeError: Cannot read properties of null`），
+   * 也**绝不**把 `null` 显示成 `0.00`（`0` 是合法实测值，两者必须分得开）。
+   * 判据＝`Number.isFinite`，`undefined` / `null` / `NaN` 一律走占位。
+   * 服务端模式下这些位来自 `snapshot.frame`（缺测字段**按报文原样缺省**，不编造）⇒ 本守卫是必需项。
+   * ⚠ `digits === 0` 时按**原样**输出（与改前 `setText('stFps', t.real.fps)` 的文本逐字一致：
+   *   整型量不补小数位），其余按固定小数位输出。
+   * @param {*} v 原始值
+   * @param {number} digits 小数位
+   * @returns {string} 数值文本或 `—`
+   */
+  function fixedOrNoData(v, digits) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return NO_DATA;
+    return digits > 0 ? v.toFixed(digits) : String(v);
+  }
+
   /* 5 种运行模式与状态色标（FR-2.1、FR-2.2）
      待机=黄、测试运行=绿、正常停机/维保检修=灰、故障锁定=红
      色值统一取自 styles/variables.css（UI-03），此处只引用变量名 */
@@ -42,20 +59,23 @@ window.Components.DeviceStatusPanel = (function () {
     setStyle('stModeBand', 'background', color);
     setText('stStage', s.stage);
 
-    /* 主要实测数据：航行器深度 + 航行速度（FR-3.9～3.11 / C-31、C-32） */
-    setText('stDepth', t.real.depth.toFixed(2));
-    setText('stSpeed', t.real.speed.toFixed(2));
-    setText('stVx', t.real.vx.toFixed(2));
-    setText('stVy', t.real.vy.toFixed(2));
+    /* 主要实测数据：航行器深度 + 航行速度（FR-3.9～3.11 / C-31、C-32）
+       ⚠ 缺失值守卫（W4 / ADR-0008 D3）：`depth/speed/vx/vy` 可能是 `null`（服务端缺测帧），
+         一律经 `fixedOrNoData()` 显示 `—`，**不得**直接 `.toFixed()`（null 上没有该方法 ⇒ TypeError）。 */
+    setText('stDepth', fixedOrNoData(t.real.depth, 2));
+    setText('stSpeed', fixedOrNoData(t.real.speed, 2));
+    setText('stVx', fixedOrNoData(t.real.vx, 2));
+    setText('stVy', fixedOrNoData(t.real.vy, 2));
     setText('stRunTime', state.stats.noData === true ? NO_DATA : window.Format.clock(state.stats.runSec || 0));
     setText('stDepthNote', '水下深度实测值 · 上位机整合后提供');
     setText('stSpeedNote', 'X-Y 平面合成速度 · vx / vy 为分速度');
 
-    /* 设备参数：次要展示（FR-3.16） */
-    setText('stFps', t.real.fps);
-    setText('stGain', t.real.gain.toFixed(1));
-    setText('stShutter', t.real.shutter);
-    setText('stCamDepth', (t.real.cameraDepth === undefined ? '—' : t.real.cameraDepth.toFixed(2)));
+    /* 设备参数：次要展示（FR-3.16）
+       `fps`/`shutter` 是整型量（无小数位），同样必须过守卫；`gain`/`cameraDepth` 为小数位量。 */
+    setText('stFps', fixedOrNoData(t.real.fps, 0));
+    setText('stGain', fixedOrNoData(t.real.gain, 1));
+    setText('stShutter', fixedOrNoData(t.real.shutter, 0));
+    setText('stCamDepth', fixedOrNoData(t.real.cameraDepth, 2));
 
     /* 联网状态（FR-2.6） */
     const online = state.device.link === 'online';

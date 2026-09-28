@@ -204,29 +204,262 @@ window.Api = (function () {
     return { ok: true, reason: '' };
   }
 
-  /** 判断上位机数据是否已过期（用于界面降级提示） */
-  function isUpperStale(now) {
+  /**
+   * 判断上位机数据是否已过期（用于界面降级提示）
+   *
+   * **服务端模式（`?source=server`）**：新鲜度的真源是**服务端链路结论**（`ingest.linkState()`），
+   * 前端不重算 —— 服务端已按 `upper.staleMs` 判定并在 `snapshot.link` / `link` 事件里给出
+   * `online`；本函数在服务端模式下直接返回服务端的结论（不再看本地 `lastUpperAt`，
+   * 因为本地只在收到事件时才更新它，两次事件之间会被误判成"冻结"，见 W5-② 判据③）。
+   */
+  function isUpperStale(now, state) {
+    if (CFG.dataSource === 'server') {
+      const st = state || ((window.MockData && window.MockData.state) ? window.MockData.state : null);
+      const sl = st && st.serverLink;
+      return !(sl && sl.online === true);
+    }
     if (!lastUpperAt) return true;
     return ((now ? now.getTime() : Date.now()) - lastUpperAt) > CFG.upper.staleMs;
   }
 
   /**
    * 把"数据冻结 / 取数失败"同步到界面判据 state.device.link（IF-D.9 / FR-2.6）
-   * 仅在 upper 模式生效：mock 模式的 device.link 由演示键 D 控制，不能被覆盖。
+   *
+   * 两条模式各自成立、互不干扰：
+   *   · `upper` 模式：`device.link` 由**上位机数据新鲜度**驱动
+   *     （`isUpperStale` / `upperValid`）；
+   *   · `server` 模式（W5-② / ADR-0008 D3）：`device.link` 由**服务端链路结论**驱动
+   *     （`state.serverLink.online`；服务端 `ingest.linkState()` 是唯一真源），
+   *     这样"SSE 断开 ⇒ 界面 ≤5 s 进入数据冻结/离线提示"这条判据才有单一依据；
+   *   · `mock` 模式：`device.link` 由演示键 D 控制，**不能被覆盖**。
    * @returns {string} 同步后的链路状态
    */
   function syncLinkState(state, now) {
-    if (!state || CFG.dataSource !== 'upper') return state ? state.device.link : 'online';
-    state.device.link = (isUpperStale(now) || state.upperValid === false) ? 'offline' : 'online';
+    if (!state) return 'online';
+    if (CFG.dataSource === 'server') {
+      const sl = state.serverLink;
+      state.device.link = (sl && sl.online === true) ? 'online' : 'offline';
+      return state.device.link;
+    }
+    if (CFG.dataSource !== 'upper') return state.device.link;
+    state.device.link = (isUpperStale(now, state) || state.upperValid === false) ? 'offline' : 'online';
     return state.device.link;
+  }
+
+  /* ---------------- 看板服务端（W5-② / ADR-0008 D1/D2/D4） ----------------
+     服务端契约（W5-① 已交付，见 `server/http/router.js`）：
+       `GET  /state`          首帧全量快照 `{ok, at, seq, snapshot}`
+       `GET  /events`         SSE 增量（`retry: 3000`；业务事件种类 frame/link/task/standard/upload/warning）
+       `GET  /upload/pending` 待补传清单（UI-20 主数据源）
+       `GET  /upload/status`  上报状态（配置 / 队列 / 告警阈值 / `autoRetry:false`）
+       `POST /upload/retry`   人工一键重报（**唯一**会再次发送待补传报文的入口）
+     口径（ADR-0008 D3/D4）：
+       · 服务端模式下前端**不造数、不直接向 MES 上报**（上报由服务端 `uploadReporter.js` 独占）；
+       · 所有失败路径只 `console.warn` + 优雅回退，**绝不 `console.error`、绝不抛未捕获异常**；
+       · 未接入的模块一律**显式无数据**（`null` / 空列表），不用演示值顶替。 */
+
+  /**
+   * 服务端基地址（**基地址真源＝`services/boardSource.js` 的 `resolveBaseUrl()`，此处不得再自行推导**）。
+   *
+   * ⚠ **F18（2026-09-28 真机正向取证的真缺陷）**：改前本函数**自己读** `CFG.board.baseUrl`
+   * （配置为空即返回空串），而 `boardSource.resolveBaseUrl()` 会按页面来源再判一次
+   * （`location.protocol === 'file:'` ⇒ 回退 `http://127.0.0.1:8787`）。
+   * 于是"基地址"这一份口径被**劈成两份**：`EventSource`（走 `boardSource`）拿对了 base，
+   * 而本文件所有 REST 取数（`fetchSnapshot`/`fetchPending`/`fetchUploadStatus`/`retryPendingServer`）
+   * 走的是**空串** ⇒ 在 `file://` 下发出 `file:///D:/state` 这种相对请求，被浏览器判 `ERR_FILE_NOT_FOUND`
+   * ⇒ 首帧快照必失败 ⇒ 优雅回退演示源 ⇒ **ADR-0008 D2 专为"双击 index.html"开的
+   * CORS `Origin: null` 白名单从来没被用上**（那条路径整条是断的）。
+   *
+   * 现口径（**单源**）：
+   *   · `window.BoardSource.resolveBaseUrl` 存在 ⇒ **一律用它的返回值**（含同源情形的空串）；
+   *   · 仅当 `BoardSource` **未加载**（旧夹具 / 裁剪环境）才退回读 `CFG.board.baseUrl`
+   *     —— 并做能力检测，**不得**因 `BoardSource` 不存在而抛 `ReferenceError`。
+   * @returns {string} 末尾无 `/` 的基地址（可为空串＝同源相对路径）
+   */
+  function serverBase() {
+    const bs = window.BoardSource;
+    if (bs && typeof bs.resolveBaseUrl === 'function') {
+      try {
+        const b = bs.resolveBaseUrl();
+        if (typeof b === 'string') return b.replace(/\/+$/, '');
+      } catch (err) {
+        /* 真源自己坏了也不能让整条取数链崩：只 warn，退回配置读法（不静默吞掉原因） */
+        console.warn('[Api] BoardSource.resolveBaseUrl() 抛错，暂按 CFG.board.baseUrl 解析：' +
+          ((err && err.message) || String(err)));
+      }
+    }
+    const b = (CFG.board && typeof CFG.board.baseUrl === 'string') ? CFG.board.baseUrl : '';
+    return b.replace(/\/+$/, '');
+  }
+
+  /** 服务端单次 HTTP 超时（真源＝`board.timeoutMs`） */
+  function serverTimeout() {
+    return (CFG.board && CFG.board.timeoutMs) || 3000;
+  }
+
+  /**
+   * 统一的 HTTP JSON 出口（**本文件所有服务端取数都必须走它**）。
+   * 错误形状沿用 `sendReport()` 的既有字段（`{ok,error,failReason,responseCode,responseText}`），
+   * 便于界面与自检用同一套判据读两种来源的失败。
+   *
+   * ⚠ **能力检测先行**：`tests/ui-check.js` 的 vm 沙箱没有 `fetch`/`AbortSignal`，
+   *    缺失时**返回失败结论**（`ok:false`）而**不抛** —— 调用方据此走优雅回退。
+   *
+   * @param {string} path    以 `/` 开头的路径（如 `/state`）
+   * @param {{method?:string, body?:object}} [options]
+   * @returns {Promise<{ok:boolean, status?:number, body?:any, url:string,
+   *                    error?:string, failReason?:string, responseCode?:string, responseText?:string}>}
+   */
+  function httpJson(path, options) {
+    const opt = options || {};
+    const url = serverBase() + path;
+    const method = String(opt.method || 'GET').toUpperCase();
+    if (typeof fetch !== 'function') {
+      return Promise.resolve({
+        ok: false, url, error: '运行环境不支持 fetch',
+        failReason: '运行环境不支持 fetch（服务端源不可用）', responseCode: '不支持', responseText: ''
+      });
+    }
+    let signal;
+    try {
+      if (typeof AbortSignal !== 'undefined' && AbortSignal && typeof AbortSignal.timeout === 'function') {
+        signal = AbortSignal.timeout(serverTimeout());
+      }
+    } catch (e) { signal = undefined; }   // 老环境：退化为无超时（仍受浏览器自身超时约束）
+
+    const init = { method: method, headers: { Accept: 'application/json' } };
+    if (signal) init.signal = signal;
+    if (opt.body !== undefined) {
+      init.headers['Content-Type'] = 'application/json;charset=UTF-8';
+      init.body = JSON.stringify(opt.body);
+    }
+
+    return fetch(url, init).then(res => res.text().then(text => {
+      let parsed = null;
+      let parseError = null;
+      try { parsed = text ? JSON.parse(text) : null; } catch (e) { parseError = e; }
+      if (!res.ok) {
+        /* HTTP 非 2xx：如实回报状态码与服务端错误体（**不 console.error**） */
+        const reason = (parsed && parsed.err && parsed.err.message) || parseError && parseError.message || ('HTTP ' + res.status);
+        return {
+          ok: false, status: res.status, body: parsed, url, responseText: text,
+          failReason: String(reason), responseCode: String(res.status),
+          error: '服务端返回 HTTP ' + res.status + '：' + String(reason)
+        };
+      }
+      if (parseError) {
+        return {
+          ok: false, status: res.status, body: null, url, responseText: text,
+          failReason: '响应不是合法 JSON：' + parseError.message, responseCode: String(res.status),
+          error: '响应不是合法 JSON'
+        };
+      }
+      return { ok: true, status: res.status, body: parsed, url, responseText: text };
+    })).catch(err => {
+      const msg = (err && err.message) || String(err);
+      return {
+        ok: false, url, error: msg, failReason: msg,
+        responseCode: '网络错误', responseText: ''
+      };
+    });
+  }
+
+  /**
+   * 取首帧全量快照（`GET /state`）。
+   * **成功判据是"`ok===true` 且 `snapshot` 是对象"** —— 只判 HTTP 200 会把
+   * `{ok:false, err:{…}}` 这种"200 包着失败"误当成功（服务端 503 未挂载 SSE 时即如此）。
+   * @returns {Promise<{ok:boolean, snapshot?:object, at?:string, seq?:number, error?:string, url:string}>}
+   */
+  function fetchSnapshot() {
+    const path = (CFG.board && CFG.board.statePath) || '/state';
+    return httpJson(path).then(r => {
+      if (!r.ok) return { ok: false, url: r.url, error: r.error, failReason: r.failReason, responseCode: r.responseCode };
+      const body = r.body;
+      if (!body || body.ok !== true || !body.snapshot || typeof body.snapshot !== 'object') {
+        const why = (body && body.err && body.err.message) || '响应体缺少 snapshot（ok!==true）';
+        return { ok: false, url: r.url, error: String(why), failReason: String(why), responseCode: String(r.status) };
+      }
+      return { ok: true, url: r.url, snapshot: body.snapshot, at: body.at, seq: body.seq };
+    });
+  }
+
+  /**
+   * 取待补传清单（`GET /upload/pending`）—— UI-20 的主数据源。
+   * @returns {Promise<{ok:boolean, count?:number, items?:Array<object>, capacity?:number,
+   *                    warnThreshold?:number, alert?:object, error?:string, url:string}>}
+   */
+  function fetchPending() {
+    return httpJson('/upload/pending').then(r => {
+      if (!r.ok) return { ok: false, url: r.url, error: r.error, failReason: r.failReason, responseCode: r.responseCode };
+      const b = r.body || {};
+      return {
+        ok: true, url: r.url,
+        count: typeof b.count === 'number' ? b.count : (Array.isArray(b.items) ? b.items.length : 0),
+        items: Array.isArray(b.items) ? b.items : [],
+        pendingOnly: b.pendingOnly === undefined ? null : b.pendingOnly,
+        failedAfterRetry: b.failedAfterRetry === undefined ? null : b.failedAfterRetry,
+        capacity: b.capacity === undefined ? null : b.capacity,
+        warnThreshold: b.warnThreshold === undefined ? null : b.warnThreshold,
+        overflow: b.overflow === true,
+        alert: b.alert === undefined ? null : b.alert
+      };
+    });
+  }
+
+  /**
+   * 取上报状态（`GET /upload/status`）：配置 / 队列 / 告警阈值 / `autoRetry:false` 的显式声明。
+   * @returns {Promise<{ok:boolean, status?:object, error?:string, url:string}>}
+   */
+  function fetchUploadStatus() {
+    return httpJson('/upload/status').then(r => {
+      if (!r.ok) return { ok: false, url: r.url, error: r.error, failReason: r.failReason, responseCode: r.responseCode };
+      return { ok: true, url: r.url, status: r.body || {} };
+    });
+  }
+
+  /**
+   * **人工触发**服务端重报（`POST /upload/retry`）—— UI-20 唯一的重报出口。
+   * 语义与 `retryPending()`（浏览器本地队列那一个）**不同**：本函数把重报交给服务端
+   * `uploadReporter.retryPending()`（`upload_log` 单源、按 `created_at, id` 顺序、幂等），
+   * 前端**不组装报文、不直接向 MES 上报**（ADR-0008 D3）。
+   * **只在被调用时发一次请求**：无定时器、无指数退避、不自动重试（NFR-10 / NFR-13）。
+   * @param {{ids?:string[], limit?:number}} [options] 空体＝重报全部待补传；`limit:1`＝只补最旧 1 条
+   * @returns {Promise<object>} 服务端响应体（含 `ok/sent/failed/remaining/skipped/reason`）或本机失败结论
+   */
+  function retryPendingServer(options) {
+    const body = {};
+    const opt = options || {};
+    if (Array.isArray(opt.ids) && opt.ids.length) body.ids = opt.ids.slice();
+    if (Number.isInteger(opt.limit) && opt.limit > 0) body.limit = opt.limit;
+    return httpJson('/upload/retry', { method: 'POST', body: body }).then(r => {
+      if (!r.ok) {
+        return {
+          ok: false, url: r.url, error: r.error, reason: r.failReason,
+          failReason: r.failReason, responseCode: r.responseCode
+        };
+      }
+      return Object.assign({ url: r.url }, r.body || {});
+    });
   }
 
   /* ---------------- 数据源接入 ---------------- */
 
   /**
-   * 启动上位机数据源
+   * 启动数据源（**三个分支，三条互不干扰的路径**）。
+   *
+   * · `'mock'`  ⇒ 返回 `'none'`：由 `services/mockData.js` 的 `tick()` 自行驱动，适配层不介入
+   *   （演示模式的行为与改前**一字不变**）；
+   * · `'upper'` ⇒ 上位机报文驱动（内置模拟上位机 / 真实轮询两条子分支，与改前逐字相同）；
+   * · `'server'` ⇒ **W5-② 新增**：服务端快照 + SSE 增量驱动。本分支**不造数**，
+   *   只是"把服务端真源标记为已选中"——真正的取数与回退在 `services/boardSource.js`
+   *   （`BoardSource.startServerSource()` 由 `src/main.js` 调用，保证"首帧快照到手才建流"）。
+   *   为什么不在本函数里直接 `fetch`：`fetchSnapshot()` 是异步的，而本函数的返回值是
+   *   `sourceKind`（同步判据，决定 `main.js` 是否跑 `M.tick()`）。让 `main.js` 先按 `'none'`
+   *   停掉本地造数、再由 `boardSource` 拉快照，**任何时刻都不会出现"两处都在推进数据"**。
+   *
    * @param {object}   state    看板状态
    * @param {Function} onFrame  每帧回调（state, applied, payload）
+   * @returns {string} `'mock-upper'` / `'upper-http'` / `'none'`（mock 与 server 都返回 `'none'`）
    */
   function startUpper(state, onFrame) {
     stopUpper();
@@ -274,7 +507,11 @@ window.Api = (function () {
       return 'upper-http';
     }
 
-    return 'none';   // mock 模式：由 mockData 自行驱动，适配层不介入
+    /* `'server'`（W5-②）与 `'mock'` 都返回 `'none'`：
+       · mock   —— 由 mockData 驱动；
+       · server —— **不得**跑 `M.tick()`（ADR-0008 D3：前端只应用、不生成）；
+         取数/回退由 `BoardSource.startServerSource()` 负责（见函数头说明）。 */
+    return 'none';
   }
 
   function stopUpper() {
@@ -307,14 +544,22 @@ window.Api = (function () {
       }
       let v = getPath(state, src);
       if (v === undefined || v === null) {
-        /* 缺值时给出安全默认，避免上报报文缺关键字段被 MES 退回 */
+        /* 缺值口径（W4 / ADR-0008 D3，2026-09-28 收口）：**一律 `null`**（"没有这个值"），
+           **绝不用 `0` 顶替** —— `0` 是合法物理量（0 m 深度 / 0 m·s⁻¹ 速度 / 0 件），
+           拿它当缺省会让 MES 侧把"本机没有数据"读成"测到了 0"，属语义失真
+           （服务端 `uploadReporter.buildReport()` 已按 `null` 实现，前端切换真实源时须同口径）。
+           两个**例外**（不是数值字段，且协议要求必有值，故按协议口径补齐而不是留 null）：
+             · `collectTime` —— 报文时刻（`yyyy-MM-dd HH:mm:ss`，DR-16 格式真源）；
+             · `testStatus`  —— 由运行模式反查附录 2 的状态码（`fieldMap.modeToTestStatus`），
+                                反查不到时仍给 `null`（不伪造运行状态）。 */
         if (field === 'collectTime') {
           v = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
               `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
         } else if (field === 'testStatus') {
-          v = MAP.modeToTestStatus[getPath(state, 'status.mode')] ?? 0;
+          const code = MAP.modeToTestStatus[getPath(state, 'status.mode')];
+          v = (typeof code === 'number') ? code : null;
         } else {
-          v = 0;
+          v = null;
         }
       }
       out[field] = v;
@@ -686,14 +931,26 @@ window.Api = (function () {
     };
   }
 
-  /** 供界面显示的自检信息 */
-  function getStatus(now) {
+  /**
+   * 供界面显示的自检信息。
+   *
+   * ⚠ **既有字段名一个都不改**（`dataSource` / `upperUrl` / `upperStale` / `mesUrl` /
+   *   `pendingCount` / `pendingCapacity` / `queueAlert` / `queueFull` / `responseStyle`）：
+   *   `tests/contract-check.js` 的 N 段（R26-P3-4）与 G 段都按这些键名取数，改名即打红。
+   *   W5-② 只**追加**服务端源相关的只读字段（`sourceKind` / `server*` / `upload*`）。
+   * @param {Date}   [now]   判定时刻（注入时钟）
+   * @param {object} [state] 看板状态（服务端模式读 `serverLink`/`upload`；缺省取 `MockData.state`）
+   */
+  function getStatus(now, state) {
     const cap = queueCap();
     const pendingCount = pending.length;
+    const st = state || ((window.MockData && window.MockData.state) ? window.MockData.state : null);
+    const sl = st && st.serverLink;
+    const up = st && st.upload;
     return {
       dataSource: CFG.dataSource,
       upperUrl: CFG.upper.url || '（未配置，待 Q-21）',
-      upperStale: isUpperStale(now),
+      upperStale: isUpperStale(now, st),
       mesUrl: CFG.mes.baseUrl || '（未配置，待 Q-23）',
       pendingCount: pendingCount,
       pendingCapacity: cap,
@@ -701,7 +958,15 @@ window.Api = (function () {
          阈值＝真源 CFG.mes.queueWarnThreshold（R26-P3-4：与容量 queueCap 分语义，不再按 90% 容量推导）。 */
       queueAlert: pendingCount >= queueWarnThreshold(),
       queueFull: pendingCount >= cap,
-      responseStyle: CFG.mes.responseStyle
+      responseStyle: CFG.mes.responseStyle,
+      /* ---- W5-② 追加（只读；不改上面任何既有字段的语义） ---- */
+      sourceKind: CFG.dataSource,
+      boardBaseUrl: serverBase(),
+      serverConnected: !!(sl && sl.online === true),
+      serverLinkState: sl ? sl.state : null,
+      serverPendingCount: (up && typeof up.pendingCount === 'number') ? up.pendingCount : null,
+      serverQueueAlert: !!(up && up.alert && up.alert.warn),
+      serverUploadAvailable: !!(up && up.available === true)
     };
   }
 
@@ -710,6 +975,9 @@ window.Api = (function () {
     CFG, MAP,
     /* IF-D */
     applyUpperPayload, validatePayload, isUpperStale, syncLinkState, startUpper, stopUpper,
+    /* 看板服务端（W5-② / ADR-0008）：统一 HTTP 出口 + 首帧快照 + UI-20 的两个只读接口与人工重报 */
+    httpJson, fetchSnapshot, fetchPending, fetchUploadStatus, retryPendingServer,
+    serverBase, serverTimeout,
     /* IF-B */
     buildReportPayload, buildUrl, uploadReport, nextUploadId, isReceiptOk, receiptReason,
     /* IF-B.5 §1.2.5 关键运行参数报文（含 uclValue/lclValue/IsPass 占位口径） */

@@ -112,8 +112,26 @@ window.Components.TaskPanel = (function () {
     return isNum(d) ? (d >= 0 ? '+' : '') + d.toFixed(digits) : '—';
   }
 
-  /** 该参数在配置里的默认段（(产品＋工序) 未命中现场录入值时使用；仅演示） */
+  /**
+   * 是否**禁止**回退到演示默认标准（F15-3，2026-09-28 负责人裁定，依据 ADR-0008 D3）。
+   *
+   * 服务端模式下"服务端没给标准"必须如实显示「标准未设定」/「—」，**不得**用
+   * `board.config.js` 的 `standards.default` 顶替 —— 否则会出现**三方不一致**：
+   * 快照 `standard = null`（库里没有生效版本）、界面却显示 `5.00 / +0.30 / -0.20 / 上限 5.30 · 下限 4.80`、
+   * 而 `Api.standardLimits()` 又给出同一组演示值；服务端 `standard.mesLimits()` 在没有标准时
+   * 一律回占位 `65535` / `IsPass: null`（从不回退演示默认）。
+   * 判定口径：`BoardConfig.dataSource === 'server'`。**演示模式行为保持原样**（仍回退演示默认），
+   * 故 10 张截图基准与 `ui-check`/`copy-check` 的既有标准区断言不受影响。
+   */
+  function demoStandardForbidden() {
+    const live = window.BoardConfig || BC;
+    return !!live && live.dataSource === 'server';
+  }
+
+  /** 该参数在配置里的默认段（(产品＋工序) 未命中现场录入值时使用；**仅演示**）
+   *  ⚠ 服务端模式下**一律返回 null**（F15-3）：不得用演示默认顶替"服务端未给标准"。 */
   function cfgRow(kind) {
+    if (demoStandardForbidden()) return null;
     const dft = STD.default || {};
     return dft[kind] || FALLBACK_STD[kind] || null;
   }
@@ -123,6 +141,8 @@ window.Components.TaskPanel = (function () {
    * 注：只要 state 里已为该参数建了行（哪怕只有典型值、缺偏差），就**不做逐项补默认** ——
    *     必要项缺失必须如实显示"标准未设定"，否则半套默认值会伪造出一条看起来合法的标准，
    *     并把 MES 上报从"占位"错误地变成"有标准"（FR-3.19 的"不写入"语义 / IF-B.5）。
+   *     **服务端模式下连"未建行"也不回退演示默认**（F15-3）⇒ 该行为 null ⇒ 三态判 `idle`、
+   *     导出格显示「—」、上报走占位哨兵（与服务端 `mesLimits()` 同口径）。
    * @returns {object|null} 该参数的规格（含 unit / digits / typical / upperDev / lowerDev）
    */
   function ensureRow(state, kind) {
@@ -738,28 +758,41 @@ window.Components.TaskPanel = (function () {
     setText('tkSpeed', isNum(t.real.speed) ? t.real.speed.toFixed(2) : '—');
     setStyle('tkDepth', 'color', styleOfLevel(levelOf(t.real.depth, ensureRow(state, 'depth')).lv));
     setStyle('tkSpeed', 'color', styleOfLevel(levelOf(t.real.speed, ensureRow(state, 'speed')).lv));
-    setText('tkVx', t.real.vx.toFixed(2));
-    setText('tkVy', t.real.vy.toFixed(2));
+    /* 分速度 vx / vy：与同段 `depth`/`speed` **同款守卫**（W4 / ADR-0008 D3）。
+       改前这里直接 `t.real.vx.toFixed(2)`：服务端缺测帧里 `velocity_x` 缺省 ⇒ `null`
+       ⇒ 抛 `TypeError`（整块任务页被 `renderAll` 的 catch 跳过、界面停在上一帧）。 */
+    setText('tkVx', isNum(t.real.vx) ? t.real.vx.toFixed(2) : '—');
+    setText('tkVy', isNum(t.real.vy) ? t.real.vy.toFixed(2) : '—');
 
     /* 测试标准区（FR-3.16 改写 / FR-3.18）＋相机参数二级菜单（FR-3.16 改写） */
     renderStandards(state);
     renderCameras(state);
 
-    /* 测试实时进度 */
-    const pct = t.progress * 100;
-    setText('tkProgressPct', pct.toFixed(1) + '%');
-    setStyle('tkProgressBar', 'width', pct.toFixed(1) + '%');
-    setText('tkProgressText', noData
-      ? `当前第 ${t.unitIndex} 件 · 当班已完成 ${NO_DATA} 件`
-      : `当前第 ${t.unitIndex} 件 · 当班已完成 ${state.stats.done} / ${state.stats.plan} 件`);
+    /* 测试实时进度
+       ⚠ 缺失值口径（W4 / ADR-0008 D3）：`task.progress` / `task.unitIndex` / `task.result`
+         在**服务端模式下**不在快照的 7 键之内（服务端 `snapshot` 不含单任务进度）⇒ 由
+         `services/stateAdapter.js` 置 `null`；此处**显式显示"尚未接入服务端"**，
+         **不得**把 `null` 当 0 显示（"算不出来"≠"进度为零"），也不得残留演示值。 */
+    const pct = isNum(t.progress) ? t.progress * 100 : null;
+    setText('tkProgressPct', pct === null ? NO_DATA : pct.toFixed(1) + '%');
+    if (pct !== null) setStyle('tkProgressBar', 'width', pct.toFixed(1) + '%');
+    setText('tkProgressText', pct === null
+      ? '单任务进度：尚未接入服务端（快照未提供 progress / unitIndex）'
+      : (noData
+        ? `当前第 ${t.unitIndex} 件 · 当班已完成 ${NO_DATA} 件`
+        : `当前第 ${t.unitIndex} 件 · 当班已完成 ${state.stats.done} / ${state.stats.plan} 件`));
 
-    /* 单任务测试结果（五态流转）；色值引用 styles/variables.css 的 CSS 变量（UI-03） */
+    /* 单任务测试结果（五态流转）；色值引用 styles/variables.css 的 CSS 变量（UI-03）
+       `t.result` 缺省（服务端模式）⇒ 显式无数据，不显示演示值「测试中」。 */
     const colors = { '合格': 'var(--ok)', '不合格': 'var(--err)', '待复检': 'var(--warn)', '待测试': 'var(--idle)' };
-    setText('tkResult', t.result);
-    setStyle('tkResult', 'color', colors[t.result] || 'var(--accent)');
-    setText('tkResultNote', `上一件判定结果：${t.lastResult} · 节拍 ${window.MockData.CFG.cycleSec}s/件`);
+    const hasResult = typeof t.result === 'string' && t.result !== '';
+    setText('tkResult', hasResult ? t.result : NO_DATA);
+    setStyle('tkResult', 'color', hasResult ? (colors[t.result] || 'var(--accent)') : 'var(--idle)');
+    setText('tkResultNote', hasResult
+      ? `上一件判定结果：${t.lastResult} · 节拍 ${window.MockData.CFG.cycleSec}s/件`
+      : '单任务判定结果：尚未接入服务端');
     document.querySelectorAll('.flow-step').forEach(el =>
-      el.classList.toggle('on', el.dataset.step === t.result));
+      el.classList.toggle('on', hasResult && el.dataset.step === t.result));
   }
 
   /** 三态 → CSS 变量（仅着色深度/速度两个主参数） */

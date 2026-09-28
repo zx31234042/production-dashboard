@@ -25,6 +25,10 @@ const ROOT = path.resolve(__dirname, '..');
 /* ---------------- 断言框架 ---------------- */
 let passed = 0;
 const failures = [];
+/* F15-2 的断言必须在**真网络路径**上做（`BoardSource.startServerSource()` 是异步的），
+   于是它只能落在异步 IIFE 里；本数组负责把这些 Promise 收集到**汇总之前**统一 await，
+   否则那条断言的结果会印在汇总行之后（数字与失败清单都会漏它）。 */
+const asyncChecks = [];
 let skipped = 0;
 
 function section(title) {
@@ -520,18 +524,26 @@ function loadBootFixture(search) {
  *
  * @param {string[]} componentRels 组件加载清单（顺序须与 index.html 一致）
  * @param {string} [search] 查询串（默认空；`?unlock=1` 等旁路参数按需给）
+ * @param {{protocol?:string}} [opts] `protocol` 写进桩件的 `location.protocol`（F18 要区分
+ *        `file:` 与同源托管；缺省 `'http:'`）。**必须在 `run()` 之前设**：`boardSource.resolveBaseUrl()`
+ *        是**调用时**读 `location.protocol`，而 vm 沙箱里 `location` 就是全局对象本身，
+ *        事后从外部对 `fx.w.location` 赋值改不到它。
  * @returns {{w:object, nodes:Map<string,object>, node:Function, out:Array, calls:object,
  *            intervals:Array, errors:Function, errorCount:Function, advance:Function,
  *            setShiftList:Function, frame:Function, click:Function, type:Function,
  *            currentShiftList:Function}}
  */
-function loadFrameFixture(componentRels, search) {
+function loadFrameFixture(componentRels, search, opts) {
   const nodes = new Map();
   const out = [];
   const intervals = [];
   const loggedErrors = [];
   const timers = [];
   const calls = {};
+  /* F15-1：`appendChild` 记下的子节点 / `remove()` 摘掉的节点 ——
+     供 `document.querySelector*` 只返回"仍在文档里"的节点（真 DOM 语义）。 */
+  const appended = [];
+  const removed = [];
   const clock = { ms: new Date('2026-09-27T10:20:30').getTime() };
   let timerSeq = 0;
   let intervalSeq = 0;
@@ -556,10 +568,37 @@ function loadFrameFixture(componentRels, search) {
       addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); },
       __fire: (type, ev) => (handlers[type] || []).forEach(fn => fn(ev || { key: 'Enter' })),
       querySelector: sel => node(id + ' ' + sel),
-      appendChild: () => {},
-      remove: () => {},
+      /* F15-1：`appendChild` 必须**记下子节点**（真 DOM 语义），否则"降级横幅只 1 条 / 存在性"
+         这类按 `document.querySelector*` 观察的断言看到的是空集合 —— 而"0 条"对
+         "不得叠加（≤1）"**同样为真** ⇒ 断言变成防空洞（复核实测：D22 变异测不出来）。
+         `__parent` / `parentNode` 也一并维护：`BoardSource.showFallbackBanner()` 用它判断
+         "这条横幅到底在不在文档里"（游离节点不得复用）。 */
+      appendChild: child => {
+        if (child && typeof child === 'object') {
+          child.__parent = o;
+          o.__children = o.__children || [];
+          if (o.__children.indexOf(child) < 0) o.__children.push(child);
+          appended.push(child);
+          if (child.__id) nodes.set(child.__id, child);
+          if (child.id) nodes.set(child.id, child);
+        }
+        return child;
+      },
+      remove: () => {
+        removed.push(o);
+        if (o.__parent && Array.isArray(o.__parent.__children)) {
+          const i = o.__parent.__children.indexOf(o);
+          if (i >= 0) o.__parent.__children.splice(i, 1);
+        }
+        o.__parent = null;
+        const ai = appended.indexOf(o);
+        if (ai >= 0) appended.splice(ai, 1);
+        nodes.delete(o.__id);
+        if (o.id) nodes.delete(o.id);
+      },
       closest: () => null
     };
+    Object.defineProperty(o, 'parentNode', { get() { return o.__parent || null; }, configurable: true });
     Object.defineProperty(o, 'textContent', {
       get() { return o.__text || ''; },
       set(v) { o.__text = String(v); out.push({ kind: 'text', id: o.__id, value: String(v) }); },
@@ -589,12 +628,18 @@ function loadFrameFixture(componentRels, search) {
       error: (...a) => { loggedErrors.push({ kind: 'error', text: a.map(x => (x && x.message) ? x.message : String(x)).join(' ') }); }
     },
     Date: FakeDate,
-    location: { search: search || '' },
+    location: { search: search || '', protocol: (opts && opts.protocol) || 'http:' },
     URLSearchParams,
+    /* F18：把桩 `fetch` 暴露进沙箱 —— 用例用它**捕获真实请求 URL**（行为判据，不是读源码字符串） */
+    fetch: (...a) => sandbox.__fetch(...a),
     innerWidth: 3840, innerHeight: 2160,
     addEventListener: () => {}
   };
   sandbox.window = sandbox;
+  /* F18：桩 `fetch`（默认"网络错误"式拒绝；用例可覆盖 `sandbox.__fetch` 以**捕获真实请求 URL**）
+     ＋ `AbortSignal.timeout` 占位（`api.httpJson` 会做能力检测，缺了也不抛，这里给全更贴近浏览器）。 */
+  sandbox.__fetch = () => Promise.reject(new Error('ui-check 桩 fetch：未接网络'));
+  sandbox.AbortSignal = { timeout: () => ({}) };
   sandbox.setTimeout = (fn, delay) => { const id = ++timerSeq; timers.push({ id, delay, fn, fired: false, cancelled: false }); return id; };
   sandbox.clearTimeout = id => { const t = timers.find(x => x.id === id); if (t) t.cancelled = true; };
   sandbox.setInterval = (fn, delay) => { const id = ++intervalSeq; intervals.push({ id, delay, fn }); return id; };
@@ -602,8 +647,20 @@ function loadFrameFixture(componentRels, search) {
   sandbox.document = {
     readyState: 'complete',                 /* 直接跑 start()，不必再触发 DOMContentLoaded */
     getElementById: node,
-    querySelector: () => null,
-    querySelectorAll: () => [],
+    /* F15-1：`document.querySelector*` 必须**真的能查到已插入的节点**（真 DOM 语义）。
+       改前恒返回 null / []，于是"降级横幅存在且不叠加"这类断言**对 0 条也为真**（空洞），
+       D22 变异测不出来（复核实测）。现在按 `appendChild` 记录的"仍在文档里"的节点查找。 */
+    querySelector: sel => {
+      const cls = String(sel).replace(/^\./, '');
+      for (const el of appended) {
+        if (String(el.className || '').split(/\s+/).indexOf(cls) >= 0) return el;
+      }
+      return null;
+    },
+    querySelectorAll: sel => {
+      const cls = String(sel).replace(/^\./, '');
+      return appended.filter(el => String(el.className || '').split(/\s+/).indexOf(cls) >= 0);
+    },
     createElement: () => node('created-' + (++timerSeq)),
     addEventListener: () => {}
   };
@@ -664,6 +721,11 @@ function loadFrameFixture(componentRels, search) {
     startErr,
     CALL_KEYS,
     resetCalls,
+    /** F15-1：当前"仍在文档里"的降级横幅（按类名精确筛选，供"存在且不叠加"断言使用） */
+    banners: cls => appended.filter(el =>
+      String(el.className || '').split(/\s+/).indexOf(String(cls).replace(/^\./, '')) >= 0),
+    /** F15-1：`appendChild` 记录（插入顺序） */
+    appended,
     /** 捕获到的 console.warn/error 原文（不回放，避免把**预期内**的告警混进门禁输出） */
     errors: kind => loggedErrors.filter(e => kind === undefined || e.kind === kind).map(e => e.text),
     errorCount: () => loggedErrors.filter(e => e.kind === 'error').length,
@@ -3888,7 +3950,308 @@ async function main() {
     );
   }
 
+  /* ===== F15（D11，2026-09-28 独立复核 R-2026-09-28-02）：源降级横幅 + frame:null 缺值 =====
+     立案：
+       F15-1（P1）`fallbackToDemo()` 曾把 `state.device.link` 置 `'online'`，而源降级横幅的
+         className 里含 `degraded-banner` ⇒ 被 `Dashboard.renderDegraded()` 的
+         `document.querySelector('.degraded-banner')` 命中 ⇒ 同一次 `renderAll` 走
+         `!offline && banner ⇒ banner.remove()`，**降级提示在 1 帧内被删**（复核真启动路径实测
+         5 帧后两条横幅全没，只剩页脚小角标）。
+       F15-2（P2）`snapshot.frame === null`（服务端从未收到帧）时"先归 null"的守卫在
+         `applyServerFrame()` 内部、而它只在 `frame` 是对象时才被调 ⇒ 实测位保留 `mockData`
+         演示种子值（界面 `#stDepth="5.00" #stFps="400"`）—— ADR-0008 D3「不得用演示值顶替」。
+     判据一律**行为**判据（真启动路径逐帧驱动 + 真节点文本 + 本帧写入证据），遵 ADR-0004 D23。
+     ⚠ 本节的"横幅存在且只 1 条"断言**对 0 条为假**（`>0` 与 `===1` 同时成立才过）——
+       这正是 F15-1 立案的"空洞断言"修补点（D22 变异 8 可指名变红）。 ---- */
+  {
+    const F15_COMPONENTS = [
+      /* `loadFrameFixture` 的 `componentRels` 会按顺序 `run()` 这些文件；它固定预加载的是
+         config/fieldMap/format/mockData/api/Dashboard。W5-② 的两个新服务（形状翻译与
+         服务端取数）必须显式列进来，否则 `window.StateAdapter` / `window.BoardSource` 是空的。 */
+      'src/services/stateAdapter.js', 'src/services/boardSource.js',
+      'src/components/HeaderBar.js', 'src/components/TabsBar.js', 'src/components/CurveChart.js',
+      'src/components/DeviceStatusPanel.js', 'src/components/TaskPanel.js', 'src/components/ShiftPanel.js',
+      'src/components/StatsPanel.js', 'src/components/AlarmPanel.js', 'src/components/MaintPanel.js',
+      'src/components/NoticePanel.js', 'src/components/SettingPanel.js'
+    ];
+    const SOURCE_BANNER = 'source-fallback-banner';
+    const LINK_BANNER = 'degraded-banner';
+    const R = { err: null, r: null };
+
+    try {
+      /* (A) 服务端不可达 ⇒ 回退演示源 ⇒ 源降级横幅**必须存在**且**1 s/5 s/30 s 后仍在**、且只 1 条 */
+      const fx = loadFrameFixture(F15_COMPONENTS);
+      fx.w.BoardConfig.dataSource = 'server';
+      fx.w.BoardConfig.board.baseUrl = 'http://127.0.0.1:1';   // 必然连不上
+      const st = fx.w.MockData.state;
+      /* 让"回退"这一异步收敛在**注入时钟**下完成：直接调真实出口，再逐帧驱动渲染循环 */
+      fx.w.BoardSource.fallbackToDemo('F15 用例：端口不可达', st);
+      fx.w.Pages.Dashboard.renderAll(st);
+
+      const snap = () => ({
+        src: fx.banners(SOURCE_BANNER).length,
+        link: fx.banners(LINK_BANNER).filter(el =>
+          String(el.className).split(/\s+/).indexOf(SOURCE_BANNER) < 0).length,
+        text: fx.banners(SOURCE_BANNER).map(el => String(el.textContent || ''))
+      });
+      const s1 = snap();
+      fx.frame();                                    // ≈1 s
+      const s1f = snap();
+      fx.frame(); fx.frame(); fx.frame(); fx.frame(); // 累计 ≈5 s
+      const s5 = snap();
+      for (let i = 0; i < 25; i++) fx.frame();        // 累计 ≈30 s
+      const s30 = snap();
+
+      R.r = {
+        afterFallback: s1,
+        after1s: s1f,
+        after5s: s5,
+        after30s: s30,
+        dataSource: fx.w.BoardConfig.dataSource,
+        sourceFallback: st.sourceFallback === true,
+        errors: fx.errors('error')
+      };
+    } catch (e) { R.err = e.message; }
+
+    check(
+      'F15-1（D11）服务端不可达回退演示源后，**源降级横幅存在（>0 条）且 1 s / 5 s / 30 s 后仍在**、' +
+      '文本正确、且**不叠加**（恰 1 条；既有上位机链路横幅已被摘掉，不得两条同屏）',
+      R.err === null && R.r !== null &&
+      R.r.afterFallback.src === 1 && R.r.after1s.src === 1 &&
+      R.r.after5s.src === 1 && R.r.after30s.src === 1 &&
+      R.r.after30s.link === 0 &&
+      R.r.after30s.text.some(t => t.indexOf('看板服务端不可用') >= 0 && t.indexOf('已回退演示数据源') >= 0),
+      R.err ? `夹具执行异常：${R.err}` : R.r === null ? '（无观察值）' :
+        `回退后：源横幅 ${R.r.afterFallback.src} 条 → 1 s ${R.r.after1s.src} 条 → 5 s ${R.r.after5s.src} 条 → ` +
+        `30 s ${R.r.after30s.src} 条（均应 1）；30 s 时链路横幅 ${R.r.after30s.link} 条（应 0）；` +
+        `文本=${JSON.stringify(R.r.after30s.text)}；sourceFallback=${R.r.sourceFallback}；` +
+        `console.error=${R.r.errors.length}`
+    );
+    check(
+      'F15-1b（D11）源降级**不再借用 `device.link` 表达**：其驱动位是 `state.sourceFallback`；' +
+      '且真·上位机断连横幅（`device.link !== \'online\'`）在**未回退**时仍能出现、链路恢复后自行消失',
+      R.err === null && R.r !== null && R.r.sourceFallback === true &&
+      (() => {
+        try {
+          const f2 = loadFrameFixture(F15_COMPONENTS);
+          const s2 = f2.w.MockData.state;
+          s2.device.link = 'offline';
+          f2.w.Pages.Dashboard.renderAll(s2);
+          const shown = f2.banners(LINK_BANNER).filter(el =>
+            String(el.className).split(/\s+/).indexOf(SOURCE_BANNER) < 0).length;
+          s2.device.link = 'online';
+          f2.w.Pages.Dashboard.renderAll(s2);
+          const hidden = f2.banners(LINK_BANNER).filter(el =>
+            String(el.className).split(/\s+/).indexOf(SOURCE_BANNER) < 0).length;
+          R.r.linkPair = { shown, hidden };
+          return shown === 1 && hidden === 0;
+        } catch (e) { R.r.linkPair = { err: e.message }; return false; }
+      })(),
+      R.err ? `夹具执行异常：${R.err}` : `sourceFallback=${R.r && R.r.sourceFallback}；` +
+        `链路横幅：断连时 ${R.r && R.r.linkPair && R.r.linkPair.shown} 条（应 1）→ 恢复后 ` +
+        `${R.r && R.r.linkPair && R.r.linkPair.hidden} 条（应 0）`
+    );
+
+    /* (B) `snapshot.frame === null`（服务端从未收到帧）⇒ 实测位「—」、real 逐键 null、零 console.error。
+       走**真网络路径**：把沙箱 fetch 替换成"返回 `{ok:true, snapshot}`"，**await** BoardSource
+       的启动 Promise（`startServerSource()` 的当前实现是同步注册 + 两段 `.then()`，故必须等它收敛），
+       再驱动真 `step()` 逐帧渲染。 */
+    const N = { err: null, r: null };
+    const N_DONE = (async () => {
+      try {
+        const fx = loadFrameFixture(F15_COMPONENTS, '?source=server');
+        const REAL_FETCH = fx.w.fetch;
+        const st = fx.w.MockData.state;
+        /* ⚠ "演示种子值确实存在"这个**前置**必须在**调用适配层之前**取：
+           适配层一旦把实测位归 null，就读不到种子了（实测踩过：前置取值晚了一步，
+           于是"前置不成立"把整条断言判红，掩盖了真实结论）。 */
+        const seedBefore = {
+          depth: st.task.real.depth, speed: st.task.real.speed, vx: st.task.real.vx, vy: st.task.real.vy,
+          fps: st.task.real.fps, gain: st.task.real.gain, shutter: st.task.real.shutter,
+          cameraDepth: st.task.real.cameraDepth
+        };
+        fx.w.BoardConfig.board.baseUrl = 'http://127.0.0.1:1';
+        fx.w.fetch = (url, init) => {
+          const u = String(url);
+          if (/\/upload\/(pending|status)/.test(u)) {
+            return REAL_FETCH ? REAL_FETCH(url, init) : Promise.reject(new Error('no fetch'));
+          }
+          return Promise.resolve({
+            ok: true, status: 200,
+            text: () => Promise.resolve(JSON.stringify({
+              ok: true, at: '2026-09-28 10:00:00', seq: 0,
+              snapshot: {
+                link: null, task: null, device: null, frame: null,
+                stats: { planQty: 180, shift: null }, standard: null, upload: null
+              }
+            }))
+          });
+        };
+        await fx.w.BoardSource.startServerSource(st, () => {});   // 等首帧快照真正落地
+        /* ⚠ 这里**不**再驱动 `fx.frame()`：`loadFrameFixture` 的 `main.js` 是在
+           `BoardConfig.dataSource` 仍为默认 `'mock'` 时启动的（`sourceKind==='none'`），
+           它的 `step()` 会跑 `M.tick()`；本用例是**异步**等 `startServerSource()` 收敛之后才检查，
+           此刻若再驱动一帧，`M.tick()` 会把演示值写回来，从而看不到"归 null"这一步。
+           本用例要证的是**适配层把 frame:null 归成 null**（渲染层据此显示「—」），
+           不是"服务端模式下 tick 不跑"——后者由门禁 `contract-check` 的源码形状断言与
+           我的 W5-② 行为级夹具（判据②）负责。故：等快照落地 ⇒ 立即断言状态与已渲染文本。 */
+        fx.w.Pages.Dashboard.renderAll(st);
+        const IDS = ['stDepth', 'stSpeed', 'stVx', 'stVy', 'stFps', 'stGain', 'stShutter', 'stCamDepth'];
+        N.r = {
+          seedBefore,
+          seedIsNumeric: Object.keys(seedBefore).every(k => typeof seedBefore[k] === 'number'),
+          texts: IDS.reduce((a, id) => (a[id] = String(fx.node(id).textContent || ''), a), {}),
+          realNull: ['depth', 'speed', 'vx', 'vy', 'fps', 'gain', 'shutter', 'cameraDepth']
+            .every(k => st.task.real[k] === null),
+          serverMode: st.serverMode === true,
+          frameMissing: true,
+          errors: fx.errors('error')
+        };
+      } catch (e) { N.err = e.message; }
+      check(
+        'F15-2（D11）`snapshot.frame === null`（服务端从未收到帧）⇒ 8 个实测位一律「—」、' +
+        '`state.task.real` 逐键 `null`、整屏零 `console.error`（**不得**把 mockData 演示种子值当真实值显示）',
+        N.err === null && N.r !== null && N.r.seedIsNumeric && N.r.serverMode && N.r.realNull &&
+        Object.keys(N.r.texts).every(id => N.r.texts[id] === '—') && N.r.errors.length === 0,
+        N.err ? `夹具执行异常：${N.err}` : N.r === null ? '（无观察值）' :
+          `回退前演示种子=${JSON.stringify(N.r.seedBefore)}；real 逐键 null=${N.r.realNull}（serverMode=${N.r.serverMode}）；` +
+          `界面=${JSON.stringify(N.r.texts)}；console.error=${N.r.errors.length}`
+      );
+    })();
+    asyncChecks.push(N_DONE);
+
+    /* (C) F15-3：服务端模式**不得**回退演示默认上下限（成对：演示模式仍回退） */
+    const T = { err: null, r: null };
+    try {
+      const f3 = loadFrameFixture(F15_COMPONENTS);
+      f3.w.BoardConfig.dataSource = 'server';
+      const st3 = f3.w.MockData.state;
+      st3.task.standard = undefined;
+      const serverLim = f3.w.Api.standardLimits(st3);
+      f3.w.BoardConfig.dataSource = 'mock';
+      const st4 = f3.w.MockData.state;
+      st4.task.standard = undefined;
+      const demoLim = f3.w.Api.standardLimits(st4);
+      T.r = { serverLim, demoLim };
+    } catch (e) { T.err = e.message; }
+    check(
+      'F15-3（D11，ADR-0008 D3 裁定）服务端模式下**关闭**演示默认上下限回退：无标准 ⇒ ' +
+      '`Api.standardLimits()` 双参数均 `null`（界面「标准未设定」/「—」、上报走 N-7 哨兵）；' +
+      '**成对**：演示模式仍回退 `standards.default`（depth 5.30/4.80 · speed 5.20/4.80）',
+      T.err === null && T.r !== null &&
+      T.r.serverLim.depth === null && T.r.serverLim.speed === null &&
+      !!T.r.demoLim.depth && T.r.demoLim.depth.upper === 5.30 && T.r.demoLim.depth.lower === 4.80 &&
+      !!T.r.demoLim.speed && T.r.demoLim.speed.upper === 5.20 && T.r.demoLim.speed.lower === 4.80,
+      T.err ? `夹具执行异常：${T.err}` : T.r === null ? '（无观察值）' :
+        `服务端：depth=${JSON.stringify(T.r.serverLim.depth)} speed=${JSON.stringify(T.r.serverLim.speed)}（应均 null）；` +
+        `演示：depth=${JSON.stringify(T.r.demoLim.depth)} speed=${JSON.stringify(T.r.demoLim.speed)}`
+    );
+  }
+
   /* ---------------- 汇总 ---------------- */
+  /* F15-2 走真网络路径（`BoardSource.startServerSource()` 是异步的）⇒ 必须等它的断言跑完再汇总，
+     否则那条断言的结果会落在"汇总行之后"（数字对不上、清单也漏它）。 */
+  await Promise.all(asyncChecks);
+
+  /* ===== F18（D12，2026-09-28 真机正向取证的真缺陷）：基地址必须**只留一份真源** =====
+     立案：`src/services/api.js` 的 `serverBase()` 曾**自己读** `CFG.board.baseUrl`（空即空串），
+     而 `boardSource.resolveBaseUrl()` 会按 `location.protocol === 'file:'` 回退到
+     `http://127.0.0.1:8787` ⇒ 基地址被劈成两份：`EventSource` 拿对了 base，
+     而本文件所有 REST 取数（`fetchSnapshot`/`fetchPending`/…）在 `file://` 下发出
+     **相对路径** ⇒ 实际打到 `file:///D:/state`（`net::ERR_FILE_NOT_FOUND`）⇒ 首帧必失败
+     ⇒ 优雅回退演示源 ⇒ **ADR-0008 D2 专为"双击 index.html"开的 CORS `Origin: null` 白名单
+     从来没被用上**（那条路径整条是断的；真机实测角标显示「已回退 · 演示数据」而服务端在跑）。
+     判据一律**行为**判据：桩 `fetch` 捕获**真实请求 URL**（不读源码字符串），遵 ADR-0004 D23。 ---- */
+  {
+    const F18_COMPONENTS = [
+      'src/services/stateAdapter.js', 'src/services/boardSource.js',
+      'src/components/HeaderBar.js', 'src/components/TabsBar.js', 'src/components/CurveChart.js',
+      'src/components/DeviceStatusPanel.js', 'src/components/TaskPanel.js', 'src/components/ShiftPanel.js',
+      'src/components/StatsPanel.js', 'src/components/AlarmPanel.js', 'src/components/MaintPanel.js',
+      'src/components/NoticePanel.js', 'src/components/SettingPanel.js'
+    ];
+    /* (c) 用**独立最小 vm 上下文**（只装 config/fieldMap/api/mockData，不装 BoardSource、不跑 main.js）：
+       `loadFrameFixture` 内部会 `wrapCalls()` 逐个包 `CALL_KEYS` 里的组件，无法表达"缺 BoardSource"。 */
+    const F = { err: null, file: null, same: null, none: null };
+    /** 取一次"URL 观察"：桩 fetch 只记 URL、返回网络错误式拒绝（本用例只关心 URL） */
+    const observe = (fx, jobs) => {
+      const urls = [];
+      fx.w.__fetch = url => { urls.push(String(url)); return Promise.reject(new Error('F18 桩：不真发请求')); };
+      return Promise.all(jobs(fx.w.Api)).then(() => urls);
+    };
+    try {
+      /* (a) file:// ⇒ 8787（ADR-0008 D2 的核心承诺） */
+      const a = loadFrameFixture(F18_COMPONENTS, '', { protocol: 'file:' });
+      a.w.BoardConfig.board.baseUrl = '';            // 与真实配置一致（同源＝空串）
+      const aResolved = a.w.BoardSource.resolveBaseUrl();
+      const aBase = a.w.Api.getStatus().boardBaseUrl;
+      const aUrls = await observe(a, Api => [Api.fetchSnapshot().catch(() => {}), Api.fetchPending().catch(() => {})]);
+      F.file = { reserved: aResolved, base: aBase, urls: aUrls };
+
+      /* (b) 成对：同源托管（https:）⇒ 空串 / 相对路径（不得把同源也写死成 8787） */
+      const b = loadFrameFixture(F18_COMPONENTS, '', { protocol: 'https:' });
+      b.w.BoardConfig.board.baseUrl = '';
+      const bBase = b.w.Api.getStatus().boardBaseUrl;
+      const bUrls = await observe(b, Api => [Api.fetchSnapshot().catch(() => {})]);
+      F.same = { base: bBase, urls: bUrls, resolved: b.w.BoardSource.resolveBaseUrl() };
+
+      /* (c) BoardSource 不存在 ⇒ 退旧读法、不抛（能力检测，不得 ReferenceError）。
+         这里**不用** `loadFrameFixture`：它内部会把 `CALL_KEYS` 里的组件逐个包一层，
+         而"存在性"恰恰要求清单里**没有** BoardSource + 全套组件仍在 ⇒ 用一个只装
+         config/fieldMap/utils/api/mockData 的最小 vm 上下文（**不跑 main.js**），
+         直接观察 `Api` 的基地址出口 —— 这正是 F18 要证的那一层。 */
+      const cSandbox = { location: { search: '', protocol: 'file:' }, URLSearchParams };
+      cSandbox.window = cSandbox;
+      cSandbox.console = { log: () => {}, warn: () => {}, error: () => {} };
+      cSandbox.__urls = [];
+      cSandbox.__fetch = url => { cSandbox.__urls.push(String(url)); return Promise.reject(new Error('F18 桩：不真发请求')); };
+      cSandbox.fetch = (...a) => cSandbox.__fetch(...a);
+      cSandbox.AbortSignal = { timeout: () => ({}) };
+      vm.createContext(cSandbox);
+      const cRun = rel => vm.runInContext(readText(rel), cSandbox, { filename: path.join(ROOT, rel) });
+      cRun('src/config/board.config.js');
+      cRun('src/config/fieldMap.js');
+      cRun('src/utils/dom.js');
+      cRun('src/utils/format.js');
+      cRun('src/services/api.js');
+      cRun('src/services/mockData.js');
+      cSandbox.BoardConfig.board.baseUrl = 'http://10.0.0.9:9999';
+      const cBase = cSandbox.Api.getStatus().boardBaseUrl;
+      await cSandbox.Api.fetchSnapshot().catch(() => {});
+      const cUrls = cSandbox.__urls;
+      F.none = { hasBoardSource: typeof cSandbox.BoardSource, base: cBase, urls: cUrls };
+    } catch (e) { F.err = e.message; }
+
+    check(
+      'F18-a（D12）`file://`（双击 index.html）⇒ 基地址与 `BoardSource.resolveBaseUrl()` 逐字相同（`http://127.0.0.1:8787`），' +
+      '且 `fetchSnapshot()` 的 URL **恰为** `http://127.0.0.1:8787/state`、`fetchPending()` 为 `http://127.0.0.1:8787/upload/pending`',
+      F.err === null && F.file !== null &&
+      F.file.reserved === 'http://127.0.0.1:8787' && F.file.base === F.file.reserved &&
+      F.file.urls.indexOf('http://127.0.0.1:8787/state') >= 0 &&
+      F.file.urls.indexOf('http://127.0.0.1:8787/upload/pending') >= 0,
+      F.err ? `夹具执行异常：${F.err}` : F.file === null ? '（无观察值）' :
+        `resolveBaseUrl()=${JSON.stringify(F.file.reserved)}；getStatus().boardBaseUrl=${JSON.stringify(F.file.base)}；` +
+        `实际请求 URL=${JSON.stringify(F.file.urls)}`
+    );
+    check(
+      'F18-b（D12，成对）同源托管（`https:`）+ 配置空串 ⇒ `boardBaseUrl === ""` 且 `fetchSnapshot()` 的 URL 是**相对** `/state`' +
+      '（证明没有把同源情形也写死成 8787）',
+      F.err === null && F.same !== null &&
+      F.same.resolved === '' && F.same.base === '' && F.same.urls.indexOf('/state') >= 0,
+      F.err ? `夹具执行异常：${F.err}` : F.same === null ? '（无观察值）' :
+        `resolveBaseUrl()=${JSON.stringify(F.same.resolved)}；boardBaseUrl=${JSON.stringify(F.same.base)}；` +
+        `实际请求 URL=${JSON.stringify(F.same.urls)}`
+    );
+    check(
+      'F18-c（D12）`BoardSource` **不存在**时退回读 `CFG.board.baseUrl` 且**不抛**（能力检测，不得 `ReferenceError`）',
+      F.err === null && F.none !== null && F.none.hasBoardSource === 'undefined' &&
+      F.none.base === 'http://10.0.0.9:9999' && F.none.urls.indexOf('http://10.0.0.9:9999/state') >= 0,
+      F.err ? `夹具执行异常：${F.err}` : F.none === null ? '（无观察值）' :
+        `typeof BoardSource=${F.none.hasBoardSource}；boardBaseUrl=${JSON.stringify(F.none.base)}；` +
+        `实际请求 URL=${JSON.stringify(F.none.urls)}`
+    );
+  }
+
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 ${skipped} 项`);
   if (failures.length) {

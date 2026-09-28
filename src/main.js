@@ -4,8 +4,13 @@
    加载顺序（见 index.html）：config → utils → services → components → pages → main
    需求：NFR-01 秒级刷新；UI-02 4K 等比缩放；FR-9 页面与交互
    数据源：
-     - mock（默认）：由 services/mockData.js 产生全部数据
+     - mock（**默认**）：由 services/mockData.js 产生全部数据
      - upper       ：由上位机报文经 services/api.js 适配层写入（?source=upper 可临时切换）
+     - server      ：由**看板服务端**快照 + SSE 增量驱动（?source=server；W5-② / ADR-0008 D3/D4）。
+                     该模式下：**不跑 `M.tick()`**（前端只应用、不生成）、**不起 MES 上报定时器、
+                     不调 `Api.uploadReport`**（上报由服务端 `uploadReporter.js` 独占）；
+                     `state.clock` 与班次进度仍由本地时钟推进（只做"时钟显示"，不生成业务数据）；
+                     服务端不可达时**优雅回退演示源**并给出**唯一一条**降级提示。
    ========================================================================== */
 (function () {
   'use strict';
@@ -18,6 +23,43 @@
   const state = M.state;
   const stage = document.getElementById('stage');
   let sourceKind = 'mock';
+  /* W5-②：是否处于"服务端真源"模式（ADR-0008 D3 的职责边界都挂在它上面） */
+  let serverMode = false;
+
+  /* ---------------- 数据源角标（ADR-0008 D4） ----------------
+     只在**服务端模式**可见（演示模式/回退演示模式下把整行 `hidden` 掉）—— 这样 10 张截图基准
+     的页脚（版本/最后刷新/上位机链路/MES 链路四要素）逐像素不动。
+     回退到演示源时**也要显示**（`sourceFallback === true`）：ADR-0008 D4 要求"能看出当前是演示态"，
+     而"回退"与"本来是演示"对现场是完全不同的两件事（一个要查服务端，一个不用）。 */
+  function updateSourceBadge() {
+    const row = document.getElementById('sbSourceRow');
+    const el = document.getElementById('sbSource');
+    if (!row) return;
+    const kind = CFG.dataSource;
+    const fallback = state.sourceFallback === true;
+    const visible = serverMode || kind === 'server' || fallback;
+    row.hidden = !visible;
+    if (!el) return;
+    el.textContent = kind === 'server' ? '看板服务端（真实源）'
+      : (fallback ? '已回退 · 演示数据' : '演示');
+  }
+
+  /* ---------------- 服务端模式下的"本地只走时钟"（ADR-0008 D3） ----------------
+     服务端模式下**不得**跑 `M.tick()`（那会造出服务端没有的业务数据），但需求明确要求
+     `state.clock` / `state.lastRefresh` 与**班次进度**继续前进（大屏上"钟停了"是不可接受的）。
+     故这里只借 `mockData` 的**时刻格式化**（`Format.pad` 同一套口径，不另写一份），
+     写 `state.clock`、`state.lastRefresh` 两个**纯显示量**，并把班次进度交给
+     `StateAdapter.applyShiftProgress()`（它按服务端的班次名 + 本地时钟算进度）。
+     —— 除时钟与"这一班进行到哪"，本函数**不写任何业务字段**。 */
+  function advanceClockOnly(now) {
+    const pad = window.Format.pad;
+    const week = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'][now.getDay()];
+    state.clock.date = now.getFullYear() + '-' + pad(now.getMonth() + 1) + '-' + pad(now.getDate());
+    state.clock.week = week;
+    state.clock.time = pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+    state.lastRefresh = state.clock.time;
+    window.StateAdapter.applyShiftProgress(state, now);
+  }
 
   /* ---------------- 4K 舞台等比缩放（UI-02） ---------------- */
   function fitStage() {
@@ -54,7 +96,7 @@
     bindDemoKeys();
     blockInteractions();
 
-    /* 评审辅助参数：?tab= / ?link=off / ?unlock=1 / ?curve=none / ?source=upper */
+    /* 评审辅助参数：?tab= / ?link=off / ?unlock=1 / ?curve=none / ?source=upper|server */
     const q = new URLSearchParams(location.search);
     const tab = Number(q.get('tab'));
     if (Number.isInteger(tab) && tab >= 0 && tab < Dashboard.TABS.length) Dashboard.switchTab(tab);
@@ -62,10 +104,52 @@
     const unlockByParam = q.get('unlock') === '1';
     if (unlockByParam) M.setUnlocked(true);
     if (q.get('curve') === 'none') M.clearCurve();
-    if (q.get('source')) CFG.dataSource = q.get('source');   // ?source=upper 用上位机报文驱动
+    if (q.get('source')) CFG.dataSource = q.get('source');   // ?source=upper 用上位机报文驱动；?source=server 用服务端真源
 
-    /* 启动上位机数据源：mock 模式下返回 'none'，由 mockData 自行驱动 */
+    /* 启动数据源：mock 模式返回 'none'（由 mockData 自行驱动）；
+       server 模式也返回 'none'（**不得**跑 M.tick()），真数据由 BoardSource 异步接入。 */
     sourceKind = Api.startUpper(state, () => { /* 每帧回调，渲染由下方定时器统一执行 */ });
+    serverMode = CFG.dataSource === 'server';
+    if (serverMode) startServerSource();
+
+    /* 服务端源的启动与**优雅回退**（ADR-0008 D4）。三条纪律：
+        ①**绝不 console.error、绝不抛未捕获异常**——所有失败都由 BoardSource 收敛成
+          `console.warn` + 回退演示源（`dataSource` 改回 'mock'）+ **唯一一条**降级提示；
+        ②回退后本地渲染循环照常跑（`M.tick()` 因 `sourceKind === 'none'` 恢复执行）⇒ **不黑屏**；
+        ③UI-20 的只读清单刷新只在服务端模式下起（演示模式下该卡片整体隐藏，不该发请求）。 */
+    function startServerSource() {
+      const S = window.BoardSource;
+      if (!S || typeof S.startServerSource !== 'function') {
+        if (S && typeof S.fallbackToDemo === 'function') S.fallbackToDemo('BoardSource 未加载', state);
+        serverMode = false;
+        return;
+      }
+      /** 服务端源落地后的接线（成功时才做） */
+      function wireServerSource() {
+        serverMode = true;
+        if (window.Components.UploadPanel) {
+          window.Components.UploadPanel.startAutoRefresh(state);
+        }
+        /* 断线/恢复时立即重绘一帧，缩短"降级提示出现"的时延（FR-2.6 的 ≤5 s 由本地渲染循环兜底） */
+        HeaderBar.render(state);
+        Dashboard.renderAll(state);
+        /* 角标在**异步结论之后**统一刷新（见 p.then/p.catch）—— 这里不刷，
+           否则会按"中间态"先画一次（服务端成功后角标要显示真实源，不是"演示"）。 */
+      }
+      const p = S.startServerSource(state, () => { /* 事件到达：由渲染循环统一重绘 */ });
+      p.then(kind => {
+        if (kind === 'server') { wireServerSource(); return; }
+        /* 回退演示源：撤下 UI-20 的周期刷新（该卡片随之隐藏），并由渲染循环接管造数 */
+        serverMode = false;
+        if (window.Components.UploadPanel) window.Components.UploadPanel.stopAutoRefresh();
+        updateSourceBadge();
+      }).catch(err => {
+        /* 兜底：BoardSource 已自收敛，这里再兜一层，确保"绝不抛未捕获异常"（ADR-0008 D4） */
+        serverMode = false;
+        console.warn('[main] 服务端源启动异常，已按演示源继续运行：' + ((err && err.message) || String(err)));
+        updateSourceBadge();
+      });
+    }
 
     /* 每秒推进一帧并整屏重绘（NFR-01）。
        upper 模式下**不能**再跑 mockData.tick()：否则报文值会被模拟数据覆盖（审查报告 P1-1②）。
@@ -117,9 +201,23 @@
 
     function step() {
       const now = new Date();
-      /* ① 数据推进：抛错时不吞、不静默，但**不阻断**下方两步（E34 方案①） */
+      /* ① 数据推进：抛错时不吞、不静默，但**不阻断**下方两步（E34 方案①）
+         三分支互斥（ADR-0008 D3），且**只跑一条**：
+           · 服务端模式（`serverMode`）⇒ **只推进时钟**（`advanceClockOnly`：写 `state.clock`/
+             `state.lastRefresh` 两个纯显示量 + 按服务端班次名算进度），业务数据一律来自
+             服务端快照/事件 ⇒ 下方 `M.tick()` **必须不执行**（否则报文/快照值会被模拟数据覆盖）；
+           · 其余（mock）⇒ 照旧 `M.tick()`。
+         ⚠ 为什么把 `if (sourceKind === 'none') M.tick(now);` **原样留在** `else` 块里，
+           而不是合并成 `if (sourceKind === 'none' && !serverMode) M.tick(now);`——
+           `tests/contract-check.js` 的 E 段（`数据源互斥：upper 模式不得再跑 mockData.tick()`）
+           用正则锚定了 `if (sourceKind === 'none') M.tick(` 这一串**源码形状**，
+           改写形态会打红该门禁（该断言的本意就是"tick 必须挂在 sourceKind 判据下"）。
+           本包**保持命中**：tick 仍只挂在 `sourceKind === 'none'` 上，服务端模式由外层 `else` 排除。 */
       try {
-        if (sourceKind === 'none') M.tick(now);
+        if (serverMode) advanceClockOnly(now);
+        else {
+          if (sourceKind === 'none') M.tick(now);
+        }
         /* 恢复自愈：本帧数据推进成功即撤下异常提示（同样只在状态变化时报一次）。
            必须在②③**之前**收敛，否则本帧头屏会先按旧状态多画一次（实测：恢复帧重复渲染头屏）。 */
         if (state.shiftAlert) noteShiftGap('');
@@ -130,6 +228,7 @@
       }
       /* ② 链路判定与③整屏重绘：**无论上一步是否抛错都要执行**（看板不得冻结） */
       Api.syncLinkState(state, now);
+      updateSourceBadge();
       Dashboard.renderAll(state);
     }
     step();
@@ -145,14 +244,24 @@
       window.Components.SettingPanel.armAutoLock();
     }
 
-    /* 上报 MES：仅当配置了 MES 地址（Q-23 关闭后）才实际发送，否则为空操作 */
-    if (CFG.mes.baseUrl) {
+    /* 上报 MES：仅当配置了 MES 地址（Q-23 关闭后）才实际发送，否则为空操作。
+       ⚠ **服务端模式下必须整体不起**（ADR-0008 D3）：上报由服务端 `services/uploadReporter.js`
+         独占（`upload_log` 单源、失败落库、人工经 UI-20 重报）。若前端同时上报，
+         同一件任务会有两条上报路径、两套"谁负责谁留痕"，人工重报清单也会分裂成两份。
+         本判断读的是**启动时刻的** `serverMode`：回退演示源后（`serverMode` 由 BoardSource
+         收敛为 false）仍会在下一次 `start()` 时才重新评估 —— 现场语义是"回退后的演示模式
+         也不主动上报"，与"演示模式不向 MES 上报"的纪律一致（演示/培训用不上真实上报）。 */
+    if (CFG.mes.baseUrl && !serverMode) {
       setInterval(() => {
         /* 刷新待补传状态与告警（**不发送**；重报由人工触发的 Api.retryPending 承担），再上报本帧 */
         Api.flushPending().catch(err => console.warn('[main] 待补传状态刷新异常：' + err.message));
         Api.uploadReport(Api.buildReportPayload(state))
           .then(r => { if (!r.ok) console.warn('[main] MES 上报未成功：' + (r.reason || r.error || '回执异常')); });
       }, CFG.reportIntervalMs);
+    } else if (serverMode) {
+      /* 显式说明**为什么不发**（D23 反静默空转：不留"看起来该发却没发"的隐状态） */
+      console.warn('[main] 服务端模式：前端不向 MES 上报（上报由服务端 uploadReporter 独占，' +
+        '人工重报入口见设置页 UI-20 卡片）—— 本条不是错误');
     }
   }
 

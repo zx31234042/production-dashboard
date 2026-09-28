@@ -26,8 +26,12 @@ const BOARD_CONFIG = (function () {
 
   const CFG = {
     /* ---------------- 数据源 ---------------- */
-    /* 'mock'  = 用内置模拟数据驱动（默认，评审演示用）
-       'upper' = 用"上位机报文 + 适配层"驱动（联调前自测用；?source=upper 可临时切换） */
+    /* 'mock'   = 用内置模拟数据驱动（**默认**，评审演示 / 培训 / 服务端不在场时用）
+       'upper'  = 用"上位机报文 + 适配层"驱动（联调前自测用；?source=upper 可临时切换）
+       'server' = 用"看板服务端快照 + SSE 增量"驱动（W5-②；?source=server 或本键显式开启；
+                  **失败/未就绪时优雅回退 'mock'**，见 ADR-0008 D4 与 src/services/boardSource.js）
+       ⚠ 默认值**仍是 'mock'**：10 张截图基准、ui-check、browser-check 的既有断言都建立在
+         "默认演示模式、首屏必出两位小数实测值"之上（ADR-0008 D4）。服务端源必须**显式开启**。 */
     dataSource: 'mock',
 
     refreshMs: 1000,          // 界面刷新周期（NFR-01）
@@ -242,6 +246,54 @@ const BOARD_CONFIG = (function () {
          仍持有一份同值 `80`；待前端座位改为读本键后消除（见 W3 回执"未决/风险"）。 */
     warnings: {
       orderOverduePending: 80   // 工单超时判据：设备侧待测队列件数 **> 该值** 即「工单超时预警」（err，FR-5.11）
+    },
+
+    /* ---------------- 看板服务端连接（W5-② / ADR-0008 D1/D2/D4） ----------------
+       ⚠ 本节是本包**新增**的段（`board` 与 `server`），**只新增、不改动、不重排**任何既有键 ——
+         既有键与注释的行号因此一个都不动（`trace-check` 的引用锚点按行号锚定）。
+       为什么必须有：服务端 `server/index.js` 的 `serverConfigFrom()` 与
+         `services/dispatch.js` 的鉴权解析都**按这些键名读** `board.config.js`；
+         前端切真实源（W5-②）也要读同一份地址与超时，写两份必然漂移（规范 9.6 单一真源）。
+
+       `board.baseUrl` 语义（ADR-0008 D1/D2）：
+         · **同源时用空串**（相对路径）—— 服务端托管 `index.html`（`GET /`）时，`fetch('/state')`
+           与 `new EventSource('/events')` 都是同源，无 CORS、无预检；
+         · **`file://` 双击**时前端（`src/services/boardSource.js` 的 `resolveBaseUrl()`）回退到
+           `http://127.0.0.1:8787` —— 服务端 `http/cors.js` **仅在回环绑定时**才放行 `Origin: null`；
+         · 端口以服务端**实际监听端口**为准，故这里只是缺省值（可用 `--port` / 环境变量覆盖）。 */
+    board: {
+      baseUrl: '',              // 同源＝空串（相对路径）；file:// 下由 boardSource 回退到下方默认地址
+      statePath: '/state',      // GET 首帧全量快照（与 SSE hello 同源：同一构造函数产出）
+      eventsPath: '/events',    // GET SSE 增量（服务端自带 `retry: 3000`，重连交给浏览器）
+      timeoutMs: 3000,          // 单次 HTTP 超时（与 upper.timeoutMs 同量级）
+      reconnectMs: 3000         // 断线重连间隔（与服务端 `retry: 3000` 同值；本前端不自建重连定时器）
+    },
+
+    /* ---------------- 服务端运行参数（W5-② 补段；键名与 ADR-0007 一致） ----------------
+       服务端**已按这些键名读取**（`server/index.js` 的 `serverConfigFrom()`、`services/dispatch.js`
+       的 `resolveAccessControl()`），故键名不得改名。优先级由服务端定义：
+         **内置默认 → 本段 → 环境变量 → 命令行参数**（后者覆盖前者）。
+       · 默认监听 `127.0.0.1:8787`（**仅本机/局域网、不得对外**，NFR-25 / AC-09）——
+         改成非回环地址会让 CORS 的 `Origin: null` 白名单**自动失效**（ADR-0008 D2），
+         且服务端会显著告警；
+       · `dataDir` / `dbFile` 留 `null`＝由 `platform/paths.js` 按环境决定（dev/prod 两套数据目录）；
+       · `ifAuth` 是 **IF-A 的静态访问令牌**（外部系统调用本机接口用），
+         **与 ADR-0007 的设置页会话令牌严格分开**，不得混用（那会让"对外接口凭证"
+         变成"看板管理员凭证"）。`maxFailures`/`lockMinutes`/`sessionHours` 三个键由
+         ADR-0007 D2/D3 指定为设置页登录的配置真源（由 W5-③ 消费）。 */
+    server: {
+      host: '127.0.0.1',        // 仅回环；改成 0.0.0.0 之前先读 ADR-0008 D2 的残余风险说明
+      port: 8787,               // 端口以实际监听值为准（router 的 CORS 白名单按实际端口生成）
+      dataDir: null,            // null＝由 platform/paths.js 决定（dev/prod 分目录）
+      dbFile: null,             // null＝dataRoot/board.db
+      maxBodyBytes: 1048576,    // 请求体上限 1 MiB（超过 ⇒ 413；服务端 router 的同一缺省）
+      ifAuth: {
+        enabled: false,         // false＝本机接口不鉴权（现场单人操作）；置 true 必须给 token
+        token: '',              // 静态令牌（Bearer）；**不得**与设置页口令/会话令牌共用
+        maxFailures: 5,         // ADR-0007 D2：连续失败 5 次即锁定
+        lockMinutes: 5,         // ADR-0007 D2：锁定 5 分钟
+        sessionHours: 12        // ADR-0007 D3：会话令牌 TTL 12 h（滑动续期，绝对上限 24 h）
+      }
     }
   };
 

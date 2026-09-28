@@ -113,6 +113,10 @@ window.FieldMap = (function () {
       uploadId:      '@uploadId'                // 由 api.js 生成，非 state 字段
     },
 
+    /* (F15-3) 该 `standardLimits` 是否**允许回退演示默认上下限**：缺省允许（演示模式原样），
+       但服务端模式必须禁止（见 `board.config.js` 的 `dataSource === 'server'`）。 */
+    allowDemoStandardFallback: true,
+
     /* 说明：`uclValue` / `lclValue` / `IsPass` 属 **§1.2.5 关键运行参数报文**（IF-B.5 / C-78），
        **不是**附录 2 的 13 个字段，故**不列进 boardToReport**（否则 IF-B.8 的字段数会变）。
        该结构的组装在 `services/api.js` 的 `buildParamReportPayload()`；
@@ -187,7 +191,15 @@ window.FieldMap = (function () {
    * 取值口径：
    *   - 该参数已在 `state.task.standard` 建过行（DR-03）⇒ **只认这一行**；缺必要项 ⇒ 该项为 null
    *     （＝标准未设定，调用方按占位 `65535` / `IsPass=null` 上报）；
-   *   - 未建行 ⇒ 用 `BoardConfig.standards.default` 兜底（**仅演示**；真实系统此处也是"未录入"）。
+   *   - 未建行 ⇒ 用 `BoardConfig.standards.default` 兜底（**仅演示**；真实系统此处也是"未录入"）；
+   *   - ⚠ **服务端模式下禁止该兜底**（F15-3，2026-09-28 负责人裁定，依据 ADR-0008 D3）：
+   *     `dataSource === 'server'` 时，`standard` 表为空 ⇒ 快照 `standard = null` ⇒
+   *     `state.task.standard` 未建行；若此处仍回退演示默认，就会出现
+   *     **界面空、而 `Api.standardLimits()` 却有值（depth 5.30/4.80 · speed 5.20/4.80）的
+   *     三方不一致**（服务端 `standard.mesLimits()` 在没有标准时一律回占位 `65535` / `IsPass:null`，
+   *     从不回退演示默认）。故服务端模式下一律 `null` ⇒ 界面「标准未设定」/「—」、
+   *     上报侧沿用 N-7 既有哨兵。**演示模式行为保持原样**（仍回退演示默认）。
+   *     旁路开关：`MAP.allowDemoStandardFallback`（供自检显式控制；缺省 true）。
    * @param {object} state 看板状态
    * @returns {{depth:{upper:number,lower:number}|null, speed:{upper:number,lower:number}|null}}
    */
@@ -204,7 +216,9 @@ window.FieldMap = (function () {
       };
     };
     const run = (state && state.task && state.task.standard) || null;
-    const dft = spec.default || null;
+    /* 服务端模式禁止回退演示默认（F15-3）；`allowDemoStandardFallback === false` 亦禁止 */
+    const serverMode = !!((window.BoardConfig || {}).dataSource === 'server');
+    const dft = (serverMode || MAP.allowDemoStandardFallback === false) ? null : (spec.default || null);
     const out = {};
     ['depth', 'speed'].forEach(kind => {
       const recorded = !!(run && Object.prototype.hasOwnProperty.call(run, kind));

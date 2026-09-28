@@ -394,6 +394,38 @@
         <div class="list fill" id="setSelfCheckList"></div>
       </div>
 
+      <!-- ---------- UI-20 待补传清单与人工重报入口（W5-② / ADR-0008 D3，需求 V1.38 `:572`） ----------
+           需求原文：「在设置页提供 MES 上报失败的**待补传清单**（显示**待补传条数、接口名、时间、
+           失败原因**），支持操作人员**按序 / 批量触发重报**；重报动作与结果写入操作日志
+           （与 FR-8.7 一致）；**不做自动重试**（与 IF-B.9 一致）」。
+           数据源：`GET /upload/pending`、`GET /upload/status`、`POST /upload/retry`（服务端 W4 已实现）。
+           ⚠ **只在服务端模式可见**（`src/components/UploadPanel.js` 的 render 按 `state.serverMode`
+           切显隐）⇒ 默认演示模式下不出现，10 张截图基准不受影响；初始 `hidden` 是同一口径的静态兜底。
+           位置：设置页「系统状态自检」之后、「录入 / 发布 / 参数配置」之前（第 2 行第 1 列）。 -->
+      <div class="card upload-card" id="upCard" hidden>
+        <div class="card-title">MES 待补传清单与人工重报<span class="title-note">UI-20 · 不自动重试</span></div>
+        <div class="upload-head">
+          <span class="mono upload-count" id="upPendingCount">待补传 — 条</span>
+          <span class="chip chip-ok" id="upAlertBadge">队列正常</span>
+          <span class="upload-progress" id="upProgress" style="display:none">处理中…</span>
+        </div>
+        <div class="std-note" id="upQueueMeta">队列容量 — · 告警阈值 —</div>
+        <div class="btn-row mt-18">
+          <button class="btn" id="upSeqBtn">按序重报（最旧 1 条）</button>
+          <button class="btn primary" id="upBatchBtn">批量重报（全部待补传）</button>
+        </div>
+        <div class="upload-list">
+          <table class="data-table compact fill upload-table" id="upPendingTable">
+            <thead><tr><th>上传流水号</th><th>接口名</th><th>时间</th><th>失败原因</th></tr></thead>
+            <tbody id="upPendingBody"></tbody>
+          </table>
+          <div class="list-item lv-info is-empty" id="upPendingEmpty">
+            <span class="body empty-note">当前无待补传报文（MES 上报队列为空）</span>
+          </div>
+        </div>
+        <div class="std-msg" id="upMsg">人工重报入口（不做自动重试）：按序＝每次补传最旧 1 条；批量＝一次补传全部待补传；每次动作与结果都写入操作日志（FR-8.7）。</div>
+      </div>
+
       <div class="card entry-card">
         <div class="card-title">录入 / 发布 / 参数配置<span class="title-note">需解锁（FR-6.11、FR-7.12、FR-8.6）</span></div>
         <div class="entry-grid">
@@ -453,6 +485,10 @@
       <div><span>最后刷新</span><b class="mono" id="sbRefresh">00:00:00</b></div>
       <div><span>上位机链路</span><b class="mono ok" id="sbHeartbeat">正常</b></div>
       <div><span>MES 链路</span><b class="mono ok" id="sbMes">正常</b></div>
+      <!-- 数据源角标（ADR-0008 D4）：**只在服务端模式可见**（初始 hidden，由 src/main.js 按
+           `BoardConfig.dataSource` 切换）⇒ 演示模式下不出现，10 张截图基准不受影响。
+           文案由 main.js 写；演示模式下节点保持 hidden 且文本为空。 -->
+      <div id="sbSourceRow" hidden><span>数据源</span><b class="mono" id="sbSource">演示</b></div>
     </div>
   </footer>
 
@@ -466,12 +502,20 @@
 </div>
 
 <!-- 加载顺序：config → utils → services → components → pages → main
-     （被依赖的先加载；不使用 ES module，保证双击 index.html 即可打开） -->
+     （被依赖的先加载；不使用 ES module，保证双击 index.html 即可打开）
+     W5-② 三个新文件的位置：
+       · `services/stateAdapter.js`   —— services 段首位（只定义函数、不调用 Api：
+         真正调用 `Api.applyUpperPayload()` 是在运行期，故与 api.js 的先后不影响加载）；
+       · `services/boardSource.js`    —— 紧随 api.js（模块体内 `resolveBaseUrl()` 会读
+         `BoardConfig.board`，故必须在 board.config.js 之后；对 Api/StateAdapter 的引用都在运行期）；
+       · `components/UploadPanel.js`  —— 紧随 `SettingPanel.js`（它渲染设置页的 DOM 契约）。 -->
 <script src="src/config/board.config.js"></script>
 <script src="src/config/fieldMap.js"></script>
 <script src="src/utils/dom.js"></script>
 <script src="src/utils/format.js"></script>
+<script src="src/services/stateAdapter.js"></script>
 <script src="src/services/api.js"></script>
+<script src="src/services/boardSource.js"></script>
 <script src="src/services/mockData.js"></script>
 <script src="src/services/mockUpperSource.js"></script>
 <script src="src/components/HeaderBar.js"></script>
@@ -485,6 +529,7 @@
 <script src="src/components/MaintPanel.js"></script>
 <script src="src/components/NoticePanel.js"></script>
 <script src="src/components/SettingPanel.js"></script>
+<script src="src/components/UploadPanel.js"></script>
 <script src="src/pages/Dashboard.js"></script>
 <script src="src/main.js"></script>
 </body>
