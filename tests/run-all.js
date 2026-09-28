@@ -67,7 +67,9 @@ const SUITES = [
   { name: 'docs-cross-check', desc: '跨文档一致性 + 权威数字校验', needBrowser: false, slow: false },
   { name: 'browser-check', desc: '真实浏览器（无头 Edge + CDP）', needBrowser: true, slow: false },
   { name: 'overlap-check', desc: '元素重叠检测', needBrowser: true, slow: false },
-  { name: 'stress-check', desc: '整班次长跑（默认 8 小时）', needBrowser: true, slow: true }
+  /* slow 仍为 true：默认 20 分钟虽不再是"整夜浸泡"，但仍是本仓最耗时的一类（起真浏览器 + 采样），
+     `--fast` 下跳过它是对的；整班次浸泡改由 `--soak` / `--hours 8` 显式触发（见 stress-check.js）。 */
+  { name: 'stress-check', desc: '长跑稳定性（默认 20 分钟；--soak / --hours 8 为整班次浸泡）', needBrowser: true, slow: true }
 ];
 
 /** 从脚本文本里数出 check( 调用条数（静态口径，仅作参考展示） */

@@ -12,9 +12,16 @@
          node tests/overlap-check.js                    # 只报候选（未填白名单时退出码 1）
          node tests/overlap-check.js --min 10           # 调整可忽略阈值（百分比）
          node tests/overlap-check.js --shots 3          # 为最严重的 3 类各截一张图
+         node tests/overlap-check.js --whitelist <路径>  # 换成另一份白名单（自检/定点变异用，不动仓库文件）
+         node tests/overlap-check.js --page <html 路径>  # 换成另一个页面（自检/定点变异用）
    产物：tests/._verify/overlaps/report.json（明细）、overlaps/*.png（截图）
    权限：需可创建命名管道的权限（与 tests/browser-check.js 相同）。
-   退出码：0 = 无未白名单化的重叠；1 = 有候选；2 = 脚本自身异常。
+   计数口径（**runner 解析的标准汇总行**：`通过 N 项，失败 M 项，跳过 K 项`）：
+         · **检测项**：每个「分辨率×页面」1 项 —— 检测执行完成即计入；该页出现**未白名单化**命中时该项计入失败；
+         · **组合项**：聚合后的每个「选择器组合」1 项 —— 命中白名单 ⇒ 通过；未白名单化 ⇒ 失败（逐条列出）；
+         · **跳过项**：本脚本恒 0（环境不满足时走 `env.skipSuite` 整脚本退 3，不产出汇总行）。
+         等价性（**判据语义不得放松**）：`失败 > 0` ⇔ `未白名单化 > 0` —— 与旧的"未白名单化 0 类即通过"同一门槛。
+   退出码：0 = 无未白名单化的重叠；1 = 有候选；2 = 脚本自身异常；3 = 环境不满足（整脚本跳过）。
    ========================================================================== */
 'use strict';
 
@@ -29,9 +36,7 @@ const env = require('./env');
 env.assertRuntime();
 
 const ROOT = path.resolve(__dirname, '..');
-const PAGE = pathToFileURL(path.join(ROOT, 'index.html')).href;
 const OUT = path.join(ROOT, 'tests', '._verify', 'overlaps');
-const WHITELIST = path.join(ROOT, 'tests', 'overlap-whitelist.json');
 const PORT = Number(process.env.DSH_OVERLAP_PORT || 18950);
 
 function arg(name, fallback) {
@@ -41,6 +46,10 @@ function arg(name, fallback) {
   return v === undefined || v.startsWith('--') ? true : v;
 }
 
+/* `--page` / `--whitelist` 是**自检与定点变异用**的注入出口：默认仍是仓库的 index.html 与白名单，
+   换路径后可以"人造一处重叠"或"取消白名单覆盖"来验证失败路径可达，**不必改动仓库里的任何文件**。 */
+const PAGE = pathToFileURL(path.resolve(String(arg('page', path.join(ROOT, 'index.html'))))).href;
+const WHITELIST = path.resolve(String(arg('whitelist', path.join(ROOT, 'tests', 'overlap-whitelist.json'))));
 const MIN_PCT = Number(arg('min', 5));
 const SHOTS = Number(arg('shots', 3));
 
@@ -102,6 +111,30 @@ class Cdp {
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/**
+ * **纯函数**：把检测结果折算成 runner 的标准计数（口径见文件头「计数口径」）。
+ * 抽成纯函数是为了**在没有浏览器的环境里也能验证记账**（定点变异/自检不必起 Edge）。
+ * @param {{detections:number, rows:Array<[string, object]>, allowKeys:Set<string>,
+ *          unallowed:string[], pagesWithUnallowed:Set<string>}} input
+ * @returns {{passed:number, failed:number, skipped:number, allowedCombos:number, total:number}}
+ */
+function tallyOverlap(input) {
+  const detections = Number(input.detections) || 0;
+  const rows = Array.isArray(input.rows) ? input.rows : [];
+  const allowKeys = input.allowKeys || new Set();
+  const unallowed = Array.isArray(input.unallowed) ? input.unallowed : [];
+  const pagesWithUnallowed = input.pagesWithUnallowed || new Set();
+  const allowedCombos = rows.filter(([k]) => allowKeys.has(k)).length;
+  /* 失败 = 未白名单化的**组合**数 + 出现未白名单化命中的**页面**（检测项）数；
+     未白名单化 > 0 ⇒ 至少一个页面命中 ⇒ failed > 0（等价性见文件头）。 */
+  const failed = unallowed.length + pagesWithUnallowed.size;
+  const passed = (detections - pagesWithUnallowed.size) + allowedCombos;
+  return { passed, failed, skipped: 0, allowedCombos, total: passed + failed };
+}
+
+/** runner 解析的标准汇总行（**这一行是契约**：`通过 N 项，失败 M 项，跳过 K 项`） */
+const summaryLine = t => `通过 ${t.passed} 项，失败 ${t.failed} 项，跳过 ${t.skipped} 项`;
 
 async function waitHttp(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -223,6 +256,9 @@ async function main() {
 
   const agg = new Map();   // "selA × selB" → { count, worst, cases: [] }
   const details = [];
+  /* 计数（口径见文件头）：检测项 = 「分辨率×页面」；出现未白名单化命中的页计入失败 */
+  let detections = 0;
+  const pagesWithUnallowed = new Set();
 
   for (const [w, h] of RESOLUTIONS) {
     await cdp.send('Emulation.setDeviceMetricsOverride', { width: w, height: h, deviceScaleFactor: 1, mobile: false });
@@ -230,8 +266,10 @@ async function main() {
     for (const [name, query] of pages) {
       await openPage(query);
       const hits = await evaluate(DETECT_EXPR(SELECTORS, MIN_PCT));
+      detections++;
       for (const hit of hits) {
         const key = [hit.a.replace(/#\d+$/, ''), hit.b.replace(/#\d+$/, '')].sort().join(' × ');
+        if (!allowKeys.has(key)) pagesWithUnallowed.add(`${w}×${h} ${name}`);
         if (!agg.has(key)) agg.set(key, { count: 0, worst: 0, cases: [] });
         const rec = agg.get(key);
         rec.count++;
@@ -275,14 +313,26 @@ async function main() {
     console.log(`\n请人工看图确认这些重叠是否合法；合法的写进 ${path.relative(ROOT, WHITELIST)} 的 allow 数组（字段 a / b / reason）。`);
   }
 
+  /* ---- runner 解析用的标准汇总行（口径见文件头「计数口径」） ---- */
+  const tally = tallyOverlap({ detections, rows, allowKeys, unallowed, pagesWithUnallowed });
+  console.log(`计数口径：检测项 ${detections}（分辨率×页面）＋ 组合项 ${rows.length}（白名单命中 ${tally.allowedCombos}）` +
+    `＝ ${tally.total} 项；未白名单化命中出现在 ${pagesWithUnallowed.size} 个页面上`);
+  console.log(summaryLine(tally));
+
   if (cdp) cdp.close();
   if (edge && edge.exitCode === null) { try { edge.kill(); } catch (e) { /* 已退出 */ } }
-  process.exit(unallowed.length ? 1 : 0);
+  /* 退出码语义与旧版**等价**：tally.failed > 0 ⇔ 未白名单化 > 0（见文件头「计数口径」的等价性说明） */
+  process.exit(tally.failed ? 1 : 0);
 }
 
-main().catch(err => {
-  console.error('\n脚本异常终止：' + (err && err.stack ? err.stack : err));
-  if (cdp) cdp.close();
-  if (edge && edge.exitCode === null) { try { edge.kill(); } catch (e) { /* 已退出 */ } }
-  process.exit(2);
-});
+/* 被 require 时只导出纯函数（供记账自检/定点变异用），**不执行**门禁本体 */
+if (require.main === module) {
+  main().catch(err => {
+    console.error('\n脚本异常终止：' + (err && err.stack ? err.stack : err));
+    if (cdp) cdp.close();
+    if (edge && edge.exitCode === null) { try { edge.kill(); } catch (e) { /* 已退出 */ } }
+    process.exit(2);
+  });
+}
+
+module.exports = { tallyOverlap, summaryLine, DETECT_EXPR, RESOLUTIONS, PAGES, EXTRA, SELECTORS };
