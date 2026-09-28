@@ -351,7 +351,7 @@ function authorityBlockers(results) {
  * 收尾校验 `tests\README.md` 第三节的**权威数字**与本轮实跑是否一致（P2-22）。
  * 为什么放在 runner 而不是某个门禁脚本里：本 runner 是唯一持有"本轮最终账"的地方
  * （suite 成员跑到自己时还看不到后面的脚本），且它不会自递归。
- * 只在**跑全了全部离线门禁**时判定，避免 `--only`/`--fast` 子集造成假失败。
+ * 只在**跑全了权威区覆盖的全部门禁脚本**时判定，避免 `--only`/`--fast` 子集造成假失败。
  *
  * **输出契约（2026-09-20 修 P3-6 时钉住）**：任何"**比对未执行**"的分支（`blocked` / `skipped`）
  * 都必须在 `detail` 里写明**原因 + 涉及脚本名**，由 `main` 原样打印 —— 旧实现只留一句
@@ -371,13 +371,20 @@ function authorityBlockers(results) {
  * @returns {{ok:boolean,kind:string,detail:string}}
  */
 function verifyAuthorityTotals(agg, results) {
-  const offlineAll = SUITES.filter(s => !s.needBrowser).map(s => s.name);
+  /* 「本轮跑全了没有」必须对**权威区覆盖的全量脚本**判定 —— 不是 `!needBrowser` 的子集。
+     立案（E50，2026-09-28）：权威区合计是**含浏览器/长跑脚本**的全量值（它们在 README 第三节
+     被逐条登记），而这里原来按 `!needBrowser` 取集合 ⇒ `--fast`（过滤 slow ＋ needBrowser）下
+     `browser-check`/`overlap-check`/`stress-check` **既不在集合里、也没跑** ⇒ `missing = []`，
+     于是拿**全量**权威值去比**子集**实跑值，**误报"权威数字已漂移"**（与本函数自述"避免
+     `--only`/`--fast` 子集造成假失败"直接矛盾；现场离线体检报告第六节就是这么出现假红的）。
+     判据与夹具同源：`harness-check` 第十一节按同一集合口径构造用例（含 E50 定点回归）。 */
+  const authorityAll = SUITES.map(s => s.name);
   const ran = new Set(results.map(r => r.suite.name));
-  const missing = offlineAll.filter(n => !ran.has(n));
+  const missing = authorityAll.filter(n => !ran.has(n));
   if (missing.length) {
     return { ok: true, kind: 'skipped',
       detail: `**未执行**：本轮未跑全离线门禁（缺 ${missing.length} 个：${missing.join('、')}）` +
-        ' —— 不拿残缺的账去比权威值（`--only` 跑子集时属正常）' };
+        ' —— 不拿残缺的账去比权威值（`--only`/`--fast` 跑子集时属正常）' };
   }
   let readme = '';
   try { readme = fs.readFileSync(path.join(env.paths.tests, 'README.md'), 'utf8'); } catch (err) {
@@ -423,10 +430,11 @@ function verifyAuthorityTotals(agg, results) {
   }
   const allowanceNote = knownDeviations > 0 ? `（含已登记偏差 ${knownDeviations} 项，真实通过 ${truePass}）` : '';
 
-  /* 顺带校验：runner 认定的离线门禁必须在权威区被逐个点名（新增脚本别忘登记） */
+  /* 顺带校验：**权威区覆盖的每个门禁脚本**都必须在权威行里被逐个点名（新增脚本别忘登记）。
+     集合口径同前（E50）：对全量判定，不用 `!needBrowser` 子集。 */
   const named = [...new Set([...line.matchAll(/`([a-z0-9-]+)`/g)].map(m => m[1])
     .filter(n => n.endsWith('-check') || n === 'screenshot-diff'))];
-  const notListed = offlineAll.filter(n => !named.includes(n));
+  const notListed = authorityAll.filter(n => !named.includes(n));
   if (notListed.length) {
     return { ok: false, kind: 'broken', detail: `权威区漏列离线门禁：${notListed.join('、')}` };
   }

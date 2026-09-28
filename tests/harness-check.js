@@ -2918,14 +2918,18 @@ t.section('九、防回潮断言的定点变异（旧实现必须被现有断言
 t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTotals）');
 {
   const runAll3 = require('./run-all');
-  const offline = runAll3.SUITES.filter(s => !s.needBrowser).map(s => s.name);
+  /* 集合口径与实现**同源**（E50，2026-09-28）：权威区覆盖**全部** suite（含浏览器/长跑脚本），
+     故这里造账也必须造满全量 —— 只造 `!needBrowser` 的子集会让下面每条断言都退化成
+     "未跑全 ⇒ skipped"，从而**静默失去**"真会拦住漂移"的证明力。 */
+  const allSuites3 = runAll3.SUITES.map(s => s.name);
   const mkR = (name, passed, failed) => ({ suite: { name, needBrowser: false },
     status: failed ? 'failed' : 'passed', summary: { passed, failed, skipped: 0 } });
   const resultsOf = (docsFailed) => {
     const base = { 'contract-check': 58, 'ui-check': 40, 'tools-check': 24, 'files-check': 11,
       'harness-check': 73, 'logic-check': 52, 'db-check': 46, 'platform-check': 21,
-      'trace-check': 4, 'copy-check': 22, 'screenshot-diff': 24, 'docs-cross-check': 53 };
-    return offline.map(n => n === 'docs-check'
+      'trace-check': 4, 'copy-check': 22, 'screenshot-diff': 24, 'docs-cross-check': 53,
+      'browser-check': 33, 'overlap-check': 27, 'stress-check': 11 };
+    return allSuites3.map(n => n === 'docs-check'
       ? mkR('docs-check', docsFailed ? 42 : 44, docsFailed ? 2 : 0)
       : mkR(n, base[n] || 0, 0));
   };
@@ -3129,9 +3133,15 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
         failList(a1, a2, '新加的 D2 断言'))]).includes('docs-check'),
       `登记数 ${reg.failedAssertions}，实跑多 1 条 → 必须阻止比对`);
 
-    /* ⑤ "未执行比对"的两个分支必须写明原因与涉及脚本名（P3-6 的另一半：跳过必须显式） */
-    const offline4 = runAll4.SUITES.filter(s => !s.needBrowser).map(s => s.name);
-    const fullRun = (overrides) => offline4.map(n => overrides[n] || row(n, 'passed', 0, ''));
+    /* ⑤ "未执行比对"的两个分支必须写明原因与涉及脚本名（P3-6 的另一半：跳过必须显式）
+       ⚠ 集合口径（E50，2026-09-28 修）：**权威区覆盖的是全部 suite**（含浏览器/长跑脚本 ——
+       它们在 `tests\README.md` 第三节被逐条登记），故"这轮跑全了没有"必须对**全量**判定；
+       此前这里与 `run-all` 的实现都用 `!needBrowser` 当全集 ⇒ `--fast`（过滤 slow ＋
+       needBrowser）下"缺脚本"检测不到，拿**全量**权威值去比**子集**实跑值，**误报
+       "权威数字已漂移"**（现场离线体检报告第六节就是这么出现假红的）。夹具与实现必须同源，
+       故一并改；E50 定点回归见本段末尾。 */
+    const allSuites4 = runAll4.SUITES.map(s => s.name);
+    const fullRun = (overrides) => allSuites4.map(n => overrides[n] || row(n, 'passed', 0, ''));
     const blocked = runAll4.verifyAuthorityTotals({ passed: 1 }, fullRun({
       'docs-check': row('docs-check', 'failed', reg.failedAssertions + 1, failList(a1, a2, '新加的 D2 断言')),
       'db-check': row('db-check', 'failed', 6, '')
@@ -3151,6 +3161,18 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
     const ranAll = runAll4.verifyAuthorityTotals({ passed: 1 }, fullRun({}));
     t.check('账目干净时会**真的**走到比对（mismatch），而不是"未执行" —— 机制可达性的运行时旁证',
       ranAll.kind === 'mismatch' && !/未执行/.test(ranAll.detail), ranAll.detail);
+
+    /* E50 定点回归（2026-09-28）：`--fast` 的子集形态必须落 `skipped`，**不得**判"权威数字已漂移"。
+       构造方式与 runner 的 `--fast` 完全同源：`SUITES.filter(s => !s.slow && !s.needBrowser)`。 */
+    const fastSuites = runAll4.SUITES.filter(s => !s.slow && !s.needBrowser).map(s => s.name);
+    const fastMissing = allSuites4.filter(n => !fastSuites.includes(n));
+    const fast = runAll4.verifyAuthorityTotals({ passed: 1 }, fastSuites.map(n => row(n, 'passed', 0, '')));
+    t.check('E50 定点回归：`run-all --fast` 的子集（slow ＋ needBrowser 未跑）⇒ `kind=skipped`、`ok=true`，' +
+      '且详情**点名**被跳过的脚本（判"漂移"即为回潮）',
+      fast.ok === true && fast.kind === 'skipped' && /未执行/.test(fast.detail) &&
+      fastMissing.length === 3 && fastMissing.every(n => fast.detail.includes(n)),
+      `fast 缺失集=${JSON.stringify(fastMissing)}（期望 3 个）；实得 ok=${fast.ok}、kind=${fast.kind}；` +
+      `detail=${fast.detail}`);
   }
 }
 /* ---------------- 十二、"工作区稳定性"判定的真值表（2026-09-20 新增） ----------------
