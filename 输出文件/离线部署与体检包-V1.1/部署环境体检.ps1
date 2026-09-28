@@ -1,6 +1,6 @@
 ﻿# ==========================================================================
 #  现场部署环境体检（离线可跑；不需要管理员、不需要外网）
-#  用途：在到货的看板主机（联想开天 M630Z）上采集 ENV / DEP / Q-26 相关实测读数，
+#  用途：在到货的看板主机（联想开天 M630Z）上采集 ENV / DEP / Q-26 相关实测读数，**本包自带便携 Node 24 并自动定位**（无需操作员改 PATH）。
 #        并在装了 Node 24 且仓库已就位时顺带跑 preflight 与全量门禁（不依赖任何 npm 包）。
 #  产出：同目录 部署环境体检报告-<主机名>-<时间戳>.txt（UTF-8 带 BOM，记事本可直接看）
 #  依据：需求 ENV-01/ENV-16/ENV-20、DEP-04、NFR-05；技术债 Q-26；ADR-0002（Node 24 LTS 基线）
@@ -9,6 +9,22 @@
 #        仓库自带门禁，那一步只写 <仓库>\tests\._verify\ 下的日志/账本（不写系统、不装东西）。
 # ==========================================================================
 $ErrorActionPreference = 'Continue'
+
+# ---------------------------------------------------------------- Node 定位（不要求操作员改 PATH）
+# 现场最容易卡住的一步是"装 Node 并把它加进 PATH"，且 **Win10 与 Win11 的图形入口不一致**：
+# Win11 的「系统」页里没有"系统信息"，高级系统设置藏在「关于」里（2026-09-28 在本机实测）。
+# 因此本脚本按顺序自己找 Node，**只在本次进程内**把找到的目录前置到 PATH —— 不改系统、不改用户变量：
+#   ① 本包同目录下的 `._node\`（推荐：随包发布；点号前缀是**故意的** —— 该目录必须被仓库文件卫生门禁跳过，见 E53）
+#   ② 本包同目录下的 node\   ③ 本包同目录下任意 node-v*-win-x64\
+#   ④ 都没有 ⇒ 用系统 PATH 上已有的 node（第五节会如实报出实际路径）
+$NodeDir = $null
+if ($PSScriptRoot) {
+  $cands = @((Join-Path $PSScriptRoot '._node'), (Join-Path $PSScriptRoot 'node'))
+  $cands += @(Get-ChildItem -Path $PSScriptRoot -Directory -Filter '._node-v*-win-x64' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+  $cands += @(Get-ChildItem -Path $PSScriptRoot -Directory -Filter 'node-v*-win-x64' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+  foreach ($d in $cands) { if ($d -and (Test-Path (Join-Path $d 'node.exe'))) { $NodeDir = $d; break } }
+}
+if ($NodeDir) { $env:PATH = $NodeDir + ';' + $env:PATH }
 
 $Lines = New-Object System.Collections.Generic.List[string]
 function W($s) { $script:Lines.Add([string]$s) }
@@ -24,6 +40,8 @@ W ("生成时间   ：" + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 W ("采集主机   ：" + $env:COMPUTERNAME + "    用户：" + $env:USERNAME)
 W ("脚本位置   ：" + $PSScriptRoot)
 W ("说明       ：本文件由 部署环境体检.ps1 只读采集；不含任何修改系统的动作。")
+if ($NodeDir) { W ("Node 定位  ：" + $NodeDir + "（本包自带；仅本次进程内前置到 PATH，未改系统、未改用户变量）") }
+else { W "Node 定位  ：本包同目录未自带便携 Node ⇒ 用系统 PATH 上的 node（见第五节实际路径）" }
 
 # ---------------------------------------------------------------- 一、操作系统
 Section '一、操作系统与固件（ENV / Q-26）'
@@ -66,6 +84,7 @@ Try-Run '待重启标志'       { 'WU RebootRequired=' + (Test-Path 'HKLM:\SOFTW
 
 # ---------------------------------------------------------------- 五、Node / 浏览器 / 网络
 Section '五、运行时与浏览器（ADR-0002：Node 24 LTS 基线；浏览器类门禁需 msedge）'
+Try-Run 'node 实际路径' { $c = Get-Command node -ErrorAction SilentlyContinue; if ($c) { $c.Source } else { '（PATH 上找不到 node）' } }
 Try-Run 'node --version'  { $v = & node --version 2>&1; $v }
 Try-Run 'node:sqlite 可用' { & node -e "const{DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(':memory:');d.exec('create table t(a)');d.prepare('insert into t values(1)').run();const r=d.prepare('select count(*) c from t').get();console.log('ok rows='+r.c)" 2>&1 }
 Try-Run 'npm --version'   { & npm --version 2>&1 }
@@ -94,6 +113,7 @@ if (-not $repo) {
   W '    node tests\run-all.js --fast      （快跑；跳过耗时/浏览器类）'
 } else {
   W ('仓库位置：' + $repo)
+  Try-Run 'git 可用性' { if (Get-Command git -ErrorAction SilentlyContinue) { 'git 可用（docs-check 的历史提交信息类断言可判定）' } else { '**未安装 git** ⇒ docs-check 读不到提交历史（会打印"共 0 条"而报红）、docs-cross-check 的逐脚本比对也不成立 ⇒ 报告里若出现 docs-check / docs-cross-check 红项，属**环境所致、不是代码问题**，照常回传即可' } }
   Try-Run 'git 状态' { (git -C $repo status -sb 2>&1 | Out-String).Trim() }
   Try-Run 'git HEAD' { (git -C $repo log --oneline -1 2>&1 | Out-String).Trim() }
   $nodeOk = $false

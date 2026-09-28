@@ -22,6 +22,8 @@ reference/
 # SHASUMS256.txt，需要时到 nodejs.org 取同版本 zip 复核。包内报告目录 `._env-report\` 由下面
 # 「操作系统与编辑器杂项」的 `._*` 规则忽略（报告是带 BOM 的 .txt，落进扫描区会把 files-check 判红）。
 输出文件/**/node-v*-win-x64.zip
+# 便携 Node **解压出来的目录**（随包发给现场用，102 MB，不入库）
+输出文件/**/node-v*-win-x64/
 
 # ---------- Office / WPS 临时锁文件 ----------
 # Word 打开文档时生成的 ~$ 开头文件，关闭后一般自动删除
