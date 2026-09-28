@@ -19,6 +19,39 @@ window.MockUpperSource = (function () {
   const round1 = v => Math.round(v * 10) / 10;
   const pad = n => String(n).padStart(2, '0');
 
+  /* ---------------- 异常注入开关（E22 判据①；**默认关闭**） ----------------
+     为什么需要它：附录 2 的码 `3`（设备异常 ⇒ 看板显示模式「故障锁定」）是**正交状态**，
+     真实上位机偶发才出现、靠等是等不来的 —— 要把它变成**可复跑**的判据，必须能**定点注入**。
+     语义（与 tools/mock-upper/mock-upper.js 的同一段**逐字一致**；两处是同一口径的模拟器）：
+       · **默认关闭**：`testStatus` 只出现 0/1/2，**永不等于 3**，阶段按 FR-2.5 的四段推进；
+       · 注入窗口 [afterSec, afterSec+durSec) **内**：`testStatus = 3`（设备异常），
+         同时 `stage` **冻结**在进入窗口那一刻的阶段文本（阶段不随节拍推进）＝"阶段冻结"；
+       · 窗口**结束后**：`stage` 从冻结处**继续推进**（恢复），`testStatus` 回到 0/1/2。
+     实现方式：窗口内冻结的秒数从节拍里扣掉（`elapsed = rawElapsed - frozen`）⇒ 阶段原地不动。
+     开启方式：① `MockUpperSource.setAbnormal({afterSec, durSec})`（自检与联调用）；
+              ② 地址栏 `?source=upper&abnormal=<sec>&abnormalDur=<sec>`（演示用；不写＝关闭）。 */
+  const ABNORMAL = { enabled: false, afterSec: 0, durSec: 20 };
+  function setAbnormal(opts) {
+    const o = opts || {};
+    ABNORMAL.enabled = o.enabled === true || Number(o.afterSec) > 0;
+    ABNORMAL.afterSec = Math.max(0, Number(o.afterSec) || 0);
+    ABNORMAL.durSec = Math.max(0, Number(o.durSec) > 0 ? Number(o.durSec) : 20);
+    return { enabled: ABNORMAL.enabled, afterSec: ABNORMAL.afterSec, durSec: ABNORMAL.durSec };
+  }
+  function abnormalState() {
+    return { enabled: ABNORMAL.enabled, afterSec: ABNORMAL.afterSec, durSec: ABNORMAL.durSec };
+  }
+  function abnormalFromSearch(search) {
+    const q = new URLSearchParams(search || '');
+    if (!q.has('abnormal')) return abnormalState();
+    return setAbnormal({ enabled: true, afterSec: Number(q.get('abnormal')), durSec: Number(q.get('abnormalDur') || 0) });
+  }
+  try {
+    if (typeof window !== 'undefined' && window.location && window.location.search) {
+      abnormalFromSearch(window.location.search);
+    }
+  } catch (e) { /* 无 location（vm/离线自检）⇒ 保持默认关闭，不抛错 */ }
+
   /** 初始化内部随机游走状态 */
   function init(now) {
     return {
@@ -71,7 +104,15 @@ window.MockUpperSource = (function () {
           `3`（设备异常）为**正交状态**：任何阶段都可能出现、出现时阶段冻结（走「故障锁定」+ 单独告警）。
        ⚠ 必须与 tools/mock-upper/mock-upper.js 的同一段**逐字一致**（两处是同一口径的模拟器）。 */
     const cycle = CFG.production.cycleSec;
-    const elapsed = Math.floor((d.getTime() - s.startedAt) / 1000);
+    const rawElapsed = Math.floor((d.getTime() - s.startedAt) / 1000);
+    /* 异常注入窗口按**真实经过秒**判定；窗口内已冻结的秒数从节拍里扣掉 ⇒ 阶段原地不动（阶段冻结） */
+    const abn = ABNORMAL.enabled
+      ? {
+        active: rawElapsed >= ABNORMAL.afterSec && rawElapsed < ABNORMAL.afterSec + ABNORMAL.durSec,
+        frozen: Math.max(0, Math.min(rawElapsed, ABNORMAL.afterSec + ABNORMAL.durSec) - ABNORMAL.afterSec)
+      }
+      : { active: false, frozen: 0 };
+    const elapsed = rawElapsed - abn.frozen;
     const unitSec = elapsed % cycle;
     const progress = unitSec / cycle;
     s.unitIndex = Math.floor(elapsed / cycle) + 1;
@@ -81,6 +122,9 @@ window.MockUpperSource = (function () {
     else if (progress < 0.85)   { stage = '运行'; result = '测试中'; testStatus = 1; }
     else if (progress < 0.97)   { stage = '判定'; result = '测试中'; testStatus = 2; }
     else                        { stage = '完成'; result = '测试中'; testStatus = 0; }
+    /* 注入窗口内：码换成 `3`（设备异常），`stage` 保持上面算出的**冻结值**不动 —— 阶段冻结＋单独状态码 */
+    if (abn.active) testStatus = 3;
+    s.abnormal = abn.active;
     s.result = result;
 
     const payload = {
@@ -130,5 +174,5 @@ window.MockUpperSource = (function () {
     return next(null, new Date()).payload;
   }
 
-  return { next, sample, init };
+  return { next, sample, init, setAbnormal, abnormalState, abnormalFromSearch };
 })();
