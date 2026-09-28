@@ -82,10 +82,28 @@ window.Components.SettingPanel = (function () {
       ['同步状态', '已同步 · 偏差 32 ms']
     ].map(([k, v]) => `<div class="kv-row"><span class="k">${k}</span><span class="v mono">${v}</span></div>`).join(''));
 
-    /* 系统状态自检 */
-    setHTML('setSelfCheckList', state.selfCheck.map(c =>
-      `<div class="list-item lv-${c.lv}"><span class="body">${c.name}</span>` +
-      `<span class="meta ${c.lv}">${c.state}</span></div>`).join(''));
+    /* 系统状态自检。
+       W7-B（FR-8.5 / NFR-26）：**服务端模式下用真实端点探测**（`services/selfCheckProbe.js`
+       把 `GET /health`、`/ifd/status`、`/ifa/status`、`/upload/status` 映射成既有那 7 条行）。
+       · 这里按**既有渲染节拍**调用 `SelfCheckProbe.ensure(state)`：内部 5 s 节流 + 在途去重
+         ⇒ **不新起定时器**、不会每秒重复打服务端；探测结果写进 `state.selfCheck` 后本函数照旧渲染。
+       · **演示模式一行都不动**：`ensure()` 在非服务端模式下立即返回 false，
+         `state.selfCheck` 仍由 `mockData.buildSelfCheck()` 提供（成对断言见 ui-check 的 W7-B-c）。
+       · 探测失败**绝不影响本帧渲染**：`ensure()` 不抛（它自己把每项失败收敛成行结论）。 */
+    try {
+      if (window.SelfCheckProbe && typeof window.SelfCheckProbe.ensure === 'function') {
+        window.SelfCheckProbe.ensure(state);
+      }
+    } catch (err) {
+      console.warn('[SettingPanel] 自检探测触发异常（已跳过，不影响渲染）：' + ((err && err.message) || String(err)));
+    }
+    setHTML('setSelfCheckList', (state.selfCheck || []).map(c =>
+      `<div class="list-item lv-${esc(c.lv)}"><span class="body">${esc(c.name)}</span>` +
+      `<span class="meta ${esc(c.lv)}">${esc(c.state)}</span></div>`).join('') ||
+      /* 服务端模式下首帧快照还没被探测结果填上时（`state.selfCheck` 暂空），给出**显式进行中**占位
+         —— 不留空白，也不假装"七项全过"（演示模式永远有 7 行，走不到这里）。 */
+      '<div class="list-item lv-info is-empty"><span class="body empty-note">' +
+      '尚未接入服务端自检结果：正在探测 /health、/ifd/status、/upload/status…</span></div>');
 
     /* 操作日志（FR-8.7 / NFR-15）：解锁后的写操作全程留痕；展示取最近 20 条、时间倒序 */
     const logs = (state.opLog || []).slice().reverse();

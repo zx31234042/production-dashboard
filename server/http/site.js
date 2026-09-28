@@ -6,6 +6,8 @@
    白名单（**白名单式，不是黑名单**；裁定原文点名哪些必须 404）：
      · `GET /`（或 `/index.html`）  ⇒ 仓库根的 `index.html`
      · `GET /src/**`                ⇒ 仓库 `src\` 子树（按扩展名给正确 `Content-Type`）
+     · `GET /favicon.ico`           ⇒ **204 空体**（W7-C）：浏览器**自动**请求图标，本仓不提供；
+                                      它**不进**上面的白名单（不是"可托管文件"），也**不开**精确路由
      · 其余一律 **404**（沿用 router 的 JSON 404 形状，**不返回 HTML**）：
        `需求文档\` / `项目记录\` / `tests\` / `tools\` / `本地归档\` / `输出文件\` /
        `server\` / `data\` / `.git`，以及一切路径穿越形态。
@@ -22,7 +24,8 @@
      ⑤ **只认规范拼写**（F7）：非根路径不得带尾斜杠、不得有 `//` 或 `.` 段、`index.html` 比较
         大小写不敏感（详见 `resolvePath()` 的规范化口径）。
    响应：`Cache-Control: no-store`（开发期避免改前端后仍看到旧文件）＋ `Content-Length`；
-         路径穿越/白名单外**只记 warn**（不写 console.error），返回 404。
+         路径穿越/白名单外**只记 warn**（不写 console.error），返回 404；
+         `GET /favicon.ico` 例外：**204 空体**（浏览器自动请求，见下）—— 不记 warn、不落 404。
    ⚠ **给后来者的忠告（F9 实测教训）**：拆 Windows **junction** 只能用 `cmd /c rmdir <链接路径>`；
       **绝对不要**对 junction 目录调 `fs.rmSync(..., { recursive: true })` —— 那可能**顺着链接删到目标目录**。
    依赖：`platform/paths.js`（D11：业务代码不得硬编码路径）、node 内置模块。零第三方依赖。
@@ -152,7 +155,7 @@ function mountSite(router, options = {}) {
   const normCase = s => (process.platform === 'win32' ? String(s).toLowerCase() : String(s));
   const insideOrEqual = (child, parent) =>
     normCase(child) === normCase(parent) || normCase(child).startsWith(normCase(parent) + path.sep);
-  const served = { index: 0, asset: 0, denied: 0, missing: 0 };
+  const served = { index: 0, asset: 0, denied: 0, missing: 0, favicon: 0 };
 
   /**
    * 解析后落到绝对路径，并做"字面在 root 之内 + realpath 落在**对应白名单层**之内 + 是常规文件"校验。
@@ -182,6 +185,26 @@ function mountSite(router, options = {}) {
   async function handle(req, res, ctx = {}) {
     const method = String(ctx.method || req.method || '').toUpperCase();
     if (method !== 'GET') return false;
+    /* ---- W7-C：`/favicon.ico` ⇒ **204 No Content**（空体、`Content-Length: 0`） ----
+       为什么必须有这一条：ADR-0008 D1 把"服务端托管同源入口"（`http://127.0.0.1:8787/`）定为**首选入口**，
+       浏览器打开该页会**自动**请求 `/favicon.ico`；本仓不提供图标 ⇒ 旧行为是 404，控制台因此留下
+       一条 `network, level=error` 日志，而各门禁"无红色报错（含浏览器 error 日志）"盯的正是这类东西 ——
+       偏偏门禁平时都在 `file://` 下跑（**不发** favicon 请求）⇒ 永远抓不到，只有首选模式会撞上。
+       204 的语义：请求合法、本机**确实没有**这个资源、**无需**客户端再取内容 —— 既有信息量，又安静。
+       ⚠ 两条边界（都刻意如此，别"顺手优化"）：
+        · **不**把 `/favicon.ico` 加进白名单（`resolvePath` 仍拒它）—— 白名单是"可托管的文件"的真源，
+          本仓没有这个文件；这里是"对该请求给一个安静的空应答"，不是"托管了图标"；
+        · **不**新增 router 精确路由 —— 路由清单是冻结基线（"增删端点即红"），静态兜底层是它的正确归属。
+       计数进 `served.favicon`，便于自检/巡检读"首选入口下确实被请求过"。 */
+    if (ctx.path === '/favicon.ico') {
+      served.favicon++;
+      res.writeHead(204, {
+        'Content-Length': '0',
+        'Cache-Control': 'no-store'
+      });
+      res.end();
+      return true;
+    }
     const r = resolvePath(ctx.path);
     if (!r.ok) {
       served.denied++;

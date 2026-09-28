@@ -365,6 +365,54 @@ window.Api = (function () {
   }
 
   /**
+   * 取健康检查**并带回响应 `Date` 头**（W7-B 自检「NTP 时间同步」行要拿它比对本地时钟）。
+   *
+   * ⚠ 为什么**不**改 `httpJson()`／`fetchHealth()` 的返回形状：它们已被既有调用方与门禁使用，
+   * 本包只许**新增**。故这里走一条**本函数专用**的 `fetch`（与 `httpJson` 同一套能力检测、
+   * 同一套超时、同一套错误形状思想），把 `Date` 头一并回传。
+   * @returns {Promise<{ok:boolean, health?:object, dateHeader?:string, error?:string,
+   *                    failReason?:string, responseCode?:string, url:string}>}
+   */
+  function fetchHealthWithDate() {
+    const url = serverBase() + '/health';
+    if (typeof fetch !== 'function') {
+      return Promise.resolve({
+        ok: false, url, error: '运行环境不支持 fetch',
+        failReason: '运行环境不支持 fetch（服务端自检不可用）', responseCode: '不支持'
+      });
+    }
+    let signal;
+    try {
+      if (typeof AbortSignal !== 'undefined' && AbortSignal && typeof AbortSignal.timeout === 'function') {
+        signal = AbortSignal.timeout(serverTimeout());
+      }
+    } catch (e) { signal = undefined; }
+    const init = { method: 'GET', headers: { Accept: 'application/json' } };
+    if (signal) init.signal = signal;
+    return fetch(url, init).then(res => {
+      const dateHeader = (res.headers && typeof res.headers.get === 'function') ? res.headers.get('date') : null;
+      return res.text().then(text => {
+        let parsed = null;
+        try { parsed = text ? JSON.parse(text) : null; } catch (e) { parsed = null; }
+        if (!res.ok) {
+          const why = (parsed && parsed.err && parsed.err.message) || ('HTTP ' + res.status);
+          return { ok: false, url, dateHeader: dateHeader || undefined, responseText: text,
+            error: '服务端返回 HTTP ' + res.status + '：' + String(why),
+            failReason: String(why), responseCode: String(res.status) };
+        }
+        if (!parsed) {
+          return { ok: false, url, dateHeader: dateHeader || undefined, responseText: text,
+            error: '响应不是合法 JSON', failReason: '响应不是合法 JSON', responseCode: String(res.status) };
+        }
+        return { ok: true, url, health: parsed, dateHeader: dateHeader || undefined };
+      });
+    }).catch(err => {
+      const msg = (err && err.message) || String(err);
+      return { ok: false, url, error: msg, failReason: msg, responseCode: '网络错误' };
+    });
+  }
+
+  /**
    * 取首帧全量快照（`GET /state`）。
    * **成功判据是"`ok===true` 且 `snapshot` 是对象"** —— 只判 HTTP 200 会把
    * `{ok:false, err:{…}}` 这种"200 包着失败"误当成功（服务端 503 未挂载 SSE 时即如此）。
@@ -403,6 +451,48 @@ window.Api = (function () {
         overflow: b.overflow === true,
         alert: b.alert === undefined ? null : b.alert
       };
+    });
+  }
+
+  /**
+   * 取健康检查（`GET /health`）—— W7-B（FR-8.5 / NFR-26「系统状态自检」的真实探测数据源）。
+   * 响应口径（服务端 `server/index.js` 的 `healthPayload()`）：
+   * `{ok, uptimeSec, dbWritable, version, listen, pid, env, dataRoot, dbFile, streams, lastError, ifd?}`
+   * ⚠ 服务端**没有**磁盘余量与 NTP 偏差字段（演示期的两项是硬编码文案），故自检侧对这两项
+   * 走"尽力探测 + 明确未接入"口径，**不得**编造数值（见 `services/selfCheckProbe.js`）。
+   * @returns {Promise<{ok:boolean, health?:object, error?:string, url:string}>}
+   */
+  function fetchHealth() {
+    return httpJson('/health').then(r => {
+      if (!r.ok) return { ok: false, url: r.url, error: r.error, failReason: r.failReason, responseCode: r.responseCode };
+      return { ok: true, url: r.url, health: r.body || {} };
+    });
+  }
+
+  /**
+   * 取 IF-D（上位机）链路状态（`GET /ifd/status`）—— 自检「PC 上位机连接」行的真源。
+   * 响应口径（`server/http/routes/ifD.js` 的 `statusBody`）＝ `ingest.status()`：
+   * `{ok, mount:'ifD', sources, counts, lastReject, lastStoredKey, lastStoredSecond, link:{state,online,staleMs,ageMs,…}}`
+   * 其中 `link` 与 `GET /state` 的 `snapshot.link` **同源**（都来自 `ingest.linkState()`）。
+   * @returns {Promise<{ok:boolean, status?:object, error?:string, url:string}>}
+   */
+  function fetchIfdStatus() {
+    return httpJson('/ifd/status').then(r => {
+      if (!r.ok) return { ok: false, url: r.url, error: r.error, failReason: r.failReason, responseCode: r.responseCode };
+      return { ok: true, url: r.url, status: r.body || {} };
+    });
+  }
+
+  /**
+   * 取 IF-A（接收 MES 派工/物料/工艺）状态（`GET /ifa/status`）—— 自检「看板主机网络」行的
+   * 权威侧/鉴权信息真源。响应口径＝`server/services/dispatch.js` 的 `status()`：
+   * `{ok, mount:'ifA', mounted, kinds, counts, last, auth:{enabled,degraded,warning,…}, authority:{…}}`
+   * @returns {Promise<{ok:boolean, status?:object, error?:string, url:string}>}
+   */
+  function fetchIfaStatus() {
+    return httpJson('/ifa/status').then(r => {
+      if (!r.ok) return { ok: false, url: r.url, error: r.error, failReason: r.failReason, responseCode: r.responseCode };
+      return { ok: true, url: r.url, status: r.body || {} };
     });
   }
 
@@ -977,6 +1067,8 @@ window.Api = (function () {
     applyUpperPayload, validatePayload, isUpperStale, syncLinkState, startUpper, stopUpper,
     /* 看板服务端（W5-② / ADR-0008）：统一 HTTP 出口 + 首帧快照 + UI-20 的两个只读接口与人工重报 */
     httpJson, fetchSnapshot, fetchPending, fetchUploadStatus, retryPendingServer,
+    /* W7-B（FR-8.5 / NFR-26）：自检页真实探测所需的**只读**端点（新增，不改既有函数语义） */
+    fetchHealth, fetchIfdStatus, fetchIfaStatus, fetchHealthWithDate,
     serverBase, serverTimeout,
     /* IF-B */
     buildReportPayload, buildUrl, uploadReport, nextUploadId, isReceiptOk, receiptReason,
