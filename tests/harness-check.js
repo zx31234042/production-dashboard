@@ -1145,6 +1145,7 @@ const streams = [];
       vary: h('vary'),
       contentType: ct,
       cacheControl: h('cache-control'),
+      contentLength: h('content-length'),
       len: buf.length,
       textual,
       /* 二进制（png）不入结果文件：留 64 字符样本即可，否则账本里会塞进几百 KB 乱码 */
@@ -1207,6 +1208,12 @@ const streams = [];
   OUT.site.css = await probeHttp('/src/styles/global.css');
   OUT.site.png = await probeHttp('/src/assets/screenshots/01-%E8%AE%BE%E5%A4%87%E7%8A%B6%E6%80%81-%E4%BB%BB%E5%8A%A1%E6%9B%B2%E7%BA%BF.png');
   OUT.site.served = svc.site.status().served;
+  /* W7-C：/favicon.ico（浏览器打开同源入口时**自动**请求）⇒ 必须 **204 空体**（否则控制台多一条 network error）；
+     同时记下"处理它**没有**新增路由"的证据（路由清单条数）与静态层计数（证明是被 204 分支接住、不是落 404）。 */
+  OUT.site.favicon = await probeHttp('/favicon.ico');
+  OUT.site.faviconServed = svc.site.status().served;
+  OUT.site.routesCountAfterFavicon = svc.router.list().length;
+  OUT.site.faviconNotWhitelisted = svc.site.resolve('/favicon.ico');
 
   /* 白名单外 + 穿越（fetch 形态） */
   const deniedPaths = [
@@ -1339,6 +1346,69 @@ const streams = [];
         .map(f => fs.readFileSync(path.join(dir, f), 'utf8'))
         .join('\n').split(/\r?\n/).filter(l => l.includes('游标领先'));
     } catch (err) { return ['ERR:' + ((err && err.code) || err.message)]; }
+  })();
+
+  /* ================= ⑦d E22②：testStatus 上行**不伪造**（码原样到 MES；无帧时拒发而不是编一个） =================
+     为什么单列：附录 2 的 testStatus 来源＝**PC 上位机**；服务端只能**照抄最近一帧的码** ——
+     既不许自造（无帧时编 0/1/2），也不许改写（把「3 设备异常」按本机「维保检修 → 0」那类规则折叠掉）。
+     判据（可否证）：① 逐码 0/1/2/3 落帧 ⇒ 报文里的 testStatus 与**落库那一帧**逐个相等；
+                    ② 无帧且 dataSource≠mock ⇒「NO_TEST_STATUS」**拒发**、且一条 upload_log 都不写；
+                    ③「维保检修 → 0」是**本机**显示模式的反查规则（真源 fieldMap.modeToTestStatus），
+                      服务端**不参与**改写 —— 所以码 3 到 MES 仍是 3（与 ① 互为对照）。 */
+  OUT.e22 = { order: 'WO-W5-E22', noFrameOrder: 'WO-W5-NOF', codes: [], noFrame: {} };
+  OUT.e22.task = await post(base, '/ifa/dispatch',
+    { procOrderNo: OUT.e22.order, productCode: 'P-W5', processNo: '30', planQty: 5, equipCode: 'EQ-W5' });
+  OUT.e22.taskNoFrame = await post(base, '/ifa/dispatch',
+    { procOrderNo: OUT.e22.noFrameOrder, productCode: 'P-W5', processNo: '30', planQty: 5, equipCode: 'EQ-W5' });
+  const mesCfg = Object.assign({}, boardConfig, {
+    dataSource: 'server',                       /* 关键：**去掉** mock 的 0 兜底，逼出"无帧怎么办" */
+    mes: Object.assign({}, boardConfig.mes, { baseUrl: 'http://127.0.0.1:9/mes' })
+  });
+  const e22Sends = [];
+  const e22Fetch = async (url, opts) => {
+    e22Sends.push({ url: String(url), body: JSON.parse(opts.body) });
+    return { status: 200, text: async () => JSON.stringify({ status: 1, msg: 'ok' }) };
+  };
+  const repE22 = createUploadReporter({ db, now: clock.source(), fetch: e22Fetch, config: mesCfg });
+  const e22LogCount = () => db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c;
+  for (const [k, code] of [0, 1, 2, 3].entries()) {
+    /* ⚠ collectTime 必须**早于**后面 F2 在途帧的 10:40:00：采样落库口径是"采集时刻比上一帧更新"，
+       取更晚的时刻会把后面的 10:40:00 挤成 raw-500ms（本夹具实测踩过一次，F2 因此变红）。 */
+    const f = frame(70 + k, '2026-09-19 10:31:0' + k);
+    f.procOrderNo = OUT.e22.order;
+    f.testStatus = code;
+    const posted = await post(base, '/ifd/frame', f);
+    const built = repE22.buildReport({ procOrderNo: OUT.e22.order });
+    const stored = db.prepare(
+      'SELECT test_status FROM measure_rt WHERE proc_order_no = ? ORDER BY id DESC LIMIT 1'
+    ).get(OUT.e22.order);
+    OUT.e22.codes.push({
+      code, post: posted,
+      built: built.ok ? { ok: true, testStatus: built.body.testStatus, frameId: built.frameId } : built,
+      storedTestStatus: stored ? stored.test_status : null
+    });
+  }
+  const e22LogBefore = e22LogCount();
+  const e22PendingBefore = repE22.pendingCount(true);       /* 队列里可能已有别的腿留下的待补传件 */
+  OUT.e22.noFrame.build = repE22.buildReport({ procOrderNo: OUT.e22.noFrameOrder });
+  OUT.e22.noFrame.report = await repE22.report({ procOrderNo: OUT.e22.noFrameOrder });
+  OUT.e22.noFrame.logBefore = e22LogBefore;
+  OUT.e22.noFrame.logAfter = e22LogCount();
+  OUT.e22.noFrame.attempts = repE22.attempts();
+  OUT.e22.noFrame.pendingBefore = e22PendingBefore;
+  OUT.e22.noFrame.pendingAfter = repE22.pendingCount(true);
+  OUT.e22.noFrame.sourceOfTestStatus = repE22.sources().testStatus;
+  OUT.e22.sends = e22Sends.length;
+  OUT.e22.modeMap = (() => {                       /* 本机显示模式 → 附录 2 码的**真源**（vm 里实跑） */
+    try {
+      const vm = require('node:vm');
+      const sb = { console };
+      sb.window = sb;
+      vm.createContext(sb);
+      vm.runInContext(fs.readFileSync(path.join(ROOT, 'src', 'config', 'board.config.js'), 'utf8'), sb);
+      vm.runInContext(fs.readFileSync(path.join(ROOT, 'src', 'config', 'fieldMap.js'), 'utf8'), sb);
+      return Object.assign({}, sb.window.FieldMap.modeToTestStatus);
+    } catch (err) { return { ERR: String((err && err.message) || err) }; }
   })();
 
   /* ================= ⑧ 优雅关闭 ================= */
@@ -1760,6 +1830,44 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     JSON.stringify(s.uploadStatus.alert) === JSON.stringify(s.stateFinal.snapshot.upload.alert),
     `/upload/status.pending=${s.uploadStatus && s.uploadStatus.pendingCount}；snapshot.upload.pending=${s.stateFinal && s.stateFinal.snapshot && s.stateFinal.snapshot.upload && s.stateFinal.snapshot.upload.pendingCount}`);
 
+  /* ---- 判据⑨ E22②：testStatus 上行不伪造（码原样到 MES ／ 无帧拒发 ／ 维保检修→0 只是本机反查规则） ---- */
+  const e22 = s.e22 || {};
+  const e22codes = e22.codes || [];
+  t.check('E22②：逐码 0/1/2/3 落帧后，MES 报文里的 testStatus 与**落库那一帧**逐个相等（服务端只照抄、不折叠）',
+    e22codes.length === 4 &&
+    e22codes.every(c => c.post && c.post.status === 200 && c.built && c.built.ok === true &&
+      c.storedTestStatus === c.code && c.built.testStatus === c.code),
+    `实跑四帧：${e22codes.map(c => `落库${c.storedTestStatus}→报文${c.built && c.built.testStatus}`).join('，')}` +
+    `（POST 状态码 ${e22codes.map(c => c.post && c.post.status).join('/')}）`);
+  t.check('E22②：码 `3`（设备异常）**不得**被"维保检修 → 0"那类本机规则改写成 0 —— ' +
+    '真源 `fieldMap.modeToTestStatus` 里「维保检修=0」与「故障锁定=3」并存，服务端不套用它',
+    (e22codes.find(c => c.code === 3) || {}).built &&
+    e22codes.find(c => c.code === 3).built.testStatus === 3 &&
+    (e22.modeMap || {})['维保检修'] === 0 && (e22.modeMap || {})['故障锁定'] === 3,
+    `码 3 的报文 testStatus=${JSON.stringify((e22codes.find(c => c.code === 3) || {}).built && e22codes.find(c => c.code === 3).built.testStatus)}；` +
+    `本机反查表=${JSON.stringify(e22.modeMap)}`);
+  t.check('E22②：无实测帧且 `dataSource≠mock` ⇒ `NO_TEST_STATUS` **拒发**：一次都不发、不写 upload_log、不进待补传、不落假成功',
+    e22.noFrame && e22.noFrame.build && e22.noFrame.build.ok === false &&
+    e22.noFrame.build.error && e22.noFrame.build.error.code === 'NO_TEST_STATUS' &&
+    e22.noFrame.build.error.field === 'testStatus' &&
+    e22.noFrame.report && e22.noFrame.report.ok === false && e22.noFrame.report.skipped === true &&
+    e22.noFrame.attempts === 0 && e22.noFrame.logBefore === e22.noFrame.logAfter &&
+    e22.noFrame.pendingBefore === e22.noFrame.pendingAfter && e22.sends === 0,
+    `buildReport.ok=${e22.noFrame && e22.noFrame.build && e22.noFrame.build.ok}` +
+    `／error.code=${e22.noFrame && e22.noFrame.build && e22.noFrame.build.error && e22.noFrame.build.error.code}` +
+    `／尝试发送次数=${e22.noFrame && e22.noFrame.attempts}／upload_log 行数 ${e22.noFrame && e22.noFrame.logBefore}→${e22.noFrame && e22.noFrame.logAfter}` +
+    `／待补传 ${e22.noFrame && e22.noFrame.pendingBefore}→${e22.noFrame && e22.noFrame.pendingAfter}／真实 fetch 调用=${e22.sends}`);
+  t.check('E22②：13 字段的**取数来源**在真源里写明 `testStatus` 来自 PC 上位机、缺值口径是"不伪造运行状态"（不是注释里的一句话）',
+    Boolean(e22.noFrame && e22.noFrame.sourceOfTestStatus) &&
+    e22.noFrame.sourceOfTestStatus.source === 'PC上位机' &&
+    /不伪造/.test(String(e22.noFrame.sourceOfTestStatus.missing || '')) &&
+    /measure_rt\.test_status/.test(String(e22.noFrame.sourceOfTestStatus.table || '')),
+    JSON.stringify(e22.noFrame && e22.noFrame.sourceOfTestStatus));
+  t.check('E22②「维保检修 → 0」的本机反查规则在真源里**逐项**成立（待机0／测试运行1／正常停机2／维保检修0／故障锁定3；' +
+    '旧实现把维保检修写 2＝"上报：测试完成"）',
+    JSON.stringify(e22.modeMap) === JSON.stringify({ '待机': 0, '测试运行': 1, '正常停机': 2, '维保检修': 0, '故障锁定': 3 }),
+    `vm 实跑 fieldMap.modeToTestStatus = ${JSON.stringify(e22.modeMap)}`);
+
   /* ---- 判据⑥：优雅关闭（在途流收尾 / 定时器清零 / stop 按时返回 / 进程自然退出码 0） ---- */
   const cl = s.close || {};
   const sseMark = ((cl.marks || []).find(x => /SSE 连接/.test(x)) || '');
@@ -1864,6 +1972,26 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     `board.config.js: ${s.site && s.site.config && s.site.config.status}/${s.site && s.site.config && s.site.config.contentType}；` +
     `main.js: ${s.site && s.site.js && s.site.js.status}/${s.site && s.site.js && s.site.js.contentType}；` +
     `global.css: ${s.site && s.site.css && s.site.css.contentType}；png: ${s.site && s.site.png && s.site.png.len}B`);
+  /* ---- W7-C：`/favicon.ico` ⇒ 204（服务端托管是首选入口，浏览器会自动请求它） ---- */
+  const fav = (s.site && s.site.favicon) || {};
+  t.check('静态/W7-C①：`GET /favicon.ico` ⇒ **204 No Content**、**body 为空**、`Content-Length: 0`、`Cache-Control: no-store`（浏览器自动请求不留 network error）',
+    fav.status === 204 && fav.len === 0 && fav.text === '' &&
+    String(fav.contentLength) === '0' && fav.cacheControl === 'no-store',
+    `status=${fav.status} body=${fav.len}B content-length=${JSON.stringify(fav.contentLength)} cache=${JSON.stringify(fav.cacheControl)} content-type=${JSON.stringify(fav.contentType)}`);
+  t.check('静态/W7-C② 正对照：新增 favicon 分支**没有**把静态口顺手关掉 —— `GET /` 仍 200 且内容仍是 `index.html` 本体、`GET /src/main.js` 仍 200/javascript、`GET /src/nope.js` 仍 404',
+    Boolean(s.site) && s.site.root.status === 200 && s.site.root.text === idxText &&
+    s.site.js.status === 200 && /javascript/.test(String(s.site.js.contentType)) &&
+    Boolean(s.site.denied && s.site.denied['/src/nope.js']) && s.site.denied['/src/nope.js'].status === 404,
+    `首页=${s.site && s.site.root && s.site.root.status}（内容相等=${Boolean(s.site && s.site.root && s.site.root.text === idxText)}）；` +
+    `main.js=${s.site && s.site.js && s.site.js.status}/${s.site && s.site.js && s.site.js.contentType}；` +
+    `nope.js=${s.site && s.site.denied && s.site.denied['/src/nope.js'] && s.site.denied['/src/nope.js'].status}`);
+  t.check('静态/W7-C③：favicon **在静态兜底层**处理，不是新注册一条路由 —— 路由清单仍 20 条；且它**不进白名单**（`resolvePath` 仍拒），而静态层计数 `served.favicon` 确实 +1（被 204 分支接住、没落 404）',
+    (s.site && s.site.routesCountAfterFavicon) === 20 &&
+    (s.site && s.site.faviconNotWhitelisted && s.site.faviconNotWhitelisted.ok === false) &&
+    (s.site && s.site.faviconServed && s.site.faviconServed.favicon === 1),
+    `路由条数=${s.site && s.site.routesCountAfterFavicon}（冻结基线 20）；resolvePath('/favicon.ico')=${JSON.stringify(s.site && s.site.faviconNotWhitelisted)}；` +
+    `served=${JSON.stringify(s.site && s.site.faviconServed)}`);
+
   t.check('静态⑧：白名单外路径（server / tests / tools / .git / data / 项目记录 / 需求文档 / 未知路径）一律 404＋JSON 形状，且响应体**不含**被禁文件内容（按真实文件的 40 字符指纹逐条比对）',
     (() => {
       const d = (s.site && s.site.denied) || {};
@@ -2088,6 +2216,417 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
   /* 只删本节点名的**夹具文件**，不删整个 tests\._verify\w5sse\：
      该目录是同座位复核/定点变异的工作区（整目录 rm 会把别人的临时产物一并清掉）。 */
   for (const f of [fSse, fNonLoop]) { try { fs.rmSync(f, { force: true }); } catch { /* 忽略 */ } }
+}
+
+/* ---------------- 四之③ W7-A-3 DoD：mock-upper（真进程）→ 服务端 → mock-mes（真进程） ----------------
+   为什么这样搭：DoD 要证明的是**三段真链路**接得上，而不是"三个模块各自单测过了"：
+     · 上游：`tools/mock-upper/mock-upper.js` 作为**独立进程** `--once --push` 打服务端 `/ifd/frame`；
+     · 中段：本仓真服务（`server/index.js` 的 `start()`，真 HTTP + 真 SQLite + 真采样落库）；
+     · 下游：`tools/mock-mes/mock-mes.js` 作为**独立进程**收 IF-B 上报，并用自己的 `/log` 出证。
+   ⚠ 一处**口径差异**必须写明（不许含糊过去）：`server/index.js` 的 `mountUpload(router, {db,logger,now,bus})`
+     没有把 `config` 传下去，而 `board.config.js` 的 `mes.baseUrl` 是空串（Q-23 未答）且**不在本轮可改文件内** ——
+     故"报告腿"用**同一套路由模块**（`createRouter` + 真实 `mountUpload`）在夹具内二次挂载、只把
+     `mes.baseUrl` 注入成 mock-mes 的地址（这是 `mountUpload` 既有的注入出口）。下游仍是真的：
+     真 HTTP POST、真 `upload_log` 落库、mock-mes 真收到并留痕。
+   六条判据（E22/DoD）：①上游真进程推送 ⇒ 服务端落库一行（字段自洽）
+                        ②报告组装 13 字段齐、首发打到**死端口** ⇒ 真失败入队（待补传 1 条）
+                        ③注入时钟推进 **5 分钟** ⇒ 一次自动重发都没有（尝试数/日志行数/待补传/mock-mes 计数全不动）
+                        ④人工 `POST /upload/retry` ⇒ 真发送成功、mock-mes 真收到 1 条、日志转"成功"、待补传归零
+                        ⑤再点一次重报 ⇒ 幂等（没有可发条目、mock-mes 计数不涨）
+                        ⑥全程 **零未捕获异常/零 console.error**（把"跑通了"与"带着错误跑通"分开） */
+const W7_DOD_FIXTURE = String.raw`'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const http = require('node:http');
+const { spawn } = require('node:child_process');
+const ROOT = path.resolve(__dirname, '..', '..', '..');
+process.env.DSH_ENV = 'test';
+const entry = require(path.join(ROOT, 'server', 'index.js'));
+const { createRouter } = require(path.join(ROOT, 'server', 'http', 'router.js'));
+const { mountUpload } = require(path.join(ROOT, 'server', 'http', 'routes', 'upload.js'));
+const { createUploadReporter } = require(path.join(ROOT, 'server', 'services', 'uploadReporter.js'));
+const boardConfig = require(path.join(ROOT, 'src', 'config', 'board.config.js'));
+
+const OUT = { errors: [], consoleErrors: [], children: [] };
+const SAVE = () => fs.writeFileSync(process.env.DSH_W7_RESULT, JSON.stringify(OUT, null, 1), 'utf8');
+process.on('uncaughtException', e => { OUT.errors.push('uncaughtException: ' + String((e && e.stack) || e)); });
+process.on('unhandledRejection', e => { OUT.errors.push('unhandledRejection: ' + String((e && e.stack) || e)); });
+const origErr = console.error.bind(console);
+console.error = function () {
+  const line = Array.prototype.map.call(arguments, String).join(' ').slice(0, 300);
+  OUT.consoleErrors.push(line);
+  return origErr.apply(null, arguments);
+};
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const MOCK_UPPER = path.join(ROOT, 'tools', 'mock-upper', 'mock-upper.js');
+const MOCK_MES = path.join(ROOT, 'tools', 'mock-mes', 'mock-mes.js');
+const ORDER = 'MES20260918001';        /* mock-upper 报文里写死的工单号（与 tools-check 的契约一致） */
+
+function spawnTool(script, args, name) {
+  const logFile = path.join(process.env.DSH_W7_TMP, name + '.log');
+  const fd = fs.openSync(logFile, 'a');
+  const proc = spawn(process.execPath, [script].concat(args), {
+    cwd: ROOT, env: Object.assign({}, process.env, { DSH_ENV: 'test' }),
+    windowsHide: true, stdio: ['ignore', fd, fd]
+  });
+  let settled = null;
+  proc.on('exit', (code, signal) => { settled = { code, signal }; });
+  OUT.children.push({ name, argv: [path.basename(script)].concat(args) });
+  return {
+    proc,
+    log: () => { try { return fs.readFileSync(logFile, 'utf8'); } catch { return ''; } },
+    exitInfo: () => settled,
+    async waitDone(ms) {
+      const until = Date.now() + ms;
+      while (!settled && Date.now() < until) await sleep(100);
+      try { fs.closeSync(fd); } catch { /* 已关 */ }
+      return settled;
+    },
+    kill() { try { fs.closeSync(fd); } catch { /* 已关 */ } try { proc.kill(); } catch { /* 已退出 */ } }
+  };
+}
+
+(async () => {
+  const port = Number(process.env.DSH_W7_PORT);
+  const mesPort = Number(process.env.DSH_W7_MES_PORT);
+  const retryPort = Number(process.env.DSH_W7_RETRY_PORT);
+  const base = 'http://127.0.0.1:' + port;
+
+  /* 注入时钟（ADR-0003 D17）：DoD 的"推进 5 分钟看有没有偷偷重发"必须能确定性推进 */
+  let fixedMs = Date.parse('2026-09-19T10:00:00');
+  const clock = {
+    now: () => new Date(fixedMs),
+    source: () => () => new Date(fixedMs),
+    advanceMs: ms => { fixedMs += ms; return fixedMs; }
+  };
+
+  /* ---- ① 下游先起来：mock-mes 真进程 + 清空它的接收日志 ---- */
+  const mes = spawnTool(MOCK_MES, ['--port', String(mesPort)], 'mock-mes');
+  OUT.mesReady = false;
+  for (let i = 0; i < 80 && !OUT.mesReady; i++) {
+    try { const r = await fetch('http://127.0.0.1:' + mesPort + '/health'); if (r.ok) OUT.mesReady = true; } catch (e) { /* 未就绪 */ }
+    if (!OUT.mesReady) await sleep(100);
+  }
+  if (OUT.mesReady) await fetch('http://127.0.0.1:' + mesPort + '/log', { method: 'DELETE' });
+  const mesLog = async () => {
+    try { return await (await fetch('http://127.0.0.1:' + mesPort + '/log')).json(); }
+    catch (e) { return { ERR: String((e && e.message) || e) }; }
+  };
+
+  /* ---- ② 中段：真服务进程内实例（真 HTTP + 真 SQLite） ---- */
+  const svc = await entry.start({
+    argv: ['--port', String(port), '--data-dir', process.env.DSH_W7_DATA, '--db-file', process.env.DSH_W7_DB],
+    installSignalHandlers: false, logConsole: false, clock
+  });
+  const db = entry.state.db;
+  OUT.service = { port, routes: svc.router.list(), mesBaseUrl: boardConfig.mes.baseUrl };
+  const post = async (b, p, body) => {
+    const r = await fetch(b + p, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {})
+    });
+    let j = null;
+    try { j = await r.json(); } catch (e) { j = null; }
+    return { status: r.status, body: j };
+  };
+
+  /* ---- ③ 派工（真路由）⇒ 报告组装需要的 task 行 ---- */
+  OUT.dispatch = await post(base, '/ifa/dispatch',
+    { procOrderNo: ORDER, productCode: 'P-DOD', processNo: '30', planQty: 3, equipCode: 'EQ-DOD' });
+
+  /* ---- ④ 上游真进程：mock-upper --once --push ⇒ 服务端 /ifd/frame ---- */
+  const rowsBefore = db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+  const upper = spawnTool(MOCK_UPPER, ['--once', '--equip', 'EQ-DOD', '--cycle', '160',
+    '--push', base + '/ifd/frame'], 'mock-upper');
+  OUT.upperExit = await upper.waitDone(20000);
+  OUT.upperLog = upper.log().slice(-500);
+  const rowsAfter = db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+  const fr = db.prepare('SELECT * FROM measure_rt ORDER BY id DESC LIMIT 1').get() || null;
+  OUT.ingest = {
+    rowsBefore, rowsAfter,
+    frame: fr ? {
+      equipCode: fr.equip_code, procOrderNo: fr.proc_order_no, collectTime: fr.collect_time,
+      depth: fr.measure_depth, speed: fr.speed, testStatus: fr.test_status
+    } : null
+  };
+
+  /* ---- ④b 端点矩阵：**正面**（每个端点一条 200）＋**逆向**（未知路径/方法不符/坏 JSON/缺字段/参数越界）
+         ＋**无副作用**（被拒请求不得落库、不得发事件） ----
+     为什么放在这里：服务是真的、库是真的、总线是真的 —— 逆向用例的"没留下痕迹"才有意义。 */
+  const probe = async (p, opts) => {
+    const r = await fetch(base + p, opts);
+    let text = '';
+    try { text = await r.text(); } catch (e) { text = ''; }
+    let j = null;
+    try { j = JSON.parse(text); } catch (e) { j = null; }
+    return {
+      status: r.status, code: (j && (j.err || j.error) && (j.err || j.error).code) || null,
+      allow: r.headers.get('allow'), acao: r.headers.get('access-control-allow-origin'),
+      text: text.slice(0, 100)
+    };
+  };
+  const jsonPost = (p, body) => probe(p, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body
+  });
+  const rowsOf = () => db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+  const logsOf = () => db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c;
+  const seqOf = async () => (await (await fetch(base + '/state')).json()).seq;
+  const mSeqBefore = await seqOf();
+  const mRowsBefore = rowsOf();
+  const mLogsBefore = logsOf();
+  OUT.matrix = {
+    routes: svc.router.list(),
+    positive: {
+      health: await probe('/health'),
+      state: await probe('/state'),
+      uploadStatus: await probe('/upload/status'),
+      uploadPending: await probe('/upload/pending'),
+      siteRoot: await probe('/'),
+      staticJs: await probe('/src/main.js')
+    },
+    negative: {
+      unknown: await probe('/no-such-path'),
+      wrongMethod: await probe('/state', { method: 'DELETE' }),
+      wrongMethodPost: await jsonPost('/upload/pending', {}),
+      badJsonFrame: await jsonPost('/ifd/frame', '{ 这不是 JSON'),
+      missingFieldFrame: await jsonPost('/ifd/frame', { equipCode: 'EQ-DOD' }),
+      badJsonDispatch: await jsonPost('/ifa/dispatch', '{ 也不是 JSON'),
+      limitZero: await probe('/upload/pending?limit=0'),
+      badJsonRetry: await jsonPost('/upload/retry', '{ 仍然不是 JSON')
+    }
+  };
+  OUT.matrix.sideEffects = {
+    seqBefore: mSeqBefore, seqAfter: await seqOf(),
+    rowsBefore: mRowsBefore, rowsAfter: rowsOf(),
+    logsBefore: mLogsBefore, logsAfter: logsOf()
+  };
+
+  /* ---- ⑤ 报告腿：同一套路由模块 + 只注入 MES 地址；首发打**死端口** ⇒ 确定性失败 ---- */
+  const cfg = Object.assign({}, boardConfig, {
+    dataSource: 'server',
+    mes: Object.assign({}, boardConfig.mes, { baseUrl: 'http://127.0.0.1:9/mes' })
+  });
+  const router2 = createRouter({ getHealth: () => ({ status: 1, msg: 'dod-report-face' }), now: clock.source() });
+  /* ⚠ 必须**显式传 reporter**：mountUpload 的 reporter 池按 db 缓存（resolveReporter 的 pool.byDb），
+     同一个 db 第二次挂载会**复用**上一次的实例（那天服务自己挂的那个读不到 MES 地址）——
+     显式注入既绕开缓存、又恰好是"给这条报告腿配上 MES 地址"的既有出口。 */
+  const rep2 = createUploadReporter({ db, now: clock.source(), config: cfg, logger: null });
+  const up2 = mountUpload(router2, { db, now: clock.source(), config: cfg, reporter: rep2, logger: null });
+  const server2 = http.createServer((req, res) => {
+    Promise.resolve(router2.handle(req, res)).catch(() => { try { res.destroy(); } catch (e) { /* 已断 */ } });
+  });
+  await new Promise(resolve => server2.listen(retryPort, '127.0.0.1', resolve));
+  const retryBase = 'http://127.0.0.1:' + retryPort;
+
+  const built = up2.instance.buildReport({ procOrderNo: ORDER });
+  OUT.report = {
+    builtOk: built.ok,
+    fields: built.ok ? built.fields.length : 0,
+    testStatus: built.ok ? built.body.testStatus : null,
+    missing: built.ok ? built.missing : null,
+    collectTimeFallback: built.ok ? built.collectTimeFallback : null,
+    url: up2.instance.buildUrl()
+  };
+  const first = await up2.instance.report({ procOrderNo: ORDER });
+  OUT.report.first = {
+    ok: first.ok, skipped: first.skipped === true, responseCode: first.responseCode,
+    failReason: first.failReason, pendingCount: first.pendingCount, httpStatus: first.httpStatus
+  };
+  OUT.report.logRowsAfterFirst = db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c;
+  OUT.report.firstRow = db.prepare('SELECT state, retry_count FROM upload_log ORDER BY id DESC LIMIT 1').get() || null;
+
+  /* ---- ⑥ 时间推进 5 分钟：**任何定时器都不该因此重发**（V1.31 / C-59 / E10） ---- */
+  const attemptsBefore = up2.instance.attempts();
+  const logRowsBeforeWait = db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c;
+  const pendingBeforeWait = up2.instance.pendingCount(true);
+  clock.advanceMs(5 * 60 * 1000);
+  await sleep(1500);                       /* 给 1.5 s 墙钟：有定时器的话这里就会动 */
+  OUT.noAutoRetry = {
+    advancedTo: new Date(fixedMs).toISOString(),
+    attemptsBefore, attemptsAfter: up2.instance.attempts(),
+    logRowsBefore: logRowsBeforeWait, logRowsAfter: db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c,
+    pendingBefore: pendingBeforeWait, pendingAfter: up2.instance.pendingCount(true),
+    mesReceived: ((await mesLog()).count === undefined ? null : (await mesLog()).count)
+  };
+
+  /* ---- ⑦ 人工一键重报（真 HTTP POST /upload/retry）：先把 MES 地址改对 ---- */
+  cfg.mes.baseUrl = 'http://127.0.0.1:' + mesPort;      /* 配置是活引用（运维改地址后即可重报） */
+  const r1 = await post(retryBase, '/upload/retry', {});
+  const log1 = await mesLog();
+  OUT.retry = {
+    status: r1.status, sent: r1.body && r1.body.sent, failed: r1.body && r1.body.failed,
+    requested: r1.body && r1.body.requested, remaining: r1.body && r1.body.remaining,
+    mesCount: log1.count === undefined ? null : log1.count,
+    mesItems: (log1.items || []).map(it => ({
+      path: it.path,
+      testStatus: it.payload && it.payload.testStatus,
+      uploadId: it.payload && it.payload.uploadId,
+      depth: it.payload && it.payload.depth
+    })),
+    uploadLogRows: db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c,
+    lastRow: db.prepare('SELECT state, response_code, retry_count FROM upload_log ORDER BY id DESC LIMIT 1').get() || null,
+    alert: r1.body && r1.body.alert
+  };
+  const r2 = await post(retryBase, '/upload/retry', {});   /* 再点一次：应当没有可发条目（幂等） */
+  const log2 = await mesLog();
+  OUT.retry2 = {
+    status: r2.status, sent: r2.body && r2.body.sent, requested: r2.body && r2.body.requested,
+    remaining: r2.body && r2.body.remaining, mesCount: log2.count === undefined ? null : log2.count
+  };
+
+  /* ---- ⑧ 收尾：报告面 → 服务 → 下游，逐层关掉（顺序与真实运维相反，故意的：先断"触发方"） ---- */
+  await new Promise(resolve => server2.close(() => resolve()));
+  OUT.stopResult = await entry.stop('w7 DoD 夹具');
+  mes.kill();
+  await sleep(300);
+  OUT.done = true;
+  SAVE();
+})().catch(err => {
+  OUT.error = String((err && err.stack) || err);
+  SAVE();
+  process.exitCode = 1;
+});
+`;
+
+/* ---------------- 四之③ W7-A-3 DoD：端到端链路（真进程 mock-upper → 真服务 → 真进程 mock-mes） ---------------- */
+t.section('四之③、W7-A-3 DoD：mock-upper（真进程）→ 服务端 → mock-mes（真进程）端到端');
+{
+  const w7Scratch = path.join(env.paths.root, 'tests', '._verify', 'w7dod');
+  fs.mkdirSync(w7Scratch, { recursive: true });
+  const w7Tmp = harness.makeTempDir('w7-dod');
+  const w7RunTag = process.pid + '-' + Date.now().toString(36);
+  const w7File = path.join(w7Scratch, 'fixture-dod-' + w7RunTag + '.js');
+  fs.writeFileSync(w7File, W7_DOD_FIXTURE, 'utf8');
+
+  const w7Port = await harness.allocPort();
+  const w7MesPort = await harness.allocPort();
+  const w7RetryPort = await harness.allocPort();
+  const w7Data = path.join(w7Tmp, 'data-dod');
+  const w7Result = path.join(w7Tmp, 'dod-result.json');
+  const w7Log = path.join(w7Tmp, 'fixture-dod.log');
+  const w7Fd = fs.openSync(w7Log, 'a');
+  const w7Proc = spawn(process.execPath, [w7File], {
+    cwd: env.paths.root,
+    env: Object.assign({}, process.env, {
+      DSH_ENV: 'test', DSH_W7_PORT: String(w7Port), DSH_W7_MES_PORT: String(w7MesPort),
+      DSH_W7_RETRY_PORT: String(w7RetryPort), DSH_W7_DATA: w7Data,
+      DSH_W7_DB: path.join(w7Data, 'board.db'), DSH_W7_TMP: w7Tmp, DSH_W7_RESULT: w7Result
+    }),
+    windowsHide: true,
+    stdio: ['ignore', w7Fd, w7Fd]
+  });
+  let w7Settled = null;
+  w7Proc.on('exit', (code, signal) => { w7Settled = { code, signal }; });
+  const w7Watchdog = setTimeout(() => { try { w7Proc.kill(); } catch { /* 已退出 */ } }, 90000);
+  const w7Until = Date.now() + 90000;
+  while (!w7Settled && Date.now() < w7Until) await new Promise(r => setTimeout(r, 150));
+  clearTimeout(w7Watchdog);
+  try { fs.closeSync(w7Fd); } catch { /* 已关 */ }
+  const w7LogText = (() => { try { return fs.readFileSync(w7Log, 'utf8'); } catch { return ''; } })();
+  const D = (() => { try { return JSON.parse(fs.readFileSync(w7Result, 'utf8')); } catch { return null; } })();
+  if (!t.requires('W7 DoD 夹具能取到结果文件（dod-result.json）', Boolean(D), w7LogText.slice(-500) || '无日志')) {
+    t.info('W7 DoD：夹具未产出结果，本节断言按失败处理（不许把"跑不了"当通过）');
+  }
+  const d = D || {};
+  const dUpper = (d.ingest || {});
+  const dFrame = dUpper.frame || {};
+
+  /* ---- 判据①：上游真进程 → 服务端落库 ---- */
+  t.check('DoD①：`tools/mock-upper` **独立进程** `--once --push` ⇒ 服务端 `/ifd/frame` **落库一行**（字段与推送报文同源：设备号/工单号/深度量程/首帧 testStatus=0）',
+    d.upperExit && d.upperExit.code === 0 && /HTTP 200/.test(String(d.upperLog || '')) &&
+    dUpper.rowsAfter === dUpper.rowsBefore + 1 &&
+    dFrame.equipCode === 'EQ-DOD' && dFrame.procOrderNo === 'MES20260918001' &&
+    dFrame.testStatus === 0 && Number(dFrame.depth) >= 4.7 && Number(dFrame.depth) <= 5.4 &&
+    Number(dFrame.speed) > 0,
+    `上游退出码=${d.upperExit && d.upperExit.code}（stdout 末段=${String(d.upperLog || '').replace(/\s+/g, ' ').slice(-120)}）；` +
+    `measure_rt 行数 ${dUpper.rowsBefore}→${dUpper.rowsAfter}；落库帧=${JSON.stringify(dFrame)}`);
+
+  /* ---- 判据②：报告组装 + 首发失败入队（真 upload_log） ---- */
+  t.check('DoD②：报告组装 13 字段齐、`testStatus` 取自**刚落库的那一帧**（=0，不伪造）；首发打到死端口 ⇒ 真失败、`upload_log` 落"待补传"、待补传 1 条',
+    d.report && d.report.builtOk === true && d.report.fields === 13 && d.report.testStatus === 0 &&
+    d.report.first && d.report.first.ok === false && d.report.first.skipped !== true &&
+    d.report.first.pendingCount === 1 && d.report.logRowsAfterFirst === 1 &&
+    d.report.firstRow && d.report.firstRow.state === '待补传',
+    `组装的 testStatus=${d.report && d.report.testStatus}（13 字段=${d.report && d.report.fields}）；` +
+    `首发 ok=${d.report && d.report.first && d.report.first.ok}／原因=${d.report && d.report.first && d.report.first.failReason}；` +
+    `upload_log 行数=${d.report && d.report.logRowsAfterFirst}／末行=${JSON.stringify(d.report && d.report.firstRow)}`);
+
+  /* ---- 判据③：时间推进 5 分钟 ⇒ 零自动重发 ---- */
+  t.check('DoD③：注入时钟推进 **5 分钟** ⇒ **没有任何自动重发**（尝试次数/`upload_log` 行数/待补传条数/mock-mes 收到条数 四项全不动）',
+    d.noAutoRetry && d.noAutoRetry.attemptsAfter === d.noAutoRetry.attemptsBefore &&
+    d.noAutoRetry.logRowsAfter === d.noAutoRetry.logRowsBefore &&
+    d.noAutoRetry.pendingAfter === d.noAutoRetry.pendingBefore && d.noAutoRetry.pendingAfter === 1 &&
+    d.noAutoRetry.mesReceived === 0,
+    `时钟推进到 ${d.noAutoRetry && d.noAutoRetry.advancedTo}；尝试 ${d.noAutoRetry && d.noAutoRetry.attemptsBefore}→${d.noAutoRetry && d.noAutoRetry.attemptsAfter}；` +
+    `upload_log ${d.noAutoRetry && d.noAutoRetry.logRowsBefore}→${d.noAutoRetry && d.noAutoRetry.logRowsAfter}；` +
+    `待补传 ${d.noAutoRetry && d.noAutoRetry.pendingBefore}→${d.noAutoRetry && d.noAutoRetry.pendingAfter}；mock-mes 收到=${d.noAutoRetry && d.noAutoRetry.mesReceived}`);
+
+  /* ---- 判据④：人工一键重报（真 HTTP）⇒ 真发送成功 ---- */
+  t.check('DoD④：人工 `POST /upload/retry`（真 HTTP）⇒ 200 + `sent=1`，**mock-mes 真进程收到 1 条**（其 `/log` 出证：路径/uploadId/testStatus 都在），`upload_log` **同一行**由"待补传"迁到"成功"、待补传归零',
+    d.retry && d.retry.status === 200 && d.retry.sent === 1 && d.retry.failed === 0 &&
+    d.retry.requested === 1 && d.retry.remaining === 0 && d.retry.mesCount === 1 &&
+    d.retry.uploadLogRows === 1 && d.retry.lastRow && d.retry.lastRow.state === '成功' &&
+    d.retry.mesItems && d.retry.mesItems.length === 1 && d.retry.mesItems[0].testStatus === 0 &&
+    d.retry.mesItems[0].path === '/service/report/receiveReport' &&
+    typeof d.retry.mesItems[0].uploadId === 'string' && Number(d.retry.mesItems[0].depth) >= 4.7,
+    `HTTP ${d.retry && d.retry.status} requested/sent/failed/remaining=${d.retry && d.retry.requested}/${d.retry && d.retry.sent}/${d.retry && d.retry.failed}/${d.retry && d.retry.remaining}；` +
+    `mock-mes /log count=${d.retry && d.retry.mesCount} items=${JSON.stringify(d.retry && d.retry.mesItems)}；` +
+    `upload_log 末行=${JSON.stringify(d.retry && d.retry.lastRow)}`);
+
+  /* ---- 判据⑤：幂等（再点一次不重复发） ---- */
+  t.check('DoD⑤：**再点一次**重报 ⇒ 幂等：没有可发条目（`requested=0`/`sent=0`），mock-mes 计数**不涨**（不重复上报同一帧）',
+    d.retry2 && d.retry2.status === 200 && d.retry2.sent === 0 && d.retry2.requested === 0 &&
+    d.retry2.remaining === 0 && d.retry2.mesCount === 1,
+    `第二次：HTTP ${d.retry2 && d.retry2.status} requested/sent/remaining=${d.retry2 && d.retry2.requested}/${d.retry2 && d.retry2.sent}/${d.retry2 && d.retry2.remaining}；mock-mes count=${d.retry2 && d.retry2.mesCount}`);
+
+  /* ---- 判据⑥：全程零未捕获异常 / 零 console.error ---- */
+  t.check('DoD⑥：整条链路**零未捕获异常、零 `console.error`**（"跑通了"与"带着错误跑通"分开记），且夹具正常退出',
+    Array.isArray(d.errors) && d.errors.length === 0 &&
+    Array.isArray(d.consoleErrors) && d.consoleErrors.length === 0 &&
+    w7Settled && w7Settled.code === 0 && d.done === true,
+    `未捕获异常=${JSON.stringify(d.errors || [])}；console.error=${JSON.stringify(d.consoleErrors || [])}；` +
+    `夹具退出码=${w7Settled && w7Settled.code}${d.error ? '；夹具内异常：' + String(d.error).slice(0, 300) : ''}`);
+
+  /* ---- 判据⑦ §1：端点矩阵（正面 / 逆向 / 无副作用 / 清单冻结） ---- */
+  const mx = d.matrix || {};
+  const pos = mx.positive || {};
+  const neg = mx.negative || {};
+  const side = mx.sideEffects || {};
+  const posNames = { health: 200, state: 200, uploadStatus: 200, uploadPending: 200, siteRoot: 200, staticJs: 200 };
+  t.check('§1 endpoint 矩阵①：现有端点的**正面**用例逐条 200（/health、/state、/upload/status、/upload/pending、站点首页、/src/main.js 静态件）',
+    Object.keys(posNames).every(k => pos[k] && pos[k].status === posNames[k]),
+    Object.keys(posNames).map(k => `${k}=${pos[k] && pos[k].status}`).join('，'));
+  const negExpect = {
+    unknown: [404, 'NOT_FOUND'], wrongMethod: [405, 'METHOD_NOT_ALLOWED'], wrongMethodPost: [405, 'METHOD_NOT_ALLOWED'],
+    badJsonFrame: [400, 'BAD_JSON'], badJsonDispatch: [400, 'BAD_JSON'], badJsonRetry: [400, 'BAD_JSON'],
+    missingFieldFrame: [400, null], limitZero: [400, 'BAD_VALUE']
+  };
+  const negBad = Object.keys(negExpect).filter(k => {
+    const want = negExpect[k];
+    const got = neg[k] || {};
+    return got.status !== want[0] || (want[1] !== null && got.code !== want[1]);
+  });
+  t.check('§1 endpoint 矩阵②：**逆向**用例逐条落在文档口径上（未知路径 404 NOT_FOUND／方法不符 405 METHOD_NOT_ALLOWED＋Allow／坏 JSON 400 BAD_JSON／缺必填字段 400／参数越界 400 BAD_VALUE）',
+    negBad.length === 0 && /GET/.test(String((neg.wrongMethod && neg.wrongMethod.allow) || '')),
+    (negBad.length ? `**不一致**：${negBad.map(k => k + ' 期望 ' + JSON.stringify(negExpect[k]) + ' 实得 ' + JSON.stringify(neg[k])).join('；')}；` : '') +
+    Object.keys(neg).map(k => `${k}=${neg[k] && neg[k].status}${neg[k] && neg[k].code ? '/' + neg[k].code : ''}`).join('，') +
+    `；405 的 Allow=${JSON.stringify(neg.wrongMethod && neg.wrongMethod.allow)}`);
+  t.check('§1 endpoint 矩阵③：被拒请求**无副作用** —— 8 条逆向用例跑完后 `measure_rt`/`upload_log` 行数与总线 `seq` **一个都没动**（不落库、不发事件）',
+    side.rowsAfter === side.rowsBefore && side.logsAfter === side.logsBefore &&
+    side.seqAfter === side.seqBefore,
+    `measure_rt ${side.rowsBefore}→${side.rowsAfter}；upload_log ${side.logsBefore}→${side.logsAfter}；总线 seq ${side.seqBefore}→${side.seqAfter}`);
+  t.check('§1 endpoint 矩阵④：路由清单与**冻结基线**逐条一致（本项目阶段一暴露的端点集合；增/删端点即红 —— 矩阵③的"无副作用"才有对象）',
+    JSON.stringify(mx.routes) === JSON.stringify([
+      'GET /auth/status', 'GET /events', 'GET /health', 'GET /ifa/status', 'GET /ifd/health', 'GET /ifd/status',
+      'GET /state', 'GET /upload/last', 'GET /upload/pending', 'GET /upload/status',
+      'POST /auth/change', 'POST /auth/init', 'POST /auth/login', 'POST /auth/logout',
+      'POST /ifa/device', 'POST /ifa/dispatch', 'POST /ifa/material', 'POST /ifa/process',
+      'POST /ifd/frame', 'POST /upload/retry'
+    ]),
+    `实际清单=${JSON.stringify(mx.routes)}`);
+
+  try { fs.rmSync(w7Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  try { fs.rmSync(w7File, { force: true }); } catch { /* 忽略 */ }
 }
 
 /* ---------------- 五、临时区与清理 ---------------- */

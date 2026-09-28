@@ -65,6 +65,37 @@ function initialClassOf(id) {
   return cls ? cls[1] : null;
 }
 
+/* W7-B'：`index.html` 的 `<script src>` 清单 —— 前端脚本的**唯一注册真源**（顺序＝浏览器执行顺序）。
+   为什么要把它做成被判据与夹具共用的真源：W7-B 新增 `src/services/selfCheckProbe.js` 时**忘了注册**，
+   而当时的夹具是**手写 rels**、把该文件直接塞进沙箱 ⇒ 门禁全绿、真页面却永远停在占位文案
+   （ADR-0004 D23 要防的正是"断言没落在真集成路径上"）。本仓无 ES 模块、无打包器，
+   故"每个前端源文件都必须被 `index.html` 显式枚举"是硬不变量。 */
+function indexScriptRels() {
+  const html = readText('index.html');
+  const rels = [];
+  const re = /<script\s+src="([^"]+)"\s*>/g;
+  let m;
+  while ((m = re.exec(html)) !== null) rels.push(m[1]);
+  return rels;
+}
+
+/* W7-B'：夹具装载**注册守卫** —— 请求装载的 rel 必须真的在 `index.html` 清单里。
+   否则夹具会替真页面"补课"（把没注册的文件装进沙箱），把致命缺口伪装成绿。
+   同一未注册文件只报一次（避免多条用例重复刷同一失败）。 */
+const _guardReported = new Set();
+function guardRegistered(rels, where) {
+  const registered = indexScriptRels();
+  const bad = rels.filter(r => registered.indexOf(r) < 0 && !_guardReported.has(r));
+  if (!bad.length) return;
+  bad.forEach(r => _guardReported.add(r));
+  check(
+    'W7-B\'-g（D12）夹具注册守卫（' + where + '）：请求装载的文件**全部**已在 `index.html` 注册',
+    false,
+    `未注册却被装载=${JSON.stringify(bad)} —— 这些文件在真页面里**根本不会执行**，` +
+    '是夹具在替它"补课"（本守卫存在的唯一目的就是不许再发生）'
+  );
+}
+
 /* ---------------- 轻量 CSS 解析（本项目无 @media/@keyframes，规则不嵌套） ---------------- */
 /** 解析 CSS 文本 → Map(选择器, { 属性: 值 })；后出现的同名选择器覆盖前者 */
 function parseCss(text) {
@@ -162,6 +193,7 @@ function loadUi(componentRels) {
   };
   vm.createContext(sandbox);
   const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  guardRegistered(componentRels, 'loadUi');
   run('src/config/board.config.js');
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
@@ -341,6 +373,7 @@ function loadAutoLockFixture() {
   sandbox.document = { querySelectorAll: () => [], getElementById: () => null, querySelector: () => null };
   vm.createContext(sandbox);
   const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  guardRegistered(['src/components/SettingPanel.js'], 'loadAutoLockFixture');
   run('src/config/board.config.js');
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
@@ -389,6 +422,22 @@ function loadAutoLockFixture() {
  * @returns {{w:object, nodes:Map<string,object>, node:Function, timers:Array, intervals:Array,
  *            warnings:Array<string>, fire:Function}}
  */
+/** `loadBootFixture` 装载的组件清单（守卫与装载共用同一份，避免两处漂移） */
+const BOOT_COMPONENTS = [
+  'src/components/HeaderBar.js',
+  'src/components/TabsBar.js',
+  'src/components/CurveChart.js',
+  'src/components/DeviceStatusPanel.js',
+  'src/components/TaskPanel.js',
+  'src/components/ShiftPanel.js',
+  'src/components/StatsPanel.js',
+  'src/components/AlarmPanel.js',
+  'src/components/MaintPanel.js',
+  'src/components/NoticePanel.js',
+  'src/components/SettingPanel.js',
+  'src/pages/Dashboard.js'
+];
+
 function loadBootFixture(search) {
   const nodes = new Map();
   const timers = [];
@@ -458,6 +507,7 @@ function loadBootFixture(search) {
 
   vm.createContext(sandbox);
   const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  guardRegistered(BOOT_COMPONENTS, 'loadBootFixture');
   run('src/config/board.config.js');
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
@@ -468,20 +518,7 @@ function loadBootFixture(search) {
   };
   run('src/services/mockData.js');
   run('src/services/api.js');
-  [
-    'src/components/HeaderBar.js',
-    'src/components/TabsBar.js',
-    'src/components/CurveChart.js',
-    'src/components/DeviceStatusPanel.js',
-    'src/components/TaskPanel.js',
-    'src/components/ShiftPanel.js',
-    'src/components/StatsPanel.js',
-    'src/components/AlarmPanel.js',
-    'src/components/MaintPanel.js',
-    'src/components/NoticePanel.js',
-    'src/components/SettingPanel.js',
-    'src/pages/Dashboard.js'
-  ].forEach(run);
+  BOOT_COMPONENTS.forEach(run);
   run('src/main.js');                     /* readyState='complete' ⇒ 启动流程在本次 run 内跑完 */
 
   return {
@@ -667,6 +704,7 @@ function loadFrameFixture(componentRels, search, opts) {
 
   vm.createContext(sandbox);
   const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  guardRegistered(componentRels, '夹具装载');
   run('src/config/board.config.js');
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
@@ -778,6 +816,9 @@ function loadFrameFixture(componentRels, search, opts) {
  *            fire:Function, click:Function, screen:Function, node:Function,
  *            input:Function, snap:Function}}
  */
+/** `loadTaskStdFixture` 装载的组件清单（守卫与装载共用同一份，避免两处漂移） */
+const TASKSTD_COMPONENTS = ['src/components/TaskPanel.js', 'src/components/SettingPanel.js', 'src/pages/Dashboard.js'];
+
 function loadTaskStdFixture(taskState) {
   const nodes = new Map();
   const timers = [];
@@ -904,6 +945,7 @@ function loadTaskStdFixture(taskState) {
   };
   vm.createContext(sandbox);
   const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+  guardRegistered(TASKSTD_COMPONENTS, 'loadTaskStdFixture');
   run('src/config/board.config.js');
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
@@ -4249,6 +4291,336 @@ async function main() {
       F.err ? `夹具执行异常：${F.err}` : F.none === null ? '（无观察值）' :
         `typeof BoardSource=${F.none.hasBoardSource}；boardBaseUrl=${JSON.stringify(F.none.base)}；` +
         `实际请求 URL=${JSON.stringify(F.none.urls)}`
+    );
+  }
+
+  /* ===== W7-B'（D12）「每个前端源文件都必须被 `index.html` 显式注册」=====
+     立案（真实缺口）：W7-B 加了 `src/services/selfCheckProbe.js`，却**没在 index.html 注册**
+     ⇒ 真页面里 `window.SelfCheckProbe === undefined`，设置页永远停在「尚未接入服务端自检结果：
+     正在探测…」占位；而当时夹具是**手写 rels** 直接把它塞进沙箱 ⇒ **门禁全绿**。
+     这就是 D23 说的"断言没落在真集成路径上"。本仓无 ES 模块、无打包器，故把这条件做成硬不变量：
+       · 判据真源＝`index.html` 的 `<script src>` 清单（`indexScriptRels()`）；
+       · 故意不注册的文件必须进 `UNREGISTERED_ALLOWED`（rel → 原因）并在失败信息里打印；
+       · 夹具侧由 `guardRegistered()` 兜住"手写清单替真页面补课"（见文件头）。 ---- */
+  {
+    const FRONT_SRC_DIRS = ['config', 'utils', 'services', 'components', 'pages'];
+    const frontSrcFiles = [];
+    for (const d of FRONT_SRC_DIRS) {
+      const abs = path.join(ROOT, 'src', d);
+      for (const f of fs.readdirSync(abs)) {
+        if (f.endsWith('.js')) frontSrcFiles.push('src/' + d + '/' + f);
+      }
+    }
+    frontSrcFiles.push('src/main.js');          /* 入口也在 `src/` 根下，同样必须注册 */
+    /** **故意不注册**的白名单：rel → 原因（当前为空；新增一条必须写明"为什么页面不需要它"） */
+    const UNREGISTERED_ALLOWED = {};
+    const scripts = indexScriptRels();
+    const missing = frontSrcFiles.filter(r => scripts.indexOf(r) < 0 && !UNREGISTERED_ALLOWED[r]);
+    const ghosts = scripts.filter(r => frontSrcFiles.indexOf(r) < 0);
+    const wlDump = Object.keys(UNREGISTERED_ALLOWED).length
+      ? Object.keys(UNREGISTERED_ALLOWED).map(r => r + '（' + UNREGISTERED_ALLOWED[r] + '）').join('；')
+      : '（空）';
+    check(
+      'W7-B\'-a（D12）`index.html` 的 `<script src>` 清单**覆盖全部前端源文件**' +
+      '（`src/{config,utils,services,components,pages}/**/*.js` ＋ `src/main.js`）、且清单无死链；白名单为空',
+      scripts.length > 0 && missing.length === 0 && ghosts.length === 0,
+      `index.html 注册 ${scripts.length} 个脚本；前端源文件 ${frontSrcFiles.length} 个；` +
+      `**未注册=${JSON.stringify(missing)}**（应 []）；死链=${JSON.stringify(ghosts)}（应 []）；白名单=${wlDump}`
+    );
+  }
+
+  /* ===== W7-B（D12，FR-8.5 / NFR-26）：设置页「系统状态自检」改**服务端真实探测** =====
+     立案：该栏此前是 `mockData.buildSelfCheck()` 的**演示数据**（服务端模式下更是空的 ⇒ 什么都看不到），
+     现场拿它判断不了真实链路。本包按既有 7 条行名（`copy-check` 的 FR-8.5 映射锁住）把服务端
+     **已有**只读端点映射进来：`GET /health`、`/ifd/status`、`/ifa/status`、`/upload/status`。
+     判据一律**行为**判据：桩 `fetch` 返回**指名的真值** ⇒ 逐行对账界面文本与桩响应；
+     并成对断言"演示模式仍走演示自检""探测失败不得显示成通过"。遵 ADR-0004 D23。 ---- */
+  {
+    /* W7-B'：**不再手写清单** —— 直接从 `index.html` 注册的脚本里派生。
+       排除项及原因（都是**夹具**的替换，不是"忘了注册"，两者不可混为一谈）：
+         · `board.config`/`fieldMap`/`format`/`mockData`/`api`/`Dashboard`/`main` 由夹具按序**自己预加载**，重复 run 会二次执行；
+         · `src/utils/dom.js` 会被夹具的**观测型 Dom 桩**顶替（真 Dom 直接操作真 document，
+           夹具的 `node()` 就观察不到节点了）。 */
+    const FIXTURE_PRELOADED = ['src/config/board.config.js', 'src/config/fieldMap.js',
+      'src/utils/format.js', 'src/utils/dom.js', 'src/services/mockData.js', 'src/services/api.js',
+      'src/pages/Dashboard.js', 'src/main.js'];
+    /** 组件/服务装载清单：**派生自 index.html**（含 `selfCheckProbe.js` —— 它没注册就不在这里） */
+    const W7B_COMPONENTS = indexScriptRels().filter(r => FIXTURE_PRELOADED.indexOf(r) < 0);
+    /** 自检七行的**行名**（逐字取自 `mockData.buildSelfCheck()`；`copy-check` FR-8.5 锁住） */
+    const W7B_NAMES = ['看板主机网络', 'PC 上位机连接', 'MES 接口连通性', 'MES 上报队列',
+      '本地数据库', '磁盘空间', 'NTP 时间同步'];
+    /** 从渲染出来的 HTML 里读某一行的 `{lv, state}`（行名 + 结论标签） */
+    const rowText = (fx, name) => {
+      const html = String(fx.node('setSelfCheckList').innerHTML || '');
+      const re = new RegExp('<span class="body">' + name + '</span><span class="meta ([a-z]+)">([^<]*)</span>');
+      const m = re.exec(html);
+      return m ? { lv: m[1], state: m[2] } : null;
+    };
+    const rowsDump = fx => W7B_NAMES.map(n => {
+      const t = rowText(fx, n);
+      return t ? n + '[' + t.lv + ']' + t.state : n + '=MISSING';
+    });
+    /** 装一套"指名真值"的桩响应（键＝去查询串的 path） */
+    const stubFetch = (fx, table, opts) => {
+      const o = opts || {};
+      fx.w.__fetch = (url) => {
+        const u = String(url);
+        let path = u;
+        const q = u.indexOf('?');
+        if (q >= 0) path = u.slice(0, q);
+        const i = path.indexOf('://');
+        if (i >= 0) path = path.slice(path.indexOf('/', i + 3));
+        const hit = table[path];
+        if (!hit) return Promise.reject(new Error('W7-B 桩：未登记的 URL ' + u));
+        if (hit.__hang) return new Promise(() => {});            // 永不 settle ⇒ 走超时/在途路径
+        /* `Date` 头**按当前时刻算**（NTP 行的判据是"本地时钟 − 服务端 Date"） */
+        const dateHdr = hit.__date === false ? null : new Date().toUTCString();
+        return Promise.resolve({
+          ok: hit.status >= 200 && hit.status < 300,
+          status: hit.status,
+          headers: { get: k => (String(k).toLowerCase() === 'date' ? dateHdr : null) },
+          text: () => Promise.resolve(typeof hit.body === 'string' ? hit.body : JSON.stringify(hit.body))
+        });
+      };
+      if (o.baseUrl) fx.w.BoardConfig.board.baseUrl = o.baseUrl;
+    };
+    const W = { err: null, demoBefore: null, server: null, fail: null, demoAfter: null, timers: null,
+      integration: null };
+    /** 指名真值桩表（`(a)` 与 `(e)` 共用）。声明在 **try 之外**：`(e)` 特意放在 try 之后，
+        以便"忘了注册"这类缺口发生时它仍能独立产出观察值。 */
+    const HEALTHY_STUBS = {
+      '/health': { status: 200, body: { ok: true, uptimeSec: 3661, dbWritable: true, version: 'V1.38',
+        listen: '127.0.0.1:8787', pid: 4242, env: 'test', dataRoot: 'D:/data', dbFile: 'D:/data/board.db',
+        streams: 2, lastError: null } },
+      '/ifd/status': { status: 200, body: { ok: true, mount: 'ifD',
+        counts: { received: 10, accepted: 9, stored: 9, rejected: 1 },
+        link: { state: 'offline', online: false, staleMs: 5000, ageMs: 6000, lastAcceptedAt: null } } },
+      '/ifa/status': { status: 200, body: { ok: true, mount: 'ifA', mounted: true,
+        auth: { enabled: false, source: 'config', degraded: true, warning: '本机接口未启用鉴权' },
+        counts: { byKind: {} } } },
+      '/upload/status': { status: 200, body: { ok: true, configured: false, baseUrl: '', responseStyle: 'status',
+        pendingCount: 3, warnThreshold: 1, capacity: 5000, alert: { warn: true }, autoRetry: false } }
+    };
+    try {
+      /* (c-1) 演示模式基线 ＋ **直接对 `ensure()` 断言"演示模式下不探测"**。
+         为什么不能只比"渲染前后相同"：那样若有人把演示短路删掉、又在别处补一次 `probe()`，
+         断言仍会绿（本用例第一版 D22 变异 2 就是这样**假绿**的）。故这里同时钉两件事：
+           ① `ensure()` 在演示模式下返回 **false**（没有发起探测）；
+           ② 显式调一次 `probe()` 后，`state.selfCheck` **仍等于**演示那七行（`mockData` 的真源
+              没被顶替）—— 渲染路径不再参与判断，判据落在**数据层**。 */
+      const d0 = loadFrameFixture(W7B_COMPONENTS);
+      /* W7-B'：**先点名**"页面根本没加载这个模块"这种缺口，否则后面只会报一句
+         `Cannot read properties of undefined (reading 'reset')`，读的人看不出根因。 */
+      if (!d0.w.SelfCheckProbe) {
+        throw new Error('页面未加载 `window.SelfCheckProbe` —— `src/services/selfCheckProbe.js` ' +
+          '很可能没在 index.html 注册（见 W7-B\'-a 的未注册清单）');
+      }
+      d0.w.BoardConfig.dataSource = 'mock';
+      d0.w.Pages.Dashboard.renderAll(d0.w.MockData.tick(new Date()));
+      W.demoBefore = rowsDump(d0);
+      const demoRowsFromData = (d0.w.MockData.state.selfCheck || []).map(c => c.name + '[' + c.lv + ']' + c.state);
+      const demoBeforeStr = JSON.stringify(demoRowsFromData);
+      /* 演示模式的 7 行**全部**是 `lv:'ok'`（`buildSelfCheck()` 的演示口径）。这是"演示真源"的指纹：
+         若探测结果被写进演示态，指纹必然被打破（探测行只会是 err/warn/ok 且文本完全不同）。 */
+      const demoAllOk = (d0.w.MockData.state.selfCheck || []).length === 7 &&
+        (d0.w.MockData.state.selfCheck || []).every(c => c.lv === 'ok');
+      d0.w.SelfCheckProbe.reset();
+      const demoEnsure = d0.w.SelfCheckProbe.ensure(d0.w.MockData.state, new Date());
+      const demoProbeRows = await d0.w.SelfCheckProbe.probe(new Date());     // 显式跑一轮探测
+      await new Promise(r => setTimeout(r, 30));                            // 交给可能的异步赋值落定
+      const demoAfterStr = JSON.stringify((d0.w.MockData.state.selfCheck || []).map(c => c.name + '[' + c.lv + ']' + c.state));
+      const demoProbeAllOk = demoProbeRows.length === 7 && demoProbeRows.every(r => r.lv === 'ok');
+      /* 探测行的"非演示"指纹：**不是全 ok**，且前 6 行（四个端点相关）全 `err`
+         （`磁盘空间` 是"尚未接入"的 `warn`，**不算** err —— 这正是本用例第一版把断言写错的地方：
+         我曾要求"七行全 err"，那是错的口径）。 */
+      const demoProbeReal = demoProbeRows.length === 7 && !demoProbeAllOk &&
+        demoProbeRows.slice(0, 5).every(r => r.lv === 'err') && demoProbeRows[6].lv === 'err' &&
+        demoProbeRows[5].lv === 'warn';
+      W.demoGuard = {
+        ensureReturned: demoEnsure,
+        demoAllOk: demoAllOk,
+        /* 演示真源没被顶替 ⇔ 渲染前后逐字相同 **且** 那七行仍是"全 ok"的演示指纹 */
+        rowsEqual: demoBeforeStr === demoAfterStr,
+        probeRowsAreReal: demoProbeReal
+      };
+
+      /* (a) 服务端模式 + 指名真值 ⇒ 逐行对账 */
+      const a = loadFrameFixture(W7B_COMPONENTS, '?source=server');
+      a.w.BoardConfig.dataSource = 'server';
+      const stA = a.w.MockData.state;
+      stA.serverMode = true;
+      /* 指名真值表：`(a)` 与 `(e) 真集成路径` 共用（同一份桩，避免两处漂移）。
+         声明在 **try 之外**：`(e)` 特意放在 try 之后以便独立于前面的成败。 */
+      stubFetch(a, HEALTHY_STUBS, { baseUrl: 'http://127.0.0.1:8787' });
+      const probeOk = await a.w.SelfCheckProbe.probe(new Date());
+      stA.selfCheck = probeOk;
+      a.w.Pages.Dashboard.renderAll(stA);
+      W.server = {
+        rows: W7B_NAMES.map(n => Object.assign({ name: n }, rowText(a, n) || { lv: 'MISSING', state: '' })),
+        dump: rowsDump(a),
+        errors: a.errors('error')
+      };
+
+      /* (b) 坏证据 ⇒ 对应行显式 err、其余行不受影响、零 console.error。
+         这里刻意把"坏"分三类，验证**每一行只按自己的数据源**判定、不互相污染：
+           · `/upload/status` → **503**：`MES 接口连通性` + `MES 上报队列` 两行 err；
+           · `/health` → 200 但 **`dbWritable:false`**：只有 `本地数据库` err（`看板主机网络` 仍 ok、`NTP` 仍 ok）；
+           · `/ifd/status` → 200 但 **`link.online:false`**：`PC 上位机连接` err。 */
+      const b = loadFrameFixture(W7B_COMPONENTS, '?source=server');
+      b.w.BoardConfig.dataSource = 'server';
+      const stB = b.w.MockData.state;
+      stB.serverMode = true;
+      stubFetch(b, {
+        '/health': { status: 200, body: { ok: true, uptimeSec: 120, dbWritable: false, version: 'V1.38',
+          listen: '127.0.0.1:8787', pid: 1, env: 'test', dataRoot: 'D:/data', dbFile: 'D:/data/board.db',
+          streams: 0, lastError: null } },
+        '/ifd/status': { status: 200, body: { ok: true, mount: 'ifD', link: { state: 'offline', online: false, staleMs: 5000, ageMs: null } } },
+        '/ifa/status': { status: 200, body: { ok: true, mount: 'ifA', mounted: true, auth: { enabled: false, degraded: false } } },
+        '/upload/status': { status: 503, body: { ok: false, err: { code: 'NO_SERVICE', message: '上报服务未装配' } } }
+      }, { baseUrl: 'http://127.0.0.1:8787' });
+      const probeFail = await b.w.SelfCheckProbe.probe(new Date());
+      stB.selfCheck = probeFail;
+      b.w.Pages.Dashboard.renderAll(stB);
+      W.fail = {
+        rows: W7B_NAMES.map(n => Object.assign({ name: n }, rowText(b, n) || { lv: 'MISSING', state: '' })),
+        dump: rowsDump(b),
+        errorCount: b.errorCount()
+      };
+
+      /* (c-2) 探测过后再回演示模式 ⇒ 自检仍逐项等于演示基线 */
+      d0.w.BoardConfig.dataSource = 'mock';
+      d0.w.Pages.Dashboard.renderAll(d0.w.MockData.tick(new Date()));
+      W.demoAfter = rowsDump(d0);
+
+      /* (d) 不新起定时器 + 窗口内重复 ensure() 节流去重 */
+      const t0 = a.intervals.filter(x => !x.cancelled).length;
+      let fetchCalls = 0;
+      const origFetch = a.w.__fetch;
+      a.w.__fetch = (...args) => { fetchCalls++; return origFetch(...args); };
+      a.w.SelfCheckProbe.reset();                                  // 清在途/节流，让"第一次 ensure"能发起
+      const f1 = a.w.SelfCheckProbe.ensure(stA, new Date());
+      const f2 = a.w.SelfCheckProbe.ensure(stA, new Date());       // 窗口内第二次
+      const f3 = a.w.SelfCheckProbe.ensure(stA, new Date());       // 第三次
+      await new Promise(r => setTimeout(r, 30));
+      const t1 = a.intervals.filter(x => !x.cancelled).length;
+      W.timers = { before: t0, after: t1, f1, f2, f3, callsAfterFirst: fetchCalls };
+
+    } catch (e) { W.err = e.message; }
+
+    /* (e) W7-B'：**真集成路径** —— 装载清单逐字取自 `index.html`（见 `W7B_COMPONENTS` 的派生）。
+       这里刻意先渲染一次**空自检**（＝服务端模式下 `stateAdapter.clearUnservedModules()` 的实况：
+       `state.selfCheck = []`），看它会不会停在「正在探测…」占位 —— 那正是"忘了注册"时真页面的样子。
+       为什么放在**外层 try 之外**并自带 try/catch：它是"忘了注册"这一缺口的**直证**，
+       而缺口本身会让 (c-1) 的 `SelfCheckProbe.reset()` 先抛错 —— 若共用同一个 try，
+       本项就永远拿不到观察值（实测：只报"（无观察值）"）。故它必须**独立于前面的成败**照旧产出实测。 */
+    W.integration = { err: null };
+    try {
+      const ie = loadFrameFixture(W7B_COMPONENTS, '?source=server');
+      ie.w.BoardConfig.dataSource = 'server';
+      const stI = ie.w.MockData.state;
+      stI.serverMode = true;
+      stI.selfCheck = [];
+      ie.w.Pages.Dashboard.renderAll(stI);
+      const intBefore = String(ie.node('setSelfCheckList').innerHTML || '');
+      const probeType = typeof ie.w.SelfCheckProbe;
+      /* `SelfCheckProbe` 是 IIFE 返回的**对象**（不是函数）⇒ 判据必须落在"`probe()` 可调用"上，
+         否则断言会写错（第一版就把它写成 `typeof === 'function'`，于是探测根本没跑、观察值失真）。 */
+      const probeCallable = !!(ie.w.SelfCheckProbe && typeof ie.w.SelfCheckProbe.probe === 'function');
+      let intAfter = intBefore;
+      if (probeCallable) {
+        stubFetch(ie, HEALTHY_STUBS, { baseUrl: 'http://127.0.0.1:8787' });
+        stI.selfCheck = await ie.w.SelfCheckProbe.probe(new Date());
+        ie.w.Pages.Dashboard.renderAll(stI);
+        intAfter = String(ie.node('setSelfCheckList').innerHTML || '');
+      }
+      W.integration = {
+        err: null,
+        listSource: 'index.html',
+        loadedCount: W7B_COMPONENTS.length,
+        probeType,
+        probeCallable,
+        placeholderBefore: /正在探测/.test(intBefore),
+        placeholderAfter: /正在探测/.test(intAfter),
+        before: intBefore,
+        after: intAfter,
+        rowOk: /看板主机网络/.test(intAfter) && /127\.0\.0\.1:8787/.test(intAfter) && !/正在探测/.test(intAfter)
+      };
+    } catch (e2) {
+      W.integration = Object.assign(W.integration, { err: (e2 && e2.message) || String(e2) });
+    }
+
+    check(
+      'W7-B-a（D12）服务端模式 + 指名真值（`/health` 200 / `/ifd/status` 离线 / `/upload/status` 未配地址）⇒ ' +
+      '自检七行**逐项与桩响应对账**（行名不变、结论含真实值/原因、三态分布正确）',
+      W.err === null && W.server !== null &&
+      W.server.rows.every(r => r.lv && r.lv !== 'MISSING') &&
+      W.server.rows[0].lv === 'warn' && /127\.0\.0\.1:8787/.test(W.server.rows[0].state) && /01:01:01/.test(W.server.rows[0].state) &&
+      W.server.rows[1].lv === 'err' && /离线断连/.test(W.server.rows[1].state) && /6 s/.test(W.server.rows[1].state) && /5000 ms/.test(W.server.rows[1].state) &&
+      W.server.rows[2].lv === 'warn' && /未配置地址/.test(W.server.rows[2].state) && /Q-23/.test(W.server.rows[2].state) &&
+      W.server.rows[3].lv === 'warn' && /待补传 3 条/.test(W.server.rows[3].state) && /5000/.test(W.server.rows[3].state) &&
+      W.server.rows[4].lv === 'ok' && /board\.db/.test(W.server.rows[4].state) &&
+      W.server.rows[5].lv === 'warn' && /尚未接入服务端/.test(W.server.rows[5].state) &&
+      /* 「磁盘空间」/「NTP」两行是**尽力的真探测**（服务端 /health 无这两个字段），必须在**可读文本**里
+         写明口径来源，免得现场把"浏览器配额"读成"磁盘剩余空间"、把"响应头 Date 偏差"读成"服务端上报的偏差"。 */
+      /口径来源：浏览器配额口径，非磁盘剩余空间/.test(W.server.rows[5].state) &&
+      W.server.rows[6].lv === 'ok' && /时钟同步/.test(W.server.rows[6].state) &&
+      /口径来源：响应头 Date 与本地钟偏差/.test(W.server.rows[6].state) &&
+      W.server.errors.length === 0,
+      W.err ? `夹具执行异常：${W.err}` : W.server === null ? '（无观察值）' :
+        `逐行实测：${W.server.dump.join(' ｜ ')}；console.error=${W.server.errors.length}`
+    );
+    check(
+      'W7-B-b（D12，成对）坏证据各归各行（`/upload/status` **503** ⇒ MES 两行 err；`/health` 200 但 **dbWritable:false** ⇒ 只有`本地数据库` err；' +
+      '`/ifd/status` link 离线 ⇒ `PC 上位机连接` err），**在线的行不受影响**（`看板主机网络`/`NTP 时间同步` 仍 ok）；整屏**零 console.error**',
+      W.err === null && W.fail !== null &&
+      W.fail.rows[0].lv === 'ok' &&
+      W.fail.rows[1].lv === 'err' && /离线断连/.test(W.fail.rows[1].state) &&
+      W.fail.rows[2].lv === 'err' && /探测失败/.test(W.fail.rows[2].state) && /503/.test(W.fail.rows[2].state) &&
+      W.fail.rows[3].lv === 'err' && /探测失败/.test(W.fail.rows[3].state) && /503/.test(W.fail.rows[3].state) &&
+      W.fail.rows[4].lv === 'err' && /dbWritable/.test(W.fail.rows[4].state) &&
+      W.fail.rows[6].lv === 'ok' && /时钟同步/.test(W.fail.rows[6].state) &&
+      /口径来源：响应头 Date 与本地钟偏差/.test(W.fail.rows[6].state) &&
+      W.fail.errorCount === 0,
+      W.err ? `夹具执行异常：${W.err}` : W.fail === null ? '（无观察值）' :
+        `逐行实测：${W.fail.dump.join(' ｜ ')}；console.error=${W.fail.errorCount}`
+    );
+    check(
+      'W7-B-c（D12，成对）**演示模式**：`ensure()` 返回 `false`（**不发起探测**），且显式 `probe()` 只返回**探测行**（夹具 fetch 必失败 ⇒ 七行全 `err`，与演示的"七行全 ok"指纹不同），' +
+      '演示态 `state.selfCheck` 仍是 `mockData.buildSelfCheck()` 那七行（渲染前后逐字相同 ⇒ 演示真源没被顶替）',
+      W.err === null && W.demoBefore !== null && W.demoAfter !== null && W.demoGuard !== null &&
+      W.demoBefore.length === 7 && W.demoBefore.every(x => !/MISSING/.test(x)) &&
+      W.demoGuard.ensureReturned === false && W.demoGuard.demoAllOk === true &&
+      W.demoGuard.probeRowsAreReal === true && W.demoGuard.rowsEqual === true &&
+      JSON.stringify(W.demoBefore) === JSON.stringify(W.demoAfter),
+      W.err ? `夹具执行异常：${W.err}` :
+        `ensure() 返回=${JSON.stringify(W.demoGuard && W.demoGuard.ensureReturned)}（应 false）；` +
+        `演示态七行全 ok=${JSON.stringify(W.demoGuard && W.demoGuard.demoAllOk)}（应 true）；` +
+        `探测行确为"非演示"（全 err）=${JSON.stringify(W.demoGuard && W.demoGuard.probeRowsAreReal)}（应 true）；` +
+        `探测后演示态未被顶替=${JSON.stringify(W.demoGuard && W.demoGuard.rowsEqual)}（应 true）；` +
+        `渲染前=${JSON.stringify(W.demoBefore)}；渲染后=${JSON.stringify(W.demoAfter)}`
+    );
+    check(
+      'W7-B-d（D12）探测**不新起定时器**、且窗口内重复 `ensure()` 被节流去重（存活 interval 数不变、第二/第三次不再发起）',
+      W.err === null && W.timers !== null &&
+      W.timers.before === W.timers.after &&
+      W.timers.f1 === true && W.timers.f2 === false && W.timers.f3 === false,
+      W.err ? `夹具执行异常：${W.err}` :
+        `存活 interval：探测前 ${W.timers.before} → 探测后 ${W.timers.after}；` +
+        `ensure() 三次返回=${JSON.stringify([W.timers.f1, W.timers.f2, W.timers.f3])}（应 [true,false,false]）`
+    );
+    check(
+      'W7-B\'-b（D12）**真集成路径**：装载清单逐字取自 `index.html` ⇒ 服务端模式下七行自检是**真探测结果**，' +
+      '不再停留「尚未接入服务端自检结果：正在探测…」占位（`window.SelfCheckProbe` 必须真的被页面加载）',
+      W.integration != null && W.integration.err === null &&
+      W.integration.probeCallable === true && W.integration.rowOk === true,
+      W.integration == null ? '（无观察值）' :
+        (W.integration.err ? `真集成路径探测抛出：${W.integration.err}；` : '') +
+        `装载清单取自=index.html（${W.integration.loadedCount} 个）；` +
+        `typeof window.SelfCheckProbe=${W.integration.probeType}；` +
+        `probe() 可调用=${JSON.stringify(W.integration.probeCallable)}（应 true）；` +
+        `空自检首帧是否停留占位=${JSON.stringify(W.integration.placeholderBefore)}；` +
+        `探测渲染后是否仍停留占位=${JSON.stringify(W.integration.placeholderAfter)}（应 false）；` +
+        `#setSelfCheckList 实测 HTML=${JSON.stringify(String(W.integration.after).slice(0, 320))}`
     );
   }
 

@@ -207,9 +207,13 @@ function stageObservationCycle(relPath) {
 
 /* ---------------- 子进程与 HTTP 小工具 ---------------- */
 
-/** 启动一个工具进程（stdio 忽略，避免沙箱下的管道限制） */
-function startTool(script, args) {
-  const child = spawn(process.execPath, [script].concat(args), { stdio: 'ignore' });
+/** 启动一个工具进程（stdio 忽略，避免沙箱下的管道限制）
+ *  @param {object} [extraEnv] 追加/覆盖的环境变量（异常注入靠环境变量开启，见 T1c） */
+function startTool(script, args, extraEnv) {
+  const child = spawn(process.execPath, [script].concat(args), {
+    stdio: 'ignore',
+    env: extraEnv ? Object.assign({}, process.env, extraEnv) : process.env
+  });
   children.push(child);
   return child;
 }
@@ -275,6 +279,8 @@ async function main() {
   const P_UPPER_TWICE = 18906;
   const P_STAGE_UPPER = 18907;
   const P_STAGE_PUSH = 18908;
+  const P_INJ_UPPER = 18909;
+  const P_INJ_PUSH = 18910;
 
   /* 期望值先取好：FR-2.5 的「阶段由 testStatus 导出」规则（需求原文实读），T1 与 T1b 共用 */
   const FR25 = stageTableFromRequirement();
@@ -486,6 +492,121 @@ async function main() {
         `前端源码表 ${JSON.stringify(frontSrc.table)}；工具源码表 ${JSON.stringify(toolSrc.table)}`);
     }
     stageRecv.server.close();
+  }
+
+  /* ===== T1c 异常注入开关（E22 判据①：设备异常 `3` 的**可注入**分支） =====
+     判据为什么长这样：附录 2 的码 `3`（设备异常 ⇒ 看板显示模式「故障锁定」）是**正交状态**，
+     真实上位机偶发才出现 —— "等它出现"不是判据，"能定点注入并且注入的语义逐条成立"才是。
+     两条**可否证**的判据（两处模拟上位机都要满足）：
+       ① 默认关闭 ⇒ 整节拍内 `testStatus` **永不等于 3**（谁把注入默认打开，这条立刻红）；
+       ② 注入窗口内 ⇒ `testStatus === 3` 且 `stage` **冻结**（本应跨过的阶段不跨），
+          窗口结束后 `stage` 从冻结处**继续推进**（恢复）—— 冻结/恢复都是逐帧可观测的。
+     实现口径：`src/services/mockUpperSource.js`（前端）与 `tools/mock-upper/mock-upper.js`（工具）
+     是同一口径的模拟器，两处的判定表达式**逐字相同**（下面直接对着源码核这两行）。 */
+  section('T1c 异常注入开关（E22 判据①：码 3 可注入、默认关闭、阶段冻结与恢复）');
+  {
+    const INJ_AFTER = 10;
+    const INJ_DUR = 5;
+    /* ---- ① 前端模拟器：vm 里逐步推进（不依赖真实时钟，逐帧都是实跑值） ---- */
+    const Wi = loadMockUpperSource();
+    const cycleI = Number(Wi.BoardConfig.production.cycleSec);
+    function frameSeq(abnOpts) {
+      Wi.MockUpperSource.setAbnormal(abnOpts || { enabled: false });
+      const t0 = new Date('2026-09-18T09:00:00');
+      let inner = null;
+      const out = [];
+      for (let k = 0; k <= cycleI + INJ_DUR + 2; k++) {
+        const f = Wi.MockUpperSource.next(inner, new Date(t0.getTime() + k * 1000));
+        inner = f.inner;
+        out.push({ k, stage: f.payload.stage, testStatus: f.payload.testStatus });
+      }
+      return out;
+    }
+    /* ⚠ 先读**模块默认态**（必须在任何 `setAbnormal` 之前读，否则读到的是上一次设置值）：
+       `setAbnormal({enabled:false})` 只是"显式关掉"，真正要防的回潮是"注入被谁默认打开"。
+       （定点变异实测：只判"显式关掉"时，把 `ABNORMAL` 的默认 enabled 改成 true 这条**照样绿**，见 MF-2。） */
+    const defaultInj = Wi.MockUpperSource.abnormalState ? Wi.MockUpperSource.abnormalState() : { enabled: 'MISSING' };
+    const seqOff = frameSeq(null);
+    const seqOn = frameSeq({ enabled: true, afterSec: INJ_AFTER, durSec: INJ_DUR });
+    const offCodes = new Set(seqOff.map(f => f.testStatus));
+    check('E22① 默认关闭：模块**默认态**即关闭（`abnormalState().enabled===false`），且整节拍内 testStatus 只出现 0/1/2、**码 3 一次都不出现**（谁把注入默认打开，这条立刻红）',
+      defaultInj.enabled === false && defaultInj.afterSec === 0 &&
+      !offCodes.has(3) && offCodes.size === 3,
+      `默认态=${JSON.stringify(defaultInj)}；默认关闭实跑 ${seqOff.length} 帧，码集合 = {${[...offCodes].sort().join('/')}}（期望 {0/1/2}，不含 3）`);
+    const win = seqOn.filter(f => f.k >= INJ_AFTER && f.k < INJ_AFTER + INJ_DUR);
+    const stageFrozen = [...new Set(win.map(f => f.stage))];
+    check('E22① 注入窗口内：码恒为 3（设备异常）且 stage **恒定**（阶段冻结，不随节拍推进）',
+      win.length === INJ_DUR && win.every(f => f.testStatus === 3) && stageFrozen.length === 1,
+      `窗口 [${INJ_AFTER},${INJ_AFTER + INJ_DUR}) 实跑 ${win.length} 帧：码集合 {${[...new Set(win.map(f => f.testStatus))].join('/')}}、` +
+      `阶段集合 {${stageFrozen.join('/')}}（期望 3 与**单一**阶段）`);
+    let shiftBad = 0, firstBad = '';
+    for (let k = INJ_AFTER + INJ_DUR; k < seqOn.length; k++) {
+      const a = seqOn[k], b = seqOff[k - INJ_DUR];
+      if (a.stage !== b.stage || a.testStatus !== b.testStatus) {
+        shiftBad++;
+        if (!firstBad) firstBad = `k=${k} 注入后 ${a.stage}/${a.testStatus} ≠ 未注入 k=${k - INJ_DUR} 的 ${b.stage}/${b.testStatus}`;
+      }
+    }
+    check('E22① 窗口结束后**阶段继续推进**（恢复）：逐帧与"未注入的同刻整体后移 ' + INJ_DUR + 's"严格相等',
+      shiftBad === 0,
+      shiftBad ? `有 ${shiftBad} 帧不一致，首个：${firstBad}` :
+        `窗口后 ${seqOn.length - INJ_AFTER - INJ_DUR} 帧与未注入序列（整体后移 ${INJ_DUR}s）逐帧相等；` +
+        `窗口前最后一帧 stage=${seqOn[INJ_AFTER - 1].stage}、窗口首帧 stage=${win[0].stage}`);
+    check('E22① 注入**只改状态码、不改阶段语义**：窗口内出现 3 的帧数恰为窗口帧数，窗口外一帧都没有',
+      seqOn.filter(f => f.testStatus === 3).length === INJ_DUR &&
+      seqOn.filter(f => f.testStatus === 3).every(f => f.k >= INJ_AFTER && f.k < INJ_AFTER + INJ_DUR),
+      `全序列出现 3 的帧 = ${seqOn.filter(f => f.testStatus === 3).length} 帧，全部落在 [${INJ_AFTER},${INJ_AFTER + INJ_DUR}) 内`);
+
+    /* ---- 码 3 的语义链（看板侧的真源）：附录 2 的码 → 显示模式「故障锁定」+ 告警色 ---- */
+    const fieldMapSrc = readText('src/config/fieldMap.js');
+    check('E22① 码 3 在看板侧的语义在真源里钉住：fieldMap 的 `3: \'故障锁定\'` 与 modeToTestStatus 的 `\'故障锁定\': 3`',
+      /3:\s*'故障锁定'/.test(fieldMapSrc) && /'故障锁定':\s*3/.test(fieldMapSrc),
+      'src/config/fieldMap.js 同时给出「码 → 显示模式」与「显示模式 → 码」两个方向');
+    const panelSrc = readText('src/components/DeviceStatusPanel.js');
+    check('E22①「故障锁定」是**独立状态**且用告警色渲染（"单独告警"不是靠阶段文案冒充的）',
+      /name:\s*'故障锁定'\s*,\s*color:\s*'var\(--err\)'/.test(panelSrc),
+      'src/components/DeviceStatusPanel.js 的 5 态表里「故障锁定」独立成项、色值 var(--err)');
+    const frontSrc2 = readText('src/services/mockUpperSource.js');
+    const toolSrc2 = readText('tools/mock-upper/mock-upper.js');
+    const sameLines = ['const elapsed = rawElapsed - abn.frozen;', 'if (abn.active) testStatus = 3;'];
+    const missing = sameLines.filter(l => !frontSrc2.includes(l) || !toolSrc2.includes(l));
+    check('E22① 两处模拟上位机的注入判定**逐字同口径**（冻结扣秒 + 窗口内改码两行在两处完全相同）',
+      missing.length === 0,
+      missing.length ? `**未逐字一致**：${missing.join('；')}` : `两处都含：${sameLines.join(' ｜ ')}`);
+
+    /* ---- ② 工具模拟器：真进程 + 环境变量注入 + 真 --push（进程级可复跑） ---- */
+    const injRecv = await startReceiver(P_INJ_PUSH);
+    startTool(UPPER, ['--port', String(P_INJ_UPPER), '--push', `http://127.0.0.1:${P_INJ_PUSH}/realtime`,
+      '--interval', '250', '--cycle', '12'], { MOCK_UPPER_ABNORMAL: '7', MOCK_UPPER_ABNORMAL_DUR: '4' });
+    /* 窗口（真实经过秒 7～11）故意**跨过**"准备→运行"的分界（第 8 秒）：冻结成立时窗口内应全是「准备」 */
+    const injDeadline = Date.now() + 14000;
+    while (Date.now() < injDeadline && injRecv.received.length < 48) await sleep(250);
+    const injFrames = injRecv.received.map(r => ({ stage: r.payload.stage, testStatus: r.payload.testStatus }));
+    injRecv.server.close();
+    if (!injFrames.length) {
+      skip('E22① 工具模拟上位机：环境变量注入 → 真进程逐帧可观测',
+        `端口 ${P_INJ_PUSH} 在 14 s 内没收到任何推送帧（环境不满足，不当作通过）`);
+    } else {
+      const winFrames = injFrames.filter(f => f.testStatus === 3);
+      const winStages = [...new Set(winFrames.map(f => f.stage))];
+      check('E22① 工具模拟上位机（真进程）：注入窗口内逐帧 testStatus=3 且 stage 冻结在「准备」——' +
+        '窗口跨过第 8 秒（未注入时该秒已是「运行」），冻结成立才会全是「准备」',
+        winFrames.length >= 4 && winStages.length === 1 && winStages[0] === '准备',
+        `收到 ${injFrames.length} 帧，其中码 3 共 ${winFrames.length} 帧，阶段集合 = {${winStages.join('/')}}` +
+        `（期望 {准备}；若为 {准备/运行} 说明阶段在异常期间仍在推进）`);
+      check('E22① 工具模拟上位机（真进程）：码 3 只出现在注入窗口内，窗口无关帧不受影响',
+        winFrames.length < injFrames.length &&
+        injFrames.slice(0, Math.max(0, injFrames.indexOf(winFrames[0]))).every(f => f.testStatus !== 3) &&
+        injFrames.slice(injFrames.lastIndexOf(winFrames[winFrames.length - 1]) + 1).every(f => f.testStatus !== 3),
+        `码 3 首次出现在第 ${injFrames.indexOf(winFrames[0]) + 1} 帧、末次在第 ${injFrames.lastIndexOf(winFrames[winFrames.length - 1]) + 1} 帧（共 ${injFrames.length} 帧）`);
+      const afterWin = injFrames.slice(injFrames.lastIndexOf(winFrames[winFrames.length - 1]) + 1);
+      check('E22① 工具模拟上位机（真进程）：窗口结束后**恢复推进**（后续帧不再是 3，且出现「运行」等正常阶段）',
+        afterWin.length > 0 && afterWin.every(f => f.testStatus !== 3) &&
+        new Set(afterWin.map(f => f.stage)).size >= 1 &&
+        afterWin.every(f => ['准备', '运行', '判定', '完成'].includes(f.stage)),
+        afterWin.length ? `窗口后 ${afterWin.length} 帧阶段集合 = {${[...new Set(afterWin.map(f => f.stage))].join('/')}}、码集合 = {${[...new Set(afterWin.map(f => f.testStatus))].join('/')}}`
+          : '窗口后没有帧（观察窗太短）');
+    }
   }
 
   /* ===== T6 参数与 README 一致性 ===== */
