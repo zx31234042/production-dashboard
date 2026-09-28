@@ -776,7 +776,7 @@ async function main() {
     `depth占位=${JSON.stringify(standardSvc.mesLimits(incompleteStds[0], { kind: 'depth', pass: true }))}`);
 
   /* "整条占位"与"缺哪个补哪个"的区别：深度自身完整时，只要**同一条标准**的速度缺项，深度也必须占位。
-     可证伪点：若 isComplete 被放宽成"该指标齐即可"，这里 depth 会返回 13.10/12.50 而红。 */
+     可证伪点：若 isComplete 被放宽成"该指标齐即可"，这里 depth 会返回 5.20/4.80（不再占位）而红。 */
   const stdOnlyOneMetric = incompleteStds[0];
   const absDepth = standardSvc.absoluteLimits(stdOnlyOneMetric).depth;
   t.check('IF-B.5：占位是**整条**而不是"缺哪个补哪个" —— 深度自身完整（绝对值可算出 5.20/4.80）但速度缺项 ⇒ 该条 depth 也占位',
