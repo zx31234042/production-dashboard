@@ -90,7 +90,7 @@ $repo = $repoCandidates | Where-Object { $_ -and (Test-Path (Join-Path $_ 'tests
 if (-not $repo) {
   W '未找到仓库（期望含 tests\preflight.js）。请把整个仓库目录拷到本机后重跑本脚本，或手工执行：'
   W '    node tests\preflight.js'
-  W '    node tests\run-all.js            （完整；含浏览器与 20 分钟长跑）'
+  W '    node tests\run-all.js            （完整；含浏览器与 5 分钟长跑）'
   W '    node tests\run-all.js --fast      （快跑；跳过耗时/浏览器类）'
 } else {
   W ('仓库位置：' + $repo)
@@ -104,7 +104,7 @@ if (-not $repo) {
     W 'Node ≥ 24 已就位 ⇒ 开始跑 preflight 与门禁（输出同时打印在本报告里）'
     Try-Run 'preflight' { Push-Location $repo; try { & node 'tests\preflight.js' 2>&1 | Out-String } finally { Pop-Location } }
     Try-Run 'run-all --fast' { Push-Location $repo; try { & node 'tests\run-all.js' '--fast' 2>&1 | Out-String } finally { Pop-Location } }
-    W '（完整门禁请另跑：node tests\run-all.js —— 含浏览器类与 20 分钟长跑）'
+    W '（完整门禁请另跑：node tests\run-all.js —— 含浏览器类与 5 分钟长跑）'
   }
 }
 
