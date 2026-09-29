@@ -3193,6 +3193,32 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       /Edge 主版本 ≥ 112/.test(preflightSrc) && /GIT_DEPENDENT/.test(dccSrc) && /环境跳过（本机无 git）/.test(dccSrc),
       `preflight 命中=${/Edge 主版本 ≥ 112/.test(preflightSrc)}；docs-cross-check 命中=${/GIT_DEPENDENT/.test(dccSrc)}／${/环境跳过（本机无 git）/.test(dccSrc)}`);
 
+  /* ---------------- E12 定点回归（2026-09-30 收口） ----------------
+     登记原文（2026-09-20）：`run-all` 日志**命名撞名会造假绿** —— 按 `<脚本>-<runner pid>.log` 命名、
+     同 pid 复用会撞旧文件 ⇒ `parseSummary` 取到**旧汇总行**，出现"失败脚本被印成 PASS"。
+     三条修法：①文件名带 pid（已在）②运行前删同名旧文件（已在）③**以失败为优先解析**（本轮补）。
+     这里把③做成定点回归：多行汇总时"前面绿、后面红"**必须判红**。 */
+  t.check('E12 定点回归①：日志里"先绿后红"两条汇总行 ⇒ `parseSummary` 必须取**红**的那条（旧实现取首条 ⇒ 假绿）',
+    (() => {
+      const s = runAll4.parseSummary('=== 汇总 ===\n通过 40 项，失败 0 项，跳过 0 项\n（子套件）\n通过 3 项，失败 2 项，跳过 0 项\n');
+      return s && s.failed === 2 && s.passed === 3 && s.worst === true && s.lines === 2;
+    })(),
+    `实测 ${JSON.stringify(runAll4.parseSummary('通过 40 项，失败 0 项，跳过 0 项\n通过 3 项，失败 2 项，跳过 0 项'))}`);
+  t.check('E12 定点回归②：多条红行取 **failed 最大**者；全绿时取 **passed 最大**者（防"先打一行占位 0/0"）',
+    (() => {
+      const a = runAll4.parseSummary('通过 1 项，失败 1 项\n通过 5 项，失败 4 项\n');
+      const b = runAll4.parseSummary('通过 0 项，失败 0 项，跳过 0 项\n通过 12 项，失败 0 项，跳过 0 项\n');
+      return a && a.failed === 4 && b && b.passed === 12 && b.lines === 2;
+    })(),
+    `多红=${JSON.stringify(runAll4.parseSummary('通过 1 项，失败 1 项\n通过 5 项，失败 4 项'))}；全绿=${JSON.stringify(runAll4.parseSummary('通过 0 项，失败 0 项\n通过 12 项，失败 0 项'))}`);
+  const runAllSrc12 = fs.readFileSync(path.join(env.paths.tests, 'run-all.js'), 'utf8');
+  t.check('E12 静态守卫：日志名含 runner pid **且**运行前删同名旧文件（两条修法都必须在场，防回退）',
+    /\$\{suite\.name\}-\$\{process\.pid\}\.log/.test(runAllSrc12) &&
+    /fs\.rmSync\(logFile/.test(runAllSrc12) &&
+    /worst: bad\.length > 0/.test(runAllSrc12),
+    `命名=${/\$\{suite\.name\}-\$\{process\.pid\}\.log/.test(runAllSrc12)}；删旧=${/fs\.rmSync\(logFile/.test(runAllSrc12)}；失败优先=${/worst: bad\.length > 0/.test(runAllSrc12)}`);
+
+
   }
 }
 /* ---------------- 十二、"工作区稳定性"判定的真值表（2026-09-20 新增） ----------------

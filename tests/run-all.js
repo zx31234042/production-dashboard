@@ -72,19 +72,32 @@ const SUITES = [
   { name: 'stress-check', desc: '长跑稳定性（默认 5 分钟；--soak / --hours 8 为整班次浸泡）', needBrowser: true, slow: true }
 ];
 
-/** 从脚本文本里数出 check( 调用条数（静态口径，仅作参考展示） */
-function countCheckCalls(file) {
-  try {
-    const src = fs.readFileSync(file, 'utf8');
-    return (src.match(/\bcheck\(/g) || []).length;
-  } catch { return 0; }
+/**
+ * 解析子进程输出里的汇总行。**E12（登记 2026-09-20，2026-09-30 收口）：以失败为优先。**
+ *
+ * 为什么：日志若出现**多条**汇总行（嵌套子跑、脚本自报子套件等），旧实现 `out.match(…)` 只取
+ * **第一条** ⇒ "前面一行绿、后面一行红"会被判成通过（假绿）。现在扫**全部**汇总行、按最坏优先取：
+ *   ① 任一条 `failed > 0` ⇒ 取其中 **failed 最大**的那条（并标 `worst: true`）；
+ *   ② 全绿 ⇒ 取 **passed 最大**的那条（防"先打一行占位 0/0"被当成结果）；
+ *   ③ 附 `lines`＝见到的汇总行条数，便于复核"这轮到底有几条汇总"。
+ * 与另两条修法合起来堵住 E12 的两种形态：**文件名带 runner pid** ＋ **运行前删同名旧文件**
+ * （`runSuite()` 内，见断言"日志命名与删旧都在场"）；本条补的是"多行只取首条"这一种。
+ */
+function parseSummary(out) {
+  const re = /通过\s*(\d+)\s*项，失败\s*(\d+)\s*项(?:，跳过\s*(\d+)\s*项)?/g;
+  const all = [];
+  let m;
+  while ((m = re.exec(out)) !== null) {
+    all.push({ passed: Number(m[1]), failed: Number(m[2]), skipped: m[3] === undefined ? 0 : Number(m[3]) });
+  }
+  if (!all.length) return null;
+  const bad = all.filter(s => s.failed > 0);
+  const pick = bad.length
+    ? bad.reduce((a, b) => (b.failed > a.failed ? b : a))
+    : all.reduce((a, b) => (b.passed > a.passed ? b : a));
+  return { passed: pick.passed, failed: pick.failed, skipped: pick.skipped, lines: all.length, worst: bad.length > 0 };
 }
 
-function parseSummary(out) {
-  const m = out.match(/通过\s*(\d+)\s*项，失败\s*(\d+)\s*项(?:，跳过\s*(\d+)\s*项)?/);
-  if (!m) return null;
-  return { passed: Number(m[1]), failed: Number(m[2]), skipped: m[3] === undefined ? 0 : Number(m[3]) };
-}
 
 /** 判断一次执行是否属于"环境不满足而跳过"（脚本自己打了 SKIP 且没有断言失败） */
 function isEnvSkip(out) {
