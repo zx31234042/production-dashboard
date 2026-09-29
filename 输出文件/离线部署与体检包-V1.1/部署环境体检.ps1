@@ -10,6 +10,16 @@
 # ==========================================================================
 $ErrorActionPreference = 'Continue'
 
+# ---- 子进程输出编码（现场实测缺口，2026-09-29 修）---------------------------------
+# 本脚本会把 node 的输出捕获进报告（`& node … | Out-String`）。PS 5.1 用**控制台输出编码**
+# 解码子进程的字节流；中文系统默认是 936/GBK，而 node 写的是 UTF-8 ⇒ 捕获到的中文会变成
+# "閫氳繃"式乱码（现场机 DESKTOP-1K4A22L 实测：第六节整段不可读）。
+# 这里**只改本进程**的输出编码，不改系统设置；设置失败也不阻断（退化为原行为）。
+try {
+  [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+  $OutputEncoding = [Console]::OutputEncoding
+} catch { }
+
 # ---------------------------------------------------------------- Node 定位（不要求操作员改 PATH）
 # 现场最容易卡住的一步是"装 Node 并把它加进 PATH"，且 **Win10 与 Win11 的图形入口不一致**：
 # Win11 的「系统」页里没有"系统信息"，高级系统设置藏在「关于」里（2026-09-28 在本机实测）。
@@ -40,6 +50,7 @@ W ("生成时间   ：" + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
 W ("采集主机   ：" + $env:COMPUTERNAME + "    用户：" + $env:USERNAME)
 W ("脚本位置   ：" + $PSScriptRoot)
 W ("说明       ：本文件由 部署环境体检.ps1 只读采集；不含任何修改系统的动作。")
+W ("控制台输出编码：" + [Console]::OutputEncoding.WebName + "（子进程输出按此编码解码；UTF-8 才能正确显示中文）")
 if ($NodeDir) { W ("Node 定位  ：" + $NodeDir + "（本包自带；仅本次进程内前置到 PATH，未改系统、未改用户变量）") }
 else { W "Node 定位  ：本包同目录未自带便携 Node ⇒ 用系统 PATH 上的 node（见第五节实际路径）" }
 
