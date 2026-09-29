@@ -136,7 +136,7 @@ D:\production-dashboard\输出文件\离线部署与体检包-V1.2\
 
 产出：`._env-report\现场门禁报告-<主机名>-<时间戳>.txt` ＋ `._env-report\现场门禁日志-<时间戳>\<脚本>.log` —— **一并回传**。
 
-> **为什么"逐个"而不是跑全量**：目标机没有 git ⇒ `harness-check` 少 2 条、`docs-check` 失败数也不同，与权威区声明的数字对不上，全量 `run-all` 会打印"**权威数字已漂移**"的**假警报**（技术债 `E55`）。逐个跑不受影响。
+> **现场已实测（2026-09-29 15:49，DESKTOP-1K4A22L）**：双击 `跑现场门禁.cmd` 一次跑完五项、**全部退出码 0**、**与开发机读数逐项相同** —— `capture-baseline` 11.3s｜`screenshot-diff` **24/0/0**｜`browser-check` **33/0/0**｜`overlap-check` **27/0/0**｜`stress-check` **11/0/3**（合计约 6.9 分钟）。逐图差异 0.32%～4.90%（**07-公告备注最接近 5% 阈值**）。产出：`._env-report\现场门禁报告-*.txt` ＋ `._env-report\现场门禁日志-*\*.log`。：目标机没有 git ⇒ `harness-check` 少 2 条、`docs-check` 失败数也不同，与权威区声明的数字对不上，全量 `run-all` 会打印"**权威数字已漂移**"的**假警报**（技术债 `E55`）。逐个跑不受影响。
 > 只想跑其中几项时（例如只补视觉回归）：PowerShell 里执行
 > `powershell -NoProfile -ExecutionPolicy Bypass -File 部署环境体检.ps1 -RunFieldGates -Only capture-baseline,screenshot-diff`
 ## 5. 把什么带回来
