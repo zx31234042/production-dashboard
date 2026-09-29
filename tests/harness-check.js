@@ -3193,7 +3193,7 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       /Edge 主版本 ≥ 112/.test(preflightSrc) && /GIT_DEPENDENT/.test(dccSrc) && /环境跳过（本机无 git）/.test(dccSrc),
       `preflight 命中=${/Edge 主版本 ≥ 112/.test(preflightSrc)}；docs-cross-check 命中=${/GIT_DEPENDENT/.test(dccSrc)}／${/环境跳过（本机无 git）/.test(dccSrc)}`);
 
-  /* ---------------- E12 定点回归（2026-09-30 收口） ----------------
+  /* ---------------- E12 定点回归（2026-09-29 收口） ----------------
      登记原文（2026-09-20）：`run-all` 日志**命名撞名会造假绿** —— 按 `<脚本>-<runner pid>.log` 命名、
      同 pid 复用会撞旧文件 ⇒ `parseSummary` 取到**旧汇总行**，出现"失败脚本被印成 PASS"。
      三条修法：①文件名带 pid（已在）②运行前删同名旧文件（已在）③**以失败为优先解析**（本轮补）。
@@ -3625,7 +3625,7 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       return `退出码 ${failRun.status}${failRun.error ? `（spawn 错误 ${failRun.error}）` : ''}`
         + `｜FAIL docs-check ${has('FAIL  docs-check')}｜"门禁全绿" ${has('门禁全绿')}（应为"缺"）`;
     })());
-  /* E19（登记 2026-09-22，2026-09-30 收口）：`--only contract-check` 这一轮**要求是稳定绿轮**，
+  /* E19（登记 2026-09-22，2026-09-29 收口）：`--only contract-check` 这一轮**要求是稳定绿轮**，
      但写方撞上它 ~1 s 的窗口时 `lib/snapshot.js` 会判"工作区被改写 ⇒ 本轮不可作证据" ⇒ 退出码 1、
      且**不会**打印"门禁全绿" ⇒ 断言**假红**（实测 N=30 里 1 次；并行开发期约 3%）。
      ⚠ 原实现还把 `runOnly` 跑了**两遍**（谓词一遍、明细一遍）⇒ 撞车概率翻倍，一并修掉。
