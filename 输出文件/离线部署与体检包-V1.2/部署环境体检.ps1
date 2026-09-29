@@ -237,6 +237,19 @@ Try-Run '待重启标志'       { 'WU RebootRequired=' + (Test-Path 'HKLM:\SOFTW
 # ---------------------------------------------------------------- 五、Node / 浏览器 / 网络
 Section '五、运行时与浏览器（ADR-0002：Node 24 LTS 基线；浏览器类门禁需 msedge）'
 Try-Run 'node 实际路径' { $c = Get-Command node -ErrorAction SilentlyContinue; if ($c) { $c.Source } else { '（PATH 上找不到 node）' } }
+Try-Run 'PATH 上另装的 node' {
+  $pk = $NodeDir
+  $all = @(Get-Command node -All -ErrorAction SilentlyContinue | ForEach-Object { $_.Source } | Where-Object { $_ })
+  if ($pk) { $all = @($all | Where-Object { $_.ToLower() -ne ((Join-Path $pk 'node.exe')).ToLower() }) }
+  if ($all.Count -eq 0) { '无（门禁用的就是包内那份）' }
+  else {
+    $other = $all[0]
+    $ov = (& $other --version 2>&1)
+    if ($pk) { $pv = (& (Join-Path $pk 'node.exe') --version 2>&1); ('另装：' + $other + '（' + $ov + '）；包内：' + $pv + ' ⇒ 两者不同时**门禁读数以包内为准**（本包入口已把包内目录前置到 PATH）') }
+    else { ('另装：' + $other + '（' + $ov + '）') }
+  }
+}
+
 Try-Run 'node --version'  { $v = & node --version 2>&1; $v }
 Try-Run 'node:sqlite 可用' { & node -e "const{DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(':memory:');d.exec('create table t(a)');d.prepare('insert into t values(1)').run();const r=d.prepare('select count(*) c from t').get();console.log('ok rows='+r.c)" 2>&1 }
 Try-Run 'npm --version'   { & npm --version 2>&1 }
