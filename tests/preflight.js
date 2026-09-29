@@ -3,7 +3,7 @@
    作用：跑门禁**之前**先确认环境可用，把"环境问题"与"代码问题"分开报 ——
         否则环境缺失会伪装成一堆断言失败，白花排查时间。
    检查项：Node 版本下限 / 运行时能力（node:sqlite、全局 fetch、AbortSignal.timeout）
-          / 临时区可写 / 磁盘余量 / 端口可用性 / Edge 可用性（截图类脚本要用）
+          / 临时区可写 / 磁盘余量 / 端口可用性 / Edge 可用性（截图类脚本要用）＋ **Edge 版本下限 ≥ 112**（`--headless=new` 的前提，E54）
           / 子进程管道能力（决定 browser-check、overlap-check、stress-check 能否跑）
    依据：ADR-0003 D15/D17；规范 9.5-5 第 6 条（跑不了的脚本必须显式说明，不得静默通过）。
    运行：node tests/preflight.js
@@ -110,6 +110,39 @@ async function main() {
   t.check('能找到 Edge 可执行文件（browser-check / capture-baseline / overlap-check 需要）',
     Boolean(edge), edge || '未找到（可用环境变量 MSEDGE_PATH 指定）');
   if (!edge) warnings.push('未找到 Edge：浏览器类脚本将无法运行');
+  /** 读 Edge 主版本（E54）：① 优先看安装目录下的**版本号目录**（`Application\154.0.4258.37\`，不依赖子进程）；
+   *  ② 退路 `msedge.exe --version`；两路都读不到则 major=0（断言如实判失败并写明"读取失败"）。 */
+  function readEdgeMajor(exe) {
+    try {
+      const vs = fs.readdirSync(path.dirname(exe)).filter(n => /^\d+\.\d+\.\d+\.\d+$/.test(n));
+      if (vs.length) {
+        const best = vs.map(s => s.split('.').map(Number))
+          .sort((a, b) => (b[0] - a[0]) || (b[1] - a[1]) || (b[2] - a[2]) || (b[3] - a[3]))[0];
+        if (best && best[0] > 0) return { major: best[0], raw: best.join('.') + '（版本目录）' };
+      }
+    } catch { /* 落到 ② */ }
+    try {
+      const r = require('node:child_process').spawnSync(exe, ['--version'], { encoding: 'utf8', timeout: 8000 });
+      const s = String((r.stdout || '') + (r.stderr || '')).trim();
+      const m = s.match(/(\d+)\./);
+      return { major: m ? Number(m[1]) : 0, raw: s };
+    } catch { return { major: 0, raw: '' }; }
+  }
+
+  /* E54（2026-09-29 登记，现场实测暴露）：浏览器类门禁脚本用 `--headless=new`，**需要 Edge ≥ 112**。
+     现场首份报告（DESKTOP-1K4A22L）Edge 为 **92.0.902.67** ⇒ 四个脚本跑不了，而失败信息**不点名"Edge 太旧"**
+     （原实现只查"能不能找到 Edge"）。这里把版本要求显式化：找到 Edge 就断言主版本；找不到则按
+     "环境能力缺失"**跳过**（上一条已如实判失败），并把升级办法写进原因，避免现场看不懂红项。 */
+  if (edge) {
+    const ev = readEdgeMajor(edge);
+    t.check('Edge 主版本 ≥ 112（`--headless=new` 的前提：browser-check / capture-baseline / overlap-check / stress-check 依赖）',
+      ev.major >= 112,
+      `${edge} → ${ev.raw || '版本读取失败'}` +
+      (ev.major >= 112 ? '' : '　⇒ **版本过旧**：请用离线升级件升级 Edge（否则浏览器类脚本拿不到证据），或在 Edge ≥ 112 的机器上跑'));
+  } else {
+    t.skip('Edge 主版本 ≥ 112（`--headless=new` 的前提）', '未找到 Edge（见上一条断言）—— 浏览器类脚本在本环境无法运行');
+  }
+
 
   /* 子进程管道能力：受限沙箱会以 EPERM 拒绝；这属于**环境能力缺失**而非体检失败，
      故记为跳过（同时进警告），避免"环境问题伪装成断言失败"——这正是体检要避免的事。 */

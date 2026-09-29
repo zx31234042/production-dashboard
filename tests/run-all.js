@@ -349,6 +349,18 @@ function authorityBlockers(results) {
   return [...new Set(blockers)];
 }
 
+/** 本机是否有 git（**E55**）：目标机可能没装 git ⇒ `docs-check`/`harness-check` 里**依赖提交历史**的断言
+ *  无法判定（harness 少 2 条、docs-check 的失败数也不同）⇒ 合计与权威区**结构性不可比**。
+ *  此时**不做权威比对**：如实说"不可比"，**不是**"权威数字已漂移"。
+ *  （现场 2026-09-29 实测：无 git 的机器上跑全量会在报告里打出指向"文档没同步"的**假红**。） */
+function gitAvailable() {
+  try {
+    const r = require('node:child_process').spawnSync('git', ['--version'], { encoding: 'utf8', timeout: 8000 });
+    return r.status === 0 && /git version/i.test(String(r.stdout || ''));
+  } catch { return false; }
+}
+
+
 /**
  * 收尾校验 `tests\README.md` 第三节的**权威数字**与本轮实跑是否一致（P2-22）。
  * 为什么放在 runner 而不是某个门禁脚本里：本 runner 是唯一持有"本轮最终账"的地方
@@ -372,7 +384,7 @@ function authorityBlockers(results) {
  * @param {Array<{suite:{name:string},status:string,summary?:object,out?:string}>} results 本轮各脚本结果
  * @returns {{ok:boolean,kind:string,detail:string}}
  */
-function verifyAuthorityTotals(agg, results) {
+function verifyAuthorityTotals(agg, results, opts = {}) {
   /* 「本轮跑全了没有」必须对**权威区覆盖的全量脚本**判定 —— 不是 `!needBrowser` 的子集。
      立案（E50，2026-09-28）：权威区合计是**含浏览器/长跑脚本**的全量值（它们在 README 第三节
      被逐条登记），而这里原来按 `!needBrowser` 取集合 ⇒ `--fast`（过滤 slow ＋ needBrowser）下
@@ -388,6 +400,19 @@ function verifyAuthorityTotals(agg, results) {
       detail: `**未执行**：本轮未跑全离线门禁（缺 ${missing.length} 个：${missing.join('、')}）` +
         ' —— 不拿残缺的账去比权威值（`--only`/`--fast` 跑子集时属正常）' };
   }
+  /* E55（2026-09-29）：**没有 git 的机器不做权威比对** —— `harness-check` 有 2 条依赖提交历史的断言、
+     `docs-check` 的失败数也与联网开发机不同 ⇒ 合计与权威区**结构性不可比**。旧实现在这里会拿"权威区
+     1161"比"现场实跑 1160 左右"、报"权威数字已漂移，请同步 tests\README.md 第三节"，即**指向"文档没同步"
+     的假红**（现场 2026-09-29 实测确认；当时因为只跑 `--fast`、落在上面的 `missing` 分支才没触发）。
+     这里如实标"未执行：不可比"，而不是"漂移" —— 与 `missing` 分支同属"**没比对就说没比对**"（规范 9.5-5）。
+     `opts.gitAvailable` 供自检注入（默认真探测），定点回归见 `harness-check` 第十一节。 */
+  const gitOk = (opts && opts.gitAvailable !== undefined) ? opts.gitAvailable === true : gitAvailable();
+  if (!gitOk) {
+    return { ok: true, kind: 'skipped',
+      detail: '**未执行**：本机没有 git（读不到提交历史）⇒ `docs-check`／`harness-check` 里依赖提交历史的断言无法判定，' +
+        '合计与权威区**不可比** —— 不做权威数字比对（**这不是"漂移"**）；要核对数字请在装了 git 的机器上跑' };
+  }
+
   let readme = '';
   try { readme = fs.readFileSync(path.join(env.paths.tests, 'README.md'), 'utf8'); } catch (err) {
     return { ok: false, kind: 'broken', detail: `读不到 tests\\README.md：${err.message}` };

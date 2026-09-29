@@ -716,12 +716,30 @@ function main() {
     badNamedScript.length === 0 && badTableScript.length === 0,
     [...badNamedScript, ...badTableScript].join('、'));
 
+  /* E55（2026-09-29）：本机没有 git 时，`docs-check`／`harness-check` 的条数**必然**与权威区不同
+     （各自有依赖提交历史的断言：harness-check 少 2 条、docs-check 的失败数也变）⇒ 这两个脚本
+     **不参与按数比对**，改为显式标注"环境跳过（本机无 git）"。否则会把**环境差异**判成缺陷
+     （现场 2026-09-29 实测：无 git 的机器上这两个脚本各报一条红，指向"权威区声明 ≠ 实跑"）。 */
+  const GIT_DEPENDENT = ['docs-check', 'harness-check'];
+  const gitOkHere = (() => {
+    try {
+      const r = require('node:child_process').spawnSync('git', ['--version'], { encoding: 'utf8', timeout: 8000 });
+      return r.status === 0 && /git version/i.test(String(r.stdout || ''));
+    } catch { return false; }
+  })();
+  const envSkipped = gitOkHere ? [] : GIT_DEPENDENT.filter(n => nameDeclarations.has(n) || tableDeclarations.has(n));
+  const envSkipNote = envSkipped.length
+    ? `｜**环境跳过（本机无 git）**：${envSkipped.join('、')} —— 其条数依赖提交历史，不参与按数比对`
+    : '';
+
+
   /* ---- 断言 1：逐脚本清单形式 ---- */
   const notDeclared = offlineGates.filter(n => !nameDeclarations.has(n));
   const mismatchedNamed = [];
   for (const [name, d] of nameDeclarations) {
     /* 自指脚本跳过；其余"拿不到任何实跑值"的由断言 6 报"未覆盖"，此处不猜也不硬比 */
     if (name === SELF_REF || actualOf(name) === undefined) continue;
+    if (envSkipped.includes(name)) continue;   /* E55：无 git 时这两个脚本不参与按数比对 */
     if (d.declared !== actualOf(name)) {
       mismatchedNamed.push(`${name}：声明 ${d.declared} ≠ 实跑 ${actualOf(name)}` +
         (recheckNames.includes(name) ? '（账本值亦不符，已实跑复核确认）' : '（取自本轮账）'));
@@ -740,6 +758,7 @@ function main() {
   const cpMismatch = [];
   for (const [name, d] of tableDeclarations) {
     if (name === SELF_REF || actualOf(name) === undefined) continue;
+    if (envSkipped.includes(name)) continue;   /* E55：无 git 时这两个脚本不参与按数比对 */
     if (d.declared !== actualOf(name)) {
       cpMismatch.push(`${name}（${d.form}）：声明 ${d.declared} ≠ 实跑 ${actualOf(name)}` +
         (recheckNames.includes(name) ? '（账本值亦不符，已实跑复核确认）' : '（取自本轮账）'));
@@ -760,6 +779,7 @@ function main() {
     ` ＋ 冲突复核 ${recheckNames.length} 个（${recheckNames.join('、') || '无'}）` +
     `＋ 账本不覆盖实跑 ${probedNames.length - recheckNames.length} 个` +
     `｜账本 ${totals.ok ? '可读' : '不可读：' + totals.why}｜实跑探针墙钟 ${probeWallMs} ms`);
+  if (envSkipped.length) t.info('**环境跳过（本机无 git）**：' + envSkipped.join('、') + ' —— 其条数依赖提交历史，不参与按数比对（E55）');
 
   /* ---- 断言 3：解析必须**全覆盖**，解析不到的不得静默放过 ---- */
   t.check('权威区每个离线门禁的牌面条数都被解析覆盖（解析不到的列进"未覆盖清单"）',

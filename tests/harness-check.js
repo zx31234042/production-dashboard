@@ -3173,6 +3173,26 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       fastMissing.length === 3 && fastMissing.every(n => fast.detail.includes(n)),
       `fast 缺失集=${JSON.stringify(fastMissing)}（期望 3 个）；实得 ok=${fast.ok}、kind=${fast.kind}；` +
       `detail=${fast.detail}`);
+
+    /* E55 定点回归（2026-09-29）：**没有 git 的机器不得判"权威数字漂移"** —— 目标机可能没装 git，
+       `harness-check` 少 2 条（依赖提交历史）、`docs-check` 的失败数也不同 ⇒ 合计与权威区**结构性不可比**。
+       旧行为会报"权威数字已漂移，请同步 tests\README.md 第三节"（现场 2026-09-29 实测的**假红**）。 */
+    const noGit = runAll4.verifyAuthorityTotals({ passed: 1 }, fullRun({}), { gitAvailable: false });
+    t.check('E55 定点回归：本机无 git ⇒ `kind=skipped`、`ok=true`，详情写明"不可比／这不是漂移"（判 `mismatch` 即回潮）',
+      noGit.ok === true && noGit.kind === 'skipped' && /不可比/.test(noGit.detail) && /这不是/.test(noGit.detail),
+      `实得 ok=${noGit.ok}、kind=${noGit.kind}；detail=${noGit.detail}`);
+    const withGit = runAll4.verifyAuthorityTotals({ passed: 1 }, fullRun({}), { gitAvailable: true });
+    t.check('E55 正对照：**有** git 时照旧走到比对（新分支不得把正常路径一并吞掉）',
+      withGit.kind === 'mismatch', `实得 kind=${withGit.kind}`);
+
+    /* 静态守卫：两处新实现的**在场证明**（E54 的 Edge 版本断言、E55 的 docs-cross-check 环境跳过）——
+       防"下一轮改动把它悄悄回退掉而没人发现"。 */
+    const preflightSrc = fs.readFileSync(path.join(env.paths.tests, 'preflight.js'), 'utf8');
+    const dccSrc = fs.readFileSync(path.join(env.paths.tests, 'docs-cross-check.js'), 'utf8');
+    t.check('静态：`preflight` 含"Edge 主版本 ≥ 112"断言（E54）且 `docs-cross-check` 含"无 git 环境跳过"处理（E55）',
+      /Edge 主版本 ≥ 112/.test(preflightSrc) && /GIT_DEPENDENT/.test(dccSrc) && /环境跳过（本机无 git）/.test(dccSrc),
+      `preflight 命中=${/Edge 主版本 ≥ 112/.test(preflightSrc)}；docs-cross-check 命中=${/GIT_DEPENDENT/.test(dccSrc)}／${/环境跳过（本机无 git）/.test(dccSrc)}`);
+
   }
 }
 /* ---------------- 十二、"工作区稳定性"判定的真值表（2026-09-20 新增） ----------------
