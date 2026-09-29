@@ -8,6 +8,9 @@
 #  注意：只读采集、不改系统，除自身报告文件外不写任何东西；唯第六节在仓库就位时会跑
 #        仓库自带门禁，那一步只写 <仓库>\tests\._verify\ 下的日志/账本（不写系统、不装东西）。
 # ==========================================================================
+#  两个入口（都是双击式）：① 体检-双击运行.cmd ⇒ 只读体检；② 配置-DEP04.cmd ⇒ 写配置（自动提权）
+param([switch]$ConfigureDep04)
+
 $ErrorActionPreference = 'Continue'
 
 # ---- 子进程输出编码（现场实测缺口，2026-09-29 修）---------------------------------
@@ -19,6 +22,66 @@ try {
   [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
   $OutputEncoding = [Console]::OutputEncoding
 } catch { }
+# ==========================================================================
+#  -ConfigureDep04：现场"无人值守"配置（DEP-04）—— **需要管理员**
+#  只改下列几项（其余一概不碰），改完立即**回读**并写报告：
+#    ① 睡眠/休眠/关屏 = 从不（AC＋DC 共六项）  ② 无线适配器省电 = 最高性能
+#    ③ 屏保 = 关闭（HKCU）                    ④ 更新后不自动重启（HKLM 策略；**不关闭更新本身**）
+#  不在本脚本内：分辨率与缩放（须 75 寸屏到位后人工设 3840×2160@30 并锁定缩放，见 README）。
+#  背景：现场首份报告（2026-09-29）实测 DEP-04 **六项全未配**（睡眠 30/15 min、休眠 3 h、
+#        关屏 10/5 min、屏保开、AU 策略键缺、方案＝平衡）。
+# ==========================================================================
+if ($ConfigureDep04) {
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if (-not $admin) { Write-Output '需要管理员权限：请双击同目录的 配置-DEP04.cmd（它会自行请求提权）。'; exit 2 }
+  $dir = Join-Path $PSScriptRoot '._env-report'
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+  $rep = Join-Path $dir ('DEP04配置报告-' + $env:COMPUTERNAME + '-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.txt')
+  $L2 = New-Object System.Collections.Generic.List[string]
+  function W2($s) { $script:L2.Add([string]$s) }
+  function IdxOf2($sub, $set) {
+    $q = & powercfg /q SCHEME_CURRENT $sub $set 2>&1
+    $hits = @($q | Select-String -Pattern '0x[0-9a-fA-F]+' -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object { $_.Value })
+    return (($hits | Select-Object -Last 2) -join ' / ')
+  }
+  W2 '现场无人值守配置报告（DEP-04）'
+  W2 ('生成时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '    主机：' + $env:COMPUTERNAME + '    管理员：' + $admin)
+  W2 ''
+  W2 '—— 改前 ——'
+  W2 ('睡眠 AC/DC      : ' + (IdxOf2 '238c9fa8-0aad-41ed-83f4-97be242c8f20' '29f6c1db-86da-48c5-9fdb-f2b67b1f44da'))
+  W2 ('休眠 AC/DC      : ' + (IdxOf2 '238c9fa8-0aad-41ed-83f4-97be242c8f20' '9d7815a6-7ee4-497e-8888-515a05f02364'))
+  W2 ('关屏 AC/DC      : ' + (IdxOf2 '7516b95f-f776-4464-8c53-06167f40cc99' '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e'))
+  W2 ('无线省电 AC/DC  : ' + (IdxOf2 '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' '12bbebe6-58d6-4636-95bb-3217ef867c1a'))
+  foreach ($k in @('standby-timeout-ac','standby-timeout-dc','hibernate-timeout-ac','hibernate-timeout-dc','monitor-timeout-ac','monitor-timeout-dc')) { & powercfg /change $k 0 | Out-Null }
+  & powercfg /setacvalueindex SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 0 | Out-Null
+  & powercfg /setdcvalueindex SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 0 | Out-Null
+  & powercfg /setactive SCHEME_CURRENT | Out-Null
+  Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name ScreenSaveActive -Value '0' -Force -ErrorAction SilentlyContinue
+  Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name ScreenSaveTimeOut -Value '0' -Force -ErrorAction SilentlyContinue
+  Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name ScreenSaverIsSecure -Value '0' -Force -ErrorAction SilentlyContinue
+  $au = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+  if (-not (Test-Path $au)) { New-Item -Path $au -Force | Out-Null }
+  New-ItemProperty -Path $au -Name NoAutoRebootWithLoggedOnUsers -Value 1 -PropertyType DWord -Force | Out-Null
+  W2 ''
+  W2 '—— 改后（回读） ——'
+  W2 ('睡眠 AC/DC      : ' + (IdxOf2 '238c9fa8-0aad-41ed-83f4-97be242c8f20' '29f6c1db-86da-48c5-9fdb-f2b67b1f44da') + '   （0x0 = 从不）')
+  W2 ('休眠 AC/DC      : ' + (IdxOf2 '238c9fa8-0aad-41ed-83f4-97be242c8f20' '9d7815a6-7ee4-497e-8888-515a05f02364') + '   （0x0 = 从不）')
+  W2 ('关屏 AC/DC      : ' + (IdxOf2 '7516b95f-f776-4464-8c53-06167f40cc99' '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e') + '   （0x0 = 从不）')
+  W2 ('无线省电 AC/DC  : ' + (IdxOf2 '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' '12bbebe6-58d6-4636-95bb-3217ef867c1a') + '   （0x0 = 最高性能）')
+  $dk = Get-ItemProperty 'HKCU:\Control Panel\Desktop' -ErrorAction SilentlyContinue
+  W2 ('屏保            : ScreenSaveActive=' + $dk.ScreenSaveActive + '  Timeout=' + $dk.ScreenSaveTimeOut + '   （应为 0 / 0）')
+  $a2 = Get-ItemProperty $au -ErrorAction SilentlyContinue
+  W2 ('更新自动重启    : NoAutoRebootWithLoggedOnUsers=' + $a2.NoAutoRebootWithLoggedOnUsers + '   （1 = 已禁止"登录用户在线时自动重启"；更新本身未关闭）')
+  W2 ('活动电源方案    : ' + ((& powercfg /getactivescheme) -join ''))
+  W2 ''
+  W2 '说明：分辨率与缩放**不在本脚本内** —— 须 75 寸屏到位后人工设 3840×2160@30Hz，并在'
+  W2 '      「设置 → 系统 → 显示 → 缩放」固定缩放（建议 150%）后锁定。'
+  W2 '请把本报告随体检报告一并回传（主代理据此登记）。'
+  [System.IO.File]::WriteAllText($rep, ($L2 -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+  Write-Output ('配置完成。报告：' + $rep)
+  exit 0
+}
+
 
 # ---------------------------------------------------------------- Node 定位（不要求操作员改 PATH）
 # 现场最容易卡住的一步是"装 Node 并把它加进 PATH"，且 **Win10 与 Win11 的图形入口不一致**：
