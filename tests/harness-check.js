@@ -3625,17 +3625,57 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       return `退出码 ${failRun.status}${failRun.error ? `（spawn 错误 ${failRun.error}）` : ''}`
         + `｜FAIL docs-check ${has('FAIL  docs-check')}｜"门禁全绿" ${has('门禁全绿')}（应为"缺"）`;
     })());
-  t.check('端到端：跑 `--only contract-check`（无失败脚本）⇒ 退出码 0，打印"门禁全绿"**且同时打印权威对账行**',
-    (() => {
-      const sub = runOnly('contract-check');
-      return sub.status === 0 && sub.text.includes('门禁全绿（无失败脚本）。') &&
-        sub.text.includes('权威数字校验：**未执行**：本轮未跑全离线门禁');
-    })(), (() => {
-      const sub = runOnly('contract-check');
-      return `退出码 ${sub.status}${sub.error ? `（spawn 错误 ${sub.error}）` : ''}`
-        + `｜权威对账行 ${sub.text.includes('权威数字校验：**未执行**') ? '有' : '缺'}｜门禁全绿 ${sub.text.includes('门禁全绿') ? '有' : '缺'}`
-        + '（绿轮丢弃对账行是同一处重构的第二个缺口：必须"绿轮也打印"）';
-    })());
+  /* E19（登记 2026-09-22，2026-09-30 收口）：`--only contract-check` 这一轮**要求是稳定绿轮**，
+     但写方撞上它 ~1 s 的窗口时 `lib/snapshot.js` 会判"工作区被改写 ⇒ 本轮不可作证据" ⇒ 退出码 1、
+     且**不会**打印"门禁全绿" ⇒ 断言**假红**（实测 N=30 里 1 次；并行开发期约 3%）。
+     ⚠ 原实现还把 `runOnly` 跑了**两遍**（谓词一遍、明细一遍）⇒ 撞车概率翻倍，一并修掉。
+     修法（采纳登记里的①＋②）：把"这轮属于哪一类"抽成**纯函数**（可定点回归）：
+       · unstable（带"工作区被改写／不可作证据"措辞）⇒ **可重试**（最多 3 次尝试）；
+       · green（退出码 0 且打出"门禁全绿"）⇒ 通过；
+       · bad（其余）⇒ **真失败绝不重试**（不许把 FAIL 重试成绿）；
+     连续都撞上并发写盘 ⇒ **按"环境不满足"跳过**并写明原因 —— 环境问题不得伪装成断言失败。 */
+  const UNSTABLE_NEEDLE = /本轮运行期间工作区被改写|不可作为证据/;
+  const attemptKind = (code, text) => {
+    if (UNSTABLE_NEEDLE.test(text)) return 'unstable';
+    if (code === 0 && text.includes('门禁全绿（无失败脚本）。')) return 'green';
+    return 'bad';
+  };
+  t.check('E19 定点回归①：`attemptKind` 三态 —— 不稳定轮⇒unstable（可重试）／绿轮⇒green／**真失败⇒bad（不得被重试掉）**',
+    attemptKind(1, '本轮运行期间工作区被改写（1 个文件）… 该轮不可作为证据') === 'unstable' &&
+    attemptKind(0, '门禁全绿（无失败脚本）。') === 'green' &&
+    attemptKind(1, 'FAIL  docs-check  41 / 2 / 0\n门禁结论：不通过') === 'bad' &&
+    attemptKind(0, '（没有"门禁全绿"字样）') === 'bad',
+    `unstable=${attemptKind(1, '本轮运行期间工作区被改写（1 个文件）')}；` +
+    `green=${attemptKind(0, '门禁全绿（无失败脚本）。')}；bad=${attemptKind(1, 'FAIL  x')}；` +
+    `code0无措辞=${attemptKind(0, '（无措辞）')}`);
+  t.check('E19 定点回归②：**不稳定措辞优先于退出码** —— 即使 exit=0，只要带"工作区被改写"也不得当成绿轮证据',
+    attemptKind(0, '门禁全绿（无失败脚本）。\n（本轮运行期间工作区被改写）') === 'unstable',
+    `实测 ${attemptKind(0, '门禁全绿（无失败脚本）。\n（本轮运行期间工作区被改写）')}`);
+  let greenSub = null;
+  let lastKind = '';
+  const subAttempts = [];
+  for (let i = 0; i < 3; i++) {
+    const sub = runOnly('contract-check');
+    const kind = attemptKind(sub.status, sub.text);
+    subAttempts.push(`${i + 1}:${kind}(exit=${sub.status})`);
+    lastKind = kind;
+    if (kind !== 'unstable') { greenSub = sub; break; }   /* green/bad 都停（bad 不重试） */
+  }
+  if (lastKind === 'unstable') {
+    t.skip('端到端：跑 `--only contract-check`（无失败脚本）⇒ 退出码 0，打印"门禁全绿"且同时打印权威对账行',
+      `连续 ${subAttempts.length} 次都撞上并发写盘（工作区被改写 ⇒ 该轮不可作证据）—— **环境不满足、不是实现缺陷**（E19）；` +
+      '停笔后复跑即为证据');
+    t.info('E19：本轮尝试序列 ' + subAttempts.join(' → '));
+  } else {
+    const sub = greenSub;
+    t.check('端到端：跑 `--only contract-check`（无失败脚本）⇒ 退出码 0，打印"门禁全绿"**且同时打印权威对账行**',
+      sub.status === 0 && sub.text.includes('门禁全绿（无失败脚本）。') &&
+      sub.text.includes('权威数字校验：**未执行**：本轮未跑全离线门禁'),
+      `尝试序列 ${subAttempts.join(' → ')}｜退出码 ${sub.status}${sub.error ? `（spawn 错误 ${sub.error}）` : ''}`
+      + `｜权威对账行 ${sub.text.includes('权威数字校验：**未执行**') ? '有' : '缺'}｜门禁全绿 ${sub.text.includes('门禁全绿') ? '有' : '缺'}`
+      + '（绿轮丢弃对账行是同一处重构的第二个缺口：必须"绿轮也打印"）');
+  }
+
 
   /* ---------------- D22 定点变异⑤：旧写法（只看 verdict.exitCode）必须被上面的断言挡下 ---------------- */
   const finalFn = runAllSrc6.match(/function finalExitCode\(entry\) \{[\s\S]*?\n\}/);
