@@ -8,8 +8,8 @@
 #  注意：只读采集、不改系统，除自身报告文件外不写任何东西；唯第六节在仓库就位时会跑
 #        仓库自带门禁，那一步只写 <仓库>\tests\._verify\ 下的日志/账本（不写系统、不装东西）。
 # ==========================================================================
-#  两个入口（都是双击式）：① 体检-双击运行.cmd ⇒ 只读体检；② 配置-DEP04.cmd ⇒ 写配置（自动提权）
-param([switch]$ConfigureDep04)
+#  三个入口（都是双击式）：① 体检-双击运行.cmd ⇒ 只读体检；② 配置-DEP04.cmd ⇒ 写配置（自动提权）；③ 跑现场门禁.cmd ⇒ 逐个跑浏览器/视觉类门禁
+param([switch]$ConfigureDep04, [switch]$RunFieldGates, [string]$Only = '')
 
 $ErrorActionPreference = 'Continue'
 
@@ -83,6 +83,7 @@ if ($ConfigureDep04) {
 }
 
 
+
 # ---------------------------------------------------------------- Node 定位（不要求操作员改 PATH）
 # 现场最容易卡住的一步是"装 Node 并把它加进 PATH"，且 **Win10 与 Win11 的图形入口不一致**：
 # Win11 的「系统」页里没有"系统信息"，高级系统设置藏在「关于」里（2026-09-28 在本机实测）。
@@ -98,6 +99,83 @@ if ($PSScriptRoot) {
   foreach ($d in $cands) { if ($d -and (Test-Path (Join-Path $d 'node.exe'))) { $NodeDir = $d; break } }
 }
 if ($NodeDir) { $env:PATH = $NodeDir + ';' + $env:PATH }
+# ==========================================================================
+#  -RunFieldGates：现场"逐个跑"浏览器类＋视觉类门禁（不需管理员、不需外网）
+#  为什么单列：现场手工敲 `node tests\…` 极易敲错（2026-09-29 现场把 `tests\` 敲成
+#  `test\` ⇒ 报 "Cannot find module"）；且**逐个跑**能避开 `E55`（无 git 的机器跑全量
+#  `run-all` 会误报"权威数字已漂移"）。本模式复用上面的仓库/Node 定位逻辑，
+#  按顺序跑、**每个脚本输出各落一份日志**，最后写一份汇总报告。
+#  用法：-RunFieldGates            ⇒ 跑全部五项
+#        -RunFieldGates -Only screenshot-diff,browser-check   ⇒ 只跑指定项
+# ==========================================================================
+if ($RunFieldGates) {
+  $stampG = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $dirG = Join-Path $PSScriptRoot '._env-report'
+  if (-not (Test-Path $dirG)) { New-Item -ItemType Directory -Path $dirG | Out-Null }
+  $logDir = Join-Path $dirG ('现场门禁日志-' + $stampG)
+  New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+  $repG = Join-Path $dirG ('现场门禁报告-' + $env:COMPUTERNAME + '-' + $stampG + '.txt')
+  $G = New-Object System.Collections.Generic.List[string]
+  function WG($s) { $script:G.Add([string]$s) }
+  $repoG = $null
+  $candG = @()
+  if ($PSScriptRoot) {
+    $pG = Split-Path $PSScriptRoot -Parent
+    $gG = $null
+    if ($pG) { $gG = Split-Path $pG -Parent }
+    if ($pG) { $candG += $pG; $candG += (Join-Path $pG 'production-dashboard') }
+    if ($gG) { $candG += $gG }
+  }
+  $candG += 'D:\production-dashboard'
+  foreach ($d in $candG) { if ($d -and (Test-Path (Join-Path $d 'tests\preflight.js'))) { $repoG = $d; break } }
+  $nodeFrom = '系统 PATH'
+  if ($NodeDir) { $nodeFrom = $NodeDir }
+  WG '现场门禁报告（浏览器类 ＋ 视觉类，逐个跑）'
+  WG ('生成时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '    主机：' + $env:COMPUTERNAME)
+  if ($repoG) { WG ('仓库    ：' + $repoG) } else { WG '仓库    ：**未找到**' }
+  WG ('Node    ：' + $nodeFrom)
+  WG ('日志目录：' + $logDir)
+  WG ''
+  if (-not $repoG) {
+    WG '未找到仓库（期望含 tests\preflight.js）⇒ 请把整个仓库目录拷到本机后重跑本入口。'
+    [System.IO.File]::WriteAllText($repG, ($G -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Output ('未找到仓库。报告：' + $repG)
+    exit 1
+  }
+  $items = @(
+    @{ n = 'capture-baseline'; why = '生成候选截图（screenshot-diff 的前置，需 Edge ≥ 112）' },
+    @{ n = 'screenshot-diff';  why = '视觉回归（基线为 1920×1080）' },
+    @{ n = 'browser-check';    why = '真实浏览器（无头 Edge ＋ CDP）' },
+    @{ n = 'overlap-check';    why = '元素重叠检测' },
+    @{ n = 'stress-check';     why = '长跑稳定性（默认 5 分钟；--soak 为整班次）' }
+  )
+  if ($Only -ne '') {
+    $want = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    $items = @($items | Where-Object { $want -contains $_.n })
+  }
+  Push-Location $repoG
+  try {
+    foreach ($it in $items) {
+      $log = Join-Path $logDir ($it.n + '.log')
+      $sw = [System.Diagnostics.Stopwatch]::StartNew()
+      $out = & node ('tests\' + $it.n + '.js') 2>&1 | Out-String
+      $code = $LASTEXITCODE
+      $sw.Stop()
+      [System.IO.File]::WriteAllText($log, $out, (New-Object System.Text.UTF8Encoding($false)))
+      $sum = ($out -split "`r?`n" | Where-Object { $_ -match '通过\s*\d+\s*项' } | Select-Object -Last 1)
+      if (-not $sum) { $sum = ($out -split "`r?`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -Last 1) }
+      WG ('{0,-17} {1,7:N1}s  退出码={2}   {3}' -f $it.n, $sw.Elapsed.TotalSeconds, $code, $sum.Trim())
+      WG ('   → ' + $it.why + '；日志：' + $log)
+      Write-Output ('  ' + $it.n + '  退出码=' + $code + '   ' + $sum.Trim())
+    }
+  } finally { Pop-Location }
+  WG ''
+  WG '说明：本模式**逐个**跑，故不会触发 E55（无 git 的机器跑全量 run-all 会误报"权威数字漂移"）。'
+  WG '请把本报告 ＋ 日志目录里的 .log 一并回传（主代理据此登记）。'
+  [System.IO.File]::WriteAllText($repG, ($G -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+  Write-Output ('完成。报告：' + $repG)
+  exit 0
+}
 
 $Lines = New-Object System.Collections.Generic.List[string]
 function W($s) { $script:Lines.Add([string]$s) }

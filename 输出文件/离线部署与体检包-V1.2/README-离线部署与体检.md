@@ -1,6 +1,6 @@
 # 离线部署与体检包 —— V1.2（看板主机：联想开天 M630Z）—— 不需要外网
 
-> 包版本：**V1.2**（2026-09-29；改动请升版本号并同步本节）
+> 包版本：**V1.2a**（2026-09-29；改动请升版本号并同步本节）
 > 用途：在**没有网络**的到货主机上完成"部署环境检查"，并把实测读数带回开发机登记。
 > 依据：需求 `ENV-01`/`ENV-16`/`ENV-20`、`DEP-04`、`NFR-05`；技术债 **Q-26**（Windows 版本与兆芯平台驱动适配）；**ADR-0002**（运行时基线＝ Node 24 LTS）。
 > 前提：本项目**零 npm 依赖** —— 目标机只需要 **Node 24**，其余全部从仓库直接跑，无需联网、无需 `npm install`。
@@ -17,6 +17,7 @@
 | `SHASUMS256.txt` | 官方校验和。核对：`certutil -hashfile node-v24.21.0-win-x64.zip SHA256` 与其中一行比对（V1.0 出包实测＝ `158F7685B44DE51F6C0DF1D153526CBCD3E1BC739A8DFC607721CEF75DE9E541`） |
 | `部署环境体检.ps1` | 体检脚本：**只读采集、不改系统**（**UTF-8 带 BOM**，PS 5.1 可直接读）。唯第六节在仓库就位时会跑仓库自带门禁，那一步只写 `<仓库>\tests\._verify\` 下的日志/账本 |
 | `配置-DEP04.cmd` | **DEP-04 无人值守配置入口**（**纯 ASCII ＋ CRLF**，**会自行请求管理员权限**）⇒ 调同一个 `.ps1` 的 `-ConfigureDep04` 模式；改完回读并产出 `DEP04配置报告-*.txt`。详见 §4.1 |
+| `跑现场门禁.cmd` | **浏览器/视觉类门禁的逐个运行入口**（纯 ASCII ＋ CRLF，**不需管理员**）⇒ 调同一个 `.ps1` 的 `-RunFieldGates`：自动找仓库与包内 Node，逐个跑 `capture-baseline`／`screenshot-diff`／`browser-check`／`overlap-check`／`stress-check`，各落一份日志 ＋ 一份汇总报告。**别手敲 `node tests\…`**（现场曾把 `tests\` 敲成 `test\`）。详见 §4.3 |
 | `._edge\` | **Edge 离线升级件**（`MicrosoftEdgeEnterpriseX64-154.0.4258.37.msi`，202.8 MB；浏览器类门禁需 Edge ≥ 112，现场是 92）。**点号目录** ⇒ 不入库、不被 `files-check` 扫描。详见 §4.2 |
 | `体检-双击运行.cmd` | 双击入口（**纯 ASCII ＋ CRLF**，避免 cmd 按 OEM 代码页读中文而定位不到脚本 —— 见 `E49`）；**自动定位包内 `._node\` 并只在本次运行内前置到 PATH** |
 | `._node\` | **已解压好的便携 Node 24.21.0**（`node.exe`，与开发机同版本）。**点号前缀是故意的**：解压出来的 Node 树含 **1668 个文本文件（1124 个 `.js`）**，落在被扫描目录会**直接打红本仓的 `files-check`**（2026-09-28 实测：扫描数 141 → 1809）；点号目录会被文件卫生门禁与 `.gitignore` 双双跳过，而 Windows 资源管理器照常显示 |
@@ -120,6 +121,23 @@ D:\production-dashboard\输出文件\离线部署与体检包-V1.2\
 > 官方入口 `https://www.microsoft.com/edge/business/download`；元数据（可脚本复核版本/大小/SHA256）`https://edgeupdates.microsoft.com/api/products?view=enterprise`。
 > 核对命令：`certutil -hashfile MicrosoftEdgeEnterpriseX64-154.0.4258.37.msi SHA256`。
 
+### 4.3 浏览器/视觉类门禁（**双击 `跑现场门禁.cmd`**，不需管理员）
+
+**别手敲 `node tests\…`** —— 2026-09-29 现场把 `tests\` 敲成了 `test\`，报 `Cannot find module`。双击 `跑现场门禁.cmd` 即可，它会**自动找仓库与包内 Node**，**逐个**跑下列五项，并把每项输出落一份日志、最后写一份汇总报告：
+
+| 顺序 | 脚本 | 作用 | 备注 |
+| --- | --- | --- | --- |
+| 1 | `capture-baseline.js` | 生成**候选截图** | `screenshot-diff` 的前置；需 Edge ≥ 112（现场已 154） |
+| 2 | `screenshot-diff.js` | 视觉回归（逐像素） | 基线为 **1920×1080**，与替代屏一致 ⇒ 有意义 |
+| 3 | `browser-check.js` | 真实浏览器（无头 Edge ＋ CDP） | |
+| 4 | `overlap-check.js` | 元素重叠检测 | |
+| 5 | `stress-check.js` | 长跑稳定性 | 默认 **5 分钟**（`--soak` 才整班次） |
+
+产出：`._env-report\现场门禁报告-<主机名>-<时间戳>.txt` ＋ `._env-report\现场门禁日志-<时间戳>\<脚本>.log` —— **一并回传**。
+
+> **为什么"逐个"而不是跑全量**：目标机没有 git ⇒ `harness-check` 少 2 条、`docs-check` 失败数也不同，与权威区声明的数字对不上，全量 `run-all` 会打印"**权威数字已漂移**"的**假警报**（技术债 `E55`）。逐个跑不受影响。
+> 只想跑其中几项时（例如只补视觉回归）：PowerShell 里执行
+> `powershell -NoProfile -ExecutionPolicy Bypass -File 部署环境体检.ps1 -RunFieldGates -Only capture-baseline,screenshot-diff`
 ## 5. 把什么带回来
 
 - `._env-report\部署环境体检报告-*.txt`（**原样回传**，第六节含门禁输出）
