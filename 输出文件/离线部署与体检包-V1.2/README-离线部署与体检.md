@@ -154,7 +154,7 @@ D:\production-dashboard\输出文件\离线部署与体检包-V1.2\
 - **75 寸屏暂不可用**（工位放不下）⇒ 现场先用**其他小屏替代**做环境检查。**验收口径不变**：`UI-00`/§1 的 75 寸显示、`AC-04` 的 4～8 m 可读性、`UI-09`/`UI-18` 的动效与防烧屏**仍需 75 寸屏**在终验收时人工确认。
 - 小屏下看板会按 `min(innerWidth/3840, innerHeight/2160)` **整体缩放显示**（不会错位、不会滚动条），因此把分辨率/缩放的实测值**照实登记**即可，不要按"看起来正常"判断达标。
 - **Edge 版本（**重要**，2026-09-29 现场实测）**：浏览器类门禁脚本用 `--headless=new`，**需要 Edge/Chrome ≥ 112**。现场机（DESKTOP-1K4A22L）Edge 为 **92.0.902.67** ⇒ `browser-check`／`overlap-check`／`capture-baseline`／`stress-check` **跑不了**（第六节会出现相应红项，且报错**不会**点名"Edge 太旧"）。**现场无网** ⇒ **已随包带 Edge 离线升级件**（V1.2 的 `._edge\MicrosoftEdgeEnterpriseX64-154.0.4258.37.msi`），**2026-09-29 现场已升级成功**：`msedge 版本 92.0.902.67 → 154.0.4258.37` ⇒ 浏览器类脚本可**逐个**在目标机跑（命令与注意事项见 §4.2；**别跑全量** —— 见 `E55`）。
-- **`screenshot-diff` 在干净机器上必红**：它把 `tests\._verify\captures` 里的候选图与 `tests\screenshots-baseline\` 逐像素比；**新机器没有候选图** ⇒ 按设计"空候选不算通过"报 3 条红。若要在现场比对：先 `node tests\capture-baseline.js`（需 Edge ≥ 112）生成候选，再 `node tests\screenshot-diff.js`。基线是 **1920×1080**，与替代屏分辨率一致 ⇒ 在替代屏上比对**是有意义的**。
+- **`screenshot-diff` 在干净机器上首轮必红、跑过 `capture-baseline` 后即 24/0（现场已实测）**：它把 `tests\._verify\captures` 里的候选图与 `tests\screenshots-baseline\` 逐像素比；**新机器没有候选图** ⇒ 按设计"空候选不算通过"报 3 条红。正确顺序：先 `node tests\capture-baseline.js`（需 Edge ≥ 112）再 `node tests\screenshot-diff.js`。基线是 **1920×1080**，与替代屏分辨率一致；**2026-09-29 现场实测 24/0**，逐图差异 0.32%～**4.90%**（**07-公告备注最接近 5% 阈值** —— 文字密集面板的字体/抗锯齿平台差，属观察项）。
 - **第六节中文乱码已在 V1.1a 修复**（旧版把 node 的 UTF-8 输出按 GBK 解码成 `閫氳繃`）；报告头现在会打印 `控制台输出编码`，若非 `utf-8` 即说明该行仍不可读。
 - **核心门禁在兆芯 Win10 上全绿**（`contract`/`ui`/`tools`/`files`/`logic`/`db`/`platform`/`trace`/`copy` 九项通过）—— 现场首份报告已证实平台适配层口径成立；第六节的红项**只有**上面三类可解释来源。
 - 目标机**没网**是预期情况：本体检**完全离线可跑**；需要外网的只有"真实 MES／上位机联调"，那不属于环境体检。
