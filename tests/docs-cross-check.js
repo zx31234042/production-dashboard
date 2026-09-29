@@ -842,6 +842,75 @@ function main() {
     '账本里那条还只是它中途落盘的数；其漂移由 run-all 收尾的 verifyAuthorityTotals 按合计拦截）' +
     `｜实跑探针墙钟 ${probeWallMs} ms`);
 
+  /* ---------------- 十五、正文"当前值"穷举校验（E51，2026-09-30 补） ----------------
+     立案（2026-09-28 登记）：本文件原先只校验**权威区**（`tests\README.md` 第三节）的数字，
+     **其它文档正文里的叙述性数字无人守** ⇒ 已实测滞后两次：架构/快照引"权威区合计 690 ＝ 690
+     （真实通过 688）"、快照一屏速览写"165/259（63.7%）＋ 153/259（59.1%）"。
+     本节把"**当前值区**"用**唯一标记**圈出来（不再按"整个 §一"取 —— §一 混着 714/773/590 这类
+     过去轮次的数字，且历史回执行 `> **09-…` 一律**故意不动**），在这些区域里**穷举**抓取下列家族：
+       ① 门禁三元组 `门禁 … N 通过 / M 失败 / K 跳过`（对**权威区声明值**；该值已由第十/十一节对实跑校验）
+       ② `可追溯覆盖 N/M` ③ `离线可验证 N/M` ④ `AC 覆盖 N/M`（对 **`trace-check` 实跑值**）
+       ⑤ `tests\ 共 N 个`（对**文件系统**：`tests\*.js` 顶层脚本数）
+     锚点找不到 ⇒ **判红**（防文档改结构后本检查被静默架空）；某家族在区域内一处都没有 ⇒ 进"未覆盖清单"
+     （只提示），但**门禁三元组与可追溯覆盖必须各有 ≥1 处**（防"把声明删掉就没人守了"）。 */
+  {
+    const snapSrc51 = read('项目记录/当前状态快照.md');
+    const archSrc51 = read('项目架构与技术栈.md');
+    const roadSrc51 = read('项目记录/后续路线图.md');
+    const pickLine = (src, pred) => (src.split(/\r?\n/).find(pred) || null);
+    const regions = [
+      { name: '快照一屏速览行', txt: pickLine(snapSrc51, l => l.includes('全量 16 个') && l.includes('门禁')) },
+      { name: '快照「跑一遍门禁看结论」行', txt: pickLine(snapSrc51, l => l.includes('跑一遍门禁看结论')) },
+      { name: '架构「门禁总数（当前）」行', txt: pickLine(archSrc51, l => l.includes('门禁总数（当前）')) },
+      { name: '路线图头部基线行', txt: pickLine(roadSrc51.split(/\r?\n/).slice(0, 12).join('\n'), l => /门禁\s*\d+\s*通过/.test(l)) }
+    ];
+    const miss51 = regions.filter(r => !r.txt).map(r => r.name);
+    t.check('E51 前提：四个"当前值区"锚点都可定位（文档改结构必须同步本节，不许静默架空）',
+      miss51.length === 0, miss51.length ? `定位不到：${miss51.join('、')}` : `四区齐备（${regions.map(r => r.name).join('、')}）`);
+    const body51 = regions.filter(r => r.txt).map(r => r.txt).join('\n');
+    /* 期望值：① 权威区声明 ② trace-check 实跑 ③ 文件系统 */
+    const authLine51 = (readmeSrc.split('\n').find(l => l.includes('离线可跑部分')) || '');
+    const expTriple51 = (authLine51.match(/合计\s*\*{0,2}(\d+)\s*通过\s*\/\s*(\d+)\s*失败\s*\/\s*(\d+)\s*跳过/) || []).slice(1).map(Number);
+    const tr51 = probe('trace-check');
+    const numPair = (src, re) => (src.match(re) || []).slice(1).map(Number);
+    const expCov51 = numPair(tr51.out, /可追溯覆盖[^\d]*(\d+)\s*\/\s*(\d+)/);
+    const expOff51 = numPair(tr51.out, /离线可验证覆盖[^\d]*(\d+)\s*\/\s*(\d+)/);
+    const expAc51 = numPair(tr51.out, /AC 覆盖[^\d]*(\d+)\s*\/\s*(\d+)/);
+    const jsCount51 = fs.readdirSync(env.paths.tests).filter(n => n.endsWith('.js')).length;
+    const fams51 = [
+      { name: '门禁三元组', re: /门禁[^\d]{0,12}(\d+)\s*通过\s*\/\s*(\d+)\s*失败\s*\/\s*(\d+)\s*跳过/g, exp: expTriple51, must: true },
+      { name: '可追溯覆盖', re: /(?:可)?追溯覆盖[^\d]{0,12}(\d+)\s*\/\s*(\d+)/g, exp: expCov51, must: true },
+      { name: '离线可验证', re: /离线可验证[^\d]{0,12}(\d+)\s*\/\s*(\d+)/g, exp: expOff51, must: false },
+      { name: 'AC 覆盖', re: /AC 覆盖[^\d]{0,8}(\d+)\s*\/\s*(\d+)/g, exp: expAc51, must: false },
+      { name: 'tests\\*.js 个数', re: /tests\\[^\d]{0,14}(\d+)\s*个/g, exp: [jsCount51], must: false }
+    ];
+    const bad51 = [];
+    const zero51 = [];
+    const counts51 = [];
+    for (const fam of fams51) {
+      let hits = 0;
+      let m;
+      fam.re.lastIndex = 0;
+      while ((m = fam.re.exec(body51)) !== null) {
+        hits++;
+        const got = m.slice(1).map(Number);
+        const ok = fam.exp.length > 0 && got.length === fam.exp.length && got.every((v, i) => v === fam.exp[i]);
+        if (!ok) bad51.push(`${fam.name}：正文写 ${got.join('/')} ≠ 期望 ${fam.exp.join('/') || '（取不到实跑值）'}（"${m[0].replace(/\s+/g, ' ').trim()}"）`);
+      }
+      counts51.push(`${fam.name}=${hits}`);
+      if (hits === 0 && fam.must) zero51.push(fam.name);
+    }
+    t.check('E51 断言：正文"当前值区"里**每个**被抓到的数字都等于实跑/权威值（零失配），且门禁三元组与可追溯覆盖**各 ≥1 处**',
+      miss51.length === 0 && expTriple51.length === 3 && bad51.length === 0 && zero51.length === 0,
+      (bad51.length ? `失配 ${bad51.length} 处：${bad51.slice(0, 4).join('；')}` : '零失配')
+      + (zero51.length ? `｜**必守家族一处都没找到**：${zero51.join('、')}` : '')
+      + `｜命中计数：${counts51.join('、')}`);
+    const zeroList51 = fams51.map((f, i) => ({ n: f.name, c: Number(String(counts51[i] || '0').split('=')[1] || 0) }))
+      .filter(x => x.c === 0).map(x => x.n);
+    t.info(`E51 未覆盖清单（该家族在"当前值区"里没出现，属正常，仅记录以免"悄悄删掉"）：${zeroList51.join('、') || '无'}`);
+  }
+
+
   t.finish();
 }
 
