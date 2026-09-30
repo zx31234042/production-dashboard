@@ -3606,7 +3606,11 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     const tmpOut = path.join(os.tmpdir(), `t1-runall-${process.pid}-${suite}.log`);
     const fd = fs.openSync(tmpOut, 'w');
     const r = spawnSync(process.execPath, [runAllPath, '--no-preflight', '--only', suite],
-      { cwd: path.join(__dirname, '..'), stdio: ['ignore', fd, fd], timeout: 120 * 1000 });
+      /* `DSH_JOBS: '1'` 是**必须**的：本嵌套轮若继承外层并行度，它会在**另一个进程正在改写
+         `tests\README.md`**（本脚本第十节会把权威数字改掉再还原）时去做工作区稳定性比对，
+         于是判"工作区被改写"、退出码非 0 ⇒ §十四 的端到端断言**假红**（已实测一次）。
+         嵌套轮永远串行 —— 它验的是"结论规则"，不是吞吐。 */
+      { cwd: path.join(__dirname, '..'), stdio: ['ignore', fd, fd], timeout: 120 * 1000, env: { ...process.env, DSH_JOBS: '1' } });
     fs.closeSync(fd);
     const text = fs.readFileSync(tmpOut, 'utf8');
     fs.rmSync(tmpOut, { force: true });
@@ -3720,6 +3724,119 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       }
     })(), '变异内容：finalExitCode 只 `return verdict.exitCode ?? 0`（删掉 failed/unverified 那一支）；'
       + '变异后实测：failed=1/verdict=0 → 0 且 unverified=1 → 0（红）；恢复后实测：failed=1 → 1、干净轮 → 0（绿）');
+}
+
+/* ---------------- 十五、并行 runner 的调度契约（2026-09-29 新增） ----------------
+   背景（实测）：全量墙钟 ≈ 453 s，其中 `stress-check` **301.7 s ＝ 67%**，其余 16 个合计 ≈ 151 s
+   ⇒ 真正的浪费是"长杆独占"，不是脚本数量多。于是给 runner 加"并行波 + 串行尾"（`--jobs N`，默认串行）。
+
+   本节守三件事，缺一条并行就不许用：
+     A 静态：`serialTail` 必须标在**对并发敏感**的三个脚本上（docs-cross-check 要读全量账本；
+       docs-check 会真跑 md2docx **写盘**；files-check 要全树扫描 —— 后两者并行会互相干扰）。
+     B 默认：并发度默认 **1＝串行** —— 并行必须显式开启；否则"作证据的那条路径"会被悄悄改掉（E52）。
+     C 行为（最强）：`--fast` 串行 vs `--fast --jobs 4` **逐脚本状态/条数完全一致**，
+       且并行账本的 `ranSuites` 仍按 SUITES 原顺序（并行完成顺序是乱的，落账必须归一）。
+   实测（本机 i7-14650HX/24 逻辑核）：串行 74.2 s → 并行 43.3 s（各脚本之和 74.1 s，加速 1.71×）。 */
+{
+  const runAll15 = require('./run-all.js');
+  const src15 = fs.readFileSync(path.join(env.paths.tests, 'run-all.js'), 'utf8');
+  /* 本节自带变异加载器：不依赖第十四节块内的局部 `loadSourceVariant`（那是块级作用域，取不到）。
+     与第十四节同一手法：`Module._compile` 不落地、不碰仓库。 */
+  const loadVariant15 = src => {
+    const Module = require('node:module');
+    const m = new Module(path.join(__dirname, 'run-all.js'), null);
+    m.filename = path.join(__dirname, 'run-all.js');
+    m.paths = Module._nodeModulePaths(__dirname);
+    m._compile(src, m.filename);
+    return m.exports;
+  };
+  const serialTailNames15 = runAll15.SUITES.filter(s => s.serialTail).map(s => s.name);
+  const needTail15 = ['docs-cross-check', 'docs-check', 'files-check'];
+  t.check('§15-A 静态：对并发敏感的三个脚本必须标 `serialTail`（并行时只落在串行尾）',
+    needTail15.every(n => serialTailNames15.includes(n)),
+    `实际 serialTail = [${serialTailNames15.join('、') || '（空）'}]；期望包含 [${needTail15.join('、')}]`);
+
+  t.check('§15-B 静态：并发度默认 1（串行）—— 并行必须显式开启，不改"作证据的默认路径"（E52）',
+    /function\s+resolveJobs\(\)\s*\{[\s\S]{0,400}?if\s*\(!String\(raw\)\.trim\(\)\)\s*return\s+1;/.test(src15),
+    '在 resolveJobs() 里找不到"未显式要求即 return 1"的判据（默认值被改成并行就会命中这条）');
+
+  /* ---- C 行为：串行 vs 并行，逐脚本比对 ----
+     ⚠ **绝不能用 `--fast`**：`--fast` 的集合里含 `harness-check`（本脚本），
+     而本节又要 fork 一个 `run-all` ⇒ 子进程再跑 `harness-check` ⇒ 再 fork ⇒ **无限递归**。
+     （2026-09-29 实测踩坑：PID 每 ~60 s 换一轮 `harness-check-10000 → -23888 → -29548`
+     —— 每轮都能"通过"，所以不会报错，只会永远跑下去。）
+     改为**显式允许清单**：挑几个覆盖"串行尾"与"并行波"两类的脚本，且**不含本脚本**。 */
+  const S15_SUITES = ['contract-check', 'db-check', 'docs-check', 'files-check', 'logic-check', 'trace-check'];
+  const RECURSION_GUARD = "不允许用 --fast/--only harness-check";
+  const RUN15_TIMEOUT = 10 * 60 * 1000;
+  const runFast15 = (jobs) => {
+    /* ⚠ 必须**逗号分隔的单个 `--only`**：`optValue('--only')` 只取一个值，
+       重复传多个 `--only` 只会生效最后一个（实测过一次"共 1 个脚本"的假象）。 */
+    const args = ['--no-preflight', '--only', S15_SUITES.join(',')];
+    if (jobs > 1) args.push('--jobs', String(jobs));
+    const started = Date.now();
+    const res = spawnSync(process.execPath, [path.join(env.paths.tests, 'run-all.js'), ...args], {
+      cwd: env.paths.root, encoding: 'utf8', timeout: RUN15_TIMEOUT, maxBuffer: 64 * 1024 * 1024,
+      /* 基线轮显式 `DSH_JOBS:'1'`：否则若外层带 `DSH_JOBS`，基线轮自己就并行了，
+         §15-C 会退化成"并行 vs 并行"（对照失效），且可能让子进程再并行化。 */
+      env: { ...process.env, DSH_ENV: env.ENV_NAME, DSH_JOBS: jobs > 1 ? '' : '1' }
+    });
+    const ms = Date.now() - started;
+    let ledger = null;
+    try { ledger = JSON.parse(fs.readFileSync(path.join(env.paths.verify, 'run-totals.json'), 'utf8')); } catch { ledger = null; }
+    return { out: (res.stdout || '') + (res.stderr || ''), ms, ledger, code: res.status };
+  };
+  const shape15 = L => (L && Array.isArray(L.suites))
+    ? L.suites.map(s => `${s.name}:${s.status}:${s.summary ? s.summary.passed + '/' + s.summary.failed + '/' + s.summary.skipped : '-'}`).join(' | ')
+    : '（读不到账本）';
+
+  let ser15 = null, par15 = null;
+  try {
+    ser15 = runFast15(1);
+    /* 递归护栏（D23 意义上的"反自证"）：清单里一旦混进本脚本，就必须当场判红 —— 
+       否则整节会安静地无限递归下去（每轮都"通过"，不报错）。 */
+    if (S15_SUITES.includes('harness-check')) throw new Error(RECURSION_GUARD);
+    par15 = runFast15(4);
+  } catch (err) {
+    t.info('§15-C 未执行：' + (err && err.message));
+  }
+  const okC15 = !!(ser15 && par15 && ser15.ledger && par15.ledger
+    && shape15(ser15.ledger) === shape15(par15.ledger)
+    && JSON.stringify(ser15.ledger.assertions) === JSON.stringify(par15.ledger.assertions)
+    && ser15.ledger.ranSuites.join(',') === par15.ledger.ranSuites.join(','));
+  t.check('§15-C 行为：`--fast` 串行 vs `--fast --jobs 4` ⇒ 逐脚本状态与条数**完全一致**，且账本仍按 SUITES 原顺序',
+    okC15,
+    `串行【${shape15(ser15 && ser15.ledger)}】\n        并行【${shape15(par15 && par15.ledger)}】\n` +
+    `        串行断言 ${JSON.stringify((ser15 && ser15.ledger && ser15.ledger.assertions) || null)}；` +
+    `并行断言 ${JSON.stringify((par15 && par15.ledger && par15.ledger.assertions) || null)}`);
+
+  /* 时效：只在本机确实把"并发"体现出来时才要求（核少或脚本少时并行不一定更快，别拿硬件当缺陷） */
+  const cores15 = os.cpus().length;
+  const speedCandidate15 = !!(ser15 && ser15.ledger && ser15.ledger.ranSuites.length >= 8) && cores15 >= 4;
+  t.check('§15-D 时效：并行墙钟 < 串行墙钟（仅在核数与脚本数足够时判定，避免拿硬件差异当缺陷）',
+    !speedCandidate15 || !!(par15 && ser15 && par15.ms < ser15.ms),
+    !speedCandidate15
+      ? `不判定（核 ${cores15}、脚本 ${ser15 && ser15.ledger ? ser15.ledger.ranSuites.length : '?'}）`
+      : `串行 ${(ser15.ms / 1000).toFixed(1)}s → 并行 ${(par15.ms / 1000).toFixed(1)}s`);
+
+  /* D22 定点变异：把 docs-cross-check 的 serialTail 去掉 ⇒ A 必须变红（证明不是恒真断言） */
+  t.check('§15-E D22 变异：去掉 `docs-cross-check` 的 `serialTail` ⇒ §15-A 判据必红；恢复后回绿',
+    (() => {
+      const anchor = "{ name: 'docs-cross-check', desc: '跨文档一致性 + 权威数字校验', needBrowser: false, slow: false, serialTail: true }";
+      if (!src15.includes(anchor)) { t.info('§15-E 变异锚点未命中（清单那行被改过）'); return false; }
+      const mutatedSrc = src15.replace(anchor, anchor.replace(', serialTail: true', ''));
+      let mutated = null;
+      try { mutated = loadVariant15(mutatedSrc); } catch (err) { t.info('§15-E 变异体载入失败：' + (err && err.message)); return false; }
+      const mutatedTails = mutated.SUITES.filter(s => s.serialTail).map(s => s.name);
+      const mutatedRed = !needTail15.every(n => mutatedTails.includes(n));
+      const currentGreen = needTail15.every(n => serialTailNames15.includes(n));
+      return mutatedRed && currentGreen;
+    })(),
+    '变异内容：删掉 docs-cross-check 那条的 `serialTail: true`（它并行时会在别的脚本还没跑完时去读账本）');
+  try {
+    fs.writeFileSync(path.join(env.paths.verify, 's15-parallel-runs.txt'),
+      JSON.stringify({ serialMs: ser15 && ser15.ms, parallelMs: par15 && par15.ms, serial: shape15(ser15 && ser15.ledger), parallel: shape15(par15 && par15.ledger) }, null, 2), 'utf8');
+  } catch { /* 忽略 */ }
 }
 
 t.finish();

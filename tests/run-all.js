@@ -17,7 +17,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { spawnSync } = require('node:child_process');
+const { spawnSync, spawn } = require('node:child_process');
 
 const snapshot = require('./lib/snapshot');
 
@@ -46,15 +46,81 @@ const optValue = name => {
   return i >= 0 && argv[i + 1] ? argv[i + 1] : null;
 };
 
+/* ---------------- 并行调度（--jobs N） ----------------
+   背景（2026-09-29 实测）：全量墙钟 ≈ 453 s，其中 **`stress-check` 301.7 s ＝ 67%**，
+   其余 16 个合计才 ≈ 151 s（`browser-check` 46.7 / `harness-check` 34.2 / `overlap-check` 31.0 /
+   `tools-check` 24.3 / 其余 ≈ 15）。**耗时集中在一个脚本上**，而不是"脚本太多"。
+   于是最划算的做法是把 `stress-check` 这根"长杆"与其余脚本**重叠**跑，
+   而不是去压那 151 s 的小头（离线 12 个门禁已实测：串行 70.0 s → 4 worker 36.4 s，加速 1.5×，
+   地板是 `harness-check` 自身 34.5 s）。
+
+   **为什么可以并行**：16 个脚本各自独立进程、端口已天然隔离
+   （`browser-check` 18920 / `stress-check` 18930 / `capture-baseline` 18940 / `overlap-check` 18950，
+   各读自己的 `DSH_*_PORT`；`tools-check` 用 18901～18909，`harness-check` 用 `DSH_PORT`/`DSH_BOARD_PORT`），
+   且 `tests\lib\snapshot.js` 的稳定性扫描已排除 `tests\._verify\` —— 各脚本的日志/临时库写入
+   不会被误判成"工作区被改写"。
+
+   **为什么有尾巴必须串行**（`serialTail`）：见 SUITES 里四条标注。
+   并行只改"谁和谁同时跑"，**不改任何断言与判据**；并发度默认 4（`DSH_JOBS` 或 `--jobs` 可覆盖）。 */
+
+/** 调度：把 suites 拆成 [并行波, 串行尾]，并保持各自在 SUITES 里的原顺序。 */
+function scheduleSuites(suites, jobs) {
+  /* `--only`（定点重跑）**一律串行**：它是"复跑某一个脚本来复核/取证"的语义，
+     并行既没有收益（通常只有一个脚本），又会让"工作区稳定性"判据在**别的进程正在改写
+     共享文件**时被触发 —— 实测过一次：嵌套轮（harness-check 端到端里 spawn 的
+     `run-all --only contract-check`）继承了 `DSH_JOBS`，于是它自己也并行，
+     正好撞上另一个进程改写 `tests\README.md` ⇒ 判"工作区被改写"、整轮不作证据。 */
+  if (!(jobs > 1) || optValue('--only')) return { parallel: [], serial: suites.slice(), jobs: 1 };
+  const parallel = suites.filter(s => !s.serialTail);
+  const serial = suites.filter(s => s.serialTail);
+  return { parallel, serial, jobs };
+}
+
+/** 有界并发：同时最多 `limit` 个子进程；结果按传入顺序返回（与串行的输出顺序一致）。 */
+async function runPool(items, limit, worker) {
+  const out = new Array(items.length);
+  let next = 0;
+  const n = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: n }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await worker(items[i], i);
+    }
+  }));
+  return out;
+}
+
+/**
+ * 解析并发度。**默认 1＝串行**（与历史行为逐字一致）——并行必须**显式开启**。
+ *
+ * 为什么默认不并行：本项目"作证据"的那条路径是**串行全量**（E52：一轮收口只跑一次全量），
+ * 它的时序与读数不该被并发改动悄悄改掉；并行是给"迭代期反复跑"用的加速档。
+ * 开启方式：`--jobs N` 或环境变量 `DSH_JOBS=N`（上限 16）。
+ * 推荐值 4：本机 24 逻辑核足够，而**被验目标机是 8 核 8 线程**（兆芯 KX-U6780A），4 已能喂满；
+ * 再高只会让 `harness-check`/`browser-check` 这类自身较重的脚本互相抢 CPU，反而拉长墙钟。
+ */
+function resolveJobs() {
+  const raw = optValue('--jobs') || process.env.DSH_JOBS || '';
+  if (!String(raw).trim()) return 1;                 // 未显式要求 ⇒ 串行
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.max(1, Math.min(16, Math.floor(n)));
+}
+
 /* ---------------- 门禁清单 ----------------
    needBrowser 脚本在受限环境（沙箱禁命名管道）会自行 SKIP，runner 据此归类为"跳过"。
-   slow 脚本默认在 --fast 下不跑。 */
+   slow 脚本默认在 --fast 下不跑。
+   serialTail 脚本**只在串行尾段跑**（见下方 scheduleSuites）：它们对"别的脚本正在跑"敏感，
+   不能进 `--jobs N` 的并行波 —— 详见 serialTail 的逐条理由。 */
 const SUITES = [
   { name: 'contract-check', desc: '字段契约与适配层', needBrowser: false, slow: false },
   { name: 'ui-check', desc: '界面结构与需求条款', needBrowser: false, slow: false },
   { name: 'tools-check', desc: '联调工具进程级行为', needBrowser: false, slow: false },
-  { name: 'docs-check', desc: '文档与规范一致性', needBrowser: false, slow: false },
-  { name: 'files-check', desc: '编码与文件卫生', needBrowser: false, slow: false },
+  /* docs-check 走串行尾段：它会调 PowerShell 真跑一遍 md2docx（**会写盘**），
+     而 files-check 要扫描整棵树 —— 两者并行会互相干扰（写盘 vs 全树扫描）。 */
+  { name: 'docs-check', desc: '文档与规范一致性', needBrowser: false, slow: false, serialTail: true },
+  { name: 'files-check', desc: '编码与文件卫生', needBrowser: false, slow: false, serialTail: true },
   { name: 'harness-check', desc: '夹具自检（时钟/样本/注入/服务启停）', needBrowser: false, slow: false },
   { name: 'logic-check', desc: '当班统计与班次边界（FR-4 / DR-17）', needBrowser: false, slow: false },
   { name: 'db-check', desc: '本地库结构与仓储层', needBrowser: false, slow: false },
@@ -63,8 +129,9 @@ const SUITES = [
   { name: 'copy-check', desc: '界面文案与需求条款对照', needBrowser: false, slow: false },
   { name: 'screenshot-diff', desc: '界面视觉回归', needBrowser: false, slow: false },
   /* 放在**最后**：它是跨文档/总账性质的聚合检查，要靠前面跑完的实跑账去比对
-     `tests\README.md` 的权威数字（P2-22）；排在前面会读到不完整的账。 */
-  { name: 'docs-cross-check', desc: '跨文档一致性 + 权威数字校验', needBrowser: false, slow: false },
+     `tests\README.md` 的权威数字（P2-22）；排在前面会读到不完整的账。
+     `serialTail: true` 让它在 `--jobs N` 并行模式下**也**一定落在最后（见 scheduleSuites）。 */
+  { name: 'docs-cross-check', desc: '跨文档一致性 + 权威数字校验', needBrowser: false, slow: false, serialTail: true },
   { name: 'browser-check', desc: '真实浏览器（无头 Edge + CDP）', needBrowser: true, slow: false },
   { name: 'overlap-check', desc: '元素重叠检测', needBrowser: true, slow: false },
   /* slow 仍为 true：默认 20 分钟虽不再是"整夜浸泡"，但仍是本仓最耗时的一类（起真浏览器 + 采样），
@@ -204,6 +271,70 @@ function runScript(suite, pipesOk, quiet) {
   }
   const verdict = classify(res.status, summary, out);
   return { ...verdict, ms, out, summary, logFile, exit: res.status };
+}
+
+/**
+ * **异步版** runScript —— 行为与上面**逐字一致**（同一日志命名、同一落盘、同一 classify 判据），
+ * 唯一差别是它不阻塞事件循环，因而多个 suite 可以真并发。
+ *
+ * 为什么要单独加一个异步版而不是把同步版改成异步：**默认串行路径必须保持原样**。
+ * 串行是本项目"作证据"的那条路径（E52：一轮收口只跑一次全量），它的时序不该被并行化改动碰到。
+ * 于是同步版**原封不动**，异步版只服务于 `--jobs N` 的并行波。
+ */
+function runScriptAsync(suite, pipesOk, quiet, sink) {
+  return new Promise(resolve => {
+    const file = path.join(env.paths.tests, suite.name + '.js');
+    const started = Date.now();
+
+    const logDir = env.ensureDir(path.join(env.paths.verify, 'run-all'));
+    const logFile = path.join(logDir, `${suite.name}-${process.pid}.log`);
+    if (fs.existsSync(logFile)) { try { fs.rmSync(logFile, { force: true }); } catch { /* 忽略 */ } }
+
+    const opts = {
+      cwd: env.paths.root,
+      env: { ...process.env, DSH_ENV: env.isProd ? 'test' : env.ENV_NAME }
+    };
+
+    const fd = fs.openSync(logFile, 'a');
+    let child;
+    try {
+      child = spawn(process.execPath, [file], { ...opts, stdio: ['ignore', fd, fd] });
+    } catch (err) {
+      try { fs.closeSync(fd); } catch { /* 忽略 */ }
+      resolve({ status: 'error', detail: err.code || err.message, ms: Date.now() - started, out: '', summary: null, logFile, exit: null });
+      return;
+    }
+
+    /* 超时与同步版同口径：慢脚本 12 h、其余 10 min。到期 kill 并记为异常（不静默记绿）。 */
+    const timeoutMs = suite.slow ? 12 * 3600 * 1000 : 10 * 60 * 1000;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { child.kill(); } catch { /* 忽略 */ } }, timeoutMs);
+
+    child.on('error', err => {
+      clearTimeout(timer);
+      try { fs.closeSync(fd); } catch { /* 忽略 */ }
+      resolve({ status: 'error', detail: err.code || err.message, ms: Date.now() - started, out: '', summary: null, logFile, exit: null });
+    });
+
+    child.on('close', code => {
+      clearTimeout(timer);
+      try { fs.closeSync(fd); } catch { /* 忽略 */ }
+      const ms = Date.now() - started;
+      let out = '';
+      try { out = fs.readFileSync(logFile, 'utf8'); } catch { out = ''; }
+      if (timedOut) {
+        resolve({ status: 'error', detail: `超时（>${Math.round(timeoutMs / 1000)}s）被终止`, ms, out, summary: parseSummary(out), logFile, exit: code });
+        return;
+      }
+      if (!quiet && out) {
+        if (sink) sink.push(out);            // 并行波：先收着，避免多脚本输出交错
+        else process.stdout.write(out);
+      }
+      const summary = parseSummary(out);
+      const verdict = classify(code, summary, out);
+      resolve({ ...verdict, ms, out, summary, logFile, exit: code });
+    });
+  });
 }
 
 /**
@@ -576,11 +707,11 @@ function finalExitCode(entry) {
   return verdict.exitCode ?? 0;
 }
 
-function main() {
+async function main() {
   if (hasFlag('--list')) {
     console.log('=== 门禁脚本清单 ===');
     for (const s of SUITES) {
-      console.log(`  ${s.name.padEnd(20)} ${s.desc}${s.needBrowser ? '  [需浏览器]' : ''}${s.slow ? '  [耗时长]' : ''}`);
+      console.log(`  ${s.name.padEnd(20)} ${s.desc}${s.needBrowser ? '  [需浏览器]' : ''}${s.slow ? '  [耗时长]' : ''}${s.serialTail ? '  [串行尾]' : ''}`);
     }
     process.exit(0);
   }
@@ -601,7 +732,7 @@ function main() {
 
   console.log('=== 统一门禁（run-all） ===');
   console.log(`  ${env.describe()}`);
-  console.log(`  共 ${suites.length} 个脚本${hasFlag('--fast') ? '（--fast：已跳过浏览器类与长跑）' : ''}\n`);
+  console.log(`  共 ${suites.length} 个脚本${hasFlag('--fast') ? '（--fast：已跳过浏览器类与长跑）' : ''}${resolveJobs() > 1 ? `（--jobs ${resolveJobs()}：并行波 + 串行尾）` : ''}\n`);
 
   /* **运行开始时**的工作区快照（见上方"工作区稳定性判定"与 lib/snapshot.js）。
      采集点很关键：必须在**任何子进程（含体检）启动之前** —— 体检与各门禁脚本都读工作区，
@@ -646,18 +777,72 @@ function main() {
     console.log('');
   }
 
+  /* ---------------- 执行（串行 by default；--jobs N 时先并行波、再串行尾） ----------------
+     **结论口径不变**：两种模式产出的 results 集合、顺序、状态判定、落盘账本与收尾对账完全一致；
+     并行只改"谁和谁同时跑"。串行路径（jobs=1）走的是**原封不动**的同步实现。 */
+  const jobs = resolveJobs();
+  const plan = scheduleSuites(suites, jobs);
   const results = [];
-  for (const s of suites) {
+  const resultsByName = new Map();
+  const startedAt = Date.now();
+
+  const pushResult = (s, r) => {
+    resultsByName.set(s.name, { suite: s, ...r });
+    results.push({ suite: s, ...r });
+  };
+
+  if (plan.parallel.length) {
+    console.log(`  ▶ 并行波 ${plan.parallel.length} 个（并发 ${plan.jobs}）：${plan.parallel.map(s => s.name).join('、')}`);
+    if (plan.serial.length) console.log(`  ▶ 串行尾 ${plan.serial.length} 个（对并发敏感，必须最后跑）：${plan.serial.map(s => s.name).join('、')}`);
+    console.log('');
+    if (quiet) plan.parallel.forEach(s => process.stdout.write(`  运行 ${s.name.padEnd(20)} … `));
+
+    const buffers = new Map();
+    const wave = await runPool(plan.parallel, plan.jobs, async (s) => {
+      const sink = [];
+      buffers.set(s.name, sink);
+      const r = await runScriptAsync(s, pipes.ok, quiet, quiet ? null : sink);
+      /* 非安静模式：该脚本的输出在它**跑完时**整段回放（并行时不能边跑边写，否则多脚本明细交错） */
+      if (!quiet && sink.length) process.stdout.write(sink.join(''));
+      if (quiet) {
+        const mark = { passed: '通过', failed: '失败', skipped: '跳过', error: '异常', unverified: '未核实' }[r.status];
+        const sum = r.summary ? `（通过 ${r.summary.passed} / 失败 ${r.summary.failed} / 跳过 ${r.summary.skipped}）` : '';
+        process.stdout.write(`${mark} ${(r.ms / 1000).toFixed(1)}s ${sum}\n`);
+      } else {
+        const mark = { passed: '通过', failed: '失败', skipped: '跳过', error: '异常', unverified: '未核实' }[r.status];
+        const sum = r.summary ? `（通过 ${r.summary.passed} / 失败 ${r.summary.failed} / 跳过 ${r.summary.skipped}）` : '';
+        console.log(`${mark} ${(r.ms / 1000).toFixed(1)}s ${sum}${r.detail ? ' ' + r.detail : ''}`);
+      }
+      return { suite: s, ...r };
+    });
+
+    /* 账本按 **SUITES 原顺序** 落盘：writeRunTotals 的语义是"截至此刻已经跑完哪些脚本"，
+       并行下完成顺序是乱的，按原顺序重建可让 `docs-cross-check` 读到的账与串行完全同形。 */
+    wave.forEach(r => resultsByName.set(r.suite.name, r));
+    const ordered = () => plan.parallel.map(s => resultsByName.get(s.name)).filter(Boolean);
+    for (const r of ordered()) results.push(r);
+    writeRunTotals(results);
+  }
+
+  /* 串行尾（以及 jobs=1 时的全部）：逐条跑，每跑完一条就更新落盘（保留 P2-22 的单向契约） */
+  for (const s of plan.serial) {
     if (quiet) process.stdout.write(`  运行 ${s.name.padEnd(20)} … `);
     else console.log(`\n  ── 运行 ${s.name}（${s.desc}）──`);
     const r = runScript(s, pipes.ok, quiet);
-    results.push({ suite: s, ...r });
+    pushResult(s, r);
     const mark = { passed: '通过', failed: '失败', skipped: '跳过', error: '异常', unverified: '未核实' }[r.status];
     const sum = r.summary ? `（通过 ${r.summary.passed} / 失败 ${r.summary.failed} / 跳过 ${r.summary.skipped}）` : '';
     console.log(`${mark} ${(r.ms / 1000).toFixed(1)}s ${sum}${r.detail ? ' ' + r.detail : ''}`);
     /* **每跑完一个就更新落盘**，而不是等收尾 —— 因为 `docs-cross-check` 本身是 suite 成员，
-       它要在自己运行时读到"截至此刻的实跑账"，等收尾写就永远读到上一轮的旧账（P2-22）。 */
+       它要在自己运行时读到"截至此刻的实跑账"，等收尾写就永远读到上一轮的旧账（P2-22）。
+       `docs-cross-check` 是串行尾的最后一个，故它运行时账本已含并行波的全部结果。 */
     writeRunTotals(results);
+  }
+
+  /* 与串行模式逐字一致的"总耗时"参考（并行下墙钟 < 各脚本之和，属预期） */
+  if (jobs > 1) {
+    const sumMs = results.reduce((a, r) => a + (r.ms || 0), 0);
+    console.log(`\n  ⏱ 并行模式耗时：墙钟 ${((Date.now() - startedAt) / 1000).toFixed(1)}s ｜ 各脚本之和 ${(sumMs / 1000).toFixed(1)}s ｜ 并发 ${plan.jobs}`);
   }
 
   /* 安静模式：把各脚本日志路径列出来，保证输出仍可查阅（不隐藏信息） */
@@ -853,10 +1038,8 @@ module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTot
   REGISTERED_DEVIATIONS, failedAssertionNames, resolveGateOutcome, finalExitCode };
 
 if (require.main === module) {
-  try {
-    main();
-  } catch (err) {
+  main().catch(err => {
     console.error('\nrunner 异常终止：' + (err && err.stack ? err.stack : err));
     process.exit(2);
-  }
+  });
 }
