@@ -859,14 +859,15 @@ function main() {
     const roadSrc51 = read('项目记录/后续路线图.md');
     const pickLine = (src, pred) => (src.split(/\r?\n/).find(pred) || null);
     const regions = [
-      { name: '快照一屏速览行', txt: pickLine(snapSrc51, l => l.includes('全量 16 个') && l.includes('门禁')) },
-      { name: '快照「跑一遍门禁看结论」行', txt: pickLine(snapSrc51, l => l.includes('跑一遍门禁看结论')) },
-      { name: '架构「门禁总数（当前）」行', txt: pickLine(archSrc51, l => l.includes('门禁总数（当前）')) },
-      { name: '路线图头部基线行', txt: pickLine(roadSrc51.split(/\r?\n/).slice(0, 12).join('\n'), l => /门禁\s*\d+\s*通过/.test(l)) }
+      { name: '快照一屏速览行', txt: pickLine(snapSrc51, l => l.includes('全量 16 个') && l.includes('门禁')), must: true },
+      { name: '快照「跑一遍门禁看结论」行', txt: pickLine(snapSrc51, l => l.includes('跑一遍门禁看结论')), must: true },
+      { name: '架构「当前值（本行由 docs-cross-check 第十五节守护）」行', txt: pickLine(archSrc51, l => l.includes('当前值（本行由') && l.includes('守护')), must: true },
+      { name: '架构「门禁总数（当前）」行（旧锚点，可选）', txt: pickLine(archSrc51, l => l.includes('门禁总数（当前）')), must: false },
+      { name: '路线图头部基线行', txt: pickLine(roadSrc51.split(/\r?\n/).slice(0, 12).join('\n'), l => /门禁\s*\d+\s*通过/.test(l)), must: true }
     ];
-    const miss51 = regions.filter(r => !r.txt).map(r => r.name);
-    t.check('E51 前提：四个"当前值区"锚点都可定位（文档改结构必须同步本节，不许静默架空）',
-      miss51.length === 0, miss51.length ? `定位不到：${miss51.join('、')}` : `四区齐备（${regions.map(r => r.name).join('、')}）`);
+    const miss51 = regions.filter(r => r.must && !r.txt).map(r => r.name);
+    t.check('E51 前提："当前值区"锚点都可定位（文档改结构必须同步本节，不许静默架空）',
+      miss51.length === 0, miss51.length ? `定位不到：${miss51.join('、')}` : `${regions.filter(r => r.txt).length} 区命中（${regions.filter(r => r.txt).map(r => r.name).join('、')}）`);
     const body51 = regions.filter(r => r.txt).map(r => r.txt).join('\n');
     /* 期望值：① 权威区声明 ② trace-check 实跑 ③ 文件系统 */
     const authLine51 = (readmeSrc.split('\n').find(l => l.includes('离线可跑部分')) || '');
