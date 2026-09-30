@@ -36,6 +36,10 @@ const platformPaths = require('../platform/paths');
 const platformClock = require('../platform/clock');
 const { createLogger } = require('../platform/log');
 const dbApi = require('./db');
+/* DR-05（`result` 表）的仓储层：**唯一写入口**（技术债 E58 ② 的写入归口，本文件 6e-3 段接线）。
+   为什么放在入口而不是 ingest 里：写的是"**本看板判定**的产出"（FR-3.13），
+   判定装配的唯一处就是本文件的 `emitWarnings()`（1 s 采样落库之后）—— 见 6e-2/6e-3 两段。 */
+const resultRepo = require('./repo/result');
 const { createRouter, pathnameOf } = require('./http/router');
 /* W1 的挂载口（`server/http/routes/ifD.js`）：IF-D 采集接入的唯一接线点，见下方 6b 段 */
 const { mountIfD } = require('./http/routes/ifD');
@@ -86,6 +90,14 @@ const SHUTDOWN_TIMEOUT_MS = 8000;
 /** 停机期间**空闲连接回收**的间隔（毫秒）：见 `stop()` 的 F2 说明 —— 在途请求应答完会变成空闲
  *  keep-alive 连接，只回收一次会漏掉它，`server.close()` 于是被对端 FIN 拖住。 */
 const SHUTDOWN_IDLE_SWEEP_MS = 50;
+/* 技术债 E58 的**临时闸已拆除**（T-20260930-08，负责人 2026-09-30 裁定的第②步）：
+   闸的构成（`orderDoneSourceReady` 注入位 + `ORDER_DONE_SUPPRESS_REASON` 字面量 +
+   `GET /health.orderWarningSource` 字段 + 启动日志的抑制行）全部随本轮删除 ——
+   拆除的前提是 `result`（DR-05）**已有写入点**：`server/repo/result.js`（唯一写入口）
+   由 `emitWarnings()` 在"1 s 采样落库成功之后"按件 upsert（见下方 6e-3 段）。
+   于是 `doneQtyOf()` 读到的件数是**真值**（未跑写入点时它是 0，但那是"真的是 0"，
+   不再是 E58 的"拿不到却用 0 代言"）。*/
+
 /** 是否回环地址（本服务默认只允许这一类；对外地址必须显式配置并由负责人批准）
  *  判据实现只有一份 = `server/http/cors.js` 的 `isLoopbackHost`（CORS 的"仅回环才回跨源头"用的
  *  是同一条判据 —— 两处各写一遍必然漂移）。本处仅转发，导出名保持不变（既有自检在用）。 */
@@ -291,7 +303,11 @@ const state = {
   lastError: null,
   /** W5-①：事件总线与链路状态监控（优雅退出时都要收尾：退订/清定时器/释放缓冲） */
   bus: null,
-  linkMonitor: null
+  linkMonitor: null,
+  /** DR-05 写入点（E58 ②）的运行计数：`writes` 累计成功、`failures` 累计失败 + 最后一次原因。
+   *  为什么要它：固化失败**不许污染采集链**（故 `persistJudgement()` 只记不抛），
+   *  但"悄悄不写"必须看得见 —— 与 `ingest` 计数 `sampledHookFailures` 同一纪律。 */
+  resultWrite: { writes: 0, failures: 0, lastError: null }
 };
 
 /**
@@ -349,6 +365,11 @@ function healthPayload() {
     dataRoot: platformPaths.paths.dataRoot,
     dbFile: state.dbFile || platformPaths.paths.dbFile,
     streams: state.router ? state.router.streamCount() : 0,
+    /* 「工单超时预警」（FR-5.11）的取数源：**已完成件数取 `result`（DR-05）真值**。
+       E58 的临时闸（`orderDoneSourceReady` / `orderWarningSource` 抑制字段）已随
+       `T-20260930-08` 拆除 —— 抑制事实不再需要"可被读到"，因为抑制已不存在：
+       件数由写入点（1 s 采样落库之后按件 upsert）驱动，真值是多少就报多少。
+       DR-05 写入点的运行计数见 `state.resultWrite`（失败不静默）。 */
     lastError: state.lastError
   }, ifd ? { ifd } : {});
 }
@@ -372,6 +393,8 @@ function fatal(logger, title, lines) {
  *   `uptimeSec` / `lastError.at` / SSE 的 `at` 与注释帧）都用它，未传即 `platformClock.createClock({mode:'real'})`。
  *   `heartbeatMs` / `linkIntervalMs` / `busCapacity` 是**自检用的注入位**（线上口径不变）：
  *   SSE 心跳周期、链路状态轮询周期、事件总线环形缓冲容量。
+ *   （`orderDoneSourceReady` 这个 E58 临时闸的注入位已随 `T-20260930-08` **删除**；
+ *   传了也无副作用 —— 本函数只读它认识的选项。见 `state.resultWrite` 与 6e-3 段。）
  * @returns {Promise<{host:string, port:number, listen:string, router:object, logger:object,
  *                    health:Function, bus:object, snapshot:Function, linkMonitor:object,
  *                    mounts:object}>}
@@ -383,6 +406,8 @@ async function start(options = {}) {
   /* 允许"停后再起"：清掉上一轮的收尾标记，否则新一轮收到信号会被幂等短路掉、永远不会退 */
   state.stopping = null;
   state.lastError = null;
+  /* DR-05 写入点的运行计数随本轮启动归零（与 lastError 同一处纪律：上一轮的失败不该赖在新一轮头上） */
+  state.resultWrite = { writes: 0, failures: 0, lastError: null };
   /* 时钟注入出口（E42）：从这里起，本进程的"现在几点"只有一个来源 */
   state.clock = resolveClock(options);
   const installSignalHandlers = options.installSignalHandlers !== false;
@@ -396,6 +421,13 @@ async function start(options = {}) {
      ⚠ 实测踩过：闭包里直接引用那个局部变量 ⇒ 每次判定挂钩都抛 `ReferenceError`、`warning`
      事件永不发布（`harness-check` 段⑦e **7 条断言当场变红**才是发现它的原因）。 */
   const boardCfg = options.boardConfig || require('../src/config/board.config');
+
+  /* ---- 2b.（已删除）E58 临时闸 ----
+      T-20260930-05 曾在此处按 E58 的裁定①立一道临时闸（`orderDoneSourceReady`，默认 off ⇒
+      `emitWarnings()` 对「工单超时预警」传 `undefined` ⇒ 该类整条不产生，先堵恒定误报）。
+      本轮 `T-20260930-08` 做完裁定②（`result` 表写入归口落地，见下方 6e-3 段）后按原注释
+      "置 true 并删闸"把闸**整段删除** —— 抑制约定、`/health.orderWarningSource` 字段与启动日志
+      的抑制行都不再存在（真源有没有写入方，现在由写入点自身说话）。 */
 
   /* ---- 2. 数据根目录（用 platform/paths.js 这一层，业务代码不得自己拼路径：D11） ---- */
   if (cfg.dataDir) {
@@ -657,15 +689,26 @@ async function start(options = {}) {
                         （DR-03"指定时刻生效版本"；**库里没有生效版本 ⇒ 显式传 `{depth:null, speed:null}`**，
                         不落进 judge 的配置演示兜底 —— 拿演示值判真任务就是伪造判定，见 FR-3.18/C-93⑤）；
        · `now`       ← 帧的 `collectTime`（**采集时刻**：判据要与这一帧的数据同一时刻；不读系统时间，D17）；
-       · `consumableHours` / `pendingQty` ← **当前拿不到**：`server/` 没有累计点亮时长、也没有设备侧
-                        待测队列件数（`production.queueDepth` 是**演示**参数，语义是"演示队列深度"，
-                        不是实测件数）⇒ **不传**，于是"耗材更换/工单超时"两类预警整条不产生
+       · `progress`  ← **由帧的 `testStatus` 按 C-98④ 的阶段导出规则算出**（`progressOf()`）：
+                        `2`（判定／附录 2 的"测试完成"）⇒ 该件测量已结束、交由本方判定 ⇒ 1；
+                        `1`（运行）/ `3`（设备异常＝正交态）：⇒ 0.5；`0`（准备／"完成"过渡回 0）⇒ 0。
+                        为什么不采信帧自报的 `progress`：`C-102③` 已定 `IF-D.4` 的进度**仅比对与展示**、
+                        不作权威；且实测两处模拟上位机的 `progress` 在整件周期内恒 `< 1` ⇒ 用它会永不判定。
+                        ⚠ 本入参是 DR-05 写入点能写出"已完成件数"的前提（T-20260930-08 补）。
+       · `shouldDone` / `doneQty` ← FR-5.11（P0）新判据的两个减数：应完成＝节拍 × (采集时刻 − 计划开工)；
+                        已完成＝`result`（DR-05）表里该工单「合格＋不合格」的件数（**真值**，无闸）。
+                        ⚠ **件序号拿不到时（帧未带/非法 `unitIndex`）两项一律不传** ⇒ 按
+                        `judge.buildWarnings()` 的契约**该类整条不产生**（"拿不到"不得用 0 或旧件数代言，
+                        E60 裁定①）；发布读的是**固化之后**的件数（裁定②），见 `emitWarnings()` 的顺序注。
+       · `consumableHours` ← **当前拿不到**：`server/` 没有累计点亮时长（`production.queueDepth` 是
+                        **演示**参数）⇒ 不传，于是"耗材更换"（FR-5.10 P1）**整条不产生**
                         （`judge.buildWarnings()` 的 docblock 写了为什么不给缺省值凑齐 5 条）。
-                        ⚠ 这是**已知的能力缺口**（FR-5.10 P1 / FR-5.11 P0 的真实源），
-                        不是本波能补的：补它需要先定这两项的**取数口径与承载表**，属独立工作项。
+                        ⚠ 这是**已知的能力缺口**（真实源＝上位机/设备台账，属外部依赖 Q-13）。
 
      **③ 判定失败怎么办**：`judge.evaluate` 抛错（配置缺项等）由 `ingest` 的挂钩 try/catch 收下并
-     计数（`ingest.status().counts.sampledHookFailures`），**不影响落库**；启动日志同时给出该计数。 */
+     计数（`ingest.status().counts.sampledHookFailures`），**不影响落库**；启动日志同时给出该计数。
+
+     **④ 判定产出还要固化到 `result`（DR-05）**：见下方 6e-3 段（技术债 E58 ② 的写入点）。 */
 
   /** 任务行缓存（按 `proc_order_no`）：标准维度＝(产品,工序)，逐帧查库没必要；`task` 行可变 ⇒
    *  只做**按票缓存**（同一票重复帧命中），并把行对象原样留着（不复制、不派生第二份字段口径）。 */
@@ -687,16 +730,17 @@ async function start(options = {}) {
     return row || null;
   }
 
-  /** 已完成件数（FR-5.11 新判据的减数）：`result` 表里该工单「合格 + 不合格」的件数（DR-05 判定结果）。
+  /** 已完成件数（FR-5.11 的减数 / FR-4.4 同口径）：`result` 表里该工单「合格 + 不合格」的件数。
    *  为什么用 `result` 而不是 `task.status`：`task.status` 是**单票聚合态**（一票多件时只能给一个状态），
    *  而"已完成多少**件**"必须按件计（DR-19 按件固化）⇒ `result` 是唯一按件的真源。
-   *  ⚠ 复检（`待复检`）**不计已完成**（尚未定论），与 `stats.js` 的 `DONE_STATUS` 同一口径。 */
+   *  ⚠ 复检（`待复检`）**不计已完成**（尚未定论），与 `stats.js` 的 `DONE_STATUS` 同一口径 ——
+   *  该口径与 SQL 都归口在 `server/repo/result.js` 的 `countDone()`（本函数只做"没库 ⇒ 0"的装配守卫，
+   *  不在这里另写一份 SQL：两份 SQL 就是两个口径）。
+   *  ⚠ 历史（E58）：本表曾**全仓无写入方** ⇒ 本函数恒 0（而 0 被读成"真的是 0" ⇒ 恒定误报）；
+   *  本轮 `T-20260930-08` 补上写入点（见 `persistJudgement()`）后，这里读到的是**真值**。 */
   function doneQtyOf(procOrderNo) {
-    if (!state.db) return 0;
-    const r = state.db.prepare(
-      "SELECT COUNT(*) AS n FROM result WHERE proc_order_no = ? AND result IN ('合格','不合格')"
-    ).get(String(procOrderNo));
-    return r && typeof r.n === 'number' ? r.n : 0;
+    if (!state.db || procOrderNo === undefined || procOrderNo === null || procOrderNo === '') return 0;
+    return resultRepo.countDone(state.db, procOrderNo);
   }
 
   /** 按节拍应完成件数（FR-5.11 新判据的减数）：`节拍(件/秒) × 实际经过秒数`，
@@ -720,6 +764,11 @@ async function start(options = {}) {
    *  （由 `judge.specOf()` 按 DR-03 库行形态归一，缺哪个指标就判哪个 idle）。 */
   const FIELD_PROC_ORDER_NO = 'procOrderNo';
   const FIELD_COLLECT_TIME = 'collectTime';
+  /** 件序号字段名（`IF-D.4` / C-103 定义的 `unitIndex`，两种报文形态同名）。
+   *  ⚠ Q-21 未答复：真实字段名以上位机方为准，届时只改这一处（与本文件其它字段名的处理同款）。 */
+  const FIELD_UNIT_INDEX = 'unitIndex';
+  /** 设备运行状态码字段名（`IF-D.1` / 附录 2：`0=待机` `1=测试中` `2=测试完成` `3=设备异常`）。 */
+  const FIELD_TEST_STATUS = 'testStatus';
 
   /** 取"该帧对应工单在**采集时刻**的生效标准"（DR-03 指定时刻生效版本）。
    *  未建立/无生效版本 ⇒ 返回**净化形态** `{depth:null, speed:null}`（由 `judge.specOf()` 判 idle）。
@@ -741,8 +790,166 @@ async function start(options = {}) {
     return typeof ct === 'string' && ct ? ct.slice(0, 19) : platformClock.fmt(currentClock().now());
   }
 
-  /** 判定挂钩（交给 `ingest` 的 `onSampled`）：算一次判定 → 由 `evaluate()` 发布 `warning` 事件。
-   *  抛出的异常由 ingest 的 try/catch 收下（见 ③ 段），此处不吞不掩。 */
+  /* ---- 6e-3. DR-05（`result` 表）的写入点 —— 技术债 E58 ② 的落地（T-20260930-08） ----
+     背景（E58）：`result`（DR-05，P0 表）此前**全仓无写入方**，唯一命中是 `doneQtyOf()` 那条 `SELECT`
+     ⇒「已完成件数」恒 0 ⇒ 只要派工带 `planStartTime`（IF-A.1），FR-5.11「工单超时预警」恒定误报 err。
+     裁定②要求补"写入归口"，并按负责人 2026-09-30 的五项口径实现（同 E58 行）：
+       (a) **谁写**＝本看板服务端（FR-3.13 判定权在我方；C-102 已定 IF-D 的**结果**仅比对、不作权威）
+           ⇒ 写的是 `judge.evaluate()` 的产出，**不采信**帧里的 `result`；
+       (b) **何时**＝每次 1 s 采样落库成功之后、对该件判一次并 upsert（与 `measure_rt` 同拍，
+           复用 `onSampled` 这一个挂钩 ⇒ **不新增接口、不新增第二条时间真源、不起第二个定时器**）；
+       (c) **粒度**＝按件一行（`(proc_order_no, unit_index)` 唯一索引 upsert）；`待复检` 不计"已完成"；
+       (d) `judged_at`＝**判定时刻**（注入时钟；与采集时刻分开存）；`duration_sec`＝该件首末**有效**帧差；
+       (e) 不实现 DR-06（`shift_stat`，属 E59）—— 本段一行都不碰班次统计。
+     "只有真的发生了判定才写"：本段只在 `emitWarnings()` 越过"无生效标准 ⇒ 不判定/不发布"的早退之后
+     被调用 ⇒ 无生效标准**不写**；而 `duplicate` / `raw-500ms` / `rejected` 帧根本不会走到 `onSampled`
+     ⇒ 也不写（与 `frame`/`warning` 事件同一写入点口径）。
+     ⚠ **E60 裁定①（2026-09-30）补的一支**：帧**拿不到件序号**（未带／非法 `unitIndex`）⇒ **本写入点
+     整条不跑**（不写 `result` 行、不动 `state.resultWrite.writes`）—— 缺省 1 会把一票多件归并成一行、
+     使「已完成」饱和于 1（审查 P1-1 实测：10 帧 ⇒ 1 行、落后率恒 90.9%）。"拿不到"就是拿不到。
+     ⚠ **顺序**：本段的调用点从"发布之后"移到"**发布之前**"（先固化、后发布，E60 裁定②）——
+     否则判出某件的那一帧仍按旧件数发布，前 9 件各闪 1 帧假 `err`（审查 P2-1）；详见 `emitWarnings()`。 */
+
+  /** 件号（DR-19 按件固化；字段名见 `FIELD_UNIT_INDEX`）：**正整数，拿不到 ⇒ `null`**。
+   *  · 帧没带 ⇒ **null ＝"拿不到"**（**不再缺省 1**）：`judge.js` 的纪律是"'拿不到'与'真的是 0'
+   *    是两件事，不得互相代言"，件号同理 —— 用缺省 1 冒充件序号会把一票的 N 件全部归并到第 1 件，
+   *    后果是 `countDone()` **饱和于 1**：同一票连推 10 帧 `testStatus=2`（判 10 件）实测 `result`
+   *    恰 1 行、落后率恒 ≈90.9% ⇒「工单超时预警」**仍恒定误报**（技术债 `E60`／审查 P1-1 实测）。
+   *    负责人 2026-09-30 裁定①：帧缺 `unitIndex` ⇒ **不固化**（不写 `result` 行）＋ 该类**不产生**。
+   *    ⚠ 为什么**不写**比"缺省 1"诚实：`unit_index` 是 `ux_result_unit` 唯一键的一半成分，
+   *      编一个键值就等于把"这一件"与"另一件"混成一行，而 `result` 表没有第二列能承载真相。
+   *  · 带了但非法（0/负数/小数/非数值）⇒ 同样 **null**（不归一、不冒充），并**记一条 warn**
+   *    （不静默：脏件号会被看见；`repo/result.js` 的入库口本来就拒收非法值）；
+   *  · 只借件序号当**行键**：判定仍由本看板给出（C-102：IF-D 的结果/进度仅比对与展示）。
+   *  @returns {number|null} 合法件号（≥1 的整数）；帧未带／非法 ⇒ `null`（＝"拿不到"） */
+  function unitIndexOf(frame) {
+    const raw = frame ? frame[FIELD_UNIT_INDEX] : undefined;
+    if (raw === undefined || raw === null || raw === '') {
+      if (logger) {
+        logger.warn('[DR-05] 帧未带 unitIndex ⇒ 按"拿不到"处理：本件**不固化**（不写 result 行）、' +
+          '本次判定**不产生**「工单超时预警」（不再缺省 1 冒充件序号，E60；IF-D.4 的真实字段名' +
+          '与取值域待 Q-21 答复）');
+      }
+      return null;
+    }
+    const n = (typeof raw === 'string' && /^\d+$/.test(raw.trim())) ? Number(raw.trim()) : raw;
+    if (Number.isInteger(n) && n >= 1) return n;
+    if (logger) {
+      logger.warn(`[DR-05] 帧里的 unitIndex 非法（${JSON.stringify(raw)}）⇒ 按"拿不到"处理：本件不固化、` +
+        `本次判定不产生「工单超时预警」（不归一为 1，E60；IF-D.4 的真实字段名与取值域待 Q-21 答复）`);
+    }
+    return null;
+  }
+
+  /** 本帧对应的**单件测试进度**（FR-3.12 / C-103 的 0～1 口径）—— 由 `testStatus` **导出**：
+   *  附录 2 的码语义与 C-98④ / FR-2.5 的阶段导出规则：`0=待机/准备`、`1=测试中/运行`、
+   *  `2=测试完成/判定`、`3=设备异常`（正交态、出现时**阶段冻结**）。
+   *  · `2`（判定）⇒ **1**：该件测量已结束、**交由本方判定**（C-98④ 明写"「判定」的结束由本方判定"）
+   *    ⇒ 只有此时 `judge.taskResult()` 才可能给出 合格/不合格/待复检；
+   *  · `1`（运行）/ `3`（异常）⇒ **0.5** ⇒ 判「测试中」（测量未结束，不得据此判合格/不合格）；
+   *  · 其余（含 `0`：准备，或"完成"过渡回 0）⇒ **0** ⇒ 判「待测试」。
+   *  ⚠ 该件已判出的**终态不会被这些中间态回退**（单调性在 `repo/result.js` 的 upsert 里保证），
+   *  故"完成"过渡帧（码回到 0）不会把刚判出的 合格/不合格 抹成「待测试」。
+   *  为什么不直接用帧自报的 `progress`：C-102③ 已定 `IF-D.4` 的进度仅比对与展示、不作权威；
+   *  且两处模拟上位机的 `progress` 恒 `< 1`（判定阶段 0.85～0.97）⇒ 用它会**永不判定**。 */
+  function progressOf(frame) {
+    const st = frame ? frame[FIELD_TEST_STATUS] : undefined;
+    if (st === 2) return 1;
+    if (st === 1 || st === 3) return 0.5;
+    return 0;
+  }
+
+  /** 该件"首末有效帧差"的进程内记账（有效＝**已落库的 1 s 采样帧**）。
+   *  **为什么不引入第二时间源**：记的是帧自带的 `collectTime`（DR-16 文本）—— 它就是同一帧落进
+   *  `measure_rt.collect_time` 的那一个字符串；首/末两个值都取自**同一条已落库事实**，
+   *  本缓存不读系统时间、不另起定时器、不新增列（ADR-0003 D17）。
+   *  **为什么不用 `measure_rt` 的 `MIN(collect_time)`**：`measure_rt` **没有** `unit_index` 列
+   *  （不加列是本仓既定口径，C-101④），按工单取 MIN 会把同工单的多件混成一件 ⇒ 按件首帧只能在
+   *  进程内按 `(工单, 件号)` 记账；库层对 `duration_sec` 取 `MAX(旧值, 新值)`（单调不减），
+   *  故进程重启后从 0 重算**也不会**让已落库的时长倒退。
+   *  容量上限：只保留最近 `PIECE_SPAN_CACHE_MAX` 件（按插入序淘汰最旧），防长时间运行下无界增长；
+   *  被淘汰的件若再来帧，就按"新首帧"重算（同样受上面的 `MAX()` 保护）。 */
+  const PIECE_SPAN_CACHE_MAX = 512;
+  const pieceSpanCache = new Map();
+
+  /** 取/更新该件的首末帧时刻，并算出整数秒差（同一秒 ⇒ 0，符合 schema 的 `INTEGER`） */
+  function pieceSpanOf(procOrderNo, unitIndex, collectTime) {
+    const key = procOrderNo + '|' + unitIndex;
+    let entry = pieceSpanCache.get(key);
+    if (!entry) {
+      entry = { first: collectTime, last: collectTime };
+      pieceSpanCache.set(key, entry);
+      if (pieceSpanCache.size > PIECE_SPAN_CACHE_MAX) {
+        const oldest = pieceSpanCache.keys().next();
+        if (!oldest.done) pieceSpanCache.delete(oldest.value);
+      }
+    } else {
+      /* 文本比较＝时间序（DR-16 定长秒级）；乱序帧只扩不外缩，保证"首末"是区间端点 */
+      if (collectTime > entry.last) entry.last = collectTime;
+      if (collectTime < entry.first) entry.first = collectTime;
+    }
+    const t0 = Date.parse(entry.first.replace(' ', 'T'));
+    const t1 = Date.parse(entry.last.replace(' ', 'T'));
+    const sec = (Number.isFinite(t0) && Number.isFinite(t1)) ? Math.round((t1 - t0) / 1000) : 0;
+    return { first: entry.first, last: entry.last, durationSec: Math.max(0, sec) };
+  }
+
+  /**
+   * DR-05 写入点：把"本看板刚判出的这一件"upsert 进 `result` 表（与判定**同一拍**）。
+   * @param {object} frame 已落库的 1 s 采样帧（`procOrderNo` / `collectTime` / `testStatus` / `unitIndex`）
+   * @param {{result:string}} verdict `judge.evaluate()` 的产出（FR-3.13 五态之一）
+   * @param {number} unitIndex **合法件号**（≥1 的整数）；由调用方用 `unitIndexOf()` 取到 ——
+   *   "拿不到"（`null`）时**调用方不得调本函数**（不固化），本函数不为它兜底（不冒充件序号）。
+   * @returns {{written:boolean, procOrderNo:string, unitIndex:number, durationSec:number}|null}
+   *   写失败 ⇒ **只记不抛**（落库是事实、判定与固化是派生）：采集链的 HTTP 面拿到的仍是"收下"，
+   *   与 `ingest` 对 `onSampled` 失败的既有纪律一致（`services/ingest.js` 的 try/catch 与
+   *   `counts.sampledHookFailures`）；失败次数另计在 `state.resultWrite.failures` 并写日志，
+   *   保证"悄悄不写"看得见。
+   */
+  function persistJudgement(frame, verdict, unitIndex) {
+    const procOrderNo = frame && frame[FIELD_PROC_ORDER_NO] !== undefined && frame[FIELD_PROC_ORDER_NO] !== null
+      ? String(frame[FIELD_PROC_ORDER_NO]) : '';
+    const collectTime = collectTimeTextOf(frame);
+    const span = pieceSpanOf(procOrderNo, unitIndex, collectTime);
+    /* 判定时刻＝**注入时钟的当前时刻**（ADR-0003 D17；与帧的采集时刻分开存） */
+    const judgedAt = platformClock.fmt(currentClock().now());
+    try {
+      const written = resultRepo.upsertJudgement(state.db, {
+        procOrderNo,
+        unitIndex,
+        result: verdict && verdict.result,
+        judgedAt,
+        now: judgedAt,
+        durationSec: span.durationSec
+      });
+      state.resultWrite.writes++;
+      return { written: written.written, procOrderNo, unitIndex, durationSec: span.durationSec };
+    } catch (err) {
+      state.resultWrite.failures++;
+      state.resultWrite.lastError = String((err && err.message) || err);
+      if (logger) {
+        logger.warn(`[DR-05] result 表写入失败（帧已落库、判定已发布；本条只影响按件固化）：` +
+          `${state.resultWrite.lastError}（工单 ${JSON.stringify(procOrderNo)}、第 ${unitIndex} 件）`);
+      }
+      return null;
+    }
+  }
+
+  /** 判定挂钩（交给 `ingest` 的 `onSampled`）：算一次判定 → **固化到 result** → 按（固化后的）
+   *  **真实件数**发布 `warning` 事件。抛出的异常由 ingest 的 try/catch 收下（见 ③ 段），此处不吞不掩
+   *  （固化那一段自带 try/catch —— 见 `persistJudgement()` 的失败口径）。
+   *
+   *  **顺序（负责人 2026-09-30 裁定②，技术债 `E60` 同族 P2）**：**先固化、后发布**。
+   *  为什么必须是这样：`FR-5.11` 的减数「已完成」＝`result` 表的真实件数（`doneQtyOf()`），
+   *  若"先发布、后固化"，则**判出某件的那一帧**仍按**旧件数**发布 ⇒ 按计划推进时第 k 件完成帧的
+   *  落后率恰 `1/k`，**前 9 件各闪 1 帧（1 s）假 `err`**（审查 P2-1 实测：帧 2 判合格却发布
+   *  "实际已完成 0 件 / 落后 100%"，帧 3 才转 ok）。⇒ 发布必须读**固化之后**的件数。
+   *  两次 `evaluate()` 的取舍：`judge.evaluate()` 的 `result`（合格/不合格/待复检）**只由参数判定
+   *  与标准决定、不依赖 `doneQty`**（`taskResult()` 不读该入参）⇒ 第一次只为**取 `result` 去固化**
+   *  （`publish:false`，不发布：发布权只留一处），第二次才**按固化后的件数**组织并发布。
+   *  两次调用同一帧、同一 `now`、同一标准、同一注入时钟 ⇒ **不引入第二条时间源、不新增业务分支**。
+   *  固化失败（`persistJudgement()` 返回 `null`）⇒ 件数没变 ⇒ 沿用第一次判定的产出发布（“真的是 0”），
+   *  不编造件数、也不吞掉本帧的预警（失败口径见 `persistJudgement()`：只记不抛）。 */
   function emitWarnings(frame) {
     const standard = standardOf(frame);
     /* ⚠ "有没有生效标准"必须用**判定引擎自己的取数口** `judge.specOf()` 判，不得自行读 `standard.depth`：
@@ -751,28 +958,64 @@ async function start(options = {}) {
        探针显示 standard 已取到行、却被早退挡掉）。`specOf()` 同时认三种形态（运行期 / 库行 / 配置段），
        是"该参数是否已设定"的**唯一**口径。 */
     const hasAny = judge.PARAMS.some(kind => judge.specOf(standard, kind) !== null);
-    /* 库里没有生效标准 ⇒ **本次不判定、也不发布**：没有标准就没有参数类预警（FR-5.8 / C-93⑤），
-       而"什么都没判"也不是状态变化；发布一条空预警只会让界面把上一条真预警擦掉（假信息）。
-       下一次"1 s 采样落库"会重新看标准是否已到位 —— 标准录入后最迟这一帧起就有预警。 */
+    /* 库里没有生效标准 ⇒ **本次不判定、也不发布、更不写 `result`**：没有标准就没有参数类预警
+       （FR-5.8 / C-93⑤），而"什么都没判"也不是状态变化；发布一条空预警只会让界面把上一条真预警擦掉
+       （假信息）。下一次"1 s 采样落库"会重新看标准是否已到位 —— 标准录入后最迟这一帧起就有预警。 */
     if (!hasAny) return null;
     const task = taskOf(frame && frame[FIELD_PROC_ORDER_NO]);
     const at = collectTimeTextOf(frame);
+    const procOrderNo = frame && frame[FIELD_PROC_ORDER_NO];
+    /* 件序号：**拿不到 ⇒ null**（帧未带／非法）。它决定两件事（E60 裁定①的"两个后果"）：
+       ① **不固化**该件 —— 本帧不写 `result` 行（写入点见 `persistJudgement()`）；
+       ② 本次判定**不产生**「工单超时预警」—— 应完成/已完成两项一律传 `undefined`，
+          按 `judge.buildWarnings()` 的既有契约"缺一即该类整条不产生"（**不是**传 0：
+          "拿不到"与"真的是 0"不得互相代言）。⇒ 若"没有件序号"与"发布顺序"叠加，
+          最终行为是**该类不产生**，而不是发一条按旧件数算出来的预警。 */
+    const unitIndex = unitIndexOf(frame);
+    const hasUnit = unitIndex !== null;
+    const shouldDone = hasUnit ? shouldDoneOf(task, at) : undefined;
+    const doneQty = hasUnit ? doneQtyOf(procOrderNo) : undefined;
+    /* ---- 第一拍：取 `result` 去固化（**不发布**：发布权只留下面那一处） ----
+       单件进度 `progress` 由 `testStatus` 按 C-98④ 导出（见 `progressOf()`）—— 它决定本次判定是
+       待测试/测试中，还是可判定的 合格/不合格/待复检。此前不传该入参 ⇒ `taskResult()` 恒判
+       「待测试」（进度缺失）⇒ DR-05 永远写不出"已完成"件 ⇒ FR-5.11 的减数只剩"应完成"一侧。 */
+    const draft = judge.evaluate({
+      now: at,
+      real: { depth: frame.depth, speed: frame.speed },
+      standard,
+      progress: progressOf(frame),
+      shouldDone,
+      doneQty
+    }, { bus, publish: false });
+    /* DR-05（E58 ②）：与本帧判定**同一拍**按件 upsert 一次（`judgedAt` 仍取注入时钟，见其内注释）。
+       拿不到件号 ⇒ **不固化**（不写行，也不动写入点计数 —— "没写"与"写失败"是两件事）。 */
+    const persisted = hasUnit ? persistJudgement(frame, draft, unitIndex) : null;
+    /* ---- 第二拍：按**固化之后**的真实件数组织发布 ----
+       固化成功 ⇒ 用刚写进去的件数**重算**一次（`result` 不依赖它 ⇒ 第二次的 `result` 与第一次相同）；
+       固化失败/未固化 ⇒ 件数没变，沿用第一拍那一次算出的件数（该帧的预警事件照发，见真计数④）。 */
     return judge.evaluate({
       now: at,
       real: { depth: frame.depth, speed: frame.speed },
       standard,
-      /* FR-5.11 新判据（2026-09-30 负责人裁定）：**进度落后率**，不再是"队列件数"。
-         两个减数都取真源：应完成 = 节拍(production.cycleSec) × (采集时刻 − 计划开工时刻)；
-         已完成 = `result` 表里该工单「合格＋不合格」的件数。缺任一项 ⇒ judge 不出该类（不编造）。 */
-      shouldDone: shouldDoneOf(task, at),
-      doneQty: task ? doneQtyOf(task.proc_order_no) : 0
+      progress: progressOf(frame),
+      shouldDone,
+      doneQty: persisted ? doneQtyOf(procOrderNo) : doneQty
     }, { bus });
   }
 
   logger.info(`[预警] 判定装配已接线（W5-② / E45）：发布点=ingest 的 onSampled（1 s 采样落库之后）；` +
-    `取数=task(procOrderNo)→标准(产品,工序,指定时刻生效版本)；` +
-    `耗材/工单两类**当前无服务端取数源 ⇒ 不产生**（不编造）；判定异常计入 ` +
-    `ingest.status().counts.sampledHookFailures`);
+    `取数=task(procOrderNo)→标准(产品,工序,指定时刻生效版本)；单件进度=testStatus 按 C-98④ 导出；` +
+    `耗材更换（FR-5.10）**仍无服务端取数源 ⇒ 不产生**（不编造，真实源＝上位机/设备台账，Q-13）；` +
+    `工单超时（FR-5.11）**已由真实件数驱动**（应完成=节拍×(采集时刻−计划开工)、已完成=result 表按件计数）；` +
+    `拿不到件序号（帧未带/非法 unitIndex）⇒ 不固化 ＋「工单超时」**整条不产生**（E60 裁定①，不编造）；` +
+    `发布读的是**固化之后**的件数（先固化后发布，E60 裁定②）；` +
+    `判定异常计入 ingest.status().counts.sampledHookFailures`);
+  logger.info(`[DR-05] result 表写入点已接线（技术债 E58 ② 收口）：与判定同拍（onSampled＝1 s 采样落库之后）` +
+    `按件 upsert（键 proc_order_no+unit_index，唯一索引 ux_result_unit）；结果＝**本看板判定**（FR-3.13，` +
+    `不采信 IF-D 的 result，C-102）；judged_at=判定时刻（注入时钟）、duration_sec=该件首末有效帧采集时刻差；` +
+    `待复检不计"已完成"（与 stats.DONE_STATUS 同口径）；写失败只记不抛（state.resultWrite.failures）。` +
+    `E58 的临时抑制闸已按裁定**整段拆除** ——「已完成件数」现在由本条写入点说话；` +
+    `**拿不到件序号（帧未带/非法 unitIndex）⇒ 本写入点整条不跑**（不再缺省 1，E60 裁定①）`);
 
   /* ---- 6f. W5-① 追加：静态托管（同源入口）＋ CORS（`file://` / 回环源） ----
      依据负责人 2026-09-28 裁定「选项 A」：
@@ -1081,5 +1324,7 @@ module.exports = {
   DEFAULT_PORT,
   SHUTDOWN_TIMEOUT_MS,
   SHUTDOWN_IDLE_SWEEP_MS,
+  /* E58 的抑制字面量导出（`ORDER_DONE_SUPPRESS_REASON`）已随临时闸一并删除（T-20260930-08）——
+     抑制约定不存在了：`result`（DR-05）写入点已在 1 s 采样落库之后按件落库。 */
   state
 };

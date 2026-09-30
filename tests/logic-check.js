@@ -710,12 +710,12 @@ t.section('八、单任务五态：待测试 / 测试中 / 合格 / 不合格 / 
 /* ---------------- 九、跨实现对账：服务端 judge ≡ 前端 mockData ----------------
    为什么必须对账：`src/services/mockData.js` 的判定/预警是**浏览器侧的第二份同类实现**
    （演示用，本包一行不得改），服务端 `judge.js` 是**权威实现**；两份一旦分叉，现场看到的
-   三态/预警与上报 MES 的口径就会各说各话。本段用**同一组输入序列**（15 组：正常 / 临近 /
+   三态/预警与上报 MES 的口径就会各说各话。本段用**同一组输入序列**（16 组＝`CASES`：正常 / 临近 /
    超范围 / 压线（上、下）/ 临近带外一格 / 同态 err / 同态 warn / 混态 / idle / 缺测 /
-   跨零点班次 / 单参数 idle / 工单超时 / 耗材更换）逐条比对。
+   跨零点班次 / 单参数 idle / 工单超时 / 耗材更换 / 班初）逐条比对。
    前端侧走**真路径**：只写运行时真源 `state.task.standard` / `state.task.real` 后 `tick()`
    （冻结 `Math.random` ⇒ 实测值确定，不靠随机命中）；服务端侧把**前端回读的同一组输入**
-   （实测值、标准、now、耗材累计时长、待测队列件数）喂给 `judge.buildWarnings()`。
+   （实测值、标准、now、耗材累计时长、应完成件数、已完成件数）喂给 `judge.buildWarnings()`。
    **比较规则**（选定理由随附）：
      ① 硬判据 ＝ 逐条、按序、**逐字**相等：**条数 / 顺序 / 名称 / 等级** —— 这是 C-88
         「名称与等级色一一对应」与「同态独立成条」的载体，容不得任何格式宽松；
@@ -725,9 +725,22 @@ t.section('八、单任务五态：待测试 / 测试中 / 合格 / 不合格 / 
         不规定文案排版；容差取半格，是因为显示精度为两位小数（0.01），小于半格不可能是有意差异；
      ④ **加严项（非需求要求，本实现下已成立）**：detail 全文**逐字一致**，另立一条断言钉住，
         将来任一侧文案单改会立刻变红，提示口径漂移。
+      ⑤ **本节的对账边界（2026-09-30 T2 复核补齐，防被读成「前后端全口径一致」）**：本段只对账
+         **「同一组入参下两侧判定函数一致」**（条数 / 顺序 / 名称 / 等级 / 参与参数 / 数值 / 单位 / 逐字），
+         **不覆盖服务端 `shouldDoneOf()` / `doneQtyOf()` 的派生** —— 本段是把前端回读的
+         「应完成 / 已完成」**同一组入参**喂给服务端判据，两个减数**怎么算出来的**不在本段射程内。
+         两侧减数的取数口径**本就不同**（**不是同源**）：
+           · **生产口径（权威）**：应完成 ＝ 节拍 ×（采集时刻 − **工单计划开工时刻**），起算点取
+             `task.plan_start_time`（＝ IF-A.1 `planStartTime`；`server/index.js` 的 `shouldDoneOf()`）
+             —— 负责人 2026-09-30 裁定「应完成起算点＝工单计划开工时刻」（需求将按 V1.40 / C-109 补句）；
+           · **前端演示口径（近似）**：应完成 ＝ 节拍 × **班次已进行秒数**
+             （`src/services/mockData.js` 的 `state.shift.elapsed`）—— 这是**演示近似**，
+             因为演示数据里没有工单计划开工时刻；**不得**读成两侧同源。
+         另有一处**真源缺口**由本段末尾的静态断言登记：`doneQtyOf()` 的唯一真源 `result` 表
+         在 `server\` 下**当前没有任何写入点** ⇒ 服务端侧"已完成件数"恒为 0。
    输入序列的实测值都取在前端演示 clamps 内（深度 [4.77,5.33]、vx [4.78,5.22]，速度由 vx/vy 合成），
    否则前端 `tick()` 会把值夹回去，"同一组输入"就不成立（这也是本段所有取值都由配置推导的原因）。 */
-t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（15 组输入序列）');
+t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（用例集见 CASES，逐组逐条比对）');
 {
   const STD = cfg.standards;
   const GRID = 1 / Math.pow(10, STD.digits);
@@ -788,10 +801,13 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（15 组�
   ];
   const NIGHT1 = [{ name: '夜班', start: 22, end: 6 }];
   /* 工单超时用例要一个**真的落后**的现场：FR-5.11 判据比较"应完成 / 已完成"，而演示数据的已完成
-     由节拍推导 ⇒ 只有把演示旋钮 `production.outputRatio` 调低（实际产出慢于计划）才构造得出落后的
+     由节拍推导 ⇒ 只有把演示旋钮 `outputRatio` 调低（实际产出慢于计划）才构造得出落后的
      工单进度。取 0.6 使落后率落进 (阈值率, 件数门槛] 区间 —— 即**必须**由比率门槛判 err，
      件数门槛（80 件）此时不成立，这样"比率门槛真的在起作用"才有证据，而不是靠件数兜底
-     （旋钮同样是加载期快照 ⇒ 必须在加载前覆盖，只改内存、不落盘）。 */
+     （旋钮同样是加载期快照 ⇒ 必须在加载前覆盖，只改内存、不落盘）。
+     ⚠ 该旋钮**不是配置真源里的参数**（2026-09-30 负责人裁定 B：它只被 `src\services\mockData.js`
+     读取，已从 `board.config.js` 移出）⇒ 本用例的注入方式是"往**内存沙箱**的配置对象上写一个
+     mockData 认得的键"，**不得**写成"该键必须存在于 board.config"的断言。 */
   const LAG_RATIO = 0.6;
 
   let FE = null;
@@ -861,12 +877,12 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（15 组�
           `（前端回读 深度 ${r.fe.real.depth}、速度 ${r.fe.real.speed}；三态一致 ${r.lvSame ? '✓' : '✗'}；` +
           `维保日期推导一致 ${r.ctxSame ? '✓' : '✗'}）`);
     }
-    t.check('九 · 三态判据逐参数一致（服务端 standardLevel ≡ 前端 standardLevel，15 组 × 2 参数）',
+    t.check(`九 · 三态判据逐参数一致（服务端 standardLevel ≡ 前端 standardLevel，${rows.length} 组 × 2 参数）`,
       rows.every(r => r.lvSame),
-      rows.filter(r => !r.lvSame).map(r => r.c.id).join('、') || '30 个参数点全部一致');
+      rows.filter(r => !r.lvSame).map(r => r.c.id).join('、') || `${rows.length * 2} 个参数点全部一致`);
     t.check('九 · 维保剩余天数与下次维保日期的推导两侧一致（含跨零点班次用例）',
       rows.every(r => r.ctxSame),
-      rows.filter(r => !r.ctxSame).map(r => r.c.id).join('、') || '15 组一致的 (daysLeft, next)');
+      rows.filter(r => !r.ctxSame).map(r => r.c.id).join('、') || `${rows.length} 组一致的 (daysLeft, next)`);
     t.check('九 · 加严项（非需求要求）：detail 全文**逐字**一致（任一侧文案单改即红）',
       rows.every(r => r.fe.warnings.length === r.sv.length &&
         r.fe.warnings.every((w, i) => w.detail === r.sv[i].detail)),
@@ -908,18 +924,269 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（15 组�
       !!oneIdle && paramRows(oneIdle.sv).length === 1 && paramCount(paramRows(oneIdle.sv)[0].detail) === 1 &&
       !String(paramRows(oneIdle.sv)[0].detail).includes('深度'),
       oneIdle ? `C13 参数类 ${paramRows(oneIdle.sv).length} 条：${paramRows(oneIdle.sv)[0].detail}` : '用例缺失');
-    /* 覆盖度证据：三类非参数预警的 warn/err/ok 分支都在用例集里出现过（否则"对账"只对了一半）。
-       工单 err 分支由 C14 的"实际产出落后"现场（`outputRatio` 旋钮）构造 —— 落后率须**由比率门槛**
-       判成立，故 detail 里同时打印该用例的"应完成/已完成"，可与件数门槛对照（见 LAG_RATIO 说明）。 */
+    /* 覆盖度证据（2026-09-30 T2 独立复核后**重写标题并逐分支指名构造者**）。
+       原标题写的是"维保 / 耗材 / 工单三类预警的 warn|ok|err 分支均被真实构造出来"——**表述过强**：
+       实测（下方 detail 打印的等级集合，逐组实测值见回执 T-20260930-01）——
+         · 维保：实现只有 warn|ok 两态（无 err），本用例集 16 组**全部 warn**（ok 分支未构造）；
+         · 耗材：只有 warn|ok 两态（无 err），warn 由 C01～C15 构造、**ok 仅由 C16 构造**；
+         · 工单：只有 ok|err 两态（**实现无 warn 态**），ok 由 C01～C13/C15/C16 构造、
+           **err 仅由 C14 构造**，且 C14 必须由**比率门槛**（不是件数兜底）判成立。
+       故本断言改为只钉**确实可达且已构造**的分支，并把"不可达/未构造"的分支写进 detail，
+       避免后来者按标题误以为 9 个组合都被验过（D19：断言只证明它自己说的那件事）。 */
     const otherLv = title => rows.map(r => (r.sv.find(w => w.title === title) || {}).lv);
-    const c14order = (rows.find(r => r.c.id === 'C14') || {}).sv || [];
-    const c14detail = (c14order.find(w => w.title === '工单超时预警') || {}).detail || '（C14 无工单预警）';
-    t.check('九 · 用例覆盖度：维保 / 耗材 / 工单三类预警的 warn|ok|err 分支均被真实构造出来',
-      otherLv('设备维保到期预警').includes('warn') && otherLv('耗材更换预警').includes('warn') &&
-      otherLv('耗材更换预警').includes('ok') && otherLv('工单超时预警').includes('err') &&
-      otherLv('工单超时预警').includes('ok'),
-      `维保[${[...new Set(otherLv('设备维保到期预警'))]}] 耗材[${[...new Set(otherLv('耗材更换预警'))]}] ` +
-      `工单[${[...new Set(otherLv('工单超时预警'))]}]；C14 现场：${c14detail}`);
+    const rowOf = id => rows.find(r => r.c.id === id) || {};
+    const lvInFE = (row, title) => (row.fe ? (row.fe.warnings.find(w => w.title === title) || {}).lv : null);
+    const lvInSV = (row, title) => (row.sv ? (row.sv.find(w => w.title === title) || {}).lv : null);
+    const detailInSV = (row, title) => (row.sv ? (row.sv.find(w => w.title === title) || {}).detail : undefined);
+    t.check('九 · 用例覆盖度（逐分支指名构造者）：维保 warn／耗材 warn＋ok／工单 err＋ok 都被**真实构造**，' +
+      '且标注了不可达分支（维保·耗材无 err；工单无 warn）',
+      otherLv('设备维保到期预警').includes('warn') &&
+      otherLv('耗材更换预警').includes('warn') && otherLv('耗材更换预警').includes('ok') &&
+      otherLv('工单超时预警').includes('err') && otherLv('工单超时预警').includes('ok') &&
+      /* 逐分支指名：ok 与 err 必须落在**具体用例**上，不是"某处恰好有一条" */
+      lvInSV(rowOf('C16'), '耗材更换预警') === 'ok' &&
+      lvInSV(rowOf('C14'), '工单超时预警') === 'err' &&
+      lvInSV(rowOf('C16'), '工单超时预警') === 'ok',
+      `维保[${[...new Set(otherLv('设备维保到期预警'))]}]（实现无 err 态、ok 未构造）` +
+      ` 耗材[${[...new Set(otherLv('耗材更换预警'))]}]（实现无 err 态；ok 仅 C16）` +
+      ` 工单[${[...new Set(otherLv('工单超时预警'))]}]（实现无 warn 态；err 仅 C14、ok 见 C01～C13/C15/C16）`);
+
+    /* C14：**唯一**构造「工单超时」err 的现场。本断言钉住"这个 err 只能来自**比率门槛**"——
+       数值全部**现场算出**（不写死）：应完成＝floor(前端回读的班次已进行秒数 ÷ 节拍)、
+       已完成＝前端回读的 done（与喂给服务端的是同一组，见上面 §九 的对账口径）。
+       ⇒ 判据若退回"队列件数 > 阈值"或比率门槛失效，本用例当场由 err 变 ok、本断言**指名**变红。 */
+    const CYC = cfg.production.cycleSec || 160;
+    const c14 = rowOf('C14');
+    const c14Should = c14.fe ? Math.floor(c14.fe.ctx.shiftElapsed / CYC) : -1;
+    const c14Done = c14.fe ? c14.fe.ctx.done : -1;
+    const c14Behind = c14Should - c14Done;
+    const c14Ratio = c14Should > 0 ? c14Behind / c14Should : 0;
+    t.check('九 · C14（实际产出慢于计划）真构造「工单超时」err：判据**只可能**由比率门槛产生' +
+      '（落后件数 ≤ 件数门槛 ⇒ 兜底门槛不成立），两侧 detail 的落后率与实算一致',
+      c14Should > 0 && c14Done >= 0 && c14Ratio > cfg.warnings.orderOverdueRatio &&
+      c14Behind <= cfg.warnings.orderOverduePending &&
+      lvInSV(c14, '工单超时预警') === 'err' && lvInFE(c14, '工单超时预警') === 'err' &&
+      String(detailInSV(c14, '工单超时预警')).includes((c14Ratio * 100).toFixed(1)),
+      `C14 现场：应完成 ${c14Should} / 已完成 ${c14Done} ⇒ 落后 ${c14Behind} 件（比率 ` +
+      `${(c14Ratio * 100).toFixed(1)}% > 阈值率 ${cfg.warnings.orderOverdueRatio}）；件数门槛 ` +
+      `${cfg.warnings.orderOverduePending}（${c14Behind} ≤ ${cfg.warnings.orderOverduePending} ⇒ **不成立**）；` +
+      `两侧等级 ${lvInFE(c14, '工单超时预警')}/${lvInSV(c14, '工单超时预警')}；detail=${detailInSV(c14, '工单超时预警')}`);
+
+    /* C16：**唯一**构造「耗材 ok」的现场，同时是「班初」现场（应完成 0）——
+       C-108 换判据的动因正是"旧口径班初恒真"（见 C-108 的实测记录），故"班初不得误报"必须被钉住。 */
+    const c16 = rowOf('C16');
+    const c16Should = c16.fe ? Math.floor(c16.fe.ctx.shiftElapsed / CYC) : -1;
+    const c16Done = c16.fe ? c16.fe.ctx.done : -1;
+    const lampCfg = (cfg.maintenance.consumables || [])[0] || {};
+    const c16Lamp = c16.fe ? c16.fe.ctx.lampHours : -1;
+    t.check('九 · C16（班初）真构造「应完成 0 ⇒ 工单不得误报（ok）」＋「点亮时长 < 阈值 ⇒ 耗材 ok」' +
+      '（本用例集里耗材 ok 的唯一构造者；旧口径下这里必报 err）',
+      c16Should === 0 && c16Done === 0 &&
+      lvInSV(c16, '工单超时预警') === 'ok' && lvInFE(c16, '工单超时预警') === 'ok' &&
+      Number.isFinite(c16Lamp) && c16Lamp <= lampCfg.threshold &&
+      lvInSV(c16, '耗材更换预警') === 'ok' && lvInFE(c16, '耗材更换预警') === 'ok',
+      `C16 现场（班初）：应完成 ${c16Should} / 已完成 ${c16Done} ⇒ 工单 ` +
+      `${lvInFE(c16, '工单超时预警')}/${lvInSV(c16, '工单超时预警')}；点亮 ${c16Lamp} h ≤ 阈值 ` +
+      `${lampCfg.threshold} h ⇒ 耗材 ${lvInFE(c16, '耗材更换预警')}/${lvInSV(c16, '耗材更换预警')}`);
+    /* 起算点分叉的**登记**（不是断言，不改判据）：本段喂给服务端的是前端回读的减数，
+       而生产侧应完成另按 `task.plan_start_time` 起算 ⇒ 这里把两侧口径现场打印出来，
+       便于复核者一眼看到"本节对账的是判据、不是取数"。 */
+    t.info(`九 · 起算点差异登记（不由本节断言）：前端演示应完成＝floor(班次已进行秒数 ${c14.fe ? c14.fe.ctx.shiftElapsed : '(缺)'} ÷ ${CYC})；` +
+      `生产侧应完成＝floor((采集时刻 − task.plan_start_time) ÷ ${CYC})（server/index.js shouldDoneOf）——` +
+      `本节只对账「同一组入参下两侧判定函数一致」，取数口径分叉不在此节覆盖范围内`);
+
+    /* 真源缺口**已收口**（T2 2026-09-30 三次对齐；D19「断言只证明它自己说的那件事」）：
+       上一轮本条是**缺口登记**（"`server\` 下没有 `result` 表写入点 ⇒ `doneQtyOf()` 恒 0"），
+       并在自己的文案里写明："本条变红即表示写入点已实装，必须换成真正的「已完成件数派生」断言"。
+       座位 3 已在 `T-20260930-08` 落地写入点：`server\repo\result.js` 的 `upsertJudgement()`
+       （唯一写入口，`ON CONFLICT DO UPDATE`），由 `server\index.js` 的 `persistJudgement()` 在
+       **1 s 采样落库之后**（`onSampled` 挂钩）按件调用。故本轮**按原话把它换掉**，换成下面三条：
+         ① **结构**：写入点确实在（且全仓唯一），`persistJudgement()` 确实调用它；
+         ② **委托**：`doneQtyOf()` 把"已完成件数"委托给同一个仓储的 `countDone()`
+            （不再自写第二份计数 SQL —— 两份 SQL 就是两个口径）；
+         ③ **派生（走真写入点）**：`countDone()` 的数**真的**由 `upsertJudgement()` 写出的行派生
+            （合格＋不合格计入、待复检不计、按件幂等、终态不回退、非法结果拒收）。
+       ⚠ 禁止用"往 `result` 塞假行"来让关联断言变绿 —— ③ 的写入**全部经真写入点**落进一个
+       **独立的内存库**（`node:sqlite` 的 `:memory:` ＋ `server/db` 的 `initSchema()`），
+       与任何生产库文件无关，也不构造生产不可达的状态。 */
+    const SERVER_JS_FILES = (() => {
+      const out = [];
+      const walk = dir => {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+          const full = path.join(dir, e.name);
+          if (e.isDirectory()) walk(full);
+          else if (e.name.endsWith('.js')) out.push(full);
+        }
+      };
+      walk(path.join(ROOT, 'server'));
+      return out;
+    })();
+    const relOf = f => path.relative(ROOT, f).split(path.sep).join('/');
+    const resultWriters = SERVER_JS_FILES.filter(f =>
+      /INSERT\s+(?:OR\s+\w+\s+)?INTO\s+result\b/i.test(fs.readFileSync(f, 'utf8')));
+    /* 取某函数的**函数体**（从声明处到下一个同级 `  function ` 之前）：只扫这一段，
+       避免把文件里别处的同名调用/SQL 当成"这个函数做了那件事"（D19 的口径要精确到函数）。 */
+    const bodyOf = (src, decl) => {
+      const i = src.indexOf(decl);
+      if (i < 0) return null;
+      const j = src.indexOf('\n  function ', i + decl.length);
+      return src.slice(i, j < 0 ? src.length : j);
+    };
+    const resultRepo = require(path.join(ROOT, 'server', 'repo', 'result.js'));
+    const indexSrc = fs.readFileSync(path.join(ROOT, 'server', 'index.js'), 'utf8');
+    const doneQtyBody = bodyOf(indexSrc, 'function doneQtyOf(');
+    const persistBody = bodyOf(indexSrc, 'function persistJudgement(');
+    t.check('九 · 真源已收口 ①（**写入点实装**）：`server\\` 下**有** `result` 表写入点 —— ' +
+      '`server/repo/result.js` 导出 `upsertJudgement()`（全仓**唯一**含 `INSERT INTO result` 的文件），' +
+      '且 `server/index.js` 的 `persistJudgement()` **真的调用**它（不是"有仓储没人用"）',
+      resultWriters.length === 1 && relOf(resultWriters[0]) === 'server/repo/result.js' &&
+      typeof resultRepo.upsertJudgement === 'function' &&
+      Boolean(persistBody) && persistBody.includes('resultRepo.upsertJudgement('),
+      `扫描 server\\*.js 共 ${SERVER_JS_FILES.length} 个文件；含 INSERT INTO result 的：` +
+      `${resultWriters.map(relOf).join('、') || '无'}；` +
+      `repo/result 导出 upsertJudgement=${typeof resultRepo.upsertJudgement}；` +
+      `persistJudgement() 调用 resultRepo.upsertJudgement=${Boolean(persistBody && persistBody.includes('resultRepo.upsertJudgement('))}`);
+    t.check('九 · 真源已收口 ②（**委托同一口**）：`doneQtyOf()` 把"已完成件数"委托给 `repo/result.js` 的 ' +
+      '`countDone()`（`result` 表的读口也只有一处），**不再**在 `server/index.js` 里自写第二份计数 SQL',
+      typeof resultRepo.countDone === 'function' &&
+      Boolean(doneQtyBody) && doneQtyBody.includes('resultRepo.countDone(') &&
+      !/SELECT\s+COUNT/i.test(doneQtyBody),
+      `doneQtyOf() 函数体：委托 resultRepo.countDone=${Boolean(doneQtyBody && doneQtyBody.includes('resultRepo.countDone('))}；` +
+      `自写 SELECT COUNT=${Boolean(doneQtyBody && /SELECT\s+COUNT/i.test(doneQtyBody))}；` +
+      `函数体=${JSON.stringify(String(doneQtyBody || '').replace(/\s+/g, ' ').trim().slice(0, 220))}`);
+
+    /* ③ 走**真写入点**的「已完成件数派生」断言（ADR-0004 D21：期望值构成性推导，不写死）：
+       在一个**独立的内存库**上**只经** `upsertJudgement()` 写入三件不同结果的判定
+       （第 1 件「合格」、第 2 件「不合格」、第 3 件「待复检」），随后对第 1 件再写一条「测试中」。
+       期望由"**写了什么** ＋ `DONE_STATUS`（FR-4.4 的已完成集合真源）"现算：
+         · `countDone()` ＝ 写成内容里落在 `DONE_STATUS` 的条数（＝ 合格 ＋ 不合格；**待复检不计**）；
+         · `countByTask()` ＝ 写过的**件数**（(工单,件号) 幂等：第 1 件写两次仍是一行）；
+         · 第 1 件的结果**不回退**（终态「合格」不被后来的「测试中」改写）、`duration_sec` 取 `MAX`；
+         · 第 3 件 `retest_count` ＝ 1（首判即待复检 ⇒ 进入复检流程一次，FR-4.9 口径）；
+         · 取值域外的结果**被拒收**（`TypeError`）且库里不新增行（写入点守边界、不做业务判断）。 */
+    const memDbApi = require(path.join(ROOT, 'server', 'db'));
+    const { DatabaseSync } = memDbApi.loadSqlite();
+    const memDb = new DatabaseSync(':memory:');
+    memDbApi.initSchema(memDb, '2026-09-30 09:00:00');
+    const MEM_T = 'WO-E58-MEM', MEM_NOW = '2026-09-30 09:00:00';
+    const memWritten = ['合格', '不合格', '待复检'];
+    const put = (unitIndex, result, durationSec) => resultRepo.upsertJudgement(memDb, {
+      procOrderNo: MEM_T, unitIndex, result, judgedAt: MEM_NOW, now: MEM_NOW, durationSec
+    });
+    put(1, memWritten[0], 10);
+    put(2, memWritten[1], 20);
+    put(3, memWritten[2], 30);
+    put(1, '测试中', 99);                          // 同一件再写：幂等 + 终态不回退 + duration 取 MAX
+    const memDone = resultRepo.countDone(memDb, MEM_T);
+    const memRows = resultRepo.countByTask(memDb, MEM_T);
+    const memRow1 = resultRepo.getOne(memDb, MEM_T, 1);
+    const memRow3 = resultRepo.getOne(memDb, MEM_T, 3);
+    /* 期望的构成性推导：落在 `DONE_STATUS`（合格＋不合格）的那些"件"才算已完成（FR-4.4 / FR-5.11） */
+    const memExpectDone = memWritten.filter(r => resultRepo.DONE_STATUS.includes(r)).length;
+    let memRejected = null;
+    try { put(4, '合格件', 1); } catch (err) { memRejected = err; }
+    const memRowsAfterReject = resultRepo.countByTask(memDb, MEM_T);
+    t.check('九 · 「已完成件数」**派生自写入点**（FR-4.4 / FR-5.11 的减数真的能非零）：' +
+      '经 `upsertJudgement()` 写入 合格/不合格/待复检 三件（第 1 件再写一次「测试中」）⇒ ' +
+      '`countDone()` ＝ **合格＋不合格**（**待复检不计**）、`countByTask()` ＝ 写过的件数（按件幂等）、' +
+      '第 1 件终态不回退、第 3 件 `retest_count` ＝ 1、取值域外的结果被拒收且不新增行',
+      memDone === memExpectDone && memExpectDone < memWritten.length &&
+      memRows === memWritten.length &&
+      Boolean(memRow1) && memRow1.result === '合格' && memRow1.duration_sec === 99 &&
+      Boolean(memRow3) && memRow3.result === '待复检' && memRow3.retest_count === 1 &&
+      memRejected instanceof TypeError && memRowsAfterReject === memWritten.length,
+      `内存库（:memory: ＋ initSchema，**只经真写入点**写入）实测：countDone=${memDone}、` +
+      `期望＝写成内容里落在 DONE_STATUS=${JSON.stringify(resultRepo.DONE_STATUS)} 的条数=${memExpectDone}` +
+      `（**待复检不计**：写 ${memWritten.length} 件、只算 ${memExpectDone} 件）；` +
+      `countByTask=${memRows}（期望 ${memWritten.length}）；` +
+      `第 1 件行=${JSON.stringify(memRow1)}（终态不回退 / duration_sec 取 MAX）；` +
+      `第 3 件行=${JSON.stringify(memRow3)}；` +
+      `取值域外的结果 '合格件' 被拒收=${memRejected instanceof TypeError}` +
+      `（${memRejected && memRejected.message ? String(memRejected.message).slice(0, 70) : '（未抛错）'}）；` +
+      `拒收后行数=${memRowsAfterReject}`);
+
+    /* ④ 当班「已完成」的**取数真源**（技术债 `E61`／审查 P1-2，负责人 2026-09-30 裁定：
+       `stateSnapshot.js` 的 `statsOf()` 由 `SELECT status FROM task` 改为 `SELECT result FROM result`，
+       与 `FR-5.11` 同源）。**为什么必须在门禁里落成断言**：此前**没有任何门禁**看这一处取数 ——
+       把 `statsOf()` 改回读 `task.status`（该列全仓无写入方 ⇒ 恒 `待测试` ⇒ 「已完成」恒 0、
+       与同帧 `FR-5.11` 的 detail 同屏矛盾），上面 ①②③ 三条**全部照旧全绿**
+       （它们只验"写入点在不在／委托给谁／`countDone` 的派生"，没有一条经 `stateSnapshot` 的统计段取数）。
+       本节 ④ 就是补这个缺口，并作为 **D22 定点变异**的靶子（ADR-0004 D22：防回潮断言须可证伪）。
+       ---- 现场构造（**与 ③ 完全独立的一段内存库**，不往 ③ 的库塞任何行） ----
+       经 `upsertJudgement()`（真写入点）写四件：合格 / 合格 / 不合格 / 待复检
+       ⇒ `DONE_STATUS` 口径下"已完成"应为 **3**（**待复检不计**），而 `result` 表共 **4** 行。
+       `task` 表另插 **2** 行（`status` 分别为「测试中」「待测试」）—— **只为证伪"读 `task.status`"这一支**：
+       这两行若被当成"已完成"来源，数是 0（都非 `DONE_STATUS`）。
+       期望值**现算**：`expectDone` ＝ 写入内容里落在 `DONE_STATUS` 的条数（不写死魔数）。
+       ⚠ 两个来源在本夹具上的取值**刻意不同**（3 vs 0/2），否则本条对"改回读 task.status"无判别力。 */
+    const snapSvc = require(path.join(ROOT, 'server', 'services', 'stateSnapshot.js'));
+    const snapDb = new DatabaseSync(':memory:');
+    memDbApi.initSchema(snapDb, MEM_NOW);
+    const SNAP_OK = 'WO-P12-SNAP-OK', SNAP_NG = 'WO-P12-SNAP-NG';
+    const snapWritten = ['合格', '合格', '不合格', '待复检'];
+    snapWritten.forEach((r, i) => resultRepo.upsertJudgement(snapDb, {
+      procOrderNo: i === 2 ? SNAP_NG : SNAP_OK, unitIndex: i + 1, result: r,
+      judgedAt: MEM_NOW, now: MEM_NOW, durationSec: 10 * (i + 1)
+    }));
+    /* `task` 行：**不是** `result` 行，也不是给被测路径喂假 `result`；它存在的唯一理由是
+       "把 `task.status` 摆成一个非 0 的值，再看那条量动不动"。 */
+    const snapTaskRow = (no, status) => snapDb.prepare(
+      'INSERT INTO task(proc_order_no, product_code, status, created_at, updated_at) VALUES(?,?,?,?,?)'
+    ).run(no, 'P-P12', status, MEM_NOW, MEM_NOW);
+    snapTaskRow('WO-P12-T1', '测试中');
+    snapTaskRow('WO-P12-T2', '待测试');
+    /* 统计段的公开取数口：整个 `snapshot()`（不另走内部函数 —— 被测的就是"快照里的 stats"） */
+    const snapStats = () => snapSvc.createStateSnapshot({
+      db: snapDb, now: () => new Date(MEM_NOW.replace(' ', 'T'))
+    })().stats;
+    const snapExpectDone = snapWritten.filter(r => resultRepo.DONE_STATUS.includes(r)).length;
+    const snapRows = snapWritten.length;
+    /** 逐态件数：**也从写入内容现算**（不写死魔数 —— 与上面的 expectDone 同一口径） */
+    const snapCountOf = st => snapWritten.filter(r => r === st).length;
+    const ST = resultRepo.STATUS;
+    /** 若有人把取数改回 `task.status`，这一格就是它会读到的值（用来当场证明本条有判别力） */
+    const taskStatusDone = () => Number(snapDb.prepare(
+      'SELECT COUNT(*) AS c FROM task WHERE status IN (?,?)'
+    ).get(resultRepo.DONE_STATUS[0], resultRepo.DONE_STATUS[1]).c);
+
+    const snapA = snapStats();
+    const fakeA = taskStatusDone();
+    t.check('九 · 当班「已完成」的**取数真源＝`result` 表**（P1-2／E61）：`stateSnapshot` 的 ' +
+      '`stats.doneQty` ＝ `result` 表里落在 `DONE_STATUS`（合格＋不合格）的**件数**，**待复检不计** —— ' +
+      '写入 合格/合格/不合格/待复检 四件 ⇒ 「已完成」只是其中合格＋不合格那几件' +
+      '（而同一份快照里 `retestQty` 非 0 证明那件**在表内**、只是不计已完成）',
+      snapA.doneQty === snapExpectDone && snapExpectDone < snapRows &&
+      snapA.passQty === snapCountOf(ST.PASS) && snapA.failQty === snapCountOf(ST.FAIL) &&
+      snapA.retestQty === snapCountOf(ST.RETEST),
+      `内存库（:memory: ＋ initSchema；四件**只经** upsertJudgement 写入）：` +
+      `stats.doneQty=${snapA.doneQty}（期望＝写入内容里落在 DONE_STATUS=${JSON.stringify(resultRepo.DONE_STATUS)} 的条数=${snapExpectDone}）；` +
+      `passQty=${snapA.passQty}（写入「${ST.PASS}」${snapCountOf(ST.PASS)} 件）/` +
+      `failQty=${snapA.failQty}（写入「${ST.FAIL}」${snapCountOf(ST.FAIL)} 件）/` +
+      `retestQty=${snapA.retestQty}（写入「${ST.RETEST}」${snapCountOf(ST.RETEST)} 件）—— ` +
+      `写 ${snapRows} 件、已完成 ${snapExpectDone} 件；` +
+      `同刻 task 表里落在 DONE_STATUS 的 ` + '`task.status`' + `＝${fakeA} 条` +
+      `（≠ ${snapExpectDone} ⇒「读 task.status」这一支在本夹具上**必然算错**，本条有判别力）`);
+
+    const snapB = snapStats();                                  // 改写 task.status 前再取一次（阴性对照基线）
+    snapDb.prepare('UPDATE task SET status = ?').run('合格');    // ① 全改「合格」（落在 DONE_STATUS 内）
+    snapTaskRow('WO-P12-T3', '测试中');                          // 并再**新增**一行 task（证明"多一行工单"也不动该量）
+    const snapC = snapStats();
+    const fakeC = taskStatusDone();
+    snapDb.prepare('UPDATE task SET status = ?').run('测试中');  // ② 全改「测试中」（落在 DONE_STATUS 外）
+    const snapD = snapStats();
+
+    t.check('九 · 当班「已完成」**不读** `task.status`（P1-2／E61；**D22 靶子**）：把 `task` 表的 ' +
+      '`status` 全改成「合格」或全改成「测试中」（并**再新增一行** task）⇒ `stats.doneQty` **一字不变**，' +
+      '始终等于 `result` 表的合格＋不合格件数',
+      snapB.doneQty === snapExpectDone && snapC.doneQty === snapB.doneQty &&
+      snapD.doneQty === snapB.doneQty && snapExpectDone < snapRows &&
+      fakeC !== snapExpectDone,
+      `task.status 三态下同一份快照的 doneQty：` +
+      `「测试中/待测试」⇒ ${snapB.doneQty}；全改「合格」＋新增一行 task ⇒ ${snapC.doneQty}；全改「测试中」⇒ ${snapD.doneQty}` +
+      `（三次都应为 ${snapExpectDone} ＝ result 表口径）；` +
+      `同期 task 表按 status 数的"假想已完成"＝${fakeA} → ${fakeC} → 0（**确实在变** ⇒ 该量若真来自 task.status，本条必红）；` +
+      `result 表行数始终＝${snapRows}`);
+    snapDb.close();
   }
 }
 

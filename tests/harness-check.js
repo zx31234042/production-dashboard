@@ -27,6 +27,27 @@ const snapshot = require('./lib/snapshot');
    注意：夹具模板里的同名 require 在**子进程**作用域，本文件顶层的断言代码读不到它。 */
 const judge = require('../server/services/judge');
 const boardConfig = require('../src/config/board.config.js');
+/* E58（DR-05 写入点，`T-20260930-08` 收口后）：进程入口模块本身。顶层这里只 require（**不起服务**，
+   `require.main !== module` ⇒ 不会自动 `main()`），用途：在**进程内**起真服务实例，让父进程能读它的库
+   句柄与 `state`，从而**按件对账** `result` 表（`countDone` / `countByTask` / `getOne`）—— 沿用层② W7 段
+   同款写法（"父进程进程内起服务"）。
+   ⚠ E58 的临时闸（`start()` 的 `orderDoneSourceReady` 注入位、`ORDER_DONE_SUPPRESS_REASON` 字面量、
+   `/health.orderWarningSource` 字段、启动日志抑制行）已随 `T-20260930-08` **整段拆除** ⇒ 本文件
+   **不再读任何"闸"字段**：件数只有一条真源（`result` 表按件计数），"该类整条不产生"与"该类判 ok"
+   不再混为一谈 —— 旧写法靠已删字段决定期望值，字段消失后退化成 `undefined === undefined` 的**恒真式**
+   （ADR-0004 D23 明令禁止）。
+   命名不与夹具模板里的 `entry` 撞车：那些是**子进程作用域**的局部变量。 */
+const serverEntry = require('../server/index.js');
+/* 标准仓储（真计数夹具要写"生效标准"才能让判定真的跑起来）。
+   ⚠ 必须**在顶层**再 require 一次：W5 夹具模板里那份 `stdRepo` 在**子进程作用域**，
+   而本文件里另有一份落在 W6 那个**块作用域**内（块内的 `const` 出了块就没了）—— 实测踩过：
+   在块外的夹具函数里直接用 `stdRepo` / `post` 会抛 `ReferenceError`。 */
+const stdRepo = require('../server/repo/standard.js');
+/* DR-05 仓储（E58 ②）：真计数夹具按件对账 `result` 表用 —— 读口（`countDone`/`countByTask`/`getOne`）
+   走**生产同一口**（不另写第二份 SQL），外加一处"写失败注入"（临时把 `upsertJudgement` 换成抛错桩，
+   测完**当场还原**，见夹具内注释）。它与 `server/index.js` 顶层 require 的是**同一个模块对象**
+   （Node 模块缓存）⇒ 换属性即可作用于生产链路，不必改被测实现。 */
+const resultRepo = require('../server/repo/result.js');
 
 env.assertRuntime();
 const t = createRunner('夹具自检（harness-check）');
@@ -1473,8 +1494,21 @@ const streams = [];
   OUT.other.warning = { expect: harmVec, at: WARN_AT };
   warnAtProbe.length = 0;                       // 从本段起点开始只记"本段产生的 warning 信封"
 
+  /* ⚠ 2026-09-30 T2 独立复核（FR-5.11 判据改造 / 需求 C-108）：本票**必须真的下发计划开工时刻**。
+     服务端「工单超时」的两个减数由 task.plan_start_time 与 result 表件数算出
+     （server/index.js 的 shouldDoneOf() / doneQtyOf()）。若不下发（该列为 NULL），生产侧恒算得
+     「应完成 0 / 已完成 0」⇒ 该条退化成一条**恒定 ok 快照**，对账就成了"两边都算 0"的恒等式，
+     **取数链路一条都没被验到**（把 shouldDoneOf 改成恒返回 0 也照样全绿 —— 这正是旧写法的问题，
+     旧写法在父进程侧把两个减数写死成 0/0）。
+     ⚠ 本段在 String.raw 模板里：**注释里不得出现反引号**（会提前闭合外层模板，files-check 的
+     node --check 当场红 —— 本次实测踩到过一次），故此处一律用「」或裸标识符。
+     故此处下发 11:00:00（在三帧采集时刻 12:00:xx 之前 1 小时）：应完成＝floor(3600 / 节拍 160)＝22 件 > 0，
+     而件数门槛（80）不成立 ⇒ 事件里的「工单超时」**只能由比率门槛**判 err ⇒ 判据全链路真的被算出来。 */
+  const W5W_PLAN_START = '2026-09-19 11:00:00';
+  OUT.other.warning.planStartSent = W5W_PLAN_START;
   OUT.other.warning.dispatch = await post(base, '/ifa/dispatch', {
-    procOrderNo: 'WO-W5W-1', productCode: 'P-W5W', processNo: '30', planQty: 6, equipCode: 'EQ-W5'
+    procOrderNo: 'WO-W5W-1', productCode: 'P-W5W', processNo: '30', planQty: 6, equipCode: 'EQ-W5',
+    planStartTime: W5W_PLAN_START
   });
   OUT.other.warning.stdV2 = stdRepo.addVersion(db, {
     productCode: 'P-W5W', processCode: '30',
@@ -1486,16 +1520,28 @@ const streams = [];
     speedTypical: boardConfig.standards.default.speed.typical
   }, '2026-09-19 11:59:59', '2026-09-19 11:59:59', { bus: svc.bus });
 
-  /* 这一帧：**同态临近**（深度与速度各距上/下限恰 k 格）⇒ 参数类恰 2 条 */
+  /* 这一帧：**同态临近**（深度与速度各距上/下限恰 k 格）⇒ 参数类恰 2 条。
+     ⚠ 本段三帧一律带**件序号**（生产字段名 unitIndex，IF-D.4 / C-103）—— 理由见下面
+     harmFrame.unitIndex 那一处（不带 ⇒ 工单类在"事件"与"期望"两侧不同侧，逐字对账当场红）。 */
   const harmFrame = frame(30, WARN_AT.harm);
   harmFrame.procOrderNo = 'WO-W5W-1';
+  /* ⚠ **必须带件序号**（T-20260930-12a 把两条失配断言对齐到座位 6 的修复）：
+     「emitWarnings()」的现行口径是「拿不到件序号（帧未带/非法 unitIndex）⇒ 本件**不固化** ＋
+     本次判定**不产生**「工单超时预警」」（E60 裁定①）。而本节的期望侧重算**恒传**
+     shouldDone / doneQty 两个减数（orderDerive + recompute）⇒ 帧不带件序号时，
+     「事件 3 条（参数类 2 ＋ 维保 1） vs 重算 4 条（多一条工单类）」当场变红（实测红项）。
+     带上之后两侧同口径：工单类在事件与重算里都出现，逐字相等重新成立。
+     同票两帧都取第 1 件（都是测试中：testStatus=1）：DR-19 按件幂等 ⇒ 该票只落 1 行
+     result（结果「测试中」**不进** countDone）⇒ 期望侧读到的已完成件数仍是 0。 */
+  harmFrame.unitIndex = 1;
   harmFrame.depth = harmVec.depth.warnVal;
   harmFrame.speed = harmVec.speed.warnVal;
   OUT.other.warning.warnPost = await post(base, '/ifd/frame', harmFrame);
 
-  /* 这一帧：**超范围**（深度越上限一格）⇒ 出「参数超范围预警」（速度仍临近） */
+  /* 这一帧：**超范围**（深度越上限一格）⇒ 出「参数超范围预警」（速度仍临近）；同样带件序号 */
   const errFrame = frame(31, WARN_AT.err);
   errFrame.procOrderNo = 'WO-W5W-1';
+  errFrame.unitIndex = 1;                  /* 同票同件（测试中）⇒ 工单类照常参与对账 */
   errFrame.depth = harmVec.depth.errVal;
   errFrame.speed = harmVec.speed.warnVal;
   OUT.other.warning.errPost = await post(base, '/ifd/frame', errFrame);
@@ -1519,6 +1565,10 @@ const streams = [];
   }, '2026-09-19 11:59:59', '2026-09-19 11:59:59', { bus: svc.bus, dangerouslySkipValidation: true });
   const halfFrame = frame(40, WARN_AT.half);
   halfFrame.procOrderNo = 'WO-W5-2';
+  /* 本票的采集时刻 12:00:20 **晚于**前一票两帧（12:00:00 / 12:00:10）——
+     1 s 采样去重是「不得早于上次落库那一秒」（ADR-0001 D7）：同秒或更早会被判 raw-500ms
+     ⇒ 不落库、也就没有 warning 事件。件序号同样必须带（不带则该帧的工单类整条消失）。 */
+  halfFrame.unitIndex = 1;
   halfFrame.depth = harmVec.depth.errVal;
   halfFrame.speed = harmVec.speed.errVal;
   OUT.other.warning.halfPost = await post(base, '/ifd/frame', halfFrame);
@@ -1529,6 +1579,37 @@ const streams = [];
     halfRow: stdRepo.getEffective(db, { productCode: 'P-W5B', processCode: '30', at: WARN_AT.half }) || null
   };
   OUT.other.warning.ifdStatus = await (await fetch(base + '/ifd/status')).json();
+  /* 夹具①这台服务的「/health」（装配自报）：R1 只把它当**实例健康**的旁证 —— E58 的闸字段
+     （orderWarningSource）已随 T-20260930-08 删除，期望侧**不再**由任何「闸值」决定
+     「工单超时」参不参与对账（无闸 ⇒ 恒按库里真值参与）。
+     ⚠ 本段在 String.raw 模板里：**注释里不得出现反引号**（会提前闭合外层模板，files-check 的
+     node --check 当场红 —— 本次实测又踩到一次）。 */
+  OUT.other.warning.health = await (await fetch(base + '/health')).json();
+  /* 本节对账要用的**夹具实测状态**（从库里回读，不靠"我以为"）：派工是否真的落进
+     task.plan_start_time、该票 result 表件数（已完成）⇒ 父进程据此**现场推导**期望值，
+     而不是把两个减数写死（旧写法 shouldDone:0/doneQty:0 就是写死，见本段断言前提）。 */
+  OUT.other.warning.taskRow = db.prepare(
+    'SELECT proc_order_no, product_code, process_no, plan_qty, plan_start_time FROM task WHERE proc_order_no = ?'
+  ).get('WO-W5W-1') || null;
+  OUT.other.warning.doneQty = db.prepare(
+    "SELECT COUNT(*) AS n FROM result WHERE proc_order_no = ? AND result IN ('合格','不合格')"
+  ).get('WO-W5W-1').n;
+  /* 三帧的 testStatus **从库里回读**（不是把「我们打算发的码」记下来）：期望侧的 progress
+     必须由**已落库的那条事实**按 C-98④ / FR-2.5 的同一映射导出（见父进程 progressOfStatus()）——
+     这样「采信了帧自报的 progress（C-102③ 明令仅比对与展示）」或「testStatus 没传进判定层」
+     都会当场变红，而不是靠两边都漏算同一项凑成恒等式。 */
+  OUT.other.warning.frameStatus = (() => {
+    const q = db.prepare('SELECT test_status FROM measure_rt WHERE proc_order_no = ? AND collect_time = ?');
+    const at = (no, ct) => {
+      const r = q.get(no, ct);
+      return r ? r.test_status : null;
+    };
+    return {
+      harm: at('WO-W5W-1', WARN_AT.harm),
+      err: at('WO-W5W-1', WARN_AT.err),
+      half: at('WO-W5-2', WARN_AT.half)
+    };
+  })();
   OUT.other.warning.hookAt = warnAtProbe.slice();      // 进程内信封：seq + at（判定时刻）
   await sWarn.pump(400);
   OUT.other.warning.stream = { text: sWarn.text(), events: sWarn.events() };
@@ -1811,6 +1892,321 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
   const kindsOf = (o, k) => evts(o).filter(e => e.event === k);
   const idsOf = o => evts(o).map(e => e.id);
 
+  /* ===== E58（DR-05 写入点，`T-20260930-08` 收口后）**真计数**夹具：`result` 表件数驱动「工单超时预警」 =====
+     为什么另起一个**进程内**实例，而不是复用夹具①那台 W5 服务：
+       · 夹具①（上面那台）由 `w5Spawn` **另起子进程**，父进程**够不着**它的库句柄与 `state`
+         （`harness.startService` 只给它 argv/env）⇒ 在夹具①上无从按件对账 `result` 表
+         （`countDone` / `countByTask` / `getOne` 一个都读不到）；
+       · 而"件数驱动预警"这条判据**必须**在真生产链路上验（派工 → 真帧 → 1 s 采样落库 →
+         onSampled → emitWarnings → judge.evaluate → bus → **DR-05 按件固化**）；
+       · 本文件既有的"父进程进程内起服务"惯例就在这两行附近（层② 的 W7 段、层③ 的用例段都用
+         `entry.start({argv, installSignalHandlers:false, logConsole:false, clock})` 的原样写法），
+         故这里**沿用同一惯例**，不另造一套。
+     ⚠ E58 的临时闸（`start()` 的 `orderDoneSourceReady` 注入位 / `ORDER_DONE_SUPPRESS_REASON` 字面量 /
+     `/health.orderWarningSource` 字段 / 启动日志抑制行）已由 `T-20260930-08` **整段拆除** ⇒
+     本段**不读任何"闸"字段**：件数只有一条真源（`result` 表按件计数），"该类整条不产生"与
+     "该类判 ok"不再混为一谈 —— 旧写法正是靠**已删字段**决定期望值，字段消失后退化成
+     `undefined === undefined` 的**恒真式**（ADR-0004 D23 明令禁止；本轮把那一整段换成本段）。
+     时钟：本段用**局部**注入时钟（值固定 10:00:00）；判定取的时刻一律是**帧的采集时刻**
+     （12:00:xx，ADR-0003 D17），与"注入时钟停在几点"无关。
+     ⚠ 本段**不往 `result` 塞任何行**：所有行都由**推帧**经真正的写入点（`emitWarnings()` →
+     `persistJudgement()` → `repo/result.js` 的 `upsertJudgement()`）产生；读口也走生产同一口
+     `repo/result.js`（不另写第二份 SQL）。 */
+  const CNT_F1 = '2026-09-19 12:00:00';
+  const CNT_F2 = '2026-09-19 12:00:01';
+  const CNT_F3 = '2026-09-19 12:00:02';
+  const CNT_HALF = '2026-09-19 12:00:10';
+  const CNT_FAIL = '2026-09-19 12:00:20';
+  /* ⚠ 采集时刻必须**全局严格递增**：ingest 的 1 s 采样口径是"collectTime 不得早于上次落库那一秒"
+     （ADR-0001 D7）——同秒的另一票会被判成 `raw-500ms`、**不落库**，也就不会产生 `warning` 事件
+     （实测踩过一次：旧写法里第二票与主票同秒 ⇒ 该票事件条为 []）。 */
+  /** `yyyy-MM-dd HH:mm:ss`（DR-16）：本段只用它把"计划开工"按**配置节拍**摆到首帧之前 */
+  const textOfDate = d => d.getFullYear() + '-' +
+    String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+    String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') + ':' +
+    String(d.getSeconds()).padStart(2, '0');
+  const CNT_CYCLE = Number(boardConfig.production.cycleSec);
+  /* 计划开工 ＝ 首帧前 **(节拍 + 1) 秒**（由**配置节拍**现算，不写死时刻）：
+     现场推导应完成 ＝ floor((节拍 + 1) ÷ 节拍) ＝ 1 件 ⇒ "恰 1 件已完成"就能把落后率从 100% 压到 0%
+     ⇒ 「工单超时预警」的 **err → ok 翻转**可以在**同一票、同一节拍**上被观测到。
+     这是本段的核心构造：不构造出"非零已完成"，"`result` 表件数真的被读进判据"就无从证明。 */
+  const CNT_PLAN_START = textOfDate(new Date(Date.parse(CNT_F1.replace(' ', 'T')) - (CNT_CYCLE + 1) * 1000));
+  const CNT_DEPTH = boardConfig.standards.default.depth.typical;
+  const CNT_SPEED = boardConfig.standards.default.speed.typical;
+  const orderTitle = judge.OTHER_TITLES.order;
+  const countProbe = async label => {
+    /* 本段自带的 POST 小工具：**不能**复用文件里那两个同名 `post`（它们在别的块作用域／子进程里，
+       本作用域取不到 —— 实测 `typeof post === 'undefined'`）。零依赖，仍走真 HTTP。 */
+    const cntPost = async (b, p, body) => {
+      const res = await fetch(b + p, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+      let parsed = null;
+      try { parsed = await res.json(); } catch { /* 非 JSON */ }
+      return { status: res.status, body: parsed };
+    };
+    const tmp = harness.makeTempDir('e58-count-' + label);
+    const logLines = [];
+    const cntLogger = {
+      info: m => logLines.push(String(m)),
+      warn: m => logLines.push(String(m)),
+      error: m => logLines.push(String(m))
+    };
+    const cntClockMs = Date.parse('2026-09-19T10:00:00');
+    const cntClock = {
+      now: () => new Date(cntClockMs),
+      source: () => () => new Date(cntClockMs)
+    };
+    const out = {
+      label, tmp, logLines, warnings: [], posts: [], frameStatus: {},
+      ticketA: 'WO-E58c-' + label, ticketB: 'WO-E58c-half-' + label,
+      /* 负向靶子的票（T-20260930-12a）：**专用**工单号/产品号 —— 它的帧刻意不带件序号，
+         故绝不能与上面两条正向票共用（否则"0 行"会被正向帧的行污染，判据失去判别力）。 */
+      ticketC: 'WO-E58c-nounit-' + label
+    };
+    /** 第 k 条 `warning` 事件里的「工单超时预警」行（0 起；本段每帧恰产生 1 条事件） */
+    out.orderRowsAt = k => {
+      const p = out.warnings[k];
+      const ws = p && Array.isArray(p.warnings) ? p.warnings : [];
+      return ws.filter(w => w.title === orderTitle);
+    };
+    let svc = null;
+    let savedUpsert = null;
+    try {
+      svc = await serverEntry.start({
+        argv: ['--port', '0', '--data-dir', tmp, '--db-file', path.join(tmp, 'board.db')],
+        installSignalHandlers: false, logConsole: false, logger: cntLogger, clock: cntClock
+      });
+      out.port = svc.port;
+      out.base = 'http://127.0.0.1:' + svc.port;
+      out.listen = svc.listen;                        // 形如 host:port（port 传 0 ⇒ 必须读回真实端口）
+      out.health = await (await fetch(out.base + '/health')).json();
+      const db = serverEntry.state.db;
+      /* `result` 表的**现场读数**（全部走生产同一口 `repo/result.js`）：
+         `done` ＝ 已完成件数（合格＋不合格）、`rows` ＝ 该票行数（幂等对账用）。 */
+      const readCounts = no => ({ done: resultRepo.countDone(db, no), rows: resultRepo.countByTask(db, no) });
+      /* 收件箱分流（T-20260930-12a）：本段前四条的读数一律取**A/B/注入失败那五帧**的现场，
+         故 `out.warnings` 的长度必须仍恰等于那五帧（"每帧恰 1 条"是逐条锁死的对账）；
+         负向靶子（票 C）的事件**另走**一个收件箱（`nuSink`）⇒ 一条不少地存进 `out.noUnit.events`，
+         同时不污染前面已记的读数。分流的只有"收进哪个数组"，事件本身照样来自同一条生产链路。 */
+      let nuSink = null;
+      const subW = svc.bus.subscribe(e => {
+        if (e.kind !== 'warning') return;
+        (nuSink || out.warnings).push(e.payload);
+      });
+      out.unsubscribe = () => { try { svc.bus.unsubscribe(subW); } catch { /* 已关 */ } };
+
+      /* ---- 票 A：**全标准 + 计划开工**（"件数驱动"的主现场）---- */
+      const A = out.ticketA, PA = 'P-E58c-' + label;
+      out.dispatchA = await cntPost(out.base, '/ifa/dispatch', {
+        procOrderNo: A, productCode: PA, processNo: '30',
+        planQty: 6, equipCode: 'EQ-E58', planStartTime: CNT_PLAN_START
+      });
+      stdRepo.addVersion(db, {
+        productCode: PA, processCode: '30',
+        depthUpperDev: boardConfig.standards.default.depth.upperDev,
+        depthLowerDev: boardConfig.standards.default.depth.lowerDev,
+        depthTypical: boardConfig.standards.default.depth.typical,
+        speedUpperDev: boardConfig.standards.default.speed.upperDev,
+        speedLowerDev: boardConfig.standards.default.speed.lowerDev,
+        speedTypical: boardConfig.standards.default.speed.typical
+      }, CNT_PLAN_START, CNT_PLAN_START, { bus: svc.bus });
+      out.taskRowA = db.prepare(
+        'SELECT proc_order_no, product_code, process_no, plan_qty, plan_start_time FROM task WHERE proc_order_no = ?'
+      ).get(A) || null;
+      out.countsBefore = readCounts(A);              // 推帧**之前**的现场读数（不是"我以为是 0"）
+      const push = async (no, seq, at, testStatus, unitIndex) => {
+        const res = await cntPost(out.base, '/ifd/frame', {
+          equipCode: 'EQ-E58', procOrderNo: no, collectTime: at, seq,
+          depth: CNT_DEPTH, speed: CNT_SPEED, velocity_x: 3, velocity_y: 4,
+          frameRate: 1000, gain: 2.5, shutter: 500, cameraDepth: 12.5, testStatus, unitIndex
+        });
+        await new Promise(r => setTimeout(r, 400));    // 让 onSampled 挂钩跑完、事件落进订阅者
+        /* 该帧固化**之后**的现场读数 ＋ 该帧 `testStatus` 的**库内回读**（生产读的是同一条已落库
+           事实；本段不记"打算发的码" ⇒ "采信帧自报 progress（C-102③ 仅比对展示）"或
+           "`testStatus` 没传进判定层"都会变红，而不是两边都漏算同一项凑成恒等式）。 */
+        const st = db.prepare(
+          'SELECT test_status FROM measure_rt WHERE proc_order_no = ? AND collect_time = ?').get(no, at);
+        const rec = {
+          ticket: no, seq, at, testStatus, unitIndex, res, counts: readCounts(no),
+          storedStatus: st ? st.test_status : null
+        };
+        out.posts.push(rec);
+        out.frameStatus[at] = rec.storedStatus;
+        return rec;
+      };
+      await push(A, 9501, CNT_F1, 1, 1);              // 测试中（progress 0.5）
+      await push(A, 9502, CNT_F2, 2, 1);              // 判定（progress 1 ⇒ 合格）；固化在预警**之后**
+      await push(A, 9503, CNT_F3, 1, 1);              // 同一件再来一帧（终态不得回退 / 行数不得增）
+      out.rowA1 = resultRepo.getOne(db, A, 1);
+      out.doneA = resultRepo.countDone(db, A);
+      out.rowsA = resultRepo.countByTask(db, A);
+
+      /* ---- 票 B：**半套标准（速度三格未设定）+ 无计划开工**，一帧判「待复检」----
+         一次覆盖两件事：① `待复检`（判定依据不成立）**不计**「已完成」（行在、`countDone` 不加）；
+         ② `shouldDoneOf()` 返 0（无计划开工）⇒ 应完成 0 ⇒ 该类判 **ok**
+            （旧口径"计划数 − 已完成"在这里恒报 err —— 这正是 C-108 换判据要修的那一半）。 */
+      const B = out.ticketB, PB = 'P-E58c-half-' + label;
+      out.dispatchB = await cntPost(out.base, '/ifa/dispatch', {
+        procOrderNo: B, productCode: PB, processNo: '30',
+        planQty: 3, equipCode: 'EQ-E58'                        // ⚠ 故意**不下发** planStartTime
+      });
+      stdRepo.addVersion(db, {
+        productCode: PB, processCode: '30',
+        depthUpperDev: boardConfig.standards.default.depth.upperDev,
+        depthLowerDev: boardConfig.standards.default.depth.lowerDev,
+        depthTypical: boardConfig.standards.default.depth.typical
+      }, CNT_HALF, CNT_HALF, { bus: svc.bus, dangerouslySkipValidation: true });
+      out.taskRowB = db.prepare(
+        'SELECT proc_order_no, plan_start_time FROM task WHERE proc_order_no = ?'
+      ).get(B) || null;
+      await push(B, 9511, CNT_HALF, 2, 1);            // 判定 ⇒ 速度标准未设定 ⇒ idle ⇒ **待复检**
+      out.rowB1 = resultRepo.getOne(db, B, 1);
+      out.doneB = resultRepo.countDone(db, B);
+      out.rowsB = resultRepo.countByTask(db, B);
+
+      /* ---- 写失败注入：证明"固化失败**不污染采集链**" ----
+         手法：`server/index.js` 顶层是 `const resultRepo = require('./repo/result')`，调用点写的是
+         `resultRepo.upsertJudgement(...)` ⇒ 换掉**同一模块对象**上的这个属性即可作用于生产链路
+         （Node 模块缓存），**不必改被测实现**；测完**当场还原**（`finally` 里再兜一层）。 */
+      out.failuresBefore = serverEntry.state.resultWrite.failures;
+      out.writesBefore = serverEntry.state.resultWrite.writes;
+      out.warnBeforeFail = out.warnings.length;
+      savedUpsert = resultRepo.upsertJudgement;
+      resultRepo.upsertJudgement = function () {
+        throw new Error('harness-check 注入：DR-05 写入点抛错桩（本条只验"固化失败不污染采集链"）');
+      };
+      try {
+        await push(A, 9521, CNT_FAIL, 2, 2);          // 新的一件（第 2 件）：判定照跑、固化必失败
+      } finally {
+        resultRepo.upsertJudgement = savedUpsert;
+        savedUpsert = null;
+      }
+      out.failRow = resultRepo.getOne(db, A, 2);      // 应为 null（没写成）
+      out.rowsAAfterFail = resultRepo.countByTask(db, A);
+      out.resultWrite = Object.assign({}, serverEntry.state.resultWrite);
+      out.hookStatus = await (await fetch(out.base + '/ifd/status')).json();
+      out.measureRows = db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+      out.loggedWriteFailure = logLines.some(l => l.indexOf('result 表写入失败') >= 0);
+
+      /* ---- 票 C（**负向靶子**，T-20260930-12a 新增：下一包 D22 变异① 的靶子）----
+         E60 裁定①的两个后果要在**真链路**上同时成立，且不许用"整次判定没跑"冒充"该类不产生"：
+           · 不固化 ⇒ `result` **0 行**、`countDone` **0**、写入点 `writes` 增量 **0**
+             （"没写"与"写失败"是两件事 ⇒ `failures` 也不得变）；
+           · 「工单超时」**整条不产生** ⇒ 事件里该类 **0 条**；
+           · 而**同一条事件**里参数类（实测双双越上限 ⇒ 深度/速度各 1 条）与维保类**照常发布**
+             ⇒ 判定确实跑了、只是那**一类**成不了条（"参数类/维保类都在、独缺该类"）。
+         ⚠ 前提独立（D20）：本票**真的**下发 planStartTime（应完成 > 0）、真的写生效标准、
+           实测真的越范围 ⇒ 若帧带了件序号，该类**必然**成条。该反面由紧接的**正向对照帧**
+           （同一票、同一标准、同一序列，**只**把 unitIndex=1 补上）当场证伪它的对立面解读：
+           那一帧的事件里「工单超时」恰 1 条（少了这个对照，"0 条"也可能只是"这条链路不判"）。
+         ⚠ 采集时刻必须**晚于**本夹具已落库的最后一秒（ADR-0001 D7：不早于上次落库那一秒，
+           否则判成 raw-500ms ⇒ 不落库、也就没有事件）：本段最后一帧在 12:00:20，
+           故本票从 12:00:30 起、逐秒递增（第二、第三帧都必须更晚）。 */
+      const C = out.ticketC, PC = 'P-E58c-nounit-' + label;
+      const cntAt = (base0, plusSec) =>
+        textOfDate(new Date(Date.parse(base0.replace(' ', 'T')) + plusSec * 1000));
+      /* 双双越上限一格：与段⑦e 的 harmVec 同一算式（上限 ＝ 典型＋上偏差，取整到配置位数；再 + 一格） */
+      const nuVec = (() => {
+        const grid = 1 / Math.pow(10, boardConfig.standards.digits);
+        const over = s => Math.round((Math.round((s.typical + s.upperDev) * 100) / 100 + grid) * 100) / 100;
+        return {
+          depth: over(boardConfig.standards.default.depth),
+          speed: over(boardConfig.standards.default.speed), grid
+        };
+      })();
+      out.noUnit = {
+        ticket: C, productCode: PC, vec: nuVec, planStartSent: CNT_PLAN_START,
+        posts: [], events: [], control: null, taskRow: null, ifdStatusCounts: null
+      };
+      out.dispatchC = await cntPost(out.base, '/ifa/dispatch', {
+        procOrderNo: C, productCode: PC, processNo: '30',
+        planQty: 6, equipCode: 'EQ-E58', planStartTime: CNT_PLAN_START
+      });
+      stdRepo.addVersion(db, {
+        productCode: PC, processCode: '30',
+        depthUpperDev: boardConfig.standards.default.depth.upperDev,
+        depthLowerDev: boardConfig.standards.default.depth.lowerDev,
+        depthTypical: boardConfig.standards.default.depth.typical,
+        speedUpperDev: boardConfig.standards.default.speed.upperDev,
+        speedLowerDev: boardConfig.standards.default.speed.lowerDev,
+        speedTypical: boardConfig.standards.default.speed.typical
+      }, CNT_PLAN_START, CNT_PLAN_START, { bus: svc.bus });
+      out.noUnit.taskRow = db.prepare(
+        'SELECT proc_order_no, product_code, process_no, plan_start_time FROM task WHERE proc_order_no = ?'
+      ).get(C) || null;
+      out.noUnit.countsBefore = readCounts(C);
+      out.noUnit.writesBefore = serverEntry.state.resultWrite.writes;
+      out.noUnit.failuresBefore = serverEntry.state.resultWrite.failures;
+      /* 帧体**显式**决定带不带 unitIndex（本条的靶子：两次推帧只变这一个字段）。
+         `unitIndex === undefined` ⇒ JSON.stringify 直接**不产出该键**（不是产出 null）。 */
+      const nuPush = async (seq, at, testStatus, unitIndex) => {
+        const body = {
+          equipCode: 'EQ-E58', procOrderNo: C, collectTime: at, seq,
+          depth: nuVec.depth, speed: nuVec.speed, velocity_x: 3, velocity_y: 4,
+          frameRate: 1000, gain: 2.5, shutter: 500, cameraDepth: 12.5, testStatus
+        };
+        if (unitIndex !== undefined) body.unitIndex = unitIndex;
+        const res = await cntPost(out.base, '/ifd/frame', body);
+        await new Promise(r => setTimeout(r, 400));    // 让 onSampled 挂钩跑完、事件落进收件箱
+        const st = db.prepare(
+          'SELECT test_status FROM measure_rt WHERE proc_order_no = ? AND collect_time = ?').get(C, at);
+        return {
+          at, seq, testStatus, unitIndex: unitIndex === undefined ? null : unitIndex,
+          frameHasUnitIndex: Object.prototype.hasOwnProperty.call(body, 'unitIndex'),
+          res, storedStatus: st ? st.test_status : null, counts: readCounts(C),
+          writes: serverEntry.state.resultWrite.writes
+        };
+      };
+      nuSink = out.noUnit.events;                      // 票 C 的事件进专用收件箱（见 subW 处注释）
+      try {
+        out.noUnit.posts.push(await nuPush(9601, cntAt(CNT_F1, 30), 2));   // 判定帧，**不带** unitIndex
+        out.noUnit.posts.push(await nuPush(9602, cntAt(CNT_F1, 31), 2));
+        out.noUnit.posts.push(await nuPush(9603, cntAt(CNT_F1, 32), 2));
+      } finally { nuSink = null; }
+      out.noUnit.countsAfter = readCounts(C);
+      out.noUnit.writesAfter = serverEntry.state.resultWrite.writes;
+      out.noUnit.failuresAfter = serverEntry.state.resultWrite.failures;
+      out.noUnit.ifdStatusCounts = (await (await fetch(out.base + '/ifd/status')).json()).counts || null;
+      out.noUnit.shouldDoneAtFirst = Math.floor(
+        (Date.parse(cntAt(CNT_F1, 30).replace(' ', 'T')) - Date.parse(CNT_PLAN_START.replace(' ', 'T')))
+        / 1000 / CNT_CYCLE);
+      /* 正向对照帧：同一票、同一标准、同一越范围实测值，**只**把件序号补上（unitIndex=1） */
+      out.noUnit.control = {
+        at: cntAt(CNT_F1, 33), events: [],
+        writesBefore: serverEntry.state.resultWrite.writes
+      };
+      nuSink = out.noUnit.control.events;
+      try {
+        out.noUnit.control.rec = await nuPush(9604, out.noUnit.control.at, 2, 1);
+      } finally { nuSink = null; }
+      out.noUnit.control.writesAfter = serverEntry.state.resultWrite.writes;
+      out.noUnit.control.counts = readCounts(C);
+      out.noUnit.control.row = resultRepo.getOne(db, C, 1);
+    } catch (err) {
+      out.error = String(err && err.stack ? err.stack : err);
+    } finally {
+      try { if (savedUpsert) resultRepo.upsertJudgement = savedUpsert; } catch { /* 已还原 */ }
+      try { if (out.unsubscribe) out.unsubscribe(); } catch { /* 已退订 */ }
+      try { out.stopResult = await serverEntry.stop('harness-check E58 真计数：' + label); }
+      catch (err) { out.stopError = String(err && err.message); }
+      try { out.serverAfterStop = serverEntry.state.server === null; } catch { /* 读不到就算了 */ }
+      try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 }); }
+      catch (err) { out.rmError = String(err && err.message); }
+    }
+    return out;
+  };
+  /* ⚠ `start()` 是进程级单例（`state.running` 为真时直接抛）⇒ 本段只起**一台**，串行用完即停。 */
+  const cnt = await countProbe('main');
+  /* 前提独立（ADR-0004 D20）：实例起不来 ⇒ 下面各条**不得**被读成"验过了"；
+     `t.requires` 不成立计"未核实"（**不计通过**），退出码按 PROJECT_RULES 9.5-5 走。 */
+  const cntOk = t.requires('E58 真计数夹具：进程内实例能起、能探活、能停（否则下面"件数驱动"各条无从判定）',
+    Boolean(cnt && cnt.health && cnt.health.ok === true && cnt.health.dbWritable === true &&
+      cnt.stopResult && cnt.stopResult.code === 0),
+    `error=${cnt && cnt.error ? String(cnt.error).slice(0, 400) : '（无）'}；` +
+    `health=${JSON.stringify(cnt && cnt.health && { ok: cnt.health.ok, dbWritable: cnt.health.dbWritable })}；` +
+    `stop=${JSON.stringify(cnt && cnt.stopResult)}`);
+
   /* ---- 判据①：建连 hello 与 GET /state 逐字节同源 ---- */
   const helloEv = evts(s.hello0).find(e => e.event === 'hello');
   t.check('W5-①：`GET /state` 200（**不是** 503 未接线）且响应体与 `hello` 事件的 data **逐字节相等**（同一构造函数产出）',
@@ -1944,21 +2340,63 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
   const warnExpect = warnOpt.expect || {};
   const warnEvents = kindsOf(warnOpt.stream, 'warning');
   const paramTitles = [judge.WARN_TITLES.warn, judge.WARN_TITLES.err];   // 参数类**两条具名**（C-88）
-  /* ⚠ 2026-09-30（FR-5.11 判据改造 / 需求 C-108）：**入参要与生产写入点一致** ——
+  /* ⚠ 2026-09-30（FR-5.11 判据改造 / 需求 C-108）；**2026-09-30 T2 独立复核改判（ADR-0004 D21）**：
      服务端现在还会算「工单超时」（应完成 = 节拍 × (采集时刻 − `task.plan_start_time`)；已完成 = `result` 表件数）。
-     本夹具的工单行**没有计划开工时刻** ⇒ 生产侧算得「应完成 0 / 已完成 0」⇒ 该类在事件里是一条
-     **快照态 ok**（新判据下"应完成 0"不告警，正是它相对旧口径的关键改进）。此处按**同一组入参**重算，
-     故 `shouldDone/doneQty` 显式传 0：生产侧一旦取数不再是 0（例如开始读别的列），本对账**当场变红**。 */
-  const recompute = (depth, speed, ct) => judge.evaluate({
+     **旧写法（本轮主代理所写）把两个减数写死成 `shouldDone: 0, doneQty: 0`，理由是"本夹具的工单行
+     没有计划开工时刻 ⇒ 生产侧算得 0/0"—— 该理由本身属实，但结论是"改期望值适配实现"而不是"对齐"**：
+     它把对账退化成"两边都算 0"的恒等式 ⇒ `shouldDoneOf()` / `doneQtyOf()` 的取数链路**一条都没被验到**
+     （把 `shouldDoneOf` 改成恒返回 0 也照样全绿）；而且它把"实现日后开始读对列"变成**测试变红**，
+     下次只能再改期望值。现改为：**夹具真的下发 `planStartTime`**（见段⑦e 的 `W5W_PLAN_START`），
+     期望值由**回读的夹具实测状态**（`warnOpt.taskRow.plan_start_time` ＋ `warnOpt.doneQty`）＋ 节拍
+     **现场推导** —— 取数链路一变（含"恒返回 0"这类实现退化）本对账当场变红。
+     ⚠ **2026-09-30 三次对齐（技术债 E58 ② 收口 / `T-20260930-08` 之后）**：E58 的临时闸已**整段拆除**
+     ⇒ 夹具①的期望侧**恒**含「工单超时」一类（无闸 ⇒ 没有"两态"，件数按库里真值参与），
+     不再由任何"闸值"决定。另有一处**必须与生产同口径**的入参：`progress` ——
+     生产侧 `emitWarnings()` 由帧的 `testStatus` 按 C-98④ / FR-2.5 **导出**（`progressOf()`），
+     **不采信**帧自报的 `progress`（C-102③：IF-D 的进度仅比对与展示、不作权威）。
+     期望侧若漏传该入参，`taskResult()` 恒判「待测试」⇒ 与事件的「测试中」对不上（R1 恒红，实测红项之一）。
+     故此处新增 `progressOfStatus()`：**与生产逐条同映射**，入参取**库内回读**的 `test_status`
+     （见段⑦e 的 `frameStatus`），不取"我们打算发的码"。 */
+  const orderDerive = ct => {
+    const row = warnOpt.taskRow || null;
+    const cyc = Number(boardConfig.production.cycleSec);
+    const t0 = row && typeof row.plan_start_time === 'string' ? Date.parse(row.plan_start_time.replace(' ', 'T')) : NaN;
+    const t1 = Date.parse(String(ct).replace(' ', 'T'));
+    const shouldDone = (Number.isFinite(cyc) && cyc > 0 && Number.isFinite(t0) && Number.isFinite(t1) && t1 > t0)
+      ? Math.floor((t1 - t0) / 1000 / cyc) : 0;
+    return { shouldDone, doneQty: Number(warnOpt.doneQty) || 0 };
+  };
+  /** 帧 `testStatus` ⇒ 单件进度：**与生产 `server/index.js` 的 `progressOf()` 逐条同映射**
+   *  （附录 2 的码语义 + C-98④ / FR-2.5 的阶段导出规则）：`2`（判定）⇒ 1；`1`（运行）/ `3`（异常）⇒ 0.5；
+   *  其余（含 `0` 准备）⇒ 0。**不采信**帧自报的 `progress`（C-102③）。 */
+  const progressOfStatus = st => (st === 2 ? 1 : (st === 1 || st === 3 ? 0.5 : 0));
+  const recompute = (depth, speed, ct, order, progress) => judge.evaluate({
     now: ct, real: { depth, speed },
     standard: {
       depth: Object.assign({}, boardConfig.standards.default.depth),
       speed: Object.assign({}, boardConfig.standards.default.speed)
     },
-    shouldDone: 0, doneQty: 0
+    progress,
+    /* 无闸 ⇒ 两个减数**恒传**（`emitWarnings()` 现在就是这样传的：缺一即整条不产生该类，
+       而这里不构造"缺一"的情形 —— 只有一态，不再有"闸关 ⇒ 不给"的分支） */
+    shouldDone: order.shouldDone, doneQty: order.doneQty
   });
+  /* 夹具前提（ADR-0004 D20）：派工**真的**把计划开工时刻落进了库，且本票确实没有已出结果的件 ——
+     这是"应完成 > 0 而件数门槛不成立"这个现场成立的前提；前提塌掉时本段的对账就没有判别力。 */
+  const harmDerive = orderDerive((warnOpt.at && warnOpt.at.harm) || '');
+  t.check('W5-②/E45 夹具前提：派工 `planStartTime` **真的落进** `task.plan_start_time`（否则「工单超时」退化成 0/0 恒等式、取数链路一条都验不到）',
+    Boolean(warnOpt.taskRow) && typeof warnOpt.planStartSent === 'string' && warnOpt.planStartSent.length > 0 &&
+    warnOpt.taskRow.plan_start_time === warnOpt.planStartSent &&
+    warnOpt.doneQty === 0 && harmDerive.shouldDone > 0,
+    `下发=${JSON.stringify(warnOpt.planStartSent)}；库内 task 行=${JSON.stringify(warnOpt.taskRow)}；` +
+    `result 件数=${warnOpt.doneQty}；推导应完成=${harmDerive.shouldDone}`);
+  /* 期望侧的 `progress` 入参：由**库内回读**的 `test_status`（段⑦e 的 `frameStatus`）现算 ——
+     没有"闸值"要回读了（E58 闸已删）。回读而不是写死 0.5：帧的码一变，期望立刻跟着变；
+     而"采信帧自报 progress"会让这里的推导与生产分叉、当场变红（D22 可证伪）。 */
+  const harmStatus = warnOpt.frameStatus ? warnOpt.frameStatus.harm : null;
   const harmExpect = recompute(warnExpect.depth && warnExpect.depth.warnVal,
-    warnExpect.speed && warnExpect.speed.warnVal, (warnOpt.at && warnOpt.at.harm) || '');
+    warnExpect.speed && warnExpect.speed.warnVal, (warnOpt.at && warnOpt.at.harm) || '',
+    orderDerive((warnOpt.at && warnOpt.at.harm) || ''), progressOfStatus(harmStatus));
   const harmEv = warnEvents[0] || null;
   const harmParam = harmExpect.warnings.filter(w => paramTitles.includes(w.title));
   t.check('W5-②/E45 写点：`warning` 事件的载荷**逐字等于**"真帧实测 + 库里生效标准"喂给判定引擎的产出（段⑦e已无任何夹具直调 ⇒ 事件只能来自生产链路）',
@@ -1967,7 +2405,212 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     JSON.stringify(harmEv.data.warnings) === JSON.stringify(harmExpect.warnings) &&
     harmEv.data.result === harmExpect.result && harmEv.data.reason === harmExpect.reason,
     `事件 warnings=${JSON.stringify(harmEv && harmEv.data && harmEv.data.warnings)}；` +
-    `按写入点入参重算=${JSON.stringify(harmExpect.warnings)}`);
+    `按写入点入参重算=${JSON.stringify(harmExpect.warnings)}；` +
+    `本次重算的入参：progress=${progressOfStatus(harmStatus)}` +
+    `（由库内回读的 test_status=${JSON.stringify(harmStatus)} 按 C-98④ 导出）、` +
+    `应完成=${orderDerive((warnOpt.at && warnOpt.at.harm) || '').shouldDone}、已完成=${warnOpt.doneQty}；` +
+    `事件 result=${JSON.stringify(harmEv && harmEv.data && harmEv.data.result)}／重算=${JSON.stringify(harmExpect.result)}`);
+
+  /* FR-5.11（C-108）在**生产链路**上的件数驱动行为，已整段改由下面的「E58 真计数」四条断言承接
+     （进程内实例 + 真帧 + 真写入点 + 按件对账）；此处不再保留旧"两态"文字说明。
+     ⚠ 历史（E58 收口前）：`doneQtyOf()` 的唯一真源 `result` 表在 `server\` 下**没有任何写入点**
+     ⇒ 服务端"已完成件数"恒 0 ⇒ 只要有计划开工时刻就恒判 err。该缺口已由 `T-20260930-08` 补上
+     （写入点＝`server/index.js` 的 `persistJudgement()`，归口 `server/repo/result.js`），
+     且**禁止**用"往 `result` 塞假行"来给任何一条凑场景 —— 本段所有行都由**推帧**经真写入点产生。 */
+
+  /* ================= FR-5.11（C-108）**真计数**判据：`result` 表件数驱动「工单超时预警」 =================
+     ⚠ 2026-09-30 T2 三次改判（ADR-0004 D21「改实现还是改期望必须判定并写明」）：
+     上一轮（`T-20260930-05` 临时闸落地时）本段是"闸 off / 闸 on **两态**"四条断言。闸在
+     `T-20260930-08` 被**整段拆除**后，那四条**全部失效**：
+       · 态①（"该类整条不产生"）与态①b（"闸默认关"）读的是**已删字段** `/health.orderWarningSource`
+         ⇒ `undefined === undefined` ⇒ **态①b 是恒真式假绿**（ADR-0004 D23 明令禁止）；
+       · 态②/②b 读 `orderWarningSource.indexOf(READY_TAG)` ⇒ **抛 TypeError 中止整轮自检**
+         （实测：`harness-check.js` 在 `:2303` 中止、其后约 171 条断言从未被核实）。
+     **判定：改期望，不改实现**（无闸是裁定要求的正确行为）。且按 D23「不许只删不补」，把四条改成
+     **件数驱动的正向断言**（下面四条）—— 它们验的是"`result` 表的件数**真的**被算进了判据"，
+     而不是"某个字段长什么样"：
+       ① 非零已完成 ⇒ 同一票「工单超时预警」**由 err 转 ok**（等级与 detail 数值全部现场推导）；
+       ② `待复检` **不计**已完成（行在、`countDone` 不加）；
+       ③ 按件幂等（同一件连推多帧 ⇒ `result` 恰 1 行、终态不回退）；
+       ④ 固化失败**不污染采集链**（帧仍 stored、预警照发、失败计数 +1）。
+     ⚠ 本段**不往 `result` 塞任何行**：行只由推帧经 `repo/result.js` 的 `upsertJudgement()` 产生。 */
+
+  if (cntOk) {
+    /* 现场推导（ADR-0004 D21：期望值一律实测/构成性推导，不写死）：
+       · 应完成 ＝ floor((帧采集时刻 − `task.plan_start_time`) ÷ 配置节拍)（与生产 `shouldDoneOf()` 同一算式）；
+       · 已完成 ＝ **该帧自己固化之后**的件数 —— 逐帧 POST 返回（`onSampled` 已跑完）后的现场读数
+         `cnt.posts[k].counts.done` 就是服务端发布那一刻读到的件数；同一进程内、同一次请求之后读，
+         后续帧还没发生 ⇒ 两者必等（不是"我以为"）。
+         ⚠ **2026-09-30 T-20260930-12a 对齐（座位 4b）**：这里旧写法是 `posts[k−1].counts.done`
+         （＝"该帧固化**之前**"的件数），其依据是旧实现的调用顺序「先 `bus.publish`、再 `persistJudgement`」。
+         座位 6 的修复（E60 裁定②）已改为「**先固化、后发布**」（`server/index.js` 的 `emitWarnings()`：
+         第一拍 `publish:false` 只为取 `result` 去固化，第二拍才按**固化之后的真实件数**组织发布）
+         ⇒ 旧偏移写出来的期望整整错位一帧（实测：F2 期望 [应完成 1／已完成 0／err]，
+         事件实为 [1／1／ok]，本条当场变红）。**判定：改期望，不改实现** ——
+         期望改读"该帧自身的固化后件数"，与"发布读的是固化之后的件数"同一口径；
+         等级仍由本段**独立算**（不调 judge），故不是"用被测对象算期望"。
+       · 等级 ＝ C-108①② 的两个门槛（比率 / 件数）**在这里独立算**，不调 `judge` ——
+         否则就是"用被测对象算期望"，等于把对账退化成自证。 */
+    const cntAtMs = k => Date.parse(String(cnt.posts[k].at).replace(' ', 'T'));
+    const cntShould = k => Math.floor(
+      (cntAtMs(k) - Date.parse(CNT_PLAN_START.replace(' ', 'T'))) / 1000 / CNT_CYCLE);
+    /* 该帧**固化之后**的件数 ＝ 该帧 POST 返回后的现场读数（本帧自己判出的那一件已计入）。
+       ⚠ 不再取 `posts[k−1]`：那正是被座位 6 的"先固化后发布"修掉的旧偏移（见上）。 */
+    const cntDoneAt = k => cnt.posts[k].counts.done;
+    const cntExpectLv = (should, done) => {
+      const behind = should - done;
+      const ratio = should > 0 ? behind / should : 0;
+      return (ratio > boardConfig.warnings.orderOverdueRatio ||
+        behind > boardConfig.warnings.orderOverduePending) ? 'err' : 'ok';
+    };
+    /* 票 A 的三帧（posts[0..2]）与票 B 的那一帧（posts[3]）分别对账 */
+    const cntA = [0, 1, 2].map(k => {
+      const rows = cnt.orderRowsAt(k);
+      const should = cntShould(k), done = cntDoneAt(k);
+      const expectLv = cntExpectLv(should, done);
+      return {
+        k, rows, should, done, expectLv,
+        hit: rows.length === 1 && rows[0].lv === expectLv &&
+          String(rows[0].detail).includes(`按节拍应完成 ${should} 件、实际已完成 ${done} 件`)
+      };
+    });
+    const cntB = cnt.orderRowsAt(3);
+    const cntStored = cnt.posts.map(p => Boolean(p.res && p.res.status === 200 &&
+      p.res.body && p.res.body.outcome === 'stored'));
+    const cntAllStored = cntStored.length === 5 && cntStored.every(Boolean);
+    const cntFailPost = cnt.posts[cnt.posts.length - 1] || null;
+    const cntFrameA = cnt.posts.filter(p => p.ticket === cnt.ticketA && p.unitIndex === 1);
+    /* 现场实测值**打印出来**（D21：断言详情只在红时打印，故这里额外给一行实测现场，
+       便于复核者不跑变异也能看到"期望值是从哪些实测读数推出来的"；不计入断言数）。 */
+    t.info(`E58 真计数现场（实测）：帧落库=${cnt.posts.length} 帧（${cntStored.filter(Boolean).length} stored）／` +
+      `warning 事件 ${cnt.warnings.length} 条；票 ${cnt.ticketA}：推帧前 done=${cnt.countsBefore.done} ⇒ ` +
+      `推帧后 done=${cnt.doneA}、行数 ${cnt.rowsA}（第 1 件=${JSON.stringify(cnt.rowA1 && cnt.rowA1.result)}，` +
+      `duration_sec=${cnt.rowA1 && cnt.rowA1.duration_sec}）；三帧[应完成/已完成/本段独立算的等级]＝` +
+      cntA.map(x => `F${x.k + 1}[${x.should}/${x.done}/${x.expectLv}]`).join(' ') +
+      `（事件实测等级＝${cntA.map(x => JSON.stringify(x.rows[0] && x.rows[0].lv)).join(' ')}）；` +
+      `票 ${cnt.ticketB}：第 1 件=${JSON.stringify(cnt.rowB1 && cnt.rowB1.result)}、retest_count=${cnt.rowB1 && cnt.rowB1.retest_count}、` +
+      `行数 ${cnt.rowsB}、done=${cnt.doneB}；写失败注入：failRow=${JSON.stringify(cnt.failRow)}、` +
+      `state.resultWrite=${JSON.stringify(cnt.resultWrite)}、行数 ${cnt.rowsA}→${cnt.rowsAAfterFail}、` +
+      `loggedWriteFailure=${cnt.loggedWriteFailure}、measure_rt=${cnt.measureRows} 行`);
+
+    /* ---- 真计数①：非零「已完成」 ⇒ 「工单超时预警」由 **err 转 ok**（数值现场推导） ---- */
+    t.check('FR-5.11/C-108 行为·**真计数①**（非零「已完成」驱动）：同一票推三帧、第 2 帧 `testStatus=2` ⇒ ' +
+      '该件判「合格」并由 DR-05 写入点**按件固化** ⇒ 同一票「工单超时预警」由 **err 转 ok**；' +
+      '三帧的等级与 detail 里的「应完成 / 已完成」**全部等于现场推导值**（应完成＝节拍×经过时长、已完成＝`result` 实测件数）',
+      cntAllStored && cnt.posts.length === 5 && cnt.warnings.length === cnt.posts.length &&
+      cnt.countsBefore.done === 0 && cnt.doneA === cnt.countsBefore.done + 1 &&
+      Boolean(cnt.rowA1) && cnt.rowA1.result === '合格' &&
+      cntA.every(x => x.hit) &&
+      cntA[0].rows.length === 1 && cntA[0].rows[0].lv === 'err' &&
+      cntA[2].rows.length === 1 && cntA[2].rows[0].lv === 'ok' &&
+      cntA[0].should > 0 && cntA[2].done > cntA[0].done,
+      `五帧落库=${cnt.posts.map((p, i) => p.at + '=' + (cntStored[i] ? 'stored' : JSON.stringify(p.res && p.res.body))).join(' , ')}；` +
+      `warning 事件 ${cnt.warnings.length} 条（帧 ${cnt.posts.length} 帧 ⇒ 每帧恰 1 条）；` +
+      `票 ${cnt.ticketA}：推帧前 ` + '`countDone`' + `=${cnt.countsBefore.done} ⇒ 推帧后=${cnt.doneA}；` +
+      `第 1 件行=${JSON.stringify(cnt.rowA1)}（库内 test_status 回读：` +
+      `${cntFrameA.map(p => p.at + '→' + JSON.stringify(p.storedStatus)).join(' , ')}）；` +
+      cntA.map(x => `F${x.k + 1}[应完成 ${x.should} / 已完成 ${x.done} ⇒ **本段独立算出的等级 ${x.expectLv}**] ` +
+        `事件=${JSON.stringify(x.rows)}`).join('；'));
+
+    /* ---- 真计数②：`待复检` **不计**「已完成」＋ 无计划开工 ⇒ 判 ok ---- */
+    t.check('FR-5.11/C-108 行为·**真计数②**（`待复检` **不计**「已完成」）：半套标准（速度三格未设定）那件判「待复检」⇒ ' +
+      '`result` **有该件行**、而复检件**不进** `countDone`；同一票无计划开工 ⇒ 应完成 0 ⇒ 「工单超时」判 ok',
+      Boolean(cnt.rowB1) && cnt.rowB1.result === '待复检' && cnt.rowB1.retest_count === 1 &&
+      cnt.rowsB === 1 && cnt.doneB === 0 && cnt.doneA > 0 &&
+      Boolean(cnt.taskRowB) && cnt.taskRowB.plan_start_time === null &&
+      cntB.length === 1 && cntB[0].lv === 'ok' &&
+      String(cntB[0].detail).includes('按节拍应完成 0 件、实际已完成 0 件'),
+      `票 ${cnt.ticketB}：库内 task.plan_start_time=${JSON.stringify(cnt.taskRowB && cnt.taskRowB.plan_start_time)}（应为 null）；` +
+      `第 1 件行=${JSON.stringify(cnt.rowB1)}（应判「待复检」、复检次数 1）；` +
+      `该票 ` + '`result`' + ` 行数=${cnt.rowsB}、` + '`countDone`' + `=${cnt.doneB}（**待复检不计**）；` +
+      `对照：另一票同一张表上已完成=${cnt.doneA}（>0 ⇒ 本条的 0 不是"读不到"）；` +
+      `该票「工单超时预警」=${JSON.stringify(cntB)}`);
+
+    /* ---- 真计数③：按件幂等（同一件连推多帧 ⇒ 恰 1 行；终态不回退） ---- */
+    t.check('FR-5.11/DR-19 行为·**真计数③**（按件幂等）：同一件（工单＋件号）连推三帧 ⇒ `result` **恰 1 行**、' +
+      '结果**单调不回退**（已判「合格」的终态不被后续中间态改写）、`duration_sec` ＝该件首末**有效**帧的采集时刻差',
+      cnt.rowsA === 1 && cnt.rowsAAfterFail === 1 && cntFrameA.length === 3 &&
+      Boolean(cnt.rowA1) && cnt.rowA1.result === '合格' &&
+      cnt.rowA1.duration_sec === Math.round((cntAtMs(2) - cntAtMs(0)) / 1000),
+      `票 ${cnt.ticketA} 第 1 件：三帧（${cntFrameA.map(p => p.at + ' testStatus=' + JSON.stringify(p.storedStatus) +
+        ' unitIndex=' + p.unitIndex).join(' , ')}）⇒ ` + '`result`' + ` 行数=${cnt.rowsA}（幂等，未新增行）；` +
+      `行内容=${JSON.stringify(cnt.rowA1)}；` +
+      `duration_sec 期望＝首末有效帧差 ${Math.round((cntAtMs(2) - cntAtMs(0)) / 1000)} s（${cnt.posts[0].at} → ${cnt.posts[2].at}）；` +
+      `写失败注入后行数=${cnt.rowsAAfterFail}（第 2 件没写成 ⇒ 行数不变）`);
+
+    /* ---- 真计数④：固化失败**不污染采集链** ---- */
+    t.check('E58/D19 行为·**真计数④**（固化失败**不污染采集链**）：注入抛错桩 ⇒ 帧仍 `stored`、`warning` 照发、' +
+      '`state.resultWrite.failures` +1 且该件**没有**写出行；判定挂钩失败计数仍为 0（异常在写入点内部被收下）',
+      Boolean(cntFailPost) && Boolean(cntFailPost.res) && cntFailPost.res.status === 200 &&
+      cntFailPost.res.body && cntFailPost.res.body.outcome === 'stored' &&
+      cnt.warnings.length === cnt.posts.length &&
+      Boolean(cnt.resultWrite) && cnt.resultWrite.failures === cnt.failuresBefore + 1 &&
+      typeof cnt.resultWrite.lastError === 'string' && cnt.resultWrite.lastError.includes('注入') &&
+      cnt.failRow === null && cnt.rowsAAfterFail === cnt.rowsA && cnt.loggedWriteFailure === true &&
+      Boolean(cnt.hookStatus && cnt.hookStatus.counts) && cnt.hookStatus.counts.sampledHookFailures === 0,
+      `注入后那一帧（${cntFailPost && cntFailPost.at}，第 2 件 / testStatus=2）：落库=${JSON.stringify(cntFailPost && cntFailPost.res && cntFailPost.res.body && cntFailPost.res.body.outcome)}；` +
+      `warning 事件 ${cnt.warnings.length}/${cnt.posts.length}（照发）；` +
+      `state.resultWrite=${JSON.stringify(cnt.resultWrite)}（注入前 failures=${cnt.failuresBefore}、writes=${cnt.writesBefore}）；` +
+      `第 2 件行=${JSON.stringify(cnt.failRow)}（应为 null）；该票行数 ${cnt.rowsA} → ${cnt.rowsAAfterFail}；` +
+      `写入失败已写日志=${cnt.loggedWriteFailure}；` +
+      `/ifd/status.sampledHookFailures=${JSON.stringify(cnt.hookStatus && cnt.hookStatus.counts && cnt.hookStatus.counts.sampledHookFailures)}；` +
+      `夹具内异常=${cnt.error || '（无）'}`);
+
+    /* ---- 负向靶子（E60 裁定① / T-20260930-12a 新增）：帧**不带** `unitIndex` ⇒
+       「工单超时」整条不产生 ＋ 本件不固化；参数类/维保类照常发布
+       （不得用"整次判定没跑"冒充"该类不产生"；正面由同票的对照帧当场反证） ---- */
+    const nu = cnt.noUnit || {};
+    const nuPosts = Array.isArray(nu.posts) ? nu.posts : [];
+    const nuEvts = Array.isArray(nu.events) ? nu.events : [];
+    const nuCtl = nu.control || {};
+    const nuCtlEvts = Array.isArray(nuCtl.events) ? nuCtl.events : [];
+    /* 按标题数条数（只数"事件里真的发出来的"，不读实现内部状态） */
+    const nuRowsOf = (payloads, titles) => {
+      let n = 0;
+      for (const p of payloads) {
+        const ws = (p && Array.isArray(p.warnings)) ? p.warnings : [];
+        for (const w of ws) if (titles.indexOf(w.title) >= 0) n++;
+      }
+      return n;
+    };
+    const nuOrderRows = nuRowsOf(nuEvts, [orderTitle]);
+    const nuParamRows = nuRowsOf(nuEvts, [judge.WARN_TITLES.warn, judge.WARN_TITLES.err]);
+    const nuMaintRows = nuRowsOf(nuEvts, [judge.OTHER_TITLES.maintenance]);
+    const nuCtlOrderRows = nuRowsOf(nuCtlEvts, [orderTitle]);
+    t.check('FR-5.11/E60① 行为·**负向靶子**（帧**不带** `unitIndex`）：同一票连推 3 帧判定帧' +
+      '（`testStatus=2`、实测双双越上限、计划开工已落库 ⇒ 应完成 > 0）⇒ `result` **0 行**、' +
+      '`countDone`=0、`state.resultWrite.writes` 增量 **0**（连 `failures` 也不得变）；' +
+      '三帧各 1 条 warning 事件里**参数类 2 条 ＋ 维保类 1 条照发**、而「工单超时预警」**0 条** ' +
+      '⇒ 是"**该类**不产生"而不是"整次判定没跑"；' +
+      '正向对照（同一票、同一标准、同一实测值，**只**把 `unitIndex`=1 补上）⇒ 该帧事件里' +
+      '「工单超时」恰 1 条、`result` 恰 1 行、writes +1',
+      nuPosts.length === 3 && nuEvts.length === 3 && nuCtlEvts.length === 1 &&
+      nuPosts.every(p => p.frameHasUnitIndex === false && Boolean(p.res) && p.res.status === 200 &&
+        p.res.body && p.res.body.outcome === 'stored' &&
+        p.writes === nu.writesBefore && p.counts.done === 0 && p.counts.rows === 0) &&
+      Boolean(nu.countsBefore) && nu.countsBefore.done === 0 &&
+      Boolean(nu.countsAfter) && nu.countsAfter.done === 0 && nu.countsAfter.rows === 0 &&
+      nu.writesAfter === nu.writesBefore && nu.failuresAfter === nu.failuresBefore &&
+      nuOrderRows === 0 && nuParamRows === nuPosts.length * 2 && nuMaintRows === nuPosts.length &&
+      nu.shouldDoneAtFirst > 0 &&
+      Boolean(nu.taskRow) && nu.taskRow.plan_start_time === CNT_PLAN_START &&
+      Boolean(nu.ifdStatusCounts) && nu.ifdStatusCounts.sampledHookFailures === 0 &&
+      Boolean(nuCtl.rec) && nuCtl.rec.frameHasUnitIndex === true &&
+      nuCtlOrderRows === 1 && Boolean(nuCtl.counts) && nuCtl.counts.rows === 1 &&
+      nuCtl.writesAfter === nuCtl.writesBefore + 1 && Boolean(nuCtl.row),
+      `票 ${nu.ticket}（产品 ${nu.productCode}）：实测 depth=${nu.vec && nu.vec.depth}／speed=${nu.vec && nu.vec.speed}` +
+      `（各越上限一格）、计划开工=${JSON.stringify(nu.planStartSent)}（库内=${JSON.stringify(nu.taskRow && nu.taskRow.plan_start_time)}）` +
+      `⇒ 首帧应完成=${nu.shouldDoneAtFirst} 件（>0 ⇒ 工单类的两个减数在本票上**都**拿得到）；` +
+      `三帧（不带 unitIndex）：` + nuPosts.map(p => `${p.at} unitIndex=${JSON.stringify(p.unitIndex)}` +
+        `(${p.res && p.res.body && p.res.body.outcome}) result行=${p.counts.rows}/done=${p.counts.done}/writes=${p.writes}`).join(' , ') +
+      `；该票 result 行数=${nu.countsAfter && nu.countsAfter.rows}、countDone=${nu.countsAfter && nu.countsAfter.done}` +
+      `（推帧前 ${nu.countsBefore && nu.countsBefore.rows}/${nu.countsBefore && nu.countsBefore.done}）；` +
+      `writes ${nu.writesBefore}→${nu.writesAfter}、failures ${nu.failuresBefore}→${nu.failuresAfter}；` +
+      `事件三类条数：工单类=${nuOrderRows}（应 0）、参数类=${nuParamRows}（应 ${nuPosts.length * 2}）、维保类=${nuMaintRows}（应 ${nuPosts.length}）；` +
+      `判定挂钩失败=${nu.ifdStatusCounts && nu.ifdStatusCounts.sampledHookFailures}；` +
+      `正向对照帧 ${nuCtl.at}（**带** unitIndex=1，其余同）：工单类=${nuCtlOrderRows} 条、该票行数=${nuCtl.counts && nuCtl.counts.rows}、` +
+      `writes ${nuCtl.writesBefore}→${nuCtl.writesAfter}；行=${JSON.stringify(nuCtl.row)}`);
+  }
 
   t.check('FR-5.8/C-88 行为：**同态临近**（深度与速度各距上/下限恰 k 格）⇒ 事件里参数类**恰 2 条**且名称均为「参数阈值临近预警」、等级 warn、每条只含一个参数',
     Boolean(harmEv) && harmParam.length === 2 &&

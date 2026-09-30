@@ -1,6 +1,6 @@
 /* ==========================================================================
-   模拟数据源（services/mockData.js）— 按需求清单 V1.39 口径编写
-             （V1.39 / C-108 工单超时预警判据改「进度落后率超阈值率」且阈值率可配：工单预警按「应完成 / 已完成」重写，并新增演示旋钮 production.outputRatio；V1.38 / C-99～C-107 口径收口与接口修正；承 V1.37 / C-98「只统一 `testStatus` 码语义与运行阶段映射（改在 config/fieldMap.js
+   模拟数据源（services/mockData.js）— 按需求清单 V1.40 口径编写
+             （V1.40 / C-109＋C-110 口径补写〔FR-5.11 起算点＋DR-05 写入口径〕；V1.39 / C-108 工单超时预警判据改「进度落后率超阈值率」且阈值率可配：工单预警按「应完成 / 已完成」重写，**演示旋钮 production.outputRatio 已移出配置真源**（2026-09-30 负责人裁定 B）；V1.38 / C-99～C-107 口径收口与接口修正；承 V1.37 / C-98「只统一 `testStatus` 码语义与运行阶段映射（改在 config/fieldMap.js
               与两处模拟上位机），本文件数据与口径未变；
               V1.36 / C-96（U-5） 只精简测试标准区说明行文案）
    作用：产生并逐秒推进看板所需的全部数据；界面组件只读取本文件输出的 state
@@ -60,7 +60,15 @@ window.MockData = (function () {
     queueDepth: BCprod.queueDepth || 72,         // 设备侧待测试排队量
     /* 演示场景旋钮（**非判据参数**）：实际产出达成率。1＝按计划节拍推进；<1 表示实际产出慢于计划 ⇒
        演示现场真的落后（FR-5.11 的 err 分支由此可复现）。正式实现取 MES 派工进度与 result 表，
-       与本旋钮无关。 */
+       与本旋钮无关。
+       ⚠ 该键**不在配置真源 `src/config/board.config.js`** 里（2026-09-30 已从该文件删除，见其
+         `production` 段注释；本行读到的 `BCprod.outputRatio` 因此恒为 `undefined`）。由此四条口径：
+         ① 本文件**默认 1（中性）**：缺键时按"按计划节拍推进"取，不改变任何演示数值；
+         ② **仅供测试在内存沙箱里覆盖**（`tests/logic-check.js` 的 `loadFrontEnd({outputRatio})` 用法：
+            在加载本文件**之前**改内存里的 `window.BoardConfig.production.outputRatio`，只改内存、不落盘）；
+         ③ **生产不读**它 —— 它是演示/测试注入位，不是业务配置项，改它不影响任何判据口径；
+         ④ 若要把它恢复成**正式配置项**，须先走需求侧（`NFR-19`：配置项口径进需求/配置清单）与架构
+            文档登记，**不得**只在本文件与 `board.config.js` 之间私自加回来（那会让"配置真源"分叉两份）。 */
     outputRatio: (BCprod.outputRatio === undefined ? 1 : BCprod.outputRatio),
     maintLast: BCmaint.lastDate || '2026-08-28', // 上次维保日期（Q-13）
     maintCycleDays: BCmaint.cycleDays || 30,     // 固定维保周期（Q-13）

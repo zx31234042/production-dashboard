@@ -27,6 +27,8 @@
                 firstPassRate, runSec, idleSec, avgTestSec, capacityRate, oee,
                 accumulate:{daySec,monthSec,yearSec,at,reset}, taskTotal, cycleSec }
               来源：**当班统计的唯一核算处**（FR-4 十五项口径不在此重写）
+              ⚠ 任务件数的**取数真源＝`result` 表（DR-05）**，不是 `task.status`（后者全仓无写入方 ⇒
+                "已完成"恒 0，与 `FR-5.11` 的 detail 同屏矛盾；E61／审查 P1-2 已裁定改源）
      standard { productCode, processCode, versionNo:number|null, effectiveFrom:string|null,
                 depth:{typical,upperDev,lowerDev,upper,lower,set}, speed:{同左},
                 limits:{depth:{upper,lower,typical}|null, speed:{…}|null} } | null
@@ -85,7 +87,7 @@ function segOf(config, name) {
 /**
  * 创建整机快照构造器。
  * @param {{db?:object, ingest?:object, upload?:object, now?:Function, config?:object}} [options]
- *   `db`     —— SQLite 句柄（读 task/device/measure_rt；**只读**，不写任何表）
+ *   `db`     —— SQLite 句柄（读 `task`／`device`／`measure_rt`／**`result`**；**只读**，不写任何表）
  *   `ingest` —— `services/ingest.js` 实例（`linkState()` / `lastSampledFrame()`）
  *   `upload` —— `services/uploadReporter.js` 实例（`status()`）；缺省 ⇒ `upload` 键为 null 的子集
  *   `now`    —— 注入时钟出口（与全进程同一份；缺省＝真实时钟，不新造第二套）
@@ -147,17 +149,35 @@ function createStateSnapshot(options = {}) {
     return out;
   }
 
-  /** 快照里的统计段（**唯一核算处**＝`services/stats.computeShiftStats()`；本文件不重写任何算式） */
+  /** 快照里的统计段（**唯一核算处**＝`services/stats.computeShiftStats()`；本文件不重写任何算式）
+   *
+   *  **取数真源（技术债 `E61`／审查 P1-2，负责人 2026-09-30 裁定）**：当班统计的"已完成"改读
+   *  **`result` 表（DR-05）**，与 `FR-5.11` 的「已完成」**同源**；`task.status` **不再**充当
+   *  "已完成"的输入。为什么必须换：`task.status` **全仓没有写入方**（`dispatch.js` 自述不写、
+   *  `schema.sql` 缺省 `待测试`）⇒ 交给 `stats.js` 的输入恒为"待测试" ⇒ `FR-4.4`／`FR-4.10`／
+   *  `FR-4.13`／`FR-4.14` 恒 0，而同帧 `FR-5.11` 的 detail 却按 `result` 表显示"实际已完成 N 件"
+   *  ⇒ **同屏两个互相矛盾的"已完成"**。裁定取"单一真源、与 `FR-5.11` 同源"这一支。
+   *
+   *  **本文件只做取数与字段改名**（这是取数层的活）：`result.result`（FR-3.13 五态之一）就是
+   *  `stats.js` 入参 `tasks[].result` 的**同一口径、同一取值域**（`repo/result.js` 与 `stats.js`
+   *  共用同一份 `STATUS`/`DONE_STATUS` 常量）⇒ 逐行原样映射，**不改写、不换算、不补 0**。
+   *  十五条算式一条都不在这里（仍在 `stats.js`）：`DONE_STATUS`＝合格＋不合格由 `stats.js:71` 判，
+   *  `待复检` 不计已完成的理由与 SQL 归口在 `repo/result.js` 的 `countDone()`。
+   *  ⚠ 由此"当班任务数"的语义从"`task` 表的派工条数"变为"**`result` 表里有测试结果的件数**"
+   *  （`taskTotal`／`startedQty`／`waitingQty`／`notStartedQty` 随之为**按件**口径）——
+   *  这是"已完成与 FR-5.11 同源"这一裁定的必然连带，已在报告 B 分区登记（不是顺手改的口径）。
+   *  ⚠ `task` 表仍供快照的 `task` 段（DR-02 工单信息）与标准段取数，本段不动那两处。 */
   function statsOf(now) {
     const prod = segOf(config, 'production');
-    const rows = db ? db.prepare('SELECT status FROM task').all() : [];
+    /* 按件读 DR-05：一票多件 ⇒ 多行；空票 ⇒ 0 行（"拿不到"就是没有行，不给假行） */
+    const rows = db ? db.prepare('SELECT result FROM result').all() : [];
     const measures = db
       ? db.prepare('SELECT collect_time FROM measure_rt ORDER BY id DESC LIMIT 1000').all()
       : [];
     const shift = shiftRules.at(now);
     const computed = statsSvc.computeShiftStats({
       shift,
-      tasks: rows.map(r => ({ result: r.status })),
+      tasks: rows.map(r => ({ result: r.result })),
       measures: measures.map(r => r.collect_time),
       planQty: prod.planQty,
       cycle: { sec: prod.cycleSec },
