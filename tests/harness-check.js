@@ -23,6 +23,10 @@ const { createClock, parseTime, BOUNDARIES } = require('./lib/clock');
 const fixture = require('./lib/fixture');
 const harness = require('./lib/harness');
 const snapshot = require('./lib/snapshot');
+/* W5-②（E45）断言要用：判定引擎（按写入点入参**重算**期望载荷）与配置真源（构造判定标准的输入）。
+   注意：夹具模板里的同名 require 在**子进程**作用域，本文件顶层的断言代码读不到它。 */
+const judge = require('../server/services/judge');
+const boardConfig = require('../src/config/board.config.js');
 
 env.assertRuntime();
 const t = createRunner('夹具自检（harness-check）');
@@ -832,7 +836,18 @@ t.section('四之②、W5-① 服务端 SSE 业务推送（快照同源／断线
    阶段划分（每段一条连接，避免"哪些事件落在哪个窗口"含糊）：
      ① hello 快照与 /state 同源   ② 心跳计数   ③ 帧事件（1 s 采样才发）＋链路在线
      ④ 断线续传（?since= / Last-Event-ID）   ⑤ 链路离线（推进注入时钟）   ⑥ 其余四类事件
-     ⑦ 超缓冲退回 hello ＋ 非法 since   ⑧ 优雅关闭（先 closeAllStreams、再 stop） */
+     ⑦ 超缓冲退回 hello ＋ 非法 since   ⑦e warning 真实写入点（本波新增）   ⑧ 优雅关闭（先 closeAllStreams、再 stop）
+
+   ⚠ **新增推帧步骤前必读**（本波实测踩过三次，代价是整段断言连续变红）：
+    ① ingest 的 1 s 采样去重是"**collectTime 不得早于上次落库那一秒**"（ADR-0001 D7）——
+       新推的帧若用更早的采集时刻，会被判成 raw-500ms（**不落库、也就没有 frame/warning 事件**），
+       连带把后续"更早时刻"的帧一起挡掉。故**新段的采集时刻必须排在它前面所有段之后**；
+    ② 段④/⑦ 的续传与环形缓冲断言按 **seq 精确对账**（[base+1, base+2, base+3]）——
+       任何在那些窗口里多发的**事件**（例如给某一票挂上"已生效的标准"后，它每帧都会多出一条
+       warning）都会让它们变红。要给某票加"可判定的标准"，就**另起专用工单号/产品号**；
+    ③ task 的写入是 INSERT … ON CONFLICT(proc_order_no) DO NOTHING ⇒ 工单号一旦被别处派发过，
+       本处的派工**改不动**它的 product_code（本波实测：E22 段先派了 WO-W5-1/P-W5，
+       导致 12:00:xx 的帧仍按 P-W5 判定）。 */
 const fs = require('node:fs');
 const path = require('node:path');
 const ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -1049,13 +1064,18 @@ const streams = [];
   OUT.link.state = (await (await fetch(base + '/state')).json()).snapshot.link;
   await sLink.close();
 
-  /* ================= ⑥ 其余三类事件（task / standard / upload）＋ 「warning」（**夹具直调** judge） =================
-     ⚠ F12：「warning」 的**唯一发布点**（「judge.evaluate」）在全仓没有生产调用方，这里是**夹具直调** ——
-     它证明的是"挂钩可用"，不是"挂在真实写入点"（生产发布点待接线：技术债 E45）。 */
+  /* ================= ⑥ 其余三类事件（task / standard / upload）＋ 「warning」（**真实写入点**） =================
+     W5-②（接线技术债 E45）：warning 事件已接进生产链路 —— 发布点是 services/ingest.js 的
+     options.onSampled（"1 s 采样落库成功"之后），判定与发布由 server/index.js 的 emitWarnings()
+     完成。故本段**不再由夹具直调** judge.evaluate：只推真帧，warning 事件只能来自生产链路。 */
   const sOther = await openStream(base);
   streams.push(sOther);
   OUT.inproc = [];                                    // 进程内旁证：同一总线上的订阅者收到了什么
   const probe = svc.bus.subscribe(e => OUT.inproc.push(e.seq + ':' + e.kind));
+  /* W5-②（E45）用：进程内订阅者把**事件信封的 at** 记下来 —— 线路上只发 data，
+     at 是进程内信封字段（eventBus 的 {seq, at, kind, payload}），故"判定时刻"的判据读这里。 */
+  const warnAtProbe = [];
+  const probeAt = svc.bus.subscribe(e => { if (e.kind === 'warning') warnAtProbe.push({ seq: e.seq, at: e.at }); });
   OUT.other = { task: [], standard: {}, upload: {}, warning: {} };
   OUT.other.task.push(await post(base, '/ifa/dispatch',
     { procOrderNo: 'WO-W5-9', productCode: 'P-W5', processNo: '30', planQty: 12, equipCode: 'EQ-W5' }));
@@ -1084,16 +1104,9 @@ const streams = [];
   OUT.other.upload.report = await rep.report({});
   OUT.other.upload.pendingCount = rep.pendingCount(true);
 
-  OUT.other.warning.result = judge.evaluate({
-    now: new Date(fixedMs),
-    real: { depth: 5.22, speed: 5 },
-    standard: {
-      depth: { typical: 5, upperDev: 0.3, lowerDev: -0.2, unit: 'm' },
-      speed: { typical: 5, upperDev: 0.3, lowerDev: -0.2, unit: 'm/s' }
-    },
-    consumableHours: 10, pendingQty: 1
-  }, { bus: svc.bus });
-
+  /* ⚠ warning 的真实写入点判据**不在本段**：它要推"1 s 采样落库"的真帧，若挂在这里会往
+     段④/⑦ 的续传与环形缓冲窗口里多塞事件（那些断言按 seq 精确对账）。故判据统一放在
+     **⑦e 段**（在段⑦之后、段⑧优雅关闭之前）：那时续传窗口已经取完证，推帧不再影响任何既有判据。 */
   await sOther.pump(500);
   OUT.other.stream = { text: sOther.text(), events: sOther.events() };
   OUT.other.sseStatus = svc.router.sseStatus();
@@ -1372,8 +1385,8 @@ const streams = [];
   const repE22 = createUploadReporter({ db, now: clock.source(), fetch: e22Fetch, config: mesCfg });
   const e22LogCount = () => db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c;
   for (const [k, code] of [0, 1, 2, 3].entries()) {
-    /* ⚠ collectTime 必须**早于**后面 F2 在途帧的 10:40:00：采样落库口径是"采集时刻比上一帧更新"，
-       取更晚的时刻会把后面的 10:40:00 挤成 raw-500ms（本夹具实测踩过一次，F2 因此变红）。 */
+    /* ⚠ collectTime 必须**早于**后面 F2 在途帧（现为 12:00:30）：采样落库口径是"采集时刻比上一帧更新"，
+       取更晚的时刻会把后面的在途帧挤成 raw-500ms（本夹具实测踩过两次：F2、以及本波新加的段⑦e）。 */
     const f = frame(70 + k, '2026-09-19 10:31:0' + k);
     f.procOrderNo = OUT.e22.order;
     f.testStatus = code;
@@ -1411,6 +1424,116 @@ const streams = [];
     } catch (err) { return { ERR: String((err && err.message) || err) }; }
   })();
 
+  /* ================= ⑦e W5-②（技术债 E45）：warning 事件的**真实写入点**判据 =================
+     为什么放在这里（而不是段⑥）：① 本段要推"1 s 采样落库"的**真帧**，会往总线上多塞事件，
+     段④/⑦ 的续传与环形缓冲断言按 seq **精确对账**，多一条就变红；
+     ② 这些帧的**采集时刻必须排在段④/⑦/⑦d 全部取证之后** —— ingest 的 1 s 采样去重是
+     "collectTime 不早于上次落库秒"（ADR-0001 D7），时刻排早了会被判成 raw-500ms、
+     根本不落库（**本波实测踩过两次**：先用 10:02:xx ⇒ 段⑦ 的 10:01:xx 全变 raw-500ms）。
+     故本段排在段⑦d 之后、段⑧优雅关闭之前，采集时刻统一取 **12:00:xx**（远晚于前面所有帧）。
+
+     ⚠ 旧写法（本轮改写）：夹具自己调 judge.evaluate({…},{bus:svc.bus}) 发一条 warning，
+     它只能证明"**挂钩可用**"，证明不了"挂在**真实写入点**"（旧断言标题里也如实这么写）。
+     新写法：夹具**一次都不直调** judge；只推真帧（POST /ifd/frame → 校验 → 去重 →
+     1 s 采样落库 → onSampled → judge.evaluate → bus.publish），从**真 HTTP SSE 连接**上收
+     warning 事件 —— 事件里的一切只能来自生产链路。
+
+     判据构造（全部取**配置真源**，不写魔数；期望值现场算出，见 OUT.other.warning.expect）：
+       · 先 POST /ifa/dispatch 落一条 task 行（**专用工单 WO-W5W-1**、产品 P-W5W / 工序 30）
+         —— 判定取标准按任务的 (产品,工序)。
+         ⚠ **两处"专用"都是必须的**（本波各踩过一次，写在这里防回潮）：
+           ① 工单号专用：WO-W5-1 在段③/④/⑦ 被推过 13 帧，而它在段⑦d 的 E22 派工里已经
+              落过 task 行（INSERT … ON CONFLICT(proc_order_no) DO NOTHING ⇒ 本段的派工**改不动**
+              既有行的 product_code）—— 复用它会顺手给那 13 帧也接上标准、各发一条 warning，
+              段④ 的 ?since= 逐 seq 对账立刻变红（期望 [4,5,6] 实得 [4,5,6,7,8,9]）；
+           ② 产品号专用：P-W5 的标准在段⑥已生效（10:00:06），同样会把段③/④/⑦ 的帧点亮。
+         P-W5W 的标准**只在本段写入**，故那些帧仍是"库内无生效标准 ⇒ 不判定、不发布"。
+       · 再用 stdRepo.addVersion 写标准（生效时刻 11:59:59；本段之前该产品没有任何标准行）：
+         帧的采集时刻取下面的 12:00:xx ⇒ 生效时刻若取错（例如用"当前时刻"而不是**帧的采集时刻**），
+         断言必红（库行只对 12:00:xx 生效）；
+       · 再推**一帧**真帧，其 depth/speed 按"距上/下限恰 k 格"构造 ⇒ 两参数**同态临近**
+         ⇒ FR-5.8 / C-88 口径：参数类**恰 2 条**「参数阈值临近预警」。 */
+  const WARN_AT = Object.freeze({ harm: '2026-09-19 12:00:00', err: '2026-09-19 12:00:10', half: '2026-09-19 12:00:20' });
+  const harmVec = (() => {
+    const grid = 1 / Math.pow(10, boardConfig.standards.digits);
+    const near = boardConfig.standards.nearRatio;
+    const band = (s) => {
+      const upper = Math.round((s.typical + s.upperDev) * 100) / 100;
+      const lower = Math.round((s.typical + s.lowerDev) * 100) / 100;
+      const k = Math.max(1, Math.ceil((upper - lower) * near / grid - 1e-9));   // standardLevel() 的 k
+      return { upper, lower, k,
+        warnVal: Math.round((upper - k * grid) * 100) / 100,                    // 距上限恰 k 格 ⇒ 临近
+        errVal: Math.round((upper + grid) * 100) / 100 };                       // 越上限一格 ⇒ 超范围
+    };
+    return { depth: band(boardConfig.standards.default.depth), speed: band(boardConfig.standards.default.speed), grid };
+  })();
+  const sWarn = await openStream(base);
+  streams.push(sWarn);
+  await sWarn.pump(120);
+  OUT.other.warning = { expect: harmVec, at: WARN_AT };
+  warnAtProbe.length = 0;                       // 从本段起点开始只记"本段产生的 warning 信封"
+
+  OUT.other.warning.dispatch = await post(base, '/ifa/dispatch', {
+    procOrderNo: 'WO-W5W-1', productCode: 'P-W5W', processNo: '30', planQty: 6, equipCode: 'EQ-W5'
+  });
+  OUT.other.warning.stdV2 = stdRepo.addVersion(db, {
+    productCode: 'P-W5W', processCode: '30',
+    depthUpperDev: boardConfig.standards.default.depth.upperDev,
+    depthLowerDev: boardConfig.standards.default.depth.lowerDev,
+    depthTypical: boardConfig.standards.default.depth.typical,
+    speedUpperDev: boardConfig.standards.default.speed.upperDev,
+    speedLowerDev: boardConfig.standards.default.speed.lowerDev,
+    speedTypical: boardConfig.standards.default.speed.typical
+  }, '2026-09-19 11:59:59', '2026-09-19 11:59:59', { bus: svc.bus });
+
+  /* 这一帧：**同态临近**（深度与速度各距上/下限恰 k 格）⇒ 参数类恰 2 条 */
+  const harmFrame = frame(30, WARN_AT.harm);
+  harmFrame.procOrderNo = 'WO-W5W-1';
+  harmFrame.depth = harmVec.depth.warnVal;
+  harmFrame.speed = harmVec.speed.warnVal;
+  OUT.other.warning.warnPost = await post(base, '/ifd/frame', harmFrame);
+
+  /* 这一帧：**超范围**（深度越上限一格）⇒ 出「参数超范围预警」（速度仍临近） */
+  const errFrame = frame(31, WARN_AT.err);
+  errFrame.procOrderNo = 'WO-W5W-1';
+  errFrame.depth = harmVec.depth.errVal;
+  errFrame.speed = harmVec.speed.warnVal;
+  OUT.other.warning.errPost = await post(base, '/ifd/frame', errFrame);
+
+  /* ---- 负向判据：**标准未设定 ⇒ 不产生参数类预警**（C-93⑤ / FR-5.8） ----
+     构造（**在真实写入点上判**，不是调 judge 自证）：
+       · 另起一票 WO-W5-2（产品 P-W5B / 工序 30），用**显式危险开关**写一条**半套库行**标准
+         （只有深度三格、**没有速度列**）—— 这正是"某参数标准未设定"的形态；
+       · 推一帧：深度与速度**双双越上限**。若判定层对"未设定的速度"回退到配置演示值（旧行为），
+         事件里会出现**速度**那条参数类预警；正确行为是**速度一条都不产生**（FR-3.18 / C-93⑤）。
+       · 另一面由"恰 3 条"那条锁住：库里**没有生效标准**时（12:00:00 之前推的帧）不得发布
+         warning 事件 —— 多一条就红。 */
+  OUT.other.warning.dispatchHalf = await post(base, '/ifa/dispatch', {
+    procOrderNo: 'WO-W5-2', productCode: 'P-W5B', processNo: '30', planQty: 3, equipCode: 'EQ-W5'
+  });
+  OUT.other.warning.stdHalf = stdRepo.addVersion(db, {
+    productCode: 'P-W5B', processCode: '30',
+    depthUpperDev: boardConfig.standards.default.depth.upperDev,
+    depthLowerDev: boardConfig.standards.default.depth.lowerDev,
+    depthTypical: boardConfig.standards.default.depth.typical
+  }, '2026-09-19 11:59:59', '2026-09-19 11:59:59', { bus: svc.bus, dangerouslySkipValidation: true });
+  const halfFrame = frame(40, WARN_AT.half);
+  halfFrame.procOrderNo = 'WO-W5-2';
+  halfFrame.depth = harmVec.depth.errVal;
+  halfFrame.speed = harmVec.speed.errVal;
+  OUT.other.warning.halfPost = await post(base, '/ifd/frame', halfFrame);
+  OUT.other.warning.halfExpect = {
+    depthErr: harmVec.depth.errVal, speedErr: harmVec.speed.errVal,
+    /* "标准未设定"的**实际形态**：库行里速度三格是 **null**（不是"列不存在" —— 列由 schema 固定，
+       未录入就是 SQL NULL）。故判据看**值**，不看列是否存在。 */
+    halfRow: stdRepo.getEffective(db, { productCode: 'P-W5B', processCode: '30', at: WARN_AT.half }) || null
+  };
+  OUT.other.warning.ifdStatus = await (await fetch(base + '/ifd/status')).json();
+  OUT.other.warning.hookAt = warnAtProbe.slice();      // 进程内信封：seq + at（判定时刻）
+  await sWarn.pump(400);
+  OUT.other.warning.stream = { text: sWarn.text(), events: sWarn.events() };
+  await sWarn.close();
+
   /* ================= ⑧ 优雅关闭 ================= */
   const sA = await openStream(base);
   streams.push(sA);
@@ -1431,7 +1554,7 @@ const streams = [];
      构造：裸 socket 先送请求头 + 一半 body（服务端已开始处理 ⇒ 在途），停机窗口内补齐 body。 */
   const sB = await openStream(base);
   streams.push(sB);
-  const inflightBody = Buffer.from(JSON.stringify(frame(88, '2026-09-19 10:40:00')), 'utf8');
+  const inflightBody = Buffer.from(JSON.stringify(frame(88, '2026-09-19 12:00:30')), 'utf8');
   const postSock = net.connect(port, '127.0.0.1');
   let postResponse = '';
   let postClosedAt = null;
@@ -1785,33 +1908,111 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
   const linkEvtsAll = [].concat(kindsOf(s.frames && s.frames.stream, 'link'), kindsOf(s.link, 'link'));
   const onlineEv = linkEvtsAll.find(e => e.data && e.data.online === true);
   const offlineEv = linkEvtsAll.find(e => e.data && e.data.online === false);
-  /* ⚠ F3（独立审查立案）：这里原写"六类事件全部挂在真实写入点"，**表述过强** ——
-     `warning` 的唯一发布点（`judge.evaluate`）在全仓**没有生产调用方**，本夹具是**直调**它。
-     故：
-       · "五类来自真实写入点"由上方的 F3 断言承担（frame/link/task/standard/upload 各有写入点证据）；
-       · "六类**挂钩**都可用"由下方这条承担，标题里明写 warning 的来源是夹具直调（不冒充生产链路）。 */
-  t.check('W5/F3：六类事件**挂钩**都可用（frame / link / task / standard / upload 来自真实写入点；**warning 由夹具直调**）',
+  /* ⚠ F3（独立审查立案，W5-② 再改）：标题原写"六类事件全部挂在真实写入点"，**表述过强** ——
+     当时 `warning` 的唯一发布点（`judge.evaluate`）在全仓**没有生产调用方**，夹具只能**直调**它。
+     W5-②（技术债 E45）接线后，`warning` 也挂到了真实写入点（`ingest` 的 1 s 采样落库之后），
+     本段断言随之改为"**六类全部来自真实写入点**"；每条写入点的证据见下面各条断言。 */
+  t.check('W5/F3：六类事件（frame / link / task / standard / upload / warning）在真 HTTP 连接上全部**来自真实写入点**',
     ['frame', 'link', 'task', 'standard', 'upload', 'warning'].every(k =>
-      [].concat(evts(s.frames && s.frames.stream), evts(s.link), evts(s.other && s.other.stream))
-        .some(e => e.event === k)),
-    `实收种类=${[...new Set([].concat(evts(s.frames && s.frames.stream), evts(s.link), evts(s.other && s.other.stream)).map(e => e.event))].join(',')}`);
+      [].concat(evts(s.frames && s.frames.stream), evts(s.link), evts(s.other && s.other.stream),
+        evts(s.other && s.other.warning && s.other.warning.stream)).some(e => e.event === k)),
+    `实收种类=${[...new Set([].concat(evts(s.frames && s.frames.stream), evts(s.link),
+      evts(s.other && s.other.stream), evts(s.other && s.other.warning && s.other.warning.stream)).map(e => e.event))].join(',')}；` +
+    `warning 的写入点证据见下方 W5-② 四条断言（真帧 → 落库 → onSampled → 真 SSE 连接）`);
   t.check('W5：`link` 覆盖**双向**变化（离线→在线 / 在线→离线），离线判据＝`ingest.linkState()`（推进注入时钟 6 s > upper.staleMs）',
     Boolean(onlineEv) && Boolean(offlineEv) && offlineEv.data.staleMs === 5000 && offlineEv.data.ageMs >= 5000 &&
     s.link && s.link.state && s.link.state.online === false,
     `online 事件=${Boolean(onlineEv)}；offline 事件=${JSON.stringify(offlineEv && offlineEv.data)}；快照 link=${JSON.stringify(s.link && s.link.state)}`);
   const taskEv = kindsOf(s.other && s.other.stream, 'task')[0];
   const uploadEv = kindsOf(s.other && s.other.stream, 'upload')[0];
-  const warnEv = kindsOf(s.other && s.other.stream, 'warning')[0];
-  t.check('W5：`task`／`upload` 载荷来自**真实写入点**（幂等命中不重发／真失败留存待补传）；`warning` 载荷形状由**夹具直调** judge 产出（生产调用方待接线 E45）',
+  t.check('W5：`task`／`upload` 载荷来自**真实写入点**（幂等命中不重发／真失败留存待补传）—— `warning` 的载荷判据在段⑦e（它要推真帧，放这里会污染续传窗口）',
     Boolean(taskEv) && taskEv.data.procOrderNo === 'WO-W5-9' && taskEv.data.table === 'task' &&
     kindsOf(s.other && s.other.stream, 'task').length === 1 &&
     Boolean(uploadEv) && uploadEv.data.action === 'enqueue-failed' && uploadEv.data.state === '待补传' &&
     uploadEv.data.pendingCount === 1 && Boolean(uploadEv.data.alert) &&
-    Boolean(s.other && s.other.upload && s.other.upload.pendingCount === 1) &&
-    Boolean(warnEv) && Array.isArray(warnEv.data.warnings) && warnEv.data.warnings.length >= 3 &&
-    typeof warnEv.data.result === 'string',
-    `task=${JSON.stringify(taskEv && taskEv.data)}；upload=${JSON.stringify(uploadEv && uploadEv.data && { action: uploadEv.data.action, pending: uploadEv.data.pendingCount })}；` +
-    `warning（夹具直调）result=${warnEv && warnEv.data.result} warnings=${warnEv && warnEv.data.warnings && warnEv.data.warnings.length}`);
+    Boolean(s.other && s.other.upload && s.other.upload.pendingCount === 1),
+    `task=${JSON.stringify(taskEv && taskEv.data)}；upload=${JSON.stringify(uploadEv && uploadEv.data && { action: uploadEv.data.action, pending: uploadEv.data.pendingCount })}`);
+
+  /* ---- W5-②（技术债 E45）：`warning` 的四条**真实写入点**判据（事件取自段⑦e 的专用连接） ----
+     为什么这四条足以证明"来自真实写入点"（而不是"夹具替它发了一条"）：
+       · 段⑦e 夹具**再也没有直调** `judge.evaluate`（该调用已整段删除）⇒ 事件不可能来自夹具；
+       · 事件的 `result`/`warnings` 必须**逐字等于**把**真帧的 depth/speed** 与**库里那一版标准**
+         喂给 `judge.evaluate()` 的产出（构成性对账：左＝连接上收到的事件，右＝按写入点入参重算）；
+       · `at` 必须是**该帧的采集时刻**、条数必须**恰等于**那些真帧的次数 ⇒ 反证"标准取值时刻"
+         与"判定发生的时机"都对得上（取错时刻、或另起一次判定都会对不上）。 */
+  const warnOpt = (s.other && s.other.warning) || {};
+  const warnExpect = warnOpt.expect || {};
+  const warnEvents = kindsOf(warnOpt.stream, 'warning');
+  const paramTitles = [judge.WARN_TITLES.warn, judge.WARN_TITLES.err];   // 参数类**两条具名**（C-88）
+  const recompute = (depth, speed, ct) => judge.evaluate({
+    now: ct, real: { depth, speed },
+    standard: {
+      depth: Object.assign({}, boardConfig.standards.default.depth),
+      speed: Object.assign({}, boardConfig.standards.default.speed)
+    }
+  });
+  const harmExpect = recompute(warnExpect.depth && warnExpect.depth.warnVal,
+    warnExpect.speed && warnExpect.speed.warnVal, (warnOpt.at && warnOpt.at.harm) || '');
+  const harmEv = warnEvents[0] || null;
+  const harmParam = harmExpect.warnings.filter(w => paramTitles.includes(w.title));
+  t.check('W5-②/E45 写点：`warning` 事件的载荷**逐字等于**"真帧实测 + 库里生效标准"喂给判定引擎的产出（段⑦e已无任何夹具直调 ⇒ 事件只能来自生产链路）',
+    Boolean(harmEv) && harmEv.data && typeof harmEv.data.result === 'string' &&
+    Array.isArray(harmEv.data.warnings) &&
+    JSON.stringify(harmEv.data.warnings) === JSON.stringify(harmExpect.warnings) &&
+    harmEv.data.result === harmExpect.result && harmEv.data.reason === harmExpect.reason,
+    `事件 warnings=${JSON.stringify(harmEv && harmEv.data && harmEv.data.warnings)}；` +
+    `按写入点入参重算=${JSON.stringify(harmExpect.warnings)}`);
+
+  t.check('FR-5.8/C-88 行为：**同态临近**（深度与速度各距上/下限恰 k 格）⇒ 事件里参数类**恰 2 条**且名称均为「参数阈值临近预警」、等级 warn、每条只含一个参数',
+    Boolean(harmEv) && harmParam.length === 2 &&
+    harmParam.every(w => w.title === judge.WARN_TITLES.warn && w.lv === 'warn') &&
+    /* 两参数**同态 ⇒ 各出一条**（C-88 / R26-P2-2）：同态下不按参数名排序，故按**集合**比对，
+       只要求"深度、速度各占一条"（顺序不作判据，避免把展示顺序写死成第二套口径）。 */
+    harmParam.map(w => (w.detail.includes('深度') ? 'depth' : (w.detail.includes('速度') ? 'speed' : '?'))).sort().join(',') === 'depth,speed' &&
+    harmParam.every(w => (w.detail.match(/深度|速度/g) || []).length === 1 && !w.detail.includes('；')),
+    harmEv ? `参数类 ${harmParam.length} 条：` + harmParam.map(w => `${w.title}/${w.lv}｜${w.detail}`).join(' ／ ') : '未收到 warning 事件');
+
+  const hookAt = (Array.isArray(warnOpt.hookAt) ? warnOpt.hookAt : []);
+  /* 期望的 `at`：由**帧采集时刻文本**现算（不写字面量 ISO）—— `at` 是信封字段，读进程内订阅者。
+     注入时钟此刻已是 10:00:0x（段⑤ 还推进过 6 s），而三帧采集时刻是 12:00:0x ⇒
+     期望值不可能被"服务端当前时刻"凑出来（差 2 小时）。 */
+  const atOfText = text => new Date(text.replace(' ', 'T')).toISOString();
+  t.check('W5-②/E45 写点时序：`warning` 事件的 `at` 是**帧的采集时刻**（不是服务端当前时刻、也不是夹具注入时刻）＋ 每次落库帧**恰产生 1 条**（三条真帧 ⇒ 恰 3 条：同态临近 / 超范围 / 半套标准；幂等、原始、脏帧都不产生）',
+    warnEvents.length === 3 && hookAt.length === 3 &&
+    /* `at` 是事件信封字段（线路只发 data）⇒ 读进程内订阅者；三条应分别等于三帧的采集时刻 */
+    ['harm', 'err', 'half'].every((k, i) => hookAt[i].at === atOfText((warnOpt.at || {})[k])) &&
+    warnOpt.warnPost && warnOpt.warnPost.body && warnOpt.warnPost.body.outcome === 'stored' &&
+    warnOpt.errPost && warnOpt.errPost.body && warnOpt.errPost.body.outcome === 'stored' &&
+    warnOpt.halfPost && warnOpt.halfPost.body && warnOpt.halfPost.body.outcome === 'stored' &&
+    warnOpt.ifdStatus && warnOpt.ifdStatus.counts && warnOpt.ifdStatus.counts.sampledHookFailures === 0,
+    `warning 事件数=${warnEvents.length}；进程内信封 seq:at=${hookAt.map(x => x.seq + ':' + x.at).join(' , ')}` +
+    `（期望＝三帧采集时刻的 UTC：12:00:00/10/20 ⇒ 04:00:00/10/20Z）；` +
+    `三次推帧 outcome=${[warnOpt.warnPost, warnOpt.errPost, warnOpt.halfPost].map(p => p && p.body && p.body.outcome).join('/')}；` +
+    `判定挂钩失败次数=${warnOpt.ifdStatus && warnOpt.ifdStatus.counts && warnOpt.ifdStatus.counts.sampledHookFailures}`);
+
+  const errEv = warnEvents[1] || null;
+  const errParam = (errEv && errEv.data && Array.isArray(errEv.data.warnings)
+    ? errEv.data.warnings.filter(w => paramTitles.includes(w.title)) : []);
+  t.check('FR-5.8 行为：**超范围**（深度越上限一格、速度仍在临近带）⇒ 事件里出「参数超范围预警」/err（深度）与「参数阈值临近预警」/warn（速度）各 1 条',
+    Boolean(errEv) && errParam.length === 2 &&
+    errParam.some(w => w.title === '参数超范围预警' && w.lv === 'err' && w.detail.includes('深度')) &&
+    errParam.some(w => w.title === '参数阈值临近预警' && w.lv === 'warn' && w.detail.includes('速度')),
+    errEv ? `参数类 ${errParam.length} 条：` + errParam.map(w => `${w.title}/${w.lv}｜${w.detail}`).join(' ／ ') : '未收到第二条 warning 事件');
+
+  const halfEv = warnEvents[2] || null;
+  const halfParam = (halfEv && halfEv.data && Array.isArray(halfEv.data.warnings)
+    ? halfEv.data.warnings.filter(w => paramTitles.includes(w.title)) : []);
+  const halfRow = (warnOpt.halfExpect && warnOpt.halfExpect.halfRow) || {};
+  t.check('C-93⑤/FR-5.8 负向（**不得伪造**）：某参数**标准未设定**（库行里速度三格为 null、只有深度三格）＋ 实测双双越上限 ⇒ 事件里**只有一条**参数类（深度超范围），**不得**为速度回退配置演示值凭空成条',
+    Boolean(halfEv) && halfParam.length === 1 &&
+    halfParam[0].title === '参数超范围预警' && halfParam[0].lv === 'err' &&
+    halfParam[0].detail.includes('深度') && !halfParam[0].detail.includes('速度') &&
+    Number.isFinite(halfRow.depthTypical) && halfRow.depthTypical !== null &&
+    halfRow.speedTypical === null && halfRow.speedUpperDev === null && halfRow.speedLowerDev === null,
+    `半套库行：深度三格=${JSON.stringify([halfRow.depthTypical, halfRow.depthUpperDev, halfRow.depthLowerDev])}、` +
+    `速度三格=${JSON.stringify([halfRow.speedTypical, halfRow.speedUpperDev, halfRow.speedLowerDev])}（应为 [null,null,null]）；` +
+    `实测 depth=${warnOpt.halfExpect && warnOpt.halfExpect.depthErr}／speed=${warnOpt.halfExpect && warnOpt.halfExpect.speedErr}；` +
+    `事件参数类 ${halfParam.length} 条：` + (halfParam.map(w => `${w.title}/${w.lv}｜${w.detail}`).join(' ／ ') || '（未收到）'));
 
   /* ---- 判据①：snapshot 的 frame / upload 与各自真源同源 ---- */
   t.check('W5-①：`snapshot.frame` 是**最新 1 s 采样帧**（与 frame 事件同源，不是另拼一份字段）',
@@ -2084,16 +2285,15 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     `采样表 ${cl.inflight && cl.inflight.rowsBefore}→${cl.inflight && cl.inflight.rowsAfter}；stopMs=${cl.stopMs}；` +
     `在途连接关闭于 stop+${cl.inflight && cl.inflight.closedAfterStop} ms`);
 
-  /* F3：如实表述 —— 前五类来自真实写入点，`warning` 是"挂钩可用、生产调用方待接线" */
-  const seenKinds = [...new Set([].concat(evts(s.frames && s.frames.stream), evts(s.link), evts(s.other && s.other.stream))
-    .map(e => e.event))];
+  /* F3：如实表述 —— W5-②（E45）接线后，**六类**全部来自真实写入点（不再有"夹具直调"那一类） */
+  const seenKinds = [...new Set([].concat(evts(s.frames && s.frames.stream), evts(s.link), evts(s.other && s.other.stream),
+    evts(s.other && s.other.warning && s.other.warning.stream)).map(e => e.event))];
   t.check('W5/F3：**五类来自真实写入点**（frame←1 s 采样落库 / link←linkState / task←派工落库 / standard←addVersion 成功路径 / upload←上报失败留存）在真 HTTP 连接上全部实测可见',
     ['frame', 'link', 'task', 'standard', 'upload'].every(k => seenKinds.includes(k)),
     `实收种类=${seenKinds.join(',')}（各类的写入点证据见上面 5 条断言）`);
-  t.check('W5/F3：`warning` 仅证明**挂钩可用**——本夹具**直调** `judge.evaluate(input,{bus})`（生产发布点**待接线**：技术债 E45，负责人 2026-09-28 裁定本轮不接）',
-    seenKinds.includes('warning') && Boolean(s.other && s.other.warning && s.other.warning.result),
-    `warning 事件在连接上可见=${seenKinds.includes('warning')}；夹具直调 judge.evaluate(...,{bus}) 返回 result=` +
-    `${s.other && s.other.warning && s.other.warning.result && s.other.warning.result.result}（**不是**生产调用方）`);
+  t.check('W5/F3：`warning` 也来自**真实写入点**（`ingest` 的 1 s 采样落库 → `onSampled` → `judge.evaluate(input,{bus})`）；段⑦e 夹具**没有任何** `judge.evaluate` 直调，事件只可能来自生产链路',
+    seenKinds.includes('warning') && warnEvents.length === 3 && Boolean(harmEv) && Boolean(errEv) && Boolean(halfEv),
+    `warning 事件在连接上可见=${seenKinds.includes('warning')}（段⑦e 共 ${warnEvents.length} 条：同态临近 / 超范围 / 半套标准各 1 条）`);
 
   /* F4：realpath 复核（root 之内指向 root 之外的 junction ⇒ 拒）＋ 普通文件不误伤
      F9：realpath 的**上界**必须是"被托管的那一层"（资源 ⇒ `<root>\src`，首页 ⇒ 恰好 index.html） */

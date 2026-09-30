@@ -18,7 +18,8 @@
           本实现按"我方判定依据是否成立"选择，理由逐条写在函数上）。
      ④ **四类预警**（FR-5.8～5.11）`buildWarnings()`：参数类 0～2 条
         （C-88 两条具名「参数阈值临近预警」/「参数超范围预警」，**一个参数一条、同态也各出一条**）
-        ＋ 维保到期 / 耗材更换 / 工单超时各 1 条。**阈值一律从配置真源读**（见 `thresholds()`），
+        ＋ 维保到期 1 条 ＋ 耗材更换 / 工单超时各 1 条（后两类**入参拿不到时不产生**，
+        理由与"为什么不编造"见 `buildWarnings()` 的 docblock）。**阈值一律从配置真源读**（见 `thresholds()`），
         代码里不写死任何阈值字面量。
    与前端演示实现的关系（**对账物，不是真源**）：
      `src/services/mockData.js` 的 `standardLevel()` / `buildParamWarnings()` / `buildWarnings()`
@@ -130,23 +131,38 @@ function rowMetricOf(src, kind) {
  * ⚠ 两种"缺"的区别（有意为之）：**运行期真源**里缺某个参数 ⇒ 按 FR-3.18 回退配置演示段
  *   （与前端同口径）；而**库行形态**缺某个参数的列 ⇒ 该参数判"未设定"（**不回退演示值**）——
  *   库行是权威取数路径，拿演示值去顶真实标准会变成"用演示值判定真任务"。
+ *   （`hasRowKeys()` 按**任一参数**有库行列名即认定"这是库行"；因此"只有深度列、没有速度列"的
+ *    半套库行 ⇒ 深度照判、**速度判 idle**，不会悄悄用演示速度标准去判。）
  * 三形态都**不含**相机参数 ⇒ 判定对象恒只有深度与速度。
  * @returns {object|null} 规格对象；未设定 ⇒ null（`standardLevel` 会判 idle）
  */
 function specOf(standardLike, kind) {
-  const src = (standardLike && typeof standardLike === 'object') ? standardLike : {};
-  const live = src[kind];
-  if (live && typeof live === 'object') return live;                    // ① / ③（配置 default 亦为此形）
-  if (PARAMS.some(k => hasRowKeys(src, k))) {                            // ② 库行形态
-    if (!hasRowKeys(src, kind)) return null;
-    const m = rowMetricOf(src, kind);
-    const dft = (standardsCfg().default || {})[kind] || {};
-    /* 库内无单位列（需求把单位固定为 深度 m / 速度 m/s）⇒ 在**归一化处**补上，
-       这样 detail 文案与前端一致（前端读 `spec.unit`）；不在这里写死 m / m/s 字面量。 */
-    return { typical: m.typical, upperDev: m.upperDev, lowerDev: m.lowerDev, unit: dft.unit };
+  /* 入参语义（**判定"标准未设定"的唯一口径**，生产侧 E45 接线后尤其关键）：
+       · 没传 / 传了非对象 ⇒ "调用方根本没给标准" ⇒ 走 ③ 配置演示段（与前端演示同口径）；
+       · 传了**对象**（哪怕空对象）⇒ "这就是本次判定的标准真源" ⇒ 只从里面取，取不到就是
+         **未设定（null）**，**绝不回退演示值**。服务端生产装配用 `{depth:null, speed:null}`
+         显式表达"库里没有生效版本"，正是走这一支 —— 拿 `standards.default` 去顶真实缺失
+         会变成"用演示值判定真任务"。 */
+  const src = (standardLike && typeof standardLike === 'object') ? standardLike : null;
+  if (src) {
+    const live = src[kind];
+    if (live && typeof live === 'object') return live;                  // ① 运行期真源形态
+    if (PARAMS.some(k => hasRowKeys(src, k))) {                          // ② 库行形态（DR-03 hydrate 产物）
+      if (!hasRowKeys(src, kind)) return null;                           // 该参数没有列 ⇒ 未设定
+      const m = rowMetricOf(src, kind);
+      const dft = (standardsCfg().default || {})[kind] || {};
+      /* 库内无单位列（需求把单位固定为 深度 m / 速度 m/s）⇒ 在**归一化处**补上，
+         这样 detail 文案与前端一致（前端读 `spec.unit`）；不在这里写死 m / m/s 字面量。 */
+      return { typical: m.typical, upperDev: m.upperDev, lowerDev: m.lowerDev, unit: dft.unit };
+    }
+    return null;                                                         // 传了对象但该指标没有值 ⇒ 未设定
   }
+  /* ③ 演示缺省：**只在调用方根本没给标准**时才走这里（与前端 `standardSpecOf()` 的回退顺序一致）。
+     ⚠ 反例（本波收口）：`standard` 传了对象但该指标的必要项缺测 ⇒ 上面两支已 `return null`，
+     **不得**再走本行 —— 这与 FR-3.18 / C-93⑤"典型值缺失 ⇒ 不判定、不预警"、
+     FR-5.8"标准未设定 ⇒ 两条都不产生"直接冲突。 */
   const dft = (standardsCfg().default || {})[kind];
-  return dft || null;                                                    // ③ 演示缺省
+  return dft || null;
 }
 
 /**
@@ -345,24 +361,34 @@ function orderWarning(pendingQty) {
 }
 
 /**
- * 四类预警（FR-5.1～5.14 的预警部分）：参数类（0～2 条，C-88）＋ 维保 / 耗材 / 工单（各 1 条）。
+ * 四类预警（FR-5.1～5.14 的预警部分）：参数类（0～2 条，C-88）＋ 维保 / 耗材 / 工单。
  * 建表顺序固定＝**参数类在前**，其后 维保 → 耗材 → 工单：这是门禁与界面识别"哪几条是参数类"的
  * 口径（不得靠名称筛）。函数**纯**：所有外部状态（时刻、累计时长、队列件数）都由入参注入。
+ *
+ * ⚠ **耗材 / 工单两类可缺**（本波接线 E45 时定；参数齐备时输出与原来**逐条相同**）：
+ *   · `consumableHours` / `pendingQty` **未给**（`undefined`/`null`）⇒ 该类的**取数源当前拿不到**，
+ *     于是**该类整条不产生**（FR-5.10 的"耗材台账/计数"、FR-5.11 的"工单计划/节拍"在服务端
+ *     **都还没有数据源**：`server/` 全仓无累计点亮时长、无设备侧待测队列件数，也没有承载它们的列）；
+ *   · 为什么不是"给个缺省值凑齐 5 条"：那是**伪造预警**（拿编造的耗材时长/队列件数驱动一条真实预警），
+ *     与 FR-3.18/C-93⑤ 的"标准未设定 ⇒ 不判定、不预警"以及本文件"绝不静默兜底成字面量"同一纪律；
+ *   · 显式传 `0` 仍然**参与**判定（`0 > 阈值` 为假 ⇒ 出 ok 条）—— "拿不到"与"真的是 0"是两件事，
+ *     不得互相代言（调用方要知道自己在给什么）。
  * @param {object} input
  *   @param {Date|string} input.now 当前时刻（维保剩余天数按它算；必填，不读系统时间）
  *   @param {object} input.real 实测 `{depth, speed}`
  *   @param {object} [input.standard] 标准真源（运行期形态 / DR-03 库行形态；缺省回落配置演示段）
- *   @param {number} input.consumableHours 耗材（水下光源）累计点亮时长（h）
- *   @param {number} input.pendingQty 设备侧待测队列件数
- * @returns {Array<{title:string, detail:string, lv:string}>} 3～5 条（参数类 0～2 + 固定 3）
+ *   @param {number} [input.consumableHours] 耗材（水下光源）累计点亮时长（h）；**缺 ⇒ 该类不产生**
+ *   @param {number} [input.pendingQty] 设备侧待测队列件数；**缺 ⇒ 该类不产生**
+ * @returns {Array<{title:string, detail:string, lv:string}>} 参数类 0～2 ＋ 维保 1 ＋（耗材/工单 各 0～1）
  */
 function buildWarnings(input = {}) {
   const t = thresholds();                       // 阈值现读一次（同一帧内自洽）
   const out = [];
   buildParamWarnings(input).forEach(w => out.push(w));
   out.push(maintenanceWarning(input.now, t.maintWarnDays));
-  out.push(consumableWarning(input.consumableHours));
-  out.push(orderWarning(input.pendingQty));
+  /* 耗材 / 工单：**取数源拿不到就整条不出**（不编造），判据是"入参是否为有限数值"——`0` 是有效值 */
+  if (isNum(input.consumableHours)) out.push(consumableWarning(input.consumableHours));
+  if (isNum(input.pendingQty)) out.push(orderWarning(input.pendingQty));
   return out;
 }
 
@@ -436,8 +462,11 @@ function taskResult(input = {}) {
  * 为什么做成**显式可选**而不是默认发布：
  *   · 本文件是判定口径的**纯函数实现**（不读系统时间、不碰 IO），前端演示实现要与之逐条对账
  *     （见 `tests/logic-check.js` 第九节）——默认发布会让"算一次判定"这种纯调用产生副作用；
- *   · 目前**尚无生产调用方**（W3 交付的是纯函数，接线到采集链路由后续包/负责人决定），
- *     故这里只把**产出点**的挂钩备好：谁调用判定，谁决定要不要推给看板。
+ *   · 谁调用判定、谁决定要不要推给看板（**发布与否是调用方的装配决定**）。
+ * **接线现状（W5-②，2026-09-30）**：生产侧已有**唯一**调用方 —— `server/index.js` 的判定装配
+ *   （`server/index.js` 里 `emitWarnings()`），由 `services/ingest.js` 的 `options.onSampled`
+ *   在"**1 s 采样落库成功**"之后回调；即 `warning` 事件挂在真实写入点上（技术债 E45 已接线）。
+ *   `tests/harness-check.js` 的第六/第九节按"**真实写入点**"判据断言，不再由夹具直调本函数。
  * `at` 取 `input.now`（业务上的"判定时刻"，由调用方注入）；未给则由总线用注入时钟兜底。
  * @param {object} input 见 `taskResult()` 与 `buildWarnings()`
  * @param {{bus?:object, publish?:boolean}} [options] `publish:false` 可显式关掉发布（默认：给了 bus 就发）

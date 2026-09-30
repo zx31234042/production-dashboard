@@ -57,7 +57,9 @@ function resolveIngest(deps = {}) {
     staleMs: deps.staleMs,
     equipCode: deps.equipCode,
     /* W5-①：事件总线透传（`frame` 事件在 ingest 的 1 s 采样落库点发布） */
-    bus: deps.bus
+    bus: deps.bus,
+    /* W5-②（E45）：判定挂钩透传（与 `frame` 事件同一写入点；不传＝行为与 W1 一致） */
+    onSampled: deps.onSampled
   });
   if (db) pool.byDb.set(db, created); else pool.nullDb = created;
   return created;
@@ -72,7 +74,9 @@ function statusBody(ingest) {
  * 挂载 IF-D 的 HTTP 面。
  * @param {object} router `server/http/router.js` 的 createRouter() 产物（提供 route/readJson/json/fail）
  * @param {{db?:object, ingest?:object, logger?:object, now?:Function, staleMs?:number,
- *          equipCode?:string, bus?:object}} [deps]
+ *          equipCode?:string, bus?:object, onSampled?:Function}} [deps]
+ *        `onSampled`（W5-② / E45）：判定挂钩，透传给 `createIngest()`；入口 `server/index.js`
+ *        用它把"1 s 采样落库成功"这条帧接到 `judge.evaluate(input,{bus})`（→ `warning` 事件）。
  * @returns {{mount:'ifD', mounted:boolean, by:'W1', routes:string[], instance:object, status:Function}}
  *          `mounted:true` 才是"已接线"的**显式**状态（与 W6 空壳 `mountIfD()` 的
  *          `mounted:false` 形成可核查的对照，见 D23 反静默空转）。

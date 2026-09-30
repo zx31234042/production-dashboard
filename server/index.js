@@ -60,6 +60,10 @@ const { createAuth } = require('./services/auth');
    与静态托管（同源入口 `GET /` + `GET /src/**`）。见下方 6f 段。 */
 const { createCors, isLoopbackHost } = require('./http/cors');
 const { mountSite } = require('./http/site');
+/* W5-②（接线技术债 E45）判定装配的两块：判定引擎（`evaluate()` 是 `warning` 事件的唯一发布点）
+   与标准取数（`standard` 表按"产品＋工序＋指定时刻生效版本"，DR-03）。见下方 6e-2 段。 */
+const judge = require('./services/judge');
+const standardSvc = require('./services/standard');
 
 /* 注入出口（ADR-0003 D17 / E42）：本文件的时间**一律**经 platformClock 取，不裸写 `new Date()` /
    `Date.now()`；形态与 `server/http/router.js`、`server/services/dispatch.js` 及下方 IF-D/IF-A
@@ -510,7 +514,10 @@ async function start(options = {}) {
     logger,
     now: currentClock().source(),
     /* W5-①：`frame` 事件在 ingest 的 **1 s 采样落库**点发布（500 ms 原始帧不发布） */
-    bus
+    bus,
+    /* W5-②（E45）：判定挂钩 —— 与 `frame` 事件**同一写入点**（1 s 采样落库成功之后），
+       实现在下方 6e-2 段（`emitWarnings`），此处只把函数引用交给 ingest。 */
+    onSampled: frame => emitWarnings(frame)
   });
   /* 把 IF-D 状态快照挂到 router 上（**只挂一个只读函数**，不改 router.js）：
      `healthPayload()` 据此把断连状态一并暴露到 `GET /health`（FR-2.6 的"可被读取"），
@@ -625,6 +632,106 @@ async function start(options = {}) {
     `事件种类=${require('./services/eventBus').KINDS.join('/')}；` +
     `心跳=${options.heartbeatMs || '默认 15000'} ms；链路监控=${linkMonitor.intervalMs} ms（阈值真源＝upper.staleMs）；` +
     `环形缓冲容量=${bus.capacity}（溢出丢最旧并计 dropped）`);
+
+  /* ---- 6e-2. W5-②（接线技术债 E45）：判定装配 —— `warning` 事件的**唯一生产发布点** ----
+     背景（技术债 E45 原文）：六类事件里只有 `warning` 没有真实发布点 —— 挂钩 `judge.evaluate(input,{bus})`
+     早就备好，但**全仓没有生产调用方** ⇒ 服务端模式下 `FR-5`（4 类预警，**P0**）在真实源下不可见。
+     本波只补"那一次调用"，判定口径一行不改（仍在 `services/judge.js`），接线位置见下三条口径。
+
+     **① 挂在哪**：`services/ingest.js` 的 `options.onSampled` —— 它只在"**1 s 采样落库成功**"
+     那条帧上回调（与 `frame` 事件同一写入点、紧随其后）。选它而不是另起定时器/另读一次库：
+       · 判定对象＝**落库的那条实测**（`duplicate` 未新增行、`raw-500ms` 不落库、`rejected` 没落库
+         ⇒ 三者都不判定，与 `frame` 事件同口径）；
+       · "先落库、再通知"与既有 `frame` 事件的顺序理由完全相同（先有事实、再有通知）。
+
+     **② 判定输入从哪来（全部取真源，缺就如实缺 —— 绝不编造）**：
+       · `real`      ← 帧里的 `depth` / `speed`（实测值；缺测 ⇒ judge 判 idle，不产生参数类预警）；
+       · `standard`  ← `task` 行按帧的 `procOrderNo` 取 `(product_code, process_no)`，
+                        再走 `services/standard.js` 的 `getEffectiveStandard(db,{…, at: 帧采集时刻})`
+                        （DR-03"指定时刻生效版本"；**库里没有生效版本 ⇒ 显式传 `{depth:null, speed:null}`**，
+                        不落进 judge 的配置演示兜底 —— 拿演示值判真任务就是伪造判定，见 FR-3.18/C-93⑤）；
+       · `now`       ← 帧的 `collectTime`（**采集时刻**：判据要与这一帧的数据同一时刻；不读系统时间，D17）；
+       · `consumableHours` / `pendingQty` ← **当前拿不到**：`server/` 没有累计点亮时长、也没有设备侧
+                        待测队列件数（`production.queueDepth` 是**演示**参数，语义是"演示队列深度"，
+                        不是实测件数）⇒ **不传**，于是"耗材更换/工单超时"两类预警整条不产生
+                        （`judge.buildWarnings()` 的 docblock 写了为什么不给缺省值凑齐 5 条）。
+                        ⚠ 这是**已知的能力缺口**（FR-5.10 P1 / FR-5.11 P0 的真实源），
+                        不是本波能补的：补它需要先定这两项的**取数口径与承载表**，属独立工作项。
+
+     **③ 判定失败怎么办**：`judge.evaluate` 抛错（配置缺项等）由 `ingest` 的挂钩 try/catch 收下并
+     计数（`ingest.status().counts.sampledHookFailures`），**不影响落库**；启动日志同时给出该计数。 */
+
+  /** 任务行缓存（按 `proc_order_no`）：标准维度＝(产品,工序)，逐帧查库没必要；`task` 行可变 ⇒
+   *  只做**按票缓存**（同一票重复帧命中），并把行对象原样留着（不复制、不派生第二份字段口径）。 */
+  const taskRowCache = new Map();
+
+  /**
+   * 取某工单的 `(产品号, 工序号, 状态)`（判定取标准用；查不到 ⇒ null，**不猜**）。
+   * 为什么按帧里的 `procOrderNo` 查：帧本身只带工单号（IF-D.1），产品/工序是 IF-A 派工落库的列
+   * —— 与 `services/stateSnapshot.js` 的标准段**同一口径**（那里也是 task 行 → 标准）。
+   */
+  function taskOf(procOrderNo) {
+    const key = String(procOrderNo === undefined || procOrderNo === null ? '' : procOrderNo);
+    if (!key) return null;
+    if (taskRowCache.has(key)) return taskRowCache.get(key);
+    const row = state.db
+      ? state.db.prepare('SELECT proc_order_no, product_code, process_no, status FROM task WHERE proc_order_no = ?').get(key)
+      : null;
+    taskRowCache.set(key, row || null);
+    return row || null;
+  }
+
+  /** 判定的标准入参（**显式 null 语义**，见 ② 段）。
+   *  库内**无生效版本** ⇒ `{depth:null, speed:null}`（＝未设定）；有版本 ⇒ 传库行本身
+   *  （由 `judge.specOf()` 按 DR-03 库行形态归一，缺哪个指标就判哪个 idle）。 */
+  const FIELD_PROC_ORDER_NO = 'procOrderNo';
+  const FIELD_COLLECT_TIME = 'collectTime';
+
+  /** 取"该帧对应工单在**采集时刻**的生效标准"（DR-03 指定时刻生效版本）。
+   *  未建立/无生效版本 ⇒ 返回**净化形态** `{depth:null, speed:null}`（由 `judge.specOf()` 判 idle）。
+   *  ⚠ 保留净化形态是**有意**的：它同时充当"库里没有生效标准"的显式表达。 */
+  function standardOf(frame) {
+    const task = taskOf(frame && frame[FIELD_PROC_ORDER_NO]);
+    if (!task || !task.product_code) return { depth: null, speed: null };
+    const productCode = String(task.product_code);
+    const processCode = task.process_no === undefined || task.process_no === null ? '' : String(task.process_no);
+    const at = collectTimeTextOf(frame);
+    const row = standardSvc.getEffectiveStandard(state.db, { productCode, processCode, at });
+    return row || { depth: null, speed: null };
+  }
+
+  /** 帧的采集时刻（判定取值时刻 / `now`）：`yyyy-MM-dd HH:mm:ss`；帧缺采集时刻 ⇒ 退注入时钟
+   *  （`ingestFrame` 已强制该字段合法，这里是**防御性**兜底，不构成第二条时间真源）。 */
+  function collectTimeTextOf(frame) {
+    const ct = frame ? frame[FIELD_COLLECT_TIME] : undefined;
+    return typeof ct === 'string' && ct ? ct.slice(0, 19) : platformClock.fmt(currentClock().now());
+  }
+
+  /** 判定挂钩（交给 `ingest` 的 `onSampled`）：算一次判定 → 由 `evaluate()` 发布 `warning` 事件。
+   *  抛出的异常由 ingest 的 try/catch 收下（见 ③ 段），此处不吞不掩。 */
+  function emitWarnings(frame) {
+    const standard = standardOf(frame);
+    /* ⚠ "有没有生效标准"必须用**判定引擎自己的取数口** `judge.specOf()` 判，不得自行读 `standard.depth`：
+       DR-03 的库行是**扁平形态**（`depthTypical` / `speedTypical` / …），`standard.depth` 恒为
+       undefined —— 按字段名直接判会把"有标准"误判成"没标准"，从而**永不判定**（本波实测踩过：
+       探针显示 standard 已取到行、却被早退挡掉）。`specOf()` 同时认三种形态（运行期 / 库行 / 配置段），
+       是"该参数是否已设定"的**唯一**口径。 */
+    const hasAny = judge.PARAMS.some(kind => judge.specOf(standard, kind) !== null);
+    /* 库里没有生效标准 ⇒ **本次不判定、也不发布**：没有标准就没有参数类预警（FR-5.8 / C-93⑤），
+       而"什么都没判"也不是状态变化；发布一条空预警只会让界面把上一条真预警擦掉（假信息）。
+       下一次"1 s 采样落库"会重新看标准是否已到位 —— 标准录入后最迟这一帧起就有预警。 */
+    if (!hasAny) return null;
+    return judge.evaluate({
+      now: collectTimeTextOf(frame),
+      real: { depth: frame.depth, speed: frame.speed },
+      standard
+    }, { bus });
+  }
+
+  logger.info(`[预警] 判定装配已接线（W5-② / E45）：发布点=ingest 的 onSampled（1 s 采样落库之后）；` +
+    `取数=task(procOrderNo)→标准(产品,工序,指定时刻生效版本)；` +
+    `耗材/工单两类**当前无服务端取数源 ⇒ 不产生**（不编造）；判定异常计入 ` +
+    `ingest.status().counts.sampledHookFailures`);
 
   /* ---- 6f. W5-① 追加：静态托管（同源入口）＋ CORS（`file://` / 回环源） ----
      依据负责人 2026-09-28 裁定「选项 A」：

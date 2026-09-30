@@ -8,6 +8,9 @@
         **显式标注退路口径**（同时把跨工单误判风险一起带出来，不隐藏）；
      ③ 采样落库（ADR-0001 D7）：**1 s 采样落库、500 ms 原始帧不落库**
         （500 ms 帧只更新内存态，供实时显示；库里只留每秒一行）；
+     ③b 判定挂钩（W5-② 接线技术债 E45）：落库成功后回调 `options.onSampled(frame)` ——
+        这是"判定/预警产出"的**真实写入点**（`warning` 事件由此产生，见下"两条挂钩"注）；
+        本文件**不自己判定**（判定口径的唯一实现在 `services/judge.js`），只负责"在正确的时刻叫一次"；
      ④ 断连状态（FR-2.6 / IF-D.9）：维护"最近一次收到**有效帧**的时刻"，
         `linkState()` / `status()` 按 `board.config.js` 的 `upper.staleMs`（缺省 5000 ms）
         给出 在线正常 / 离线断连，供 `/health` 或后续端点读取（**本包不改 SSE、不改前端**）。
@@ -48,6 +51,12 @@
      ingest.linkState();                      // → 'online' | 'offline'（FR-2.6，≤5 s）
    ========================================================================== */
 'use strict';
+
+/* W5-② 接线技术债 E45 的两条挂钩（都挂在**同一条写入点**上，先后有序 —— 先有事实、再有通知）：
+     `bus.publish(EVENT_KIND.FRAME, sampled)`   帧推送（W5-① 起就有，"1 s 采样落库"那条帧）；
+     `onSampled(sampled)`                       判定挂钩（本波接线）：装配方在回调里调
+                                                 `judge.evaluate(input,{bus})`，`warning` 事件由此发布。
+   本文件**不自己判定**（判定口径的唯一实现在 `services/judge.js`），只负责"在正确的时刻叫一次"。 */
 
 const measureRepo = require('../repo/measure');
 const platformClock = require('../../platform/clock');
@@ -385,6 +394,9 @@ function resolveStaleMs(options) {
  *   @param {object}   [options.upper]        轮询取数参数（`{url, auth, timeoutMs}`；缺省读配置 `upper`）
  *   @param {Function} [options.fetchImpl]    fetch 实现（缺省 globalThis.fetch；自检可注入假 fetch）
  *   @param {Function} [options.setIntervalImpl] / [options.clearIntervalImpl] 定时器注入（自检用）
+ *   @param {Function} [options.onSampled]    判定挂钩（W5-② / E45）：`onSampled(sampledFrame)` 在
+ *        **1 s 采样落库成功之后**回调一次（与 `frame` 事件同一写入点）；装配方在回调里调
+ *        `judge.evaluate(input,{bus})` 以发布 `warning` 事件。缺省不回调（行为与 W1 一致）。
  * @returns {object} 采集服务实例
  */
 function createIngest(options = {}) {
@@ -398,6 +410,17 @@ function createIngest(options = {}) {
   const bus = options.bus || null;
   if (bus && typeof bus.publish !== 'function') {
     throw new TypeError('ingest: options.bus 传了但不是事件总线（缺 publish）——见 services/eventBus.js');
+  }
+  /* W5-② 判定挂钩（可选注入，接线技术债 E45）：`onSampled(sampledFrame)` 只在"**1 s 采样落库成功**"
+     那条帧上回调一次（与 `frame` 事件**同一写入点**、紧随其后）。
+     为什么做成注入回调而不是在本文件里直接 require judge 并发布：
+       · 判定要读**标准真源**（`standard` 表按"产品＋工序＋指定时刻生效版本"）与派生量，属**业务装配**
+         （谁装配服务谁决定判定输入从哪来）—— ingest 的职责是"帧进得来、脏的挡得住、采样落得下"；
+       · 注入方式是 `createPoller` 的 `cfg.onResult`、`uploadReporter` 的 `fetch` 同一惯例（零新机制）；
+       · 回调抛错**不得**影响落库与帧推送（落库是事实，判定是派生），故下方 try/catch 只计数 + 记日志。 */
+  const onSampled = options.onSampled || null;
+  if (onSampled !== null && typeof onSampled !== 'function') {
+    throw new TypeError('ingest: options.onSampled 必须是函数（判定挂钩，见 services/judge.js 的 evaluate）');
   }
   const staleMs = resolveStaleMs(options);
   /* 期望设备编号：默认＝配置真源 `device.equipCode`（仅用于**报告与显式开启的**一致性校验）；
@@ -438,6 +461,11 @@ function createIngest(options = {}) {
     lastFrame: null,            // 最近一帧有效报文（**内存态**，供实时显示；500 ms 帧也更新它）
     lastSampledFrame: null      // 最近一帧**1 s 采样落库**的帧（W5 快照用；500 ms 原始帧不更新它）
   };
+
+  /** 判定挂钩（`onSampled`）的可观测性：回调抛错的次数与最后一次原因。
+   *  为什么单独记：回调是**派生**动作，失败不得影响落库，但"悄悄不判定了"必须看得见（否则又回到
+   *  "写了机制 ≠ 机制在跑"那类事故）。`stats()` / `status()` 里都如实给出。 */
+  const hookState = { sampledHookFailures: 0, lastSampledHookError: null };
 
   /** L1 采样去重（**同秒只留第一帧**）＝"500 ms 原始帧不落库"的落地判据。
    *  为什么这么判：DR-13 的 `collectTime` 是**秒级**（附录 2 / UI-08 / DR-16）而 IF-D.8 的测试
@@ -584,6 +612,27 @@ function createIngest(options = {}) {
       const sampled = framePayloadOf(v);
       state.lastSampledFrame = sampled;
       if (bus) bus.publish(EVENT_KIND.FRAME, sampled);
+
+      /* ---- ⑤ W5-②（技术债 E45）：把**这一帧**交给判定挂钩 —— `warning` 事件的**唯一真实写入点** ----
+         为什么挂在这里（与上方 `frame` 事件逐条同源，不另立第二条路径）：
+           · **只在"1 s 采样落库成功"之后**：判定对象是"落在库里的那条实测"（`duplicate` 未新增行、
+             `raw-500ms` 不落库、`rejected` 没落库 —— 三者都不判定，与 `frame` 事件同口径）；
+           · 顺序＝**先落库、再发帧、最后判定**：判定要读库（标准真源）与入参，落库之后读到的才是事实；
+           · 回调抛错**只记不抛**：落库与帧推送已经完成，判定属派生；把异常甩回 HTTP 面会让
+             "上位机看到 5xx 于是重发帧"，反而污染采集链。失败计入 `sampledHookFailures` 并写日志。 */
+      if (onSampled) {
+        try {
+          onSampled(sampled);
+        } catch (err) {
+          hookState.sampledHookFailures++;
+          hookState.lastSampledHookError = String((err && err.message) || err);
+          if (logger) {
+            logger.warn('[IF-D] 判定挂钩（onSampled → warning 事件）失败：' +
+              (err && err.message ? err.message : String(err)) +
+              ' —— 帧已落库且 frame 事件已发布，本条只影响预警推送');
+          }
+        }
+      }
       if (logger) {
         logger.info('[IF-D] 采样落库（1 s 采样）', { key, collectTime: v.collectTimeSec, dedup: dedup.basis });
       }
@@ -643,8 +692,11 @@ function createIngest(options = {}) {
           stored: state.storedFrames,
           duplicate: state.duplicateFrames,
           rawInMemory: state.rawFramesInMemory,
-          rejected: state.rejectedFrames
+          rejected: state.rejectedFrames,
+          /* W5-②：判定挂钩（`warning` 事件）的失败次数 —— 0 才是"预警链路真的在跑" */
+          sampledHookFailures: hookState.sampledHookFailures
         },
+        lastSampledHookError: hookState.lastSampledHookError,
         lastReject: state.lastReject,
         lastStoredKey: state.lastStoredKey,
         lastStoredSecond: state.lastStoredSecond,
@@ -826,7 +878,7 @@ function createIngest(options = {}) {
     },
 
     /** 运行态只读视图（自检需要断言"原始帧只进内存"时读它；**不得**在此改写） */
-    stats() { return Object.assign({}, state); }
+    stats() { return Object.assign({}, state, hookState); }
   };
 
   return ingest;
