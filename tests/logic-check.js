@@ -56,10 +56,10 @@ function loadFrontEnd(list, options) {
     { filename: path.join(ROOT, rel) });
   run('src/config/board.config.js');
   /* 班次定义在 mockData.js **加载时**就快照进 SHIFTS ⇒ 必须先改配置再加载
-     （与 contract-check 的 `mutate` 钩子同一个原因）；`queueDepth` 同理（W3 的工单超时用例
-     需要一个"待测队列 > 阈值"的演示现场，而它也是加载期快照） */
+     （与 contract-check 的 `mutate` 钩子同一个原因）；`outputRatio` 同理（W3 的工单超时 err 用例
+     需要一个"实际产出慢于计划"的演示现场，而它也是加载期快照） */
   sandbox.window.BoardConfig.shift.list = list;
-  if (typeof opts.queueDepth === 'number') sandbox.window.BoardConfig.production.queueDepth = opts.queueDepth;
+  if (typeof opts.outputRatio === 'number') sandbox.window.BoardConfig.production.outputRatio = opts.outputRatio;
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
   run('src/services/mockData.js');
@@ -111,7 +111,12 @@ function loadFrontEnd(list, options) {
             /* 耗材累计点亮时长＝演示基准 + 已完成任务数（与 mockData 的演示算式同源；
                基准从 MockData.CFG 读，**不在断言里另写一份 780**） */
             lampHours: M.CFG.lampBaseline + Math.floor(M.state.stats.done || 0),
-            pending: M.state.stats.pending
+            pending: M.state.stats.pending,
+            /* FR-5.11 **新判据**（2026-09-30 判据变更）的两个入参现场：前端按"班次已进行秒数 / 节拍"
+               算应完成、按 `state.stats.done` 取已完成 ⇒ 对账时必须把**同一组**喂给服务端，
+               否则两侧算的不是同一个量（旧口径喂的是 `pendingQty`，已废止）。 */
+            shiftElapsed: M.state.shift.elapsed,
+            done: Math.floor(M.state.stats.done || 0)
           },
           warnings: (M.state.warnings || []).map(x => ({ title: x.title, lv: x.lv, detail: x.detail }))
         };
@@ -772,26 +777,33 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（15 组�
     { id: 'C13', name: '单参数 idle（深度未设定）+ 速度正常', fe: 'default', iso: '2026-09-18T15:30:12',
       depth: dSpec.typical, speed: sSpec.typical,
       standard: { depth: { unit: dSpec.unit }, speed: sSpec } },
-    { id: 'C14', name: '工单超时（队列 > 配置阈值）', fe: 'queue', iso: '2026-09-18T00:00:30',
+    { id: 'C14', name: '工单超时（实际产出慢于计划 ⇒ 进度落后率 > 配置阈值）', fe: 'lag', iso: '2026-09-18T15:30:30',
       depth: dSpec.typical, speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
     { id: 'C15', name: '耗材更换（点亮时长 > 配置阈值）', fe: 'default', iso: '2026-09-18T12:00:00',
+      depth: dSpec.typical, speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } },
+    /* 班初现场（**同一"产出落后"实例**）：应完成仍为 0 ⇒ 工单**不得**因落后而误报；
+       已完成 0 ⇒ 点亮时长停在基准、低于更换阈值 ⇒ 耗材 ok 分支由此构造 */
+    { id: 'C16', name: '班初（落后实例但应完成 0 ⇒ 工单 ok；点亮时长 < 阈值 ⇒ 耗材 ok）', fe: 'lag', iso: '2026-09-18T00:00:30',
       depth: dSpec.typical, speed: sSpec.typical, standard: { depth: dSpec, speed: sSpec } }
   ];
   const NIGHT1 = [{ name: '夜班', start: 22, end: 6 }];
-  /* 队列用例要一个"待测队列 > 工单超时阈值"的演示现场：阈值取配置真源，队列深度加一档余量；
-     `production.queueDepth` 是 mockData 的**加载期快照** ⇒ 必须在加载前覆盖（内存，不落盘） */
-  const QUEUE_OVER = cfg.warnings.orderOverduePending + 40;
+  /* 工单超时用例要一个**真的落后**的现场：FR-5.11 判据比较"应完成 / 已完成"，而演示数据的已完成
+     由节拍推导 ⇒ 只有把演示旋钮 `production.outputRatio` 调低（实际产出慢于计划）才构造得出落后的
+     工单进度。取 0.6 使落后率落进 (阈值率, 件数门槛] 区间 —— 即**必须**由比率门槛判 err，
+     件数门槛（80 件）此时不成立，这样"比率门槛真的在起作用"才有证据，而不是靠件数兜底
+     （旋钮同样是加载期快照 ⇒ 必须在加载前覆盖，只改内存、不落盘）。 */
+  const LAG_RATIO = 0.6;
 
   let FE = null;
-  const feOk = t.requires('对账前提：前端三实例可加载（默认班次 / 跨零点班次 / 大队列）且能冻结随机走帧',
+  const feOk = t.requires('对账前提：前端三实例可加载（默认班次 / 跨零点班次 / 产出落后）且能冻结随机走帧',
     (() => {
       try {
         FE = {
           default: loadFrontEnd(cfg.shift.list.slice()),
           night: loadFrontEnd(NIGHT1),
-          queue: loadFrontEnd(cfg.shift.list.slice(), { queueDepth: QUEUE_OVER })
+          lag: loadFrontEnd(cfg.shift.list.slice(), { outputRatio: LAG_RATIO })
         };
-        return ['default', 'night', 'queue'].every(k => FE[k] && typeof FE[k].freezeTick === 'function');
+        return ['default', 'night', 'lag'].every(k => FE[k] && typeof FE[k].freezeTick === 'function');
       } catch (e) { return false; }
     })(), '');
   t.requires('对账前提：用例序列 ≥ 10 组，且覆盖 压线/同态/混态/idle/缺测/跨零点班次',
@@ -827,8 +839,12 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（15 组�
   if (feOk) {
     for (const c of CASES) {
       const fe = FE[c.fe].freezeTick(c.iso, c.standard, { depth: c.depth, speed: c.speed });
+      /* FR-5.11 新判据：服务端要的是"应完成 / 已完成"两个量，**必须取前端回读的同一组现场**
+         （节拍两侧同源＝production.cycleSec；前端应完成＝floor(shift.elapsed / cycleSec)）。 */
       const sv = judgeSvc.buildWarnings({ now: c.iso, real: fe.real, standard: c.standard,
-        consumableHours: fe.ctx.lampHours, pendingQty: fe.ctx.pending });
+        consumableHours: fe.ctx.lampHours,
+        shouldDone: Math.floor(fe.ctx.shiftElapsed / (cfg.production.cycleSec || 160)),
+        doneQty: fe.ctx.done });
       const mst = judgeSvc.maintenanceState(c.iso);
       rows.push({
         c, fe, sv, bad: compareWarnings(fe.warnings, sv),
@@ -892,13 +908,18 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（15 组�
       !!oneIdle && paramRows(oneIdle.sv).length === 1 && paramCount(paramRows(oneIdle.sv)[0].detail) === 1 &&
       !String(paramRows(oneIdle.sv)[0].detail).includes('深度'),
       oneIdle ? `C13 参数类 ${paramRows(oneIdle.sv).length} 条：${paramRows(oneIdle.sv)[0].detail}` : '用例缺失');
-    /* 覆盖度证据：三类非参数预警的 warn/err/ok 分支都在用例集里出现过（否则"对账"只对了一半） */
+    /* 覆盖度证据：三类非参数预警的 warn/err/ok 分支都在用例集里出现过（否则"对账"只对了一半）。
+       工单 err 分支由 C14 的"实际产出落后"现场（`outputRatio` 旋钮）构造 —— 落后率须**由比率门槛**
+       判成立，故 detail 里同时打印该用例的"应完成/已完成"，可与件数门槛对照（见 LAG_RATIO 说明）。 */
     const otherLv = title => rows.map(r => (r.sv.find(w => w.title === title) || {}).lv);
+    const c14order = (rows.find(r => r.c.id === 'C14') || {}).sv || [];
+    const c14detail = (c14order.find(w => w.title === '工单超时预警') || {}).detail || '（C14 无工单预警）';
     t.check('九 · 用例覆盖度：维保 / 耗材 / 工单三类预警的 warn|ok|err 分支均被真实构造出来',
       otherLv('设备维保到期预警').includes('warn') && otherLv('耗材更换预警').includes('warn') &&
       otherLv('耗材更换预警').includes('ok') && otherLv('工单超时预警').includes('err') &&
       otherLv('工单超时预警').includes('ok'),
-      `维保[${[...new Set(otherLv('设备维保到期预警'))]}] 耗材[${[...new Set(otherLv('耗材更换预警'))]}] 工单[${[...new Set(otherLv('工单超时预警'))]}]`);
+      `维保[${[...new Set(otherLv('设备维保到期预警'))]}] 耗材[${[...new Set(otherLv('耗材更换预警'))]}] ` +
+      `工单[${[...new Set(otherLv('工单超时预警'))]}]；C14 现场：${c14detail}`);
   }
 }
 
@@ -920,8 +941,8 @@ t.section('十、预警阈值可配：改配置真源（内存覆盖，不落盘
   const M = cfg.maintenance || {};
   const C = (M.consumables || [])[0] || {};
   const saved = {
-    order: cfg.warnings.orderOverduePending, warnDays: M.warnDays,
-    lamp: C.threshold, near: STD.nearRatio
+    order: cfg.warnings.orderOverduePending, orderRatio: cfg.warnings.orderOverdueRatio,
+    warnDays: M.warnDays, lamp: C.threshold, near: STD.nearRatio
   };
   const lvOf = (title, input) => {
     const hit = judgeSvc.buildWarnings(input).find(w => w.title === title);
@@ -930,23 +951,44 @@ t.section('十、预警阈值可配：改配置真源（内存覆盖，不落盘
   const input = {
     now: '2026-09-18T15:30:00', real: { depth: dSpec.typical, speed: sSpec.typical },
     standard: { depth: dSpec, speed: sSpec },
-    /* 两个外部计数取在**现阈值之上**，这样"阈值调大 ⇒ 判据反转"的对照才成立 */
-    consumableHours: C.threshold + 70, pendingQty: cfg.warnings.orderOverduePending + 40
+    /* 耗材计数取在**现阈值之上**，这样"阈值调大 ⇒ 判据反转"的对照才成立 */
+    consumableHours: C.threshold + 70,
+    /* FR-5.11 新判据的两个入参：应完成 100 / 已完成 50 ⇒ 落后率 50% ⇒ 现阈值下必 err */
+    shouldDone: 100, doneQty: 50
   };
-  const cfgOk = t.requires('阈值真源齐备：warnings.orderOverduePending / maintenance.warnDays / consumables[0].threshold / standards.nearRatio 都是配置里的有限数值',
-    Number.isFinite(saved.order) && Number.isFinite(saved.warnDays) && Number.isFinite(saved.lamp) &&
-    Number.isFinite(saved.near),
-    `orderOverduePending=${saved.order} warnDays=${saved.warnDays} lampThreshold=${saved.lamp} nearRatio=${saved.near}`);
+  const cfgOk = t.requires('阈值真源齐备：warnings.orderOverdueRatio / warnings.orderOverduePending / maintenance.warnDays / consumables[0].threshold / standards.nearRatio 都是配置里的有限数值',
+    Number.isFinite(saved.order) && Number.isFinite(saved.orderRatio) && Number.isFinite(saved.warnDays) &&
+    Number.isFinite(saved.lamp) && Number.isFinite(saved.near),
+    `orderOverdueRatio=${saved.orderRatio} orderOverduePending=${saved.order} warnDays=${saved.warnDays} lampThreshold=${saved.lamp} nearRatio=${saved.near}`);
 
   try {
-    /* ① 工单超时：阈值现值 ⇒ 队列 阈值+40 判 err；阈值上调到 队列+1 ⇒ 同一队列判 ok */
+    /* ① 工单超时（FR-5.11 新判据）：落后率 50% 在现阈值（0.1＝10%）下判 err；
+          把**比率阈值**上调到 60% 且**件数阈值**放到很大 ⇒ 同一现场判 ok；还原后回 err。
+          两个门槛**都要可配**，故这里把件数门槛也一并放大（否则 50 件落后 > 80 不成立、
+          但比率已被放大 ⇒ 只证明比率可配）。 */
     const beforeOrder = lvOf('工单超时预警', input);
-    cfg.warnings.orderOverduePending = input.pendingQty + 1;
-    const afterOrder = lvOf('工单超时预警', input);
+    cfg.warnings.orderOverdueRatio = 0.6;
+    cfg.warnings.orderOverduePending = 999999;      // 等价关闭件数门槛，单独验比率门槛
+    const afterRatioRaised = lvOf('工单超时预警', input);
+    cfg.warnings.orderOverdueRatio = saved.orderRatio;
+    cfg.warnings.orderOverduePending = 10;          // 只剩件数门槛：落后 50 > 10 ⇒ 仍 err
+    const afterCountOnly = lvOf('工单超时预警', input);
+    cfg.warnings.orderOverduePending = 999999;      // 率回基线、件数门槛关闭 ⇒ **比率门槛单独判 err**
+    const ratioOnly = lvOf('工单超时预警', input);
     cfg.warnings.orderOverduePending = saved.order;
-    t.check('NFR-19 工单超时阈值可配：改 warnings.orderOverduePending（内存）⇒ 同一队列的判据反转，还原后回到基线',
-      beforeOrder === 'err' && afterOrder === 'ok' && lvOf('工单超时预警', input) === 'err',
-      `队列 ${input.pendingQty} 件：阈值 ${saved.order} ⇒ ${beforeOrder}；阈值 ${input.pendingQty + 1} ⇒ ${afterOrder}；还原后 ⇒ ${lvOf('工单超时预警', input)}`);
+    t.check('FR-5.11 工单超时阈值可配（比率 + 件数双门槛）：改 warnings.orderOverdueRatio / orderOverduePending（内存）⇒ 同一现场的判据反转，还原后回到基线',
+      beforeOrder === 'err' && afterRatioRaised === 'ok' && afterCountOnly === 'err' && ratioOnly === 'err' &&
+      lvOf('工单超时预警', input) === 'err',
+      `应完成 ${input.shouldDone} / 已完成 ${input.doneQty}（落后率 50%）：阈值率 ${saved.orderRatio} ⇒ ${beforeOrder}；` +
+      `率 0.6 且件数门槛关闭 ⇒ ${afterRatioRaised}；率还原、件数门槛 10 ⇒ ${afterCountOnly}；` +
+      `率还原、件数门槛关闭 ⇒ ${ratioOnly}（比率门槛**单独**即可判 err）；还原后 ⇒ ${lvOf('工单超时预警', input)}`);
+
+    /* ①b FR-5.11 **允许落后率为负**（超前于计划）⇒ 绝不告警；且"应完成 0"（班初）也不得告警 */
+    const ahead = lvOf('工单超时预警', { ...input, shouldDone: 100, doneQty: 130 });
+    const zeroShould = lvOf('工单超时预警', { ...input, shouldDone: 0, doneQty: 0 });
+    t.check('FR-5.11 负落后率（超前）与"应完成 0"（班初）均**不得告警**（旧口径班初必报，是本判据换掉它的原因）',
+      ahead === 'ok' && zeroShould === 'ok',
+      `超前（应 100 / 完成 130 ⇒ 落后率 −30%）⇒ ${ahead}；班初（应 0 / 完成 0）⇒ ${zeroShould}`);
 
     /* ② 维保到期：提前天数现值 ⇒ 剩余 9 天判 warn；收紧到"剩余天数 − 1" ⇒ 同一剩余天数判 ok */
     const beforeMaint = lvOf('设备维保到期预警', input);
@@ -977,6 +1019,7 @@ t.section('十、预警阈值可配：改配置真源（内存覆盖，不落盘
       `实测 ${nearVal}（距上限 ${k} 格）：nearRatio ${saved.near} ⇒ ${beforeNear}；${saved.near / 2} ⇒ ${afterNear}；还原后 ⇒ ${judgeSvc.standardLevel(nearVal, dSpec).lv}`);
   } finally {
     cfg.warnings.orderOverduePending = saved.order;
+    cfg.warnings.orderOverdueRatio = saved.orderRatio;
     M.warnDays = saved.warnDays;
     C.threshold = saved.lamp;
     STD.nearRatio = saved.near;
@@ -985,14 +1028,15 @@ t.section('十、预警阈值可配：改配置真源（内存覆盖，不落盘
   /* ⑤ 还原复验（**配置真源与判据都回到基线**） */
   const restored = {
     order: cfg.warnings.orderOverduePending === saved.order,
+    orderRatio: cfg.warnings.orderOverdueRatio === saved.orderRatio,
     warnDays: M.warnDays === saved.warnDays,
     lamp: C.threshold === saved.lamp,
     near: STD.nearRatio === saved.near
   };
   t.check('阈值用例跑完**配置真源逐项还原**（内存覆盖不落盘，判据回到基线）',
-    restored.order && restored.warnDays && restored.lamp && restored.near &&
+    restored.order && restored.orderRatio && restored.warnDays && restored.lamp && restored.near &&
     lvOf('工单超时预警', input) === 'err' && judgeSvc.standardLevel(nearVal, dSpec).lv === 'warn',
-    `order=${cfg.warnings.orderOverduePending} warnDays=${M.warnDays} lamp=${C.threshold} nearRatio=${STD.nearRatio}（均与用例前相同）`);
+    `orderOverduePending=${cfg.warnings.orderOverduePending} orderOverdueRatio=${cfg.warnings.orderOverdueRatio} warnDays=${M.warnDays} lamp=${C.threshold} nearRatio=${STD.nearRatio}（均与用例前相同）`);
 
   /* ⑥ 阈值可配（跨实现）：前端读的是**同一个配置键**（`standards.nearRatio` 现读）
      ⇒ 改真源后两侧必须同步反转、且判据仍逐条一致（否则"可配"只配了一半）。 */

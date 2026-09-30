@@ -34,7 +34,7 @@
      const judge = require('./services/judge');
      judge.standardLevel(5.22, { typical: 5, upperDev: 0.3, lowerDev: -0.2, digits: 2 });  // → warn 临近
      judge.taskResult({ progress: 1, real: { depth: 5.22, speed: 5 }, standard: std });
-     judge.buildWarnings({ now, real, standard, consumableHours, pendingQty });
+     judge.buildWarnings({ now, real, standard, consumableHours, shouldDone, doneQty });
    ========================================================================== */
 'use strict';
 
@@ -99,7 +99,8 @@ function thresholds() {
     consumableName: c.name,
     consumableThreshold: requiredThreshold(c.threshold, 'maintenance.consumables[0].threshold'),
     consumableUnit: c.unit,
-    orderOverduePending: requiredThreshold(warningsCfg().orderOverduePending, 'warnings.orderOverduePending')
+    orderOverduePending: requiredThreshold(warningsCfg().orderOverduePending, 'warnings.orderOverduePending'),
+    orderOverdueRatio: requiredThreshold(warningsCfg().orderOverdueRatio, 'warnings.orderOverdueRatio')
   };
 }
 
@@ -344,18 +345,46 @@ function consumableWarning(hours) {
   };
 }
 
-/** 工单超时预警（FR-5.11）：设备侧待测队列件数 > 配置阈值 ⇒ err；阈值真源＝`warnings.orderOverduePending` */
-function orderWarning(pendingQty) {
+/**
+ * 工单超时预警（FR-5.11）—— **进度落后率**判据（负责人 2026-09-30 裁定改判据）。
+ *
+ * 判据：`应完成件数 = 节拍 × 实际经过时长`；`落后率 = (应完成 − 已完成) / 应完成`；
+ *   告警条件 ＝ `落后率 > warnings.orderOverdueRatio` **或** `落后件数 > warnings.orderOverduePending`。
+ *
+ * **为什么改（旧口径已废止）**：旧判据是"设备侧待测队列件数 > 固定阈值"，而队列在实现里只能取
+ *   `计划 − 已完成`（无队列的直接数据源）⇒ 班初必然等于全部计划量、**恒定越过任何固定阈值**：
+ *   2026-09-30 实测下"正常推进"与"严重落后"两种情形的判定**完全相同**（都告警）⇒ **零判别力**。
+ *   新判据让"应完成"随时长增长，"正常推进 ⇒ 落后≈0、不告警"，**只在真落后时差值才累积**。
+ *
+ * ⚠ **允许落后率为负**（负＝已完成超过应完成，即超前于计划）—— 负值**绝不告警**，
+ *   且不得因为"负"而抛错或取绝对值。
+ *
+ * @param {{shouldDone?:number, doneQty?:number}} input
+ *   `shouldDone` 应完成件数（由调用方按节拍×经过时长算，**本函数不算时长、不读时钟**）；
+ *   `doneQty` 实际已完成件数。
+ * @returns {{title,detail,lv}} 一条预警（lv ∈ ok / err）
+ */
+function orderWarning(input) {
   const t = thresholds();
-  if (!isNum(pendingQty)) {
-    throw new TypeError(`judge: 待测队列件数（pendingQty）必须是有限数值，收到 ${JSON.stringify(pendingQty)}`);
+  const inp = (input && typeof input === 'object') ? input : {};
+  if (!isNum(inp.shouldDone)) {
+    throw new TypeError(`judge: 应完成件数（shouldDone）必须是有限数值，收到 ${JSON.stringify(inp.shouldDone)}`);
   }
-  const overdue = pendingQty > t.orderOverduePending;
+  if (!isNum(inp.doneQty)) {
+    throw new TypeError(`judge: 已完成件数（doneQty）必须是有限数值，收到 ${JSON.stringify(inp.doneQty)}`);
+  }
+  const shouldDone = inp.shouldDone;
+  const doneQty = inp.doneQty;
+  const behindQty = shouldDone - doneQty;                        // **允许为负**（超前）
+  /* 应完成 > 0 才算落后率；应完成为 0（班初/未开工）时比率无意义 ⇒ 只走件数门槛 */
+  const ratio = shouldDone > 0 ? behindQty / shouldDone : 0;
+  const overdue = ratio > t.orderOverdueRatio || behindQty > t.orderOverduePending;
+  const pct = (ratio * 100).toFixed(1);
   return {
     title: OTHER_TITLES.order,
     detail: overdue
-      ? `设备侧待测队列 ${pendingQty} 件，预计超班次完成`
-      : '当班工单按节拍推进，无超时风险',
+      ? `按节拍应完成 ${shouldDone} 件、实际已完成 ${doneQty} 件，落后 ${behindQty} 件（${pct}%，阈值 ${(t.orderOverdueRatio * 100).toFixed(0)}%），预计超班次完成`
+      : `按节拍应完成 ${shouldDone} 件、实际已完成 ${doneQty} 件，落后 ${behindQty} 件（${pct}%），按节拍推进`,
     lv: overdue ? 'err' : 'ok'
   };
 }
@@ -366,19 +395,21 @@ function orderWarning(pendingQty) {
  * 口径（不得靠名称筛）。函数**纯**：所有外部状态（时刻、累计时长、队列件数）都由入参注入。
  *
  * ⚠ **耗材 / 工单两类可缺**（本波接线 E45 时定；参数齐备时输出与原来**逐条相同**）：
- *   · `consumableHours` / `pendingQty` **未给**（`undefined`/`null`）⇒ 该类的**取数源当前拿不到**，
- *     于是**该类整条不产生**（FR-5.10 的"耗材台账/计数"、FR-5.11 的"工单计划/节拍"在服务端
- *     **都还没有数据源**：`server/` 全仓无累计点亮时长、无设备侧待测队列件数，也没有承载它们的列）；
- *   · 为什么不是"给个缺省值凑齐 5 条"：那是**伪造预警**（拿编造的耗材时长/队列件数驱动一条真实预警），
+ *   · `consumableHours` **未给**（`undefined`/`null`）⇒ 该类的**取数源当前拿不到**，于是**该类整条不产生**
+ *     （FR-5.10 的"耗材台账/计数"在服务端尚无承载列 ⇒ 见 E45 相邻缺口登记）；
+ *   · 工单超时（FR-5.11）需 `shouldDone` 与 `doneQty` **两个**入参，缺一即整条不产生；
+ *     这两项服务端**都有真源**（`task.plan_qty` / `plan_start_time` / `production.cycleSec` / 结果表），
+ *     由 `server/index.js` 的 `emitWarnings()` 按新判据算出后传入；
+ *   · 为什么不是"给个缺省值凑齐 5 条"：那是**伪造预警**（拿编造的耗材时长/件数驱动一条真实预警），
  *     与 FR-3.18/C-93⑤ 的"标准未设定 ⇒ 不判定、不预警"以及本文件"绝不静默兜底成字面量"同一纪律；
- *   · 显式传 `0` 仍然**参与**判定（`0 > 阈值` 为假 ⇒ 出 ok 条）—— "拿不到"与"真的是 0"是两件事，
- *     不得互相代言（调用方要知道自己在给什么）。
+ *   · 显式传 `0` 仍然**参与**判定—— "拿不到"与"真的是 0"是两件事，不得互相代言。
  * @param {object} input
  *   @param {Date|string} input.now 当前时刻（维保剩余天数按它算；必填，不读系统时间）
  *   @param {object} input.real 实测 `{depth, speed}`
  *   @param {object} [input.standard] 标准真源（运行期形态 / DR-03 库行形态；缺省回落配置演示段）
  *   @param {number} [input.consumableHours] 耗材（水下光源）累计点亮时长（h）；**缺 ⇒ 该类不产生**
- *   @param {number} [input.pendingQty] 设备侧待测队列件数；**缺 ⇒ 该类不产生**
+ *   @param {number} [input.shouldDone] 按节拍应完成件数（FR-5.11 新判据）；**缺其一 ⇒ 该类不产生**
+ *   @param {number} [input.doneQty] 实际已完成件数；**缺其一 ⇒ 该类不产生**
  * @returns {Array<{title:string, detail:string, lv:string}>} 参数类 0～2 ＋ 维保 1 ＋（耗材/工单 各 0～1）
  */
 function buildWarnings(input = {}) {
@@ -388,7 +419,10 @@ function buildWarnings(input = {}) {
   out.push(maintenanceWarning(input.now, t.maintWarnDays));
   /* 耗材 / 工单：**取数源拿不到就整条不出**（不编造），判据是"入参是否为有限数值"——`0` 是有效值 */
   if (isNum(input.consumableHours)) out.push(consumableWarning(input.consumableHours));
-  if (isNum(input.pendingQty)) out.push(orderWarning(input.pendingQty));
+  /* 工单超时（FR-5.11 新判据）：需**两个**入参（应完成 / 已完成）才成条；缺一即整条不出（不编造） */
+  if (isNum(input.shouldDone) && isNum(input.doneQty)) {
+    out.push(orderWarning({ shouldDone: input.shouldDone, doneQty: input.doneQty }));
+  }
   return out;
 }
 

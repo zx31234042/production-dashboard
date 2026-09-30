@@ -392,8 +392,9 @@ function writeRunTotals(results) {
  *
  * **数据来源（唯一真源，不要另起炉灶）**：`PROJECT_RULES.md` 6.4「已登记的历史偏差（不改写，只登记）」
  * + `tests\docs-check.js` D2 段（PROJECT_RULES 6.1/6.2）的实跑失败清单。6.4 明确要求两个数字分清：
- *   - **`docs-check` D2 段失败清单实际列出 12 条**（9 条缺 `类型:` 前缀 + 3 条超过 30 字）
- *     → `listedItems`（= 6.4 本表逐条登记 3 条 + 同类早期 9 条）；
+ *   - **`docs-check` D2 段失败清单实际列出 13 条**（9 条缺 `类型:` 前缀 + 4 条超过 30 字；第 13 条＝
+ *     `be63c37`（2026-09-30 本机 AI 提交，37 字），推送前由门禁当场发现）
+ *     → `listedItems`（= 6.4 本表逐条登记 3 条 + 同类早期 10 条）；
  *   - **门禁断言数仍是 2 条**（D2 段只有两条 `check`）→ `failedAssertions`。
  *
  * **⚠ 数字变化时必须同步本常量**：6.4 增删登记条目、D2 段增删 `check`、失败清单条数变化，
@@ -405,8 +406,8 @@ const REGISTERED_DEVIATIONS = Object.freeze({
   'docs-check': Object.freeze({
     /* D2 段失败断言条数（＝汇总行的 failed，也是 README 第三节 `docs-check 43/2` 里的那个 2） */
     failedAssertions: 2,
-    /* 失败清单里逐条列出的偏差条数（README / 6.4 口径：9 条缺前缀 + 3 条超 30 字） */
-    listedItems: 12,
+    /* 失败清单里逐条列出的偏差条数（README / 6.4 口径：9 条缺前缀 + 4 条超 30 字） */
+    listedItems: 13,
     /* 允许失败的两条断言名（与 docs-check D2 段的 check 名逐字一致；改名即视为"换了豁免口子"） */
     assertions: Object.freeze([
       '每条提交都按「类型: 说明」书写',

@@ -1944,12 +1944,18 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
   const warnExpect = warnOpt.expect || {};
   const warnEvents = kindsOf(warnOpt.stream, 'warning');
   const paramTitles = [judge.WARN_TITLES.warn, judge.WARN_TITLES.err];   // 参数类**两条具名**（C-88）
+  /* ⚠ 2026-09-30（FR-5.11 判据改造 / 需求 C-108）：**入参要与生产写入点一致** ——
+     服务端现在还会算「工单超时」（应完成 = 节拍 × (采集时刻 − `task.plan_start_time`)；已完成 = `result` 表件数）。
+     本夹具的工单行**没有计划开工时刻** ⇒ 生产侧算得「应完成 0 / 已完成 0」⇒ 该类在事件里是一条
+     **快照态 ok**（新判据下"应完成 0"不告警，正是它相对旧口径的关键改进）。此处按**同一组入参**重算，
+     故 `shouldDone/doneQty` 显式传 0：生产侧一旦取数不再是 0（例如开始读别的列），本对账**当场变红**。 */
   const recompute = (depth, speed, ct) => judge.evaluate({
     now: ct, real: { depth, speed },
     standard: {
       depth: Object.assign({}, boardConfig.standards.default.depth),
       speed: Object.assign({}, boardConfig.standards.default.speed)
-    }
+    },
+    shouldDone: 0, doneQty: 0
   });
   const harmExpect = recompute(warnExpect.depth && warnExpect.depth.warnVal,
     warnExpect.speed && warnExpect.speed.warnVal, (warnOpt.at && warnOpt.at.harm) || '');
@@ -3285,7 +3291,7 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       t.check('已登记偏差的**失败断言数** = git 历史实算（D2 两条断言各失败一条 → 2）',
         failedRules === reg.failedAssertions,
         `实算 ${failedRules} 条失败断言（缺前缀 ${badPrefix.length} 条 / 超 ${lenLimit} 字 ${tooLong.length} 条），常量写 ${reg.failedAssertions}`);
-      t.check('已登记偏差的**失败清单条数** = git 历史实算（9 条缺前缀 + 3 条超字数 → 12）',
+      t.check('已登记偏差的**失败清单条数** = git 历史实算（9 条缺前缀 + 4 条超字数 → 13）',
         listed === reg.listedItems,
         `实算 ${listed} 条 = 缺前缀 ${badPrefix.length} + 超字数 ${tooLong.length}，常量写 ${reg.listedItems}`);
     }

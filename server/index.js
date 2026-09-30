@@ -390,6 +390,12 @@ async function start(options = {}) {
   /* ---- 1. 配置 ---- */
   const cfg = resolveConfig({ argv: options.argv, env: options.env, boardConfig: options.boardConfig });
   state.config = cfg;
+  /* 业务配置真源（`src/config/board.config.js`）—— 判定装配要读**节拍**等业务参数（FR-5.11）。
+     `resolveConfig()` 里的同名变量是**它自己的局部变量**，这个作用域取不到；此处显式再取一份
+     （与它同一来源：`options.boardConfig` 优先，否则读配置文件）。
+     ⚠ 实测踩过：闭包里直接引用那个局部变量 ⇒ 每次判定挂钩都抛 `ReferenceError`、`warning`
+     事件永不发布（`harness-check` 段⑦e **7 条断言当场变红**才是发现它的原因）。 */
+  const boardCfg = options.boardConfig || require('../src/config/board.config');
 
   /* ---- 2. 数据根目录（用 platform/paths.js 这一层，业务代码不得自己拼路径：D11） ---- */
   if (cfg.dataDir) {
@@ -675,10 +681,38 @@ async function start(options = {}) {
     if (!key) return null;
     if (taskRowCache.has(key)) return taskRowCache.get(key);
     const row = state.db
-      ? state.db.prepare('SELECT proc_order_no, product_code, process_no, status FROM task WHERE proc_order_no = ?').get(key)
+      ? state.db.prepare('SELECT proc_order_no, product_code, process_no, status, plan_qty, plan_start_time FROM task WHERE proc_order_no = ?').get(key)
       : null;
     taskRowCache.set(key, row || null);
     return row || null;
+  }
+
+  /** 已完成件数（FR-5.11 新判据的减数）：`result` 表里该工单「合格 + 不合格」的件数（DR-05 判定结果）。
+   *  为什么用 `result` 而不是 `task.status`：`task.status` 是**单票聚合态**（一票多件时只能给一个状态），
+   *  而"已完成多少**件**"必须按件计（DR-19 按件固化）⇒ `result` 是唯一按件的真源。
+   *  ⚠ 复检（`待复检`）**不计已完成**（尚未定论），与 `stats.js` 的 `DONE_STATUS` 同一口径。 */
+  function doneQtyOf(procOrderNo) {
+    if (!state.db) return 0;
+    const r = state.db.prepare(
+      "SELECT COUNT(*) AS n FROM result WHERE proc_order_no = ? AND result IN ('合格','不合格')"
+    ).get(String(procOrderNo));
+    return r && typeof r.n === 'number' ? r.n : 0;
+  }
+
+  /** 按节拍应完成件数（FR-5.11 新判据的减数）：`节拍(件/秒) × 实际经过秒数`，
+   *  节拍真源＝`production.cycleSec`（配置单一真源，代码里不写死秒数）。
+   *  经过时长的起算点＝该工单的 `plan_start_time`（IF-A.1 `planStartTime`，权威）。
+   *  缺计划开工时点 / 不可解析 / 尚未到计划开工 ⇒ **0** —— 新判据下"应完成 0"⇒ 落后率不成立、
+   *  **不告警**，这正是它相对旧口径的关键改进（班初不误报）。
+   *  ⚠ 不读系统时间：`at` 一律由调用方传采集时刻（ADR-0003 D17）。 */
+  function shouldDoneOf(task, at) {
+    const cycleSec = Number((boardCfg.production || {}).cycleSec);
+    if (!Number.isFinite(cycleSec) || cycleSec <= 0) return 0;
+    if (!task || typeof task.plan_start_time !== 'string' || !task.plan_start_time) return 0;
+    const t0 = Date.parse(String(task.plan_start_time).replace(' ', 'T'));
+    const t1 = Date.parse(String(at).replace(' ', 'T'));
+    if (!Number.isFinite(t0) || !Number.isFinite(t1) || t1 <= t0) return 0;
+    return Math.floor((t1 - t0) / 1000 / cycleSec);
   }
 
   /** 判定的标准入参（**显式 null 语义**，见 ② 段）。
@@ -721,10 +755,17 @@ async function start(options = {}) {
        而"什么都没判"也不是状态变化；发布一条空预警只会让界面把上一条真预警擦掉（假信息）。
        下一次"1 s 采样落库"会重新看标准是否已到位 —— 标准录入后最迟这一帧起就有预警。 */
     if (!hasAny) return null;
+    const task = taskOf(frame && frame[FIELD_PROC_ORDER_NO]);
+    const at = collectTimeTextOf(frame);
     return judge.evaluate({
-      now: collectTimeTextOf(frame),
+      now: at,
       real: { depth: frame.depth, speed: frame.speed },
-      standard
+      standard,
+      /* FR-5.11 新判据（2026-09-30 负责人裁定）：**进度落后率**，不再是"队列件数"。
+         两个减数都取真源：应完成 = 节拍(production.cycleSec) × (采集时刻 − 计划开工时刻)；
+         已完成 = `result` 表里该工单「合格＋不合格」的件数。缺任一项 ⇒ judge 不出该类（不编造）。 */
+      shouldDone: shouldDoneOf(task, at),
+      doneQty: task ? doneQtyOf(task.proc_order_no) : 0
     }, { bus });
   }
 

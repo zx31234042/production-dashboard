@@ -1,6 +1,6 @@
 /* ==========================================================================
-   模拟数据源（services/mockData.js）— 按需求清单 V1.38 口径编写
-             （V1.38 / C-99～C-107 口径收口与接口修正；承 V1.37 / C-98「只统一 `testStatus` 码语义与运行阶段映射（改在 config/fieldMap.js
+   模拟数据源（services/mockData.js）— 按需求清单 V1.39 口径编写
+             （V1.39 / C-108 工单超时预警判据改「进度落后率超阈值率」且阈值率可配：工单预警按「应完成 / 已完成」重写，并新增演示旋钮 production.outputRatio；V1.38 / C-99～C-107 口径收口与接口修正；承 V1.37 / C-98「只统一 `testStatus` 码语义与运行阶段映射（改在 config/fieldMap.js
               与两处模拟上位机），本文件数据与口径未变；
               V1.36 / C-96（U-5） 只精简测试标准区说明行文案）
    作用：产生并逐秒推进看板所需的全部数据；界面组件只读取本文件输出的 state
@@ -42,6 +42,8 @@ window.MockData = (function () {
   const BCdev = BC.device || {};
   /* 耗材清单（Q-13）：第 1 项为水下光源，其 threshold 即更换阈值 */
   const BClamp = (BCmaint.consumables && BCmaint.consumables[0]) || {};
+  /* 预警阈值段（FR-5.11 判据变更后新增读取；与 judge.js 同源，不各自硬编码） */
+  const BCwarn = BC.warnings || {};
 
   const CFG = {
     deviceName: BCdev.name || '水池高速摄像检验设备',
@@ -56,11 +58,19 @@ window.MockData = (function () {
     runRate: BCprod.runRate || 0.79,             // 有效运行占比 → 稼动率（Q-11）
     firstPassRate: BCprod.firstPassRate || 0.932,// 一次性测试合格率（Q-11）
     queueDepth: BCprod.queueDepth || 72,         // 设备侧待测试排队量
+    /* 演示场景旋钮（**非判据参数**）：实际产出达成率。1＝按计划节拍推进；<1 表示实际产出慢于计划 ⇒
+       演示现场真的落后（FR-5.11 的 err 分支由此可复现）。正式实现取 MES 派工进度与 result 表，
+       与本旋钮无关。 */
+    outputRatio: (BCprod.outputRatio === undefined ? 1 : BCprod.outputRatio),
     maintLast: BCmaint.lastDate || '2026-08-28', // 上次维保日期（Q-13）
     maintCycleDays: BCmaint.cycleDays || 30,     // 固定维保周期（Q-13）
     maintWarnDays: BCmaint.warnDays || 14,       // 维保到期预警提前天数（Q-13，APP 6）
     lampBaseline: 780,                           // 水下光源"上次更换后"累计点亮时长（h，演示基准）
     lampThreshold: BClamp.threshold || 800,      // 水下光源更换阈值（h，Q-13 耗材清单第 1 项）
+    /* 工单超时判据阈值（FR-5.11，2026-09-30 判据变更）—— **一律读配置真源、本处不写死**：
+       ratio ＝ 进度落后率阈值；pending ＝ 落后件数阈值（两者取或）。 */
+    orderOverdueRatio: BCwarn.orderOverdueRatio,
+    orderOverduePending: BCwarn.orderOverduePending,
     unlockPassword: '8888'                       // 演示密码（正式实现由服务端校验，NFR-14）
   };
 
@@ -231,7 +241,9 @@ window.MockData = (function () {
   /* ---------------- 统计计算（由班次已进行时长推导，保证自洽） ---------------- */
   function computeStats(elapsed, total) {
     const C = CFG.cycleSec, P = CFG.planQty;
-    const done = Math.min(P, Math.floor(elapsed / C));
+    /* 实际产出 = 计划节拍产出 × 达成率（默认 1 ⇒ 按计划节拍推进，与旧演示数据逐值相同；
+       <1 ⇒ 实际慢于计划，FR-5.11 的"已完成 < 应完成"由此成立） */
+    const done = Math.min(P, Math.floor((elapsed / C) * CFG.outputRatio));
     const testing = done < P ? 1 : 0;
     const qualified = Math.round(done * CFG.firstPassRate);
     const unqualified = done - qualified;
@@ -477,11 +489,24 @@ window.MockData = (function () {
     out.push(lamp > CFG.lampThreshold
       ? { title: '耗材更换预警', detail: `水下光源累计点亮 ${lamp} h，建议更换（阈值 ${CFG.lampThreshold} h）`, lv: 'warn' }
       : { title: '耗材更换预警', detail: `光源累计点亮 ${lamp} h，未达更换阈值（${CFG.lampThreshold} h）`, lv: 'ok' });
-    /* 4) 工单超时 */
-    const overdue = state.stats.pending > 80;
+    /* 4) 工单超时预警（FR-5.11，**判据 2026-09-30 由负责人裁定变更**）：由"待测队列件数 > 固定阈值"
+          改为**进度落后率** —— 应完成 = 节拍 × 实际经过时长；落后率 = (应完成 − 已完成) / 应完成；
+          告警 = 落后率 > CFG.orderOverdueRatio **或** 落后件数 > CFG.orderOverduePending。
+         为什么改：旧口径的"队列 = 计划 − 已完成"在班初必然等于全部计划量 ⇒ 恒定越过任何固定阈值，
+         正常与落后两种情形判定完全相同（零判别力，2026-09-30 实测）。新口径下"正常推进 ⇒ 落后≈0"。
+         ⚠ 落后率**允许为负**（超前于计划）—— 负值绝不告警（不得取绝对值、不得当成异常）。
+         ⚠ 阈值一律读配置（`orderOverdueRatio` / `orderOverduePending`），本处**不写死**。 */
+    const cycleSec = CFG.cycleSec || 160;
+    const elapsedSec = Math.max(0, Number(state.shift && state.shift.elapsed) || 0);
+    const shouldDone = Math.floor(elapsedSec / cycleSec);
+    const doneQty = Math.floor(state.stats.done || 0);
+    const behindQty = shouldDone - doneQty;                        // 允许为负
+    const behindRatio = shouldDone > 0 ? behindQty / shouldDone : 0;
+    const overdue = behindRatio > CFG.orderOverdueRatio || behindQty > CFG.orderOverduePending;
+    const overduePct = (behindRatio * 100).toFixed(1);
     out.push(overdue
-      ? { title: '工单超时预警', detail: `设备侧待测队列 ${state.stats.pending} 件，预计超班次完成`, lv: 'err' }
-      : { title: '工单超时预警', detail: '当班工单按节拍推进，无超时风险', lv: 'ok' });
+      ? { title: '工单超时预警', detail: `按节拍应完成 ${shouldDone} 件、实际已完成 ${doneQty} 件，落后 ${behindQty} 件（${overduePct}%，阈值 ${(CFG.orderOverdueRatio * 100).toFixed(0)}%），预计超班次完成`, lv: 'err' }
+      : { title: '工单超时预警', detail: `按节拍应完成 ${shouldDone} 件、实际已完成 ${doneQty} 件，落后 ${behindQty} 件（${overduePct}%），按节拍推进`, lv: 'ok' });
     return out;
   }
 
