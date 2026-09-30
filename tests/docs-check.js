@@ -268,15 +268,21 @@ async function main() {
 
   const rulesVersion = (readText('PROJECT_RULES.md').match(/\|\s*版本\s*\|\s*v([\d.]+)/) || [])[1];
   const snapshotRules = (snapshot.match(/代码与结构规范\s*\|\s*\*\*v([\d.]+)\*\*/) || [])[1];
-  const logRules = (readText('项目记录/工作日志.md').match(/PROJECT_RULES\.md`?\s*\*\*v([\d.]+)\*\*/) || [])[1];
+  /* 工作日志：**只认头部"当前版本"字段**（前 12 行），不扫全文。
+     原判据在**全文**里匹配 "PROJECT_RULES.md **v<数字>**" 并取首个命中，于是正文里
+     任何一句历史陈述（例如"PROJECT_RULES.md **v1.30**（历次版本…）"）都会被当成
+     "当前声明" ⇒ 规范每次升版都**假红**（2026-09-29 实测踩到）。口径与 docs-cross-check 一致。
+     注：本注释内不得出现反引号包裹的正则字面量（会提前闭合块注释，见 E15/E40 同族）。 */
+  const logHead = readText('项目记录/工作日志.md').split(/\r?\n/).slice(0, 12).join('\n');
+  const logRules = (logHead.match(/规范\s*\*\*v([\d.]+)\*\*/) || [])[1];
   check('快照声明的规范版本等于 PROJECT_RULES.md 头部版本',
     rulesVersion !== undefined && snapshotRules === rulesVersion,
     `PROJECT_RULES=v${rulesVersion}，快照=v${snapshotRules}`);
   if (logRules === undefined) {
-    skip('工作日志声明的规范版本一致', '工作日志里没有声明规范版本');
+    skip('工作日志声明的规范版本一致', '工作日志头部没有声明规范版本');
   } else {
     check('工作日志声明的规范版本等于 PROJECT_RULES.md 头部版本', logRules === rulesVersion,
-      `PROJECT_RULES=v${rulesVersion}，工作日志=v${logRules}`);
+      `PROJECT_RULES=v${rulesVersion}，工作日志头部=v${logRules}`);
   }
 
   const reqDoc = fs.readdirSync(path.join(ROOT, '需求文档')).filter(n => n.endsWith('.md'));

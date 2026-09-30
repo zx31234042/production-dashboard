@@ -75,9 +75,16 @@ function main() {
   const snapRules = (snap.match(/代码与结构规范\s*\|\s*\*\*v([\d.]+)\*\*/) || [])[1];
   t.check('快照声明的规范版本 = PROJECT_RULES 头部版本',
     snapRules === rulesV, `快照 v${snapRules}`);
-  const logRules = (log.match(/PROJECT_RULES\.md`?\s*\*\*v([\d.]+)\*\*/) || [])[1];
+  /* 工作日志：**只认头部"当前版本"字段**，不扫全文。
+     原判据是在**全文**里匹配 "PROJECT_RULES.md **v<数字>**" 并取首个命中，
+     于是正文里任何一句历史陈述（例如"PROJECT_RULES.md **v1.30**（历次版本…）"）
+     都会被当成"当前声明" ⇒ 规范每次升版都会**假红**（2026-09-29 实测踩到）。
+     口径与快照一致：声明必须写在头部字段里，才算"本文件声明了规范版本"。
+     注：本注释内不得出现反引号包裹的正则字面量（会把块注释提前闭合，见 E15/E40 同族）。 */
+  const logHead = log.split(/\r?\n/).slice(0, 12).join('\n');
+  const logRules = (logHead.match(/规范\s*\*\*v([\d.]+)\*\*/) || [])[1];
   t.check('工作日志声明的规范版本 = PROJECT_RULES 头部版本',
-    logRules === rulesV, `工作日志 v${logRules}`);
+    logRules === rulesV, `工作日志头部 v${logRules}`);
   /* 2026-09-20 补：路线图此前不在覆盖范围内，其"当前基线"曾长期停在 v1.15（实际 v1.24）而门禁全绿 */
   const roadmapRules = (roadmap.match(/规范\s*\*\*v([\d.]+)\*\*/) || [])[1];
   t.check('路线图声明的规范版本 = PROJECT_RULES 头部版本',
