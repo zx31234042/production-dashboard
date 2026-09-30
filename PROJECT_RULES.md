@@ -420,7 +420,7 @@ production-dashboard/
 │   ├── tools-check.js            # 联调工具进程级（mock-upper / mock-mes 的 HTTP 行为与参数一致性）
 │   ├── docs-check.js             # 文档与规范一致性（转换工具能力、提交信息格式、记录与对外文档）
 │   ├── browser-check.js          # 真实浏览器（无头 Edge + CDP：加载/报错/参数/降级/切换/无滚动条）
-│   ├── stress-check.js           # 长时间运行（默认 8 小时整班次：存活/堆/DOM/跨班次观测）
+│   ├── stress-check.js           # 长跑稳定性（默认 2 分钟回归冒烟；--soak/--hours 8：存活/堆/DOM/跨班次观测）
 │   ├── screenshot-diff.js        # 界面视觉回归比对（阈值与规则见基准图目录 README）
 │   ├── capture-baseline.js       # 基准图确定性捕获（固定时间+种子随机+冻结定时器）
 │   ├── trace-check.js            # 需求追溯（条款 → 承接证据，强制每条条款有归属）

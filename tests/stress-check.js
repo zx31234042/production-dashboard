@@ -7,7 +7,7 @@
          S4 整班次业务面：跨班次时 班次名/统计/曲线/待补传队列如何变化（**需 --hours 8**）
          S5 周期性负载：8 个页面轮一遍 + 两次断连/恢复（第 1 轮必跑，其后每小时一次）
    运行（**默认＝有限时长**，够门禁在一轮里跑完；整夜浸泡改为显式参数）：
-         node tests/stress-check.js                                   # 默认 5 分钟、预期 3 个采样点
+         node tests/stress-check.js                                   # 默认 2 分钟、预期 3 个采样点
          node tests/stress-check.js --soak                            # 整班次浸泡（＝ --hours 8）
          node tests/stress-check.js --hours 8                         # 显式浸泡小时数
          node tests/stress-check.js --minutes 2 --interval-min 0.5    # 快速自检（机制验证用，非门禁）
@@ -55,12 +55,20 @@ const PAGE = pathToFileURL(path.join(ROOT, 'index.html')).href;
 const OUT = path.join(ROOT, 'tests', '._verify');
 
 /** 默认时长（分钟）：**有限时长**，门禁一轮跑得完；整夜浸泡走 `--soak` / `--hours 8`。
- * **为什么是 5 分钟**（2026-09-28 负责人裁定）：全量门禁的墙钟 **93% 耗在本脚本**（实测 1201.6 s／全轮约 1290 s），
- * 而真正需要长跑的那 3 条判据**本来就只有 `--hours 8` 才生效**（默认下如实计跳过）⇒ 缩短默认只损失"更长的趋势观察"，
- * 换来全量门禁 **21.5 min → 约 7.6 min（实测墙钟 **453.3 s** ＝ 5 分钟长跑 ＋ 其余约 2.6 min）**；默认间隔同比缩到 2 分钟 ⇒ **采样点数仍为 3**（与原先等价）。 */
-const DEFAULT_MINUTES = 5;
-/** 默认采样间隔（分钟）：与 `DEFAULT_MINUTES` 配套 ⇒ `floor(5/2)+1 = 3` 个采样点（原 20/10 同为 3 点，语义等价） */
-const DEFAULT_INTERVAL_MIN = 2;
+ * **为什么是 2 分钟**（2026-09-29 负责人追问"能不能再缩"，主代理实测后定）：
+ *   ①本脚本是**全量墙钟的地板** —— 并行模式下全轮 335 s 里它独占 301.7 s（约 90%），
+ *     串行模式 453 s 里占 67%；不缩它就只能在"并行重叠"上再挖（已被 `--jobs` 用掉）。
+ *   ②**判据结构决定它不该按分钟计价值**：11 条断言全是"**首点 vs 末点**"比较（堆增长、DOM 增长、
+ *     时钟推进、标签数恒定、面板独占），**没有"窗口越长越强"的判据**；3 条真正需要长跑的判据
+ *     本来就只有 `--hours 8` 才生效（默认下如实计跳过）。
+ *   ③所以取"**减半时长、同步减半间隔**"：5min/2min → **2min/1min** ⇒ **采样点数仍为 3**，
+ *     窗口 5 min → 2 min，单轮省 **约 180 s**。**这不是削减覆盖，是保持采样密度而缩短窗口**。
+ *   ④口径边界（不许含糊）：本脚本默认档是**回归冒烟**；`NFR-05` 的 72 h 与 `AC-07` 的 ≥7 天
+ *     **一律靠 `--soak` / `--hours 8` 单独跑**，与默认档无关（8 h 也不等于 7 天，见 trace-check 第六节）。 */
+const DEFAULT_MINUTES = 2;
+/** 默认采样间隔（分钟）：与 `DEFAULT_MINUTES` 配套 ⇒ `floor(2/1)+1 = 3` 个采样点
+ * （20/10 与 5/2 同为 3 点 ⇒ 三代默认档的**采样点数一致**，只有窗口长度不同）。 */
+const DEFAULT_INTERVAL_MIN = 1;
 /* ⚠ 这一行必须保留 `DSH_STRESS_HOURS || 8` 的字面形态：tests\trace-check.js 的 AC-07 断言
    用正则 `DSH_STRESS_HOURS\s*\|\|\s*(\d+)` 从本文件取"浸泡默认时长"，据此判"8 h 不构成 7 天证据"。
    同时它也是本脚本的浸泡预设（`--soak` ≡ `--hours 8`）。 */
@@ -85,11 +93,11 @@ const EDGE_CANDIDATES = [
 
 const USAGE = [
   '用法：node tests/stress-check.js [选项]',
-  '  （无选项）                     默认 5 分钟、预期 3 个采样点（门禁用有限时长；整班次浸泡走 --soak）',
+  '  （无选项）                     默认 2 分钟、预期 3 个采样点（门禁用有限时长；整班次浸泡走 --soak）',
   '  --soak                        整班次浸泡（＝ --hours 8）',
   '  --hours <N>                   浸泡 N 小时（如 --hours 8）',
   '  --minutes <N>                 只跑 N 分钟（快速自检用；与 --hours/--soak 互斥）',
-  '  --interval-min <N>            采样间隔（分钟，可为小数；缺省 2 —— 与默认 5 分钟配成 3 个采样点）',
+  '  --interval-min <N>            采样间隔（分钟，可为小数；缺省 1 —— 与默认 2 分钟配成 3 个采样点）',
   '  --help                        打印本用法',
   '环境变量：DSH_STRESS_HOURS / DSH_STRESS_INTERVAL_MIN / DSH_STRESS_SIZE / DSH_STRESS_EDGE（CLI 优先）',
   '判据：计划类 2 条 + 通用 8 条 + 长跑专属 3 条（默认时长下如实计入"跳过"）+ 自洽 1 条',
