@@ -194,8 +194,10 @@ const FORBIDDEN_COLUMNS = {
  *        的补列义务"，请在同一行写清理由与被放弃的版本号。
  *   · 列名一律逐列手写（顺序与 `schema.sql` 一致，便于肉眼对账）。写错列名**不会**静默放过：
  *     漏写一列 ⇒ 正方向报"该列缺步骤"；多写/写错 ⇒ "基线列 ⊆ `schema.sql` 列"报陈旧行。
- *   · 本仓当前实例：`op_log` **无** `team_code`、`measure_rt` **无** `unit_index` —— 这两列正是
- *     `STRUCTURE_UPGRADES` 两条 `ADD COLUMN`（先例 DR-12 / DR-04·C-111）的交付物，故不在基线里。 */
+ *   · 本仓当前实例：`op_log` **无** `team_code`、`measure_rt` **无** `unit_index`、`upload_log` **无**
+ *     `fail_reason`/`updated_at` —— 这四列正是
+ *     `STRUCTURE_UPGRADES` 四条 `ADD COLUMN` 的交付物（先例 DR-12 / DR-04·C-111 / `E73` 的历史遗漏补齐），
+ *     故都不在基线里。 */
 const LEGACY_BASELINE_COLUMNS = {
   schema_meta: ['key', 'value', 'updated_at'],
   device: ['equip_code', 'equip_name', 'model', 'location', 'upper_host', 'upper_port',
@@ -229,8 +231,13 @@ const LEGACY_BASELINE_COLUMNS = {
     'next_due_at', 'created_at'],
   notice: ['id', 'category', 'sub_type', 'content', 'valid_from', 'valid_to', 'priority',
     'created_by', 'created_at', 'updated_at'],
+  /* E73（历史遗漏的补齐，规范 v1.35 · 9.5 第 6 条增补③）：`fail_reason`/`updated_at` 是 2026-09-21
+     给**已存在**的 `upload_log` 加的列，却从没有过迁移步骤 —— 它们曾躺在这份基线里，于是本门禁
+     对"老库拿不到这两列"**天然失明**（V2 老库实测：升级报成功，`enqueueFailed()` 抛
+     `table upload_log has no column named fail_reason`）。现已按"同批"补上 `STRUCTURE_UPGRADES`
+     的两条 `ADD COLUMN` 并从本行移除 ⇒ 故意不列在这里（列在这里＝本门禁对"删掉那两条 ALTER"再次失明）。 */
   upload_log: ['id', 'upload_id', 'interface', 'request_body', 'response_code', 'response_body',
-    'elapsed_ms', 'retry_count', 'state', 'created_at', 'fail_reason', 'updated_at'],
+    'elapsed_ms', 'retry_count', 'state', 'created_at'],
   /* DR-12（V1.33 第二批）：老库（V1.33 之前的库）**没有** `team_code`，同样由
      `STRUCTURE_UPGRADES` 的 `ALTER TABLE op_log ADD COLUMN team_code TEXT` 交付 ⇒ 不列在这里。 */
   op_log: ['id', 'op_time', 'operator', 'op_type', 'content', 'result', 'created_at'],

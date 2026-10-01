@@ -75,7 +75,27 @@ const STRUCTURE_UPGRADES = [
      ② 重复执行时报 `duplicate column name` 被下面的容错吞掉，天然幂等；
      ③ **不得**顺带改 `measure_rt` 的唯一索引 `ux_measure_rt`（DR-13 的幂等键列集固定为
         equip_code + proc_order_no + collect_time，与本题无关，动它等于换去重口径）。 */
-  'ALTER TABLE measure_rt ADD COLUMN unit_index INTEGER'
+  'ALTER TABLE measure_rt ADD COLUMN unit_index INTEGER',
+  /* E73（**历史遗漏的补齐**，规范 v1.35 · 9.5 第 6 条增补③）：`upload_log` 的 `fail_reason` 与
+     `updated_at` 是 2026-09-21（`349feba`）给**已存在**的表加的两列 —— 当时既没有 `STRUCTURE_UPGRADES`
+     这一层，也没有任何 `ALTER TABLE` 补列动作（当时的自述是"运行时不再有 `ALTER TABLE` 补列，
+     由结构版本判据**显式迁移或重建**"，但那半句"显式迁移"**从未落地**），于是：
+       · 新建库由下方 `schema.sql` 的 `CREATE TABLE` 天然带这两列；
+       · **V2 老库**（`schema_version='2'`）升级时 `CREATE TABLE IF NOT EXISTS` 是**空操作**，
+         两列永远不会出现 —— 而 `repo/uploadQueue.js` 的 `enqueueFailed()` 的 INSERT 显式引用它们
+         ⇒ 实测抛 `table upload_log has no column named fail_reason`（升级却报"成功"：版本 6、指纹一致、
+         `verifySchemaConsistency()` 返回 `ok:true`，见 `tests\._verify\zz6d-e73-probe.js`）。
+     ① 列名/类型以 `schema.sql` 的 `upload_log` 段为**正本**（`:246-247`）：`fail_reason TEXT`、
+        `updated_at TEXT`，本处顺序与那两列的相邻关系一致；
+     ② 两列**可空**（`schema.sql` 就是可空）⇒ 既有行天然合法、**无需数据回填**，
+        "老库既有行"的两个新列诚实地是 NULL；
+     ③ 重复执行时报 `duplicate column name`，被下面的容错吞掉 —— 天然幂等；
+     ④ **本包不改 `schema.sql`**，故按 9.5 第 6 条**不升** `SCHEMA_VERSION`：指纹由 `schema.sql` 正文算出，
+        正文没动 ⇒ 指纹不变 ⇒ `verifySchemaConsistency()` 的"正文变了却没升版"判据不受影响；
+        而 `initSchema()` 是**无条件**逐条执行本清单的（见其注释与实现），所以"老库补列"这件事
+        不依赖版本号变化也能落地。 */
+  'ALTER TABLE upload_log ADD COLUMN fail_reason TEXT',
+  'ALTER TABLE upload_log ADD COLUMN updated_at TEXT'
 ];
 
 /**
