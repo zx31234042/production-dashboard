@@ -3951,7 +3951,7 @@ t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTota
     {
       const rmRes = runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev);
       t.check('权威数字校验/E77：漏列点名的变异**真的生效**（锚点命中恰 1 次、回读确认点名已消失），' +
-        '且判红钉在**漏列**那一支（`kind=broken`：`notListed=[platform-check]`）而不是"数字漂移"（`mismatch`）',
+        '且判红钉在**漏列**那一支（`kind=broken`：`missingGates=[platform-check]`）而不是"数字漂移"（`mismatch`）',
         rmLines.hits === 1 && rmLines.removed === true && rmRes.ok === false &&
         rmRes.kind === 'broken' && /漏列离线门禁/.test(rmRes.detail) && /platform-check/.test(rmRes.detail),
         `锚点命中 ${rmLines.hits} 次（须恰 1 次）、回读点名已消失=${rmLines.removed}；` +
@@ -4817,13 +4817,194 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
   } catch { /* 忽略 */ }
 }
 
+/* ---------------- 十六、脚本入口形态（`E78`：`main()` 的异常必须被接住、并按 9.5-5 退 2） ----------------
+   立案（`E78`，2026-10-01 座位 5 普查后登记）：`E76①` 的靶子形态是"`async` 的 `main()` ＋ 顶层同步
+   `try`/`catch`" —— promise 一旦 reject，顶层 try/catch **接不住**，进程以"未处理 rejection"收场：
+   **无汇总行 ＋ 退 1**；而 9.5-5 的退出码契约要求"脚本自身异常"退 **2**。`E76①` 已修好 3 个脚本，
+   当时**没有任何门禁守这个形态** ⇒ 新写脚本（或改回旧写法）时缺陷会静默回潮 —— 退 1 与"有断言失败"
+   在 `run-all` 台账上**逐字同形**（见 `lib/assert.js` 末注），正是 `E76` 的起点。
+   本节把"入口接线"变成静态判据：
+     A 凡含 `main()` 声明的文件：**async** ⇒ 必须有 `main().catch(`（`.catch` 挂在 promise 上），
+       且其异常路径退 2（`process.exit(2)` 或 `process.exitCode = 2`）；**sync** ⇒ 必须有顶层
+       `try`/`catch`（或 `.catch`）且异常路径退 2；
+     B **禁止形态**：对 async 的 `main` 用顶层同步 try 收尾 —— 这就是 `E76①` 的靶子；
+     C **防空洞**（`D23`）：判据必须**指名**违规文件与形态（不许只报"有 1 个不合规"），
+       且扫描器要认得出本仓真实写法（普查：`async function main(` 12 处／`function main(` 4 处，
+       另有 `server\index.js` 的 `async function main(options = {})`；一并兼容 `main = async` 形式）
+       —— 只认一种写法等于给别的写法开后门；并配 `D22` 定点变异（§16-C／§16-D）＋ 负对照（§16-E）。
+   范围：`tests\*.js`（直下入口脚本）＋ `tests\lib\*.js` ＋ `server\index.js`（同为 `main()` 入口，
+   与 `E78` 的普查口径一致：17 个）。`tests\._verify\` 下的历史副本/探针**不在范围** —— 那里存着
+   旧写法的字节副本（`zz4b2-*`／`w4\bak\*` 等），纳入只会制造假红，与 `files-check` 的
+   `SKIP_DIRS` 是同一处理。 */
+{
+  /* 声明识别：取**最早**一处 `main` 声明 —— 注释/字符串里提到另一种写法时不至于误判
+     （本文件下方就有 `async function main(` 的样例字符串，取最早即第 55 行的真声明）。
+     并要求声明后面**紧跟函数体**（`(`…`)` 之后是 `{`）：否则 `lib/assert.js` 末注里那句
+     "`function main()`（同步）的脚本…"会被当成声明（实测过，必须防）。 */
+  const detectMainDecl = src => {
+    const cands = [];
+    const bodyFn = /function\s+main\s*\([^)]*\)\s*\{/g;
+    const assign = /(?:^|\n)[ \t]*(?:const|let|var)?[ \t]*main[ \t]*=[ \t]*(async\b|function\b|\([^)]*\)[ \t]*=>)/g;
+    let m;
+    while ((m = bodyFn.exec(src))) {
+      const isAsync = /async\s*$/.test(src.slice(Math.max(0, m.index - 16), m.index));
+      cands.push({ idx: m.index, kind: isAsync ? 'async' : 'sync',
+        form: isAsync ? '`async function main()`' : '`function main()`' });
+    }
+    while ((m = assign.exec(src))) {
+      const isAsync = m[1] === 'async';
+      cands.push({ idx: m.index, kind: isAsync ? 'async' : 'sync',
+        form: isAsync ? '`main = async`' : '`main = function`' });
+    }
+    if (!cands.length) return null;
+    cands.sort((a, b) => a.idx - b.idx);
+    return cands[0];
+  };
+
+  const MAIN_CATCH = /main\(\)\s*\.\s*catch\s*\(/;                        /* 推荐接法：.catch 挂在 promise 上 */
+  const TOP_TRY_MAIN = /try\s*\{\s*main\s*\(\s*\)\s*;?\s*\}\s*catch/;    /* 靶子形态（对 async 无效） */
+  const EXIT2 = /process\.exit\(\s*2\s*\)|process\.exitCode\s*=\s*2/;
+
+  /** 取**最后**一处匹配：入口调用按约定在文件尾部（本仓 17 处，尾部都在 700 字符内） */
+  const lastMatch = (re, src) => {
+    const g = new RegExp(re.source, 'g');
+    let m, last = null;
+    while ((m = g.exec(src))) last = m;
+    return last;
+  };
+
+  /** 审计一批源码（纯函数，便于下方 D22 定点变异）：返回 { counts, offenders } */
+  const auditEntryShape = sources => {
+    const counts = { total: 0, async: 0, sync: 0 };
+    const offenders = [];
+    for (const { name, src } of sources) {
+      const decl = detectMainDecl(src);
+      if (!decl) continue;
+      counts.total++;
+      counts[decl.kind]++;
+      const catchM = lastMatch(MAIN_CATCH, src);
+      const tryM = TOP_TRY_MAIN.exec(src);
+      const tailOf = m => (m ? src.slice(m.index) : '');
+      if (decl.kind === 'async') {
+        if (!catchM) {
+          offenders.push(`${name}（${decl.form}）：没有 \`main().catch(\` ⇒ rejection 无人接住（9.5-5 要求退 2）`);
+        } else if (src.length - catchM.index > 1500) {
+          offenders.push(`${name}（${decl.form}）：\`main().catch(\` 不在文件尾部（其后还有 ${src.length - catchM.index} 字符）—— 入口接线看不出在哪里收尾`);
+        } else if (!EXIT2.test(tailOf(catchM))) {
+          offenders.push(`${name}（${decl.form} ＋ \`.catch\`）：异常路径**没退 2** —— 应含 process.exit(2) 或 process.exitCode = 2`);
+        }
+        if (tryM) {
+          offenders.push(`${name}（${decl.form}）：用了顶层同步 try 包 \`main()\` 的**靶子写法** ⇒ 对 async 无效，rejection 会落成"无汇总行 ＋ 退 1"（E76① 的原形态）`);
+        }
+      } else if (tryM) {
+        if (!EXIT2.test(tailOf(tryM))) {
+          offenders.push(`${name}（${decl.form}）：顶层 \`try\`/\`catch\` 的异常路径**没退 2**（缺 process.exit(2)／process.exitCode = 2）`);
+        }
+      } else if (catchM) {
+        if (!EXIT2.test(tailOf(catchM))) {
+          offenders.push(`${name}（${decl.form}）：\`.catch\` 的异常路径**没退 2**`);
+        }
+      } else {
+        offenders.push(`${name}（${decl.form}）：既没有顶层 \`try\`/\`catch\` 也没有 \`.catch\` ⇒ 异常无人接住（9.5-5 要求退 2）`);
+      }
+    }
+    return { counts, offenders };
+  };
+
+  /* 待审源码：`tests\` 直下 ＋ `tests\lib\` ＋ `server\index.js`（读不到就**报出来**，不静默少扫） */
+  const listJs = relDir => fs.readdirSync(path.join(env.paths.root, relDir))
+    .filter(n => n.endsWith('.js')).map(n => `${relDir}/${n}`);
+  const entrySources = [];
+  for (const rel of [...listJs('tests'), ...listJs('tests/lib'), 'server/index.js']) {
+    try {
+      entrySources.push({ name: rel.split('/').join('\\'), src: fs.readFileSync(path.join(env.paths.root, rel), 'utf8') });
+    } catch (err) { t.info(`§16 读不到 ${rel}：${err.message}`); }
+  }
+
+  const real = auditEntryShape(entrySources);
+  /* 普查地板（`D23` 防空洞）：低于地板说明**扫描器/范围**坏了，不是"脚本变好了"；
+     数字真的变了（新增/删除入口脚本）就**连同本节地板一起改**，别让判据变成恒真。 */
+  const FLOOR = { total: 17, async: 13, sync: 4 };
+  t.info(`§16 入口形态普查：${real.counts.total} 个含 \`main()\` 的入口（async ${real.counts.async}／sync ${real.counts.sync}／缺陷形态 ${real.offenders.length}）`);
+  t.check('§16-A 静态：含 `main()` 的入口形态全部合规（async ⇒ `main().catch(` ＋ 退 2；sync ⇒ `try`/`catch` ＋ 退 2；禁止对 async 用顶层同步 try 包 `main()`）',
+    real.offenders.length === 0 && real.counts.total >= FLOOR.total
+      && real.counts.async >= FLOOR.async && real.counts.sync >= FLOOR.sync,
+    real.offenders.length
+      ? `违规 ${real.offenders.length} 处（逐条指名文件与形态）：${real.offenders.join('；')}`
+      : `普查 ${real.counts.total} 个（async ${real.counts.async}／sync ${real.counts.sync}），形态全部合规`
+        + `；地板 total/async/sync ≥ ${FLOOR.total}/${FLOOR.async}/${FLOOR.sync}（低于地板即判红：那是扫描器坏了，不是脚本变好了）`);
+
+  t.check('§16-B 扫描器自证：`async function main`／`function main`／`main = async` 三种真实写法都被识别，注释里的 `function main()`（无函数体）与不含 `main` 的源码都不计入',
+    (() => {
+      const a = detectMainDecl('async function main() {\n}\n');
+      const b = detectMainDecl('function main() {\n}\n');
+      const c = detectMainDecl('const main = async () => {\n};\n');
+      const d = detectMainDecl('const x = 1;\nfoo();\n');
+      const e = detectMainDecl('· `function main()`（同步）的脚本 ⇒ 顶层 `try`/`catch` ＋ 退 **2**\n');
+      return !!a && a.kind === 'async' && !!b && b.kind === 'sync' && !!c && c.kind === 'async'
+        && d === null && e === null;
+    })(),
+    '期望：async／sync／async／null／null —— 少一种识别能力就等于给那种写法开后门（`E78` 的判据必须认得出本仓真实形态）');
+
+  /* 变异靶子：`db-check.js`（`E76①` 三个受害脚本之一）。锚点用**正则**而非写死行号/片段，
+     文件长大也不失效；锚点未命中一律按**失败**处理（不许把"跑不了"当通过）。 */
+  let dbSrc = '';
+  try { dbSrc = fs.readFileSync(path.join(env.paths.tests, 'db-check.js'), 'utf8'); }
+  catch (err) { t.info('§16 读不到 db-check.js（D22 靶子）：' + err.message); }
+  const dbName = 'tests\\db-check.js';
+  /* 靶子形态用**拼接**构造：本节的 forbidden/明细判据都是**文本**判据，若在源码里原样写出
+     `try {` 紧跟 `main()`，本文件自己就会被自己命中（文本判据的经典自伤）。 */
+  const TARGET_FORM = 'try {' + '\n  main();\n} catch (err) {\n  console.error(String(err && err.stack ? err.stack : err));\n  process.exit(2);\n}\n';
+
+  t.check('§16-C D22 变异①：把 `db-check.js` 尾部换回顶层同步 try 包 `main()` 的靶子写法 ⇒ §16-A 判据必红并**指名** db-check（这正是 E76① 的原形态）',
+    (() => {
+      const anchor = lastMatch(MAIN_CATCH, dbSrc);
+      if (!anchor) { t.info('§16-C 锚点未命中：`db-check.js` 里找不到 `main().catch(`（文件被改过？）'); return false; }
+      const mutated = dbSrc.slice(0, anchor.index) + TARGET_FORM;
+      const res = auditEntryShape([{ name: dbName, src: mutated }]);
+      const allNamed = res.offenders.length > 0 && res.offenders.every(o => o.startsWith(dbName));
+      const bothForms = res.offenders.some(o => o.includes('靶子写法')) && res.offenders.some(o => o.includes('rejection 无人接住'));
+      return allNamed && bothForms;
+    })(),
+    `变异内容：删掉 \`${dbName}\` 的 \`main().catch(…)\` 收尾，换成顶层同步 try 包 \`main()\`（catch 里仍退 2）`
+      + ' —— 判红必须**指名文件与形态**，而不是只报"有 1 个不合规"');
+
+  t.check('§16-D D22 变异②：把 `db-check.js` 异常路径的 `process.exit(2)` 改成 `process.exit(1)` ⇒ §16-A 判据必红并**指名**退错码',
+    (() => {
+      const anchor = lastMatch(MAIN_CATCH, dbSrc);
+      if (!anchor) { t.info('§16-D 锚点未命中：`db-check.js` 里找不到 `main().catch(`'); return false; }
+      const tail = dbSrc.slice(anchor.index);
+      if (!tail.includes('process.exit(2)')) { t.info('§16-D 锚点未命中：`main().catch` 之后的收尾里没有 `process.exit(2)`'); return false; }
+      const mutated = dbSrc.slice(0, anchor.index) + tail.replace('process.exit(2)', 'process.exit(1)');
+      const res = auditEntryShape([{ name: dbName, src: mutated }]);
+      return res.offenders.length === 1 && res.offenders[0].startsWith(dbName) && res.offenders[0].includes('没退 2');
+    })(),
+    `变异内容：\`${dbName}\` 的 \`main().catch\` 收尾由 \`process.exit(2)\` 改成 \`process.exit(1)\``
+      + '（退 1 在 run-all 账上与"有断言失败"逐字同形，故必须退 2）');
+
+  /* 合成样本（只用于扫描器自证/负对照，不落地）。`try {` 与 `main()` 之间**必须**用拼接断开：
+     理由同上——否则本文件自己的源码就命中自己的 forbidden 正则。 */
+  const SAMPLE_ASYNC_OK = 'async function main() { done(); }\n\nmain().catch(err => {\n  console.error(String(err));\n  process.exit(2);\n});\n';
+  const SAMPLE_SYNC_OK = 'function main() { done(); }\n' + 'try {' + '\n  main();\n} catch (err) {\n  console.error(String(err));\n  process.exit(2);\n}\n';
+  t.check('§16-E 负对照：合规的 async／sync 入口样本都**不被**误报（防"把一切都判红"的假红式断言）',
+    (() => {
+      const a = auditEntryShape([{ name: '（合成 async 合规样本）', src: SAMPLE_ASYNC_OK }]);
+      const s = auditEntryShape([{ name: '（合成 sync 合规样本）', src: SAMPLE_SYNC_OK }]);
+      return a.offenders.length === 0 && s.offenders.length === 0 && a.counts.async === 1 && s.counts.sync === 1;
+    })(),
+    '合规样本：async ⇒ `main().catch(…退 2)`；sync ⇒ 顶层 `try`/`catch` ＋ 退 2 —— 两者都必须判绿（否则"判红"只是把一切都判红，那种断言没有证据力）');
+}
+
 t.finish();
 }
 
 /* 先例写法（同 browser-check.js:828、contract-check.js:1624、docs-check.js:547 …）：
-   `main()` 是 **async** ⇒ 它的 rejection **不会**被"顶层 try/catch"接住（E76① 实测：表现为
-   "无汇总行 ＋ 退 1"，`run-all` 于是把它记成"没有断言失败"而不是"跑不起来"）。用 `.catch()`
-   挂在 promise 上才接得住，并按规范 9.5-5 退 **2**（脚本自身异常），异常**打印出来**（可 grep）。 */
+   `main()` 是 **async** ⇒ 它的 rejection **不会**被"顶层 try/catch"接住。**E76① 的记账口径
+   （实测，勿沿用旧说法）**：这条路走成"无汇总行 ＋ 退 1" ⇒ `run-all.classify(1, null, out)`
+   ⇒ `status='failed'`、`detail='退出码 1'`，与"有断言失败"在 `run-all` 台账上**逐字同形**
+   （`unverified` 只对"**退 0** 且无汇总行／通过 0 项"成立）。故必须把 `.catch()` 挂在 promise 上
+   接住，并按规范 9.5-5 退 **2**（脚本自身异常），异常**打印出来**（可 grep）。
+   打印前缀现状见 `lib/assert.js` 末注：`[脚本异常]` 目前只有 E76 修的这 3 个脚本在用。 */
 main().catch(err => {
   console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
   process.exit(2);

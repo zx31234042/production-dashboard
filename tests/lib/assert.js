@@ -126,20 +126,40 @@ function createRunner(title, options = {}) {
   };
 }
 
-/* 注（**2026-09-30 更正，T-20260930-30 / E76①**）：`runMain(fn)`（带异常兜底的 main 包装，异常退 2）
-   已于 2026-09-19 删除，当时的理由是"12 个脚本各自在尾部写了 try/catch"（R-2026-09-19-02 的 P2-16：
-   "交付了却从未被验证"）。**那个理由对 `async main()` 不成立**：`try { main(); } catch` 只能接住
-   **同步**抛错，`main()` 返回的 promise 一旦 reject，顶层 try/catch **抓不到** ⇒ 由 Node 以
-   "未处理 rejection"结束进程，表现为"**无汇总行 ＋ 退 1**"，与"有断言失败"在观感与 `run-all`
-   记账上无法区分（`run-all` 把它记成"没有断言失败"而不是"跑不起来"）。
+/* 注（**2026-09-30 口径更正，T-20260930-31 ＋ T-20260930-32**）：`runMain(fn)`（带异常兜底的 main 包装，
+   异常退 2）已于 2026-09-19 删除，当时的理由是"12 个脚本各自在尾部写了 try/catch"
+   （R-2026-09-19-02 的 P2-16："交付了却从未被验证"）。**那个理由对 `async main()` 不成立**：
+   顶层 `try` 包 `main()` 只能接住 **同步**抛错，`main()` 返回的 promise 一旦 reject，
+   顶层 try/catch **抓不到** ⇒ 由 Node 以"未处理 rejection"结束进程，表现为"**无汇总行 ＋ 退 1**"。
+
+   **记账口径更正（座位 5 实测 ＋ 本包对真函数复算；旧注记此句是错的）**：旧注记写的是
+   "`run-all` 把它记成'没有断言失败'而不是'跑不起来'"（另一种写法是"记成 `error`／记成 `unverified`"）
+   —— **实测均不成立**：`run-all.classify(1, null, out)` ⇒ `status='failed'`、`detail='退出码 1'`
+   （输出连一个字节都没有时也照样 `failed`）；`unverified` **只**对"**退出码 0** 且（无汇总行／
+   通过 0 项）"成立（就是 `classify` 的 ⑤⑦ 两支，见 `run-all.js`）。
+   ⇒ **危害结论不变**：`E76①` 修前那种"rejection 静默退 1"与本文件里"**有断言失败**"在 `run-all`
+   台账上**逐字同形**（都是 `failed` ＋ `退出码 1`）—— 只是注记必须按实测写，不能照旧说法抄。
 
    **当前口径（各脚本自查，不用共享包装）**：
-     · `async main()` 的脚本 ⇒ 尾部 `main().catch(err => { console.error('[脚本异常] …'); process.exit(2) })`；
-     · `function main()`（同步）的脚本 ⇒ `try { main(); } catch (err) { … process.exit(2) }`
+     · `async main()` 的脚本 ⇒ 尾部把 `.catch()` 挂在 promise 上（异常**打印出来**），按 9.5-5 退 **2**；
+     · `function main()`（同步）的脚本 ⇒ 顶层 `try`/`catch` ＋ 退 **2**
        （见 `copy-check.js` / `trace-check.js` / `docs-cross-check.js` / `screenshot-diff.js`）。
    **曾漏掉的三个**（座位 5 于 2026-09-30 实测，报告 C·13.5）：`tests\db-check.js`、
-   `tests\harness-check.js`、`tests\preflight.js` —— 它们写了 `try { main() } catch` 而 `main()` 是
-   **async**，故"脚本自身异常"落成"退 1"。`E76` 已修（三处均收敛为上表先例写法）。
-   异常一律**打印出来**（可 grep 的前缀 `[脚本异常]`）—— 退出码 2 之外还要有可读的现场。 */
+   `tests\harness-check.js`、`tests\preflight.js` —— 它们写了顶层 `try` 包 `main()` 而 `main()` 是
+   **async**，故"脚本自身异常"落成"退 1"。`E76` 已修（三处均改为 `.catch()` 挂在 promise 上）。
+   形态回潮由 `harness-check` 第十六节（`E78`）静态守住（async ⇒ 必有 `.catch()` ＋ 退 2；
+   sync ⇒ `try`/`catch` ＋ 退 2；禁止对 async 用顶层 `try` 包 `main()`）。
+
+   **异常打印前缀的现状（2026-10-01 普查，勿按"当前口径"读）**：含 `main()` 的 **16** 个 `tests\*.js` 里，
+   **只有 E76 修的这 3 个**（`db-check`／`harness-check`／`preflight`）打 `[脚本异常]`；
+   **5** 个打 `自检脚本异常终止：`（`browser-check`／`contract-check`／`docs-check`／`tools-check`／`ui-check`）；
+   **7** 个打 `脚本异常终止：`（`capture-baseline`／`copy-check`／`docs-cross-check`／`overlap-check`／
+   `screenshot-diff`／`stress-check`／`trace-check`）；`run-all.js` 自己打 `runner 异常终止：`
+   （**不含** `脚本异常终止` 这几个字）。
+   **红线**：`tests\run-all.js` 的失败明细过滤**按字面 `脚本异常终止` 命中**
+   （该文件 `tail()` 里 `filter(l => /\[FAIL\]|失败清单|^\s+\d+\.|脚本异常终止/…)`）
+   ⇒ 任何前缀统一**不得丢掉"脚本异常终止"这几个字**（否则明细行会静默消失）。
+   "给其余脚本也加 `[脚本异常]`"属**可选**后续项（本包**未做**：要动 13 个文件的输出文案，
+   收益只是整齐；且必须同时保留 `脚本异常终止`）。 */
 
 module.exports = { createRunner };

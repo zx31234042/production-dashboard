@@ -606,9 +606,15 @@ function verifyAuthorityTotals(agg, results, opts = {}) {
      集合口径同前（E50）：对全量判定，不用 `!needBrowser` 子集。 */
   const named = [...new Set([...line.matchAll(/`([a-z0-9-]+)`/g)].map(m => m[1])
     .filter(n => n.endsWith('-check') || n === 'screenshot-diff'))];
-  const notListed = authorityAll.filter(n => !named.includes(n));
-  if (notListed.length) {
-    return { ok: false, kind: 'broken', detail: `权威区漏列离线门禁：${notListed.join('、')}` };
+  /* 命名提醒（2026-10-01 由 `notListed` 改名，T-20260930-32）：这个局部量落到 `kind='broken'`，
+     而 **`broken` 被三因共用** —— 读不到 `tests\README.md`（本函数开头那处）、权威行里找不到
+     "合计 N 通过"（紧随其后那处）、以及**这里**"漏列点名" —— 三者返回的 `kind` 完全一样，
+     消费方只能靠 `detail` 区分（前者带 `读不到`、次者带 `找不到"合计 N 通过"`、本处带 `漏列离线门禁`）。
+     ⇒ 写断言请用 `kind === 'broken'` ＋ detail 正则，**不要**按字面写 `kind === 'notListed'`
+     （那会恒假：`notListed` 从来只是一个局部变量名，不是 `kind` 取值）。 */
+  const missingGates = authorityAll.filter(n => !named.includes(n));
+  if (missingGates.length) {
+    return { ok: false, kind: 'broken', detail: `权威区漏列离线门禁：${missingGates.join('、')}` };
   }
   return { ok: true, kind: 'ok', detail: `权威区合计 ${stated} ＝ 本轮实跑 ${agg.passed}${allowanceNote}` };
 }
