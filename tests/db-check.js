@@ -25,10 +25,28 @@
         『老库形态缺、新库形态有』的列必须在 `STRUCTURE_UPGRADES` 里有对应 `ADD COLUMN` 步骤
         （反方向：不许给 `schema.sql` 里不存在的列补列），判据只读源码 ＋ 手写的老库基线
         `LEGACY_BASELINE_COLUMNS`，**不建库、不跑 `initSchema()`**（故"没有老库"也能红）。
+        2026-10-01（T-20260930-28，座位 4b）再加一节（**六之十**）：
+        **技术债 `E74` 的门禁侧** —— 把 `STRUCTURE_UPGRADES` 的**步骤形态白名单**从"探针级证据"
+        升级为**门禁级可证伪断言**（座位 6 的 `T-20260930-27` 已把判据实现并导出，但门禁断言归本节）：
+        ①**清单全过** —— `STRUCTURE_UPGRADES` 每一条步骤都被 `classifyUpgradeStep()` 接受
+        （条数在运行期读出并打印；"以后有人往清单里加违规步骤"由它兜底）；
+        ②**真值表** —— 对 `classifyUpgradeStep()` / `assertUpgradeStepShape()` 逐条断言语义，
+        **期望值构成性给出（D21）**：接受样例由清单里**真实存在的步骤**变换而来（改大小写／加空白／
+        换标识符引号／加 `UNIQUE`／加结尾分号），拒绝样例的期望＝`unsupported` ＋ **必抛错** ＋
+        消息含**步骤原文**、**全部允许形态**、**重建迁移函数的真名**（都由输入或模块导出算出）；
+        ③**守门被接线（静态）** —— 调用点确实在步骤循环体内、在 `db.exec(step)` **之前**、且**不在**
+        容忍 `duplicate column name|already exists` 的 `try` 块内（比源码字符下标，**先去注释** ——
+        本文件注释里就写着 `db.exec(step)` 与 `assertUpgradeStepShape()`）。
+        配 **D22 九组**定点变异（`tests\._verify\zz4b7-d22-mutation.js`；9 条断言**每条**都有靶子）：
+        **实现侧 7 组** —— M-A 删调用点／M-C 挪进容忍 `try`／M-D 挪到 `db.exec` 之后／M-E 判据改成不抛／
+        M-I 容忍 catch 改成全吞／M-B 往清单追加违规步骤／M-F 往白名单塞同 kind 的重复形态；
+        **门禁本体 2 组**（对**本文件**做自变异，验子判据非空洞）—— M-G 去注释扫描器连行尾 `\r` 一起抹
+        （开发期真踩到过）／M-H 删掉真值表里"空串"那一类拒绝样例。
    依据：DR-03 / DR-04 / DR-12 / DR-13 / DR-14 / DR-15 / DR-16 / DR-18 / DR-19、
         FR-3.19、IF-B.5（需求 V1.33）；ADR-0003（一用例一库）、ADR-0007（鉴权形态）、
-        ADR-0006（改 schema 必须同步升版本）、ADR-0004 D22/D23（防回潮须可证伪／静态防空洞）、
-        规范 9.5 第 6 条（数据结构变更约束，v1.34）、技术债 E18 / E44 / E71。
+        ADR-0006（改 schema 必须同步升版本）、ADR-0004 D19/D21/D22/D23（断言即证据／期望值构成性／
+        防回潮须可证伪／静态防空洞）、规范 9.5 第 6 条（数据结构变更约束，v1.34）与 9.5-5
+        「门禁机制必须可达」（判据抽成纯函数 ＋ 调用顺序静态断言）、技术债 E18 / E44 / E71 / **E74**。
    句柄约定：全程使用 `handle.db`；需要换连接时**必须**用 `handle.adopt()`，
              否则夹具自建连接不被跟踪 → Windows 上临时目录删不掉（曾实际踩到）。
    运行：node tests/db-check.js
@@ -1274,6 +1292,383 @@ async function main() {
         ? `两处都声明：${baselineConflicts.map(s => `${s.table}.${s.col}`).join('、')}` +
           '（若确需给更老的库补列，请从 LEGACY_BASELINE_COLUMNS 里删掉该列，而不是删掉步骤）'
         : `${addColumnSteps.length} 条补列步骤与基线无重叠`);
+  }
+
+/* ---------------- 六之十、`STRUCTURE_UPGRADES` 步骤形态白名单（E74）的**门禁级**断言 ----------------
+   立案：技术债 `E74`（`STRUCTURE_UPGRADES` 对"改列类型／删列"不够用、且失败方式**静默**；由座位 5 在
+   `T-20260930-24` 的 C·12.6③ 提出并实测出"静默三连"）。座位 6 在 `T-20260930-27` 把判据**实现并导出**
+   （`UPGRADE_STEP_FORMS` / `classifyUpgradeStep()` / `assertUpgradeStepShape()`），判定点落在
+   `initSchema()` 的步骤循环里、`db.exec(step)` **之前**、且**在**容忍 `duplicate column name|already exists`
+   的那个 `try` **之外**。本节把那套判据从"探针级证据"升级为**门禁级可证伪断言**（三条）：
+     ① 清单全过 —— `STRUCTURE_UPGRADES` 里**每一条**步骤都被 `classifyUpgradeStep()` 接受。
+        **条数在运行期读出并打印**（不写死 —— D21）；条件是"条数 > 0 且 0 条被拒 且 kind/form 自洽"
+        （`>0` 是**非空转**要求：清单空了这条不许假绿，D23）。
+     ② 真值表 —— 对 `classifyUpgradeStep()` / `assertUpgradeStepShape()` 逐条断言语义。
+        **期望值构成性给出（D21）**：接受样例一律由**清单里真实存在的步骤**变换而来（`swapCase`／
+        `toLowerCase`／`toUpperCase`／空白加宽／首尾空白／`;`／标识符引号／`CREATE UNIQUE`），
+        **期望 kind 与源步骤相同**（不手抄魔数）；拒绝样例的期望＝`ok:false` ＋ `kind:'unsupported'`
+        ＋ `form:null` ＋ 非空 `reason` ＋ `assertUpgradeStepShape()` **必抛**，且抛错消息必须含
+        **步骤原文**（由输入算出）、**全部允许形态**（由 `UPGRADE_STEP_FORMS` 算出）、
+        **重建迁移函数的真名**（由模块导出里 `migrate*` 那个名字算出）。多语句夹带那两条另配
+        **反事实对照**：把夹带部分去掉后的前缀**必须被接受** ⇒ 证明"被拒"是因为夹带，不是因为前缀。
+     ③ 守门被接线（**静态**）—— 调用点确实在步骤循环体内、在 `db.exec(step)` **之前**、且**不在**
+        容忍 `duplicate column` 的 `try` 块内。做法仿 9.5-5「门禁机制必须可达」的先例
+        （`tests\harness-check.js` 第十节之二：比较源码字符下标），但**本文件必须先去注释** ——
+        `server\db\index.js` 的注释里就写着 `db.exec(step)`（docblock）与 `assertUpgradeStepShape()`
+        （清单 docblock），不去注释就会把注释里的字样当成"调用点"（"删了却还是绿"）。
+   可证伪性（D22，靶子见 `tests\._verify\zz4b7-d22-mutation.js`，**九组** —— 9 条断言每条都有靶子）：
+     M-A 删掉判定点那一行 ⇒ ③①②③三条接线断言必红（含"调用点唯一"）；
+     M-C 把判定点挪进容忍 `duplicate column` 的 `try` 内 ⇒ ③③ 必红；
+     M-D 把判定点挪到 `db.exec(step)` **之后** ⇒ ③② 必红；
+     M-E 把 `assertUpgradeStepShape()` 改成不抛（直接返回分类结果）⇒ ② 的**拒绝项**必红；
+     M-I 把容忍 catch 改成"全吞"（删掉重抛那一支）⇒ ③④ 必红；
+     M-F 往白名单塞一条**同 kind 的重复形态** ⇒ ① 与 ② 的**接受项**必红（汇总级）；
+     M-G（对**本文件**自变异）去注释扫描器连行尾 `\r` 一起抹 ⇒ ③⓪ 必红；
+     M-H（对**本文件**自变异）删掉真值表里"空串"那一类拒绝样例 ⇒ ② 的**覆盖**必红。
+     **M-B 的如实登记**：往清单末尾追加一条违规步骤（`ALTER TABLE upload_log DROP COLUMN fail_reason`）时，
+     `db-check` 在**第一节** `:347` 的 `initSchema()` 就当场抛错中止（**无汇总行**、退 1、栈帧指向 `main`）
+     ⇒ **走不到**六之十，① 拿不到汇总级红；故 M-B 按"门禁中止 ＋ ① 的**判据级**探针为 false"取证，
+     ① 的**汇总级**可证伪性由 **M-F** 补证。
+   边界（如实登记，不冒领）：
+     · ①② 只证"**判据函数**对给定样例给出正确判定"，**不证**"白名单够宽" —— 未来合法的**新**形态会被
+       当场拒，这是**设计意图**（扩白名单＝改契约，必须同批配 D22），门禁证不了"白名单够宽"；
+     · ③ 只证"**源码文本**里调用点的位置与唯一性"，**不证**运行期确实执行过（运行期证据在座位 6 的
+       探针 `tests\._verify\zz6e-whitelist-probe.js` 与本章六之八的运行期断言里）；
+     · 本节的判据**只覆盖 `ADD COLUMN`／`CREATE INDEX IF NOT EXISTS` 两种形态**（与 9.5 第 6 条
+       v1.35 "覆盖面"一致）：**改列类型／删列**必须走重建迁移函数 ＋ 评审纪律，
+       **不得**据此推断"门禁绿 ＝ 结构变更全部已迁移"（ADR-0004 D19）。 */
+  t.section('六之十、`STRUCTURE_UPGRADES` 步骤形态白名单（E74）的门禁级断言（清单全过／真值表／守门接线）');
+  {
+    /* 判据的**唯一真源**＝模块导出（不是从源码文本另抄一份会漂移的正则）。 */
+    const forms = db.UPGRADE_STEP_FORMS;
+    const formWhatOfKind = new Map(forms.map(f => [f.kind, f.what]));
+    const declaredKinds = forms.map(f => f.kind);
+    const steps = Array.from(db.STRUCTURE_UPGRADES, s => String(s));
+
+    /* ---------- ① 清单全过（"以后有人往清单里加违规步骤"的兜底） ---------- */
+    const stepVerdicts = steps.map(s => db.classifyUpgradeStep(s));
+    const rejectedSteps = [];
+    const inconsistentSteps = [];
+    const stepKindCount = {};
+    steps.forEach((s, i) => {
+      const v = stepVerdicts[i];
+      if (!v || v.ok !== true) {
+        rejectedSteps.push(`${JSON.stringify(s)}（${v ? v.reason : '判据没返回结果'}）`);
+        return;
+      }
+      if (formWhatOfKind.get(v.kind) !== v.form) {
+        inconsistentSteps.push(`${JSON.stringify(s)}（kind=${v.kind}、form=${JSON.stringify(v.form)}，` +
+          '与 `UPGRADE_STEP_FORMS` 里同 kind 的 `what` 不一致）');
+      }
+      stepKindCount[v.kind] = (stepKindCount[v.kind] || 0) + 1;
+    });
+    t.check(`六之十/清单：\`STRUCTURE_UPGRADES\` 的 ${steps.length} 条步骤**逐条**通过 \`classifyUpgradeStep()\`` +
+      '（＝`initSchema()` 真会执行的那份清单；**以后有人往清单里加违规步骤 ⇒ 必红**）',
+      steps.length > 0 && rejectedSteps.length === 0 && inconsistentSteps.length === 0,
+      rejectedSteps.length || inconsistentSteps.length
+        ? [...rejectedSteps.map(x => `被拒：${x}`), ...inconsistentSteps.map(x => `不自洽：${x}`)].join('；')
+        : `${steps.length} 条全部通过；形态分布：` +
+          (Object.entries(stepKindCount).map(([k, n]) => `${k} ${n} 条`).join('、') || '（空）'));
+
+    /* ---------- ② 真值表（期望值构成性给出：接受样例由清单里的真实步骤变换而来） ---------- */
+    const swapCase = s => s.replace(/[A-Za-z]/g, c => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()));
+    const widenSpaces = s => s.replace(/\s+/g, '   ');
+    const srcAdd = steps.find(s => { const v = db.classifyUpgradeStep(s); return v.ok && v.kind === 'add-column'; });
+    const srcIndex = steps.find(s => { const v = db.classifyUpgradeStep(s); return v.ok && v.kind === 'create-index'; });
+    const NO_SRC = '（清单里没有该形态的真实步骤，接受样例无从构造 —— 这本身就是红）';
+    const addParts = srcAdd ? /^ALTER\s+TABLE\s+(\S+)\s+ADD\s+COLUMN\s+(\S+)([\s\S]*)$/i.exec(srcAdd) : null;
+    const quotedAdds = addParts
+      ? [['"', '"'], ['`', '`'], ['[', ']']].map(([l, r]) => ({
+        text: `ALTER TABLE ${l}${addParts[1]}${r} ADD COLUMN ${l}${addParts[2]}${r}${addParts[3]}`,
+        kind: 'add-column',
+        why: `标识符引号 ${l}…${r}`
+      }))
+      : [];
+    const accepts = [
+      { text: srcAdd || NO_SRC, kind: 'add-column', why: '清单原文（`ALTER TABLE … ADD COLUMN` 基本形）' },
+      { text: srcIndex || NO_SRC, kind: 'create-index', why: '清单原文（`CREATE INDEX IF NOT EXISTS`）' },
+      { text: srcAdd ? swapCase(srcAdd) : NO_SRC, kind: 'add-column', why: '大小写混写' },
+      { text: srcAdd ? srcAdd.toLowerCase() : NO_SRC, kind: 'add-column', why: '全小写' },
+      { text: srcAdd ? srcAdd.toUpperCase() : NO_SRC, kind: 'add-column', why: '全大写' },
+      { text: srcIndex ? swapCase(srcIndex) : NO_SRC, kind: 'create-index', why: '索引句大小写混写' },
+      { text: srcAdd ? widenSpaces(srcAdd) : NO_SRC, kind: 'add-column', why: '词间多余空白' },
+      { text: srcAdd ? `\n\t${srcAdd}  \t` : NO_SRC, kind: 'add-column', why: '首尾空白／换行' },
+      { text: srcAdd ? `${srcAdd};` : NO_SRC, kind: 'add-column', why: '允许**一个**结尾分号' },
+      { text: srcIndex ? srcIndex.replace(/^(\s*)CREATE\s+/i, (m0, p1) => `${p1}CREATE UNIQUE `) : NO_SRC,
+        kind: 'create-index', why: '`CREATE UNIQUE INDEX IF NOT EXISTS`' },
+      ...quotedAdds
+    ];
+    const acceptProblems = [];
+    for (const e of accepts) {
+      const v = db.classifyUpgradeStep(e.text);
+      if (!v || v.ok !== true || v.kind !== e.kind || v.form !== formWhatOfKind.get(e.kind)) {
+        acceptProblems.push(`${e.why}：期望 kind=${e.kind}、form=${JSON.stringify(formWhatOfKind.get(e.kind))}，` +
+          `实得 ${JSON.stringify({ ok: v && v.ok, kind: v && v.kind, form: v && v.form, reason: v && v.reason })}` +
+          `（样例 ${JSON.stringify(e.text)}）`);
+        continue;
+      }
+      let asserted = null;
+      try {
+        asserted = db.assertUpgradeStepShape(e.text);
+      } catch (err) {
+        acceptProblems.push(`${e.why}：\`assertUpgradeStepShape()\` 对**合法**步骤抛了错 —— ${err && err.message}`);
+        continue;
+      }
+      if (!asserted || asserted.ok !== true || asserted.kind !== e.kind) {
+        acceptProblems.push(`${e.why}：\`assertUpgradeStepShape()\` 的返回与 \`classifyUpgradeStep()\` 不一致` +
+          `（${JSON.stringify(asserted)}）`);
+      }
+    }
+    t.check(`六之十/真值表/**接受项**：${accepts.length} 条构造样例逐条被接受、kind／form 与**源步骤同形**` +
+      '（清单原文／全大写／全小写／大小写混写／多余空白／首尾空白／三种标识符引号／`UNIQUE` 索引／结尾分号；' +
+      '样例全部由清单里的真实步骤变换而来，D21）',
+      accepts.length > 0 && acceptProblems.length === 0,
+      acceptProblems.length ? acceptProblems.join('；')
+        : `${accepts.length} 条全部通过（kind＝${declaredKinds.join('／')}）`);
+
+    /* 拒绝项：六类任务包点名形态 ＋ 非字符串；多语句夹带两条另配"反事实对照"（去掉夹带后必须被接受）。 */
+    const migrateExports = Object.keys(db).filter(k => /^migrate[A-Z]/.test(k));
+    const DECLARED_REJECT_CATS = [
+      '删列 DROP COLUMN', '改名 RENAME TO', '非 DDL（UPDATE）', '多语句夹带',
+      '建索引缺 IF NOT EXISTS', '空串', '非字符串'
+    ];
+    const rejects = [
+      { cat: '删列 DROP COLUMN', text: 'ALTER TABLE upload_log DROP COLUMN fail_reason' },
+      { cat: '改名 RENAME TO', text: 'ALTER TABLE upload_log RENAME TO upload_log_old' },
+      { cat: '非 DDL（UPDATE）', text: "UPDATE upload_log SET state = '待补传'" },
+      { cat: '多语句夹带', text: 'ALTER TABLE t ADD COLUMN a TEXT; DROP TABLE t',
+        counterfactual: 'ALTER TABLE t ADD COLUMN a TEXT' },
+      { cat: '多语句夹带', text: srcAdd ? `${srcAdd}; DROP TABLE op_log` : NO_SRC, counterfactual: srcAdd },
+      { cat: '建索引缺 IF NOT EXISTS', text: 'CREATE INDEX ix_x ON upload_log(upload_id)' },
+      { cat: '空串', text: '' },
+      { cat: '非字符串', text: null }
+    ];
+    const rejectProblems = [];
+    for (const e of rejects) {
+      const v = db.classifyUpgradeStep(e.text);
+      const problems = [];
+      if (!v || v.ok !== false) problems.push(`ok 应为 false，实得 ${JSON.stringify(v && v.ok)}`);
+      if (v && v.kind !== 'unsupported') problems.push(`kind 应为 unsupported，实得 ${JSON.stringify(v.kind)}`);
+      if (v && v.form !== null) problems.push(`form 应为 null，实得 ${JSON.stringify(v.form)}`);
+      if (v && (typeof v.reason !== 'string' || !v.reason)) problems.push('reason 应为非空说明');
+      /* 判据必须无副作用／可重复：同入参再判一次必须逐字节同结果。 */
+      if (JSON.stringify(db.classifyUpgradeStep(e.text)) !== JSON.stringify(v)) {
+        problems.push('同入参两次判定结果不一致（判据带状态？）');
+      }
+      let threw = null;
+      let msg = '';
+      try {
+        db.assertUpgradeStepShape(e.text);
+      } catch (err) {
+        threw = err;
+        msg = err && err.message ? err.message : String(err);
+      }
+      if (!threw) {
+        problems.push('`assertUpgradeStepShape()` **没有抛错**（该形态必须当场炸，否则又回到"静默空转"）');
+      } else {
+        if (!msg.includes(JSON.stringify(e.text))) {
+          problems.push(`抛错消息不含**步骤原文**（应含 ${JSON.stringify(JSON.stringify(e.text))}）`);
+        }
+        const missingForms = forms.filter(f => !msg.includes(f.what)).map(f => f.what);
+        if (missingForms.length) problems.push(`抛错消息没写全**允许形态**：缺 ${missingForms.join(' ／ ')}`);
+        if (!migrateExports.length) {
+          problems.push('模块没有导出任何 `migrate*` 重建迁移函数，无从核对"正确出路"是否被点名');
+        } else if (!migrateExports.some(n => msg.includes(n))) {
+          problems.push(`抛错消息没点名**重建迁移函数**（导出里现有 ${migrateExports.join('／')}）`);
+        }
+      }
+      if (e.counterfactual) {
+        const cv = db.classifyUpgradeStep(e.counterfactual);
+        if (!cv || cv.ok !== true) {
+          problems.push(`反事实对照（去掉夹带后的 ${JSON.stringify(e.counterfactual)}）本应被接受，` +
+            `实得 ${JSON.stringify(cv)}`);
+        }
+      }
+      if (problems.length) rejectProblems.push(`${e.cat}｜${JSON.stringify(e.text)}：${problems.join('；')}`);
+    }
+    t.check(`六之十/真值表/**拒绝项**：${rejects.length} 条违规样例逐条判 ${'`unsupported`'}` +
+      '（`ok:false` / `kind` / `form:null` / 非空 `reason` / 同入参两次同结果），且 `assertUpgradeStepShape()` ' +
+      '**必抛**、消息带**步骤原文**＋**全部允许形态**＋**重建迁移函数真名**（多语句夹带另验"去掉夹带即被接受"）',
+      rejects.length > 0 && rejectProblems.length === 0,
+      rejectProblems.length ? rejectProblems.join('；')
+        : `${rejects.length} 条全部按期望被拒（含 ${DECLARED_REJECT_CATS.join('／')}）`);
+
+    const missingKinds = declaredKinds.filter(k => !accepts.some(e => e.kind === k));
+    const missingCats = DECLARED_REJECT_CATS.filter(c => !rejects.some(e => e.cat === c));
+    const strayCats = rejects.map(e => e.cat).filter(c => !DECLARED_REJECT_CATS.includes(c));
+    t.check('六之十/真值表/**覆盖**：每种允许形态都有接受样例、每类违规（' + DECLARED_REJECT_CATS.join('／') +
+      '）都有拒绝样例 —— 真值表**不空转**（D23：两张表任何一个为空 ⇒ 上面的"逐条"都是恒真）',
+      forms.length > 0 && accepts.length >= forms.length && accepts.length > 0 && rejects.length > 0 &&
+      missingKinds.length === 0 && missingCats.length === 0 && strayCats.length === 0,
+      [
+        missingKinds.length ? `没有接受样例的形态：${missingKinds.join('、')}` : '',
+        missingCats.length ? `没有拒绝样例的违规类别：${missingCats.join('、')}` : '',
+        strayCats.length ? `未登记的违规类别：${strayCats.join('、')}` : ''
+      ].filter(Boolean).join('；') ||
+      `允许形态 ${forms.length} 种（接受样例 ${accepts.length} 条）、违规类别 ${DECLARED_REJECT_CATS.length} 类` +
+      `（拒绝样例 ${rejects.length} 条）`);
+
+    /* ---------- ③ 守门被接线（静态：比源码字符下标，**先去注释**） ---------- */
+    /* 单趟扫描：`code` ＝ 把 `//` 与块注释抹成**等长空白**的副本（**字符下标不变**）；
+       `mask[i]=1` ＝ 该下标属真代码（注释、字符串/模板串内容、正则内容都是 0）。
+       为什么必须去注释：`server\db\index.js` 的注释里就写着 `db.exec(step)` 与 `assertUpgradeStepShape()`，
+       直接对原文比下标会把"注释里的字样"算成调用点 ⇒ 调用点被删了、静态断言却照样绿。 */
+    const scanJs = (src) => {
+      const chars = src.split('');
+      const mask = new Uint8Array(src.length);
+      let prev = '';
+      let i = 0;
+      while (i < src.length) {
+        const ch = src[i];
+        if (ch === '/' && src[i + 1] === '/') {
+          /* 行尾的 `\r` 必须留着（本仓工作区是 CRLF）：否则"抹注释"会顺手改掉行尾，
+             行数/下标虽不变，`\r\n` 却退化成 `\n` —— 自检那条"行数相等"就是为此而设。 */
+          while (i < src.length && src[i] !== '\n') {
+            if (src[i] !== '\r') chars[i] = ' ';
+            i++;
+          }
+          continue;
+        }
+        if (ch === '/' && src[i + 1] === '*') {
+          while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) {
+            if (src[i] !== '\n' && src[i] !== '\r') chars[i] = ' ';
+            i++;
+          }
+          if (i < src.length) { chars[i] = ' '; chars[i + 1] = ' '; i += 2; }
+          continue;
+        }
+        if (ch === "'" || ch === '"' || ch === '`') {                 /* 字符串/模板串：内容不算代码 */
+          mask[i] = 1;
+          i++;
+          while (i < src.length && src[i] !== ch) {
+            if (src[i] === '\\') { i += 2; continue; }
+            i++;
+          }
+          if (i < src.length) { mask[i] = 1; i++; }
+          prev = ch;
+          continue;
+        }
+        if (ch === '/' && (prev === '' || /[=(,:[!&|?{};+\-*%~^<>]/.test(prev))) {   /* 正则字面量 */
+          mask[i] = 1;
+          i++;
+          let inClass = false;
+          while (i < src.length) {
+            const c = src[i];
+            if (c === '\\') { i += 2; continue; }
+            if (c === '\n') break;
+            mask[i] = 1;
+            if (c === '[') inClass = true;
+            else if (c === ']') inClass = false;
+            i++;
+            if (c === '/' && !inClass) break;
+          }
+          while (i < src.length && /[a-z]/.test(src[i])) { mask[i] = 1; i++; }
+          prev = '/';
+          continue;
+        }
+        mask[i] = 1;
+        if (!/\s/.test(ch)) prev = ch;
+        i++;
+      }
+      return { code: chars.join(''), mask };
+    };
+    /* 配对扫描大括号（只数真代码里的括号，跳过字符串/正则 —— 与 harness-check 第十节之二的先例同法）。 */
+    const matchBraceAt = (codeText, maskOf, openAt) => {
+      let depth = 0;
+      for (let i = openAt; i < codeText.length; i++) {
+        if (!maskOf[i]) continue;
+        if (codeText[i] === '{') depth++;
+        else if (codeText[i] === '}') { depth--; if (depth === 0) return i; }
+      }
+      return -1;
+    };
+
+    /* ③-0 扫描器自检（真值表）：注释里的字样必须被抹掉，字符串/模板串/正则里的 `//`、`/*` 必须原样保留。 */
+    const scanFixture = [
+      'const a = 1; // db.exec(step)',
+      '/* assertUpgradeStepShape(step); try { */',
+      'const s = "// 不是注释";',
+      'const r = /a\\/\\/b/;',
+      'const t2 = `// 也不是注释`;',
+      ''
+    ].join('\r\n');
+    const fixtureScanned = scanJs(scanFixture);
+    t.check('六之十/静态/接线⓪ 扫描器自检：注释被抹成**等长空白**（字符下标不变），' +
+      '而字符串／模板串／正则里的 `//`、`/*` **原样保留**（否则 ③①②③ 的下标比较全是错的）',
+      fixtureScanned.code.length === scanFixture.length &&
+      !fixtureScanned.code.includes('db.exec(step)') &&
+      !fixtureScanned.code.includes('assertUpgradeStepShape(step);') &&
+      !fixtureScanned.code.includes('try {') &&
+      fixtureScanned.code.includes('"// 不是注释"') &&
+      fixtureScanned.code.includes('`// 也不是注释`') &&
+      fixtureScanned.code.includes('/a\\/\\/b/') &&
+      fixtureScanned.code.split('\r\n').length === scanFixture.split('\r\n').length &&
+      fixtureScanned.mask[0] === 1 && fixtureScanned.mask[scanFixture.indexOf('不是注释')] === 0,
+      `长度 ${scanFixture.length} → ${fixtureScanned.code.length}；` +
+      `注释字样残留=${fixtureScanned.code.includes('db.exec(step)')}；` +
+      `字符串原样保留=${fixtureScanned.code.includes('"// 不是注释"')}`);
+
+    const indexSrcPath = require.resolve('../server/db/index.js');
+    const rawSrc = fs.readFileSync(indexSrcPath, 'utf8');
+    const scanned = scanJs(rawSrc);
+    const code = scanned.code;
+    const mask = scanned.mask;
+    const findRealNeedles = (needle) => {
+      const hits = [];
+      for (let at = code.indexOf(needle); at >= 0; at = code.indexOf(needle, at + 1)) if (mask[at]) hits.push(at);
+      return hits;
+    };
+    const findRealRe = (re) => {
+      const hits = [];
+      re.lastIndex = 0;
+      for (let m = re.exec(code); m; m = re.exec(code)) if (mask[m.index]) hits.push(m.index);
+      return hits;
+    };
+    const lineOfAt = at => (at < 0 ? '未定位' : String(code.slice(0, at).split(/\r?\n/).length));
+
+    const callSites = findRealRe(/assertUpgradeStepShape\s*\(\s*step\s*\)\s*;/g);
+    const callAt = callSites.length === 1 ? callSites[0] : -1;
+    const loopHits = findRealNeedles('for (const step of STRUCTURE_UPGRADES) {');
+    const loopAt = loopHits.length ? loopHits[0] : -1;
+    const loopBrace = loopAt >= 0 ? code.indexOf('{', loopAt) : -1;
+    const loopEnd = loopBrace > 0 && mask[loopBrace] ? matchBraceAt(code, mask, loopBrace) : -1;
+    const execSites = findRealRe(/db\.exec\(\s*step\s*\)/g);
+    const execAt = execSites.length === 1 ? execSites[0] : -1;
+    const trySites = findRealRe(/try\s*\{/g).filter(at => execAt >= 0 && at < execAt);
+    const tryAt = trySites.length ? trySites[trySites.length - 1] : -1;
+    const tryBrace = tryAt >= 0 ? code.indexOf('{', tryAt) : -1;
+    const catchAt = execAt >= 0 ? code.indexOf('catch', execAt) : -1;
+    const catchBrace = catchAt >= 0 ? code.indexOf('{', catchAt) : -1;
+    const catchEnd = catchBrace > 0 && mask[catchBrace] ? matchBraceAt(code, mask, catchBrace) : -1;
+    const catchBody = catchEnd > catchBrace ? code.slice(catchBrace, catchEnd) : '';
+
+    t.check('六之十/静态/接线①：`assertUpgradeStepShape(step);` 在**去注释后**的源码里**唯一**，' +
+      '且落在 `for (const step of STRUCTURE_UPGRADES)` 的**循环体内**（删调用点／挪出循环 ⇒ 必红）',
+      callSites.length === 1 && loopBrace > 0 && loopEnd > loopBrace && callAt > loopBrace && callAt < loopEnd,
+      `调用点 ${callSites.length} 处（第 ${lineOfAt(callAt)} 行）；循环头第 ${lineOfAt(loopAt)} 行、` +
+      `循环体收口第 ${lineOfAt(loopEnd)} 行 —— 调用点必须在两者之间`);
+
+    t.check('六之十/静态/接线②：调用点**早于** `db.exec(step)`（去注释后 `db.exec(step)` 唯一；' +
+      '把判定点挪到执行**之后** ⇒ 必红）',
+      callAt > 0 && execSites.length === 1 && callAt < execAt,
+      callSites.length !== 1 ? `源码里找不到唯一调用点（命中 ${callSites.length} 处）`
+        : execSites.length !== 1 ? `去注释后 \`db.exec(step)\` 命中 ${execSites.length} 处（要求恰好 1 处）`
+        : `调用点第 ${lineOfAt(callAt)} 行（下标 ${callAt}） < exec 第 ${lineOfAt(execAt)} 行（下标 ${execAt}）`);
+
+    t.check('六之十/静态/接线③：调用点**不在**容忍 `duplicate column name|already exists` 的那个 `try` 块内' +
+      '（挪进 try ⇒ 形态违规被那张网吞掉、必红）',
+      callAt > 0 && tryBrace > 0 && catchAt > tryBrace && !(callAt > tryBrace && callAt < catchAt),
+      `try 第 ${lineOfAt(tryBrace)} 行、catch 第 ${lineOfAt(catchAt)} 行、调用点第 ${lineOfAt(callAt)} 行`);
+
+    t.check('六之十/静态/接线④：那张容忍网确实**存在**且**只吞**"已存在"类错误（catch 体点名 ' +
+      '`duplicate column name` 与 `already exists`，且**仍会重抛**别的错误）—— 这条防 ③③ 变成' +
+      '"try 没了所以不在 try 里"的**空洞断言**（D23）',
+      catchBody.length > 0 && catchBody.includes('duplicate column name') &&
+      catchBody.includes('already exists') && /\bthrow\b/.test(catchBody),
+      catchBody.length
+        ? `catch 体 ${catchBody.length} 字符；含 duplicate column name=${catchBody.includes('duplicate column name')}、` +
+          `含 already exists=${catchBody.includes('already exists')}、含重抛（\`throw\`）=${/\bthrow\b/.test(catchBody)}`
+        : `定位不到容忍 catch 的块体（try@${tryAt}／catch@${catchAt}／catchBrace@${catchBrace}）`);
   }
 
 /* ---------------- 七、备份（DR-15 / DEP-08） ---------------- */
