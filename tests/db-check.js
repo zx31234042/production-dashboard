@@ -4413,9 +4413,11 @@ async function main() {
   t.finish();
 }
 
-try {
-  main();
-} catch (err) {
-  console.error('\n脚本异常终止：' + (err && err.stack ? err.stack : err));
+/* 先例写法（同 browser-check.js:828、contract-check.js:1624、docs-check.js:547 …）：
+   `main()` 是 **async** ⇒ 它的 rejection **不会**被"顶层 try/catch"接住（E76① 实测：表现为
+   "无汇总行 ＋ 退 1"，`run-all` 于是把它记成"没有断言失败"而不是"跑不起来"）。用 `.catch()`
+   挂在 promise 上才接得住，并按规范 9.5-5 退 **2**（脚本自身异常），异常**打印出来**（可 grep）。 */
+main().catch(err => {
+  console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
   process.exit(2);
-}
+});

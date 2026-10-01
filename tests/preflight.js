@@ -172,9 +172,11 @@ async function main() {
   t.finish();
 }
 
-try {
-  main();
-} catch (err) {
-  console.error('\n体检脚本异常终止：' + (err && err.stack ? err.stack : err));
+/* 先例写法（同 browser-check.js:828、contract-check.js:1624、docs-check.js:547 …）：
+   `main()` 是 **async** ⇒ 它的 rejection **不会**被"顶层 try/catch"接住（E76① 实测：表现为
+   "无汇总行 ＋ 退 1"，与"有断言失败"无法区分）。用 `.catch()` 挂在 promise 上才接得住，
+   并按规范 9.5-5 退 **2**（脚本自身异常）。异常必须**打印出来**（前缀 `[脚本异常]`，可 grep）。 */
+main().catch(err => {
+  console.error('\n[脚本异常] 体检脚本异常终止：' + (err && err.stack ? err.stack : err));
   process.exit(2);
-}
+});

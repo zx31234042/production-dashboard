@@ -3924,12 +3924,39 @@ t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTota
     const otherFail = withDev.map(r => r.suite.name === 'db-check' ? mkR('db-check', 40, 6) : r);
     t.check('权威数字校验：其他脚本失败时先报它们，而不是纠结数字',
       runAll3.verifyAuthorityTotals({ passed: sumOf(otherFail) }, otherFail).ok === false, '');
-    /* 漏列脚本：从权威行删掉 platform-check 的点名 */
-    const lines = original.split(/\r?\n/);
-    lines[authIndex()] = lines[authIndex()].replace(/`platform-check` \*\*21\/0\*\*，/, '');
-    fs.writeFileSync(readmePath, lines.join('\r\n'), 'utf8');
+    /* 漏列脚本：从权威行删掉 platform-check 的点名（**E77**）。
+       ⚠ 锚点**不得含计数**：旧写法写死 `` `platform-check` **21/0**， ``，而权威区现值是
+       **29/0** ⇒ `replace` 变 **no-op**、"点名没删掉"却**照样判绿**（座位 5 报告 C·13.6 的锚点漂移）。
+       改法（任务包 T-20260930-30 建议形）＝`/`platform-check`[^，,]*，/`：只认**点名**，
+       计数/说明文字怎么写都不影响锚点命中。命中数顺带**回读**，`!== 1` 判红（锚点再漂移就
+       明确以"锚点回读失败"报错，不许静默空转）。
+       只删到**第一个半角/全角逗号**（点名 ＋ 可能残留一个未配对的右括号）；`named` 是逐 token 扫的，
+       残留括号不影响它 —— 要点名真的消失即可，且残余可见 ⇒ 便于追查。 */
+    const removeGateNamedInAuthority = (name) => {
+      const target = `${'`'}${name}${'`'}`;
+      const cur = fs.readFileSync(readmePath, 'utf8').split(/\r?\n/);
+      const i = authIndex();
+      const line = cur[i];
+      const hits = [...line.matchAll(new RegExp(target + '[^，,]*，', 'g'))].length;
+      if (hits === 1) cur[i] = line.replace(new RegExp(target + '[^，,]*，'), '');
+      fs.writeFileSync(readmePath, cur.join('\r\n'), 'utf8');
+      /* 回读（先例 `setStated` :3895-3898）：必须读到"点名真的没了"的痕迹，否则整条判空转 */
+      const back = fs.readFileSync(readmePath, 'utf8').split(/\r?\n/)[i] || '';
+      return { hits, removed: line.includes(target) && !back.includes(target) };
+    };
+    const rmLines = removeGateNamedInAuthority('platform-check');
     t.check('权威数字校验：权威区漏列某个离线门禁即判不通过（新增脚本别忘登记）',
       runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev).ok === false, '');
+    /* E77 定点回归：证明上一条**不是空转**（点名真的被删掉了，而且删对了分支） */
+    {
+      const rmRes = runAll3.verifyAuthorityTotals({ passed: sumOf(withDev) }, withDev);
+      t.check('权威数字校验/E77：漏列点名的变异**真的生效**（锚点命中恰 1 次、回读确认点名已消失），' +
+        '且判红钉在**漏列**那一支（`kind=broken`：`notListed=[platform-check]`）而不是"数字漂移"（`mismatch`）',
+        rmLines.hits === 1 && rmLines.removed === true && rmRes.ok === false &&
+        rmRes.kind === 'broken' && /漏列离线门禁/.test(rmRes.detail) && /platform-check/.test(rmRes.detail),
+        `锚点命中 ${rmLines.hits} 次（须恰 1 次）、回读点名已消失=${rmLines.removed}；` +
+        `判定 ok=${rmRes.ok}、kind=${rmRes.kind}、detail=${rmRes.detail}`);
+    }
   } finally {
     fs.writeFileSync(readmePath, original, 'utf8');
   }
@@ -4793,9 +4820,11 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
 t.finish();
 }
 
-try {
-  main();
-} catch (err) {
-  console.error('\n脚本异常终止：' + (err && err.stack ? err.stack : err));
+/* 先例写法（同 browser-check.js:828、contract-check.js:1624、docs-check.js:547 …）：
+   `main()` 是 **async** ⇒ 它的 rejection **不会**被"顶层 try/catch"接住（E76① 实测：表现为
+   "无汇总行 ＋ 退 1"，`run-all` 于是把它记成"没有断言失败"而不是"跑不起来"）。用 `.catch()`
+   挂在 promise 上才接得住，并按规范 9.5-5 退 **2**（脚本自身异常），异常**打印出来**（可 grep）。 */
+main().catch(err => {
+  console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
   process.exit(2);
-}
+});

@@ -126,8 +126,20 @@ function createRunner(title, options = {}) {
   };
 }
 
-/* 注：`runMain(fn)`（带异常兜底的 main 包装，异常退 2）已于 2026-09-19 删除 ——
-   12 个脚本各自在尾部写了 try/catch，它从加进来起就**零引用**
-   （R-2026-09-19-02 的 P2-16："交付了却从未被验证"）。留着只会让后来者以为它会生效。 */
+/* 注（**2026-09-30 更正，T-20260930-30 / E76①**）：`runMain(fn)`（带异常兜底的 main 包装，异常退 2）
+   已于 2026-09-19 删除，当时的理由是"12 个脚本各自在尾部写了 try/catch"（R-2026-09-19-02 的 P2-16：
+   "交付了却从未被验证"）。**那个理由对 `async main()` 不成立**：`try { main(); } catch` 只能接住
+   **同步**抛错，`main()` 返回的 promise 一旦 reject，顶层 try/catch **抓不到** ⇒ 由 Node 以
+   "未处理 rejection"结束进程，表现为"**无汇总行 ＋ 退 1**"，与"有断言失败"在观感与 `run-all`
+   记账上无法区分（`run-all` 把它记成"没有断言失败"而不是"跑不起来"）。
+
+   **当前口径（各脚本自查，不用共享包装）**：
+     · `async main()` 的脚本 ⇒ 尾部 `main().catch(err => { console.error('[脚本异常] …'); process.exit(2) })`；
+     · `function main()`（同步）的脚本 ⇒ `try { main(); } catch (err) { … process.exit(2) }`
+       （见 `copy-check.js` / `trace-check.js` / `docs-cross-check.js` / `screenshot-diff.js`）。
+   **曾漏掉的三个**（座位 5 于 2026-09-30 实测，报告 C·13.5）：`tests\db-check.js`、
+   `tests\harness-check.js`、`tests\preflight.js` —— 它们写了 `try { main() } catch` 而 `main()` 是
+   **async**，故"脚本自身异常"落成"退 1"。`E76` 已修（三处均收敛为上表先例写法）。
+   异常一律**打印出来**（可 grep 的前缀 `[脚本异常]`）—— 退出码 2 之外还要有可读的现场。 */
 
 module.exports = { createRunner };
