@@ -20,9 +20,15 @@
         **E44 备份文件名同秒不覆盖**（毫秒 + 冲突递增探测；5 次同秒备份 ⇒ 5 个文件）、
         **ADR-0007 鉴权**（scrypt 哈希非明文 / 错误次数锁定 / 内存会话令牌 / 本机一次性初始化 /
         与 IF-A 静态令牌互不通用 / 六类留痕含来源 IP / `POST /auth/*` 的 HTTP 端到端）。
+        2026-10-01（T-20260930-23，座位 4b）再加一节（**六之九**）：
+        **规范 v1.34 / 9.5 第 6 条「数据结构变更约束」的静态配套门禁** —— `schema.sql` 里
+        『老库形态缺、新库形态有』的列必须在 `STRUCTURE_UPGRADES` 里有对应 `ADD COLUMN` 步骤
+        （反方向：不许给 `schema.sql` 里不存在的列补列），判据只读源码 ＋ 手写的老库基线
+        `LEGACY_BASELINE_COLUMNS`，**不建库、不跑 `initSchema()`**（故"没有老库"也能红）。
    依据：DR-03 / DR-04 / DR-12 / DR-13 / DR-14 / DR-15 / DR-16 / DR-18 / DR-19、
         FR-3.19、IF-B.5（需求 V1.33）；ADR-0003（一用例一库）、ADR-0007（鉴权形态）、
-        ADR-0006（改 schema 必须同步升版本）、技术债 E18 / E44。
+        ADR-0006（改 schema 必须同步升版本）、ADR-0004 D22/D23（防回潮须可证伪／静态防空洞）、
+        规范 9.5 第 6 条（数据结构变更约束，v1.34）、技术债 E18 / E44 / E71。
    句柄约定：全程使用 `handle.db`；需要换连接时**必须**用 `handle.adopt()`，
              否则夹具自建连接不被跟踪 → Windows 上临时目录删不掉（曾实际踩到）。
    运行：node tests/db-check.js
@@ -154,6 +160,85 @@ const REQUIRED_COLUMNS = {
  *  核对方式：需求 V1.33 §7 DR-03 行（列清单里没有这四个）+ `server/db/schema.sql` 的 standard 建表段。 */
 const FORBIDDEN_COLUMNS = {
   standard: ['set_depth', 'set_gain', 'set_frame_rate', 'set_shutter']
+};
+
+/** 老库基线列集（规范 **9.5 第 6 条**「数据结构变更约束」配套**静态**门禁的**独立锚**，
+ *  判据跑在第六章之九；那份断言**不建库、不跑 `initSchema()`**，只读本常量＋`schema.sql` 正文
+ *  ＋`server/db/index.js` 导出的 `STRUCTURE_UPGRADES`，故"没有老库、只读源码"也能红）。
+ *
+ *  **是什么**：`表 -> 列名数组` ＝ **老库升级路径里"非 `ADD COLUMN` 的那部分"一定会交付的列**
+ *  —— 具体三类来源：① 老库本来就有的列；② `schema.sql` 的 `CREATE TABLE IF NOT EXISTS`
+ *  对老库**新建**的表（表还不是老库形态？那它整表由这一句建出来，列自然齐）；
+ *  ③ `server/db/index.js` 的 `migrateLegacyStandard()` 对 legacy `standard` 的**重建**
+ *  （该重建内联的建表 DDL 与 `schema.sql` 的 `standard` 段逐列一致，见该函数注释与六之七）。
+ *  由此判据只有一句：**`schema.sql` 里落在这份基线之外的列，只能由 `STRUCTURE_UPGRADES`
+ *  的 `ADD COLUMN` 步骤交付 ⇒ 必须有同表同列的步骤**（正方向）；反过来，每条 `ADD COLUMN`
+ *  指向的列必须真实存在于 `schema.sql`、且**不得**同时出现在基线里（反方向＋口径一致）。
+ *
+ *  ⚠ **为什么必须手写、以及每次真实升级要复核什么**（本条最容易做错的地方）：
+ *   · **不得**从 `schema.sql` 现推基线（例如拿"当前列集 − 步骤列集"当基线）—— 那样"期望"与
+ *     "实际"同源，改 `schema.sql` 时两侧一起变，断言**恒真**：正是 ADR-0004 **D23** 要堵的
+ *     自证式空洞写法（本文件 `REQUIRED_TABLES`/`REQUIRED_COLUMNS` 手写也是同一理由）。
+ *   · **不得**从 git 历史现推（`git show <旧提交>:server/db/schema.sql`）：①本门禁要能在**任何**
+ *     工作区复跑 —— 交付包/浅克隆/单文件拷贝里没有 `.git`，靠历史就整段跑不了（门禁"跑不了"
+ *     只能退 3，等于这条规则在最需要它的现场交付形态里失效）；②历史给的是"**某次提交时**的
+ *     形态"，而现场老库的真实形态未必等于它（可能更老、可能被人手改过），"提交形态"推不出
+ *     "老库**一定**有的列"；③9.5-5 第 9 条（v1.34 勘误）已实测"提交/行尾规范化会改写工作区字节"，
+ *     把判据挂在历史字节上等于给这条门禁引入与本题无关的漂移源。
+ *   · **每次真实升级都要复核它**（这本就是 9.5 第 6 条"同批"的一部分），方向是具体的：
+ *     ① **新增列不要写进这里** —— 写进来等于声明"老库不缺它"，本条门禁对该列**立刻失明**；
+ *        正常升级后这里**一个字都不用改**（新列落在基线之外，而步骤已在 `STRUCTURE_UPGRADES` 里）。
+ *     ② **删列／改列名**必须同批删掉这里的陈旧行（否则"基线列 ⊆ `schema.sql` 列"那一条必红），
+ *        并按 9.5 第 6 条给"删列/改列"本身的迁移步骤。
+ *     ③ 只有当**确实不再支持**缺某列的老库版本时，才把该列移进这里 —— 移入即"放弃对那批老库
+ *        的补列义务"，请在同一行写清理由与被放弃的版本号。
+ *   · 列名一律逐列手写（顺序与 `schema.sql` 一致，便于肉眼对账）。写错列名**不会**静默放过：
+ *     漏写一列 ⇒ 正方向报"该列缺步骤"；多写/写错 ⇒ "基线列 ⊆ `schema.sql` 列"报陈旧行。
+ *   · 本仓当前实例：`op_log` **无** `team_code`、`measure_rt` **无** `unit_index` —— 这两列正是
+ *     `STRUCTURE_UPGRADES` 两条 `ADD COLUMN`（先例 DR-12 / DR-04·C-111）的交付物，故不在基线里。 */
+const LEGACY_BASELINE_COLUMNS = {
+  schema_meta: ['key', 'value', 'updated_at'],
+  device: ['equip_code', 'equip_name', 'model', 'location', 'upper_host', 'upper_port',
+    'mes_base_url', 'camera_count', 'updated_at'],
+  task: ['proc_order_no', 'batch_no', 'product_code', 'product_name', 'product_no', 'drawing_no',
+    'order_no', 'plan_qty', 'plan_start_time', 'plan_end_time', 'process_no', 'process_name',
+    'status', 'actual_start', 'actual_end', 'created_at', 'updated_at'],
+  /* `standard` 的旧库形态是 V1.33 之前的 set_* 结构（与当前列**完全不同**），由
+     `migrateLegacyStandard()` **重建**交付 —— 重建内联 DDL 与 `schema.sql` 的 standard 段逐列一致，
+     故这些列全部算"非 `ADD COLUMN` 部分交付"，不在基线之外。
+     ⚠ 将来若给 `standard` **加列**：重建只对 legacy 形态触发（对已是新形态的库是空操作），
+     所以新列**必须**走 `STRUCTURE_UPGRADES` 的 `ADD COLUMN`，并且**不要**把它补进这一行。 */
+  standard: ['id', 'product_code', 'process_code', 'version_no', 'depth_upper_dev', 'depth_lower_dev',
+    'depth_typical', 'speed_upper_dev', 'speed_lower_dev', 'speed_typical', 'effective_from',
+    'created_by', 'team_code', 'created_at'],
+  /* DR-04（需求 V1.41 / C-111）：老库（V1.41 之前的库）**没有** `unit_index`，
+     它由 `STRUCTURE_UPGRADES` 的 `ALTER TABLE measure_rt ADD COLUMN unit_index INTEGER` 交付
+     ⇒ 故意不列在这里（列在这里＝本门禁对"删掉那条 ALTER"失明）。 */
+  measure_rt: ['id', 'equip_code', 'proc_order_no', 'measure_depth', 'speed', 'velocity_x',
+    'velocity_y', 'frame_rate', 'gain', 'shutter', 'camera_depth', 'test_status', 'collect_time',
+    'created_at'],
+  result: ['id', 'proc_order_no', 'unit_index', 'result', 'judged_at', 'retest_count',
+    'duration_sec', 'created_at', 'updated_at'],
+  shift_stat: ['id', 'shift_date', 'shift_name', 'plan_qty', 'started_qty', 'finished_qty',
+    'qualified_qty', 'failed_qty', 'retest_qty', 'pass_rate', 'run_sec', 'idle_sec', 'oee',
+    'frozen_at', 'created_at'],
+  alarm: ['id', 'alarm_code', 'alarm_type', 'level', 'occurred_at', 'brief', 'action',
+    'close_state', 'handler', 'handled_at', 'closed_at', 'created_at', 'updated_at'],
+  warning: ['id', 'warn_type', 'trigger_cond', 'triggered_at', 'state', 'created_at'],
+  maintenance: ['id', 'kind', 'content', 'maint_time', 'handler', 'accept_state', 'cycle_days',
+    'next_due_at', 'created_at'],
+  notice: ['id', 'category', 'sub_type', 'content', 'valid_from', 'valid_to', 'priority',
+    'created_by', 'created_at', 'updated_at'],
+  upload_log: ['id', 'upload_id', 'interface', 'request_body', 'response_code', 'response_body',
+    'elapsed_ms', 'retry_count', 'state', 'created_at', 'fail_reason', 'updated_at'],
+  /* DR-12（V1.33 第二批）：老库（V1.33 之前的库）**没有** `team_code`，同样由
+     `STRUCTURE_UPGRADES` 的 `ALTER TABLE op_log ADD COLUMN team_code TEXT` 交付 ⇒ 不列在这里。 */
+  op_log: ['id', 'op_time', 'operator', 'op_type', 'content', 'result', 'created_at'],
+  task_curve: ['id', 'proc_order_no', 'unit_index', 'kind', 'samples', 'sample_count',
+    'interval_sec', 'duration_sec', 'min_value', 'max_value', 'finished_at', 'created_at'],
+  /* ADR-0007 D1 的表：整表由 `CREATE TABLE IF NOT EXISTS` 交付（老库里根本没这张表）。 */
+  auth_credential: ['id', 'username', 'algo', 'params', 'salt', 'hash', 'fail_count', 'locked_until',
+    'is_initial', 'created_at', 'updated_at', 'changed_by', 'team_code']
 };
 
 /** 附录 2 的 13 字段 → 落库位置（uploadId 落在上传日志表，不在实测表） */
@@ -1047,6 +1132,141 @@ async function main() {
         `verifySchemaConsistency=${JSON.stringify(db.verifySchemaConsistency(legacyUid.db))}`);
     }
     legacyUid.close();
+  }
+
+/* ---------------- 六之九、9.5 第 6 条（数据结构变更约束）的**静态**配套门禁 ----------------
+   立案：规范 v1.34 的 **9.5 第 6 条**（2026-10-01 新增）要求"改 `schema.sql`（增/删/改列或表）
+   必须**同批**做两件事 ①升 `SCHEMA_VERSION` ②在 `STRUCTURE_UPGRADES` 加对应的幂等迁移步骤"，
+   并**点名**配套门禁：`schema.sql` 里「老库形态缺、新库形态有」的列，必须在 `STRUCTURE_UPGRADES`
+   里有对应步骤（由座位 4b 补，配 D22 变异反证）。现状是：①那半句由 `verifySchemaConsistency()`
+   （库内结构版本 ↔ 声明）＋本章第一节的指纹断言守着；**②这半句此前没有任何门禁** ——
+   `2026-09-30` 的 `E69` 轮 D22 M7（删掉 `ALTER TABLE measure_rt ADD COLUMN unit_index INTEGER`）
+   能变红，靠的是本章**六之八**那条**运行期**断言（真临时库 + 真 `initSchema`），
+   而本仓当时的缺陷形态恰恰是"开发机新建库天然不需要那一步、只有现场老库需要"
+   （后果：老库每帧落库失败 `table measure_rt has no column named unit_index`），属**环境差异型**故障。
+   故本条要的是**静态兜底**：**不建库、不跑 `initSchema()`**，只读 `schema.sql` 正文
+   ＋ `server/db/index.js` 导出的 `STRUCTURE_UPGRADES`（＝`initSchema()` 真正执行的那份清单）
+   ＋ 手写的老库基线 `LEGACY_BASELINE_COLUMNS`，所以**没有老库也能红**。它抓的正是规则要堵的形态：
+   **"改了正本（`schema.sql`）、忘了迁移步骤"**（新增列落在基线之外 ⇒ 必须找到步骤）。
+   判据（两个方向都要，缺一即为空洞）：
+     正方向 —— `schema.sql` 声明的列 ∉ 老库基线 ⇒ 必须能在 `STRUCTURE_UPGRADES` 里找到
+               同表同列的 `ADD COLUMN` 步骤；
+     反方向 —— `STRUCTURE_UPGRADES` 的每条 `ADD COLUMN` 指向的表/列必须真实存在于 `schema.sql`
+               （不许"给不存在的列补列"的死步骤），且该列**不得**同时出现在基线里
+               （同一件事两处说法相反 ⇒ 要么步骤是死步骤、要么基线过宽而对本门禁失明）。
+   边界（如实登记，不冒领）：①"改列类型/约束"（列集不变）**不在**本条判据内 —— 它没有
+   `ADD COLUMN` 形态的步骤可查，属 9.5 第 6 条的评审纪律范围；②"删列"由"基线列 ⊆ `schema.sql` 列"
+   那一条**兜住注意义务**（必须清理基线、并按规则给删列迁移步骤），但不假装能机器判定删列步骤写对没写对。 */
+  t.section('六之九、9.5 第 6 条静态门禁（改 `schema.sql` 必须同批给迁移步骤；不建库、不跑 `initSchema`）');
+  {
+    /* ① `schema.sql` 侧：表 → 列集。复用本章既有的解析器（第一节、六之三用的是同一套，
+       不另写一份会漂移的正则）。 */
+    const schemaSqlText = db.readSchemaSql();
+    const declaredNow = parseSchemaTables(schemaSqlText);
+    const schemaCols = {};
+    for (const table of declaredNow) schemaCols[table] = parseSchemaColumns(schemaSqlText, table);
+
+    /* ② 步骤侧：解析 `initSchema()` 真正执行的那份清单（导出的数组本身，不是从源码文本另抄一份）。 */
+    const addColumnSteps = [];
+    const unclassifiedSteps = [];
+    for (const raw of db.STRUCTURE_UPGRADES) {
+      const m = /^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)/i
+        .exec(String(raw));
+      if (m) { addColumnSteps.push({ table: m[1], col: m[2], raw: String(raw).trim() }); continue; }
+      /* 除"补列"外本仓只允许"建索引"一类；出现别的形态必须**当场红** —— 否则新形态会被本段
+         静默忽略（解析器腐烂 ⇒ 后面的判据全部假绿，正是 ADR-0004 D23 要防的"静态防空洞"）。 */
+      if (!/^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(String(raw))) {
+        unclassifiedSteps.push(String(raw).trim());
+      }
+    }
+    const stepColsOf = table => addColumnSteps.filter(s => s.table === table).map(s => s.col);
+    const indexSteps = db.STRUCTURE_UPGRADES.length - addColumnSteps.length - unclassifiedSteps.length;
+
+    /* ③ 解析器不空转（表数对得上、每张表都解析出非空列集）—— 否则下面的判据会变成假红或假绿。 */
+    const emptyParsed = declaredNow.filter(tb => schemaCols[tb].length === 0);
+    t.check('六之九/静态：`schema.sql` 声明的每张表都解析出**非空**列集（解析器不空转 —— ' +
+      '否则"正方向"会把整表列都算成"缺步骤"、或反过来变成假绿）',
+      declaredNow.length > 0 && emptyParsed.length === 0,
+      `表数=${declaredNow.length}${emptyParsed.length ? `；解析为空列集的表：${emptyParsed.join(', ')}` : ''}`);
+
+    t.check(`六之九/静态：\`STRUCTURE_UPGRADES\` 的 ${db.STRUCTURE_UPGRADES.length} 条步骤每条都能被分类为` +
+      '「补列」或「建索引」（新形态步骤必须在本段**当场登记**，不得被静默忽略）',
+      unclassifiedSteps.length === 0,
+      unclassifiedSteps.length ? `未分类步骤：${unclassifiedSteps.join(' | ')}`
+        : `补列 ${addColumnSteps.length} 条（${addColumnSteps.map(s => `${s.table}.${s.col}`).join('、')}）；` +
+          `建索引 ${indexSteps} 条`);
+
+    /* ④ 基线自身的完整性：表集必须与 `schema.sql` 完全一致（新增表要明确分类、删表要同批删基线行）。 */
+    const baselineTables = Object.keys(LEGACY_BASELINE_COLUMNS);
+    const tablesOnlyInSchema = declaredNow.filter(tb => !baselineTables.includes(tb));
+    const tablesOnlyInBaseline = baselineTables.filter(tb => !declaredNow.includes(tb));
+    const tableDiffDetail = [];
+    if (tablesOnlyInSchema.length) tableDiffDetail.push(`schema.sql 有而基线未分类：${tablesOnlyInSchema.join(', ')}`);
+    if (tablesOnlyInBaseline.length) tableDiffDetail.push(`基线有而 schema.sql 已无：${tablesOnlyInBaseline.join(', ')}`);
+    t.check('六之九/静态：老库基线的表集 = `schema.sql` 声明的表集（新增表必须在 ' +
+      '`LEGACY_BASELINE_COLUMNS` 里明确分类；删表必须同批删掉基线行）',
+      tablesOnlyInSchema.length === 0 && tablesOnlyInBaseline.length === 0,
+      tableDiffDetail.length ? tableDiffDetail.join('；') : `两处都是 ${declaredNow.length} 张表`);
+
+    /* ⑤ 基线列必须真实存在（删列/改列名后基线里的陈旧行必须同批清理）。 */
+    const staleBaselineCols = [];
+    for (const [table, cols] of Object.entries(LEGACY_BASELINE_COLUMNS)) {
+      if (!schemaCols[table]) continue;                       // 表级差异由④点名，这里不重复报
+      for (const col of cols) if (!schemaCols[table].includes(col)) staleBaselineCols.push(`${table}.${col}`);
+    }
+    t.check('六之九/静态：基线里每一列都仍存在于 `schema.sql`（**删列/改列名**后必须同批清理基线的' +
+      '陈旧行，并按 9.5 第 6 条给该变更本身的迁移步骤）',
+      staleBaselineCols.length === 0,
+      staleBaselineCols.length ? `基线里的陈旧列：${staleBaselineCols.join('、')}（schema.sql 已无这些列）`
+        : '无陈旧列');
+
+    /* ⑥ **正方向**（本门禁的主判据）：基线之外的列 ⇒ 必须有同表同列的 `ADD COLUMN` 步骤。
+       可证伪点：①删掉 `STRUCTURE_UPGRADES` 里某条 `ADD COLUMN`（D22 的 M7）；②往 `schema.sql`
+       加一列而不动 `STRUCTURE_UPGRADES`（M8"改了正本、忘了迁移"）—— 两者都必红，且**不需要**
+       任何真库或 `initSchema()`（这正是本条相对六之八那条运行期断言的意义）。 */
+    const colsNeedingSteps = [];
+    const colsMissingSteps = [];
+    for (const [table, cols] of Object.entries(LEGACY_BASELINE_COLUMNS)) {
+      if (!schemaCols[table]) continue;
+      const baseline = new Set(cols);
+      const steps = new Set(stepColsOf(table));
+      for (const col of schemaCols[table]) {
+        if (baseline.has(col)) continue;                      // 老库一定有 ⇒ 无需步骤
+        colsNeedingSteps.push(`${table}.${col}`);
+        if (!steps.has(col)) colsMissingSteps.push(`${table}.${col}`);
+      }
+    }
+    t.check('六之九/静态/**正方向**：`schema.sql` 里"老库基线之外"的列（＝只能由迁移步骤交付的新列）' +
+      '在 `STRUCTURE_UPGRADES` 里都有同表同列的 `ADD COLUMN` 步骤（**改了正本、忘了迁移 ⇒ 必红**；' +
+      '不建库、不跑 `initSchema()` ⇒ 没有老库也能红）',
+      colsMissingSteps.length === 0,
+      colsMissingSteps.length
+        ? `缺补列步骤：${colsMissingSteps.join('、')}（须在 server/db/index.js 的 STRUCTURE_UPGRADES 里补 ` +
+          '`ALTER TABLE … ADD COLUMN …` 并同批升 SCHEMA_VERSION）'
+        : `须由步骤交付的列=[${colsNeedingSteps.join('、')}]，均有步骤`);
+
+    /* ⑦ **反方向**：不许"给 `schema.sql` 里不存在的列补列"的死步骤（步骤清单与结构正本必须对得上）。 */
+    const stepsWithoutColumn = addColumnSteps.filter(s =>
+      !schemaCols[s.table] || !schemaCols[s.table].includes(s.col));
+    t.check('六之九/静态/**反方向**：`STRUCTURE_UPGRADES` 每条 `ADD COLUMN` 指向的表/列都真实存在于 ' +
+      '`schema.sql`（不许"给不存在的列补列"的死步骤 —— 那种步骤要么永远报错、要么悄悄建出结构正本' +
+      '之外的列）',
+      stepsWithoutColumn.length === 0,
+      stepsWithoutColumn.length
+        ? `指向 schema.sql 里不存在的列：${stepsWithoutColumn.map(s => `${s.table}.${s.col}`).join('、')}`
+        : `每条都落在 schema.sql 上：${addColumnSteps.map(s => `${s.table}.${s.col}`).join('、') || '（无补列步骤）'}`);
+
+    /* ⑧ 口径一致：有步骤的列不得同时被基线声称"老库已有"（两处说法相反时必红 —— 要么步骤是死步骤，
+       要么基线过宽、对本门禁失明；真需要给**更老**的库补列时，正确动作是**收窄基线**、不是删步骤）。 */
+    const baselineConflicts = addColumnSteps.filter(s =>
+      (LEGACY_BASELINE_COLUMNS[s.table] || []).includes(s.col));
+    t.check('六之九/静态/口径一致：带 `ADD COLUMN` 步骤的列**不得**同时写在老库基线里（同一件事两处' +
+      '说法相反 ⇒ 要么步骤是死步骤，要么基线过宽而对本门禁失明）',
+      baselineConflicts.length === 0,
+      baselineConflicts.length
+        ? `两处都声明：${baselineConflicts.map(s => `${s.table}.${s.col}`).join('、')}` +
+          '（若确需给更老的库补列，请从 LEGACY_BASELINE_COLUMNS 里删掉该列，而不是删掉步骤）'
+        : `${addColumnSteps.length} 条补列步骤与基线无重叠`);
   }
 
 /* ---------------- 七、备份（DR-15 / DEP-08） ---------------- */
