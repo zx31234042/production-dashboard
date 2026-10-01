@@ -1059,9 +1059,20 @@ async function main() {
      同一组输入怎么构造（两侧都用**仓库现值**，不写魔数）：
        · 完成数 done = min(planQty, floor(班次已进行时长 / cycleSec))，合格 = round(done × firstPassRate)
          —— 这正是 mockData.computeStats 的构造口径，故可**独立于被测函数**先算出来；
-       · 服务端侧把同一组计数翻译成 tasks（合格 N1 条 + 不合格 N2 条 + 测试中 2 条），
-         运行时长用**采集时刻串**表达（stats.js 的 runSec = 采集条数 − 1，秒级整数粒度），
-         取 round(班次已进行时长 × runRate)，与前端 runSec = 已进行时长 × runRate 同源。
+       · 服务端侧的入参形状自 `E65` 起**分成两类**（`server\services\stats.js` 的 docblock）：
+         票级 `orders:[{planQty, started}]`（一票即整票计划数，`started:true`）、
+         件级 `pieces:[{result, durationSec}]`（合格 N1 件 + 不合格 N2 件 + 测试中 2 件）。
+         **两侧必须喂等价输入**：前端的「完成件数/合格数」由构造值给；件级时长之和
+         **恰恰取前端自己的运行时长** `round(已进行时长 × runRate)` —— 这正是 `E65` 偏差① 之后
+         `avgTestSec`（分子＝Σ 件级时长）与前端 `avgTest`（分子＝runSec）**唯一的对齐方式**；
+         运行时长同时用**采集时刻串**表达（`runSecInt + 1` 条 ⇒ stats.js 的 runSec = 采集条数 − 1
+         = runSecInt，秒级整数粒度）。
+       · ⚠ 本段**不改** `src\services\mockData.js`（前端那份实现的现值），只把**输入**改成新契约。
+       · ⚠ **本段对新分子的判别力是有限的**（如实登记，不夸大）：因为件级时长之和＝前端运行时长，
+         "服务端分子取 Σ 件级时长"与"取 runSec"在本段**数值上不可区分**（实测：把 `stats.js` 的
+         `avgTestSec` 分子改回 `runSec` ⇒ 本段 5 条断言**全绿**）。对偏差①真正可证伪的是下面
+         ②d（**独立构造**）与 `tests\logic-check.js` 的 `FR-4.13` 断言 —— 那里件级时长之和
+         与班次运行时长**刻意不同**（Σ660s vs 班次进度 14400s），变异后当场变红。
        两侧 `planQty` / `cycleSec` / `runRate` / `firstPassRate` 都读 `board.config.js`，
        因此 Q-11 改参数后本段期望值自动跟随，不需要改断言。
 
@@ -1094,7 +1105,33 @@ async function main() {
     /* 取整函数与 stats.js 的 pct() 同口径（保留 1 位小数）；比对前两侧都过一遍 */
     const norm1 = v => Number(v.toFixed(1));
 
-    /** 把"同一组输入"分别喂给前端与服务端，返回两侧的派生指标 */
+    /** 把秒数**按件切开**成非负整数秒（与 `result.duration_sec` INTEGER 同域），各件之和**恰等于** total。
+     *  ⚠ `T-20260930-18`（B3-5 改法①）后本函数**只用于"构造自检"**，不再用来把服务端的件级时长
+     *    绑成前端的运行时长 —— 那种"输入等价性"会让两侧共用一个真源，构造出一致并**掩盖分叉**
+     *    （座位 6 实测：把前端 `avgTest` 改回 `runSec / done` 时，旧 M 段三条谓词 `true/true/true` 全绿）。 */
+    function splitInt(total, n) {
+      const out = [];
+      for (let i = 0; i < n; i++) out.push(Math.floor(total * (i + 1) / n) - Math.floor(total * i / n));
+      return out;
+    }
+
+    /* `E67`／`E68` 之后**两侧各自独立取数**（B3-5 改法①；不再靠"把 Σ件级时长绑成 runSec"对齐）：
+       两侧的**件级时长定义本就不同、不可互相换算**，故把它显式登记为"**不可比量**" ——
+       登记的是**口径**（各自的取数来源），不是某个具体差额数字（避免把可变读数写成魔数，ADR-0004 D21）。
+       · 服务端（`stats.js` 的 `avgTestSec`）：件级时长＝**独立给定的整数秒**（`duration_sec` INTEGER 同域）；
+       · 前端（`mockData.js` 的 `avgTest`）：件级时长＝**演示节拍** `cycleSec / outputRatio`。
+       "是否真的不可比"**可证伪**：若有人把它们改回同一个真源（例如把服务端 `durationSec` 由 `runSec` 切开、
+       或把前端 `avgTest` 改回 `runSec / done`），本段两侧的差额会塌成 0（或前端侧内等式失效）⇒ ②b／②c 变红。 */
+    const INCOMPARABLE_4B = {
+      name: 'FR-4.13 两侧 avgTest 的**件级时长定义**',
+      feBasis: `演示节拍 cycleSec / outputRatio ＝ ${prod.cycleSec} / ${prod.outputRatio}`,
+      beBasis: '件级时长＝独立给定的整数秒之和（Σ pieces[].durationSec）'
+    };
+
+    /** 把"同一组输入"分别喂给前端与服务端，返回两侧的派生指标
+     *  （`E65` 后的新契约：服务端入参＝票级 `orders` ＋ 件级 `pieces`，不再是 `tasks`）
+     *  ⚠ `T-20260930-18`：件级时长**由本函数独立给定**（见下面 `BE_PIECE_SEC = 100`），
+     *     **不再由前端 `runSec` 切开** —— 这是 B3-5 改法①的落点。 */
     function evalCase(iso) {
       const at = new Date(iso);
       const shift = shiftRules.at(at);
@@ -1108,25 +1145,144 @@ async function main() {
       h.window.MockData.tick(h.__at(iso));
       const fe = h.window.MockData.state.stats;
 
-      const list = [];
-      for (let i = 0; i < pass; i++) list.push({ result: stats.STATUS.PASS });
-      for (let i = 0; i < done - pass; i++) list.push({ result: stats.STATUS.FAIL });
-      for (let i = 0; i < 2; i++) list.push({ result: stats.STATUS.RUNNING });   // ≥1 条在测，服务端才算有效运行
+      /* 件级时长：**服务端独立取数** —— 前 done 件各 `BE_PIECE_SEC` 秒（整数秒，`duration_sec` 同域），
+         两条「测试中」件各 0s（尚未完成，`duration_sec` 缺省为 0）。
+         ⇒ Σ durationSec ＝ `BE_PIECE_SEC × done`，与前端的 `runSec` **无关**（故意不等）。
+         本构造仍做一次**自检**（`durSumSame`）：Σ ＝ 常数 × done（不再借 `splitInt(runSecInt, done)`）。 */
+      const BE_PIECE_SEC = 100;
+      const dur = new Array(done).fill(BE_PIECE_SEC);
+      const pieces = [];
+      for (let i = 0; i < pass; i++) pieces.push({ result: stats.STATUS.PASS, durationSec: BE_PIECE_SEC });
+      for (let i = pass; i < done; i++) pieces.push({ result: stats.STATUS.FAIL, durationSec: BE_PIECE_SEC });
+      for (let i = 0; i < 2; i++) pieces.push({ result: stats.STATUS.RUNNING, durationSec: 0 });
+      /* 票级：一票＝整票计划数（与前端 planQty 同一取值），且"已开工"（两侧都按已开工算） */
+      const orders = [{ planQty: prod.planQty, started: true }];
+      /* 采集时刻串仍是两侧**共同输入**（服务端 `runSec` 由它的条数决定）——
+         这是真实契约本身（`runSec` ＝ 采样条数 − 1），不是"把两侧绑成等价"的构造。 */
       const measures = [];
       for (let i = 0; i <= runSecInt; i++) measures.push(new Date(at.getTime() - i * 1000));
       const be = stats.computeShiftStats({
-        shift, tasks: list, measures, planQty: prod.planQty, cycleSec: prod.cycleSec,
+        shift, orders, pieces, measures,
         accum: { daySec: 0, monthSec: 0, yearSec: 0, at }, addRunSec: runSecInt, now: at
       });
-      return { iso, elapsedSec, done, pass, runSecExact, runSecInt, fe, be };
+      return { iso, elapsedSec, done, pass, runSecExact, runSecInt, dur, durSum: dur.reduce((s, v) => s + v, 0),
+        bePieceSec: BE_PIECE_SEC, pieces, orders, fe, be };
     }
 
+    /* ---- `E67` 裁定②（分子**集合**＝`DONE_STATUS`）与 `E65` 偏差①（分子不是 `runSec`）的**独立靶子** ----
+       上面 `evalCase` 现在两侧各自取数，但"服务端分子只累加**已完成件**"这条**集合口径**在
+       `evalCase` 的现场里不可证伪（那里的 `pieces` 只有合格／不合格＋两条 0 秒「测试中」——
+       去掉过滤与保留过滤**数值相同**）。故这里另起两组**刻意分离**的输入，把"分子"与"集合"
+       两个维度分别钉死；两条读数都走**真**实现，另两组走**在内存里编译的旧写法**（不落盘、不碰仓库）：
+
+       (A) 分子维度：件级时长之和（300s）≠ 班次运行时长（20s）⇒ 真实现 ＝ Σ÷done ＝ 100；
+           把分子换回 `runSec` 的旧写法 ＝ 20 ⇒ **两条读数必须不同**。
+       (B) 集合维度（`T-20260930-18` 新增，B3-5 改法③）：同一组输入里混入 **1 件「待复检」（带 240s 时长）**
+           ⇒ 真实现 `avgTestSec` **不变**（＝100）；把 `DONE_STATUS.includes(p.result) &&` 去掉的旧写法
+           ⇒ 变大（(300+240)/3 ＝ 180）⇒ 两条读数必须不同。**这一格是"集合口径"唯一可证伪点**：
+           本仓把 `待复检` 算进分子，正是 `E67` 之前被门禁锁住的错口径（C·8.4 争议①）。 */
+    const MUT_AVG_NUMERATOR = 'const avgTestSec = done > 0 ? Math.round(runSec / done) : 0;';
+    const MUT_ALL_PIECES = 'p && Number.isFinite(Number(p.durationSec))';
+    /* 与 `evalCase` 里 `pieces` 形状相同、与 `stats.js` 的 STATUS 取值域同一份 */
+    const RUN = stats.STATUS.RUNNING;
+    const RETEST = stats.STATUS.RETEST;
+    const numeratorProbe = (() => {
+      const at = new Date('2026-09-18T12:00:00');
+      const shift = shiftRules.at(at);
+      const pieces = [
+        { result: stats.STATUS.PASS, durationSec: 100 },
+        { result: stats.STATUS.PASS, durationSec: 100 },
+        { result: stats.STATUS.FAIL, durationSec: 100 }
+      ];
+      const measures = [];
+      for (let i = 0; i <= 20; i++) measures.push(new Date(at.getTime() - i * 1000));   // runSec = 20s
+      const input = {
+        shift, orders: [{ planQty: 10, started: true }], pieces, measures,
+        accum: { daySec: 0, monthSec: 0, yearSec: 0, at }, addRunSec: 0, now: at
+      };
+      const real = stats.computeShiftStats(input);
+      const done = pieces.filter(p => p.result === stats.STATUS.PASS || p.result === stats.STATUS.FAIL).length;
+      const durSum = pieces.reduce((s, p) => s + p.durationSec, 0);
+      return { at, shift, pieces, measures, input, real: real.avgTestSec, done, durSum, runSec: real.runSec,
+        expectReal: done > 0 ? Math.round(durSum / done) : 0 };
+    })();
+    /* 编译一份"内存变异体"并跑同一组输入；锚点未命中 ⇒ 返回 null（断言把它判红，不放行） */
+    const compileVariant = (src, from, to, tag) => {
+      if (!src.includes(from)) return { tag, ok: false };
+      const srcPath = require('node:path').join(__dirname, '..', 'server', 'services', 'stats.js');
+      const Module = require('node:module');
+      const m = new Module(srcPath, null);
+      m.filename = srcPath;
+      m.paths = Module._nodeModulePaths(require('node:path').dirname(srcPath));
+      m._compile(src.replace(from, to), srcPath);
+      return { tag, ok: true, mod: m.exports };
+    };
+    const statsSrc = require('node:fs').readFileSync(
+      require('node:path').join(__dirname, '..', 'server', 'services', 'stats.js'), 'utf8');
+    const legacyNum = compileVariant(statsSrc, 'const avgTestSec = done > 0 ? Math.round(testSecSum / done) : 0;',
+      MUT_AVG_NUMERATOR, '分子改回 runSec');
+    const legacyAll = compileVariant(statsSrc, 'p && DONE_STATUS.includes(p.result) && Number.isFinite(Number(p.durationSec))',
+      MUT_ALL_PIECES, '去掉 DONE_STATUS 过滤');
+    const legacyNumRead = legacyNum.ok ? legacyNum.mod.computeShiftStats(numeratorProbe.input).avgTestSec : null;
+
+    /* (B) 集合维度现场：3 件已完成（各 100s）＋ **1 件「待复检」（240s）** ＋ 1 件「测试中」（0s） */
+    const collectionProbe = (() => {
+      const at = new Date('2026-09-18T12:00:00');
+      const shift = shiftRules.at(at);
+      /* 现算期望的"已完成件集合"：**由构造内容现算**，不写死 3 —— 集合判据一旦被改，这里同时跟着对不上 */
+      const allPieces = [
+        { result: stats.STATUS.PASS, durationSec: 100 },
+        { result: stats.STATUS.PASS, durationSec: 100 },
+        { result: stats.STATUS.FAIL, durationSec: 100 },
+        { result: RETEST, durationSec: 240 },
+        { result: RUN, durationSec: 0 }
+      ];
+      const measures = [];
+      for (let i = 0; i <= 20; i++) measures.push(new Date(at.getTime() - i * 1000));   // runSec = 20s（与分子无关）
+      const input = {
+        shift, orders: [{ planQty: 10, started: true }], pieces: allPieces, measures,
+        accum: { daySec: 0, monthSec: 0, yearSec: 0, at }, addRunSec: 0, now: at
+      };
+      const real = stats.computeShiftStats(input);
+      const done = allPieces.filter(p => stats.DONE_STATUS.includes(p.result)).length;
+      const doneDurSum = allPieces.reduce(
+        (s, p) => s + (stats.DONE_STATUS.includes(p.result) ? p.durationSec : 0), 0);
+      const allDurSum = allPieces.reduce((s, p) => s + p.durationSec, 0);
+      const legacy = legacyAll.ok ? legacyAll.mod.computeShiftStats(input).avgTestSec : null;
+      return { done, retestQty: real.retestQty, doneDurSum, allDurSum, runSec: real.runSec,
+        real: real.avgTestSec, legacy, expectReal: done > 0 ? Math.round(doneDurSum / done) : 0,
+        expectLegacy: done > 0 ? Math.round(allDurSum / done) : 0 };
+    })();
+    check(
+      '跨实现一致（E67 裁定②·**独立靶子（集合维度）**）：`avgTestSec` 的分母/分子＝**同一集合**（`DONE_STATUS`）' +
+      '—— 混入 1 件带 240s 的「待复检」⇒ 真实现**不变**、去掉 `DONE_STATUS` 过滤的旧写法**必变大**',
+      legacyAll.ok && stats.DONE_STATUS.includes(RETEST) === false && collectionProbe.retestQty === 1 &&
+      collectionProbe.real === collectionProbe.expectReal &&
+      collectionProbe.real === numeratorProbe.expectReal &&
+      collectionProbe.legacy === collectionProbe.expectLegacy &&
+      collectionProbe.legacy !== collectionProbe.real,
+      `现场：已完成 ${collectionProbe.done} 件（Σ${collectionProbe.doneDurSum}s）＋「待复检」1 件（240s，` +
+      `DONE_STATUS 含「${RETEST}」=${stats.DONE_STATUS.includes(RETEST)}）＋「测试中」1 件（0s）；` +
+      `真实现 avgTestSec=${collectionProbe.real}s（期望 Σ已完成 ${collectionProbe.doneDurSum}s ÷ ${collectionProbe.done} ` +
+      `＝ ${collectionProbe.expectReal}s，**与上面分子靶子的 100s 逐值相同 ⇒ "待复检"确实没进分子**）；` +
+      `去掉 DONE_STATUS 过滤的旧写法＝${collectionProbe.legacy}s（期望 ${collectionProbe.expectLegacy}s）` +
+      `⇒ ${collectionProbe.legacy !== collectionProbe.real ? '两者**不同**（集合口径可证伪）' : '两者相同（靶子无力，须查）'}；` +
+      `（对照：本现场的 runSec＝${collectionProbe.runSec}s，与两个读数都不同 ⇒ 也顺带证伪"分子取 runSec"）`);
+    check(
+      '跨实现一致（E65 偏差①·**独立靶子（分子维度）**）：服务端平均测试时长的分子＝Σ **件级**时长（不是 runSec）' +
+      '—— 刻意让 Σ 件级时长（300s）≠ 班次运行时长（20s）⇒ 期望值现算，且"改回 runSec"的读数**必须不同**',
+      legacyNum.ok && numeratorProbe.real === numeratorProbe.expectReal &&
+      legacyNumRead !== numeratorProbe.real,
+      `件级 ΣdurationSec=${numeratorProbe.durSum}s ÷ doneQty=${numeratorProbe.done} ⇒ 期望 ${numeratorProbe.expectReal}s；` +
+      `真实现实测 ${numeratorProbe.real}s；把分子改回 runSec（runSec=${numeratorProbe.runSec}s）的读数 ` +
+      `${legacyNumRead}s ⇒ 两者${legacyNumRead !== numeratorProbe.real ? '**不同**（靶子有力）' : '相同（靶子无力，须查）'}`);
+
     /* 四个时刻：
-       · 10:00 / 12:00 —— 整点班次进度（runSec 恰为整数），与现有 K 段同一时间基准；
-       · 14:19:30 —— 非整点、runSec 带小数的样本；
-       · 03:30:58 —— **取整边界样本**：实测 done=79、runSec=10000s，平均数 126.58227848101266，
-         即小数部分 0.58 —— 距 .5 最近的那类输入（四舍五入必然进位 127，截断则得 126），
-         用于让"服务端取整"这条已知边界**可证伪**而不是被容差盖住。 */
+       · 10:00 / 12:00 —— 整点班次进度（runSecInt 恰为整数），与现有 K 段同一时间基准；
+       · 14:19:30 —— 非整点样本（`elapsedSec × runRate` 带小数，取整后才落到采集串条数）；
+       · 03:30:58 —— **取整边界样本**：实测 elapsed=12658s ⇒ done=79、runSecInt=10000，
+         前端平均时长 126.58（小数部分 .58）—— 距 .5 最近的那类输入（四舍五入必然进位 127，
+         截断则得 126），用于让"服务端取整"这条已知边界**可证伪**而不是被容差盖住。 */
     const evals = ['2026-09-18T10:00:00', '2026-09-18T12:00:00',
       '2026-09-18T14:19:30', '2026-09-18T03:30:58'].map(evalCase);
 
@@ -1136,11 +1292,15 @@ async function main() {
       e.pass > 0 && e.pass < e.done && e.runSecInt > 0);
     if (requires('跨实现一致性的输入可用（班次已进行、完成数 ∈ (0, 计划数)、运行时长 > 0）',
       inputsOk, evals.map(e => `${e.iso}: elapsed=${e.elapsedSec}s done=${e.done} pass=${e.pass} runSec=${e.runSecInt}s`).join('；'))) {
-      /* ① 两侧对"完成数"这一共同输入必须一致（若连它都不一致，下面的比对没有意义） */
+      /* ① 两侧对"完成数"这一共同输入必须一致（若连它都不一致，下面的比对没有意义）。
+         ⚠ `E65` 后的判别力：这一段在**旧形状**（把件塞进 `tasks`）下服务端恒 0 ⇒ 本条必红；
+         现在两侧喂的是等价输入（件级 `pieces` 的合格/不合格件数 ＝ 构造值 pass/done−pass）。 */
       check(
         '跨实现一致性前提：同一组输入下两侧的完成数一致（FR-4.4）',
-        evals.every(e => e.fe.done === e.done && e.be.doneQty === e.done),
-        evals.map(e => `${e.iso}: 前端 ${e.fe.done} / 服务端 ${e.be.doneQty} / 构造值 ${e.done}`).join('；')
+        evals.every(e => e.fe.done === e.done && e.be.doneQty === e.done &&
+          e.be.passQty === e.pass && e.be.failQty === e.done - e.pass),
+        evals.map(e => `${e.iso}: 前端 ${e.fe.done} / 服务端 ${e.be.doneQty} / 构造值 ${e.done}` +
+          `（合格 前端 ${e.fe.qualified} / 服务端 ${e.be.passQty} / 构造 ${e.pass}）`).join('；')
       );
 
       /* ②a 三项百分比指标：**必须严格一致**（两侧都归一到 1 位小数，容差 0.05 只吸收浮点表示误差）。
@@ -1164,37 +1324,63 @@ async function main() {
         );
       }
 
-      /* ②b 平均测试时长（FR-4.13）：**已知取整边界**，写成可证伪的构成性断言，而不是放宽容差。
-         事实（实测 + 源码）：
-           · 公式两侧一致，都是 `runSec / done`（mockData.computeStats 与 stats.js 的派生指标段）；
-           · 差异只在最后一步：服务端对该商做 `Math.round` **取整到整秒**，
-             前端**不取整**（保留小数）。
-         ⇒ 期望关系（构成性，无魔数）：`服务端值 === Math.round(前端值)`，等价于
-           `前端值 − 服务端值 ∈ (−0.5, 0.5]`。
-         它是不是恒真？不是：服务端值是"同一个商取整后的结果"这一事实本身就是要验的关系 ——
-         一旦某侧公式分叉（分子/分母被改动），`Math.round(前端) === 服务端` 立刻不成立。
-         取整边界样本（03:30:58）实测 126.58227848101266 → 服务端 127：**截断**会得 126、
-         **四舍五入**才得 127，故这条同时锁住"服务端确实走 Math.round 而非截断"。 */
+      /* ②b 平均测试时长（FR-4.13）：`E67` 之后**两侧各自独立取数**，故本段**不再**断言
+          "服务端值 === Math.round(前端值)"（那条断言把两侧绑成同一真源，构造出一致并掩盖分叉 ——
+          B3-5 指出的正是这一点；实测旧写法下把前端 `avgTest` 改回 `runSec / done` 曾使三条谓词全绿）。
+          改为两条**侧内**构成性断言（ADR-0004 D21：期望值现算，不写死魔数）：
+            · 服务端：`avgTestSec` ＝ `Math.round(Σ pieces[].durationSec ÷ doneQty)`（分子是**件级时长和**）；
+            · 前端：`avgTest` ＝ **演示节拍** `cycleSec / outputRatio`（与服务端同一需求口径、各自取数）。
+          两侧的**取值**在本样本上不必相等 —— 那是"两份实现各自的输入不同"的必然结果，
+          在 ②c 里作为**已知边界**登记（`INCOMPARABLE_4B`），不再当"公式差异"去放宽容差。 */
       const avgBoundary = evals.map(e => ({
-        iso: e.iso, done: e.done, fe: e.fe.avgTest, be: e.be.avgTestSec,
+        iso: e.iso, done: e.done, fe: e.fe.avgTest, be: e.be.avgTestSec, durSum: e.durSum,
         delta: e.fe.avgTest - e.be.avgTestSec,
-        sameRound: e.be.avgTestSec === Math.round(e.fe.avgTest),
-        withinHalf: (e.fe.avgTest - e.be.avgTestSec) > -0.5 && (e.fe.avgTest - e.be.avgTestSec) <= 0.5,
-        /* 独立等价计算（不改源码）：前端值应等于 构造运行时长 / 完成数 —— 证明两侧公式同源，
-           即"不取整时两侧严格相等"，与取整无关 */
-        formulaSame: Math.abs(e.fe.avgTest - e.runSecExact / e.done) < 1e-9
+        /* 侧内构成性等式（两侧各自成立；改任一侧的分子/分母集合/取整口径都会让对应那条变红） */
+        beFormulaOk: e.be.avgTestSec === (e.done > 0 ? Math.round(e.durSum / e.done) : 0),
+        feFormulaOk: e.fe.avgTest === (prod.outputRatio > 0 ? prod.cycleSec / prod.outputRatio : prod.cycleSec),
+        /* **构造自检**（原"输入等价性"，B3-5 建议②：降级为构造自检，不再当公式契约）：
+           Σ durationSec 是本次构造**自己给的常数 × done**（不再借 `splitInt(runSecInt, done)`）；
+           `be.runSec === runSecInt` 则是**真实契约**（服务端 `runSec` ＝ 采集条数 − 1）。 */
+        durSumIsConstruct: e.durSum === e.bePieceSec * e.done,
+        runSecContract: e.be.runSec === e.runSecInt
       }));
       check(
-        '跨实现一致（FR-4.13 平均测试时长）：服务端值 === Math.round(前端值) —— 取整口径差异属已知边界' +
-        '（服务端取整、前端不取整），非公式差异',
-        avgBoundary.every(r => r.sameRound),
-        avgBoundary.map(r => `${r.iso}: 前端 ${r.fe} / 服务端 ${r.be}（done=${r.done}，Math.round(前端)=${Math.round(r.fe)}）`).join('；')
+        '跨实现一致（FR-4.13 平均测试时长·**侧内构成性等式**）：服务端 `avgTestSec` ＝ Math.round(' +
+        'Σ **件级**时长 ÷ 已完成数)，前端 `avgTest` ＝ **演示节拍**（cycleSec / outputRatio）' +
+        '—— 两侧各自独立取数、不靠"把 Σ件级时长绑成 runSec"对齐',
+        avgBoundary.every(r => r.beFormulaOk && r.feFormulaOk),
+        avgBoundary.map(r => `${r.iso}: 服务端 ${r.be}（期望 round(${evals.find(x => x.iso === r.iso).durSum} ÷ ${r.done})）` +
+          `／前端 ${r.fe}（期望 ${prod.cycleSec} / ${prod.outputRatio} ＝ ${prod.cycleSec / prod.outputRatio}）`).join('；')
       );
+      const incomparable = {
+        declared: INCOMPARABLE_4B,
+        /* "不可比"的可证伪判据（**不写魔数**）：两侧取值在本段现场上**确实不同**；
+           若有人把两侧绑回同一真源（差额全为 0）⇒ 本条变红。 */
+        distinct: avgBoundary.every(r => r.delta !== 0),
+        sameSideFormulaOk: avgBoundary.every(r => r.beFormulaOk && r.feFormulaOk)
+      };
       check(
-        '取整边界有界且与公式无关：|前端 − 服务端| ≤ 0.5，且前端值 = 运行时长 / 完成数（不取整时两侧严格相等）',
-        avgBoundary.every(r => r.withinHalf && r.formulaSame),
-        avgBoundary.map(r => `${r.iso}: 前端 ${r.fe} − 服务端 ${r.be} = ${r.delta}` +
-          `（∈ (−0.5, 0.5]：${r.withinHalf}；前端 = runSec/done：${r.formulaSame}）`).join('；')
+        '跨实现一致（E67 后**不可比量已显式登记**）：两侧的**件级时长**定义不同 ⇒ avgTest ' +
+        '**不要求相等**（前端＝演示节拍、服务端＝独立整数秒之和后再取整）；"不可比"本身须可证伪',
+        incomparable.distinct && incomparable.sameSideFormulaOk,
+        '登记：' + INCOMPARABLE_4B.name + ' —— 前端＝' + INCOMPARABLE_4B.feBasis +
+        '、服务端＝' + INCOMPARABLE_4B.beBasis + '；实测各样本差额 ' +
+        avgBoundary.map(r => r.iso + '→' + r.delta).join('、') +
+        '（全不为 0=' + incomparable.distinct + '，即两侧**没有**被绑成同一真源）；' +
+        '两侧各自侧内构成性等式成立=' + incomparable.sameSideFormulaOk
+      );
+      /* ②d `E65` 新契约的**构造自检**（B3-5 建议②：由"公式契约"降级为"构造自检"，并显式登记
+         "本段 ΣdurationSec 由构造给出 ⇒ 对 `avgTest` 的**集合口径**不可证伪"——
+          对集合口径真正可证伪的是上面 (B) 的 `collectionProbe` 与 `tests\logic-check.js` 的
+          `FR-4.13`／九 · 当班件级取数两条断言）。 */
+      check(
+        '跨实现一致（构造自检，**不对集合口径作证**）：服务端件级时长之和 ＝ 构造常数 × 完成数，' +
+        '且服务端有效运行 runSec ＝ 采集条数 − 1（真实契约，与构造无关）',
+        avgBoundary.every(r => r.durSumIsConstruct && r.runSecContract),
+        avgBoundary.map(r => `${r.iso}: ΣdurationSec=${evals.find(x => x.iso === r.iso).durSum}` +
+          `（＝${evals.find(x => x.iso === r.iso).bePieceSec}×${r.done}：${r.durSumIsConstruct}）` +
+          ` / 服务端 runSec=${evals.find(x => x.iso === r.iso).be.runSec} vs runSecInt=${evals.find(x => x.iso === r.iso).runSecInt}` +
+          `（${r.runSecContract}）`).join('；')
       );
       /* ③ 前端基线自洽（D23 式守卫）：断言的输入口径不得在无人察觉时漂移。
          合格数 / 完成数 若与界面输出的一次性合格率对不上，说明"同一组输入"两个字段各说各话 ——

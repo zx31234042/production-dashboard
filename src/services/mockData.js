@@ -261,7 +261,28 @@ window.MockData = (function () {
     const started = Math.min(P, done + testing + recheck);   // 开工数封顶于计划数，避免"未开工"为负（FR-4.3）
     const runSec = elapsed * CFG.runRate;
     const idleSec = elapsed - runSec;
-    const avgTest = done > 0 ? runSec / done : 0;
+    /* FR-4.13 单台平均测试时长：**与服务端 `server/services/stats.js` 的 `avgTestSec` 同一算式** ——
+       Σ(已完成件的件级测试时长) ÷ 完成数（合格＋不合格），依据需求 FR-4.13
+       「完成测试总时长 ÷ 完成数量」。
+       ⚠ `E67`（负责人 2026-09-30 裁定③）与上一版的差别（如实登记）：上一版写 `runSec / done`，
+         分子是**设备**口径的运行时长（`elapsed × runRate`）；而服务端自 `E65` 起用**件级**时长之和
+         ⇒ 同一指标两份实现各自取数、门禁 M 段的"输入等价性"构造又把两侧绑成相等 ⇒ 分叉无人守。
+       件级时长**由演示数据现算**（不另造一个与服务端矛盾的量）：
+         · 演示里一件的测试时长 ＝ 单件节拍 `CFG.cycleSec`（`tick()` 的件序号与四阶段都按它推进）；
+         · 演示旋钮 `outputRatio` < 1 表示"实际产出慢于计划"（见上面 `done` 的算式）⇒ 实际节拍被
+           拉长为 `cycleSec / outputRatio`，与 `done = floor(elapsed / cycleSec × ratio)` 同一口径。
+       集合与服务端 `DONE_STATUS` **同集合**：`待复检`／`测试中`／`待测试` **不计入分子**
+       （它们仍进 `demoPieces`，只为让"这条过滤"本身是可读、可被定点变异证伪的一条真过滤）。 */
+    const pieceSec = CFG.outputRatio > 0 ? CFG.cycleSec / CFG.outputRatio : CFG.cycleSec;
+    const demoPieces = [];
+    for (let i = 0; i < qualified; i++) demoPieces.push({ result: '合格', durationSec: pieceSec });
+    for (let i = 0; i < unqualified; i++) demoPieces.push({ result: '不合格', durationSec: pieceSec });
+    for (let i = 0; i < recheck; i++) demoPieces.push({ result: '待复检', durationSec: pieceSec });
+    if (testing > 0) demoPieces.push({ result: '测试中', durationSec: 0 });
+    const testSecSum = demoPieces.reduce((s, p) =>
+      s + ((p.result === '合格' || p.result === '不合格') && Number.isFinite(p.durationSec)
+        ? Math.max(0, p.durationSec) : 0), 0);
+    const avgTest = done > 0 ? testSecSum / done : 0;
     return {
       plan: P, started, notStarted: P - started,
       done, testing, pending,

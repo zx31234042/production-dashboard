@@ -25,10 +25,18 @@
               { shift:{name,date,startAt,endAt,elapsedSec,totalSec}, planQty, startedQty,
                 notStartedQty, doneQty, runningQty, waitingQty, passQty, failQty, retestQty,
                 firstPassRate, runSec, idleSec, avgTestSec, capacityRate, oee,
-                accumulate:{daySec,monthSec,yearSec,at,reset}, taskTotal, cycleSec }
+                accumulate:{daySec,monthSec,yearSec,at,reset}, orderTotal, cycleSec }
               来源：**当班统计的唯一核算处**（FR-4 十五项口径不在此重写）
-              ⚠ 任务件数的**取数真源＝`result` 表（DR-05）**，不是 `task.status`（后者全仓无写入方 ⇒
-                "已完成"恒 0，与 `FR-5.11` 的 detail 同屏矛盾；E61／审查 P1-2 已裁定改源）
+              ⚠ **两类粒度分别取数**（技术债 `E65`，负责人 2026-09-30 裁定）：
+                · **票级**（`planQty`/`startedQty`/`notStartedQty`/`orderTotal`）← `task` 表
+                  （`plan_qty`、`plan_start_time` 落在当班窗口）＋ 该票在 `measure_rt` **是否有采样帧**；
+                · **件级**（`doneQty`/`passQty`/`failQty`/`retestQty`/`runningQty`/`waitingQty`/
+                  `firstPassRate`/`avgTestSec`）← `result` 表（DR-05，`judged_at` 落在当班窗口）。
+              ⚠ "已完成"的**取数真源＝`result` 表**，不是 `task.status`（后者全仓无写入方 ⇒
+                "已完成"恒 0，与 `FR-5.11` 的 detail 同屏矛盾；E61／审查 P1-2 已裁定改源）。
+              ⚠ **不用** `task.status` 判"已开工"（同一原因：无写入方）；开工判定＝`measure_rt` 有帧。
+              ⚠ `src/config/board.config.js` 的 `production.planQty` **仅供前端演示**，本段不取它
+                （计划数真源＝当班 `task.plan_qty` 之和；无派工 ⇒ 0，见 `E65`）。
      standard { productCode, processCode, versionNo:number|null, effectiveFrom:string|null,
                 depth:{typical,upperDev,lowerDev,upper,lower,set}, speed:{同左},
                 limits:{depth:{upper,lower,typical}|null, speed:{…}|null} } | null
@@ -87,7 +95,7 @@ function segOf(config, name) {
 /**
  * 创建整机快照构造器。
  * @param {{db?:object, ingest?:object, upload?:object, now?:Function, config?:object}} [options]
- *   `db`     —— SQLite 句柄（读 `task`／`device`／`measure_rt`／**`result`**；**只读**，不写任何表）
+ *   `db`     —— SQLite 句柄（读 `task`／`device`／`measure_rt`／`result`；**只读**，不写任何表）
  *   `ingest` —— `services/ingest.js` 实例（`linkState()` / `lastSampledFrame()`）
  *   `upload` —— `services/uploadReporter.js` 实例（`status()`）；缺省 ⇒ `upload` 键为 null 的子集
  *   `now`    —— 注入时钟出口（与全进程同一份；缺省＝真实时钟，不新造第二套）
@@ -151,36 +159,73 @@ function createStateSnapshot(options = {}) {
 
   /** 快照里的统计段（**唯一核算处**＝`services/stats.computeShiftStats()`；本文件不重写任何算式）
    *
-   *  **取数真源（技术债 `E61`／审查 P1-2，负责人 2026-09-30 裁定）**：当班统计的"已完成"改读
-   *  **`result` 表（DR-05）**，与 `FR-5.11` 的「已完成」**同源**；`task.status` **不再**充当
-   *  "已完成"的输入。为什么必须换：`task.status` **全仓没有写入方**（`dispatch.js` 自述不写、
-   *  `schema.sql` 缺省 `待测试`）⇒ 交给 `stats.js` 的输入恒为"待测试" ⇒ `FR-4.4`／`FR-4.10`／
-   *  `FR-4.13`／`FR-4.14` 恒 0，而同帧 `FR-5.11` 的 detail 却按 `result` 表显示"实际已完成 N 件"
-   *  ⇒ **同屏两个互相矛盾的"已完成"**。裁定取"单一真源、与 `FR-5.11` 同源"这一支。
+   *  **票级与件级分别取数（技术债 `E65`，负责人 2026-09-30 裁定的三条口径）**：
+   *   ① **开工判定 ＝ 该票在 `measure_rt` 里有采样帧**（库内可推、**不新增写点**、**不用 `task.status`**）。
+   *      为什么不用 `task.status`／`actual_start`：这两列**全仓无写入方**（`dispatch.js:683` 自述
+   *      `status` 不写 —— 它是本机进度列；`schema.sql` 缺省「待测试」）⇒ 若拿它判开工，"开工"恒 0
+   *      （这是 `E65` 的**改前**形态）。也**不**在这里补写 `task.status`／`actual_start` —— 那是被
+   *      负责人否决的选项 B（见 `E65`）。
+   *   ② **当班归属**：票按 `task.plan_start_time` 落在班次窗口；件按 `result.judged_at` 落在班次窗口；
+   *      **无 `plan_start_time` 的票不参与统计**（不编造、也不按 0 计）。窗口用**既有班次真源**
+   *      `services/shift.js`（`shift.startAt`/`shift.endAt` 本身就是 DR-16 文本，直接做半开区间
+   *      `>= startAt AND < endAt` 比较 —— 不在这里另造时间源、不重算班次边界）。
+   *   ③ **计划数 ＝ Σ 当班窗口内 `task.plan_qty`**；**无派工 ⇒ 计划 0**；**不用配置的演示值顶替**
+   *      （`board.config.js` 的 `production.planQty` 自 `E65` 起**仅供前端演示**，本段**不再读它**）。
    *
-   *  **本文件只做取数与字段改名**（这是取数层的活）：`result.result`（FR-3.13 五态之一）就是
-   *  `stats.js` 入参 `tasks[].result` 的**同一口径、同一取值域**（`repo/result.js` 与 `stats.js`
-   *  共用同一份 `STATUS`/`DONE_STATUS` 常量）⇒ 逐行原样映射，**不改写、不换算、不补 0**。
-   *  十五条算式一条都不在这里（仍在 `stats.js`）：`DONE_STATUS`＝合格＋不合格由 `stats.js:71` 判，
-   *  `待复检` 不计已完成的理由与 SQL 归口在 `repo/result.js` 的 `countDone()`。
-   *  ⚠ 由此"当班任务数"的语义从"`task` 表的派工条数"变为"**`result` 表里有测试结果的件数**"
-   *  （`taskTotal`／`startedQty`／`waitingQty`／`notStartedQty` 随之为**按件**口径）——
-   *  这是"已完成与 FR-5.11 同源"这一裁定的必然连带，已在报告 B 分区登记（不是顺手改的口径）。
+   *  **本文件只做取数**（取数层的活），十五条算式一条都不在这里（仍在 `stats.js`）：
+   *  `DONE_STATUS`＝合格＋不合格由 `stats.js` 判；`待复检` 不计已完成的理由与 SQL 归口在
+   *  `repo/result.js` 的 `countDone()`；`started` 的布尔翻转由本段按"有无采样帧"给出，
+   *  它只描述**数据状态**，不是算式。
    *  ⚠ `task` 表仍供快照的 `task` 段（DR-02 工单信息）与标准段取数，本段不动那两处。 */
   function statsOf(now) {
-    const prod = segOf(config, 'production');
-    /* 按件读 DR-05：一票多件 ⇒ 多行；空票 ⇒ 0 行（"拿不到"就是没有行，不给假行） */
-    const rows = db ? db.prepare('SELECT result FROM result').all() : [];
-    const measures = db
-      ? db.prepare('SELECT collect_time FROM measure_rt ORDER BY id DESC LIMIT 1000').all()
-      : [];
     const shift = shiftRules.at(now);
+    /* ---- 票级取数（`task` ＋ `measure_rt`）----
+       只取"计划开工时刻落在当班窗口内且确实有派工数量"的票；`plan_start_time` 为空 ⇒ **整票不参与**
+       （`plan_start_time IS NOT NULL AND plan_start_time <> ''`；不按 0 处理、不拿 `created_at` 顶替）。 */
+    let orders = [];
+    if (db) {
+      const rows = db.prepare(
+        `SELECT proc_order_no AS procOrderNo, plan_qty AS planQty
+           FROM task
+          WHERE plan_start_time IS NOT NULL AND plan_start_time <> ''
+            AND plan_start_time >= ? AND plan_start_time < ?`
+      ).all(shift.startAt, shift.endAt);
+      /* 开工判据（口径①）：该票在当班窗口内**有没有采样帧**。取一行即判"已开工" ——
+         这里刻意不用 `COUNT(*)`（票多时每票一次全表数没有收益），也不用 `task.status`。 */
+      const probe = db.prepare(
+        `SELECT 1 AS hit FROM measure_rt
+          WHERE proc_order_no = ? AND collect_time >= ? AND collect_time < ? LIMIT 1`);
+      orders = rows.map(r => ({
+        planQty: r.planQty,
+        started: Boolean(probe.get(r.procOrderNo, shift.startAt, shift.endAt))
+      }));
+    }
+    /* ---- 件级取数（`result`，DR-05）----
+       按 `judged_at` 落窗口取"当班件"；`result` 逐行原样映射给 `stats.js`（**不改写、不换算、不补 0**），
+       五态取值域与 `stats.js` 的 `STATUS` 同一份（`repo/result.js` 已在写入口校验过）。 */
+    let pieces = [];
+    if (db) {
+      const rows = db.prepare(
+        `SELECT result, duration_sec AS durationSec
+           FROM result
+          WHERE judged_at IS NOT NULL AND judged_at >= ? AND judged_at < ?`
+      ).all(shift.startAt, shift.endAt);
+      pieces = rows.map(r => ({ result: r.result, durationSec: r.durationSec }));
+    }
+    /* 有效运行/待机推导仍用**当班窗口内**的采样时刻串（与票级"有无帧"同源，但用途不同：
+       前者数条数、后者只判有无）。 */
+    const measures = db
+      ? db.prepare(
+        `SELECT collect_time AS collectTime FROM measure_rt
+          WHERE collect_time >= ? AND collect_time < ?
+          ORDER BY id DESC LIMIT 1000`).all(shift.startAt, shift.endAt)
+      : [];
     const computed = statsSvc.computeShiftStats({
       shift,
-      tasks: rows.map(r => ({ result: r.result })),
-      measures: measures.map(r => r.collect_time),
-      planQty: prod.planQty,
-      cycle: { sec: prod.cycleSec },
+      orders,
+      pieces,
+      measures: measures.map(r => r.collectTime),
+      cycle: { sec: segOf(config, 'production').cycleSec },
       now,
       /* DR-17 累计运行：本项目尚无落库调用方（见文件头"口径与边界"），故增量 0、无上次值 */
       addRunSec: 0
