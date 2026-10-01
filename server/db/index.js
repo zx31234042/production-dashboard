@@ -60,7 +60,102 @@ const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
  * 容错口径：这些步骤**只可能因"列/索引已存在"而失败**，此时吞掉该错误继续。其余错误照常抛出，
  * 由 `initSchema()` 回滚整个事务 —— 保证"要么整套结构到位，要么一行不动"。
  * 每条步骤都必须是**可重复执行且不破坏数据**的；带重建语义的迁移见 `migrateLegacyStandard()`。
+ *
+ * **形态白名单（E74，2026-10-01）**：本清单**只接受**两种形态 —— (a) `ALTER TABLE <表> ADD COLUMN <列> …`、
+ * (b) `CREATE INDEX IF NOT EXISTS <索引> …`（`UNIQUE` 可选）；由 `assertUpgradeStepShape()` 在**执行每条
+ * 之前**判定，不匹配即**当场抛错**，且**不被**下面那句 `duplicate column name` 的容忍 catch 吞掉。
+ * 判据本体与"为什么"见紧接着的 `UPGRADE_STEP_FORMS` / `assertUpgradeStepShape()` docblock。
  */
+
+/**
+ * `STRUCTURE_UPGRADES` 步骤的**形态白名单** —— 唯一一份判据（纯函数：不建库、不碰数据库句柄、无副作用）。
+ *
+ * **白名单是什么**：只接受下面两种形态（大小写不敏感、允许多余空白、允许 `"x"` / `` `x` `` / `[x]` 三种标识符引号）
+ *   (a) `ALTER TABLE <表> ADD COLUMN <列> …`
+ *   (b) `CREATE INDEX IF NOT EXISTS <索引> …`（`UNIQUE` 可选）
+ * 其余一律**当场抛错**（见 `assertUpgradeStepShape()`），由 `initSchema()` 回滚整个事务。
+ *
+ * **为什么（技术债 `E74`；判据由座位 5 在 `T-20260930-24` 的 C·12.6③ 提出、X1 实验实测）**：
+ * 本清单在 `initSchema()` 里被**无条件逐条执行**，而单条步骤的失败**只**在
+ * `duplicate column name|already exists` 时被吞 ⇒ "改列类型／删列"这类**不在白名单里**的变更会走出
+ * 一条**静默三连**（X1 实测签名）：
+ *   ① **静默空操作**：`ALTER TABLE … ALTER COLUMN …` 这类语句在 SQLite 下对**已存在**的表什么都不改，
+ *      步骤却"执行成功"；`ALTER TABLE … RENAME TO …` 更糟 —— 它会**真改名**，且**照样不报错**；
+ *   ② **结构分化**：新库与老库由此**静默不同**（X1 造出"缺 `fail_reason`"的库）；
+ *   ③ **没有任何读数报警**：`verifySchemaConsistency()` 在**已经分化**的库上仍返回 `{"ok":true}`，
+ *      直到**第一次真实写入**才抛 `table upload_log has no column named fail_reason`
+ *      ⇒ "门禁绿、库却分叉"，与 `E71`／`E73` 同族（ADR-0004 D19："门禁绿"≠"结构已迁移"）。
+ * 这条白名单把"静默空转"换成"**响亮失败**"：形态不对 ⇒ 连试都不试，错误信息直接带**步骤原文**与**正确出路**。
+ *
+ * **新形态要进来必须先扩白名单并配 D22**：白名单是**判据**、不是说明文档 —— 增加一种形态等于**改契约**，
+ * 必须同批给出"按旧白名单跑**必红**"的定点变异证据（ADR-0004 D22），否则新形态会像 X1 那样被静默漏过。
+ * **正确出路**：删列／改列类型／改约束请写**有名有姓的重建迁移函数**（先例 `migrateLegacyStandard()`：
+ * 整表重建、自带判据与自检、可审计），并配 D22 靶子。
+ */
+const UPGRADE_STEP_FORMS = [
+  {
+    kind: 'add-column',
+    what: 'ALTER TABLE <表> ADD COLUMN <列> …',
+    re: /^ALTER\s+TABLE\s+(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)/i
+  },
+  {
+    kind: 'create-index',
+    what: 'CREATE INDEX IF NOT EXISTS <索引> …（`UNIQUE` 可选）',
+    re: /^CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF\s+NOT\s+EXISTS\s+(?:"[^"]+"|`[^`]+`|\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)/i
+  }
+];
+
+/**
+ * 判定一条升级步骤属于哪种**允许形态**（纯函数，可对真值表逐条断言）。
+ *
+ * 判据刻意**只锚定前缀**、不锚定整句：列类型/DEFAULT/约束的合法写法太多，写全必然要么漏、要么把
+ * 现有步骤拒之门外（后者正是"白名单写窄了"）。唯一额外的一条正文约束是"**单语句**"：
+ * 允许一个结尾分号，但不允许语句体内再出现分号 —— 否则 `ALTER TABLE t ADD COLUMN a TEXT; DROP TABLE t`
+ * 这种"合法前缀 ＋ 夹带"会整条通过，白名单当场形同虚设。
+ *
+ * @param {*} step 步骤原文（`STRUCTURE_UPGRADES` 的一项）
+ * @returns {{ok:boolean, kind:'add-column'|'create-index'|'unsupported', form:string|null, reason:string}}
+ *   命中时 `kind` 为形态名、`form` 为等价写法；未命中时 `ok=false` 且 `reason` 说明为什么。
+ */
+function classifyUpgradeStep(step) {
+  if (typeof step !== 'string') {
+    return { ok: false, kind: 'unsupported', form: null, reason: '步骤不是字符串' };
+  }
+  const text = step.trim();
+  if (!text) return { ok: false, kind: 'unsupported', form: null, reason: '步骤是空串' };
+  const body = text.replace(/;\s*$/, '');
+  if (body.includes(';')) {
+    return { ok: false, kind: 'unsupported', form: null, reason: '一条步骤里出现了多条语句（`;` 不止结尾那一个）' };
+  }
+  for (const form of UPGRADE_STEP_FORMS) {
+    if (form.re.test(body)) return { ok: true, kind: form.kind, form: form.what, reason: '' };
+  }
+  return { ok: false, kind: 'unsupported', form: null, reason: '不匹配任何允许形态' };
+}
+
+/**
+ * 断言一条升级步骤在白名单内；不在则**抛错**（错误信息**带违规步骤原文**与**正确出路**）。
+ *
+ * **调用位置有讲究**：调用点在 `initSchema()` 的步骤循环里、`db.exec(step)` **之前**，且刻意放在
+ * 容忍 `duplicate column name|already exists` 的那个 `try` **之外** —— 形态违规**不得**被那张网吞掉。
+ *
+ * @param {*} step 步骤原文（`STRUCTURE_UPGRADES` 的一项）
+ * @returns {{ok:true, kind:string, form:string, reason:string}} 通过时的分类结果（供调用方记录）
+ * @throws {Error} 形态不在白名单内（消息含 `违规步骤原文：…`）
+ */
+function assertUpgradeStepShape(step) {
+  const verdict = classifyUpgradeStep(step);
+  if (verdict.ok) return verdict;
+  throw new Error(
+    `STRUCTURE_UPGRADES 步骤形态不被允许（E74）：${verdict.reason}。` +
+    `只接受两种形态：${UPGRADE_STEP_FORMS.map(f => f.what).join(' ／ ')}。` +
+    `违规步骤原文：${JSON.stringify(step)}。` +
+    '删列/改列类型请写**有名有姓的重建迁移函数**（先例 migrateLegacyStandard()）并配 D22 靶子：' +
+    '这两类变更在 SQLite 下对老库是**静默空操作**（改类型）或**静默真删/真改名**（DROP COLUMN／RENAME），' +
+    '而 verifySchemaConsistency() 在已经分化的库上仍返回 ok:true —— 只有第一次真实写入才会炸。'
+  );
+}
+
 const STRUCTURE_UPGRADES = [
   /* DR-12（V1.33）：op_log 增列 team_code（班组编号）。schema.sql 的新建表语句里已有该列，
      旧库（SCHEMA_VERSION '3'）需要这一步补上；重复执行时报 `duplicate column name` 被吞掉。 */
@@ -596,6 +691,9 @@ function initSchema(db, now, options = {}) {
     migration = migrateLegacyStandard(db);
     db.exec(sql);
     for (const step of STRUCTURE_UPGRADES) {
+      /* E74：**先判形态、再执行** —— 且刻意放在下面这个 try **之外**，让
+         `duplicate column name|already exists` 的那张容忍网**吞不到**"形态违规"这一步。 */
+      assertUpgradeStepShape(step);
       try {
         db.exec(step);
       } catch (err) {
@@ -746,6 +844,9 @@ function formatNow(d = new Date()) {
 module.exports = {
   SCHEMA_VERSION,
   SCHEMA_FILE,
+  UPGRADE_STEP_FORMS,
+  classifyUpgradeStep,
+  assertUpgradeStepShape,
   STRUCTURE_UPGRADES,
   PRE_MIGRATION_BACKUP_OP_TYPE,
   readSchemaSql,
