@@ -98,11 +98,17 @@ CREATE INDEX IF NOT EXISTS ix_standard_product ON standard(product_code, effecti
    换成占位行**（追加式模型下等于静默毁数据），已改掉 —— 详情见本次交付说明。 */
 
 /* ---------------- DR-04 实测数据表（高频时序；DR-13 去重键） ----------------
-   注意：只落 1 s 采样；500 ms 原始帧**只进内存不落库**（ADR-0001 D7） */
+   注意：只落 1 s 采样；500 ms 原始帧**只进内存不落库**（ADR-0001 D7）
+   列序依据**需求 V1.41 §7 DR-04 的字段次序**（`procOrderNo、件序号 unit_index、depth、speed…`），
+   故 `unit_index` 紧邻 `proc_order_no`：落库口 `server/repo/measure.js` 的 `toParams()`/`INSERT_SQL`
+   是**按位置**绑定的，两处必须与下面这段逐位一致（错位会静默写错列）。 */
 CREATE TABLE IF NOT EXISTS measure_rt (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   equip_code    TEXT NOT NULL,
   proc_order_no TEXT NOT NULL,
+  unit_index    INTEGER,                         -- 件序号（＝IF-D.4 的 unitIndex；**采集落库时写入**，V1.41 / C-111）
+                                                 --   帧未带 / 非法（非整数、<1）⇒ NULL ＝"拿不到"，**不得用 0/1 代言**
+                                                 --   真实字段名与取值域待 Q-21 答复
   measure_depth REAL,                            -- 航行器水下深度 depth（≠ 相机深度）
   speed         REAL,
   velocity_x    REAL,
@@ -118,6 +124,15 @@ CREATE TABLE IF NOT EXISTS measure_rt (
 -- DR-13：以 equipCode + procOrderNo + collectTime 为去重键
 CREATE UNIQUE INDEX IF NOT EXISTS ux_measure_rt ON measure_rt(equip_code, proc_order_no, collect_time);
 CREATE INDEX IF NOT EXISTS ix_measure_rt_task_time ON measure_rt(proc_order_no, collect_time);
+/* 旧库兼容（V1.41 之前建的库，`measure_rt` 没有 `unit_index` 列）：该列**允许 NULL**
+   ⇒ 既有行天然合法、**不需要任何数据回填**（一行都不 UPDATE）。但 SQLite 的
+   `CREATE TABLE IF NOT EXISTS` 对**已存在的旧表是空操作**、列不会凭空出现（且 SQLite 写不出
+   `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`），故旧库的补列交给 `server/db/index.js` 的
+   `STRUCTURE_UPGRADES`（`SCHEMA_VERSION` 驱动的幂等升级步骤，与 `op_log.team_code` 同一先例）。
+   分工与本仓既有一致：**schema.sql 描述新建库的结构正本，升级动作由读取它的那个模块统一执行**。
+   为什么必须补：不补列时老库上带 `unit_index` 的落库语句会报
+   `table measure_rt has no column named unit_index` ⇒ 采集链整条断（每一帧都失败），
+   而不是"少记一个件序号"这种可容忍的降级。 */
 
 /* ---------------- DR-05 测试结果表 ---------------- */
 CREATE TABLE IF NOT EXISTS result (

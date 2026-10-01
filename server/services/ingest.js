@@ -37,10 +37,13 @@
           那等于在库的唯一索引之外**另起第二套去重真源**，正是任务书明令禁止的。
      故本实现**只报告库层的真实结果**（inserted=false），不自行改写；同秒多帧（seq 不同、
      collect_time 同）由"1 s 采样"这条口径先行拦下（见 ②/③），不会把 500 ms 原始帧顶掉采样帧。
-   落库表与字段（依据 ADR-0001 D7 + `server/db/schema.sql:100-120`）：
-     表 `measure_rt`；写入字段＝`equip_code, proc_order_no, measure_depth(depth), speed,
+   落库表与字段（依据 ADR-0001 D7 + `server/db/schema.sql` 的 DR-04 建表段）：
+     表 `measure_rt`；写入字段＝`equip_code, proc_order_no, unit_index, measure_depth(depth), speed,
      velocity_x, velocity_y, frame_rate, gain, shutter, camera_depth, test_status, collect_time,
      created_at`。**`seq` 不落库**——schema 与唯一索引都没有该列（C-101④ 明示"本次不加列"）。
+     `unit_index`（V1.41 / C-111）：＝`IF-D.4` 的 `unitIndex`，**采集落库时写入**；帧未带或非法
+     （非整数、< 1）⇒ 写 **NULL** 并计入 `status().frameUnitIndex.withoutIndex`（**不整帧拒收**：
+     实测数据本身有效）。它使 `FR-4.2` 的"开工数"能按**件**计（`FR-4.3` 的减数与被减数同单位，E69）。
    依赖：`server/repo/measure.js`（SQL，唯一落库出口）、`platform/clock.js`（时间注入与格式）、
         `src/config/board.config.js`（`upper.staleMs` 等参数真源）。**零第三方依赖。**
    用法：
@@ -88,7 +91,11 @@ const FIELD = Object.freeze({
   gain: 'gain',
   shutter: 'shutter',
   cameraDepth: 'cameraDepth',
-  testStatus: 'testStatus'
+  testStatus: 'testStatus',
+  /* V1.41 / C-111：`IF-D.4` 的件序号（落 `measure_rt.unit_index`）。字段名沿用
+     `src\config\fieldMap.js` 的既有映射（`'task.unitIndex' → key: 'unitIndex'`），真实字段名与
+     取值域待 `Q-21` 答复后只改两处（那边＋本常量）。 */
+  unitIndex: 'unitIndex'
 });
 
 /** **必填**字段（三件：去重主口径的键成分 + 值域校验的锚）。
@@ -216,6 +223,31 @@ function parseCollectTime(value) {
 }
 
 /**
+ * 解析件序号（`IF-D.4` 的 `unitIndex` → `measure_rt.unit_index`；V1.41 / C-111 ＋ 技术债 `E69`）。
+ *
+ * **纯函数**：不读库、不取时间、不改入参。**绝不抛错、绝不改判整帧** —— 件序号缺失或非法
+ * **不是**帧的错（实测数据本身有效），故这里只回答"这一帧的件序号拿不拿得到"，由调用方决定
+ * "拿不到就写 NULL 并计数"。
+ * 判据（与 `server/index.js` 的 `unitIndexOf()` 同一口径，两处读的是**同一帧的同一个字段**，
+ * 不许一个收下、另一个判"拿不到"）：
+ *   · `undefined` / `null` / `''`            ⇒ `{ok:false, reason:'absent'}`（帧没带）
+ *   · 整数且 ≥ 1                             ⇒ `{ok:true, value}`（**归一为数字**）
+ *   · 纯数字字符串（如 `'3'`，上位机常把序号序列化成字符串）⇒ 收下并归一为数字
+ *   · 其余（`0` / 负数 / 小数 / `'abc'` / 布尔 / 对象 / 超安全整数）⇒ `{ok:false, reason:'invalid'}`
+ * **为什么合法值不写 0**：`unit_index` 是"这一帧测的是哪一件"的事实，"拿不到"与"真的是第 0 件"
+ * 是两件事 —— 用 0/1 代言会把一票多件静默归并成一件（`server/index.js` 的 `unitIndexOf()` 注释
+ * 记着这条实测后果：10 帧 ⇒ `result` 只 1 行、落后率恒 ≈90.9%）。
+ * @param {any} raw 帧里的件序号原值
+ * @returns {{ok:true, value:number}|{ok:false, reason:'absent'|'invalid'}}
+ */
+function parseUnitIndex(raw) {
+  if (raw === undefined || raw === null || raw === '') return { ok: false, reason: 'absent' };
+  const n = (typeof raw === 'string' && /^\d+$/.test(raw.trim())) ? Number(raw.trim()) : raw;
+  if (isInt(n) && Number.isSafeInteger(n) && n >= 1) return { ok: true, value: n };
+  return { ok: false, reason: 'invalid' };
+}
+
+/**
  * 校验单个**可缺**数值字段：缺 ⇒ 跳过；类型/精度/量程不符 ⇒ 返回原因。
  * 判据顺序**固定**为 类型 → 整型 → 精度 → 量程：`depth: '5.00'` 必须报"类型错"而不是"超量程"
  * （否则现场会照着"量程"去改数据，而真正的问题是报文把数字序列化成了字符串）。
@@ -339,6 +371,13 @@ function validateFrame(frame, options = {}) {
     }
   }
 
+  /* ⑦ 件序号 `unitIndex`（V1.41 / C-111）：**有意不在这里校验、更不拒收** ——
+     负责人 2026-09-30 裁定②：非法件序号（非整数、< 1）**不整帧拒收**（实测数据本身有效），
+     按"**未提供**"处理（写 NULL ＋ 计入 `state.frameUnitIndex.withoutIndex`）。
+     理由：件序号是 `IF-D.4` 的**附加**字段（真实字段名与取值域待 `Q-21`），把它当必填会因
+     "上位机还没回填该字段"而丢掉真实测量数据 —— 那正是本仓反复禁止的"把配置/接口问题
+     当成帧脏"。解析在 `parseUnitIndex()`，落库在 `ingestFrame()` 的 ③ 段。 */
+
   return {
     ok: true,
     frame,
@@ -459,7 +498,16 @@ function createIngest(options = {}) {
     lastStoredSecond: null,     // 最近一次**落库**的那一秒（1 s 采样去重：同一秒不再落第二行）
     lastStoredKey: null,        // 最近一次落库的四/三字段键（诊断与幂等证据）
     lastFrame: null,            // 最近一帧有效报文（**内存态**，供实时显示；500 ms 帧也更新它）
-    lastSampledFrame: null      // 最近一帧**1 s 采样落库**的帧（W5 快照用；500 ms 原始帧不更新它）
+    lastSampledFrame: null,     // 最近一帧**1 s 采样落库**的帧（W5 快照用；500 ms 原始帧不更新它）
+    /* 件序号可观测性（V1.41 / C-111 ＋ 技术债 E69，与 E58 同精神）：
+       `FR-4.2` 的"开工数"**按件计**（判据＝该件在 `measure_rt` 有采样数据、以 `unit_index` 区分）
+       ⇒ 帧**不带件序号**时开工数会算成 **0**。故必须能区分两种"0"：
+         · `withoutIndex` —— 落库的帧里**没有**件序号的条数（开工数为 0 **可能只是帧没带**）；
+         · `withIndex`    —— 落库的帧里**带了**合法件序号的条数。
+       计数口径＝**真正落库（`stored`）的那一帧**：重复帧 / 500 ms 原始帧 / 被拒收帧都不是库里的行，
+       不计入 ⇒ 恒有 `withIndex + withoutIndex === counts.stored`（探针据此交叉核对，防"计数漂移"）。
+       **绝不用 0 代言"拿不到"**。 */
+    frameUnitIndex: { withIndex: 0, withoutIndex: 0 }
   };
 
   /** 判定挂钩（`onSampled`）的可观测性：回调抛错的次数与最后一次原因。
@@ -569,12 +617,17 @@ function createIngest(options = {}) {
 
       /* 落库出口**唯一**＝`server/repo/measure.js`（本包不写第二套 SQL，也不另起去重真源）。
          幂等依据：`INSERT OR IGNORE` + 库层唯一索引 `ux_measure_rt(equip_code, proc_order_no,
-         collect_time)`（`server/db/schema.sql:119`）。 */
+         collect_time)`（`server/db/schema.sql` 的 DR-04 段；**刻意不写行号** —— schema 一增列
+         行号即漂移，`PROJECT_RULES` 9.5-5 第 9 条要求引用带哈希而非会过期的行号）。 */
       const nowIso = platformClock.fmt(new Date(atMs));
+      /* 件序号（V1.41 / C-111）：**拿不到就写 NULL**，绝不整帧拒收、也不拿 0/1 代言
+         （裁定②：实测数据本身有效）。落列位置见 `server/repo/measure.js` 的 `toParams()`。 */
+      const unit = parseUnitIndex(v.frame[FIELD.unitIndex]);
       const row = {
         equipCode: v.frame[FIELD.equipCode],
         procOrderNo: v.frame[FIELD.procOrderNo],
         collectTime: v.collectTimeSec,          // **截断到秒**（DR-16：落库维持秒级）
+        unitIndex: unit.ok ? unit.value : null, // 缺 / 非法 ⇒ NULL（＝"这一帧没有件序号"）
         depth: v.frame[FIELD.depth],
         speed: v.frame[FIELD.speed],
         velocity_x: v.frame[FIELD.velocityX],
@@ -601,6 +654,27 @@ function createIngest(options = {}) {
       state.storedFrames++;
       state.lastStoredSecond = v.collectTimeSec;
       state.lastStoredKey = key;
+      /* 件序号计数（**只数真正落库的那一帧** ⇒ 恒有 withIndex + withoutIndex === storedFrames）：
+         非法/缺失都记 `withoutIndex`，并**留一条 warn**（不静默：现场要能看出"开工数为什么是 0"）。
+         为什么在落库成功之后计数而不是之前：`duplicate`/`raw-500ms` 不新增行，先计数会让两个数
+         与 `counts.stored` 对不上，把"可观测位"变成"又一个会漂移的数字"。 */
+      if (unit.ok) {
+        state.frameUnitIndex.withIndex++;
+      } else {
+        state.frameUnitIndex.withoutIndex++;
+        /* 日志**不逐帧刷**（帧率 1/s×多设备，逐帧 warn 会把日志淹掉、反而看不见）：
+           首次 + 之后每 100 帧各一条，与上方"500 ms 原始帧"的既有节流写法同款。
+           计数本身是**逐帧**的（不受日志节流影响），`/health` 里读得到真值。 */
+        if (logger && (state.frameUnitIndex.withoutIndex === 1 || state.frameUnitIndex.withoutIndex % 100 === 0)) {
+          const raw = v.frame[FIELD.unitIndex];
+          logger.warn(unit.reason === 'absent'
+            ? `[IF-D] 帧未带件序号（IF-D.4 unitIndex；累计 ${state.frameUnitIndex.withoutIndex} 帧）⇒ ` +
+              'measure_rt.unit_index 写 NULL、这些帧不计入开工件数（FR-4.2 按件计；"帧没带"≠"真没开工"）'
+            : `[IF-D] 帧里的件序号非法（${JSON.stringify(raw)}；累计 ${state.frameUnitIndex.withoutIndex} 帧）` +
+              ' ⇒ 视同"未提供"：unit_index 写 NULL、不计入开工件数（**不整帧拒收** —— 实测数据本身有效；' +
+              'IF-D.4 的真实字段名与取值域待 Q-21）');
+        }
+      }
       /* ---- ④ W5-①：把"**1 s 采样落库**的这条帧"发布到事件总线（`frame` 的**唯一**发布点） ----
          为什么只发这里（三条口径，逐条对齐需求）：
            · 「1 s 采样落库、500 ms 原始帧不落库」（ADR-0001 D7 / W1 判据③）——事件流若把 500 ms
@@ -697,6 +771,15 @@ function createIngest(options = {}) {
           sampledHookFailures: hookState.sampledHookFailures
         },
         lastSampledHookError: hookState.lastSampledHookError,
+        /* V1.41 / C-111（技术债 E69）：件序号计数 —— 让"开工数为什么是 0"可被现场读出来
+           （"帧没带件序号" vs "真没开工"）。`/health` 的 `ifd` 子集与 `GET /ifd/status` 同源
+           （两处都是本函数的返回值，不另算一份）。恒有 withIndex + withoutIndex === counts.stored。 */
+        frameUnitIndex: {
+          withIndex: state.frameUnitIndex.withIndex,
+          withoutIndex: state.frameUnitIndex.withoutIndex,
+          stored: state.storedFrames,
+          note: '帧件序号（IF-D.4 unitIndex）：缺件序号的帧 unit_index 写 NULL 且不计入开工件数（FR-4.2 按件计）'
+        },
         lastReject: state.lastReject,
         lastStoredKey: state.lastStoredKey,
         lastStoredSecond: state.lastStoredSecond,

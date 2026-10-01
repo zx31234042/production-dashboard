@@ -34,8 +34,17 @@ const path = require('node:path');
  *    该表是**纯新增**：`CREATE TABLE IF NOT EXISTS` 对旧库幂等生效，**不做重建迁移**；
  *    升版仍是必须的（ADR-0006 D2：schema.sql 正文一变指纹即变，`verifySchemaConsistency()`
  *    会以"指纹变了而结构版本没变"报错），且"旧库结构版本 ≠ 当前版本"正是 **E18 迁移前强制备份**
- *    的判据之一（见 `planMigration()`）。 */
-const SCHEMA_VERSION = '5';
+ *    的判据之一（见 `planMigration()`）。
+ *  2026-09-30 由 '5' 升到 '6'（需求 **V1.41 / C-111**：`FR-4.x` 计量单位定义 ＋ `DR-04` 件序号补登；
+ *    技术债 `E69`）：`measure_rt` **增列** `unit_index`（件序号 ＝ IF-D.4 的 `unitIndex`，
+ *    采集落库时写入）。该列**允许 NULL**（帧未带/非法件序号 ⇒ NULL），故：
+ *      ① **不需要任何数据回填** —— 既有行的 NULL 就是"这一帧没有件序号"的诚实表达
+ *         （**绝不用 0/1 代言"拿不到"**，与本仓 `judge.js` 的"拿不到不说"同一纪律）；
+ *      ② 旧库的补列走 `STRUCTURE_UPGRADES`（下一条）—— 理由与 `op_log.team_code` 逐字相同：
+ *         `CREATE TABLE IF NOT EXISTS` 对旧表是**空操作**，SQLite 又写不出 `ADD COLUMN IF NOT EXISTS`。
+ *    升版同样是必须的（正文一变指纹即变），且"库内版本 5 ≠ 当前 6"会命中 `planMigration()`
+ *    ⇒ 旧库启动前**强制备份**（E18 不可跳过）。 */
+const SCHEMA_VERSION = '6';
 
 /** 建表脚本位置（与本文件同目录） */
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
@@ -58,7 +67,15 @@ const STRUCTURE_UPGRADES = [
   'ALTER TABLE op_log ADD COLUMN team_code TEXT',
   /* 上面的列补齐后才能建这个索引（旧表补列前建会报 `no such column: team_code`）；
      `IF NOT EXISTS` 本身幂等。 */
-  'CREATE INDEX IF NOT EXISTS ix_op_log_team ON op_log(team_code, op_time)'
+  'CREATE INDEX IF NOT EXISTS ix_op_log_team ON op_log(team_code, op_time)',
+  /* DR-04（V1.41 / C-111）：measure_rt 增列 unit_index（件序号，采集落库时写入）。
+     旧库（SCHEMA_VERSION < '6'）需要这一步补上；`CREATE TABLE IF NOT EXISTS` 对旧表是空操作。
+     ① 列**允许 NULL** ⇒ 既有行天然合法、**无需数据回填**（这里刻意不写成 NOT NULL + DEFAULT 1：
+        "缺件序号"必须能与"真的是第 1 件"分开，用 DEFAULT 1 会把一票 N 件静默归并成一件）；
+     ② 重复执行时报 `duplicate column name` 被下面的容错吞掉，天然幂等；
+     ③ **不得**顺带改 `measure_rt` 的唯一索引 `ux_measure_rt`（DR-13 的幂等键列集固定为
+        equip_code + proc_order_no + collect_time，与本题无关，动它等于换去重口径）。 */
+  'ALTER TABLE measure_rt ADD COLUMN unit_index INTEGER'
 ];
 
 /**

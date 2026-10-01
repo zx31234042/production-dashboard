@@ -14,18 +14,27 @@
         4) `tests/contract-check.js` 的占位断言（OEE 段）与跨实现一致性断言（M 段）
    设计：**纯函数 + 注入时钟** —— 不读系统时间、不碰数据库、不碰界面，
         因此可以用固定时刻把"班次边界/跨零点/累计不倒退"逐条钉死（FR-4.16 / DR-17）。
-   粒度分离（技术债 `E65`，负责人 2026-09-30 裁定；本次只改**入参形状**）：
-        FR-4 的 15 项指标天然分属**两种粒度**，此前它们**共用一个 `tasks` 入参**（票级与件级混用）：
-          · **票级**（派工票）＝ FR-4.1 计划数 / FR-4.2 开工数 / FR-4.3 未开工 / 票数
-            ⇒ 入参 `orders`（来自 `task` 表：`plan_qty`、`plan_start_time` ＋ 该票是否已有采样帧）
-          · **件级**（测试件）＝ FR-4.4 已完成 / FR-4.5～4.9 / FR-4.10 合格率 / FR-4.13 平均时长
-            ⇒ 入参 `pieces`（来自 `result` 表：`result`、`judged_at`、`duration_sec`）
-        混用的两种错误形态（都实测过，见 `项目记录\后续路线图.md` 的 `E65` 行）：
+   粒度与计量单位（技术债 `E65` ＋ `E69`；需求 V1.41 §0.2 / C-111）：
+        FR-4 的 15 项指标原先**共用一个 `tasks` 入参**（票级与件级混用），`E65` 拆分后又留下
+        `E69` 这个**单位错配**（开工按"票"计、计划按"件"计 ⇒ FR-4.3 减数与被减数不同单位）。
+        现口径：
+          · **计量单位统一为「测试任务（件）」**（C-111）：**派工**＝`DR-02` `task` 一行
+            （`IF-A.1` 一条报文，含 `dispatchQty` 个测试任务）；**测试任务/件**＝一次测试
+            （以 `measure_rt.unit_index` 区分）。故 FR-4.1 计划数 / FR-4.2 开工数 / FR-4.3 未开工
+            **同单位**、可直接相减。
+          · 入参 `orders`（来自 `task` 表）：每票 `planQty` —— 它是**测试任务数**，不是"票数"；
+          · 入参 `startedPieces`（来自 `measure_rt`，取数在 `stateSnapshot.statsOf()`）：
+            **当班已开始测试的件数**（`unit_index IS NOT NULL` 且按 `(proc_order_no, unit_index)` 去重）；
+          · 入参 `pieces`（来自 `result` 表：`result`、`judged_at`、`duration_sec`）：件级结果态
+            （FR-4.4 已完成 / FR-4.5～4.9 / FR-4.10 合格率 / FR-4.13 平均时长）。
+        混用的两种错误形态（都实测过，见 `项目记录\后续路线图.md` 的 `E65`／`E69` 行）：
           ① 传 `task.status`：该列**全仓无写入方** ⇒ 恒「待测试」⇒ 开工恒 0；
-          ② 传 `result` 行（把"件"当"票"）：`planQty` 变成"已判定件数"、待测恒 0。
-        故 `orders` 与 `pieces` **必须分别取数**（取数在 `server/services/stateSnapshot.js` 的 `statsOf()`）。
+          ② 传 `result` 行（把"件"当"票"）：`planQty` 变成"已判定件数"、待测恒 0；
+          ③ 用"有帧的票数"当开工数（`E69` 原形态）：30 件 / 3 票 ⇒ 未开工 27（减数与被减数不同单位）。
+        故 `orders`／`startedPieces`／`pieces` **必须分别取数**（取数在 `server/services/stateSnapshot.js`
+        的 `statsOf()`）；`orderTotal`（票数）**是唯一保留的票级量**，不得参与上面的减法。
    关键口径（此前前端踩过的两个坑，这里写成硬约束）：
-        · 未开工数 = max(0, 计划 − 开工数)  —— **绝不出现负数**
+        · 未开工数 = max(0, 计划 − 开工数)  —— **绝不出现负数**（两数同单位，见上）
         · 累计运行（日/月/年）**单调不减** —— 跨班次不清零，只有跨自然日/月/年才重置
    依赖：platform/clock.js（时间工具）。
    ========================================================================== */
@@ -56,11 +65,20 @@ function pct(a, b) {
  * 核算当班统计。
  * @param {object} input
  *   @param {object}   input.shift     班次（createShiftRules().at(now) 的结果，含 elapsedSec/totalSec/date/name）
- *   @param {Array}    input.orders    **票级**当班派工票 `[{ planQty, started }]`
- *       `planQty` ＝ 该票的派工数量（`task.plan_qty`，FR-4.1 的加数）；
- *       `started` ＝ 该票是否**已开始测试**（布尔，FR-4.2；服务端口径＝该票在 `measure_rt` 里有采样帧）。
+ *   @param {Array}    input.orders    **票级**当班派工票 `[{ planQty }]`
+ *       `planQty` ＝ 该票的派工数量（`task.plan_qty`，FR-4.1 的加数）；**单位＝测试任务（件）**
+ *       （需求 V1.41 §0.2 / C-111：`IF-A.1` 一条派工报文含 `dispatchQty` 个测试任务）。
  *       调用方只放**当班**票（`task.plan_start_time` 落在班次窗口内；无 `plan_start_time` 的票不参与）。
  *       ⚠ **不要**把"件"（`result` 行）传进来当票 —— 那是 `E65` 的病灶（票级量被件级数据顶替）。
+ *       ⚠ 上一版的 `p.started`（每票一个布尔）**已删除**（`E69`）：见下面的 `startedPieces`。
+ *   @param {number}   input.startedPieces  **开工数：当班已开始测试的测试任务（件）数**（FR-4.2）。
+ *       **单位＝件/测试任务**（不是派工票数、不是采样帧数）—— 口径见 C-111：件以 `unit_index` 区分，
+ *       判定依据＝该件在 `measure_rt` 有采样数据；取数在 `server/services/stateSnapshot.js` 的
+ *       `statsOf()`（当班窗口内 `unit_index IS NOT NULL`、按 `(proc_order_no, unit_index)` 去重后计数）。
+ *       ⚠ 字段名刻意写成 `startedPieces`（而不是 `started`/`startedQty`）就是为了让读者一眼看出
+ *         **单位是件**：上一版这里是"每票一个布尔、由本函数数票数"，而 `planQty` 是件数 ⇒
+ *         FR-4.3 的**减数与被减数单位不同**（实测 30 件 / 3 票 / 未开工 27），这就是 `E69`。
+ *       缺省/非有限值 ⇒ 按 **0** 处理（当班没有已开工的件；绝不产生 `NaN`）。
  *   @param {Array}    input.pieces    **件级**当班测试件 `[{ result, durationSec? }]`
  *       `result` ＝ FR-3.13 五态之一（`STATUS` 的取值域）；`durationSec` ＝ 该件测试时长（秒，FR-4.13 的加数）。
  *       调用方只放**当班**件（`result.judged_at` 落在班次窗口内）。
@@ -75,11 +93,12 @@ function pct(a, b) {
  *       顶替（那项自 `E65` 起**仅供前端演示**）—— 无派工 ⇒ 计划数就是 **0**，不编造。
  *   @param {string|Date} input.now    当前时刻
  * @returns {object} 15 项指标 + DR-17 累计运行 + 班次信息
- *   · `planQty`／`startedQty`／`notStartedQty`／`orderTotal` —— **票级**（来自 `orders`）
+ *   · `planQty`／`startedQty`／`notStartedQty` —— **单位＝测试任务（件）**（`FR-4.x` 同一单位，C-111）：
+ *     `planQty` ＝ Σ`orders[].planQty`（FR-4.1）；`startedQty` ＝ `startedPieces`（FR-4.2，件数）；
+ *     `notStartedQty` ＝ `max(0, planQty − startedPieces)`（FR-4.3）。
+ *   · `orderTotal` ＝ 参与核算的**当班派工票数**（`orders.length`）—— **唯一保留的票级量**，故**不要**
+ *     与上面三项直接相减（那是 `E69` 的病灶：票数减件数）；原名 `taskTotal`，`E65` 时改名。
  *   · `doneQty`／`passQty`／`failQty`／`retestQty`／`runningQty`／`waitingQty`／`avgTestSec` —— **件级**（来自 `pieces`）
- *   · `orderTotal` ＝ 参与核算的**当班派工票数**（`orders.length`）—— 原名 `taskTotal`，
- *     上一版它承载的是传入行数（`E61` 之后被读成"件数"），语义已由 `E65` 更正为此处定义；
- *     逐字保留 `taskTotal` 会继续误导读者（"任务/件数"），故**改名**。
  *   · 除零行为（**实测**，见 `tests\._verify\zz6b-stats-probe.js` 的空库现场④）：
  *     `planQty = 0` ⇒ `capacityRate = 0`；`doneQty = 0` ⇒ `firstPassRate = 0`、`avgTestSec = 0`；
  *     `elapsedSec = 0` ⇒ `oee = 0`。全部由 `pct()`/`safeDiv()`（分母 ≤ 0 返回 0）与显式
@@ -100,12 +119,18 @@ function computeShiftStats(input) {
   const planQty = input.planQty === undefined
     ? orders.reduce((s, o) => s + (o && Number.isFinite(Number(o.planQty)) ? Math.max(0, Number(o.planQty)) : 0), 0)
     : Math.max(0, Number(input.planQty) || 0);
-  /* 已开工 ＝ **有采样帧的当班票数**（FR-4.2；口径由负责人 2026-09-30 裁定，不用 `task.status`）。
-     ⚠ 与上一版 `Math.min(…, planQty)` 的差别（如实登记，非顺手改口径）：这里**不按计划数封顶** ——
-       开工数是"票数"，计划数是"件数"，两者不同量纲，封顶会把"一票派工 5 件"的开工算错。
-       未开工仍按 FR-4.3 的 `max(0, 计划 − 开工)` 收口，故永不为负。 */
-  const started = orders.filter(o => o && o.started).length;
-  const notStarted = Math.max(0, planQty - started);         // FR-4.3
+  /* 已开工 ＝ **当班已开始测试的测试任务（件）数**（FR-4.2 / C-111：件以 `unit_index` 区分，
+     判定依据＝该件在 `measure_rt` 有采样数据；取数在 `stateSnapshot.statsOf()`）。
+     ⚠ `E69`（负责人 2026-09-30 裁定③）：上一版这里是 `orders.filter(o => o.started).length`
+        —— 数的是**派工票数**，而 `planQty` 是**测试任务数** ⇒ FR-4.3 的减数与被减数**单位不同**
+        （实测 30 件 / 3 票 / 未开工 27）。故入参改为显式的件数 `startedPieces`、**算式一字未动**
+        （下面仍是 `max(0, 计划 − 开工)`）。缺省/非有限值按 0（当班没有已开工的件，绝不产生 NaN）。
+     ⚠ 与更早一版 `Math.min(…, planQty)` 的差别（如实登记，非顺手改口径）：这里**不按计划数封顶** ——
+       开工件是可观测事实，封顶会把"开工多于计划"这类真实现象藏起来；未开工仍按 FR-4.3 的
+       `max(0, 计划 − 开工)` 收口，故永不为负。 */
+  const startedPieces = Number.isFinite(Number(input.startedPieces))
+    ? Math.max(0, Number(input.startedPieces)) : 0;
+  const notStarted = Math.max(0, planQty - startedPieces);   // FR-4.3
 
   /* ---------------- 二、件级计数（FR-4.4～4.10） ---------------- */
   const running = count(pieces, STATUS.RUNNING);
@@ -193,8 +218,8 @@ function computeShiftStats(input) {
       name: shift.name, date: shift.date, startAt: shift.startAt, endAt: shift.endAt,
       elapsedSec, totalSec: shift.totalSec
     },
-    /* FR-4.1～4.9 */
-    planQty, startedQty: started, notStartedQty: notStarted, doneQty: done,
+    /* FR-4.1～4.9（单位均为「测试任务／件」，见文件头与 C-111） */
+    planQty, startedQty: startedPieces, notStartedQty: notStarted, doneQty: done,
     runningQty: running, waitingQty: waiting, passQty: pass, failQty: fail, retestQty: retest,
     /* FR-4.10～4.15 */
     firstPassRate, runSec, idleSec, avgTestSec, capacityRate, oee,

@@ -27,14 +27,23 @@
                 firstPassRate, runSec, idleSec, avgTestSec, capacityRate, oee,
                 accumulate:{daySec,monthSec,yearSec,at,reset}, orderTotal, cycleSec }
               来源：**当班统计的唯一核算处**（FR-4 十五项口径不在此重写）
-              ⚠ **两类粒度分别取数**（技术债 `E65`，负责人 2026-09-30 裁定）：
-                · **票级**（`planQty`/`startedQty`/`notStartedQty`/`orderTotal`）← `task` 表
-                  （`plan_qty`、`plan_start_time` 落在当班窗口）＋ 该票在 `measure_rt` **是否有采样帧**；
-                · **件级**（`doneQty`/`passQty`/`failQty`/`retestQty`/`runningQty`/`waitingQty`/
-                  `firstPassRate`/`avgTestSec`）← `result` 表（DR-05，`judged_at` 落在当班窗口）。
+              ⚠ **计量单位（需求 V1.41 §0.2 / C-111）**：`FR-4.x` 的单位统一为「**测试任务（件）**」
+                —— **派工**＝`DR-02` `task` 一行（`IF-A.1` 一条报文，含 `dispatchQty` 个测试任务），
+                **测试任务/件**＝一次测试（以 `measure_rt.unit_index` 区分）。故：
+                · `planQty`（FR-4.1）＝Σ 当班 `task.plan_qty`＝**测试任务数**；
+                · `startedQty`（FR-4.2）＝当班 `measure_rt` 里 `unit_index IS NOT NULL`、
+                  按 `(proc_order_no, unit_index)` 去重的**件数**；
+                · `notStartedQty`（FR-4.3）＝`max(0, planQty − startedQty)` ⇒ **减数与被减数同单位**；
+                · `orderTotal` ＝ 参与核算的**派工票数**（`task` 行数）—— **唯一保留的票级量**。
+              取数（技术债 `E65` 的分离 ＋ `E69` 的单位修复）：
+                · `planQty`/`notStartedQty` ← `task`（`plan_qty`、`plan_start_time` 落在当班窗口）；
+                · `startedQty` ← `measure_rt`（`unit_index` 去重件数，窗口按帧 `collect_time`）；
+                · `doneQty`/`passQty`/`failQty`/`retestQty`/`runningQty`/`waitingQty`/
+                  `firstPassRate`/`avgTestSec` ← `result` 表（DR-05，`judged_at` 落在当班窗口）。
               ⚠ "已完成"的**取数真源＝`result` 表**，不是 `task.status`（后者全仓无写入方 ⇒
                 "已完成"恒 0，与 `FR-5.11` 的 detail 同屏矛盾；E61／审查 P1-2 已裁定改源）。
-              ⚠ **不用** `task.status` 判"已开工"（同一原因：无写入方）；开工判定＝`measure_rt` 有帧。
+              ⚠ **不用** `task.status` 判"已开工"（同一原因：无写入方）；开工判定＝`measure_rt`
+                里有该件的采样数据且 `unit_index` 非空。
               ⚠ `src/config/board.config.js` 的 `production.planQty` **仅供前端演示**，本段不取它
                 （计划数真源＝当班 `task.plan_qty` 之和；无派工 ⇒ 0，见 `E65`）。
      standard { productCode, processCode, versionNo:number|null, effectiveFrom:string|null,
@@ -159,30 +168,38 @@ function createStateSnapshot(options = {}) {
 
   /** 快照里的统计段（**唯一核算处**＝`services/stats.computeShiftStats()`；本文件不重写任何算式）
    *
-   *  **票级与件级分别取数（技术债 `E65`，负责人 2026-09-30 裁定的三条口径）**：
-   *   ① **开工判定 ＝ 该票在 `measure_rt` 里有采样帧**（库内可推、**不新增写点**、**不用 `task.status`**）。
+   *  **计量单位与取数（需求 V1.41 §0.2 / C-111；技术债 `E65` ＋ `E69`）**：
+   *   ① **开工判定 ＝ 当班窗口内该件在 `measure_rt` 有采样行且 `unit_index` 非空**，
+   *      按 `(proc_order_no, unit_index)` **去重**后数**件数**（库内可推、**不新增写点**、
+   *      **不用 `task.status`）。`E69` 之前这里问的是"该票有没有帧"⇒ 数出来是**派工票数**，
+   *      而 `planQty` 是**测试任务数** ⇒ `FR-4.3` 的减数与被减数不同单位（实测 30 件 / 3 票 / 未开工 27）。
    *      为什么不用 `task.status`／`actual_start`：这两列**全仓无写入方**（`dispatch.js:683` 自述
    *      `status` 不写 —— 它是本机进度列；`schema.sql` 缺省「待测试」）⇒ 若拿它判开工，"开工"恒 0
    *      （这是 `E65` 的**改前**形态）。也**不**在这里补写 `task.status`／`actual_start` —— 那是被
    *      负责人否决的选项 B（见 `E65`）。
    *   ② **当班归属**：票按 `task.plan_start_time` 落在班次窗口；件按 `result.judged_at` 落在班次窗口；
-   *      **无 `plan_start_time` 的票不参与统计**（不编造、也不按 0 计）。窗口用**既有班次真源**
-   *      `services/shift.js`（`shift.startAt`/`shift.endAt` 本身就是 DR-16 文本，直接做半开区间
+   *      **开工件按帧的 `collect_time`** 落在班次窗口；**无 `plan_start_time` 的票不参与统计**
+   *      （不编造、也不按 0 计）。窗口用**既有班次真源** `services/shift.js`
+   *      （`shift.startAt`/`shift.endAt` 本身就是 DR-16 文本，直接做半开区间
    *      `>= startAt AND < endAt` 比较 —— 不在这里另造时间源、不重算班次边界）。
-   *   ③ **计划数 ＝ Σ 当班窗口内 `task.plan_qty`**；**无派工 ⇒ 计划 0**；**不用配置的演示值顶替**
-   *      （`board.config.js` 的 `production.planQty` 自 `E65` 起**仅供前端演示**，本段**不再读它**）。
+   *   ③ **计划数 ＝ Σ 当班窗口内 `task.plan_qty`**（单位＝测试任务/件）；**无派工 ⇒ 计划 0**；
+   *      **不用配置的演示值顶替**（`board.config.js` 的 `production.planQty` 自 `E65` 起**仅供前端演示**，
+   *      本段**不再读它**）。
    *
    *  **本文件只做取数**（取数层的活），十五条算式一条都不在这里（仍在 `stats.js`）：
    *  `DONE_STATUS`＝合格＋不合格由 `stats.js` 判；`待复检` 不计已完成的理由与 SQL 归口在
-   *  `repo/result.js` 的 `countDone()`；`started` 的布尔翻转由本段按"有无采样帧"给出，
-   *  它只描述**数据状态**，不是算式。
+   *  `repo/result.js` 的 `countDone()`；`startedPieces`（开工件数）由本段按上面的 SQL 数出来，
+   *  它只描述**数据状态**，不是算式（`notStartedQty` 的算式仍在 `stats.js`）。
    *  ⚠ `task` 表仍供快照的 `task` 段（DR-02 工单信息）与标准段取数，本段不动那两处。 */
   function statsOf(now) {
     const shift = shiftRules.at(now);
-    /* ---- 票级取数（`task` ＋ `measure_rt`）----
+    /* ---- 票级取数（`task`）----
        只取"计划开工时刻落在当班窗口内且确实有派工数量"的票；`plan_start_time` 为空 ⇒ **整票不参与**
-       （`plan_start_time IS NOT NULL AND plan_start_time <> ''`；不按 0 处理、不拿 `created_at` 顶替）。 */
+       （`plan_start_time IS NOT NULL AND plan_start_time <> ''`；不按 0 处理、不拿 `created_at` 顶替）。
+       ⚠ `plan_qty` 的**单位＝测试任务（件）**（需求 V1.41 §0.2 计量单位口径 / C-111：一条 `IF-A.1`
+       派工报文含 `dispatchQty` 个测试任务）—— 故它就是 `FR-4.1` 的"测试任务数"，与下面的开工件数同单位。 */
     let orders = [];
+    let startedPieces = 0;
     if (db) {
       const rows = db.prepare(
         `SELECT proc_order_no AS procOrderNo, plan_qty AS planQty
@@ -190,15 +207,30 @@ function createStateSnapshot(options = {}) {
           WHERE plan_start_time IS NOT NULL AND plan_start_time <> ''
             AND plan_start_time >= ? AND plan_start_time < ?`
       ).all(shift.startAt, shift.endAt);
-      /* 开工判据（口径①）：该票在当班窗口内**有没有采样帧**。取一行即判"已开工" ——
-         这里刻意不用 `COUNT(*)`（票多时每票一次全表数没有收益），也不用 `task.status`。 */
-      const probe = db.prepare(
-        `SELECT 1 AS hit FROM measure_rt
-          WHERE proc_order_no = ? AND collect_time >= ? AND collect_time < ? LIMIT 1`);
-      orders = rows.map(r => ({
-        planQty: r.planQty,
-        started: Boolean(probe.get(r.procOrderNo, shift.startAt, shift.endAt))
-      }));
+      orders = rows.map(r => ({ planQty: r.planQty }));
+      /* 开工判据（`FR-4.2` / C-111，技术债 `E69` 的修复点）：当班窗口内、`unit_index IS NOT NULL`、
+         按 `(proc_order_no, unit_index)` **去重后的件数** —— 即"当班已开始测试的**测试任务数**"，
+         判定依据＝该件在 `measure_rt` 有采样数据。窗口按**帧的 `collect_time`**（与 `started` 的
+         旧口径同一个时间列），半开区间 `>= startAt AND < endAt`（与 `services/shift.js` 同一真源，
+         不在这里另造时间源）。
+         ⚠ **为什么必须去重 + 必须排除 NULL**（上一版的病灶，实测：30 件 / 3 票 / 未开工 27）：
+           · 旧实现问的是"该票**有没有**采样帧"（`SELECT 1 … LIMIT 1`）⇒ 数出来是**派工票数**，
+             而 `planQty` 是**测试任务数** ⇒ `FR-4.3` 的减数与被减数是**两种单位**（E69 的根因）；
+           · 同一件推多帧（1 s 采样）⇒ 不去重就会把"件数"数成"帧数"；
+           · `unit_index IS NULL` 的帧**没有件可归属**（帧没带/件序号非法 ⇒ 落库写 NULL）⇒ 不计入，
+             否则等于把"拿不到"当成"开工了一件"（与 `judge.js` 的"拿不到不说"同一纪律）；
+             这类帧的条数可从 `ingest.status().frameUnitIndex.withoutIndex`（`/health` 里）读到。
+         ⚠ 与 `orders` 的**边界**（如实登记，不是新口径）：本数**不**按"票是否参与"过滤 —— 裁定原文
+           只给"当班窗口 + `unit_index IS NOT NULL` + 按 `(proc_order_no, unit_index)` 去重"三条，
+           故某票的 `plan_start_time` 落在窗外时，其当班帧仍计入开工件数；`FR-4.3` 的
+           `max(0, 计划 − 开工)`（在 `stats.js`）保证未开工数不会因此为负。 */
+      startedPieces = db.prepare(
+        `SELECT COUNT(*) AS c FROM (
+           SELECT 1 AS hit FROM measure_rt
+            WHERE collect_time >= ? AND collect_time < ?
+              AND unit_index IS NOT NULL
+            GROUP BY proc_order_no, unit_index)`
+      ).get(shift.startAt, shift.endAt).c;
     }
     /* ---- 件级取数（`result`，DR-05）----
        按 `judged_at` 落窗口取"当班件"；`result` 逐行原样映射给 `stats.js`（**不改写、不换算、不补 0**），
@@ -223,6 +255,9 @@ function createStateSnapshot(options = {}) {
     const computed = statsSvc.computeShiftStats({
       shift,
       orders,
+      /* 开工数：**当班的测试任务（件）数**（`FR-4.2` / C-111）。字段名把单位写在脸上 ——
+         它是**件数**，不是票数、更不是帧数（`stats.js` 的 docblock 同此口径）。 */
+      startedPieces,
       pieces,
       measures: measures.map(r => r.collectTime),
       cycle: { sec: segOf(config, 'production').cycleSec },

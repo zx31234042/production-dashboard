@@ -3,6 +3,10 @@
    作用：measure_rt 表的读写。**只做 SQL，不做业务判断**（判断在 server/services/*）。
    依据：DR-04（实测数据表）、DR-13（去重键 equipCode + procOrderNo + collectTime）、
         DR-16（时间格式 yyyy-MM-dd HH:mm:ss）、ADR-0001 D7（只落 1 s 采样）。
+        V1.41 / C-111：DR-04 **增列件序号 `unit_index`**（＝IF-D.4 的 `unitIndex`，**采集落库时写入**）
+        —— 入参 `row.unitIndex` 为"合法件序号（≥1 的整数）"或**缺省/`null`（＝本帧没有件序号）**；
+        本层**不做**合法值判定（那是 `services/ingest.js` 的 `parseUnitIndex()`），也**不做**"缺省 1"
+        这类兜底：`unit_index` 是"这一帧测的是哪一件"的事实，冒充件序号会把一票多件静默归并成一件。
    依赖：仅传入的 db 句柄。
    ========================================================================== */
 'use strict';
@@ -35,10 +39,21 @@ function assertTime(value, field) {
   return value;
 }
 
-/** 行对象 → 语句参数（字段名与 schema 列一一对应；depth 映射到 measure_depth 以免与相机深度混淆） */
+/** 行对象 → 语句参数（字段名与 schema 列一一对应；depth 映射到 measure_depth 以免与相机深度混淆）
+ *
+ *  ⚠ **按位置绑定**：本数组的次序必须与 `INSERT_SQL` 的列清单**逐位一致**，而 `INSERT_SQL` 的列清单
+ *  又必须与 `server/db/schema.sql` 的 `measure_rt` 建表段逐位一致（`unit_index` 紧邻 `proc_order_no`
+ *  —— 依据需求 V1.41 §7 DR-04 的字段次序）。**错位不会报错、只会静默写错列**，故三处改动必须同批做，
+ *  并由 `tests\._verify\zz3b-unitindex-probe.js` 的**逐列回读**守着（不只看行数）。 */
 function toParams(row, nowIso) {
   return [
     row.equipCode, row.procOrderNo,
+    /* 件序号（V1.41 / C-111）：**缺值/非法一律 NULL**。这里**不**做"缺省 1"这类兜底 ——
+       `unit_index` 是"这一帧测的是哪一件"的事实，用 1 冒充会把一票多件静默归并成一件
+       （与本仓 `server/index.js` 的 `unitIndexOf()`、`services/judge.js` 的"拿不到不说"同一纪律）。
+       合法值的判定（整数、≥1、数字字符串归一）在**服务层** `services/ingest.js` 的 `parseUnitIndex()`
+       —— 仓储层"只做 SQL、不做业务判断"（本文件头），故这里只负责"没有就写 NULL"。 */
+    row.unitIndex === undefined ? null : row.unitIndex,
     row.depth === undefined ? null : row.depth,
     row.speed === undefined ? null : row.speed,
     row.velocity_x === undefined ? null : row.velocity_x,
@@ -53,11 +68,13 @@ function toParams(row, nowIso) {
   ];
 }
 
+/* 列清单＝`server/db/schema.sql` 的 measure_rt 声明次序（unit_index 第 3 位，紧邻 proc_order_no）。
+   ⚠ 幂等键 `ux_measure_rt(equip_code, proc_order_no, collect_time)`（DR-13）**未动** —— 加列不改去重口径。 */
 const INSERT_SQL =
   `INSERT OR IGNORE INTO measure_rt(
-     equip_code, proc_order_no, measure_depth, speed, velocity_x, velocity_y,
+     equip_code, proc_order_no, unit_index, measure_depth, speed, velocity_x, velocity_y,
      frame_rate, gain, shutter, camera_depth, test_status, collect_time, created_at)
-   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 /**
  * 插入一帧（按 DR-13 去重）。

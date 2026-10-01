@@ -328,8 +328,10 @@ t.section('二、班次边界自动切换与跨零点归属（FR-4.16）');
 }
 
 /* ---------------- 三、15 项指标（FR-4.1～4.15） ----------------
-   ⚠ 入参形状自 `E65`（技术债，负责人 2026-09-30 裁定）起**分为两类**：
-     · 票级 `orders:[{planQty, started}]`（来自 `task` 表；`started` ＝ 该票在 `measure_rt` 有帧）；
+   ⚠ 入参形状自 `E65`（技术债，负责人 2026-09-30 裁定）起**分为两类**，`E69` 起如下：
+     · 票级 `orders:[{planQty}]`（来自 `task` 表；单位＝测试任务/件，C-111 §0.2）；
+     · **开工件数** `startedPieces:<number>`（来自 `measure_rt` 的 `unit_index` 去重件数；
+       取数在 `server/services/stateSnapshot.js` 的 `statsOf()`，本段只验算式不吃取数）；
      · 件级 `pieces:[{result, durationSec}]`（来自 `result` 表；`durationSec` ＝ 单件测试时长）。
    本段因此**不再**用旧的 `tasks: mixed({…})`（旧形状在新实现里被整段忽略 ⇒ 票级与件级全 0，
    那是「喂错输入」不是「实现错」）。下面的期望值全部**由夹具现算**（构成性推导），不写死魔数。 */
@@ -348,16 +350,24 @@ t.section('三、15 项当班指标（FR-4.1～4.15）');
     piece('不合格', 90), piece('不合格', 100),
     piece('待复检', 110)
   ];
-  /** 票级夹具（当班派工票）：两票各 8 件、都已有采样帧 ⇒ 计划 16、开工 2 票 */
-  const ORDERS = [{ planQty: 8, started: true }, { planQty: 8, started: true }];
+  /** 票级夹具（当班派工票）：两票各 8 件 ⇒ 计划 16。
+   *  ⚠ `E69`（负责人 2026-09-30 裁定③）起 `orders` **不再带逐票 `started` 布尔** —— 那已不是入参：
+   *  `FR-4.2` 的开工数是**件数**（单位＝测试任务，C-111 §0.2），由取数层
+   *  （`server/services/stateSnapshot.js` 的 `statsOf()`）按件数出来、以 `startedPieces` 显式传入。 */
+  const ORDERS = [{ planQty: 8 }, { planQty: 8 }];
   /* 期望值：全部由夹具现算（`E65` 的两种粒度分别只从自己那一类取数） */
   const expectPlanQty = ORDERS.reduce((s, o) => s + o.planQty, 0);
-  const expectStarted = ORDERS.filter(o => o.started).length;
   const expectOrderTotal = ORDERS.length;
   const cnt = st => PIECES.filter(p => p.result === st).length;
   const expectPass = cnt('合格');
   const expectFail = cnt('不合格');
   const expectDone = expectPass + expectFail;                 // FR-4.4 已完成 = 合格 + 不合格
+  /* 开工件数（`FR-4.2` / C-111）：**由件级夹具现算** —— "已开始测试"的件＝已判完成的件
+     （合格＋不合格）＋ 正在测试的件；`待测试`（还没开始）与 `待复检`（判定依据不成立）不计。
+     ⚠ 本夹具刻意让 `expectStartedPieces` **既不等于**派工票数 `ORDERS.length`、**也不等于**计划件数
+     `expectPlanQty`、更不等于 0 ⇒ 下面 FR-4.2 / FR-4.3 两条**真的能分辨单位**
+     （「改回数票数」⇒ 2、「忽略入参」⇒ 0、「把计划当开工」⇒ 16，三种回潮都当场变红）。 */
+  const expectStartedPieces = cnt('合格') + cnt('不合格') + cnt('测试中');
   /* `E67`（负责人 2026-09-30 裁定②）后的分子集合：**只累加 `DONE_STATUS`（合格＋不合格）的件** ——
      依据需求 `FR-4.13`「**完成**测试总时长 ÷ 完成数量」，分子与分母 `expectDone` **同一集合**；
      `待复检`／`测试中`／`待测试` 不计（它们没有"完成测试时长"，算进去是编造分子）。
@@ -365,7 +375,7 @@ t.section('三、15 项当班指标（FR-4.1～4.15）');
      专门用来让"这条过滤"可证伪的一件 —— 若实现去掉 `DONE_STATUS` 过滤，本条当场变红。 */
   const expectDurSum = PIECES.reduce(
     (s, p) => s + (stats.DONE_STATUS.includes(p.result) ? p.durationSec : 0), 0);
-  const base = { shift, orders: ORDERS, pieces: PIECES, now: clock.now() };
+  const base = { shift, orders: ORDERS, startedPieces: expectStartedPieces, pieces: PIECES, now: clock.now() };
   const r = stats.computeShiftStats({
     ...base,
     accum: { daySec: 3600, monthSec: 7200, yearSec: 10800, at: clock.now() }
@@ -373,11 +383,19 @@ t.section('三、15 项当班指标（FR-4.1～4.15）');
 
   t.check('FR-4.1 计划总数 = Σ 当班派工票的 planQty（票级入参）',
     r.planQty === expectPlanQty, `实测 ${r.planQty}，由 orders 现算 ${expectPlanQty}`);
-  t.check('FR-4.2 开工数 = 当班票里"已有采样帧（started）"的**票数**（票级，不按件数、不按 task.status）',
-    r.startedQty === expectStarted, `实测 ${r.startedQty}，由 orders.started 现算 ${expectStarted}`);
-  t.check('FR-4.3 未开工 = 计划 − 开工（票数对件数收口，不为负）',
-    r.notStartedQty === Math.max(0, expectPlanQty - expectStarted),
-    `实测 ${r.notStartedQty}（max(0, ${expectPlanQty} − ${expectStarted})）`);
+  t.check('FR-4.2 开工数 ＝ 当班**已开始测试的测试任务（件）数**（入参 `startedPieces`；C-111 计量单位）' +
+    '—— **不是**派工**票数**（`orders.length`）、**不是**采样帧数、**不看** `task.status`',
+    r.startedQty === expectStartedPieces &&
+    expectStartedPieces !== ORDERS.length && expectStartedPieces !== expectPlanQty &&
+    expectStartedPieces !== 0,
+    `实测 ${r.startedQty}，由件级夹具现算 ${expectStartedPieces}` +
+    `（＝已完成件 ${expectDone} ＋ 在测件 ${cnt('测试中')}；` +
+    `对照组：派工票数 ${ORDERS.length}、计划件数 ${expectPlanQty} —— 三个量刻意互不相等）`);
+  t.check('FR-4.3 未开工 ＝ 计划 − 开工（`max(0, planQty − startedPieces)`，**减数与被减数同单位＝件**）' +
+    '—— 旧口径把"票数"从"件数"里减掉（实测 30 件 / 3 票 / 未开工 27）正是 `E69`',
+    r.notStartedQty === Math.max(0, expectPlanQty - expectStartedPieces),
+    `实测 ${r.notStartedQty}（max(0, ${expectPlanQty} − ${expectStartedPieces})；` +
+    `若误按票数减则为 ${Math.max(0, expectPlanQty - ORDERS.length)}）`);
   t.check('FR-4.4 已完成 = 合格 + 不合格（件级入参）',
     r.doneQty === expectDone, `实测 ${r.doneQty}，由 pieces 现算 ${expectDone}`);
   t.check('FR-4.5 测试中数量（件级）', r.runningQty === cnt('测试中'), String(r.runningQty));
@@ -539,15 +557,22 @@ t.section('四、边界与除零（"未开工为负"是前端曾复现过的真�
   const clock = createClock({ mode: 'fixed', at: '2026-09-19T15:00:00' });
   const shift = shifts.current(clock);
 
-  /* `E65` 新契约下的"开工数超过计划"：票级 `started` 数（2 票）**大于**计划件数（1 件）
-     —— 两个量纲不同（票数 vs 件数），未开工仍必须封顶为 0、不能是负数。 */
+  /* `E69` 新契约下的"开工数超过计划"：**开工件数（3 件）大于**计划件数（1 件）——
+     两数**同单位**（件），故这是"确实开了 3 件而计划只有 1 件"的可观测事实。
+     ⚠ 期望值刻意让 `startedQty` **保持 3（不按计划数封顶）**：开工是可观测事实，封顶会把
+     "开工多于计划"藏起来；未开工由 `FR-4.3` 的 `max(0, 计划 − 开工)` 收口，故永不为负。
+     这一条同时是"`Math.min(…, planQty)` 那版实现"的靶子（若被改回来 ⇒ `startedQty` 变 1 ⇒ 必红）。 */
+  const overflowOrders = [{ planQty: 1 }];
+  const overflowPieces = 3;                 // 计划 1 件，实际开工 3 件（同单位、可由取数层数出来）
   const overflow = stats.computeShiftStats({
-    shift, orders: [{ planQty: 1, started: true }, { planQty: 0, started: true }],
+    shift, orders: overflowOrders, startedPieces: overflowPieces,
     pieces: [{ result: '合格', durationSec: 30 }], now: clock.now()
   });
-  t.check('开工数超过计划时，未开工封顶为 0（不出现负数）',
-    overflow.startedQty === 2 && overflow.planQty === 1 && overflow.notStartedQty === 0,
-    `开工（票）=${overflow.startedQty} 计划（件）=${overflow.planQty} 未开工=${overflow.notStartedQty}`);
+  t.check('开工数超过计划时，未开工封顶为 0（不出现负数）—— 且 `startedQty` ＝ **件数**（同单位）、' +
+    '**按件如实报出、不按计划封顶**（`E69`／C-111：开工 3 件 ＞ 计划 1 件是可观测事实）',
+    overflow.startedQty === overflowPieces && overflow.planQty === 1 && overflow.notStartedQty === 0,
+    `开工（件）=${overflow.startedQty}（入参 ${overflowPieces}）计划（件）=${overflow.planQty}` +
+    ` 未开工=${overflow.notStartedQty}`);
 
   /* 空库/空入参：**四项比率与时长一律 0，且全部 `Number.isFinite`**（不留 NaN/Infinity）。
      与 `stateSnapshot` 的空库现场（第九节）同一口径，此处锁**纯函数**一层。 */
@@ -562,22 +587,30 @@ t.section('四、边界与除零（"未开工为负"是前端曾复现过的真�
   t.check('空数据的全部数值项都是有限数（无 NaN／Infinity 传到界面）',
     emptyNums.every(Number.isFinite), `逐项：${JSON.stringify(emptyNums)}`);
 
-  /* 未给 `planQty` 覆盖值时，计划数真源＝`Σ orders[].planQty`（不再是"任务条数"） */
-  const planOrders = [{ planQty: 2, started: true }, { planQty: 3, started: true }];
+  /* 未给 `planQty` 覆盖值时，计划数真源＝`Σ orders[].planQty`（不再是"任务条数"）；
+     开工数由**显式的件数入参**给出（`E69`）—— 期望式把它一并算进去。 */
+  const planOrders = [{ planQty: 2 }, { planQty: 3 }];
+  /* 开工件数：由夹具现算（票数的"上一件"），且**刻意不等于票数**（1 ≠ 2）⇒ 本条能分辨单位 */
+  const noPlanStartedPieces = planOrders.length - 1;
   const noPlan = stats.computeShiftStats({
-    shift, orders: planOrders, pieces: [{ result: '合格', durationSec: 5 }], now: clock.now()
+    shift, orders: planOrders, startedPieces: noPlanStartedPieces,
+    pieces: [{ result: '合格', durationSec: 5 }], now: clock.now()
   });
-  t.check('未给计划数时按 Σ orders[].planQty 兜底（不留 undefined；不再按传入条数计）',
+  t.check('未给计划数时按 Σ orders[].planQty 兜底（不留 undefined；不再按传入条数计），' +
+    '且未开工 ＝ 计划 − **开工件数**（不是 − 票数）',
     noPlan.planQty === planOrders.reduce((s, o) => s + o.planQty, 0) &&
-    noPlan.notStartedQty === planOrders.reduce((s, o) => s + o.planQty, 0) - planOrders.filter(o => o.started).length,
-    `实测 plan=${noPlan.planQty}（Σ orders.planQty=${planOrders.reduce((s, o) => s + o.planQty, 0)}），未开工=${noPlan.notStartedQty}`);
+    noPlan.startedQty === noPlanStartedPieces &&
+    noPlan.notStartedQty === planOrders.reduce((s, o) => s + o.planQty, 0) - noPlanStartedPieces,
+    `实测 plan=${noPlan.planQty}（Σ orders.planQty=${planOrders.reduce((s, o) => s + o.planQty, 0)}），` +
+    `开工=${noPlan.startedQty}（入参 ${noPlanStartedPieces}，票数 ${planOrders.length}），未开工=${noPlan.notStartedQty}`);
 
   /* 全部票未开工 + 无采集串 + 无在测件 ⇒ 有效运行 0（待机占满）。
-     ⚠ 待测件放**件级**（旧夹具把它塞在 `tasks` 里，新实现只把它当"未提供的入参"）。 */
-  const waitingOrders = [{ planQty: 4, started: false }, { planQty: 6, started: false }];
+     ⚠ 待测件放**件级**（旧夹具把它塞在 `tasks` 里，新实现只把它当"未提供的入参"）。
+     ⚠ `E69` 起"未开工"由**开工件数入参＝0** 表达（不再有逐票 `started` 布尔）。 */
+  const waitingOrders = [{ planQty: 4 }, { planQty: 6 }];
   const waitingPieces = [{ result: '待测试', durationSec: 0 }];
   const allWaiting = stats.computeShiftStats({
-    shift, orders: waitingOrders, pieces: waitingPieces, measures: [], now: clock.now()
+    shift, orders: waitingOrders, startedPieces: 0, pieces: waitingPieces, measures: [], now: clock.now()
   });
   const waitingPlan = waitingOrders.reduce((s, o) => s + o.planQty, 0);
   t.check('全部待测试：开工 0、未开工等于计划、有效运行为 0（待机占满）',
@@ -1299,8 +1332,9 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（用例�
     })().stats;
     const snapExpectDone = snapWritten.filter(r => resultRepo.DONE_STATUS.includes(r)).length;
     const snapRows = snapWritten.length;
-    /* ④b～④f（`E65` 票级/件级分离的端到端取数）的现场：**同一段独立内存库**，
-       票级经 `task`（`plan_qty` ＋ `plan_start_time` 窗口）＋ `measure_rt`（有无采样帧）取数，
+    /* ④b～④f（`E65` 票级/件级分离 ＋ `E69` 开工数按件计的端到端取数）的现场：**同一段独立内存库**，
+       票级经 `task`（`plan_qty` ＋ `plan_start_time` 窗口）取数；**开工件数**经 `measure_rt`
+       （当班窗口内 `unit_index` 非空、按 `(proc_order_no, unit_index)` 去重）；
        件级经 `result`（`judged_at` 窗口）取数。所有期望值**现算**（不写死魔数）。 */
     const SNAP_NO_START = 'WO-SNAP-NOSTART';
     const SNAP_WIN = ['WO-SNAP-T1', 'WO-SNAP-T2'];
@@ -1329,10 +1363,32 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（用例�
     insSnapTask.run(SNAP_WIN[1], 'P-SNAP', SNAP_PLAN[SNAP_WIN[1]], '2026-09-19 09:00:00', '待测试', SNAP_NOW, SNAP_NOW);
     insSnapTask.run(SNAP_NO_START, 'P-SNAP', SNAP_PLAN[SNAP_NO_START], null, '待测试', SNAP_NOW, SNAP_NOW);
     insSnapTask.run(SNAP_OUT, 'P-SNAP', SNAP_PLAN[SNAP_OUT], '2026-09-19 07:00:00', '待测试', SNAP_NOW, SNAP_NOW);
+    /* 现场甲的采样帧：**刻意含三种边界**，期望值全部由本数组现算（ADR-0004 D21 构成性推导）：
+       · **同一件多帧**（`u1` 3 帧、`u2` 2 帧、`u3` 1 帧）⇒ 不去重会把"件数"数成"帧数"；
+       · **缺件序号**（`unit_index IS NULL`，当班窗口内、行是真的）⇒ 不计入开工件数；
+       · **上一班**（`SNAP_OUT` 的帧，行仍在库内）⇒ 不计入当班。
+       ⚠ 帧用**列名**写入（本现场不经 `repo/measure.js` —— 那一条由下面 ⑤ 的逐列回读单独守）。 */
     const insSnapMeasure = snapDb.prepare(
-      'INSERT INTO measure_rt(equip_code, proc_order_no, collect_time, created_at) VALUES(?,?,?,?)');
-    insSnapMeasure.run('EQ-SNAP', SNAP_WIN[0], '2026-09-19 10:05:00', SNAP_NOW);
-    insSnapMeasure.run('EQ-SNAP', SNAP_WIN[1], '2026-09-19 09:05:00', SNAP_NOW);
+      'INSERT INTO measure_rt(equip_code, proc_order_no, unit_index, collect_time, created_at) VALUES(?,?,?,?,?)');
+    const SNAP_FRAMES = [
+      { no: SNAP_WIN[0], at: '2026-09-19 10:05:00', unit: 1 },
+      { no: SNAP_WIN[0], at: '2026-09-19 10:06:00', unit: 1 },      // 同一件第 2 帧
+      { no: SNAP_WIN[0], at: '2026-09-19 10:07:00', unit: 1 },      // 同一件第 3 帧
+      { no: SNAP_WIN[0], at: '2026-09-19 10:08:00', unit: 2 },
+      { no: SNAP_WIN[0], at: '2026-09-19 10:09:00', unit: 2 },      // 第二件第 2 帧
+      { no: SNAP_WIN[0], at: '2026-09-19 10:10:00', unit: 3 },      // 第三件 1 帧
+      { no: SNAP_WIN[1], at: '2026-09-19 09:05:00', unit: null },   // **缺件序号**（当班窗口内的真行）
+      { no: SNAP_OUT, at: '2026-09-19 07:30:00', unit: 9 }          // 上一班（行仍在库内）
+    ];
+    SNAP_FRAMES.forEach(f => insSnapMeasure.run('EQ-SNAP', f.no, f.unit, f.at, SNAP_NOW));
+    /* 期望值：全部由上面这张帧表现算（`FR-4.2` / C-111 的判据＝当班窗口内、`unit_index` 非空、
+       按 `(proc_order_no, unit_index)` 去重后的**件数**）。 */
+    const snapWinFrames = SNAP_FRAMES.filter(f => inSnapWin(f.at));
+    const expectStartedPieces = new Set(
+      snapWinFrames.filter(f => f.unit !== null).map(f => f.no + '|' + f.unit)).size;
+    const snapWinRows = snapWinFrames.length;                             // 当班窗口内的**行数**（含 NULL 那条）
+    const snapNullInWin = snapWinFrames.filter(f => f.unit === null).length;
+    const snapWinTickets = new Set(snapWinFrames.map(f => f.no)).size;    // "按票计"会得到的读数
     /* ⚠ 必须走**同一个公开取数口** `snapshot()`；`config` 只在注入时显式给出
        （`createStateSnapshot` 的 `config` 缺省才回落真配置 ⇒ 不能传 `undefined` 覆盖）；
        库句柄显式传入 ⇒ 现场甲／乙／空库各自独立，互不污染。 */
@@ -1354,27 +1410,89 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（用例�
       `（期望 ${SNAP_WIN.length} 票）；` +
       `配置的 production.planQty=${PROD_CFG.planQty}（未取用）`);
 
-    t.check('九 · 当班票级取数（`E65` 裁定①）：`startedQty` ＝ 当班窗口内**在 `measure_rt` 有采样帧的票数**' +
-      '（不看 `task.status`），`notStartedQty` ＝ max(0, planQty − startedQty)',
-      snapE.startedQty === SNAP_WIN.length && snapE.notStartedQty === expectPlanQty - snapE.startedQty &&
-      snapE.notStartedQty === expectPlanQty - SNAP_WIN.length,
-      `两票各有 1 帧（均在窗口内）⇒ startedQty=${snapE.startedQty}（期望 ${SNAP_WIN.length}）、` +
-      `notStartedQty=${snapE.notStartedQty}（期望 ${expectPlanQty} − ${SNAP_WIN.length}）；` +
-      `task.status 三行都是「待测试」（判定**未**读它）`);
+    /* ② **按件去重**（`E69` 的修复点；C-111 §0.2 的计量单位）：同一件推 3 帧 ＋ 第二件 2 帧 ＋ 第三件 1 帧
+       ⇒ 开工数是**件数**，不是帧数、也不是票数。本现场刻意让三个读数**互不相等**（件 3 / 行 7 / 票 2），
+       故"不去重"（⇒7）、"按票计"（⇒2）、"忽略取数"（⇒0）三种回退都当场变红。 */
+    t.check('九 · `FR-4.2` 开工数**按件去重**（`unit_index` 去重；`E69`／C-111）：同一件推 3 帧 ＋ 第二件 2 帧 ' +
+      '＋ 第三件 1 帧 ⇒ `startedQty` ＝ **件数**（**不是**帧行数、**不是**派工票数）',
+      snapE.startedQty === expectStartedPieces &&
+      snapWinRows > expectStartedPieces && expectStartedPieces !== snapWinTickets &&
+      expectStartedPieces > 0 &&
+      snapDb.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE collect_time >= ? AND collect_time < ?')
+        .get(WIN.startAt, WIN.endAt).c === snapWinRows &&
+      snapE.notStartedQty === expectPlanQty - expectStartedPieces,
+      `内存库当班帧 ${snapWinRows} 行（其中 ${snapNullInWin} 行 ` + '`unit_index IS NULL`' + `）；` +
+      `去重后件数=${expectStartedPieces}（期望 startedQty=${snapE.startedQty}）；` +
+      `对照：按票计会得 ${snapWinTickets}、按行计会得 ${snapWinRows} ⇒ 三个量互不相等；` +
+      `notStartedQty=${snapE.notStartedQty}（期望 ${expectPlanQty} − ${expectStartedPieces}）`);
 
-    /* ② 把其中一票的采样帧挪到**上一班**（行仍在库里）⇒ 该票不再算"已开工" */
+    /* ③ 两道条件各**单独可证伪**：① `unit_index IS NULL` 的当班帧不计入；② 判据落在**当班窗口**
+       （把第二件的 2 帧挪到上一班、行仍在库内 ⇒ 开工减 1、未开工加 1，而 `planQty`／`orderTotal` 不变）。 */
     const snapBeforeMoved = snapE;
-    snapDb.prepare('UPDATE measure_rt SET collect_time = ? WHERE proc_order_no = ?')
-      .run('2026-09-19 07:30:00', SNAP_WIN[0]);
+    /* ⚠ 逐帧挪、且**各挪到一个不同的窗外秒**：`measure_rt` 的唯一键是
+       `(equip_code, proc_order_no, collect_time)`（DR-13），两帧挪到同一秒会撞唯一键。 */
+    const snapMovedAt = ['2026-09-19 07:28:00', '2026-09-19 07:29:00'];
+    const updSnapMoved = snapDb.prepare(
+      'UPDATE measure_rt SET collect_time = ? WHERE proc_order_no = ? AND unit_index = ? AND collect_time = ?');
+    snapWinFrames.filter(f => f.no === SNAP_WIN[0] && f.unit === 2)
+      .forEach((f, i) => updSnapMoved.run(snapMovedAt[i], f.no, f.unit, f.at));
     const snapMoved = snapWith(snapDb, null);
-    t.check('九 · 票级 `started` 判据须落在**当班窗口**：把一票的 `measure_rt` 行挪到上一班' +
-      '（行仍在库内）⇒ `startedQty` 减 1、`notStartedQty` 相应加 1，而 `planQty`／`orderTotal` 不变',
+    const snapMovedRowsInWin = snapDb.prepare(
+      'SELECT COUNT(*) AS c FROM measure_rt WHERE collect_time >= ? AND collect_time < ?')
+      .get(WIN.startAt, WIN.endAt).c;
+    t.check('九 · `FR-4.2` 开工取数的**两道过滤**（负向靶子）：① `unit_index IS NULL` 的当班帧**不计入**' +
+      '（窗内确有 1 条这样的真行）② 判据落在**当班窗口**（`collect_time` 半开区间）—— ' +
+      '把第二件的帧挪到上一班（行仍在库内）⇒ 开工减 1、未开工加 1，而 `planQty`／`orderTotal` 不变。' +
+      '去掉 `IS NOT NULL`（⇒ 多算 1 件）或去掉窗口条件（⇒ 不减）都会让本条变红',
+      snapNullInWin === 1 &&
+      snapE.startedQty === expectStartedPieces &&
       snapMoved.startedQty === snapBeforeMoved.startedQty - 1 &&
       snapMoved.notStartedQty === snapBeforeMoved.notStartedQty + 1 &&
-      snapMoved.planQty === snapBeforeMoved.planQty && snapMoved.orderTotal === snapBeforeMoved.orderTotal,
+      snapMoved.planQty === snapBeforeMoved.planQty && snapMoved.orderTotal === snapBeforeMoved.orderTotal &&
+      snapMovedRowsInWin === snapWinRows - 2,
+      `当班窗内缺件序号的行 ${snapNullInWin} 条（不计入 ⇒ 开工 ${snapE.startedQty}＝件数 ${expectStartedPieces}；` +
+      `若不去 NULL 则为 ${expectStartedPieces + snapNullInWin}）；` +
       `挪帧前 startedQty=${snapBeforeMoved.startedQty}／notStartedQty=${snapBeforeMoved.notStartedQty}；` +
-      `挪到 07:30（上一班）后 startedQty=${snapMoved.startedQty}／notStartedQty=${snapMoved.notStartedQty}；` +
+      `第二件 2 帧挪到 07:30（上一班）后 startedQty=${snapMoved.startedQty}／` +
+      `notStartedQty=${snapMoved.notStartedQty}（当班帧 ${snapWinRows} → ${snapMovedRowsInWin} 行）；` +
       `planQty=${snapMoved.planQty}、orderTotal=${snapMoved.orderTotal}（未变）`);
+
+    /* ⑤ **落库列序**（`repo/measure.js` 的 `toParams()` / `INSERT_SQL` 与 `schema.sql` 的列序必须逐位一致）：
+       本改动最危险的点是"**按位置绑定**"—— `unit_index` 若落错列**不会报错、只会静默写错列**。
+       故这里**逐列按列名回读**（不是只数行数）：给每一列一个互不相同的探针值，回读时"哪一列读到哪个值"
+       必须逐一对上；再单独断言 `unit_index` 在**新建库**里的声明位置紧邻 `proc_order_no`
+       （需求 V1.41 §7 `DR-04` 的字段次序）。错位一行 ⇒ 至少两列对不上 ⇒ 本条必红。 */
+    const measureRepo = require(path.join(ROOT, 'server', 'repo', 'measure.js'));
+    const colDb = new DatabaseSync(':memory:');
+    memDbApi.initSchema(colDb, SNAP_NOW);
+    const COL_PROBE = {
+      equipCode: 'EQ-COL', procOrderNo: 'WO-COL', unitIndex: 7,
+      depth: 1.11, speed: 2.22, velocity_x: 3.33, velocity_y: 4.44,
+      frameRate: 55, gain: 6.6, shutter: 777, cameraDepth: 8.88,
+      testStatus: 2, collectTime: '2026-09-19 10:00:00'
+    };
+    /* 期望：**字段名 → 它该落的列名**（期望值＝"我传进去的那个值"，逐条现算，不写死数值） */
+    const COL_OF_FIELD = {
+      equipCode: 'equip_code', procOrderNo: 'proc_order_no', unitIndex: 'unit_index',
+      depth: 'measure_depth', speed: 'speed', velocity_x: 'velocity_x', velocity_y: 'velocity_y',
+      frameRate: 'frame_rate', gain: 'gain', shutter: 'shutter', cameraDepth: 'camera_depth',
+      testStatus: 'test_status', collectTime: 'collect_time'
+    };
+    const colIns = measureRepo.insertFrame(colDb, COL_PROBE, SNAP_NOW);
+    const colRow = colDb.prepare(
+      'SELECT * FROM measure_rt WHERE equip_code = ? AND proc_order_no = ?')
+      .get(COL_PROBE.equipCode, COL_PROBE.procOrderNo);
+    const colMismatch = Object.keys(COL_OF_FIELD).filter(f => colRow[COL_OF_FIELD[f]] !== COL_PROBE[f]);
+    const measureColOrder = memDbApi.listColumns(colDb, 'measure_rt');
+    t.check('九 · **落库列序**（`repo/measure.js` 按位置绑定 ↔ `schema.sql` 列序）：逐**列名**回读 —— ' +
+      '13 个字段各自落进自己的列（`unitIndex` → `unit_index`、`depth` → `measure_depth` …），' +
+      '且 `unit_index` 在新建库的声明次序**紧邻** `proc_order_no`（V1.41 §7 `DR-04` 字段次序）',
+      colIns.inserted === true && colMismatch.length === 0 &&
+      measureColOrder.indexOf('unit_index') === measureColOrder.indexOf('proc_order_no') + 1 &&
+      colRow.unit_index === COL_PROBE.unitIndex && colRow.created_at === SNAP_NOW,
+      `逐列回读：错位列 ${colMismatch.length} 个${colMismatch.length ? '（' + colMismatch.join('、') + '）' : ''}；` +
+      `行=${JSON.stringify(colRow)}；列序=[${measureColOrder.join(', ')}]`);
+    colDb.close();
 
     /* ③ 件级按 `judged_at` 落当班窗口：**另起一段独立内存库**（现场乙，与现场甲的件完全无关），
        先只写 4 件当班件取基线，再经**同一个真写入点**补写两件"上一班"的件（1 合格 + 1 待复检），
@@ -1456,15 +1574,18 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（用例�
         'INSERT INTO task(proc_order_no, product_code, plan_qty, plan_start_time, status, created_at, updated_at)' +
         ' VALUES(?,?,?,?,?,?,?)');
       MID_TASKS.forEach(x => insMidTask.run(x.no, 'P-MID', x.qty, x.t0, '待测试', SNAP_MID_NOW, SNAP_MID_NOW));
-      /* 帧：窗内 16:05／23:35，窗外 15:55 */
+      /* 帧：窗内 16:05／16:06／23:35（**带件序号**，`IN-1` 两件、`IN-2` 一件）、
+         窗内 23:36（**缺件序号** ⇒ 不计入开工件数）、窗外 15:55（上一班） */
       const insMidMeasure = snapDbM.prepare(
-        'INSERT INTO measure_rt(equip_code, proc_order_no, collect_time, created_at) VALUES(?,?,?,?)');
+        'INSERT INTO measure_rt(equip_code, proc_order_no, unit_index, collect_time, created_at) VALUES(?,?,?,?,?)');
       const MID_FRAMES = [
-        { no: 'WO-MID-IN-1', at: '2026-09-19 16:05:00' },
-        { no: 'WO-MID-IN-2', at: '2026-09-19 23:35:00' },
-        { no: 'WO-MID-OUT', at: '2026-09-19 15:55:00' }
+        { no: 'WO-MID-IN-1', at: '2026-09-19 16:05:00', unit: 1 },
+        { no: 'WO-MID-IN-1', at: '2026-09-19 16:06:00', unit: 2 },
+        { no: 'WO-MID-IN-2', at: '2026-09-19 23:35:00', unit: 5 },
+        { no: 'WO-MID-IN-2', at: '2026-09-19 23:36:00', unit: null },
+        { no: 'WO-MID-OUT', at: '2026-09-19 15:55:00', unit: 9 }
       ];
-      MID_FRAMES.forEach(x => insMidMeasure.run('EQ-MID', x.no, x.at, SNAP_MID_NOW));
+      MID_FRAMES.forEach(x => insMidMeasure.run('EQ-MID', x.no, x.unit, x.at, SNAP_MID_NOW));
       /* 件：窗内 16:00:00／23:59:59；窗外 15:59:59 与**次日 00:00:00**（右端点） */
       const MID_PIECES = [
         { result: '合格', sec: 10, at: '2026-09-19 16:00:00' },
@@ -1483,6 +1604,10 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（用例�
       const snapMid = snapMidWith(snapDbM);
       const midInTasks = MID_TASKS.filter(x => x.t0 !== null && inMidWin(x.t0));
       const midInFrames = MID_FRAMES.filter(x => inMidWin(x.at));
+      /* 开工件数（`FR-4.2` / C-111）：窗内、`unit_index` 非空、按 `(proc_order_no, unit_index)` 去重 */
+      const midExpectStarted = new Set(
+        midInFrames.filter(x => x.unit !== null).map(x => x.no + '|' + x.unit)).size;
+      const midNullInWin = midInFrames.filter(x => x.unit === null).length;
       const midInPieces = MID_PIECES.filter(p => inMidWin(p.at));
       const midExpectDone = midInPieces.filter(p => resultRepo.DONE_STATUS.includes(p.result)).length;
       const midExpectDurSum = midInPieces.reduce(
@@ -1492,19 +1617,21 @@ t.section('九、跨实现对账：服务端 judge ≡ 前端 mockData（用例�
          右端点若被当成闭区间，次日 00:00:00 那件 600s 会进分子。 */
       const midWrongAvgIfClosed = midExpectDone > 0
         ? Math.round((midExpectDurSum + 600) / midExpectDone) : 0;
-      t.check('九 · **跨零点窗口**（中班 [16:00, 次日 00:00)）：票按 `plan_start_time`、件按 `judged_at` ' +
-        '**半开区间**落当班 —— 16:00:00 与 23:59:59 计入，15:59:59 与**次日 00:00:00** 不计；' +
-        '`orderTotal`／`startedQty` 只数当班窗口内的票',
+      t.check('九 · **跨零点窗口**（中班 [16:00, 次日 00:00)）：票按 `plan_start_time`、件按 `judged_at`、' +
+        '开工件按帧的 `collect_time` **半开区间**落当班 —— 16:00:00 与 23:59:59 计入，15:59:59 与**次日 00:00:00** 不计；' +
+        '`orderTotal` 只数当班**票数**，`startedQty` 只数当班**件数**（窗内 `unit_index` 非空且去重）',
         snapMid.planQty === midInTasks.reduce((s, x) => s + x.qty, 0) &&
         snapMid.orderTotal === midInTasks.length &&
-        snapMid.startedQty === midInFrames.length &&
-        snapMid.notStartedQty === midInTasks.reduce((s, x) => s + x.qty, 0) - midInFrames.length &&
+        snapMid.startedQty === midExpectStarted &&
+        midExpectStarted !== midInFrames.length &&
+        snapMid.notStartedQty === midInTasks.reduce((s, x) => s + x.qty, 0) - midExpectStarted &&
         snapMid.doneQty === midExpectDone && snapMid.avgTestSec === midExpectAvg &&
         snapMid.planQty !== MID_TASKS[2].qty + MID_TASKS[3].qty &&
         snapMid.avgTestSec !== midWrongAvgIfClosed,
         `内存库（:memory:）：四票（16:00=10／23:30=20 在窗内；15:30=88 在上一班；无 plan_start_time=99）⇒ ` +
         `planQty=${snapMid.planQty}（期望 ${midInTasks.reduce((s, x) => s + x.qty, 0)}）、orderTotal=${snapMid.orderTotal}` +
-        `（期望 ${midInTasks.length}）、startedQty=${snapMid.startedQty}（期望 ${midInFrames.length}＝窗内帧数）；` +
+        `（期望 ${midInTasks.length} 票）、startedQty=${snapMid.startedQty}` +
+        `（期望 ${midExpectStarted}＝窗内**去重件数**；窗内帧 ${midInFrames.length} 行、其中 ${midNullInWin} 行无件序号）；` +
         `四件（16:00:00 合格／23:59:59 不合格 在窗内；15:59:59／次日 00:00:00 在窗外）⇒ ` +
         `doneQty=${snapMid.doneQty}（期望 ${midExpectDone}）、avgTestSec=${snapMid.avgTestSec}` +
         `（期望 Σ${midExpectDurSum}s ÷ ${midExpectDone} ＝ ${midExpectAvg}s；` +

@@ -1059,9 +1059,13 @@ async function main() {
      同一组输入怎么构造（两侧都用**仓库现值**，不写魔数）：
        · 完成数 done = min(planQty, floor(班次已进行时长 / cycleSec))，合格 = round(done × firstPassRate)
          —— 这正是 mockData.computeStats 的构造口径，故可**独立于被测函数**先算出来；
-       · 服务端侧的入参形状自 `E65` 起**分成两类**（`server\services\stats.js` 的 docblock）：
-         票级 `orders:[{planQty, started}]`（一票即整票计划数，`started:true`）、
+       · 服务端侧的入参形状自 `E65` 起**分成两类**（`server\services\stats.js` 的 docblock），
+         `E69`（负责人 2026-09-30 裁定③）后如下：
+         票级 `orders:[{planQty}]`（一票即整票计划数）＋ **开工件数** `startedPieces:<number>`
+         （由 `measure_rt.unit_index` 去重数出、取数在 `stateSnapshot.statsOf()`）＋
          件级 `pieces:[{result, durationSec}]`（合格 N1 件 + 不合格 N2 件 + 测试中 2 件）。
+         ⚠ `E69` 之前这里写的是 `orders:[{planQty, started:true}]` —— 那个 `started` **已是死入参**
+         （新实现只读 `startedPieces`），留着会让后来人误以为票级布尔仍在新契约里，故本段按新契约改写。
          **两侧必须喂等价输入**：前端的「完成件数/合格数」由构造值给；件级时长之和
          **恰恰取前端自己的运行时长** `round(已进行时长 × runRate)` —— 这正是 `E65` 偏差① 之后
          `avgTestSec`（分子＝Σ 件级时长）与前端 `avgTest`（分子＝runSec）**唯一的对齐方式**；
@@ -1155,18 +1159,22 @@ async function main() {
       for (let i = 0; i < pass; i++) pieces.push({ result: stats.STATUS.PASS, durationSec: BE_PIECE_SEC });
       for (let i = pass; i < done; i++) pieces.push({ result: stats.STATUS.FAIL, durationSec: BE_PIECE_SEC });
       for (let i = 0; i < 2; i++) pieces.push({ result: stats.STATUS.RUNNING, durationSec: 0 });
-      /* 票级：一票＝整票计划数（与前端 planQty 同一取值），且"已开工"（两侧都按已开工算） */
-      const orders = [{ planQty: prod.planQty, started: true }];
+      /* 票级：一票＝整票计划数（与前端 planQty 同一取值）；**开工件数按 `E69` 新契约显式给**
+         （＝已完成的 done 件 ＋ 两条「测试中」件 —— 它们都已"开始测试"；同一件级夹具现算，不写死）。
+         ⚠ 本值**与 `orders.length`（1 票）刻意不等** ⇒ 下面 ②a-2 那条断言有判别力
+         （若实现退回"数票数"或忽略该入参，读数会变成 1 或 0）。 */
+      const orders = [{ planQty: prod.planQty }];
+      const startedPieces = done + 2;
       /* 采集时刻串仍是两侧**共同输入**（服务端 `runSec` 由它的条数决定）——
          这是真实契约本身（`runSec` ＝ 采样条数 − 1），不是"把两侧绑成等价"的构造。 */
       const measures = [];
       for (let i = 0; i <= runSecInt; i++) measures.push(new Date(at.getTime() - i * 1000));
       const be = stats.computeShiftStats({
-        shift, orders, pieces, measures,
+        shift, orders, startedPieces, pieces, measures,
         accum: { daySec: 0, monthSec: 0, yearSec: 0, at }, addRunSec: runSecInt, now: at
       });
       return { iso, elapsedSec, done, pass, runSecExact, runSecInt, dur, durSum: dur.reduce((s, v) => s + v, 0),
-        bePieceSec: BE_PIECE_SEC, pieces, orders, fe, be };
+        bePieceSec: BE_PIECE_SEC, pieces, orders, startedPieces, fe, be };
     }
 
     /* ---- `E67` 裁定②（分子**集合**＝`DONE_STATUS`）与 `E65` 偏差①（分子不是 `runSec`）的**独立靶子** ----
@@ -1197,7 +1205,7 @@ async function main() {
       const measures = [];
       for (let i = 0; i <= 20; i++) measures.push(new Date(at.getTime() - i * 1000));   // runSec = 20s
       const input = {
-        shift, orders: [{ planQty: 10, started: true }], pieces, measures,
+        shift, orders: [{ planQty: 10 }], startedPieces: 10, pieces, measures,
         accum: { daySec: 0, monthSec: 0, yearSec: 0, at }, addRunSec: 0, now: at
       };
       const real = stats.computeShiftStats(input);
@@ -1240,7 +1248,7 @@ async function main() {
       const measures = [];
       for (let i = 0; i <= 20; i++) measures.push(new Date(at.getTime() - i * 1000));   // runSec = 20s（与分子无关）
       const input = {
-        shift, orders: [{ planQty: 10, started: true }], pieces: allPieces, measures,
+        shift, orders: [{ planQty: 10 }], startedPieces: 10, pieces: allPieces, measures,
         accum: { daySec: 0, monthSec: 0, yearSec: 0, at }, addRunSec: 0, now: at
       };
       const real = stats.computeShiftStats(input);
@@ -1323,6 +1331,27 @@ async function main() {
             : evals.map(e => `${e.iso}: ${e.fe[row.fe]} ↔ ${e.be[row.be]}`).join('；')
         );
       }
+
+      /* ②a-2 `E69`／C-111 的新契约（**侧内**，不与前端比相等）：开工数是**件数入参** `startedPieces`
+         （不是票级布尔 `started`）。本段原构造里的 `started: true` 自 `E69` 起已是**死入参**
+         （实现不再读它）—— 留着会让后来人误以为票级布尔仍是契约，故按新契约改写并在这里把
+         "该入参真的被消费"钉成一句断言（`startedPieces` 与本段派工票数 1 **刻意不等** ⇒ 有判别力：
+         实现若退回"数票数"⇒ 1、忽略入参 ⇒ 0，都当场变红）。
+         ⚠ **不与前端 `started` 比相等**（这不是"少写一条断言"，而是**不可比量必须显式登记**）：
+            · 前端（`src\services\mockData.js`）：`started = min(计划, 完成＋在测＋待复检)` —— **演示派生量**；
+            · 服务端：`startedPieces` 由调用方从 `measure_rt.unit_index` **去重数出的件数**给出。
+         两者取数真源不同，绑成"两侧一致"会把 `T-20260930-18`／B3-5 已消除的"构造出一致"请回来。 */
+      check(
+        '跨实现一致（`E69` 新契约·**侧内**）：服务端 `startedQty` ＝ 入参 `startedPieces`（**件数**）、' +
+        '`notStartedQty` ＝ max(0, planQty − startedPieces) —— 该入参**不是死参数**（与派工票数刻意不等）',
+        evals.every(e => e.be.startedQty === e.startedPieces &&
+          e.be.notStartedQty === Math.max(0, e.be.planQty - e.startedPieces) &&
+          e.startedPieces !== e.orders.length && e.startedPieces > 0),
+        evals.map(e => `${e.iso}: startedQty=${e.be.startedQty}（入参 ${e.startedPieces}／派工票数 ${e.orders.length}）` +
+          `、notStartedQty=${e.be.notStartedQty}（＝max(0, ${e.be.planQty} − ${e.startedPieces})）`).join('；') +
+        '；**不可比量已显式登记**：两侧「开工数」取数真源不同 —— ' +
+        '前端＝演示派生量 min(计划, 完成＋在测＋待复检)、服务端＝`measure_rt.unit_index` 去重件数，故**不**比相等'
+      );
 
       /* ②b 平均测试时长（FR-4.13）：`E67` 之后**两侧各自独立取数**，故本段**不再**断言
           "服务端值 === Math.round(前端值)"（那条断言把两侧绑成同一真源，构造出一致并掩盖分叉 ——

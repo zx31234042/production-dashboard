@@ -124,7 +124,10 @@ const REQUIRED_COLUMNS = {
     'depth_upper_dev', 'depth_lower_dev', 'depth_typical',
     'speed_upper_dev', 'speed_lower_dev', 'speed_typical',
     'effective_from', 'created_by', 'team_code', 'created_at'],
-  measure_rt: ['equip_code', 'proc_order_no', 'measure_depth', 'speed', 'velocity_x',
+  /* DR-04（需求 **V1.41** / C-111）：`measure_rt` 增列**件序号 `unit_index`**（＝`IF-D.4` 的 `unitIndex`，
+     采集落库时写入）⇒ 它已是需求点名的关键列，必须登记进这份"独立于 schema.sql 的需求锚"
+     （否则"把该列从 schema.sql 删掉"这份锚不会响，而 `FR-4.2` 的开工数将整段塌成 0）。 */
+  measure_rt: ['equip_code', 'proc_order_no', 'unit_index', 'measure_depth', 'speed', 'velocity_x',
     'velocity_y', 'frame_rate', 'gain', 'shutter', 'camera_depth', 'test_status', 'collect_time'],
   result: ['proc_order_no', 'unit_index', 'result', 'judged_at', 'retest_count'],
   shift_stat: ['shift_date', 'shift_name', 'plan_qty', 'started_qty', 'qualified_qty',
@@ -984,6 +987,67 @@ async function main() {
       `行=[${legacyOpLogRows.map(r => r.op_type).join(' / ')}]`);
   }
   legacy.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
+
+/* ---------------- 六之八、DR-04 件序号 `unit_index` 的旧库升级路径（V1.41 / C-111，技术债 `E69`） ----------------
+   立案：`measure_rt` 的件序号是 **V1.41 新增的列**，而 `schema.sql` 的 `CREATE TABLE IF NOT EXISTS`
+   对**已存在的旧表是空操作** —— 旧库不会凭空长出这一列。若只有 `schema.sql` 而没有补列步骤，
+   旧库升级后带该列的落库语句会报 `table measure_rt has no column named unit_index`
+   ⇒ **采集链每帧失败**（不是"少记一个件序号"这种可容忍降级）。故本条把"旧库补列"这条路径
+   变成可复跑断言：补列后**列在、既有行一行不丢、该列为 NULL（零回填）**，且这次升级命中
+   `planMigration()` 的"结构版本升级"判据（E18 迁移前**强制备份**不可跳过）。
+   手法：先按**当前**结构建库 + 写一行，再把它退回**上一版形态**（`DROP COLUMN unit_index` ＋
+   `schema_version` 改成上一版）—— 旧形态由当前结构**现推**，不手写一份会随 schema 漂移的旧 DDL；
+   版本号同样**现算**（`SCHEMA_VERSION − 1`），故以后再升版本段不用改。 */
+  t.section('六之八、DR-04 件序号 `unit_index` 的旧库升级路径（V1.41 / C-111）');
+  {
+    const legacyUid = makeTempDb({ name: 'legacy-unit-index' });
+    db.initSchema(legacyUid.db, NOW);
+    const uidColsBefore = db.listColumns(legacyUid.db, 'measure_rt');
+    legacyUid.db.prepare(
+      `INSERT INTO measure_rt(equip_code, proc_order_no, unit_index, measure_depth, speed, collect_time, created_at)
+       VALUES(?, ?, ?, ?, ?, ?, ?)`
+    ).run('EQ-OLD', 'WO-OLD', 7, 5.25, 6.5, '2026-09-01 08:00:00', NOW);
+    legacyUid.db.exec('ALTER TABLE measure_rt DROP COLUMN unit_index');   // 退回 V1.41 之前的列集
+    const uidPrevVersion = String(Number(SCHEMA_VERSION) - 1);
+    legacyUid.db.prepare('UPDATE schema_meta SET value = ? WHERE key = ?')
+      .run(uidPrevVersion, 'schema_version');
+    const uidColsLegacy = db.listColumns(legacyUid.db, 'measure_rt');
+    const uidPlanBefore = db.planMigration(legacyUid.db);
+    if (t.requires('旧库前提：`measure_rt` 确已退回"无 `unit_index`"的旧形态、且库内结构版本＝上一版',
+      uidColsBefore.includes('unit_index') && !uidColsLegacy.includes('unit_index') &&
+      db.getSchemaVersion(legacyUid.db) === uidPrevVersion,
+      `退回前列含 unit_index=${uidColsBefore.includes('unit_index')}；退回后列=[${uidColsLegacy.join(', ')}]；` +
+      `库内版本=${db.getSchemaVersion(legacyUid.db)}（期望上一版 ${uidPrevVersion}）；当前 SCHEMA_VERSION=${SCHEMA_VERSION}`)) {
+      const uidInit = db.initSchema(legacyUid.db, NOW);
+      const uidColsAfter = db.listColumns(legacyUid.db, 'measure_rt');
+      const uidRow = legacyUid.db.prepare(
+        'SELECT * FROM measure_rt WHERE equip_code = ? AND proc_order_no = ?').get('EQ-OLD', 'WO-OLD');
+      const uidRows = legacyUid.db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+      t.check('DR-04（V1.41 / C-111）：旧库（`measure_rt` 无 `unit_index`）经 `initSchema()` **补列** —— ' +
+        '列补上了、**既有行一行不丢且逐列原样**、而该列是 `NULL`（**零回填**：绝不拿 0/1 冒充件序号，' +
+        '否则一票 N 件会被静默归并成一件）',
+        uidColsAfter.includes('unit_index') && uidRows === 1 && Boolean(uidRow) &&
+        uidRow.unit_index === null && uidRow.measure_depth === 5.25 && uidRow.speed === 6.5 &&
+        uidRow.collect_time === '2026-09-01 08:00:00',
+        `退回时列=[${uidColsLegacy.join(', ')}] ⇒ 补列后列=[${uidColsAfter.join(', ')}]；` +
+        `行数=${uidRows}、行=${JSON.stringify(uidRow)}`);
+
+      t.check('DR-04/E18（V1.41 / C-111）：旧库的"结构版本升级（上一版 → 当前版）"**命中迁移计划并强制备份**，' +
+        '升级后库内版本＝`SCHEMA_VERSION`、结构一致性校验通过（`schema.sql` 一改就必须升版本）',
+        uidPlanBefore.needed === true &&
+        uidPlanBefore.reasons.some(r => r.includes(`结构版本升级 ${uidPrevVersion} → ${SCHEMA_VERSION}`)) &&
+        uidInit.migrationPlan.needed === true &&
+        Boolean(uidInit.preMigrationBackup && uidInit.preMigrationBackup.path) &&
+        fs.existsSync(uidInit.preMigrationBackup.path) && uidInit.preMigrationBackup.bytes > 0 &&
+        db.getSchemaVersion(legacyUid.db) === SCHEMA_VERSION &&
+        db.verifySchemaConsistency(legacyUid.db).ok === true,
+        `升级计划原因=${JSON.stringify(uidPlanBefore.reasons)}；备份=${uidInit.preMigrationBackup && uidInit.preMigrationBackup.path}` +
+        `（${uidInit.preMigrationBackup && uidInit.preMigrationBackup.bytes} 字节）；` +
+        `升级后库内版本=${db.getSchemaVersion(legacyUid.db)}；` +
+        `verifySchemaConsistency=${JSON.stringify(db.verifySchemaConsistency(legacyUid.db))}`);
+    }
+    legacyUid.close();
+  }
 
 /* ---------------- 七、备份（DR-15 / DEP-08） ---------------- */
   t.section('七、备份与校验（DR-15 / DEP-08）');

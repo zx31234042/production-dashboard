@@ -313,8 +313,10 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
        HTTP 面（init/login/change/logout）→ 库内状态"，进程内建服务证明不了"装配真的生效"。
        手法与本节上面一致：`harness.startService`（stdio 落文件，受限环境下管道会 EPERM）、
        临时库/端口/目录全部唯一（门禁允许并发跑）。
-       前置造数：先按**当前**结构建库，再把 `schema_meta.schema_version` 改回 '4' ——
-       于是真进程启动时命中 E18 判据②"结构版本升级 4 → 5"，启动日志里的**迁移前备份行**
+       前置造数：先按**当前**结构建库，再把 `schema_meta.schema_version` 改回**上一版**
+       （＝`SCHEMA_VERSION − 1`，**由单一真源现算、不写死数字** —— 写死会让每次升版都假红一次，
+       实测踩过：`SCHEMA_VERSION` 5 → 6 后本段日志变成"结构版本升级 4 → 6"，而断言里写的是 `4 → 5`）——
+       于是真进程启动时命中 E18 判据②"结构版本升级 <上一版> → <当前版>"，启动日志里的**迁移前备份行**
        与磁盘上的备份文件都成为可断言的**行为**证据（不是匹配源码字符串）。 */
     {
       const authTmp = harness.makeTempDir('w5-auth-e2e');
@@ -324,10 +326,12 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
       const PW2 = 'W5E2E-Pass-2';
       const { DatabaseSync } = require('node:sqlite');
       const dbApi = require('../server/db');
+      /* 上一版结构版本号：**期望值全部由它现算**（`SCHEMA_VERSION` 是唯一真源，ADR-0004 D21） */
+      const PREV_SCHEMA_VERSION = String(Number(dbApi.SCHEMA_VERSION) - 1);
       {
         const seed = new DatabaseSync(authDbFile);
         dbApi.initSchema(seed, '2026-09-28 10:00:00');
-        seed.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
+        seed.prepare('UPDATE schema_meta SET value = ? WHERE key = ?').run(PREV_SCHEMA_VERSION, 'schema_version');
         seed.close();
       }
       let authSvc = null;
@@ -352,7 +356,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
           try { return fn(c); } finally { c.close(); }
         };
 
-        /* ① 启动日志：E18 迁移前备份（判据②）＋ op_log 审计 ＋ 库内版本已升到 5 */
+        /* ① 启动日志：E18 迁移前备份（判据②）＋ op_log 审计 ＋ 库内版本已升到 `SCHEMA_VERSION` */
         const health = await call('GET', '/health');
         const logText = authSvc.output();
         const backupLine = (logText.match(/\[启动\] E18 迁移前已备份：([^\r\n]+)/) || [])[1] || '';
@@ -361,12 +365,17 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
           "SELECT op_type, result, content FROM op_log WHERE op_type = '迁移前备份' ORDER BY id").all());
         const versionAfterStart = withDb(c => c.prepare(
           "SELECT value FROM schema_meta WHERE key = 'schema_version'").get().value);
-        t.check('W5-③ 端到端（真进程）：启动期命中 E18 判据②（库内版本 4 ≠ 5）⇒ 启动日志写明' +
-          '「迁移前已备份：<path>（原因 结构版本升级 4 → 5…）」、备份文件**真的落盘**且备份内是**迁移前**的库、' +
-          '`op_log` 有审计行（result=成功、含文件名）、启动后库内版本已升到 5；' +
+        /* ⚠ 结构版本号**一律现算**（`previous → current` 由 `dbApi.SCHEMA_VERSION` 推出）：
+           写死字面量会让本段在**每次升版**时假红一次（ADR-0004 D21：期望值由已知正确的量算出）。 */
+        const versionUpgradeRe = new RegExp('结构版本升级 ' + PREV_SCHEMA_VERSION + ' → ' + dbApi.SCHEMA_VERSION);
+        t.check('W5-③ 端到端（真进程）：启动期命中 E18 判据②（库内版本 ' + PREV_SCHEMA_VERSION +
+          ' ≠ ' + dbApi.SCHEMA_VERSION + '）⇒ 启动日志写明' +
+          '「迁移前已备份：<path>（原因 结构版本升级 ' + PREV_SCHEMA_VERSION + ' → ' + dbApi.SCHEMA_VERSION + '…）」、' +
+          '备份文件**真的落盘**且备份内是**迁移前**的库、' +
+          '`op_log` 有审计行（result=成功、含文件名）、启动后库内版本已升到 ' + dbApi.SCHEMA_VERSION + '；' +
           '**F20 对照**：本库本来就有 `op_log`（审计一次成功）⇒ 该行必须是 `审计 op_log=ok #<id>` 且**不含** `backfill`',
           health.status === 200 && backupPath !== '' && fs.existsSync(backupPath) &&
-          /结构版本升级 4 → 5/.test(backupLine) &&
+          versionUpgradeRe.test(backupLine) &&
           auditAfterStart.length === 1 && auditAfterStart[0].result === '成功' &&
           String(auditAfterStart[0].content).includes(path.basename(backupPath)) &&
           versionAfterStart === dbApi.SCHEMA_VERSION &&
@@ -508,7 +517,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
     }
 
     /* ---- 2d. W5-③/**F20**：**极旧库（连 `op_log` 表都没有）**的启动日志必须如实标"已 backfill"（真起进程）----
-       造数：当前结构建库 → `DROP TABLE op_log` → 版本改回 '4' ⇒ 迁移前那次审计必然失败
+       造数：当前结构建库 → `DROP TABLE op_log` → 版本改回**上一版**（`SCHEMA_VERSION − 1`，现算）⇒ 迁移前那次审计必然失败
        （`no such table: op_log`），迁移后由 db 层**补写**（`backfill（迁移后补写）`）。
        **改前复现**（F20 立案）：该行会打印"审计 op_log=写入失败（已告警，auditDegraded=true）"，
        而库里其实已有 backfill 行 ⇒ **日志与事实不符**。改后应打印"写入失败→已 backfill #<id>"。
@@ -523,7 +532,9 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
         const seed = new DatabaseSync(f20DbFile);
         dbApi.initSchema(seed, '2026-09-28 10:00:00');
         seed.exec('DROP TABLE op_log');       // 极旧库的形态：连 op_log 表都没有
-        seed.prepare("UPDATE schema_meta SET value = '4' WHERE key = 'schema_version'").run();
+        /* 版本同样**现算**（上一版），不写死数字 —— 与 2c 同一个理由（升版不假红） */
+        seed.prepare('UPDATE schema_meta SET value = ? WHERE key = ?')
+          .run(String(Number(dbApi.SCHEMA_VERSION) - 1), 'schema_version');
         seed.close();
       }
       let f20Svc = null;
@@ -2138,6 +2149,13 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
       out.noUnit.countsBefore = readCounts(C);
       out.noUnit.writesBefore = serverEntry.state.resultWrite.writes;
       out.noUnit.failuresBefore = serverEntry.state.resultWrite.failures;
+      /* `E69`／C-111 的现场读数（下面两条新断言只读**真链路**的现场，不读实现内部状态）：
+         · `svc.snapshot().stats.startedQty` ＝ 快照统计段算出的**开工件数**（`FR-4.2`，走
+           `stateSnapshot.statsOf()` 的 SQL ⇒ `measure_rt.unit_index`）；
+         · `/health` 顶层 `frameUnitIndex` ＝ 帧件序号计数（与 `/ifd/status` 同源）。
+         推 C 票那三帧**之前**先各读一次，作为"不虚增 / 增量"的基线。 */
+      out.noUnit.startedBefore = svc.snapshot().stats.startedQty;
+      out.noUnit.healthBefore = await (await fetch(out.base + '/health')).json();
       /* 帧体**显式**决定带不带 unitIndex（本条的靶子：两次推帧只变这一个字段）。
          `unitIndex === undefined` ⇒ JSON.stringify 直接**不产出该键**（不是产出 null）。 */
       const nuPush = async (seq, at, testStatus, unitIndex) => {
@@ -2149,12 +2167,15 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
         if (unitIndex !== undefined) body.unitIndex = unitIndex;
         const res = await cntPost(out.base, '/ifd/frame', body);
         await new Promise(r => setTimeout(r, 400));    // 让 onSampled 挂钩跑完、事件落进收件箱
+        /* 库内回读**两列**（按列名）:`unit_index` 是本次改动新增的列 —— 只读 test_status 证明不了
+           "件序号真的落进它自己那一列"（列序错位会静默写错列）。 */
         const st = db.prepare(
-          'SELECT test_status FROM measure_rt WHERE proc_order_no = ? AND collect_time = ?').get(C, at);
+          'SELECT test_status, unit_index FROM measure_rt WHERE proc_order_no = ? AND collect_time = ?').get(C, at);
         return {
           at, seq, testStatus, unitIndex: unitIndex === undefined ? null : unitIndex,
           frameHasUnitIndex: Object.prototype.hasOwnProperty.call(body, 'unitIndex'),
-          res, storedStatus: st ? st.test_status : null, counts: readCounts(C),
+          res, storedStatus: st ? st.test_status : null, storedUnitIndex: st ? st.unit_index : null,
+          counts: readCounts(C),
           writes: serverEntry.state.resultWrite.writes
         };
       };
@@ -2167,7 +2188,13 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
       out.noUnit.countsAfter = readCounts(C);
       out.noUnit.writesAfter = serverEntry.state.resultWrite.writes;
       out.noUnit.failuresAfter = serverEntry.state.resultWrite.failures;
-      out.noUnit.ifdStatusCounts = (await (await fetch(out.base + '/ifd/status')).json()).counts || null;
+      /* 三帧**不带**件序号之后：开工件数不得虚增（`FR-4.2` 按件计 ⇒ 没有件序号就没有"件"）；
+         同时把 `/health` 与 `/ifd/status` **背靠背**各取一次（中间不再推帧 ⇒ 两次读的是同一现场），
+         供"两处同源"与"`withIndex + withoutIndex = stored` 不变量"两条断言使用。 */
+      out.noUnit.startedAfterNoUnit = svc.snapshot().stats.startedQty;
+      out.noUnit.healthAfterNoUnit = await (await fetch(out.base + '/health')).json();
+      out.noUnit.ifdStatus = await (await fetch(out.base + '/ifd/status')).json();
+      out.noUnit.ifdStatusCounts = out.noUnit.ifdStatus.counts || null;
       out.noUnit.shouldDoneAtFirst = Math.floor(
         (Date.parse(cntAt(CNT_F1, 30).replace(' ', 'T')) - Date.parse(CNT_PLAN_START.replace(' ', 'T')))
         / 1000 / CNT_CYCLE);
@@ -2183,6 +2210,21 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
       out.noUnit.control.writesAfter = serverEntry.state.resultWrite.writes;
       out.noUnit.control.counts = readCounts(C);
       out.noUnit.control.row = resultRepo.getOne(db, C, 1);
+      /* 正向对照帧（**带** `unitIndex=1`，其余同）之后：开工件数必须**增 1**；
+         并记录全表行数，供"`stored` ＝ 表行数"这条交叉核对使用。 */
+      out.noUnit.startedAfterControl = svc.snapshot().stats.startedQty;
+      out.noUnit.healthAfterControl = await (await fetch(out.base + '/health')).json();
+      /* `withIndex + withoutIndex = stored`／"两处同源"这两条必须在**同一现场**读：
+         `/health` 与 `/ifd/status` 背靠背各取一次，中间不再推帧（实测踩过：拿"控制帧之前"的
+         `/ifd/status` 去和"控制帧之后"的 `/health` 比 ⇒ 差一帧，是**取数时刻不同**、不是同源破了）。 */
+      out.noUnit.ifdStatusAfterControl = await (await fetch(out.base + '/ifd/status')).json();
+      out.noUnit.measureRowsAfter = db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
+      /* 库里**按列名**数出来的两个数（与 `/health` 的计数交叉核对；这一对是"计数↔事实"的双向核对：
+         若计数口径漂移、或件序号没真的落进那一列，两个方向都会当场对不上）。 */
+      out.noUnit.measureUnitIndexCounts = {
+        withIndex: db.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE unit_index IS NOT NULL').get().c,
+        withoutIndex: db.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE unit_index IS NULL').get().c
+      };
     } catch (err) {
       out.error = String(err && err.stack ? err.stack : err);
     } finally {
@@ -2610,6 +2652,66 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
       `判定挂钩失败=${nu.ifdStatusCounts && nu.ifdStatusCounts.sampledHookFailures}；` +
       `正向对照帧 ${nuCtl.at}（**带** unitIndex=1，其余同）：工单类=${nuCtlOrderRows} 条、该票行数=${nuCtl.counts && nuCtl.counts.rows}、` +
       `writes ${nuCtl.writesBefore}→${nuCtl.writesAfter}；行=${JSON.stringify(nuCtl.row)}`);
+
+    /* ---- `E69`／C-111 判别力断言①（**负向靶子**）：帧**不带** `unitIndex` ⇒ 开工件数**不虚增** ----
+       立案：`FR-4.2` 自 V1.41（C-111）起按**件**计，判据＝该件在 `measure_rt` 有采样数据且 `unit_index` 非空。
+       若"没有件序号的帧也算开工"（例如把 `unit_index IS NOT NULL` 这条过滤去掉），
+       现场就会把"拿不到件序号"当成"开工了一件" —— 与 `judge.js` 的"拿不到不说"同一纪律。
+       本条在**真链路**上验三件事，且带**正向对照**（否则"不增"也可能只是"这个量根本不动"）：
+         ① 同一票连推 3 帧**不带** `unitIndex` ⇒ `snapshot.stats.startedQty` **不变**；
+         ② 这 3 帧在库里 `unit_index` **为 NULL**（按列名回读，不是只看行数）；
+         ③ `/health.frameUnitIndex.withoutIndex` **恰 +3**（"帧没带件序号"这件事**可被现场读出来**）；
+         ④ 对照帧只多带 `unitIndex=1` ⇒ `startedQty` **恰 +1**（证明这个量确实随件数动）。 */
+    {
+      const nuBefore = nu.startedBefore, nuAfterNo = nu.startedAfterNoUnit, nuAfterCtl = nu.startedAfterControl;
+      const nuHealthBefore = (nu.healthBefore && nu.healthBefore.frameUnitIndex) || null;
+      const nuHealthAfterNo = (nu.healthAfterNoUnit && nu.healthAfterNoUnit.frameUnitIndex) || null;
+      const nuStoredNull = nuPosts.length === 3 && nuPosts.every(p => p.storedUnitIndex === null);
+      const nuWithoutDelta = nuHealthBefore && nuHealthAfterNo
+        ? nuHealthAfterNo.withoutIndex - nuHealthBefore.withoutIndex : null;
+      t.check('FR-4.2/E69 行为·**负向靶子**（帧**不带** `unitIndex` ⇒ 开工数**不虚增**）：同一票连推 3 帧' +
+        '（其余字段与对照帧相同）⇒ 快照 `stats.startedQty` **一字不增**、这 3 行库内 `unit_index` **为 NULL**、' +
+        '`/health.frameUnitIndex.withoutIndex` **恰 +3**；而**只多带** `unitIndex=1` 的对照帧 ⇒ `startedQty` **恰 +1**' +
+        '（去掉 `unit_index IS NOT NULL` 过滤 ⇒ 开工数会虚增 3 ⇒ 本条必红）',
+        Number.isFinite(nuBefore) && nuBefore > 0 &&
+        nuAfterNo === nuBefore && nuStoredNull && nuWithoutDelta === 3 &&
+        nuAfterCtl === nuBefore + 1,
+        `开工件数（快照 stats）：推 3 帧不带件序号前=${nuBefore} ⇒ 后=${nuAfterNo}（须相等）；` +
+        `对照帧（带 unitIndex=1）后=${nuAfterCtl}（须 ${nuBefore} + 1）；` +
+        `三帧库内 unit_index=${JSON.stringify(nuPosts.map(p => p.storedUnitIndex))}；` +
+        `/health.frameUnitIndex.withoutIndex：${nuHealthBefore && nuHealthBefore.withoutIndex} ⇒ ` +
+        `${nuHealthAfterNo && nuHealthAfterNo.withoutIndex}（Δ=${nuWithoutDelta}，须 3）；` +
+        `withIndex：${nuHealthBefore && nuHealthBefore.withIndex} ⇒ ${nuHealthAfterNo && nuHealthAfterNo.withIndex}`);
+    }
+
+    /* ---- `E69` 判别力断言④：`/health.frameUnitIndex` 的**不变量**与**同源** ----
+       口径（`services/ingest.js` 的 `state.frameUnitIndex` 注释）：计数**只数真正落库的那一帧**
+       （重复帧 / 500 ms 原始帧 / 被拒收帧都不是库里的行）⇒ 恒有 `withIndex + withoutIndex === stored`，
+       且 `stored` 应等于 `measure_rt` 的行数（两个独立真源交叉核对）；
+       两个计数还应与库里**按列名**数出的"`unit_index` 非空 / 为空"的行数**逐项相等**
+       （这一对是"计数 ↔ 事实"的双向核对：`ingest` 若不再把件序号写进那一列，`withIndex` 就与库对不上）。
+       同源：`/health` 顶层的该对象与 `GET /ifd/status` 里的**逐字段相等** —— 两处都只是搬运
+       `ingest.status()` 的同一个返回值（此处两次 HTTP 中间**不再推帧**，故是同一现场）。
+       反证：谁若在 `/health` 侧另算一份计数、把计数挪到"落库之前"、或让 `ingest` 不写该列，本条的等式必红。 */
+    {
+      const h = (nu.healthAfterControl && nu.healthAfterControl.frameUnitIndex) || null;
+      const s = (nu.ifdStatusAfterControl && nu.ifdStatusAfterControl.frameUnitIndex) || null;
+      const uic = nu.measureUnitIndexCounts || {};
+      t.check('FR-4.2/E69 行为·**不变量与同源**：`/health.frameUnitIndex` 恒有 `withIndex + withoutIndex = stored`、' +
+        '`stored` ＝ `measure_rt` 实际行数、两个计数＝库里按列名数出的 `unit_index` 非空/为空行数，' +
+        '且与 `GET /ifd/status` 的 `frameUnitIndex` **逐字段相等**（同一份 `ingest.status()`）',
+        Boolean(h) && Boolean(s) &&
+        h.withIndex + h.withoutIndex === h.stored &&
+        h.stored === nu.measureRowsAfter &&
+        h.withIndex === uic.withIndex && h.withoutIndex === uic.withoutIndex &&
+        JSON.stringify(h) === JSON.stringify(s),
+        `health.frameUnitIndex=${JSON.stringify(h)}；ifd/status.frameUnitIndex=${JSON.stringify(s)}；` +
+        `两处逐字段相等=${JSON.stringify(h) === JSON.stringify(s)}；` +
+        `measure_rt 行数=${nu.measureRowsAfter}（须＝ stored）；` +
+        `库里按列名数：unit_index 非空 ${uic.withIndex} 行／为空 ${uic.withoutIndex} 行；` +
+        `推帧前 withIndex/withoutIndex=${nu.healthBefore && nu.healthBefore.frameUnitIndex && nu.healthBefore.frameUnitIndex.withIndex}` +
+        `/${nu.healthBefore && nu.healthBefore.frameUnitIndex && nu.healthBefore.frameUnitIndex.withoutIndex}`);
+    }
   }
 
   t.check('FR-5.8/C-88 行为：**同态临近**（深度与速度各距上/下限恰 k 格）⇒ 事件里参数类**恰 2 条**且名称均为「参数阈值临近预警」、等级 warn、每条只含一个参数',

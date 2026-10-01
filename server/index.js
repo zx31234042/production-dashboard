@@ -365,6 +365,13 @@ function healthPayload() {
     dataRoot: platformPaths.paths.dataRoot,
     dbFile: state.dbFile || platformPaths.paths.dbFile,
     streams: state.router ? state.router.streamCount() : 0,
+    /* 帧件序号计数（V1.41 / C-111 ＋ 技术债 `E69`）：`FR-4.2` 的开工数**按件计**
+       （判据＝该件在 `measure_rt` 有采样数据、以 `unit_index` 区分），帧**不带件序号**时开工数会算成 0
+       ⇒ 现场必须能一眼分清"**真没开工**"与"**帧没带件序号**"（与 `state.resultWrite` 同精神）。
+       值**与 `GET /ifd/status` 同源**（都是 `ingest.status()` 的返回值，此处只搬运、不另算）；
+       IF-D 未接线时给 `null`（键恒在，"没有这个数"与"这个数是 0"分得开）。
+       恒有 `withIndex + withoutIndex === stored`（只数真正落库的帧）。 */
+    frameUnitIndex: ifd && ifd.frameUnitIndex ? ifd.frameUnitIndex : null,
     /* 「工单超时预警」（FR-5.11）的取数源：**已完成件数取 `result`（DR-05）真值**。
        E58 的临时闸（`orderDoneSourceReady` / `orderWarningSource` 抑制字段）已随
        `T-20260930-08` 拆除 —— 抑制事实不再需要"可被读到"，因为抑制已不存在：
@@ -563,6 +570,11 @@ async function start(options = {}) {
   router.ifdStatus = ifd.status;
   logger.info(`[路由] IF-D 采集已接线（${ifd.by}）：${ifd.routes.join(' , ')}；` +
     `去重主口径=equipCode+procOrderNo+collectTime+seq（无 seq 走退路口径）；落库=1 s 采样（ADR-0001 D7）`);
+  /* 口径播报（V1.41 / C-111，技术债 E69）：**开工数按件计**，故"帧没带件序号"这件事必须一眼可见 ——
+     启动即把口径与可读位置说清楚，避免现场把"帧没带件序号"当成"设备真没开工"。 */
+  logger.info('[口径] 帧件序号：`IF-D.4 unitIndex`（落 `measure_rt.unit_index`）；' +
+    '**缺件序号的帧 unit_index 写 NULL 且不计入开工件数**（FR-4.2 按件计，判定依据＝该件在 DR-04 有采样数据）；' +
+    '计数见 `GET /health` 的 `frameUnitIndex`（=`GET /ifd/status` 同源）—— "真没开工"与"帧没带件序号"是两件事。');
 
   /* ---- 6c. W2 业务挂载：IF-A 接收（MES 派工/物料/工艺/设备；本机提供接口） ----
      依据 `server/http/router.js` 挂载位的指引（"请把注册写进对应函数体"），注册动作在
@@ -863,10 +875,12 @@ async function start(options = {}) {
    *  **为什么不引入第二时间源**：记的是帧自带的 `collectTime`（DR-16 文本）—— 它就是同一帧落进
    *  `measure_rt.collect_time` 的那一个字符串；首/末两个值都取自**同一条已落库事实**，
    *  本缓存不读系统时间、不另起定时器、不新增列（ADR-0003 D17）。
-   *  **为什么不用 `measure_rt` 的 `MIN(collect_time)`**：`measure_rt` **没有** `unit_index` 列
-   *  （不加列是本仓既定口径，C-101④），按工单取 MIN 会把同工单的多件混成一件 ⇒ 按件首帧只能在
-   *  进程内按 `(工单, 件号)` 记账；库层对 `duration_sec` 取 `MAX(旧值, 新值)`（单调不减），
-   *  故进程重启后从 0 重算**也不会**让已落库的时长倒退。
+   *  **为什么不用 `measure_rt` 的 `MIN(collect_time)`**：该表**曾经**没有 `unit_index` 列
+   *  （C-101④ 当时的口径），按工单取 MIN 会把同工单的多件混成一件 ⇒ 按件首帧只能在进程内按
+   *  `(工单, 件号)` 记账。**V1.41 / C-111 起 `measure_rt.unit_index` 已落库**（DR-04 增列），
+   *  库层现在**可以**按件取首末帧 —— 但本缓存**本轮不动**（改它等于换 `duration_sec` 的取数口径，
+   *  超出本包裁定范围；且历史行的 `unit_index` 为 NULL，按件聚合对老数据仍不成立）。
+   *  库层对 `duration_sec` 取 `MAX(旧值, 新值)`（单调不减），故进程重启后从 0 重算**也不会**让已落库的时长倒退。
    *  容量上限：只保留最近 `PIECE_SPAN_CACHE_MAX` 件（按插入序淘汰最旧），防长时间运行下无界增长；
    *  被淘汰的件若再来帧，就按"新首帧"重算（同样受上面的 `MAX()` 保护）。 */
   const PIECE_SPAN_CACHE_MAX = 512;
