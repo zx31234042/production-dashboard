@@ -5968,76 +5968,181 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
     const a1FactOf = (date, name) => {
       const w = a1WindowOf(date, name);
       if (!w) return null;
+      const row = shiftStatRepo.getShiftRow(a1Db, date, name);
+      /* `frozenPieces` ＝ **冻结当时**窗口内的判定件数（不查库）：`pass_rate`/`oee` 都是
+         "本次固化算没算得出来"的派生位，而算不算得出来只由 `shiftStatRowOf()` 的
+         `pieceCount > 0` / `frameCount > 0` 决定 ⇒ "冻结时算得出来" ⇔ 那些位的取值本身。
+         这一点必须**与库内现值分开取**：`judged_at` 可被后续帧刷新，库内现值可能是"事后"的。 */
       return {
         window: `${w.startAt} → ${w.endAt}`,
         frames: a1Db.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE collect_time >= ? AND collect_time < ?')
           .get(w.startAt, w.endAt).c,
         pieces: a1Db.prepare('SELECT COUNT(*) AS c FROM result WHERE judged_at IS NOT NULL AND judged_at >= ? AND judged_at < ?')
-          .get(w.startAt, w.endAt).c
+          .get(w.startAt, w.endAt).c,
+        frozenPieces: row ? (row.pass_rate === null ? 0 : 1) : null
       };
     };
-    /* 逐行**合法性判定**（纯函数，便于拿座位 5 的两个合法反例做负对照）：
-         · 无采集帧 ⇒ `oee` 必须 NULL（不得用 0 顶替"算不出来"）；有帧 ⇒ 必须非 NULL（真 0% 也照写 0）；
-         · 有判定件 ⇒ `pass_rate` 必须非 NULL；
-         · 整班无帧无件 ⇒ `pass_rate` 也必须 NULL（占位行两列都 NULL）。
-       ⚠ **`pass_rate` 侧为什么不写等价（"`pass_rate IS NULL` ⇔ 现在数到的件数 ＝ 0"）**：
-       `result.judged_at` 是**可变列** —— 同一件被后续帧重新判定时会被刷新（`repo/result.js` 的
-       upsert 语义），故"现在数到的件数"可能**小于**"冻结时刻数到的件数" ⇒ `现在 pieces = 0` **不能**
-       反推"冻结时也是 0"。本节实测到该形态：`2026-10-02|中班` 冻在 16:00:01 那一帧之后（当刻
-       `pieceCount > 0` ⇒ `pass_rate = 0`），而 A1-5 时那一件的 `judged_at` 已被后续判定刷到窗外
-       ⇒ 现在 pieces = 0。`measure_rt` 则是**只增不改**（每秒一行、窗口在过去）⇒ `frameCount` 侧
-       可以做等价判定（无帧 ⇔ oee NULL）。 */
+    /* 逐行**合法性判定**（纯函数；负对照直接调它）——**三条判据**（能力：两侧都判 ⇒ 判别力不小于
+       原来的"有件 ⇒ 非 NULL"这一侧），逐条注明"能不能判"：
+         · ① 无采集帧 ⇒ `oee` 必须 NULL（不得用 0 顶替"算不出来"）；有帧 ⇒ 必须非 NULL（真 0% 也照写 0）。
+              `measure_rt` 只增不改（每秒一行、窗口在过去）⇒ 这一条两侧都是**真等价**，可判。
+         · ② 冻结时**一件都没有** ⇒ `pass_rate` 必须 NULL（没有分母就不许给比率）。
+              ⚠ 前提是"冻结时"的件数（由 `pass_rate` 这个派生位反读：`frozenPieces === 0` ⇔
+              `pass_rate IS NULL` —— 那是 `shiftStatRowOf()` 在同一行里写下的 `rateDeterminable`），
+              **不是库里现数的件数**。
+         · ③ 反方向：**冻结时有判定件** ⇒ 必须给比率（有分母却不给值同样不许）。它与 ② 合起来
+              正是"`frozenPieces === 0` ⇔ `pass_rate IS NULL`"这个**双向**等价 —— 真实现里
+              `2026-10-02|中班` 就是 `frozenPieces = 1`、`pass_rate = 0` 的现场。
+       ⚠ **⒜（`E88`，2026-10-02 修）为什么不能写成反向蕴含（"库里数到的件数 > 0 ⇒ `pass_rate` 非 NULL"）
+       或等价（"`pass_rate IS NULL` ⇔ 现在数到的件数 ＝ 0"）**：`result.judged_at` 是**可变列**
+       （`repo/result.js:129` 的 upsert 会把它刷成本次判定时刻）⇒ 同一件被后续帧重判后会被刷到窗外，
+       "现在数到的件数"可以 **小于** "冻结时数到的件数"。**本节的夹具就真实产出该形态**（实测）：
+         `2026-10-02|中班` 在 `2026-10-03 01:00:10` 那一 tick 固化（当刻 `pieceCount = 1` ⇒ `pass_rate = 0`），
+         而同一 tick 里 `persistJudgement()` 随后把那一件的 `judged_at` 从 `2026-10-02 16:00:10`（窗内）
+         刷成 `2026-10-03 01:00:10`（窗外，`result.created_at=2026-10-02 16:00:10`
+         证明它冻结时**确实在窗内**）⇒ 事后 `pieces = 0`。
+       旧写法（"有判定件 ⇒ `pass_rate` 非 NULL"用的是**现在**的件数）会把这行**假判红**；
+       改成冻结时件数做前提后，该行**可判且为绿**（零判别力损失：它照样要求"冻结时有件就必须给比率"）。
+       ⚠ **残余（如实登记，不假装已覆盖）**：① 侧的 `frameCount` 用的是库内现值，本节全序复核时
+       `oee` 也始终非 NULL（`run_sec = 0` 的行 `oee` 都是 0）⇒ 该侧在本夹具内**未见**同类反例；
+       但 `measure_rt` 的"只增不改"只保证帧**总行数**不倒退，**不**证明"冻结时窗口内帧数"与
+       "现在窗口内帧数"恒等（同一 tick 内先冻结后落库这件事对帧侧同样存在，只是本夹具的帧窗口
+       恰好都在过去）。这一条**只作登记**，不写成断言。 */
     const a1ShapeVerdict = (row, fact) => {
       if (!fact) return '取不到班次窗口（判不了就判红）';
       if (fact.frames === 0 && row.oee !== null) return '无采集帧却给了 oee（用 0 顶替"算不出来"）';
       if (fact.frames > 0 && row.oee === null) return '有采集帧却把 oee 留 NULL（可判定却不给值）';
-      if (fact.pieces > 0 && row.pass_rate === null) return '有判定件却把 pass_rate 留 NULL';
-      if (fact.frames === 0 && fact.pieces === 0 && row.pass_rate !== null) return '整班无帧无件却给了 pass_rate（占位行必须两列 NULL）';
+      if (fact.frozenPieces !== null && fact.frozenPieces > 0 && row.pass_rate === null) {
+        return '冻结时有判定件却把 pass_rate 留 NULL（有分母却不给比率）';
+      }
+      if (fact.frozenPieces === 0 && row.pass_rate !== null) return '冻结时一件都没有却给了 pass_rate（没有分母就不许给比率）';
       return null;
     };
+    /* 台账（**逐行**，两条判据各一行读数；不是判据本身）：`bad` ＝ 判据①／② 的落点；
+       `subsetBad` ＝ 判据③ 的落点（"现在数到的件数 ≤ 冻结时数到的件数"—— 
+       `judged_at` 只被往后刷 ⇒ 件只会**离开**窗口，不会凭空进入）；`staleRows` ＝ 两者**不等**的行，
+       即"该窗口的件数在我们读数之前被动过"的现场台账（合法，不是红）。 */
     const a1ShapeAudit = () => {
       const rows = shiftStatRepo.listRows(a1Db, 50).map(r => {
         const fact = a1FactOf(r.shift_date, r.shift_name);
-        return { key: `${r.shift_date}|${r.shift_name}`, row: r, fact, bad: a1ShapeVerdict(r, fact) };
+        const subsetBad = Boolean(fact) && fact.frozenPieces !== null && fact.pieces > fact.frozenPieces
+          ? `现在数到 ${fact.pieces} 件 > 冻结时 ${fact.frozenPieces} 件（件只能离开窗口 ⇒ 库内真源与冻结读数不一致）` : null;
+        return { key: `${r.shift_date}|${r.shift_name}`, row: r, fact, bad: a1ShapeVerdict(r, fact), subsetBad };
       });
       const kinds = {
-        '有帧无件': rows.filter(x => x.fact && x.fact.frames > 0 && x.row.oee !== null && x.row.pass_rate === null).length,
-        '有帧有件': rows.filter(x => x.fact && x.fact.frames > 0 && x.row.oee !== null && x.row.pass_rate !== null).length,
-        '无帧无件（占位行）': rows.filter(x => x.fact && x.fact.frames === 0 && x.fact.pieces === 0
+        '有帧无件': rows.filter(x => x.fact && x.fact.frames > 0 && x.row.oee !== null && x.fact.frozenPieces === 0).length,
+        '有帧有件': rows.filter(x => x.fact && x.fact.frames > 0 && x.row.oee !== null && x.fact.frozenPieces > 0).length,
+        '无帧无件（占位行）': rows.filter(x => x.fact && x.fact.frames === 0 && x.fact.frozenPieces === 0
           && x.row.oee === null && x.row.pass_rate === null).length,
-        '无帧有件（本节夹具不产出）': rows.filter(x => x.fact && x.fact.frames === 0 && x.fact.pieces > 0
+        '无帧有件（本节夹具不产出）': rows.filter(x => x.fact && x.fact.frames === 0 && x.fact.frozenPieces > 0
           && x.row.oee === null && x.row.pass_rate !== null).length
       };
-      return { rows, kinds, bad: rows.filter(x => x.bad) };
+      return {
+        rows, kinds, bad: rows.filter(x => x.bad), subsetBad: rows.filter(x => x.subsetBad),
+        staleRows: rows.filter(x => x.fact && x.fact.frozenPieces !== null && x.fact.pieces !== x.fact.frozenPieces)
+      };
     };
     const a1ShapeAt5 = a1ShapeAudit();
-    /* **合法反例负对照**（`E85⒜` 的现场，也是这条判据的 D22）：座位 5 实测的两个**合法**形态都必须
-       **不被**新判据判红 —— `(run_sec=0, oee=0, pass_rate=NULL)`（窗口内恰 1 帧）与
-       `(run_sec=0, oee=NULL, pass_rate=0)`（无帧有件）。旧判据（"两列同 NULL 或同非 NULL"）
-       会把**后者**判红 ⇒ 这里连同旧判据一起复现，作为"旧判据确实会假红合法形态"的反证。 */
+    /* **合法反例负对照**（`E85⒜` 的现场，也是这条判据的 D22）：判红的**前提**是"件数/帧数读数可信"，
+       故负对照给两种**件数读数不可信或读数为 0**的合法形态；夹具产不出的那一种用显式构造（构造变量逐项写明）：
+         · `(run_sec=0, oee=0, pass_rate=NULL)`（窗口内恰 1 帧、无件）：**真实**形态（`2026-10-02|早班`）；
+         · `(run_sec=0, oee=NULL, pass_rate=0)`（冻结时窗口内有件 ⇒ `pass_rate=0`；零帧 ⇒ `oee` 只能 NULL）：
+           **构造**（本节夹具产不出）—— `fact.frozenPieces=1` 与 `pass_rate=0` 都是 `row` 自己的位，
+           互相对齐；`frames=0` 与 `oee=NULL` 同理；**唯一**来自库的 `fact.pieces=0` 是"事后重判把它刷出去了"，
+           正是 ⒜ 的现场形状。
+       旧判据（"两列同 NULL 或同非 NULL"）会把**这两个**都判红 ⇒ 一并复现作反证。 */
     const a1LegalShapes = [
-      { name: '(0,0,NULL)＝窗口内恰 1 帧', row: { run_sec: 0, oee: 0, pass_rate: null }, fact: { frames: 1, pieces: 0 } },
-      { name: '(0,NULL,0)＝无帧有件', row: { run_sec: 0, oee: null, pass_rate: 0 }, fact: { frames: 0, pieces: 1 } }
+      {
+        name: '(0,0,NULL)＝窗口内恰 1 帧、无件（真实）', real: true,
+        row: { run_sec: 0, oee: 0, pass_rate: null }, fact: { frames: 1, pieces: 0, frozenPieces: 0 }
+      },
+      {
+        name: '(0,NULL,0)＝冻结时有件 1、事后被重判归零', real: false,
+        row: { run_sec: 0, oee: null, pass_rate: 0 }, fact: { frames: 0, pieces: 0, frozenPieces: 1 }
+      }
     ];
     const a1LegalVerdicts = a1LegalShapes.map(s => ({
       name: s.name, newBad: a1ShapeVerdict(s.row, s.fact),
-      oldBad: (s.row.oee === null) !== (s.row.pass_rate === null)
+      oldBad: (s.row.oee === null) !== (s.row.pass_rate === null)     /* 旧判据：只比"两列同号" */
     }));
     const a1OldFalseReds = a1LegalVerdicts.filter(v => v.oldBad).map(v => v.name);
-    t.check('A1-5 **"不用 0 顶替"的两个状态位（各自独立）逐行对齐库内真源**（`E85⒜` 重写）：' +
-      '无采集帧 ⇒ `oee` 必须 NULL、有帧 ⇒ 非 NULL（真 0% 也照写 0）；有判定件 ⇒ `pass_rate` 非 NULL；' +
-      '整班无帧无件 ⇒ 两列都 NULL（占位行）；且"有帧无件""有帧有件"两种形态在本节的库里都真实存在 —— ' +
-      '**窗口由班次真源现算**、两个计数由本节自写 SQL 数（`ADR-0004 D19`）；' +
-      '负对照：两个**合法**形态（`(0,0,NULL)` 与 `(0,NULL,0)`）都不许被判红，而**旧判据**会把**两个都**假判红',
+    /* ⒜ 的**判别力读数**（修方向**不得**削弱判别力）：两条子判据各自的"反例"都必须被抓 ——
+       ① 的反例＝**无帧却给了 `oee`**（占位行拿 0 顶替"算不出来"）：`frames=0` ⇒ 必须 NULL；
+       ② 的反例＝**冻结时有件却把 `pass_rate` 留 NULL**（有分母却不给比率）。
+       ⚠ 这两条与旧判据（"两列同 NULL 或同非 NULL"）**不能比判别力**：旧判据在**合法**形态上就会假红
+       （见上面的负对照，两个都红），所以"旧判据在这儿也红"**不构成**"新判据没退化"的证据。
+       本节的证据是另一条：新判据在**全部合法形态**上绿的同时，把这两条反例**照样**判红
+       ⇒ 判别力不小于旧判据（旧判据多出来的那些"红"全是假红）。 */
+    const a1E88NegCases = [
+      {
+        name: '① 的反例：无帧却给了 oee（拿 0 顶替"算不出来"，无帧无件）',
+        row: { run_sec: 0, oee: 0, pass_rate: null }, fact: { frames: 0, pieces: 0, frozenPieces: 0 }
+      },
+      {
+        name: '② 的反例：冻结时有件 1 却把 pass_rate 留 NULL（有分母却不给比率）',
+        row: { run_sec: 0, oee: 0, pass_rate: null }, fact: { frames: 1, pieces: 0, frozenPieces: 1 }
+      }
+    ].map(c => Object.assign({}, c, {
+      newBad: a1ShapeVerdict(c.row, c.fact),
+      oldBad: (c.row.oee === null) !== (c.row.pass_rate === null)   /* 旧判据：只比"两列同号" */
+    }));
+    t.check('A1-5 **"不用 0 顶替"的两个状态位（各自独立）逐行对齐库内真源**（`E85⒜` 重写、'
+      + '`E88⒜` 修 `pass_rate` 侧的方向，2026-10-02）：无采集帧 ⇒ `oee` 必须 NULL、有帧 ⇒ 非 NULL；' +
+      '**冻结时一件都没有** ⇒ `pass_rate` 必须 NULL、**冻结时有判定件** ⇒ 必须给比率' +
+      '（前提都取**冻结时**的件数，**不取**库里现数的件数 —— `judged_at` 可变，事后重判会把件刷出窗口）；' +
+      '且"有帧无件""有帧有件"两种形态在本节的库里都真实存在 —— ' +
+      '**窗口与冻结时件数都由库内真源现算／反读**、`frames`/`pieces` 由本节自写 SQL 数（`ADR-0004 D19`）；' +
+      '负对照：两个**合法**形态（`(0,0,NULL)` 真实 与 `(0,NULL,0)` 冻结有件·事后归零）都不许被判红，' +
+      '而**旧判据**会把**两个都**假判红；判别力：两条子判据各自的**反例都仍被判红**' +
+      '（无帧却给 oee／冻结时有件却不给比率）⇒ 判别力不小于旧判据（旧判据多出的红全是假红）',
       a1ShapeAt5.rows.length >= 1 && a1ShapeAt5.bad.length === 0 &&
+      a1ShapeAt5.subsetBad.length === 0 &&
       a1ShapeAt5.kinds['有帧无件'] >= 1 && a1ShapeAt5.kinds['有帧有件'] >= 1 &&
-      a1LegalVerdicts.every(v => v.newBad === null) && a1OldFalseReds.length === a1LegalShapes.length &&
+      a1LegalVerdicts.every(v => v.newBad === null) &&
+      a1LegalShapes.filter(s => s.real).length >= 1 && a1OldFalseReds.length === a1LegalShapes.length &&
+      a1E88NegCases.every(c => c.newBad !== null && c.oldBad === true) &&
       a1EarlyRow.oee === 0 && a1EarlyRow.pass_rate === null,
-      `逐行：${a1ShapeAt5.rows.map(x => `${x.key}(frames=${x.fact ? x.fact.frames : '?'},pieces=${x.fact ? x.fact.pieces : '?'}` +
+      `逐行：${a1ShapeAt5.rows.map(x => `${x.key}(frames=${x.fact ? x.fact.frames : '?'},` +
+        `冻结时件数=${x.fact ? x.fact.frozenPieces : '?'},现在数到=${x.fact ? x.fact.pieces : '?'}` +
         ` ⇒ run_sec=${x.row.run_sec},oee=${JSON.stringify(x.row.oee)},pass_rate=${JSON.stringify(x.row.pass_rate)})`).join(' , ')}；` +
       `与独立性判据不符 ${a1ShapeAt5.bad.length} 行（须为 0）${a1ShapeAt5.bad.length ? '：' + a1ShapeAt5.bad.map(x => `${x.key}(${x.bad})`).join('、') : ''}；` +
+      `"现在数到 ≤ 冻结时"不符 ${a1ShapeAt5.subsetBad.length} 行（须为 0）` +
+      `${a1ShapeAt5.subsetBad.length ? '：' + a1ShapeAt5.subsetBad.map(x => `${x.key}(${x.subsetBad})`).join('、') : ''}；` +
       `形态行数＝${JSON.stringify(a1ShapeAt5.kinds)}；` +
-      `负对照（新判据 vs 旧判据）：${a1LegalVerdicts.map(v => `${v.name} ⇒ 新=${v.newBad === null ? '绿' : '红'}／旧=${v.oldBad ? '红（假红）' : '绿'}`).join('；')}`);
+      `负对照（新判据 vs 旧判据）：${a1LegalVerdicts.map(v => `${v.name} ⇒ 新=${v.newBad === null ? '绿' : '红'}／旧=${v.oldBad ? '红（假红）' : '绿'}`).join('；')}；` +
+      `判别力（反例必须判红）：${a1E88NegCases.map(c => `${c.name} ⇒ 新=${c.newBad === null ? '**绿（判别力丢失）**' : '红'}／旧=${c.oldBad ? '红' : '绿（旧判据抓不到）'}`).join('；')}`);
+
+    /* A1-5b（**`E88⒜` 的现场取证**，2026-10-02）：本节夹具**确实产出**该形态 ——
+       `2026-10-02|中班` 的 `pass_rate` 非 NULL（＝冻结时窗口内至少有一件）而**现在**按 `judged_at`
+       数到 0 件。这一条把"事后重判会把件刷出窗口"从注释里的说法变成**逐字可复跑的读数**，
+       并同时锁住 `frozen_at` 与 `created_at` 这两个时间锚（`frozen_at` ∈ 下一班窗口、
+       `result.created_at` ∈ 本窗口 ⇒ 件是"本窗口内判出、之后被重判"的）。
+       期望值**不写死**：全部由库内真源现算（窗口、`created_at`、`frozen_at`）。
+       ⚠ 判别力：若 A1-5 退回旧写法（用现在的件数做前提），这一行会**立即**假判红（A1-5 与 A1-19 都会红）
+       —— 这就是 ⒜ 所指的"窄假红窗口"，本条即它的回归护栏。 */
+    const a1StaleRow = a1ShapeAt5.staleRows[0] || null;
+    const a1StaleWin = a1StaleRow ? a1WindowOf(a1StaleRow.row.shift_date, a1StaleRow.row.shift_name) : null;
+    const a1StalePiece = a1StaleRow
+      ? a1Db.prepare('SELECT proc_order_no AS no, unit_index AS unit, judged_at, created_at FROM result ' +
+          'WHERE created_at >= ? AND created_at < ? ORDER BY unit_index LIMIT 1').get(a1StaleWin.startAt, a1StaleWin.endAt)
+      : null;
+    t.check('A1-5b **`E88⒜` 的现场**（2026-10-02 实测，**非构造**）：本节夹具产出的合法形态 —— ' +
+      '某历史固化行的**冻结时件数 > 0**（由 `pass_rate` 非 NULL 反读）而**现在**按可变列 `judged_at` 数到的件数为 0；' +
+      '且该件是被**事后重判**刷出去的（`result.created_at` 落在**该班窗口内**、`judged_at` 落在窗口外）—— ' +
+      '凡"用现在的件数做前提"的判据在这一行上必然假判红，本节的 A1-5／A1-19 在修好后必须仍为绿',
+      a1ShapeAt5.staleRows.length >= 1 && Boolean(a1StaleRow) &&
+      a1StaleRow.fact.frozenPieces > 0 && a1StaleRow.fact.pieces === 0 &&
+      a1StaleRow.row.pass_rate !== null && Boolean(a1StalePiece) &&
+      a1StalePiece.created_at >= a1StaleWin.startAt && a1StalePiece.created_at < a1StaleWin.endAt &&
+      !(a1StalePiece.judged_at >= a1StaleWin.startAt && a1StalePiece.judged_at < a1StaleWin.endAt) &&
+      a1ShapeVerdict(a1StaleRow.row, a1StaleRow.fact) === null,
+      `被动的行 ${a1ShapeAt5.staleRows.length} 行（≥1）：` +
+      a1ShapeAt5.staleRows.map(x => `${x.key}（窗口 ${x.fact.window}、冻结时件数=${x.fact.frozenPieces}、` +
+        `现在数到=${x.fact.pieces}、pass_rate=${JSON.stringify(x.row.pass_rate)}、frozen_at=${x.row.frozen_at}）`).join('；') +
+      `${a1StalePiece ? `；该窗内判出的件：${a1StalePiece.no}#${a1StalePiece.unit} created_at=${a1StalePiece.created_at}（窗内）` +
+        `／judged_at=${a1StalePiece.judged_at}（窗外 ⇒ 被重判刷出）` : ''}；` +
+      `"件数未被动过"的行 ${a1ShapeAt5.rows.length - a1ShapeAt5.staleRows.length} 行`);
+
 
     /* ---- ②b 一跳跨过**多个**已跑完班次 ⇒ 枚举必须真的"一步一班"地走完 ----
        ⚠ **关键设计（首版这里是不可证伪的，D22 实测被抓出来）**：枚举循环的比较基准是 `list` 的**末尾**
@@ -6374,19 +6479,29 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
     /* ---- `E85⒜` 收尾：跑完本节**全部**帧之后，再用同一组独立性判据复核**整序** ----
        此刻库里已同时存在"有帧无件"（早班10-02 等）、"有帧有件"（中班10-02）与"无帧无件"（中班10-03、
        晚班10-07 等占位行）三种形态 ⇒ 这条非空性条件在这里才立得住（A1-5 时占位行还没产生）。
-       ⚠ "无帧有件"（`(0,NULL,0)`）**本节夹具产不出来**（件数由帧驱动判定、判定的 `judged_at`
-       落不进无帧窗口）⇒ **不要求**它出现，但 A1-5 的负对照已证明这种合法形态**不会**被判红。 */
+       ⚠ `E88⒜` 更正（2026-10-02）：旧注释说"无帧有件"（`(0,NULL,0)`）本节夹具产不出来 —— **实测产得出**：
+       `2026-10-02|中班` 的 `pass_rate` 非 NULL（冻结时窗口内有件 ⇒ `pieceCount > 0`）而事后按可变的
+       `judged_at` 数到 0 件 ⇒ 在**现值口径**下正是 `frames>0` 且 `pieces=0`；只是因为该窗内**确有 1 帧**，
+       所以它不算"无帧"那一类。真正的"无帧"形态在本夹具里只有**占位行**（窗口内一帧都没有）——
+       而"无帧却有件"在实现上不可能（判定的 `judged_at` 由帧驱动、`frozen_at` 也由帧 tick 给出），
+       故 A1-19 **不要求**它出现，A1-5 用显式构造的合法形态覆盖它（那条构造的形状与"中班10-02"同型）。 */
     const a1ShapeEnd = a1ShapeAudit();
-    t.check('A1-19 状态位"不用 0 顶替"的**全序复核**（`E85⒜` 收尾）：本节帧序列跑完后，库内**每一行**仍满足 ' +
-      'A1-5 的四条独立性判据，且"有帧无件""有帧有件""无帧无件（占位行）"三种形态各至少 1 行 —— ' +
-      '占位行两列都必须 NULL（`run_sec = 0` 那个 0 **不得**被读成"零运行"）',
-      a1ShapeEnd.rows.length >= 3 && a1ShapeEnd.bad.length === 0 &&
+    t.check('A1-19 状态位"不用 0 顶替"的**全序复核**（`E85⒜` 收尾、`E88⒜` 修方向）：本节帧序列跑完后，库内**每一行**仍满足 ' +
+      'A1-5 的独立性判据（**冻结时件数**做前提，不拿库里现数的件数当前提），且"有帧无件""有帧有件"' +
+      '"无帧无件（占位行）"三种形态各至少 1 行；"现在数到的件数 ≤ 冻结时数到的件数"全表成立（`judged_at` 只被往后刷）；' +
+      '占位行两列都必须 NULL（`run_sec = 0` 那个 0 **不得**被读成"零运行"）—— 合法行不因"件数事后被动过"而假判红',
+      a1ShapeEnd.rows.length >= 3 && a1ShapeEnd.bad.length === 0 && a1ShapeEnd.subsetBad.length === 0 &&
       a1ShapeEnd.kinds['有帧无件'] >= 1 && a1ShapeEnd.kinds['有帧有件'] >= 1 &&
-      a1ShapeEnd.kinds['无帧无件（占位行）'] >= 1,
+      a1ShapeEnd.kinds['无帧无件（占位行）'] >= 1 &&
+      a1ShapeEnd.staleRows.length >= 1,
       `共 ${a1ShapeEnd.rows.length} 行；与独立性判据不符 ${a1ShapeEnd.bad.length} 行（须为 0）` +
       `${a1ShapeEnd.bad.length ? '：' + a1ShapeEnd.bad.map(x => `${x.key}(${x.bad})`).join('、') : ''}；` +
+      `"现在数到 ≤ 冻结时"不符 ${a1ShapeEnd.subsetBad.length} 行（须为 0）；` +
+      `件数被事后动过的行 ${a1ShapeEnd.staleRows.length} 行（须 ≥ 1，否则 ⒜ 的现场没被覆盖）` +
+      `${a1ShapeEnd.staleRows.length ? '：' + a1ShapeEnd.staleRows.map(x => x.key).join('、') : ''}；` +
       `形态行数＝${JSON.stringify(a1ShapeEnd.kinds)}（三种各须 ≥ 1）；逐行＝` +
-      a1ShapeEnd.rows.map(x => `${x.key}(frames=${x.fact ? x.fact.frames : '?'},pieces=${x.fact ? x.fact.pieces : '?'}` +
+      a1ShapeEnd.rows.map(x => `${x.key}(frames=${x.fact ? x.fact.frames : '?'},` +
+        `冻结时件数=${x.fact ? x.fact.frozenPieces : '?'},现在数到=${x.fact ? x.fact.pieces : '?'}` +
         ` ⇒ oee=${JSON.stringify(x.row.oee)},pass_rate=${JSON.stringify(x.row.pass_rate)})`).join(' , '));
   } finally {
     shiftStatRepo.upsertFrozen = a1OrigUpsert;                // 计数包装当场还原成模块原件（不留痕）
