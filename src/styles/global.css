@@ -114,14 +114,26 @@ html, body {
 #panel-alarm   { grid-template-columns: 1.05fr 1fr 1.25fr; }
 #panel-maint   { grid-template-columns: 1fr 1fr 1.35fr; }
 #panel-notice  { grid-template-columns: 1.15fr 1fr 1fr; }
-/* `#panel-setting` 的轨道声明（F16-1 起为**三行**：`auto 1fr auto`）。
-   ⚠ **第三条轨道必须是 `auto`、不能是固定 px**（F16-1 的关键，也是 F13/F14 两次踩过的坑）：
-     演示模式（默认源）下 UI-20 卡片 `display:none` ⇒ **第三行没有任何网格项**
-     ⇒ 该 `auto` 轨道**塌缩为 0** ⇒ 第 2 行 `1fr` 分到的空间与改动前（两行 `auto 1fr`）
-     **完全相同**。若写成固定 `320px`，演示模式也会预留 320px ⇒ 10 张截图基准集体漂移。
-   服务端模式下三行分别为：第 1 行 `auto`、第 2 行 `1fr`（操作日志 / 录入发布，恢复整行高）、
-   第 3 行 `auto`（= UI-20 卡片自身 `height: 320px`）。 */
-#panel-setting { grid-template-columns: 1fr 1fr 1fr; grid-template-rows: auto 1fr auto; }
+/* `#panel-setting` 的轨道声明（T-20261002-17 修复 `05bcf7b` 引入的版面回归）。
+   ★ **显式两条轨道 ＋ `grid-auto-rows: auto`**（**不是** `grid-template-rows: auto 1fr auto`）。
+     为什么不能写第三条**显式** `auto` 轨道（这是 `05bcf7b` 版面回归①的真因，已由
+     `T-20261002-16` 定量锁定、本座位复核）：
+       显式轨道**恒存在**，`.tab-panel{gap:24px}` 的**行距按轨道条数计** ⇒ 三条显式轨道
+       ＝ **两条** 24px 行距（共 48px），即使第三条轨道自身塌缩为 0 **也照样吃掉那 24px**。
+       实测（1920×1080 视口、`#stage` 缩放 0.5 ⇒ 24 CSS px ＝ 12 屏幕 px）：
+       第 2 行（操作日志 / 录入发布）净少 24 CSS px，底部锚定控件整体上移
+       （`#maintSave` 881→869、`#cfgMsg` 905.5→893.5、`#entryMsg` 933.5→921.5，均为屏幕 px）。
+     现口径：**第 3 行改成隐式轨道**（`grid-auto-rows: auto`）—— 隐式轨道**只在真有网格项
+     落进去时才生成**，故：
+       · **演示模式**（UI-20 卡片 `display:none`，不生成盒子 ⇒ 不被自动放置）：网格只有
+         2 条轨道 ⇒ 只计 **1 条** 24px 行距 ⇒ 第 2 行高度与 `05bcf7b` 之前**逐像素相同**
+         （＝ 10 张截图基准的口径，基准因此不漂移）；
+       · **服务端模式**（卡片存在）：自动放置把卡片落到隐式第 3 行，该行由
+         `grid-auto-rows: auto` 按内容定高（＝ 卡片自身 `height: 320px`）⇒ 三行两距
+         ＝ 812 + 498 + 320 + 48 = 1678px（4K 账见下），**行位合理、不丢卡片**。
+     ⚠ `auto` 隐式行与本文件其它地方 `grid-auto-rows` 的初始值相同（初始值就是 `auto`），
+       这里**显式写出**只为把"第 3 行按内容定高"这一意图钉在代码里，不是新增行为。 */
+#panel-setting { grid-template-columns: 1fr 1fr 1fr; grid-template-rows: auto 1fr; grid-auto-rows: auto; }
 /* W5-② / UI-20：待补传清单与人工重报卡片。
    位置＝设置页（需求原文："在**设置页**提供…"）。
 
@@ -132,28 +144,40 @@ html, body {
        网格自动放置而言它等价于**不存在**：它不被放置、不占用任何行/列、也**不参与网格轨道尺寸
        计算**（`auto`/`1fr` 行都不看它）；
      · 且**既有卡片/操作日志/录入发布的 CSS 一字不动**（`.log-card` 仍 `(1,2)`、
-       `.entry-card` 仍 `(2/-1,2)`、三列定义未动）；`#panel-setting` 的轨道由
-       `auto 1fr` 变为 **`auto 1fr auto`**，但那**唯一的差别（第三条 `auto` 轨道）在演示模式下
-       塌缩为 0**（第三行没有网格项）⇒ 第 2 行 `1fr` 分到的空间与改动前完全相同。
+       `.entry-card` 仍 `(2/-1,2)`、三列定义未动）；`#panel-setting` 的轨道**仍是两条显式**
+       （`auto 1fr`，与改动前逐字相同）＋ `grid-auto-rows: auto` 承接"服务端模式下才存在"的
+       第 3 行 ⇒ 演示模式下**连隐式轨道都不生成**，行距只计一次 ⇒ 与改动前逐像素一致。
+     ⚠ 这里曾（`05bcf7b`→`T-20261002-17`）写成第三条**显式** `auto` 轨道，并误以为"该轨道
+       塌缩为 0 就没有代价"——**错**：显式轨道恒存在，`gap` 按轨道条数计 ⇒ 白白多吃 24 CSS px
+       行距。回归的定量分解与受控实验见 `tests\._verify\seat3t17\`（本座位的几何探针）。
      ⇒ **演示模式（默认源）下 `#panel-setting` 的渲染结果与改动前逐像素一致**，
         10 张截图基准（含 `08-操作设置`）不受影响；`tests/screenshot-diff.js` 无需重拍。
 
    ★ **服务端模式下的排版（F16-1 定稿：UI-20 独占一行、高 320px）**：
      本卡片**不写任何 `grid-column` / `grid-row`** ⇒ 完全由**自动放置**定位；第 2 行三格被
-     显式放置项 `.log-card`(1,2) 与 `.entry-card`(2/-1,2) 占满 ⇒ 卡片自动落入**第 3 行第 1 列**
-     （该行由上面的第三条 `auto` 轨道承载），并因自身 `height: 320px` 而**独占整行、只有 320px 高**：
+     显式放置项 `.log-card`(1,2) 与 `.entry-card`(2/-1,2) 占满 ⇒ 卡片自动落入**隐式第 3 行第 1 列**
+     （该行由上面的 `grid-auto-rows: auto` 承载，**只在卡片存在时才生成**），并因自身
+     `height: 320px` 而**独占整行、只有 320px 高**：
        第 1 行 `auto` ：看板输入解锁 │ 系统时间设置 │ 系统状态自检（≈812px，与 F14 时同）
        第 2 行 `1fr`  ：操作日志（留痕） │ 录入 / 发布 / 参数配置（≈498px，**不再被压成细条**）
-       第 3 行 `auto` ：**本卡片**（3 列 1fr 的网格项跨到第 1 列；宽 = 1249.33px @4K、高 320px）
+       第 3 行 `auto` ：**本卡片**（隐式轨道；宽 = 列宽、高 320px）
      4K 账（3840×2160，#stage 内距 22px ⇒ `#board-main` 可用 3796×1678，三列各 **1249.33px**；
      行/列 `gap: 24px`，两条行距 48px）：812 + 498 + 320 + 48 = **1678px** ⇒ 恰好铺满、**无溢出**。
      为什么卡片只有 1 列宽（而不是跨 2 列）：F13 的跨列实测把第 2 行压到 103px（见下），
      而"失败原因读全"这一原始目标**由列宽 + 换行独立达成**（1 列下该列约 397px，
      `td.up-reason` 走 `white-space:normal; overflow-wrap:anywhere` ⇒ **换行而非省略号**），
      故无需跨列；卡片内部清单靠既有 `flex:1; min-height:0` 自行滚动。
-   ⚠ 行高 812/498 是按 CSS 值估算的**渲染值**，非测量值（本环境无头 Edge 的 CDP 端口不可达 ⇒
-     `overlap-check`/`browser-check` 整脚本跳过）；**测量口径与三档分辨率由
-     `tests/overlap-check.js` 与主代理的真机复测负责**。 */
+   ⚠ **已推翻的旧说法**（原文：行高 812/498 是按 CSS 值估算的渲染值、非测量值；本环境无头 Edge
+     的 CDP 端口不可达 ⇒ `overlap-check`/`browser-check` 整脚本跳过）——`T-20261002-17` 实测
+     本环境 CDP **可达**：`browser-check` 33/0 真跑，本座位的几何探针也真读到数值。
+     **实测**（`tests\._verify\seat3t17\geom-probe.js`，1920×1080 视口 ⇒ `#stage` 缩放 0.5、
+     CSS px 为屏幕 px 的 2 倍；真服务端 `node server/index.js --port 8787` ＋ `?tab=7&source=server`）：
+       `#panel-setting` 的 **used** 轨道 ＝ `864.188px 445.812px 320px`（`grid-auto-rows: auto`
+       生成的隐式第 3 行 ＝ 卡片 `height:320px`），两条行距 48px ⇒ 864.188+445.812+320+48
+       ＝ **1678.0px** ⇒ 恰好铺满、**无溢出**（上面的 812/498 只是同一 1310px 的另一种估算切分）。
+     演示模式（无第 3 行）实测 used 轨道 ＝ `864.188px 789.812px`，**只有一条** 24px 行距。
+     ⚠ 三档分辨率（3840×2160 / 1920×1080 / 1366×768）的完整口径仍由 `tests\overlap-check.js`
+       与主代理的真机复测负责（本座位只测了 1920×1080）。 */
 /* ⚠ 以下两条是**既有卡片的原始 grid-area**，逐字取自本包改动前的 HEAD
    （`git show HEAD:src/styles/global.css`）—— F13 的第一版编辑曾误删它们（`git diff` 的
    `-2` 就是这两行），导致 `.log-card`/`.entry-card` 退回自动放置、第 2 行整体重排。
@@ -166,9 +190,11 @@ html, body {
    浏览器创建**隐式第 3 行（`auto`，本卡片内容约 663px）**⇒ 总需求 864+663+间距 > 可用高
    ⇒ `1fr` 第 2 行被压到 **103px**（`操作日志 [22,1160,1249,103]`、`录入 [1295,1160,2523,103]`、
    `upCard [22,1287,2523,663]`；1920/1366 同形）。故**跨列已撤**（F14），
-   F16-1 改为"显式第三条 `auto` 轨道 + 卡片自身 320px"—— 用**受控的行**替代"隐式行"。 */
+   F16-1 改为"卡片自身 320px ＋ 第 3 行按内容定高"—— 用**受控的行高**替代"内容撑开的隐式行"。
+   ⚠ F16-1 当时把第 3 行写成**显式** `auto` 轨道，那**正是 `T-20261002-17` 立案的版面回归①**
+     （显式空轨道照吃 24px 行距）；现改回**隐式**行（`grid-auto-rows: auto`），本段历史记录不变。 */
 /* F16-1：卡片自身高度 320px（**演示模式该卡片 `display:none`，故这条对演示模式零影响**；
-   服务端模式下它把承载它的第三条 `auto` 轨道定为 320px）。 */
+   服务端模式下它把承载它的**隐式**第 3 行定为 320px）。 */
 #panel-setting .upload-card { height: 320px; }
 #panel-setting .upload-card > .card-title { font-size: 50px; padding-bottom: 12px; margin-bottom: 16px; }
 #panel-setting .upload-card > .card-title .title-note { font-size: 34px; }
@@ -684,6 +710,19 @@ textarea.form-input { resize: none; }
   font-size: 30px; color: var(--muted);
 }
 #board-status > div { display: flex; justify-content: space-between; }
+/* ★ `T-20261002-17` 修复 `05bcf7b` 的版面回归②：`#sbSourceRow` 的 `hidden` **必须真的生效**。
+   为什么上一行会把 `hidden` 盖掉（这是**同一类坑的第三次**，前两次：`.pwd-row{display:flex}`
+   与 `#upPendingEmpty`，见 `index.html` 与 `#panel-setting #upPendingEmpty[hidden]` 两处注释）：
+     `[hidden]{display:none}` 只是 **UA 样式表**的规则，而**作者样式恒胜 UA 样式**（与特异度无关）
+     ⇒ 上一行 `#board-status > div{display:flex}` 一写，`hidden` 属性就**形同不存在**。
+   现场后果（实测，`T-20261002-16` 定量锁定）：演示模式下页脚**4 行变 5 行**、原 4 行整体上移
+   10.5 屏幕 px ⇒ `08-操作设置` 多出 **0.32%（6619 px，包围盒 x1664..1893 / y979..1075）**，
+   且**页脚是全站共用的** ⇒ 10 张基准图**每张都多这 6619 px**（不是只有 08）。
+   修法：把"非 hidden 才生效"写进选择器（`>` 右侧加 `[hidden]`），特异度 `(1,1,1)` 高于
+   `#board-status > div` 的 `(1,0,1)` ⇒ `hidden` 恢复为真正的"不生成盒子、不参与布局"。
+   ⚠ 刻意写得**比 `#sbSourceRow` 更一般**（覆盖 `#board-status` 下**任何**行）：页脚还会加行，
+     不把这条坑留给下一个"给行加 `hidden` 的人"。 */
+#board-status > div[hidden] { display: none; }
 #board-status b { color: var(--text); font-weight: 600; }
 #board-status b.ok { color: var(--ok); }
 
