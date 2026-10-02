@@ -101,8 +101,18 @@
     const tab = Number(q.get('tab'));
     if (Number.isInteger(tab) && tab >= 0 && tab < Dashboard.TABS.length) Dashboard.switchTab(tab);
     if (q.get('link') === 'off') M.toggleLink();
-    const unlockByParam = q.get('unlock') === '1';
+    /* `?unlock=1` 评审旁路（ADR-0007 D5）：**只在演示模式**成立 —— 服务端模式**强制登录**，
+       解锁必须经 `POST /auth/login` 取得会话令牌，**不得**靠一个查询参数自称已登录
+       （D5 明令"不假装已登录"；`?source=server` 与 `?unlock=1` 同时给出时以"服务端模式"为准）。 */
+    const serverByParam = q.get('source') === 'server' || CFG.dataSource === 'server';
+    const unlockRequested = q.get('unlock') === '1';
+    const unlockByParam = unlockRequested && !serverByParam;
     if (unlockByParam) M.setUnlocked(true);
+    if (unlockRequested && !unlockByParam) {
+      /* 不静默忽略：说清"为什么这个参数在服务端模式下不起作用"（否则评审会以为旁路坏了） */
+      console.warn('[main] 服务端模式下忽略 ?unlock=1：解锁必须以 POST /auth/login 取得会话令牌' +
+        '（ADR-0007 D5：服务端模式强制登录，不得旁路）—— 本条不是错误');
+    }
     if (q.get('curve') === 'none') M.clearCurve();
     if (q.get('source')) CFG.dataSource = q.get('source');   // ?source=upper 用上位机报文驱动；?source=server 用服务端真源
 

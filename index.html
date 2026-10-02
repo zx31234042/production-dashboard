@@ -376,7 +376,37 @@
           <button class="btn" id="setLockBtn">锁 定</button>
         </div>
         <div class="pwd-msg" id="setMsg">演示密码：8888</div>
+        <!-- ADR-0007 D5 的**模式提示**（T-20261002-15 / 技术债 E86①）：演示模式显示
+             「演示模式：未启用服务端口令校验（口令由服务端校验）」，服务端模式显示校验方与登录态
+             （文案由 `src/components/SettingPanel.js` 的 render 按 `serverMode(state)` 写；
+             两种模式**都要显示**，故这里没有 hidden —— 静态初值是演示模式那一句）。
+             ⚠ 这是**新增的界面事实**（显式降级，不静默、不假装已登录），不是装饰。 -->
+        <div class="hint" id="setAuthNote">演示模式：未启用服务端口令校验（口令由服务端校验）</div>
         <div class="hint">解锁后可录入维保信息、修改公告信息与系统时间</div>
+        <!-- 服务端模式独有的两行（演示模式**不参与布局** ⇒ 10 张截图基准版面零变化）：
+             · 改密（FR-8.4）：原口令 + 新口令 + 确认；
+             · 口令初始化（ADR-0007 D4）：本机一次性初始化码 + 要设置的口令（仅回环可用，无默认口令）。
+             显隐由 `SettingPanel.render()` 切换（服务端模式：改密行＝已登录时可见；初始化行＝收到
+             409 `not_initialized` 后可见）。
+             ⚠ 外面套一层**无 class** 的 `div` 承接 `hidden`：`[hidden]{display:none}` 是 UA 规则，
+             会被 `.pwd-row{display:flex}` 这样的作者样式覆盖（同特异度下作者样式胜）⇒ 直接把 hidden
+             挂在 `.pwd-row` 上等于没挂（与 `#upCard` 需要 `#panel-setting #upPendingEmpty[hidden]`
+             那条 CSS 同源的原因）。 -->
+        <div id="setPwdChangeWrap" hidden>
+          <div class="pwd-row" id="setPwdChangeRow">
+            <input type="password" id="setOldPwd" class="pwd-input" placeholder="原口令" maxlength="64">
+            <input type="password" id="setNewPwd" class="pwd-input" placeholder="新口令（4～64 位）" maxlength="64">
+            <input type="password" id="setNewPwd2" class="pwd-input" placeholder="确认新口令" maxlength="64">
+            <button class="btn primary" id="setPwdChangeBtn">修改密码</button>
+          </div>
+        </div>
+        <div id="setInitWrap" hidden>
+          <div class="pwd-row" id="setInitRow">
+            <input type="text" id="setInitCode" class="pwd-input" placeholder="一次性初始化码" maxlength="32">
+            <input type="password" id="setInitPwd" class="pwd-input" placeholder="设置新口令（4～64 位）" maxlength="64">
+            <button class="btn primary" id="setInitBtn">初始化口令</button>
+          </div>
+        </div>
       </div>
 
       <div class="card">
@@ -515,6 +545,10 @@
 <script src="src/utils/format.js"></script>
 <script src="src/services/stateAdapter.js"></script>
 <script src="src/services/api.js"></script>
+<!-- ADR-0007（T-20261002-15）：会话令牌的**唯一**前端出口（`window.BoardSession`）。
+     放在 api.js 之后（它运行期调 `Api.authLogin/authLogout/authChange/authInit/authStatus`），
+     放在组件之前（`SettingPanel.js` 在 bind/render 时按能力检测取用）。 -->
+<script src="src/services/auth.js"></script>
 <script src="src/services/boardSource.js"></script>
 <script src="src/services/mockData.js"></script>
 <script src="src/services/mockUpperSource.js"></script>

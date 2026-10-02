@@ -25,15 +25,39 @@ window.Components.SettingPanel = (function () {
      计时逻辑仍只有一份（bind 内的 armAutoLock），这里只是把同一份逻辑的引用拿出来。 */
   let autoLockArmer = null;
 
+  /* ================= ADR-0007（T-20261002-15 / 技术债 E86①）：登录接线与模式提示 =================
+     口径真源＝`项目记录\ADR\ADR-0007-设置页口令与登录鉴权形态.md`（D1–D9）。本页只承担 **D5** 的两件事：
+       · **演示模式**（`dataSource:'mock'`）：**不启用**登录拦截 —— 解锁仍走 `MockData.CFG.unlockPassword`
+         的**演示口令**（`8888` **只允许存在于演示模式**，D4/D5），界面**显式提示**"未启用服务端口令校验"；
+       · **服务端模式**：**强制**登录 —— 解锁＝`POST /auth/login`（由 `window.BoardSession` 提交口令，
+         本页**不做**任何哈希 / 口令比对 / 错误计数 / 锁定判定，D5），成功即保存服务端下发的会话令牌
+         （内存 + `sessionStorage`，D3/D7），失败按服务端给出的码显示（401/423 含剩余秒数/409 走本机初始化）。
+     **统一 401 处理**：`services/api.js` 的 `httpJson()`（全仓唯一 HTTP 出口）把每个 401 交给
+       `window.BoardSession.noteUnauthorized()`；本页在 `render()` 里读它的记账并**可见降级**
+       （提示"未登录或登录已过期"，回到锁定态，**不黑屏、不抛未捕获异常**）。
+     自动锁定（FR-8.2）：5 分钟到点在**既有**计时器回调里**同步**调 `logout`（令牌即失效）——
+       **前端计时器与服务端令牌不各管一套**（D5）；**不新增第二个计时器**，
+       提示弹窗仍沿用既有 `#autoLockTip`（DOM 契约与时长都不动）。
+     ⚠ 刷新页面的口径（显式，不假装已登录）：`sessionStorage` 里的令牌仍在（同标签页刷新不丢），
+       但 `state.unlocked` 一并复位；前端**不凭一个未经校验的令牌自称已登录**（D5 禁止"假装已登录"），
+       重新解锁会重新走 `POST /auth/login` 换发新令牌。 */
+  /** 演示模式提示（**逐字**照 ADR-0007 D5；演示模式下界面必须显示它） */
+  const DEMO_MODE_NOTE = '演示模式：未启用服务端口令校验（口令由服务端校验）';
+  /** 服务端模式提示（说明校验方；后半句由 render() 按登录态/失效态补） */
+  const SERVER_MODE_NOTE = '服务端模式：口令由服务端校验（POST /auth/login）';
+  /** 服务端模式下的口令长度上限（ADR-0007 D1：4～64 位）——`#setPwd` 的 `maxlength="8"` 是按演示口令定的 */
+  const SERVER_PWD_MAX = 64;
+  /** 「服务端尚未初始化」态（**只有**收到 409 `not_initialized` 才置位）⇒ 显示本机一次性初始化行（D4） */
+  let needsInit = false;
+
   /* ---------------- FR-7.12（T-20261002-08）：服务端模式下的公告新增/编辑/删除 ----------------
      需求原文（`需求文档\…-V1.41.md:533`）：「**仅本机解锁后可新增/编辑/删除公告**」。
      本模块此前只有"发布"一条内存路径（刷新即丢）⇒ 本波把它接到服务端的 `POST /notice`
      （唯一写入口＝`server/repo/notice.js`，落 `notice` 表并**同批**写 `op_log`）。
-     边界（本包**不做**、也不假装做）：
-       · **解锁仍走既有演示口令**（`MockData.CFG.unlockPassword`）：服务端会话令牌（ADR-0007 的
-         `POST /auth/login`）的前端接线属 `FR-8.4` 的包，不在本波；`sessionToken()` 留出出口，
-         取不到令牌时 `POST /notice` 会如实回 **401**，本页把该失败**显示出来**（绝不静默）。
-       · **演示模式一行都不改**：服务端分支只在 `serverMode(state)` 为真时进入。 */
+     鉴权出口（**T-20261002-15 / E86① 已接线**）：服务端模式下"解锁"＝`POST /auth/login` 取得会话令牌
+     （见下方 ADR-0007 段与 `sessionToken()`），`POST /notice` 带 `Authorization: Bearer <令牌>`；
+     取不到令牌时服务端回 **401**，本页把该失败**显示出来**（绝不静默），并把登录态**如实降级**。
+     边界（本包**不做**、也不假装做）：**演示模式一行都不改** —— 服务端分支只在 `serverMode(state)` 为真时进入。 */
 
   /** 正在编辑的公告 id（服务端模式；`null` ＝ 新增）。演示模式恒为 null、不参与任何分支。 */
   let noticeEditingId = null;
@@ -44,13 +68,36 @@ window.Components.SettingPanel = (function () {
       ((window.BoardConfig || {}).dataSource === 'server')));
   }
 
-  /** 会话令牌（ADR-0007 D3 的 `Bearer`）：提交给 `POST /notice` 的鉴权头。
-   *  **由登录接线包提供**（`window.BoardSession.token()`，或状态位 `state.sessionToken`）；
-   *  取不到就返回空串 —— 调用方**不伪造令牌**，服务端会回 401 并把原因显示给操作人。 */
-  function sessionToken(state) {
+  /** 会话出口（`services/auth.js` 的 `window.BoardSession`）：**能力检测**，缺了返回 null（不抛）。
+   *  为什么要有能力检测：`index.html` 未注册该文件、或裁剪环境/测试桩件里没有它时，
+   *  本页必须**如实降级**（提示"服务端登录未装配"）而不是抛 `ReferenceError` 把整帧渲染打断。 */
+  function session() {
     const bs = window.BoardSession;
+    return (bs && typeof bs.token === 'function') ? bs : null;
+  }
+
+  /** 会话失效（统一 401 处理）的可读说明；无则空串。取用一律走能力检测。 */
+  function lostNoteText() {
+    const bs = session();
+    if (!bs || typeof bs.lostNote !== 'function') return '';
+    try { return String(bs.lostNote() || ''); } catch (err) { return ''; }
+  }
+
+  /** 设置元素 `hidden`（能力检测：节点缺失时静默跳过 —— `Dom.$` 在真 DOM 里可能返回 null） */
+  function setHidden(id, on) {
+    const el = $(id);
+    if (el) el.hidden = !!on;
+  }
+
+  /** 会话令牌（ADR-0007 D3 的 `Bearer`）：提交给 `POST /notice` 的鉴权头。
+   *  **唯一出口**＝`window.BoardSession.token()`（`services/auth.js`，内存 + `sessionStorage`）；
+   *  兜底读状态位 `state.sessionToken`（**有意的兼容出口**：`T-20261002-08` 的公告写入与本仓若干
+   *  夹具按它取令牌，二者至少一个可用）；取不到就返回空串 —— 调用方**不伪造令牌**，
+   *  服务端会回 401，本页把原因显示给操作人并把登录态如实降级。 */
+  function sessionToken(state) {
+    const bs = session();
     try {
-      if (bs && typeof bs.token === 'function') {
+      if (bs) {
         const t = bs.token();
         if (t) return String(t);
       }
@@ -100,13 +147,41 @@ window.Components.SettingPanel = (function () {
 
   /* ---------------- 渲染 ---------------- */
   function render(state) {
-    const unlocked = state.unlocked;
+    const server = serverMode(state);
+    const lost = server ? lostNoteText() : '';
+
+    /* ADR-0007 D5 的**统一 401 处理**在本页的落点：会话失效 ⇒ 可见降级回锁定态
+       （`httpJson()` 已在出口处清掉令牌并记账，这里只做"界面如实反映"）。
+       三条纪律：①不黑屏（照常 render）；②不抛异常（全部能力检测）；③不假装已登录。 */
+    if (server && lost && state.unlocked) {
+      const MM = window.MockData;
+      if (MM && typeof MM.setUnlocked === 'function') MM.setUnlocked(false);
+      if (autoLockArmer) autoLockArmer.clear();      /* 已回到锁定态：撤下 FR-8.2 的锁定计时（与手动锁定同口径） */
+    }
+    const unlocked = !!state.unlocked;
+    const loggedIn = server && !!sessionToken(state);
 
     /* 解锁状态 */
     setClass('setLockDot', 'lock-dot' + (unlocked ? ' on' : ''));
     setText('setLockText', unlocked ? '已解锁：可录入维保信息、修改公告' : '当前已锁定');
     $('setSyncBtn').disabled = !unlocked;
     $('setManualBtn').disabled = !unlocked;
+
+    /* ADR-0007 D5：**模式提示**（显式降级，不静默、不假装已登录）
+       · 演示模式 ⇒ 逐字给出 ADR 指定的那句"未启用服务端口令校验"；
+       · 服务端模式 ⇒ 说明校验方，并如实标注登录态 / 会话失效（失效文案由统一 401 处理记账）。 */
+    setText('setAuthNote', !server ? DEMO_MODE_NOTE
+      : SERVER_MODE_NOTE + (lost ? '；' + lost
+        : (loggedIn ? '；当前已登录（会话令牌在本窗口内）' : '；当前未登录')
+          + (needsInit ? '；服务端尚未初始化：请用一次性初始化码设置口令（ADR-0007 D4）' : '')));
+
+    /* 服务端模式独有的两行（**演示模式恒 hidden** ⇒ 10 张截图基准版面零变化）：
+       · 改密行：要 Bearer（D5/D8④）⇒ 只在"服务端模式且已登录"时出现；
+       · 初始化行：只有服务端**确实未初始化**（409）时才出现（D4：不设默认口令、不许远程初始化）。
+       ⚠ `hidden` 挂在**无 class 的外层 div** 上（`#setPwdChangeWrap`/`#setInitWrap`）：内层是
+         `.pwd-row`（`display:flex`，作者样式会盖掉 UA 的 `[hidden]{display:none}`），挂内层等于没挂。 */
+    setHidden('setPwdChangeWrap', !(server && loggedIn));
+    setHidden('setInitWrap', !(server && needsInit));
 
     /* 维保录入 / 公告发布：解锁后才可编辑（FR-6.11、FR-7.12） */
     ['maintContent', 'maintOwner', 'maintState', 'maintSave',
@@ -115,7 +190,7 @@ window.Components.SettingPanel = (function () {
     /* FR-7.12（服务端模式）：编辑态把按钮文案换成「保存修改」；锁定时**退出编辑态**
        （锁定后按钮已 disabled，若留着编辑态，解锁后一次误点就会改到别的那条公告）。
        ⚠ 演示模式**一字不改**：`serverMode(state)` 为假时下面这段整段不执行。 */
-    if (serverMode(state)) {
+    if (server) {
       if (!unlocked && noticeEditingId !== null) noticeEditingId = null;
       setText('noticeSave', noticeEditingId === null ? '发布公告' : '保存修改');
     }
@@ -126,10 +201,22 @@ window.Components.SettingPanel = (function () {
 
     const em = $('entryMsg');
     if (!em.dataset.sticky) {
-      em.textContent = unlocked
-        ? '已解锁：录入内容保存后写入本地库并记录操作日志'
-        : '当前已锁定：请先在左侧输入解锁密码（演示密码 8888）';
-      em.className = 'entry-note' + (unlocked ? ' ok' : '');
+      /* ⚠ 两条分支的文案**必须分开写死**（不做拼接抽象）：
+         · 演示模式那两句与被 10 张截图基准冻结的版面**逐字相同**（含"演示密码 8888"）；
+         · 服务端模式**不得**出现演示口令，且未登录/会话失效时如实写"未登录或登录已过期"（D4/D5）。 */
+      if (server) {
+        em.textContent = lost
+          ? lost + '：请先在左侧输入解锁密码重新登录（口令由服务端校验）'
+          : (unlocked
+            ? '已解锁：录入内容保存后写入服务端库并记录操作日志'
+            : '当前已锁定：未登录或登录已过期，请先在左侧输入解锁密码（口令由服务端校验）');
+        em.className = 'entry-note' + (unlocked && !lost ? ' ok' : '');
+      } else {
+        em.textContent = unlocked
+          ? '已解锁：录入内容保存后写入本地库并记录操作日志'
+          : '当前已锁定：请先在左侧输入解锁密码（演示密码 8888）';
+        em.className = 'entry-note' + (unlocked ? ' ok' : '');
+      }
     }
 
     /* 系统时间设置（ENV-18 / FR-8.3：以 NTP 同步优先） */
@@ -202,6 +289,10 @@ window.Components.SettingPanel = (function () {
         autoLockTimer = null;
         if (!state.unlocked) return;
         M.setUnlocked(false);
+        /* ADR-0007 D5：5 分钟到点**同步调 `logout`**（令牌即失效）——
+           "前端计时器与服务端令牌不各管一套"。**只在服务端模式下调**：演示模式没有服务端会话，
+           也不该因为一次自动锁定发出任何请求（演示模式行为逐字不变）。 */
+        if (serverMode(state)) logoutSession();
         M.pushLog('自动锁定', '解锁后超过 5 分钟，系统自动回到锁定状态');
         msg.textContent = '解锁已超过 5 分钟，系统已自动锁定';
         msg.className = 'pwd-msg';
@@ -215,6 +306,30 @@ window.Components.SettingPanel = (function () {
     /* 把同一份 arm/clear 逻辑暴露给模块级 `armAutoLock()`（见文件顶部变量注释）：
        旁路解锁（?unlock=1）与手动解锁走的是**同一个定时器与同一个回调**，行为完全一致。 */
     autoLockArmer = { arm: armAutoLock, clear: clearAutoLock };
+
+    /**
+     * 登出服务端会话（ADR-0007 D5：自动锁定 / 手动锁定都走这一条出口，不各管一套）。
+     * **同步发起**（`BoardSession.logout()` 内部**先清本地令牌**再发请求 ⇒ 返回时本地已失效）；
+     * 失败只如实 `console.warn`，**绝不抛**（锁定这一事实不因登出请求失败而改变）。
+     */
+    function logoutSession() {
+      const bs = session();
+      if (!bs || typeof bs.logout !== 'function') return;
+      try {
+        bs.logout().then(r => {
+          if (r && r.ok === false && !r.skipped) {
+            console.warn('[SettingPanel] 服务端登出未成功（本地令牌已清除，界面按未登录处理）：' +
+              ((r && (r.reason || r.errorCode)) || '未知原因'));
+          }
+        }).catch(err => {
+          console.warn('[SettingPanel] 服务端登出异常（本地令牌已清除，界面按未登录处理）：' +
+            ((err && err.message) || String(err)));
+        });
+      } catch (err) {
+        console.warn('[SettingPanel] 服务端登出同步抛错（本地令牌已在 logout 内清除）：' +
+          ((err && err.message) || String(err)));
+      }
+    }
 
     /* FR-8.2 / FR-3.19⑧ / C-84③：设置页的**每一个写操作与录入框键入**都按任务页**同一口径**刷新 ——
        ① `onActivity()` 重置 FR-9.4"无操作自动返回首页"计时；
@@ -230,12 +345,20 @@ window.Components.SettingPanel = (function () {
     }
 
     /* FR-8.2 / C-84③：锁定后的保存**不得静默失效**。复用本页既有的 #entryMsg 提示机制
-       （与"请填写…后再保存"同一处文案位、同样 4 s 后自动恢复默认文案），给出可观察反馈。 */
+       （与"请填写…后再保存"同一处文案位、同样 4 s 后自动恢复默认文案），给出可观察反馈。
+       ⚠ 演示模式那句**逐字不变**（含"演示密码 8888"）；服务端模式**不得**出现演示口令（D4）。 */
     function denyLocked(action) {
-      flashEntry(`当前已锁定：${action}未保存，请先在左侧输入解锁密码（演示密码 8888）`, true);
+      flashEntry(serverMode(state)
+        ? `当前已锁定：${action}未保存，请先在左侧输入解锁密码（服务端校验）`
+        : `当前已锁定：${action}未保存，请先在左侧输入解锁密码（演示密码 8888）`, true);
     }
 
-    function tryUnlock() {
+    /**
+     * 演示模式的解锁（**行为与接线前逐字不变**，ADR-0007 D5 明示保留）。
+     * 这里的比对对象**只是演示口令**（`MockData.CFG.unlockPassword`，`8888` 仅此模式存在）——
+     * 它**不是**口令校验的实现：服务端模式一个字节都不走这条路（下面的 `tryUnlockServer`）。
+     */
+    function tryUnlockDemo() {
       // 演示实现：真实系统须由服务端校验口令（NFR-14），不得在前端存放明文
       if (input.value === M.CFG.unlockPassword) {
         M.setUnlocked(true);
@@ -252,13 +375,259 @@ window.Components.SettingPanel = (function () {
       noteActivity();
     }
 
+    /**
+     * 服务端模式的解锁（FR-8.1 / ADR-0007 D5）＝把口令**原样**交给 `POST /auth/login`：
+     * 本页**不比对、不哈希、不计数、不判定锁定** —— 服务端给什么就显示什么：
+     *   · 200 ⇒ 保存会话令牌（`sessionStorage`）并置解锁位；
+     *   · 401 `bad_credentials` ⇒ 口令不正确（对外不区分"用户不存在"，D2）；
+     *   · 423 `locked` ⇒ 如实显示 `retryAfterSec` 剩余秒数（锁定期间口令正确也拒，D2/D8①）；
+     *   · 409 `not_initialized` ⇒ 提示走**本机**一次性初始化（D4），并显示初始化行；
+     *   · 其余（403 非回环 / 400 / 网络失败）⇒ 一律落到 `#setMsg` 与 `#entryMsg`（**绝不静默**）。
+     */
+    function tryUnlockServer() {
+      const bs = session();
+      const pwd = String(input.value === undefined || input.value === null ? '' : input.value);
+      if (!bs || typeof bs.login !== 'function') {
+        msg.textContent = '服务端登录未装配：window.BoardSession 不可用（检查 index.html 是否已注册 src/services/auth.js）';
+        msg.className = 'pwd-msg err';
+        flashEntry('解锁未提交：服务端登录出口未装配（window.BoardSession 不可用）', true);
+        return;
+      }
+      if (!pwd) {
+        msg.textContent = '请输入解锁口令（服务端口令由 POST /auth/login 校验）';
+        msg.className = 'pwd-msg err';
+        return;
+      }
+      msg.textContent = '正在提交服务端校验…';
+      msg.className = 'pwd-msg';
+      bs.login(pwd).then(r => {
+        if (r && r.ok) {
+          M.setUnlocked(true);
+          M.pushLog('解锁', '服务端校验通过（POST /auth/login）：已取得会话令牌（本窗口内存 + sessionStorage）');
+          msg.textContent = '解锁成功，维保录入与公告修改已开放（5 分钟无操作自动锁定）';
+          msg.className = 'pwd-msg ok';
+          input.value = '';
+          needsInit = false;
+          armAutoLock();
+          render(state);
+          noteActivity();
+          return;
+        }
+        msg.className = 'pwd-msg err';
+        const code = String((r && r.errorCode) || '');
+        const status = r ? r.status : null;
+        const why = (r && r.reason) ? String(r.reason) : '未知原因';
+        if (status === 423) {
+          /* D2/D8①：锁定中（口令正确也拒）——**如实显示剩余秒数**（由服务端注入时钟算出） */
+          const sec = (r && r.retryAfterSec !== undefined && r.retryAfterSec !== null)
+            ? Number(r.retryAfterSec) : null;
+          msg.textContent = '账号已锁定：请在 ' +
+            (sec === null || !Number.isFinite(sec) ? '服务端给出的剩余时间后' : sec + ' 秒后') +
+            '重试（口令正确也会被拒；连续失败 5 次锁定 5 分钟）' +
+            (r && r.lockedUnknown === true ? '［服务端：锁定时间不可解析，从严按锁定处理］' : '');
+          flashEntry('解锁被拒（HTTP 423 locked）：账号锁定中，' +
+            (sec === null || !Number.isFinite(sec) ? '请稍后重试' : '剩余 ' + sec + ' 秒') +
+            '（服务端令牌未下发）', true);
+        } else if (status === 409) {
+          /* D4：无凭证行 ⇒ 未初始化。**唯一**初始化入口是本机回环 + 一次性初始化码（不设默认口令） */
+          needsInit = true;
+          msg.textContent = '服务端尚未初始化（409 not_initialized）：请在本机用服务端控制台打印的' +
+            '一次性初始化码设置口令（下方「口令初始化」，仅回环可用）';
+          flashEntry('解锁被拒（HTTP 409 not_initialized）：服务端尚无凭证行，请先在本机初始化口令' +
+            '（一次性码由服务端在本机给出；不设默认口令）', true);
+        } else if (status === 401 && (code === 'bad_credentials' || code === '')) {
+          msg.textContent = '密码错误，请重新输入（服务端校验；连续失败 5 次将锁定 5 分钟）';
+          flashEntry('解锁被拒（HTTP 401 bad_credentials）：口令不正确（服务端对外不区分原因）', true);
+        } else if (status === 401) {
+          msg.textContent = '登录态无效：' + why + '，请重新输入口令';
+          flashEntry('解锁被拒（HTTP 401 ' + (code || 'unauthorized') + '）：' + why, true);
+        } else {
+          msg.textContent = '解锁失败：' + (status === null ? '' : 'HTTP ' + status + ' ') + why;
+          flashEntry('解锁未成功：' + (status === null ? '' : 'HTTP ' + status + ' ') + why, true);
+        }
+        render(state);            /* 统一 401 处理/初始化态的可见降级由 render 落到 #entryMsg 与模式提示 */
+        noteActivity();
+      }).catch(err => {
+        /* 兜最后一层：`BoardSession` 已自收敛，这里只是保证"绝不抛未捕获异常" */
+        msg.textContent = '解锁失败：' + ((err && err.message) || String(err));
+        msg.className = 'pwd-msg err';
+        flashEntry('解锁未成功：' + ((err && err.message) || String(err)), true);
+      });
+    }
+
+    /** 解锁入口：**两条互不干扰的路径**（ADR-0007 D5）——服务端模式强制登录，演示模式走演示口令 */
+    function tryUnlock() {
+      if (serverMode(state)) { tryUnlockServer(); return; }
+      tryUnlockDemo();
+    }
+
     /* 关键参数配置：把配置文件当前值载入输入框（只在绑定时写一次，避免秒级刷新覆盖用户输入） */
     $('cfgEquipCode').value = M.CFG.equipCode;
     $('cfgUpperUrl').value = CFG.upper.url || '';
     $('cfgMesUrl').value = CFG.mes.baseUrl || '';
     $('cfgWarnDays').value = String(M.CFG.maintWarnDays);
 
+    /* ADR-0007 D1/D5：服务端口令口径是 **4～64 位**，而 `#setPwd` 的 `maxlength="8"` 是按演示口令
+       8888 定的 ⇒ **服务端模式**放宽到 64（否则现场设的长口令根本打不进来）。
+       演示模式**一字不改**（仍是 8）—— 这就是"演示模式行为逐字不变"的一部分。 */
+    if (serverMode(state)) input.maxLength = SERVER_PWD_MAX;
+
+    /* ADR-0007 D4/D5：`index.html` 的**静态初值**是演示模式的文案（"演示密码：8888"）——
+       服务端口径里**不得**出现演示口令（D4 明令）。故服务端模式下在绑定时**一次性**换成本模式的文案：
+         · `#setMsg` 是提示位，服务端模式下 `render()` **不**改写它（只有解锁/改密动作会写）⇒ 必须在这里初始化；
+         · `#entryMsg` 由 `render()` 每帧维护（服务端模式下第一帧就会写成"未登录或登录已过期…"），
+           这里顺手换掉只是为了"静态初值也不出现演示口令"。
+       演示模式**一字不改**（下面这段整段不执行）⇒ 10 张截图基准与本模式行为都不受影响。 */
+    if (serverMode(state)) {
+      if (/演示密码|8888/.test(String(msg.textContent || ''))) {
+        msg.textContent = '服务端口令由服务端校验（POST /auth/login）';
+      }
+      if (/演示密码|8888/.test(String(entryMsg.textContent || ''))) {
+        entryMsg.textContent = '当前已锁定：未登录或登录已过期，请先在左侧输入解锁密码（口令由服务端校验）';
+      }
+    }
+
+    /**
+     * 改密（FR-8.4 / ADR-0007 D5）：原口令 + 新口令 + 确认 ⇒ `POST /auth/change`（Bearer）。
+     * 成功后**强制清当前会话并要求重新登录**（服务端已清该用户全部在途会话，D8④）。
+     * 前端只做两件**本地**事：两项非空、两次输入一致（确认框存在的意义）；
+     * 口令策略（4～64 位 / 不得与原口令相同）与"原口令是否正确"**全部由服务端判** ——
+     * 这里**不比对**任何口令（D5：不得在浏览器里做哈希/比对/计数/锁定判定）。
+     */
+    function doPwdChange() {
+      if (!serverMode(state)) {
+        flashEntry('演示模式未启用服务端口令校验：修改密码仅在服务端模式可用（口令由服务端校验）', true);
+        return;
+      }
+      const bs = session();
+      if (!bs || typeof bs.change !== 'function') {
+        flashEntry('改密未提交：服务端会话出口未装配（window.BoardSession 不可用）', true);
+        return;
+      }
+      const oldPw = String($('setOldPwd').value === undefined ? '' : $('setOldPwd').value);
+      const newPw = String($('setNewPwd').value === undefined ? '' : $('setNewPwd').value);
+      const again = String($('setNewPwd2').value === undefined ? '' : $('setNewPwd2').value);
+      if (!oldPw || !newPw) { flashEntry('请填写原口令与新口令后再提交改密', true); return; }
+      if (newPw !== again) { flashEntry('两次输入的新口令不一致：本次不提交（服务端未收到任何改密请求）', true); return; }
+      msg.textContent = '正在提交服务端改密…';
+      msg.className = 'pwd-msg';
+      bs.change(oldPw, newPw).then(r => {
+        if (r && r.ok) {
+          $('setOldPwd').value = ''; $('setNewPwd').value = ''; $('setNewPwd2').value = '';
+          M.setUnlocked(false);                    /* D5：改密成功后**强制**清当前会话并要求重新登录 */
+          clearAutoLock();
+          msg.textContent = '口令已修改：当前会话已被服务端清除，请用新口令重新解锁';
+          msg.className = 'pwd-msg ok';
+          flashEntry('口令已修改（服务端已换盐换派生值并清空全部在途会话）：本窗口登录态已清除，请用新口令重新解锁', false);
+          render(state);
+          return;
+        }
+        msg.className = 'pwd-msg err';
+        const status = r ? r.status : null;
+        const code = String((r && r.errorCode) || '');
+        const why = (r && r.reason) ? String(r.reason) : '未知原因';
+        if (status === 401 && code === 'bad_credentials') {
+          msg.textContent = '原口令不正确（服务端校验失败，会话未清除）';
+          flashEntry('改密被拒（HTTP 401 bad_credentials）：原口令不正确，服务端未改任何东西', true);
+        } else if (status === 401) {
+          msg.textContent = '未登录或登录已过期，请重新解锁后再改密';
+          flashEntry('改密被拒（HTTP 401 ' + (code || 'unauthorized') + '）：' + why + '；请重新解锁', true);
+        } else if (status === 409) {
+          needsInit = true;
+          msg.textContent = '凭证行不存在（409）：请先在本机重新初始化口令';
+          flashEntry('改密被拒（HTTP 409）：' + why, true);
+        } else if (status === 400) {
+          msg.textContent = '新口令不符合口径：' + why;
+          flashEntry('改密被拒（HTTP 400 ' + (code || 'bad_password') + '）：' + why, true);
+        } else {
+          msg.textContent = '改密失败：' + (status === null ? '' : 'HTTP ' + status + ' ') + why;
+          flashEntry('改密未成功：' + (status === null ? '' : 'HTTP ' + status + ' ') + why, true);
+        }
+        render(state);
+      }).catch(err => {
+        msg.textContent = '改密失败：' + ((err && err.message) || String(err));
+        msg.className = 'pwd-msg err';
+        flashEntry('改密未成功：' + ((err && err.message) || String(err)), true);
+      });
+    }
+
+    /**
+     * 本机一次性初始化（ADR-0007 D4）：`POST /auth/init {code, password}` —— **唯一**初始化入口。
+     * 两条硬约束由**服务端**判：①请求必须来自回环；②码必须是本次进程启动生成的那一枚（用后即废）。
+     * 前端只是转发：**不设默认口令**、不生成码、不做任何本地放行（D4 明令禁止默认口令进服务端口径）。
+     */
+    function doInitPassword() {
+      /* 演示模式**不碰**服务端：该行在演示模式下恒 `hidden`，但按钮监听是照绑的 ⇒ 这里再显式挡一层，
+         保证"即使被脚本点到"也**不会**朝服务端发一次初始化请求（演示模式行为逐字不变的硬要求）。 */
+      if (!serverMode(state)) {
+        flashEntry('演示模式未启用服务端口令校验：口令初始化仅在服务端模式可用（一次性码由服务端在本机给出）', true);
+        return;
+      }
+      const bs = session();
+      if (!bs || typeof bs.init !== 'function') {
+        flashEntry('初始化未提交：服务端会话出口未装配（window.BoardSession 不可用）', true);
+        return;
+      }
+      const code = String($('setInitCode').value === undefined ? '' : $('setInitCode').value).trim();
+      const pwd = String($('setInitPwd').value === undefined ? '' : $('setInitPwd').value);
+      if (!code || !pwd) { flashEntry('请填写一次性初始化码与要设置的口令后再初始化（两项都必填）', true); return; }
+      msg.textContent = '正在提交本机初始化…';
+      msg.className = 'pwd-msg';
+      bs.init(code, pwd).then(r => {
+        if (r && r.ok) {
+          needsInit = false;
+          $('setInitCode').value = ''; $('setInitPwd').value = '';
+          msg.textContent = '口令初始化成功：请用刚设置的口令解锁（一次性初始化码已立即作废）';
+          msg.className = 'pwd-msg ok';
+          flashEntry('口令初始化成功（服务端已写入派生值与独立盐；一次性初始化码已立即作废）：请用新口令解锁', false);
+          render(state);
+          return;
+        }
+        msg.className = 'pwd-msg err';
+        const status = r ? r.status : null;
+        const code2 = String((r && r.errorCode) || '');
+        const why = (r && r.reason) ? String(r.reason) : '未知原因';
+        if (status === 403 && code2 === 'not_loopback') {
+          msg.textContent = '初始化只允许来自本机回环（403 not_loopback）：请在本机浏览器打开设置页';
+          flashEntry('初始化被拒（HTTP 403 not_loopback）：' + why, true);
+        } else if (status === 401) {
+          msg.textContent = '一次性初始化码不正确或已作废（401 ' + (code2 || 'bad_init_code') + '）：见服务端控制台打印的码';
+          flashEntry('初始化被拒（HTTP 401 ' + (code2 || 'bad_init_code') + '）：' + why, true);
+        } else if (status === 409) {
+          needsInit = false;
+          msg.textContent = '服务端已初始化过（409 ' + (code2 || 'already_initialized') + '）：请直接解锁';
+          flashEntry('初始化被拒（HTTP 409 ' + (code2 || 'already_initialized') + '）：' + why, true);
+          /* 用只读的 `GET /auth/status`（**无需鉴权**、不含秘密，D8⑦）把服务端实况补进提示，
+             避免"已初始化过"这句在操作人看来无从下手（还剩几次会话/是否锁定服务端说了算）。 */
+          if (typeof bs.status === 'function') {
+            bs.status().then(st => {
+              if (!st || !st.ok) return;
+              setText('setAuthNote', SERVER_MODE_NOTE + '；服务端已初始化（在途会话 ' +
+                (st.sessions === undefined ? '—' : st.sessions) + ' 个' +
+                (st.locked === true ? '；当前处于锁定中，剩余 ' + (st.retryAfterSec || 0) + ' 秒' : '') + '）');
+            }).catch(() => { /* 只读状态取不到不影响任何判定：提示位保持上面那句 */ });
+          }
+        } else if (status === 400) {
+          msg.textContent = '口令不符合口径：' + why;
+          flashEntry('初始化被拒（HTTP 400 ' + (code2 || 'bad_password') + '）：' + why, true);
+        } else {
+          msg.textContent = '初始化失败：' + (status === null ? '' : 'HTTP ' + status + ' ') + why;
+          flashEntry('初始化未成功：' + (status === null ? '' : 'HTTP ' + status + ' ') + why, true);
+        }
+        render(state);
+      }).catch(err => {
+        msg.textContent = '初始化失败：' + ((err && err.message) || String(err));
+        msg.className = 'pwd-msg err';
+        flashEntry('初始化未成功：' + ((err && err.message) || String(err)), true);
+      });
+    }
+
     $('setUnlockBtn').addEventListener('click', tryUnlock);
+    /* 服务端模式独有的两个入口（演示模式下这两行恒 `hidden`，本监听永不命中 ⇒ 行为一字不变）：
+       · 「修改密码」（FR-8.4）：原口令 + 新口令 + 确认；
+       · 「口令初始化」（ADR-0007 D4）：一次性初始化码 + 要设置的口令（仅本机回环可用）。 */
+    $('setPwdChangeBtn').addEventListener('click', doPwdChange);
+    $('setInitBtn').addEventListener('click', doInitPassword);
     /* 密码框键入也属于"设置页键入"：同样刷新回首页计时与 5 分钟锁定计时（原实现只调 onActivity()）。
        回车另走 tryUnlock()（其内部已 noteActivity()），故对回车不重复刷新。 */
     input.addEventListener('keydown', e => { if (e.key === 'Enter') tryUnlock(); else noteActivity(); });
@@ -273,6 +642,9 @@ window.Components.SettingPanel = (function () {
       clearAutoLock();          /* 手动锁定：只清锁定计时，**不**重挂（锁定态无需再计时） */
       if (state.unlocked) M.pushLog('手动锁定', '操作人手动锁定看板输入');
       M.setUnlocked(false);
+      /* ADR-0007 D5：锁定 ⇒ 服务端会话**同步**失效（自动锁定与手动锁定走同一条出口，
+         不留"界面已锁、令牌还在"的分裂状态）。演示模式不调：没有服务端会话，行为逐字不变。 */
+      if (serverMode(state)) logoutSession();
       msg.textContent = '已锁定';
       msg.className = 'pwd-msg';
       render(state);
@@ -334,6 +706,11 @@ window.Components.SettingPanel = (function () {
           const code = (body && ((body.err && body.err.code) || body.error)) || '';
           const why = (body && body.err && body.err.message) || (r && (r.failReason || r.error)) || '未知原因';
           flashEntry('公告未保存（HTTP ' + ((r && r.status) || '—') + (code ? ' ' + code : '') + '）：' + why, true);
+          /* ADR-0007 D5：**统一 401 处理**的界面动作要**当帧**落地（不等下一秒的渲染循环）——
+             若是会话失效，`services/api.js` 已在 HTTP 出口清掉令牌并记账，这里 render 一次即可
+             把"未登录或登录已过期"写进 `#entryMsg`/`#setAuthNote` 并**如实降级**回锁定态。
+             `flashEntry` 已把 `#entryMsg` 置为 sticky ⇒ 本次 render 不会覆盖上面那句失败提示。 */
+          render(st);
           return;
         }
         /* 服务端已落库（且已写 op_log）⇒ 用响应里的同一份投影刷新界面 */

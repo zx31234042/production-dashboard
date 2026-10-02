@@ -297,6 +297,44 @@ window.Api = (function () {
     return (CFG.board && CFG.board.timeoutMs) || 3000;
   }
 
+  /** 从响应体取**机器可读**错误码（`routes/auth.js` 与 `routes/notice.js` 同形：`body.error` 与 `body.err.code`） */
+  function errorCodeOf(body) {
+    if (!body || typeof body !== 'object') return '';
+    const v = (body.err && body.err.code) || body.error;
+    return v === undefined || v === null ? '' : String(v);
+  }
+
+  /**
+   * **统一 401 处理**（ADR-0007 D5 的第三件事："前端只做提交口令 / 保存令牌 / 统一处理 401"）。
+   *
+   * 为什么挂在 `httpJson()` 上：它是**全仓唯一的服务端 HTTP 出口**（本文件头与 T-20261002-08 均已
+   * 固化该口径）——把"401 ⇒ 清会话 + 记一条可见说明"收在这一处，就不会出现"某些调用方记得处理、
+   * 某些忘了"的分裂；也**不必**再起第二套 fetch。
+   *
+   * ⚠ 判定"是不是会话失效"的权力**不在本函数**：本函数只把 `{path, status, errorCode, reason}`
+   * 原样交给 `window.BoardSession.noteUnauthorized()`，由它按机器可读码区分
+   * `unauthorized`（会话失效）与 `bad_credentials`/`bad_init_code`（与登录态无关的 401，见
+   * `services/auth.js` 的 `isSessionLoss()`）。这样"哪种 401 算掉线"只有一份口径。
+   *
+   * 三条纪律：①出口未装配（裁剪环境 / 测试桩件）⇒ **静默跳过**，不抛、不刷控制台（一次 401 不该
+   * 因为缺一个可选出口就变成异常）；②`BoardSession` 自己抛错 ⇒ 只 `warn` 一次并照常把响应返回给
+   * 调用方（绝不吞掉本次业务结论）；③本函数**不改** `r` 的字段（既有调用方读到的形状逐字节不变）。
+   */
+  function noteUnauthorized(status, path, body) {
+    if (status !== 401) return;
+    const bs = window.BoardSession;
+    if (!bs || typeof bs.noteUnauthorized !== 'function') return;
+    try {
+      bs.noteUnauthorized({
+        path: path, status: status, errorCode: errorCodeOf(body),
+        reason: (body && ((body.err && body.err.message) || body.reason)) || ''
+      });
+    } catch (err) {
+      console.warn('[Api] 统一 401 处理抛错（已忽略，本次响应照常返回）：' +
+        ((err && err.message) || String(err)));
+    }
+  }
+
   /**
    * 统一的 HTTP JSON 出口（**本文件所有服务端取数都必须走它**）。
    * 错误形状沿用 `sendReport()` 的既有字段（`{ok,error,failReason,responseCode,responseText}`），
@@ -353,6 +391,8 @@ window.Api = (function () {
       if (!res.ok) {
         /* HTTP 非 2xx：如实回报状态码与服务端错误体（**不 console.error**） */
         const reason = (parsed && parsed.err && parsed.err.message) || parseError && parseError.message || ('HTTP ' + res.status);
+        /* ADR-0007 D5：唯一的 HTTP 出口在这里收敛"会话类 401"（清令牌 + 记一条可见说明） */
+        noteUnauthorized(res.status, path, parsed);
         return {
           ok: false, status: res.status, body: parsed, url, responseText: text,
           failReason: String(reason), responseCode: String(res.status),
@@ -544,8 +584,115 @@ window.Api = (function () {
     });
   }
 
-  /* ---------------- 数据源接入 ---------------- */
+  /* ---------------- 设置页鉴权（ADR-0007 D1–D5；T-20261002-15 / 技术债 E86①） ----------------
+     服务端契约（`server/http/routes/auth.js` 已落地，**本包不得改服务端**）：
+       `POST /auth/init   {code, password}`              本机回环 + 一次性初始化码（D4）
+       `POST /auth/login  {username?, password}`         `{ok,token,username,expiresAt}`（D3）
+       `POST /auth/logout`（Bearer）                      令牌即刻失效
+       `POST /auth/change {oldPassword, newPassword}`（Bearer）改密并**清该用户全部在途会话**（D5/D8④）
+       `GET  /auth/status`                                 `{ok,initialized,locked,…}`（无秘密；D8⑦）
+     HTTP 状态码口径（**唯一真源＝ADR-0007 D2/D4**，本文件**不重判**）：
+       200 成功｜400 `bad_password`｜401 `bad_credentials` / `bad_init_code` / `unauthorized`
+       ｜403 `not_loopback`｜409 `not_initialized` / `already_initialized`｜423 `locked`（带 `retryAfterSec`）
+     本段的职责边界：**只做 HTTP 适配与归一化**（把 `httpJson` 的既有失败形状 + 服务端错误体
+     整理成一份稳定形状），**不比对口令、不计数、不判定锁定**（那是浏览器不该做的事，D5）。
+     调用方（`services/auth.js` 的 `window.BoardSession`）据此保存令牌 / 显示可操作提示。 */
 
+  /**
+   * 把 `httpJson()` 的响应整理成**鉴权结果的稳定形状**（调用方只读这一份，不再自己挖 `body` 的层级）。
+   * @param {object} r `httpJson()` 的返回值
+   * @returns {{ok:boolean, url:string, status:number|null, errorCode:string, reason:string, body:object|null}}
+   *   成功时另带服务端给出的字段（`token`/`username`/`expiresAt`/`initialized`/`requireRelogin`/…）；
+   *   失败时另带可操作字段（`retryAfterSec`/`lockedUntil`/`lockedUnknown`）。
+   */
+  function authResultOf(r) {
+    const body = (r && r.body && typeof r.body === 'object') ? r.body : null;
+    const out = {
+      ok: !!(r && r.ok === true),
+      url: (r && r.url) || '',
+      status: (r && r.status === undefined) ? null : (r ? r.status : null),
+      errorCode: errorCodeOf(body),
+      reason: (body && ((body.reason) || (body.err && body.err.message))) ||
+        (r && (r.failReason || r.error)) || '',
+      body: body
+    };
+    const serverKeys = out.ok
+      ? ['token', 'username', 'expiresAt', 'absoluteExpiresAt', 'initialized', 'isInitial',
+        'requireRelogin', 'sessionsCleared', 'sessionsRemaining']
+      : ['retryAfterSec', 'lockedUntil', 'lockedUnknown'];
+    if (body) serverKeys.forEach(k => { if (body[k] !== undefined) out[k] = body[k]; });
+    return out;
+  }
+
+  /**
+   * 读服务端鉴权状态（`GET /auth/status`）—— **无需鉴权**、**不含任何秘密**（D8⑦）。
+   * 用途：区分"未初始化（该走本机一次性初始化）"与"已初始化但没登录"，给出可操作提示。
+   * @returns {Promise<object>} `{ok, initialized, locked, retryAfterSec, isInitial, sessions, …}`
+   */
+  function authStatus() {
+    return httpJson('/auth/status').then(r => {
+      if (!r.ok) return authResultOf(r);
+      return Object.assign(authResultOf(r), r.body || {}, { ok: r.body && r.body.ok !== false });
+    });
+  }
+
+  /**
+   * 提交口令换取会话令牌（`POST /auth/login`）。
+   * @param {string} password 口令（原样提交；前端**不做**哈希/比对，D5）
+   * @param {string} [username] 缺省 `admin`（服务端同样缺省它）
+   * @returns {Promise<object>} 成功 ⇒ `{ok:true, token, username, expiresAt, absoluteExpiresAt}`
+   */
+  function authLogin(password, username) {
+    const body = { password: password === undefined || password === null ? '' : String(password) };
+    if (username !== undefined && username !== null && username !== '') body.username = String(username);
+    return httpJson('/auth/login', { method: 'POST', body: body }).then(authResultOf);
+  }
+
+  /**
+   * 令牌即刻失效（`POST /auth/logout`，Bearer）。未携带/伪造令牌 ⇒ 服务端 401（本函数如实回报）。
+   * @param {string} token 会话令牌
+   */
+  function authLogout(token) {
+    const headers = token ? { Authorization: 'Bearer ' + token } : {};
+    return httpJson('/auth/logout', { method: 'POST', body: {}, headers: headers }).then(authResultOf);
+  }
+
+  /**
+   * 改密（`POST /auth/change`，Bearer）：原口令 + 新口令。
+   * 成功后服务端**清空该用户全部在途会话**（D8④）⇒ 调用方必须清本地会话并要求重新登录（D5）。
+   * @param {string} oldPassword 原口令
+   * @param {string} newPassword 新口令（4～64 位；口径由服务端判）
+   * @param {string} token 会话令牌
+   */
+  function authChange(oldPassword, newPassword, token) {
+    const headers = token ? { Authorization: 'Bearer ' + token } : {};
+    return httpJson('/auth/change', {
+      method: 'POST',
+      body: {
+        oldPassword: oldPassword === undefined || oldPassword === null ? '' : String(oldPassword),
+        newPassword: newPassword === undefined || newPassword === null ? '' : String(newPassword)
+      },
+      headers: headers
+    }).then(authResultOf);
+  }
+
+  /**
+   * 本机一次性初始化（`POST /auth/init {code, password}`）—— D4 的**唯一**初始化入口。
+   * 回环判定与"码是否本次进程生成"都由服务端做；前端只是转发（并**只**在本机回环上才会成功）。
+   * @param {string} code 服务端控制台打印的一次性初始化码
+   * @param {string} password 要设置的口令
+   */
+  function authInit(code, password) {
+    return httpJson('/auth/init', {
+      method: 'POST',
+      body: {
+        code: code === undefined || code === null ? '' : String(code).trim(),
+        password: password === undefined || password === null ? '' : String(password)
+      }
+    }).then(authResultOf);
+  }
+
+  /* ---------------- 数据源接入 ---------------- */
   /**
    * 启动数据源（**三个分支，三条互不干扰的路径**）。
    *
@@ -1079,6 +1226,8 @@ window.Api = (function () {
     applyUpperPayload, validatePayload, isUpperStale, syncLinkState, startUpper, stopUpper,
     /* 看板服务端（W5-② / ADR-0008）：统一 HTTP 出口 + 首帧快照 + UI-20 的两个只读接口与人工重报 */
     httpJson, fetchSnapshot, fetchPending, fetchUploadStatus, retryPendingServer,
+    /* ADR-0007（设置页鉴权；T-20261002-15 / E86①）：会话令牌的**唯一** HTTP 出口（走 httpJson） */
+    authStatus, authLogin, authLogout, authChange, authInit,
     /* W7-B（FR-8.5 / NFR-26）：自检页真实探测所需的**只读**端点（新增，不改既有函数语义） */
     fetchHealth, fetchIfdStatus, fetchIfaStatus, fetchHealthWithDate,
     serverBase, serverTimeout,
