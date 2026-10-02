@@ -2945,11 +2945,11 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     `首页=${s.site && s.site.root && s.site.root.status}（内容相等=${Boolean(s.site && s.site.root && s.site.root.text === idxText)}）；` +
     `main.js=${s.site && s.site.js && s.site.js.status}/${s.site && s.site.js && s.site.js.contentType}；` +
     `nope.js=${s.site && s.site.denied && s.site.denied['/src/nope.js'] && s.site.denied['/src/nope.js'].status}`);
-  t.check('静态/W7-C③：favicon **在静态兜底层**处理，不是新注册一条路由 —— 路由清单仍 20 条；且它**不进白名单**（`resolvePath` 仍拒），而静态层计数 `served.favicon` 确实 +1（被 204 分支接住、没落 404）',
-    (s.site && s.site.routesCountAfterFavicon) === 20 &&
+  t.check('静态/W7-C③：favicon **在静态兜底层**处理，不是新注册一条路由 —— 路由清单仍 21 条（冻结基线随 `T-20261002-08` 的 `POST /notice` 由 20 → 21，**favicon 一条都没加**）；且它**不进白名单**（`resolvePath` 仍拒），而静态层计数 `served.favicon` 确实 +1（被 204 分支接住、没落 404）',
+    (s.site && s.site.routesCountAfterFavicon) === 21 &&
     (s.site && s.site.faviconNotWhitelisted && s.site.faviconNotWhitelisted.ok === false) &&
     (s.site && s.site.faviconServed && s.site.faviconServed.favicon === 1),
-    `路由条数=${s.site && s.site.routesCountAfterFavicon}（冻结基线 20）；resolvePath('/favicon.ico')=${JSON.stringify(s.site && s.site.faviconNotWhitelisted)}；` +
+    `路由条数=${s.site && s.site.routesCountAfterFavicon}（冻结基线 21）；resolvePath('/favicon.ico')=${JSON.stringify(s.site && s.site.faviconNotWhitelisted)}；` +
     `served=${JSON.stringify(s.site && s.site.faviconServed)}`);
 
   t.check('静态⑧：白名单外路径（server / tests / tools / .git / data / 项目记录 / 需求文档 / 未知路径）一律 404＋JSON 形状，且响应体**不含**被禁文件内容（按真实文件的 40 字符指纹逐条比对）',
@@ -3574,15 +3574,16 @@ t.section('四之③、W7-A-3 DoD：mock-upper（真进程）→ 服务端 → m
     side.rowsAfter === side.rowsBefore && side.logsAfter === side.logsBefore &&
     side.seqAfter === side.seqBefore,
     `measure_rt ${side.rowsBefore}→${side.rowsAfter}；upload_log ${side.logsBefore}→${side.logsAfter}；总线 seq ${side.seqBefore}→${side.seqAfter}`);
-  t.check('§1 endpoint 矩阵④：路由清单与**冻结基线**逐条一致（本项目阶段一暴露的端点集合；增/删端点即红 —— 矩阵③的"无副作用"才有对象）',
+  t.check('§1 endpoint 矩阵④：路由清单与**冻结基线**逐条一致（本项目阶段一暴露的端点集合；增/删端点即红 —— 矩阵③的"无副作用"才有对象）。' +
+    '基线 **21 条**：`T-20261002-08`（`FR-7.12`，P0）新增 `POST /notice` 一条，其余 20 条逐字不动',
     JSON.stringify(mx.routes) === JSON.stringify([
       'GET /auth/status', 'GET /events', 'GET /health', 'GET /ifa/status', 'GET /ifd/health', 'GET /ifd/status',
       'GET /state', 'GET /upload/last', 'GET /upload/pending', 'GET /upload/status',
       'POST /auth/change', 'POST /auth/init', 'POST /auth/login', 'POST /auth/logout',
       'POST /ifa/device', 'POST /ifa/dispatch', 'POST /ifa/material', 'POST /ifa/process',
-      'POST /ifd/frame', 'POST /upload/retry'
+      'POST /ifd/frame', 'POST /notice', 'POST /upload/retry'
     ]),
-    `实际清单=${JSON.stringify(mx.routes)}`);
+    `实际清单（${mx.routes ? mx.routes.length : 0} 条，冻结基线 21）=${JSON.stringify(mx.routes)}`);
 
   try { fs.rmSync(w7Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
   try { fs.rmSync(w7File, { force: true }); } catch { /* 忽略 */ }
@@ -6015,6 +6016,396 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
   }
   t.check('A1：本节自建的临时目录跑完**当场删除**（一用例一库，不留残留）',
     !fs.existsSync(a1Tmp), a1Tmp);
+}
+
+/* ---------------- 十七、FR-7.12 公告写链路（IF-E `POST /notice`；T-20261002-08 交付） ----------------
+   被测对象（**全部已入库**，本节只断言、不改实现）：
+     · `server/repo/notice.js`      —— DR-10 的**唯一写入口**（`publish`/`edit`/`remove`）＋ 四个读口；
+     · `server/http/routes/notice.js` —— **IF-E 写路由** `POST /notice`（鉴权 → 回环 → 锁定 → 动作 → 落库）；
+     · `server/services/stateSnapshot.js` 的 `notices` 段 —— 与 `POST /notice` 响应**同一份投影**。
+   需求依据：`FR-7.12`（P0）「**仅本机解锁后可新增/编辑/删除公告**」；「操作记录保留」＝`FR-8.7`／`NFR-15`／`DR-12`。
+   负责人已裁定的口径（本节**逐条按它写**，不反向假设）：
+     · **两支 403 都保留**（`not_loopback` ＝来源不是回环；`locked` ＝会话有效但账号锁定，ADR-0007 D2）⇒ 各一条；
+     · 删除＝**硬删 ＋ 原文进 `op_log`**（`valid_to` 是 DR-10 的**有效期**语义，**不是**软删标志）；
+     · 投影 `lv` 恒 `'info'`、`todo` 恒 `[]`（`notice` 表无等级/待办列 ⇒ **不要求实现编造**）；
+     · **不发 SSE 事件**（前端用 `POST` 响应里同一份投影就地刷新）；
+     · `valid_from` 缺省＝发布时刻、`valid_to` 缺省 NULL、`priority` 缺省 0 —— `FR-7.11` 的**有效期过滤与轮播
+       未实现**（P1／技术债 `E3`），两列**只是如实落库**，故本节只断言"缺省取值"，**不**断言任何过滤/轮播行为；
+     · 401 只 `warn` **不写库**（未解锁场景不留痕）；**过了鉴权闸**的被拒一律留一条 `result='失败'`。
+   为什么进程内 ＋ 真进程两段都要：
+     · `not_loopback` 与 `locked` **只能在进程内造**（回环闸看 `req.socket.remoteAddress`；锁定要看账号状态位），
+       真 HTTP 回环请求永远是回环来源；
+     · 而"`GET /state` 与 SSE `hello` 的 `notices` 同源同形"**只能在真进程上验**（SSE 是长连接、`hello` 是建连首帧）。
+   `E86①`（已知集成缺口）：前端"解锁 ⇒ 会话令牌"**未接线**（属 `FR-8.4`／`ADR-0007` 的包）⇒ 服务端模式下
+   前端写入会拿 401 并被**显示**。该缺口的行为断言归 `tests\ui-check.js`（本节**不**要求本包实现登录接线）。 */
+t.section('十七、FR-7.12 公告写链路（IF-E `POST /notice`：鉴权／仅本机／锁定／入参／留痕／投影同源）');
+{
+  const dbApiN = require('../server/db');
+  const { createAuth: createAuthN } = require('../server/services/auth');
+  const { mountNotice } = require('../server/http/routes/notice');
+  const { createRouter: createRouterN } = require('../server/http/router');
+  const { createStateSnapshot } = require('../server/services/stateSnapshot');
+  const opLogRepoN = require('../server/repo/opLog');
+  const noticeRepoN = require('../server/repo/notice');
+
+  const N_NOW = '2026-10-02 09:30:00';
+  const N_PW = 'Notice#2026';
+
+  /* 进程内 req/res 桩件（只为本节服务）。`remote` 可控 —— 回环闸那两条只能在进程内造；
+     形状与 `server/http/router.js` 的 `readJson`/`json` 期望一致（`Symbol.asyncIterator` ＋ `writeHead/end`）。 */
+  const nReq = ({ body = null, token = '', remote = '127.0.0.1' } = {}) => {
+    const chunks = body === null ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
+    return {
+      method: 'POST', url: '/notice',
+      headers: token ? { authorization: 'Bearer ' + token } : {},
+      socket: { remoteAddress: remote },
+      [Symbol.asyncIterator]() {
+        let i = 0;
+        return {
+          next: async () => (i < chunks.length
+            ? { value: chunks[i++], done: false }
+            : { value: undefined, done: true })
+        };
+      }
+    };
+  };
+  const nRes = () => {
+    const out = { status: null, body: null, text: '' };
+    return {
+      out,
+      writeHead(s) { out.status = s; return this; },
+      setHeader() { return this; },
+      write() { return true; },
+      end(t) {
+        out.text = t === undefined ? '' : String(t);
+        try { out.body = JSON.parse(out.text); } catch { out.body = null; }
+        return this;
+      },
+      destroy() { return this; }
+    };
+  };
+
+  const nTmp = harness.makeTempDb({ name: 'notice-route-matrix' });
+  try {
+    dbApiN.initSchema(nTmp.db, N_NOW);
+    const nDb = nTmp.db;
+    const nClock = createClock({ mode: 'fixed', at: '2026-10-02T09:30:00' });
+    const nAuth = createAuthN({ db: nDb, now: nClock.source(), silent: true, teamCode: '检验一班' });
+    const nInit = nAuth.init({ code: nAuth.initCode(), password: N_PW, remote: '127.0.0.1' });
+    const nLogin = nAuth.login({ password: N_PW, remote: '127.0.0.1' });
+    const nToken = (nLogin && nLogin.token) || '';
+    const nRouter = createRouterN({ getHealth: () => ({ ok: true }), now: nClock.source() });
+    const nMount = mountNotice(nRouter, {
+      db: nDb, auth: nAuth, now: nClock.source(), operator: null, teamCode: '检验一班'
+    });
+    const nDrive = async opts => { const res = nRes(); await nRouter.handle(nReq(opts), res); return res.out; };
+    const nCount = () => nDb.prepare('SELECT COUNT(*) AS c FROM notice').get().c;
+    const nRows = () => nDb.prepare('SELECT * FROM notice ORDER BY id').all();
+    const nOpCount = (opType, result) => (result === undefined
+      ? nDb.prepare('SELECT COUNT(*) AS c FROM op_log WHERE op_type = ?').get(opType).c
+      : nDb.prepare('SELECT COUNT(*) AS c FROM op_log WHERE op_type = ? AND result = ?').get(opType, result).c);
+    /** 公告类留痕里的**失败**行（`auth` 自己的失败留痕 op_type 不以"公告"开头，故按前缀筛） */
+    const nFailNotice = () => nDb.prepare(
+      "SELECT op_type, result, content, operator, team_code, op_time FROM op_log " +
+      "WHERE result = '失败' AND op_type LIKE '公告%' ORDER BY id").all();
+
+    t.requires('FR-7.12 前提：进程内鉴权可初始化并取到会话令牌（下面的 401/403 才有归因对象）',
+      Boolean(nInit && nInit.ok === true && nLogin && nLogin.ok === true && /^[0-9a-f]{64}$/.test(nToken)),
+      `init.ok=${nInit && nInit.ok}；login.ok=${nLogin && nLogin.ok}；token 长度=${nToken.length}`);
+
+    /* ---- A0 正对照：回环 ＋ 有效令牌 ⇒ 真落库（"解锁后新增公告"的最小闭环） ---- */
+    const n0 = await nDrive({ token: nToken, body: { action: 'publish', content: '公告链路正对照（原文）', subType: '生产调整' } });
+    const nRow0 = nRows()[0] || {};
+    t.check('FR-7.12 路由 A0 正对照：回环来源 ＋ 有效会话令牌 ⇒ 200（不是 401/403/503）；`notice` 表恰 +1 行、' +
+      '`op_log`（公告发布/成功）恰 +1 行；缺省取值如实落库（`valid_from`＝发布时刻、`valid_to`＝NULL、`priority`＝0）；' +
+      '`mountNotice` 只注册 1 条路由且就是 `POST /notice`',
+      n0.status === 200 && n0.body && n0.body.ok === true && nCount() === 1 && nRows().length === 1 &&
+      nOpCount('公告发布', opLogRepoN.RESULT.SUCCESS) === 1 &&
+      nRow0.content === '公告链路正对照（原文）' && nRow0.sub_type === '生产调整' &&
+      nRow0.category === noticeRepoN.CATEGORY.NOTICE && Number(nRow0.priority) === 0 &&
+      nRow0.valid_from === N_NOW && nRow0.valid_to === null && nRow0.created_at === N_NOW &&
+      n0.body.opLogId !== null && nMount.routes.length === 1 && nMount.routes[0] === 'POST /notice',
+      `HTTP ${n0.status}；notice=${nCount()} 行；发布留痕（成功）=${nOpCount('公告发布', opLogRepoN.RESULT.SUCCESS)}；` +
+      `库行=${JSON.stringify(nRow0)}；routes=[${nMount.routes.join(',')}]`);
+    const nPubId = n0.body && n0.body.id;
+
+    /* ---- A1：401（未登录/伪造令牌）**不留痕** ---- */
+    const nLogsBefore401 = opLogRepoN.count(nDb);
+    const nNoTok = await nDrive({ body: { action: 'publish', content: '未登录不该写进去' } });
+    const nForged = await nDrive({ token: 'deadbeef', body: { action: 'publish', content: '伪造令牌也不该写进去' } });
+    t.check('FR-7.12 路由 A1 **未登录**（无 Bearer ＋ 伪造令牌）⇒ 两条都 401 `unauthorized`（带原因），' +
+      '且 `notice` 表与 `op_log` **一行都没动** —— 未解锁场景不留痕（401 只在服务端日志 warn）',
+      nNoTok.status === 401 && nNoTok.body && nNoTok.body.error === 'unauthorized' &&
+      typeof nNoTok.body.reason === 'string' && nNoTok.body.reason.length > 0 &&
+      nForged.status === 401 && nForged.body && nForged.body.error === 'unauthorized' &&
+      nCount() === 1 && nOpCount('公告发布', opLogRepoN.RESULT.SUCCESS) === 1 &&
+      opLogRepoN.count(nDb) === nLogsBefore401 && nFailNotice().length === 0,
+      `无令牌=${nNoTok.status}/${nNoTok.body && nNoTok.body.error}；伪造=${nForged.status}/${nForged.body && nForged.body.error}；` +
+      `notice=${nCount()}；op_log ${nLogsBefore401}→${opLogRepoN.count(nDb)}（应不变）；公告类失败留痕=${nFailNotice().length}（应 0）`);
+
+    /* ---- A2：403 `not_loopback`（FR-7.12 的「仅本机」）＋ 过了鉴权闸的被拒要留痕 ---- */
+    const nOff = await nDrive({
+      token: nToken, remote: '10.10.2.77',
+      body: { action: 'publish', content: '来自局域网的公告' }
+    });
+    const nFail2 = nFailNotice();
+    t.check('FR-7.12 路由 A2 **非本机来源**（socket `10.10.2.77`）＋ 有效令牌 ⇒ 403 `not_loopback`' +
+      '（FR-7.12「仅本机」；判据只看 `req.socket.remoteAddress`、不信请求头）；`notice` 表一行不写，' +
+      '但**过了鉴权闸的被拒也留痕**：`op_log` 恰 +1 条 `result=失败`（带操作人/班组/DR-16 时刻）',
+      nOff.status === 403 && nOff.body && nOff.body.error === 'not_loopback' && nCount() === 1 &&
+      nFail2.length === 1 && nFail2[0].result === opLogRepoN.RESULT.FAILED &&
+      nFail2[0].op_type === noticeRepoN.OP_TYPE.PUBLISH &&
+      nFail2[0].operator !== null && nFail2[0].team_code === '检验一班' &&
+      /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(String(nFail2[0].op_time)) &&
+      /not_loopback/.test(String(nFail2[0].content)),
+      `HTTP ${nOff.status}/${nOff.body && nOff.body.error}；notice=${nCount()}；公告类失败留痕=` +
+      `${nFail2.length} 条：${JSON.stringify(nFail2)}`);
+
+    /* ---- A3：400 `bad_value`（publish 缺 content ⇒ 仓储入参校验抛错 ⇒ 400，不是 500） ---- */
+    const nBadVal = await nDrive({ token: nToken, body: { action: 'publish', subType: '生产调整' } });
+    /* ---- A4：400 `bad_action`（动作名不在三态里） ---- */
+    const nBadAct = await nDrive({ token: nToken, body: { action: 'rename', content: 'x' } });
+    /* ---- A5：404 `not_found`（删不存在的行 ⇒ 不静默假装成功） ---- */
+    const nMiss = await nDrive({ token: nToken, body: { action: 'delete', id: 999999 } });
+    const nFail345 = nFailNotice();
+    t.check('FR-7.12 路由 A3/A4/A5 三条逆向逐条落在契约码上：缺 `content` ⇒ 400 `bad_value`、' +
+      '动作名非法 ⇒ 400 `bad_action`、删不存在的行 ⇒ 404 `not_found` —— **每条都留一条 `result=失败`**（拒收也留痕，' +
+      '与 401/503 分得开），且 `notice` 表始终仍是 1 行',
+      nBadVal.status === 400 && nBadVal.body && nBadVal.body.error === 'bad_value' &&
+      nBadAct.status === 400 && nBadAct.body && nBadAct.body.error === 'bad_action' &&
+      nMiss.status === 404 && nMiss.body && nMiss.body.error === 'not_found' &&
+      nCount() === 1 && nFail345.length === 4 &&
+      nFail345[1].op_type === noticeRepoN.OP_TYPE.PUBLISH &&
+      nFail345[2].op_type === noticeRepoN.OP_TYPE.REJECT &&
+      nFail345[3].op_type === noticeRepoN.OP_TYPE.DELETE &&
+      nFail345.every(r => r.result === opLogRepoN.RESULT.FAILED),
+      `缺 content=${nBadVal.status}/${nBadVal.body && nBadVal.body.error}；非法动作=${nBadAct.status}/${nBadAct.body && nBadAct.body.error}；` +
+      `删不存在=${nMiss.status}/${nMiss.body && nMiss.body.error}；notice=${nCount()}；公告类失败留痕=` +
+      `${nFail345.length} 条（op_type=${nFail345.map(r => r.op_type).join('/')}）`);
+
+    /* ---- A6：编辑＝**同一条更新**（行数不变、`id`/`created_at` 不变、`updated_at` 刷新） ---- */
+    const nEdit = await nDrive({
+      token: nToken,
+      body: { action: 'edit', id: nPubId, content: '公告链路正对照（编辑后）', subType: '工艺变更' }
+    });
+    const nRowE = nRows()[0] || {};
+    t.check('FR-7.12 路由 A6 **编辑**：200 ⇒ 仍是**同一行**（`notice` 行数不变、`id` 与 `created_at` 逐字不变）而 ' +
+      '`content`/`sub_type` 已更新、`updated_at` 刷新为本动作时刻；`op_log`（公告编辑/成功）恰 +1，' +
+      '留痕正文含「内容『旧』→『新』」逐字变更清单',
+      nEdit.status === 200 && nEdit.body && nEdit.body.ok === true && nCount() === 1 && nRows().length === 1 &&
+      Number(nRowE.id) === Number(nPubId) && Number(nRowE.id) === Number(n0.body.id) &&
+      nRowE.content === '公告链路正对照（编辑后）' && nRowE.sub_type === '工艺变更' &&
+      nRowE.created_at === nRow0.created_at && nRowE.updated_at === N_NOW &&
+      nOpCount('公告编辑', opLogRepoN.RESULT.SUCCESS) === 1 &&
+      /公告链路正对照（原文）/.test(String(nEdit.body.changed && nEdit.body.changed.join('；'))) &&
+      /公告链路正对照（编辑后）/.test(String(nEdit.body.changed && nEdit.body.changed.join('；'))),
+      `HTTP ${nEdit.status}；行数=${nCount()}（id ${nRow0.id}→${nRowE.id}）；created_at ${nRow0.created_at}→${nRowE.created_at}；` +
+      `updated_at=${nRowE.updated_at}；changed=${JSON.stringify(nEdit.body && nEdit.body.changed)}`);
+
+    /* ---- A7：成功响应带的**投影**与 `GET /state` 快照走**同一份**（不写第二份投影） ---- */
+    const nSnap = createStateSnapshot({ db: nDb, now: nClock.source() })();
+    const nProj = nEdit.body && nEdit.body.notices;
+    t.check('FR-7.12 路由 A7 **投影同源**：`POST /notice` 成功响应里的 `notices` 与 `GET /state` 快照的 `notices` ' +
+      '**逐字节相等**，且都等于读口 `repo/notice.js` 的 `listForBoard()` 产出（三处一份投影）；' +
+      '行形状＝`{id,tag,text,lv,time}`（`lv` 恒 `info`、`todo` 恒 `[]`，表无等级/待办列 ⇒ 不编造）',
+      Boolean(nProj) && Boolean(nSnap.notices) &&
+      JSON.stringify(nProj) === JSON.stringify(nSnap.notices) &&
+      JSON.stringify(nProj) === JSON.stringify(noticeRepoN.listForBoard(nDb)) &&
+      nProj.notices.length === 1 && nProj.notices[0].id === nPubId &&
+      nProj.notices[0].tag === '工艺变更' && nProj.notices[0].text === '公告链路正对照（编辑后）' &&
+      nProj.notices[0].lv === 'info' && /^\d{2}:\d{2}$/.test(String(nProj.notices[0].time)) &&
+      Array.isArray(nProj.tips) && nProj.tips.length === 0 &&
+      Array.isArray(nProj.todo) && nProj.todo.length === 0,
+      `POST 响应 notices=${JSON.stringify(nProj)}；快照 notices=${JSON.stringify(nSnap.notices)}；三处相等=` +
+      `${JSON.stringify(nProj) === JSON.stringify(nSnap.notices) && JSON.stringify(nProj) === JSON.stringify(noticeRepoN.listForBoard(nDb))}`);
+
+    /* ---- A8：删除＝**硬删**（行数 −1、按 id 查不到）＋ 原文进留痕 ---- */
+    const nDel = await nDrive({ token: nToken, body: { action: 'delete', id: nPubId } });
+    const nDelAgain = await nDrive({ token: nToken, body: { action: 'delete', id: nPubId } });
+    t.check('FR-7.12 路由 A8 **删除＝硬删 ＋ 原文进 `op_log`**：200 ⇒ `notice` 表 −1 行（0 行）、按 id 查不到，' +
+      '删除留痕（公告删除/成功）恰 +1 且正文里带**原文**与发布时刻/创建人；对同一条**再删** ⇒ 404 `not_found`' +
+      '（不静默假装成功）—— `valid_to` 仍是有效期列，**不是**软删标志',
+      nDel.status === 200 && nDel.body && nDel.body.ok === true && nCount() === 0 &&
+      noticeRepoN.getById(nDb, nPubId) === null &&
+      nOpCount('公告删除', opLogRepoN.RESULT.SUCCESS) === 1 &&
+      nDelAgain.status === 404 && nDelAgain.body && nDelAgain.body.error === 'not_found' &&
+      nOpCount('公告删除', opLogRepoN.RESULT.SUCCESS) === 1 &&
+      (() => {
+        const row = nDb.prepare("SELECT content FROM op_log WHERE op_type = '公告删除' AND result = '成功' ORDER BY id DESC LIMIT 1").get();
+        const txt = String(row && row.content);
+        return /公告原文：公告链路正对照（编辑后）/.test(txt) && txt.includes(N_NOW);
+      })(),
+      `HTTP ${nDel.status}；notice=${nCount()}（硬删）；删除留痕（成功）=${nOpCount('公告删除', opLogRepoN.RESULT.SUCCESS)}；` +
+      `再删=${nDelAgain.status}/${nDelAgain.body && nDelAgain.body.error}；留痕正文=` +
+      JSON.stringify((nDb.prepare("SELECT content FROM op_log WHERE op_type='公告删除' AND result='成功' ORDER BY id DESC LIMIT 1").get() || {}).content));
+
+    /* ---- A9：503 `NO_SERVICE`（未接库 ⇒ 装配问题，不是报文问题；**无库可写故不留痕**） ---- */
+    const n503Router = createRouterN({ getHealth: () => ({ ok: true }), now: nClock.source() });
+    const n503Mount = mountNotice(n503Router, {
+      db: null, auth: nAuth, now: nClock.source(), teamCode: '检验一班'
+    });
+    const nRes503 = nRes();
+    await n503Router.handle(nReq({ token: nToken, body: { action: 'publish', content: '没有库就不该假装写成功' } }), nRes503);
+    const n503 = nRes503.out;
+    t.check('FR-7.12 路由 A9 **未接库**（`db = null`）＋ 有效令牌 ⇒ 503 `NO_SERVICE`（不静默假成功、也不报 400）；' +
+      '`mounted:false` 自报；此时**无库可写** ⇒ 不计入留痕面（`status().rejected` 仍 0、`notice` 表仍是 0 行）',
+      n503.status === 503 && n503.body && n503.body.error === 'NO_SERVICE' &&
+      n503Mount.mounted === false && n503Mount.status().rejected === 0 &&
+      nCount() === 0 && nOpCount('公告删除', opLogRepoN.RESULT.SUCCESS) === 1,
+      `HTTP ${n503.status}/${n503.body && n503.body.error}；mounted=${n503Mount.mounted}；` +
+      `rejected=${n503Mount.status().rejected}（应 0）；notice=${nCount()}（应 0）`);
+
+    /* ---- A10：403 `locked`（会话有效但账号锁定，ADR-0007 D2）—— 与 `not_loopback` **分得开** ---- */
+    for (let i = 0; i < 6; i++) nAuth.login({ password: 'wrong-password', remote: '127.0.0.1' });
+    const nLockedState = nAuth.status();
+    const nLocked = await nDrive({ token: nToken, body: { action: 'publish', content: '锁定态不该写进去' } });
+    t.check('FR-7.12 路由 A10 会话**仍然有效**但账号已**锁定** ⇒ 403 `locked`（"有登录态但无权限"这一支；' +
+      'ADR-0007 D2 锁定期间口令正确也拒）—— 与 A2 的 `not_loopback` **两个码不混同**；同样留一条 `result=失败`',
+      nLockedState.locked === true && nLocked.status === 403 && nLocked.body && nLocked.body.error === 'locked' &&
+      typeof nLocked.body.retryAfterSec === 'number' && nCount() === 0 &&
+      nFailNotice().length === 6 && nFailNotice()[5].op_type === noticeRepoN.OP_TYPE.PUBLISH &&
+      nFailNotice()[5].result === opLogRepoN.RESULT.FAILED,
+      `status.locked=${nLockedState.locked}（failCount=${nLockedState.failCount}）；HTTP ${nLocked.status}/` +
+      `${nLocked.body && nLocked.body.error}（retryAfterSec=${nLocked.body && nLocked.body.retryAfterSec}）；` +
+      `公告类失败留痕=${nFailNotice().length} 条（${nFailNotice().map(r => r.op_type).join('/')}）`);
+
+    /* ---- A11：被拒留痕的**口径汇总**（401 不写、503 无库可写、其余各一条 `result=失败`） ---- */
+    const nFailAll = nFailNotice();
+    const nStat = nMount.status();
+    t.check('FR-7.12 路由 A11 **被拒也留痕**的口径汇总（可逐条对账）：`401 ×2` 与 `503` **不写**，' +
+      '`403 not_loopback`/`403 locked`/`400 bad_value`/`400 bad_action`/`404 not_found`/`404 再删` 各恰 1 条 —— ' +
+      '公告类 `result=失败` 共 **6** 条，条数与 `status()` 计数器（`rejected=6`/`unauthorized=2`/`forbidden=2`）自洽',
+      nFailAll.length === 6 && nStat.rejected === 6 && nStat.unauthorized === 2 && nStat.forbidden === 2 &&
+      nFailAll.every(r => r.result === opLogRepoN.RESULT.FAILED && /^公告/.test(String(r.op_type))) &&
+      nOpCount('公告发布', opLogRepoN.RESULT.SUCCESS) === 1 &&
+      nOpCount('公告编辑', opLogRepoN.RESULT.SUCCESS) === 1 &&
+      nOpCount('公告删除', opLogRepoN.RESULT.SUCCESS) === 1 &&
+      nStat.publish === 1 && nStat.edit === 1 && nStat.delete === 1,
+      `公告类失败留痕 ${nFailAll.length} 条（op_type=${nFailAll.map(r => r.op_type).join('/')}）；` +
+      `counters=${JSON.stringify(nStat)}；成功留痕 发布/编辑/删除=` +
+      `${nOpCount('公告发布', opLogRepoN.RESULT.SUCCESS)}/${nOpCount('公告编辑', opLogRepoN.RESULT.SUCCESS)}/` +
+      `${nOpCount('公告删除', opLogRepoN.RESULT.SUCCESS)}`);
+  } finally {
+    nTmp.close();
+    t.check('FR-7.12：进程内矩阵自建的临时库跑完**当场关闭并删除**（一用例一库，不留残留）',
+      !fs.existsSync(nTmp.dir), nTmp.dir);
+  }
+
+  /* ---- B：真进程 ＋ 真 HTTP ＋ 真 SQLite：会话令牌 → 发布 → `GET /state` 与 SSE `hello` 的 notices 同源同形 ----
+     为什么必须另起真进程：`hello` 是 SSE **建连首帧**，只有走过真 HTTP 长连接才拿得到；
+     而"两处同源"这句话的可证伪形态就是"两边 JSON 逐字节相等"（同一构造函数）。 ---- */
+  {
+    const nSvcTmp = harness.makeTempDir('notice-e2e');
+    let nSvc = null;
+    let nLive = null;
+    /** 读一帧 SSE `hello`（真 HTTP 长连接；超时/中断一律按"没读到"返回，由断言判红，不静默当通过） */
+    const nReadHello = async base => {
+      const ctl = new AbortController();
+      let text = '';
+      try {
+        const res = await fetch(base + '/events', { signal: ctl.signal });
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let reading = reader.read();
+        reading.catch(() => { /* abort/重置：由下面的 race 收敛 */ });
+        const until = Date.now() + 6000;
+        while (Date.now() < until && text.indexOf('event: hello') < 0) {
+          let chunk;
+          try {
+            chunk = await Promise.race([
+              reading,
+              new Promise(r => setTimeout(() => r({ timeout: true }), 200))
+            ]);
+          } catch { break; }
+          if (chunk.timeout) continue;
+          if (chunk.done) break;
+          text += dec.decode(chunk.value, { stream: true });
+          reading = reader.read();
+          reading.catch(() => { /* 同上 */ });
+        }
+        try { await reader.cancel(); } catch { /* 已关 */ }
+      } catch (err) {
+        text = 'ERR ' + ((err && err.message) || String(err));
+      } finally {
+        try { ctl.abort(); } catch { /* 已关 */ }
+      }
+      return text;
+    };
+    try {
+      nSvc = await harness.startService({
+        script: 'server/index.js', args: ['--data-dir', nSvcTmp], readyPath: '/health', timeoutMs: 30000
+      });
+      const nBase = `http://127.0.0.1:${nSvc.port}`;
+      nLive = dbApiN.openDb(path.join(nSvcTmp, 'board.db'));
+      const nCodeRow = nLive.db.prepare(
+        "SELECT content FROM op_log WHERE op_type = '口令初始化码' ORDER BY id DESC LIMIT 1").get();
+      const nInitCode = (/一次性初始化码=([0-9a-f]{12})/.exec(nCodeRow ? nCodeRow.content : '') || [])[1] || '';
+      const nPostB = async (p, body, token) => {
+        const headers = { Accept: 'application/json' };
+        if (body !== undefined && body !== null) headers['Content-Type'] = 'application/json;charset=UTF-8';
+        if (token) headers.Authorization = 'Bearer ' + token;
+        const r = await fetch(nBase + p, {
+          method: 'POST', headers, body: body === undefined || body === null ? undefined : JSON.stringify(body)
+        });
+        const text = await r.text();
+        let j = null;
+        try { j = text ? JSON.parse(text) : null; } catch { j = null; }
+        return { status: r.status, body: j, text };
+      };
+      const nInitB = await nPostB('/auth/init', { code: nInitCode, password: N_PW });
+      const nLoginB = await nPostB('/auth/login', { password: N_PW });
+      const nTokenB = (nLoginB.body && nLoginB.body.token) || '';
+      const nPubB = await nPostB('/notice',
+        { action: 'publish', content: '端到端公告：SSE 与 /state 同源', subType: '工艺变更' }, nTokenB);
+      const nRowsB = nLive.db.prepare('SELECT * FROM notice ORDER BY id').all();
+      t.check('FR-7.12 端到端 B1 真进程（真 HTTP ＋ 真 SQLite）：`/auth/init` ＋ `/auth/login` 取到会话令牌后 ' +
+        '`POST /notice` 发布 ⇒ 200、库内恰 1 行（内容/类型逐字相符），`op_log` 有一条公告发布成功留痕 —— ' +
+        '公告写入复用**既有登录态**，不另造第二套令牌',
+        nInitB.status === 200 && nLoginB.status === 200 && /^[0-9a-f]{64}$/.test(nTokenB) &&
+        nPubB.status === 200 && nPubB.body && nPubB.body.ok === true &&
+        nRowsB.length === 1 && nRowsB[0].content === '端到端公告：SSE 与 /state 同源' &&
+        nRowsB[0].sub_type === '工艺变更' &&
+        nLive.db.prepare("SELECT COUNT(*) AS c FROM op_log WHERE op_type='公告发布' AND result='成功'").get().c === 1,
+        `init=${nInitB.status}；login=${nLoginB.status}（token 长度 ${nTokenB.length}）；发布 HTTP ${nPubB.status}；` +
+        `库内 ${nRowsB.length} 行=${JSON.stringify(nRowsB[0] || null)}`);
+
+      const nStateRes = await fetch(nBase + '/state');
+      const nStateBody = await nStateRes.json();
+      const nStateNotices = nStateBody && nStateBody.snapshot && nStateBody.snapshot.notices;
+      const nItem = nStateNotices && nStateNotices.notices && nStateNotices.notices[0];
+      t.check('FR-7.12 端到端 B2 `GET /state` 快照的 `notices` 段＝库内真值（真进程上再验一次）：本条公告在列、' +
+        '行形状＝`{id,tag,text,lv,time}`（`lv` 恒 `info`）、`tips`/`todo` 为数组且 `todo` 恒 `[]`',
+        nStateRes.status === 200 && Boolean(nStateNotices) && Array.isArray(nStateNotices.notices) &&
+        nStateNotices.notices.length === 1 && Boolean(nItem) &&
+        Object.keys(nItem).sort().join(',') === 'id,lv,tag,text,time' &&
+        nItem.id === nRowsB[0].id && nItem.tag === '工艺变更' && nItem.text === '端到端公告：SSE 与 /state 同源' &&
+        nItem.lv === 'info' && /^\d{2}:\d{2}$/.test(String(nItem.time)) &&
+        Array.isArray(nStateNotices.todo) && nStateNotices.todo.length === 0,
+        `snapshot.notices=${JSON.stringify(nStateNotices)}`);
+
+      const nHelloText = await nReadHello(nBase);
+      const nHelloMatch = /event: hello\ndata: ([^\n]+)/.exec(nHelloText);
+      let nHelloData = null;
+      try { nHelloData = nHelloMatch ? JSON.parse(nHelloMatch[1]) : null; } catch { nHelloData = null; }
+      const nHelloNotices = nHelloData && nHelloData.snapshot && nHelloData.snapshot.notices;
+      t.check('FR-7.12 端到端 B3 SSE `hello`（建连首帧）与 `GET /state` 的 `notices` **同源同形**：两处 ' +
+        '`JSON.stringify` 逐字节相等，且都含本条公告 —— 前端"用 POST 响应里同一份投影就地刷新"与' +
+        '"`hello` 与 `/state` 同一构造函数"这两条口径由此同时成立',
+        Boolean(nHelloNotices) && JSON.stringify(nHelloNotices) === JSON.stringify(nStateNotices) &&
+        nHelloNotices.notices.length === 1 &&
+        nHelloNotices.notices[0].text === '端到端公告：SSE 与 /state 同源',
+        `hello.snapshot.notices=${JSON.stringify(nHelloNotices)}；与 /state 相等=` +
+        `${JSON.stringify(nHelloNotices) === JSON.stringify(nStateNotices)}；hello 原文片段=` +
+        JSON.stringify(nHelloText.slice(0, 220)));
+    } finally {
+      if (nLive) { try { nLive.db.close(); } catch { /* 已关 */ } }
+      if (nSvc) { try { await nSvc.stop(); } catch { /* 尽力 */ } }
+      try { fs.rmSync(nSvcTmp, { recursive: true, force: true }); } catch { /* 已删 */ }
+    }
+    t.check('FR-7.12 端到端：本节自建的服务与临时目录跑完**当场停掉并删除**（一用例一库，不留残留）',
+      !fs.existsSync(nSvcTmp) && (!nSvc || nSvc.proc.exitCode !== null || nSvc.proc.killed === true),
+      `${nSvcTmp} 存在=${fs.existsSync(nSvcTmp)}`);
+  }
 }
 
 t.finish();

@@ -4624,6 +4624,278 @@ async function main() {
     );
   }
 
+  /* ===== U8 FR-7.12 公告「编辑 / 删除」入口与设置页写入链（`T-20261002-08` 交付） =====
+     判据分四组（一律**行为**判据，遵 ADR-0004 D23：跑真组件、读真节点，不做源码字符串匹配）：
+       ① **演示模式的行逐字节不变** —— 编辑/删除入口只在服务端模式渲染，演示模式走原来那条拼装分支
+          （10 张截图基准 `tests/screenshots-baseline/` 不受影响）；
+       ② **入口仅解锁态** —— 服务端模式 ＋ 解锁 ⇒ 两个按钮可点；锁定 ⇒ 渲染但 `disabled`；
+       ③ **服务端写入链** —— 解锁 ⇒ 真走 `POST /notice`（`Api.httpJson` 唯一出口、带会话令牌头），成功用响应里
+          **同一份投影**就地刷新；失败（含 401）**写进 `#entryMsg`**、**绝不静默**；
+          ⚠ `E86①` **已知集成缺口**：前端"解锁 ⇒ 会话令牌"未接线（属 `FR-8.4`／`ADR-0007` 的包）⇒
+          服务端模式下写入会拿 401 并**被显示**。本节的判据就是"**失败可见**"，**不要求**本包实现登录接线。
+       ④ **`stateAdapter` 的公告段** —— 服务端给了就**映射**（不再清空）；缺段/空段 ⇒ 既有空态（UI-11）。
+     为什么要自建夹具而不是复用既有两个：`loadAutoLockFixture` 的 `Dom.setHTML` 是空实现（读不到渲染出的
+     HTML）；`loadFrameFixture` 的节点没有 `getAttribute`（`SettingPanel.actionButtonOf()` 靠它向上找
+     `data-notice-act`，缺了则编辑/删除入口永远点不动 —— 断言会退化成恒真）。故这里自建一个**最小但齐全**的桩。 ---- */
+  section('U8 FR-7.12 公告编辑/删除入口与服务端写入链（演示模式零变化 / 仅解锁态 / 失败可见 / 适配层映射）');
+  {
+    const NODES = new Map();
+    const nNode = id => {
+      if (NODES.has(id)) return NODES.get(id);
+      const attrs = {};
+      const handlers = {};
+      const classes = new Set();
+      const o = {
+        __id: id, hidden: false, disabled: false, value: '', className: '', style: {}, dataset: {}, __parent: null,
+        classList: {
+          add: c => classes.add(c), remove: c => classes.delete(c),
+          contains: c => classes.has(c), toggle: () => {}
+        },
+        addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); },
+        __fire: (type, ev) => (handlers[type] || []).forEach(fn => fn(ev || { key: 'Enter' })),
+        setAttribute: (k, v) => { attrs[k] = String(v); },
+        getAttribute: k => (attrs[k] === undefined ? null : attrs[k]),
+        appendChild(child) { if (child && typeof child === 'object') child.__parent = o; return child; },
+        remove() {}, closest: () => null, querySelector: () => null
+      };
+      Object.defineProperty(o, 'parentNode', { get: () => o.__parent, configurable: true });
+      Object.defineProperty(o, 'textContent', {
+        get: () => o.__text || '', set: v => { o.__text = String(v); }, configurable: true
+      });
+      Object.defineProperty(o, 'innerHTML', {
+        get: () => o.__html || '', set: v => { o.__html = String(v); }, configurable: true
+      });
+      NODES.set(id, o);
+      return o;
+    };
+
+    const htmlOut = new Map();
+    const warnings = [];
+    const fetchCalls = [];
+    let nextFetch = null;              /* (url, init) => Promise —— 用例按场景替换 */
+    const sandbox = {
+      console: {
+        log() {},
+        warn: (...a) => warnings.push(a.map(x => (x && x.message) ? x.message : String(x)).join(' ')),
+        error: (...a) => warnings.push(a.map(x => (x && x.message) ? x.message : String(x)).join(' '))
+      }
+    };
+    sandbox.window = sandbox;
+    /* 定时器桩件：`flashEntry` 的 4 s 复位与自动锁定计时都不真跑（只登记），否则 Node 进程被钉住 */
+    sandbox.setTimeout = () => 1;
+    sandbox.clearTimeout = () => {};
+    sandbox.fetch = (url, init) => {
+      fetchCalls.push({ url, init });
+      return nextFetch ? nextFetch(url, init) : Promise.reject(new Error('U8 桩 fetch：未接网络'));
+    };
+    sandbox.AbortSignal = { timeout: () => ({}) };
+    sandbox.document = { getElementById: nNode, querySelector: () => null, querySelectorAll: () => [], addEventListener: () => {} };
+    vm.createContext(sandbox);
+    const nRun = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+    const U8_COMPONENTS = ['src/components/NoticePanel.js', 'src/components/SettingPanel.js', 'src/services/stateAdapter.js'];
+    guardRegistered(U8_COMPONENTS, 'loadNoticeFixture');
+    nRun('src/config/board.config.js');
+    nRun('src/config/fieldMap.js');
+    nRun('src/utils/format.js');
+    sandbox.window.Dom = {
+      $: nNode,
+      setText: (id, v) => { nNode(id).__text = String(v); },
+      setHTML: (id, v) => { nNode(id).__html = String(v); htmlOut.set(id, String(v)); },
+      setClass: (id, v) => { nNode(id).className = String(v); },
+      setStyle: () => {}, toggleClass: () => {}
+    };
+    nRun('src/services/mockData.js');
+    nRun('src/services/api.js');
+    U8_COMPONENTS.forEach(nRun);
+
+    const U8 = { err: null };
+    try {
+      /* ---------------- ① 演示模式：公告行**逐字节**等于改动前 ---------------- */
+      const DEMO_ROW = { tag: '生产调整', text: '正文 <b>x</b>', lv: 'info', time: '09:30' };
+      /* 改动前的公告行拼装 —— **逐字**写成本用例的字面量（来源：`T-20261002-08` 之前 `rowPlain()` 的形态，
+         也正是 10 张截图基准所冻结的版面）。`esc()` 只做 `& < > "` 四个替换 ⇒ 期望值**手工展开**为字面量，
+         与被测实现不共用任何表达式（不拿"自己的输出"证明"自己没变"）。 */
+      const LEGACY_ROW = '<div class="list-item lv-info"><span class="tag">生产调整</span>' +
+        '<span class="body">正文 &lt;b&gt;x&lt;/b&gt;</span><span class="meta mono">09:30</span></div>';
+      const esc = sandbox.window.Format.esc;
+      sandbox.window.Components.NoticePanel.render({ notices: { notices: [DEMO_ROW], tips: [], todo: [] } });
+      const demoHtml = String(htmlOut.get('ntNoticeList') || '');
+      /* ⚠ **必须用"带 `id` 的演示行"再断一次**（本轮 D22 首跑实测出来的补钉）：只断言"无 id 的演示行"
+         时，"把 `rowOf` 改成**无条件**走带动作分支"那种变异**测不出来** —— 因为 `actionsOf()` 对
+         `id` 缺失的行本来就返回空串（实测：该变异体下 163/0 全绿）。两种输入都断，这条才真正锁住
+         "入口**只在服务端模式**渲染"这个判据本身，而不是靠"演示数据恰巧没有 id"兜住。 */
+      sandbox.window.Components.NoticePanel.render({
+        notices: { notices: [Object.assign({}, DEMO_ROW, { id: 7 })], tips: [], todo: [] }
+      });
+      const demoWithIdHtml = String(htmlOut.get('ntNoticeList') || '');
+      U8.demo = {
+        html: demoHtml,
+        withId: demoWithIdHtml,
+        legacy: LEGACY_ROW,
+        escMatches: esc(DEMO_ROW.text) === '正文 &lt;b&gt;x&lt;/b&gt;',
+        hasButton: demoHtml.indexOf('<button') >= 0,
+        hasData: demoHtml.indexOf('data-notice') >= 0
+      };
+      check('U8/FR-7.12-a 演示模式（`dataSource` 非服务端、`state.serverMode` 非真）：公告行 HTML 与改动前**逐字节相同**、' +
+        '**不带**任何 `<button>` 与 `data-notice-*`（**带 `id` 的行同样如此** —— "入口只在服务端模式渲染"不能靠"演示数据恰巧无 id"兜住）' +
+        '—— 编辑/删除入口只在服务端模式渲染，10 张截图基准版面零变化',
+        U8.demo.escMatches && demoHtml === LEGACY_ROW && demoWithIdHtml === LEGACY_ROW &&
+        !U8.demo.hasButton && !U8.demo.hasData,
+        `esc 口径一致=${U8.demo.escMatches}；无 id 行=${JSON.stringify(demoHtml)}；带 id 行=` +
+        `${JSON.stringify(demoWithIdHtml)}；期望行=${JSON.stringify(LEGACY_ROW)}；` +
+        `含 button=${U8.demo.hasButton}；含 data-notice=${U8.demo.hasData}`);
+
+      /* ---------------- ② 服务端模式 ＋ 解锁 ⇒ 两个入口可点；锁定 ⇒ `disabled` ---------------- */
+      const ACTS = id => '<span class="notice-acts">' +
+        `<button type="button" class="btn tiny" data-notice-act="edit" data-notice-id="${id}">编辑</button>` +
+        `<button type="button" class="btn tiny danger" data-notice-act="delete" data-notice-id="${id}">删除</button></span>`;
+      const srvRow = Object.assign({}, DEMO_ROW, { id: 7 });
+      sandbox.window.Components.NoticePanel.render({
+        notices: { notices: [srvRow], tips: [], todo: [] }, serverMode: true, unlocked: true
+      });
+      const unlockedHtml = String(htmlOut.get('ntNoticeList') || '');
+      sandbox.window.Components.NoticePanel.render({
+        notices: { notices: [srvRow], tips: [], todo: [] }, serverMode: true, unlocked: false
+      });
+      const lockedHtml = String(htmlOut.get('ntNoticeList') || '');
+      const lockedDisabled = (lockedHtml.match(/ disabled>/g) || []).length;
+      U8.unlocked = unlockedHtml;
+      U8.locked = lockedHtml;
+      check('U8/FR-7.12-b 服务端模式 ＋ **解锁**：每条公告带「编辑 / 删除」入口（`data-notice-act` ＋ `data-notice-id`），' +
+        '两个按钮**都不可 disabled**，且整行＝演示行**原样**＋动作入口（改动是纯追加、正文仍转义）',
+        unlockedHtml === LEGACY_ROW.replace('</div>', ACTS(7) + '</div>') &&
+        unlockedHtml.indexOf(' disabled') < 0 &&
+        unlockedHtml.indexOf('正文 &lt;b&gt;x&lt;/b&gt;') > 0,
+        `实测行=${JSON.stringify(unlockedHtml)}`);
+      check('U8/FR-7.12-c 服务端模式 ＋ **锁定**：入口**仍在**（不凭空消失）但两个按钮**都 `disabled`** —— ' +
+        'FR-7.12「仅**解锁**后可新增/编辑/删除公告」在这两个入口上的落点（实际点击还会走 `denyLocked` 的可见反馈）',
+        lockedDisabled === 2 && lockedHtml.indexOf('data-notice-act="edit"') > 0 &&
+        lockedHtml.indexOf('data-notice-act="delete"') > 0 &&
+        lockedHtml.replace(/ disabled/g, '') === unlockedHtml,
+        `disabled 计数=${lockedDisabled}（应 2）；锁定行去 disabled 后与解锁行逐字相等=` +
+        `${lockedHtml.replace(/ disabled/g, '') === unlockedHtml}`);
+
+      /* ---------------- ③ 服务端写入链（发布 / 401 可见 / 锁定态零请求） ---------------- */
+      const ST = sandbox.window.MockData.state;
+      sandbox.window.Components.SettingPanel.bind(ST, () => {});
+      const flush = () => new Promise(r => setTimeout(r, 30));
+      const okBody = notices => ({ ok: true, status: 200, body: { ok: true, notices } });
+      const jsonRes = (status, obj) => ({
+        ok: status >= 200 && status < 300, status, text: () => Promise.resolve(JSON.stringify(obj))
+      });
+
+      ST.serverMode = true;
+      ST.unlocked = true;
+      ST.sessionToken = 'U8-TOKEN';
+      ST.notices = { notices: [{ id: 5, tag: '生产调整', text: '服务端已有公告', lv: 'info', time: '09:00' }], tips: [], todo: [] };
+      nNode('noticeType').value = '工艺变更';
+      nNode('noticeText').value = 'U8 服务端模式新公告';
+      fetchCalls.length = 0;
+      nextFetch = () => Promise.resolve(jsonRes(200, {
+        ok: true,
+        notices: { notices: [{ id: 6, tag: '工艺变更', text: 'U8 服务端模式新公告', lv: 'info', time: '09:30' }], tips: [], todo: [] }
+      }));
+      nNode('noticeSave').__fire('click');
+      await flush();
+      const pubCall = fetchCalls[fetchCalls.length - 1] || {};
+      const pubInit = pubCall.init || {};
+      let pubBody = null;
+      try { pubBody = JSON.parse(String(pubInit.body)); } catch { pubBody = null; }
+      U8.publish = {
+        calls: fetchCalls.length, url: String(pubCall.url || ''), method: pubInit.method,
+        body: pubBody, headers: pubInit.headers || {},
+        notices: ST.notices, msg: String(nNode('entryMsg').textContent || '')
+      };
+      check('U8/FR-7.12-d 服务端模式 ＋ 解锁点「发布」⇒ **恰 1 次** `POST /notice`（`action=publish`、`content`/`subType` 取自输入框、' +
+        '带 `Authorization: Bearer <会话令牌>`）；成功后用**响应里同一份投影**就地刷新 `state.notices`（不重拉快照），反馈写在 `#entryMsg`',
+        fetchCalls.length === 1 && /\/notice$/.test(U8.publish.url) && pubInit.method === 'POST' &&
+        pubBody && pubBody.action === 'publish' && pubBody.content === 'U8 服务端模式新公告' &&
+        pubBody.subType === '工艺变更' &&
+        U8.publish.headers.Authorization === 'Bearer U8-TOKEN' &&
+        ST.notices.notices.length === 1 && ST.notices.notices[0].id === 6 &&
+        ST.notices.notices[0].text === 'U8 服务端模式新公告' && ST.notices.todo.length === 0 &&
+        /已发布/.test(U8.publish.msg),
+        `http 调用=${fetchCalls.length} 次；url=${JSON.stringify(U8.publish.url)}；method=${U8.publish.method}；` +
+        `body=${JSON.stringify(pubBody)}；headers=${JSON.stringify(U8.publish.headers)}；` +
+        `state.notices=${JSON.stringify(ST.notices)}；#entryMsg=${JSON.stringify(U8.publish.msg)}`);
+
+      /* 401（`E86①` 的现场形态：服务端模式但令牌无效/缺失）⇒ **失败可见** */
+      const before401 = JSON.stringify(ST.notices);
+      fetchCalls.length = 0;
+      nextFetch = () => Promise.resolve(jsonRes(401, {
+        ok: false, error: 'unauthorized',
+        err: { code: 'unauthorized', httpStatus: 401, message: '会话令牌缺失/伪造/过期/已登出 —— 请先经 POST /auth/login 解锁' }
+      }));
+      nNode('noticeText').value = '会被服务端拒绝的公告';
+      nNode('noticeSave').__fire('click');
+      await flush();
+      const msg401 = String(nNode('entryMsg').textContent || '');
+      U8.reject = { calls: fetchCalls.length, msg: msg401, notices: ST.notices };
+      check('U8/FR-7.12-e **服务端拒绝可见**（`E86①` 的行为侧）：401 ⇒ `#entryMsg` 里写明「公告未保存」＋ HTTP 码 ＋ ' +
+        '机器可读码 ＋ 原因，`state.notices` **逐字不变**（失败**绝不静默**；本包**不**实现登录接线，缺口如实暴露给操作人）',
+        fetchCalls.length === 1 && /公告未保存/.test(msg401) && /401/.test(msg401) &&
+        /unauthorized/.test(msg401) && JSON.stringify(ST.notices) === before401,
+        `http 调用=${U8.reject.calls} 次；#entryMsg=${JSON.stringify(msg401)}；` +
+        `notices 未变=${JSON.stringify(ST.notices) === before401}`);
+
+      /* 锁定态点「发布」⇒ 0 次请求 ＋ 可见反馈（不静默失效） */
+      ST.unlocked = false;
+      fetchCalls.length = 0;
+      nNode('noticeText').value = '锁定态不该发出去';
+      nNode('noticeSave').__fire('click');
+      await flush();
+      const msgLocked = String(nNode('entryMsg').textContent || '');
+      U8.lockedClick = { calls: fetchCalls.length, msg: msgLocked };
+      check('U8/FR-7.12-f 服务端模式 ＋ **锁定**点「发布」⇒ **0 次请求**（不把锁定态写入发出去）且 `#entryMsg` 明示' +
+        '「锁定 / 未保存」（FR-8.2 的"锁定后不得静默失效"在公告这一支同样成立）',
+        fetchCalls.length === 0 && /锁定/.test(msgLocked) && /未保存/.test(msgLocked),
+        `http 调用=${U8.lockedClick.calls} 次（应 0）；#entryMsg=${JSON.stringify(msgLocked)}`);
+
+      /* ---------------- ④ `stateAdapter` 的公告段：有段映射 / 缺段与空段空态 ---------------- */
+      const mkState = () => ({
+        notices: { notices: [{ tag: '演示值', text: '演示公告', lv: 'info', time: '08:00' }], tips: [], todo: [] },
+        warnings: [], selfCheck: [], opLog: [], alarm: { active: null, queue: [], ledger: [] },
+        maint: {}, task: {}, stats: {}, device: {}, shift: { list: [] }, upload: null, clock: { time: '09:30:00' }
+      });
+      const NUL = { link: null, task: null, device: null, frame: null, stats: null, standard: null, upload: null };
+      const stMap = mkState();
+      sandbox.window.StateAdapter.snapshotToState(stMap, Object.assign({}, NUL, {
+        notices: {
+          notices: [{ id: 7, tag: '生产调整', text: '服务端公告正文', lv: 'info', time: '09:30' }],
+          tips: [{ id: 9, tag: '测试要求', text: '服务端工艺提示', lv: 'info', time: '08:00' }],
+          todo: []
+        }
+      }), new Date('2026-10-02T09:30:00'));
+      const stEmpty = mkState();      /* 服务端给了"空段" */
+      sandbox.window.StateAdapter.snapshotToState(stEmpty, Object.assign({}, NUL, {
+        notices: { notices: [], tips: [], todo: [] }
+      }), new Date('2026-10-02T09:30:00'));
+      const stMissing = mkState();    /* 旧服务端/裁剪快照：**连 notices 段都没有** */
+      sandbox.window.StateAdapter.snapshotToState(stMissing, Object.assign({}, NUL), new Date('2026-10-02T09:30:00'));
+      U8.adapter = { map: stMap.notices, empty: stEmpty.notices, missing: stMissing.notices, serverMode: stMap.serverMode };
+      check('U8/FR-7.12-g `stateAdapter`：服务端给了公告段 ⇒ **映射**（不再清空）—— `notices`/`tips` 逐键搬进 `state.notices`' +
+        '（含 `id`，供编辑/删除定位）、`todo` 恒 `[]`、`serverMode` 置真；演示值被替换（ADR-0008 D3：不得用演示值顶替）',
+        stMap.notices.notices.length === 1 && stMap.notices.tips.length === 1 &&
+        stMap.notices.notices[0].id === 7 && stMap.notices.notices[0].tag === '生产调整' &&
+        stMap.notices.notices[0].text === '服务端公告正文' && stMap.notices.notices[0].lv === 'info' &&
+        stMap.notices.notices[0].time === '09:30' && stMap.notices.tips[0].id === 9 &&
+        stMap.notices.todo.length === 0 && stMap.serverMode === true,
+        `映射后 state.notices=${JSON.stringify(stMap.notices)}；serverMode=${stMap.serverMode}`);
+      check('U8/FR-7.12-h `stateAdapter`：服务端**确实没有数据**（空段／缺段）⇒ 一律落**既有空态** ' +
+        '`{notices:[],tips:[],todo:[]}`（不留 `mockData.js` 的演示公告残留；UI-11 的空态文案由 NoticePanel 承担）',
+        [stEmpty, stMissing].every(s => s.notices.notices.length === 0 && s.notices.tips.length === 0 &&
+          s.notices.todo.length === 0 && Array.isArray(s.notices.todo)),
+        `空段后=${JSON.stringify(stEmpty.notices)}；缺段后=${JSON.stringify(stMissing.notices)}`);
+
+      /* 零 console.warn/error（夹具自身不许制造噪音：U8 只做"失败可见"，不往控制台灌） */
+      check('U8/FR-7.12-i 本节全程**零 `console.warn`/`console.error`**（"失败可见"落在 `#entryMsg`，不靠刷控制台）',
+        warnings.length === 0, warnings.join(' | ').slice(0, 240));
+    } catch (e) {
+      U8.err = (e && e.stack) || String(e);
+      check('U8/FR-7.12 夹具执行完毕（未抛异常）', false, String(U8.err).slice(0, 400));
+    }
+  }
+
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 ${skipped} 项`);
   if (failures.length) {

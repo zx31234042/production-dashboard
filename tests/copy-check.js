@@ -181,7 +181,27 @@ const MAP = [
   { clause: 'FR-3.19', note: '第⑦步逐单元格留痕文案：被改单元格 + 修改前后值 + 导出上下限 + 生效时间（班组编号由 logEntry 追加）；被拒路径同样含被改单元格名',
     status: 'confirmed',
     items: ['被改单元格「', '导出上限 ', '导出下限 ', '生效时间 ', '班组编号 ', '录入被拒绝'],
-    files: ['src/components/TaskPanel.js'] }
+    files: ['src/components/TaskPanel.js'] },
+
+  /* FR-7.12（P0「**仅本机解锁后可新增/编辑/删除公告**」；`T-20261002-08` 交付、
+     `T-20261002-09` 按**源码实际字符串**登记文案）：编辑/删除入口只在**服务端模式**渲染
+     （演示模式不渲染 ⇒ 10 张截图基准版面零变化，该判据在 ui-check 的 U8/FR-7.12-a），
+     故这里的文案核对对象就是 `NoticePanel.js` 的入口拼装与 `SettingPanel.js`/`index.html` 的
+     按钮与提示词。**逐字取自源码**，不写"应该是什么"。 */
+  { clause: 'FR-7.12', note: '公告列表的「编辑 / 删除」入口（服务端模式才渲染）：容器类名与两个动作属性＋按钮文案',
+    status: 'confirmed',
+    items: ['notice-acts', 'data-notice-act="edit"', 'data-notice-act="delete"', '>编辑</button>', '>删除</button>'],
+    files: ['src/components/NoticePanel.js'] },
+
+  { clause: 'FR-7.12', note: '设置页公告写入的按钮/编辑态/成功与失败提示文案（服务端模式走真实路由；失败一律显示在 #entryMsg）',
+    status: 'confirmed',
+    items: ['>发布公告</button>', '保存修改', '公告已发布（服务端已落库并写入操作日志 op_log）',
+      '已保存修改（服务端已落库并写入操作日志 op_log）', '已删除（原文已写入服务端操作日志 op_log）',
+      '公告未保存（HTTP ', '公告未保存：服务端接口未装配（window.Api.httpJson 不可用）',
+      '正在编辑公告 #', '改完点「保存修改」（再点一次「编辑」可取消）', '已取消编辑（回到「发布公告」）',
+      '找不到这条公告（列表可能已刷新），请重新选择', '删除公告 #',
+      '删除后原文仍保留在服务端操作日志（op_log）里。', '已解锁：可录入维保信息、修改公告'],
+    files: ['src/components/SettingPanel.js', 'index.html'] }
 ];
 
 let passed = 0;

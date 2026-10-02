@@ -117,6 +117,10 @@ const { mountAuth } = require('../server/http/routes/auth');
    `server/index.js`，由第四节的 `harness-check` 端到端覆盖）。 */
 const shiftStatRepo = require('../server/repo/shiftStat');
 const warningRepo = require('../server/repo/warning');
+/* `FR-7.12`（P0，`T-20261002-08`）的**唯一写入口**：`notice` 表（DR-10）的
+   `publish` / `edit` / `remove` ＋ 三个读口（`list` / `listForBoard` / `getById` / `count`）。
+   本节（十之十二）的断言对象就是它 —— 该模块在 `T-20261002-08` 之前**不存在**。 */
+const noticeRepo = require('../server/repo/notice');
 
 env.assertRuntime();
 const t = createRunner('本地库结构自检（db-check）');
@@ -4859,6 +4863,238 @@ async function main() {
     }
     t.check('A1：本章自建的临时库跑完**当场关闭并删除**（一用例一库，不留残留）',
       !fs.existsSync(A1.dir), A1.dir);
+  }
+
+  /* ---------------- 十之十二、FR-7.12 公告仓储层（DR-10 唯一写入口 ＋ 同事务留痕 ＋ 读口） ----------------
+     需求依据：`FR-7.12`（P0）「**仅本机解锁后可新增/编辑/删除公告**」；「操作记录保留」＝`FR-8.7`／`NFR-15`／`DR-12`。
+     负责人已裁定的口径（本节逐条按它写）：
+       · 三个动作都走 `server/repo/notice.js` 的**唯一写入口**，且都是 `BEGIN → 写表 → op_log.append → COMMIT`
+         （**表与留痕同事务**："改了但没留痕"这个中间态不允许出现）；
+       · **删除＝硬删 ＋ 原文进 `op_log`**（`valid_to` 是 DR-10 的**有效期**语义，**不是**软删标志）；
+       · 投影 `lv` 恒 `'info'`、`todo` 恒 `[]`（表无等级/待办列 ⇒ **不得**要求实现编造）；
+       · `valid_from` 缺省＝发布时刻、`valid_to` 缺省 NULL、`priority` 缺省 0 —— `FR-7.11` 的**有效期过滤与轮播
+         未实现**（P1／技术债 `E3`），两列只是如实落库，故本节**不**为过滤/轮播写任何"已实现"断言。 ---- */
+  t.section('十之十二、FR-7.12 公告仓储层（`repo/notice.js`：发布/编辑/删除 ＋ 同事务 `op_log` ＋ 四个读口）');
+  {
+    const NC = makeTempDb({ name: 'notice-repo' });
+    try {
+      db.initSchema(NC.db, NOW);
+      const NC_T0 = '2026-10-02 09:30:00';
+      const NC_T1 = '2026-10-02 09:31:00';
+      const NC_T2 = '2026-10-02 10:00:00';
+      const ctx0 = { now: NC_T0, operator: '张伟', teamCode: '检验一班' };
+      const ctx1 = { now: NC_T1, operator: '李娜', teamCode: '检验二班' };
+      const logs = opType => opLogRepo.list(NC.db, { opType }, { limit: 50 });
+
+      /* ---- ① 发布 ---- */
+      const pub = noticeRepo.publish(NC.db, {
+        content: '仓储层公告原文（发布）', subType: '生产调整', createdBy: '张伟'
+      }, ctx0);
+      const rowPub = noticeRepo.getById(NC.db, pub.id);
+      const pubLogs = logs(noticeRepo.OP_TYPE.PUBLISH);
+      t.check('DR-10/FR-7.12-1 **发布**（唯一写入口 `publish`）：`notice` 表恰 +1 行、逐列如实落库' +
+        '（`valid_from` 缺省＝发布时刻、`valid_to` 缺省 NULL、`priority` 缺省 0、`created_at`＝`updated_at`＝注入时刻）；' +
+        '同一事务里 `op_log`（公告发布/成功）恰 +1 且带操作人与班组编号',
+        pub.ok === true && pub.action === 'publish' && noticeRepo.count(NC.db) === 1 &&
+        rowPub.content === '仓储层公告原文（发布）' && rowPub.sub_type === '生产调整' &&
+        rowPub.category === noticeRepo.CATEGORY.NOTICE && rowPub.valid_from === NC_T0 &&
+        rowPub.valid_to === null && Number(rowPub.priority) === 0 &&
+        rowPub.created_by === '张伟' && rowPub.created_at === NC_T0 && rowPub.updated_at === NC_T0 &&
+        Boolean(pub.row) && pub.opLogId !== null && pubLogs.length === 1 &&
+        pubLogs[0].result === opLogRepo.RESULT.SUCCESS && pubLogs[0].operator === '张伟' &&
+        pubLogs[0].teamCode === '检验一班' && pubLogs[0].opTime === NC_T0 &&
+        /仓储层公告原文（发布）/.test(String(pubLogs[0].content)),
+        `id=${pub.id}；行=${JSON.stringify(rowPub)}；留痕=${JSON.stringify(pubLogs)}`);
+
+      /* ---- ② 编辑＝同一条更新 ---- */
+      const beforeEdit = noticeRepo.getById(NC.db, pub.id);
+      const ed = noticeRepo.edit(NC.db, { id: pub.id, content: '仓储层公告原文（编辑后）' }, ctx1);
+      /* ⚠ `|| {}` 不是防御性摆设：若"编辑"把主键改掉（D22 靶子 `M7-edit-bumps-id` 就是这样），
+         `getById(pub.id)` 会返 `null` —— 直接读 `null.created_at` 会让**整个脚本**以未捕获异常终止
+         （无汇总行、退 2），于是这条断言**报不出红也不同名**（D22 首跑实测：`db-check` 侧"一条都没命中"）。
+         改法：让"行没了"如实变成一条**指名**的失败。 */
+      const afterEdit = noticeRepo.getById(NC.db, pub.id) || {};
+      const editLogs = logs(noticeRepo.OP_TYPE.EDIT);
+      t.check('DR-10/FR-7.12-2 **编辑**（`edit`）：仍是**同一条更新** —— `notice` 行数不变、`id` 与 `created_at` ' +
+        '逐字不变，`content` 已改、`updated_at` 刷新为本次动作时刻，`created_by` **不动**（那是"谁发布的"）；' +
+        '`op_log`（公告编辑/成功）恰 +1，留痕正文含逐字段变更清单（「旧」→「新」）',
+        ed.ok === true && ed.action === 'edit' && noticeRepo.count(NC.db) === 1 &&
+        Number(afterEdit.id) === Number(pub.id) && afterEdit.created_at === beforeEdit.created_at &&
+        afterEdit.content === '仓储层公告原文（编辑后）' && afterEdit.updated_at === NC_T1 &&
+        afterEdit.created_by === beforeEdit.created_by && afterEdit.valid_from === beforeEdit.valid_from &&
+        ed.changed.length === 1 && /内容/.test(ed.changed[0]) &&
+        /仓储层公告原文（发布）/.test(ed.changed[0]) && /仓储层公告原文（编辑后）/.test(ed.changed[0]) &&
+        editLogs.length === 1 && editLogs[0].result === opLogRepo.RESULT.SUCCESS &&
+        /仓储层公告原文（发布）/.test(String(editLogs[0].content)),
+        `行数=${noticeRepo.count(NC.db)}（id ${beforeEdit.id}→${afterEdit.id}）；created_at ${beforeEdit.created_at}→` +
+        `${afterEdit.created_at}；updated_at=${afterEdit.updated_at}；changed=${JSON.stringify(ed.changed)}；` +
+        `留痕=${JSON.stringify(editLogs[0] || null)}`);
+
+      /* ---- ③ 编辑"零变化"不是操作 ---- */
+      const logsBeforeNoChange = opLogRepo.count(NC.db);
+      const noChange = noticeRepo.edit(NC.db, { id: pub.id, content: '仓储层公告原文（编辑后）' }, ctx1);
+      /* 同 ② 的理由：`getById(pub.id)` 可能返 `null`（`M7-edit-bumps-id` 变异体下就是）——
+         不兜住会让脚本在这里未捕获异常终止，本条与后面所有条**都不进失败清单**（D22 首跑实测）。 */
+      const rowForNoChange = noticeRepo.getById(NC.db, pub.id) || {};
+      t.check('DR-10/FR-7.12-3 **编辑零变化**：一个字段都没改 ⇒ `{ok:false, error:\'no_change\'}` —— ' +
+        '`notice` 表与 `op_log` 都**一行不写**（"什么都没改"不是操作），`updated_at` 也**不被刷新**',
+        noChange.ok === false && noChange.error === 'no_change' && noChange.id === pub.id &&
+        rowForNoChange.updated_at === NC_T1 &&
+        noticeRepo.count(NC.db) === 1 && opLogRepo.count(NC.db) === logsBeforeNoChange &&
+        logs(noticeRepo.OP_TYPE.EDIT).length === 1,
+        `返=${JSON.stringify(noChange)}；updated_at=${rowForNoChange.updated_at}；` +
+        `op_log ${logsBeforeNoChange}→${opLogRepo.count(NC.db)}（应不变）`);
+
+      /* ---- ④ 删除＝硬删 ＋ 原文进 op_log ---- */
+      const del = noticeRepo.remove(NC.db, { id: pub.id }, ctx1);
+      const delLogs = logs(noticeRepo.OP_TYPE.DELETE);
+      const delLog = delLogs[0] || {};
+      t.check('DR-10/FR-7.12-4 **删除＝硬删 ＋ 原文进 `op_log`**：`notice` 表 −1 行、`getById` 返 `null`' +
+        '（**不是**软删 —— `valid_to` 是 DR-10 的**有效期**列，不当删除标志用）；删除留痕恰 +1（公告删除/成功）' +
+        '且正文里带**原文全文**、发布时刻与创建人；返回值 `deleted` ＝删除前那一行原文',
+        del.ok === true && del.action === 'delete' && noticeRepo.count(NC.db) === 0 &&
+        noticeRepo.getById(NC.db, pub.id) === null &&
+        delLogs.length === 1 && delLog.result === opLogRepo.RESULT.SUCCESS &&
+        /公告原文：仓储层公告原文（编辑后）/.test(String(delLog.content)) &&
+        String(delLog.content).includes(NC_T0) && /张伟/.test(String(delLog.content)) &&
+        Boolean(del.deleted) && Number(del.deleted.id) === Number(pub.id) &&
+        del.deleted.content === '仓储层公告原文（编辑后）',
+        `行数=${noticeRepo.count(NC.db)}（硬删）；留痕正文=${JSON.stringify(delLog.content)}；` +
+        `deleted=${JSON.stringify(del.deleted || null)}`);
+
+      /* ---- ⑤ 表与留痕**同事务**（D22 靶子：注入 opLog.append 抛错） ---- */
+      const txSeed = noticeRepo.publish(NC.db, { content: '同事务用例：先正常写一行' }, ctx1);
+      const txBefore = { n: noticeRepo.count(NC.db), logs: opLogRepo.count(NC.db) };
+      const savedAppend = opLogRepo.append;
+      let txErr = null;
+      opLogRepo.append = () => { throw new Error('D22 注入：留痕写失败（表内容必须一并回滚）'); };
+      try {
+        noticeRepo.publish(NC.db, { content: '同事务用例：留痕失败 ⇒ 这一行不许留下' }, ctx1);
+      } catch (err) {
+        txErr = err;
+      } finally {
+        opLogRepo.append = savedAppend;
+      }
+      const txAfter = { n: noticeRepo.count(NC.db), logs: opLogRepo.count(NC.db) };
+      const txLeftover = NC.db.prepare(
+        "SELECT COUNT(*) AS c FROM notice WHERE content LIKE '同事务用例：留痕失败%'").get().c;
+      t.check('DR-10/FR-7.12-5 **表与留痕同事务**（D22 靶子）：注入 `opLog.append` 抛错 ⇒ 异常如实抛出，' +
+        '且 `notice` 表写入**一并回滚**（行数与 `op_log` 条数都回到动作前，"改了但没留痕"这个中间态不存在）；' +
+        '注入还原后 `opLog.append` 逐字回到原函数（不污染后续用例）',
+        txSeed.ok === true && txBefore.n === 1 &&
+        txErr !== null && /D22 注入/.test(String(txErr && txErr.message)) &&
+        txAfter.n === txBefore.n && txAfter.logs === txBefore.logs && txLeftover === 0 &&
+        noticeRepo.count(NC.db) === 1 && opLogRepo.append === savedAppend,
+        `动作前 notice=${txBefore.n} 行／op_log=${txBefore.logs} 条；抛错=${JSON.stringify(txErr && txErr.message)}；` +
+        `动作后 notice=${txAfter.n} 行／op_log=${txAfter.logs} 条；半截行残留=${txLeftover}；` +
+        `append 已还原=${opLogRepo.append === savedAppend}`);
+
+      /* ---- ⑥ 目标行不存在：不新增、不静默成功、不写留痕 ---- */
+      const logsBeforeMiss = opLogRepo.count(NC.db);
+      /* ⚠ 包一层 `try` 不是"给实现留后路"：D22 靶子 `M13-not-found-throws` 正是把"返 not_found"
+         改成"抛错"。不包的话那条变异会让**整个脚本**未捕获异常终止（无汇总行、退 2）⇒ 本条**报不出红
+         也不同名**（D22 首跑实测）。包起来后"抛错"如实变成一条**指名**的失败，语义也更严：
+         `edit`/`remove` 必须**返 not_found**，抛错同样算不合契约。 */
+      const missOf = fn => { try { return fn(); } catch (err) { return { ok: false, error: 'threw:' + ((err && err.message) || String(err)) }; } };
+      const missEdit = missOf(() => noticeRepo.edit(NC.db, { id: 999999, content: '不存在的行' }, ctx0));
+      const missDel = missOf(() => noticeRepo.remove(NC.db, { id: 999999 }, ctx0));
+      t.check('DR-10/FR-7.12-6 目标行不存在：`edit`/`remove` 一律返 `{ok:false, error:\'not_found\'}`' +
+        '（**不新增行**、**不静默成功**），且**不写留痕** —— 连"操作"都没发生（调用方据此回 404，见 harness-check §17）',
+        missEdit.ok === false && missEdit.error === 'not_found' &&
+        missDel.ok === false && missDel.error === 'not_found' &&
+        noticeRepo.count(NC.db) === 1 && opLogRepo.count(NC.db) === logsBeforeMiss,
+        `edit=${JSON.stringify(missEdit)}；remove=${JSON.stringify(missDel)}；` +
+        `notice=${noticeRepo.count(NC.db)}；op_log ${logsBeforeMiss}→${opLogRepo.count(NC.db)}（应不变）`);
+
+      /* ---- ⑦ 读口一致（count / getById / list / listForBoard） ---- */
+      const li1 = noticeRepo.publish(NC.db, { content: '读口用例：车间公告 A', subType: '生产调整' }, { now: NC_T2, operator: '张伟', teamCode: '检验一班' });
+      const li2 = noticeRepo.publish(NC.db, { content: '读口用例：工艺提示 B', category: noticeRepo.CATEGORY.TIP }, { now: NC_T2, operator: '张伟', teamCode: '检验一班' });
+      const li3 = noticeRepo.publish(NC.db, { content: '读口用例：车间公告 C', subType: '车间公示', priority: 5 }, { now: NC_T2, operator: '张伟', teamCode: '检验一班' });
+      const listAll = noticeRepo.list(NC.db, {}, {});
+      const board = noticeRepo.listForBoard(NC.db);
+      t.check('DR-10/FR-7.12-7 读口一致：`count`＝库内行数；`getById` 命中/未命中（`null` —— 不猜）；' +
+        '`list` 与 `listForBoard` **同一行集与同一排序**（`priority` 大者在前、同优先级按 `valid_from`/`id` 倒序）；' +
+        '读口**不筛有效期**（`FR-7.11` 过滤未实现＝P1，本行不为它背书）',
+        noticeRepo.count(NC.db) === 4 &&
+        noticeRepo.getById(NC.db, li1.id).content === '读口用例：车间公告 A' &&
+        noticeRepo.getById(NC.db, 999999) === null &&
+        listAll.length === 4 &&
+        listAll.map(r => Number(r.id)).join(',') === [li3.id, li2.id, li1.id, txSeed.id].join(',') &&
+        board.notices.length + board.tips.length === 4 &&
+        [board.notices, board.tips].every(a => Array.isArray(a)),
+        `count=${noticeRepo.count(NC.db)}；list 顺序（id）=${listAll.map(r => r.id).join(',')}（期望 ${[li3.id, li2.id, li1.id, txSeed.id].join(',')} —— ` +
+        `优先级 5 的那条在最前，同优先级按 valid_from/id 倒序，⑤ 的种子行（09:31）在最后）；` +
+        `notices=${board.notices.length}、tips=${board.tips.length}`);
+
+      /* ---- ⑧ 投影行形状（唯一一份投影） ---- */
+      const itemC = board.notices.find(x => x.text === '读口用例：车间公告 C');
+      const itemA = board.notices.find(x => x.text === '读口用例：车间公告 A');
+      const itemB = board.tips[0];
+      t.check('DR-10/FR-7.12-8 投影行形状（`listForBoard` 是**唯一**一份投影，`POST /notice` 响应与 `GET /state` 快照共用）：' +
+        '行键恰 `{id,tag,text,lv,time}` —— `tag` ← `sub_type` 优先、缺则退 `category`；`text` ← `content` **原样**；' +
+        '`lv` **恒 `info`**（表无等级列 ⇒ 不编造）；`time` ← `valid_from` 的 `HH:MM`；' +
+        '`category = 工艺提示` 的行进 `tips`、其余进 `notices`；`todo` **恒 `[]`**（那些是派生量，表里没有）',
+        Boolean(itemC) && Object.keys(itemC).sort().join(',') === 'id,lv,tag,text,time' &&
+        itemC.tag === '车间公示' && itemC.text === '读口用例：车间公告 C' && itemC.lv === 'info' && itemC.time === '10:00' &&
+        Boolean(itemA) && itemA.tag === '生产调整' && itemA.lv === 'info' &&
+        board.notices.every(x => x.lv === 'info') &&
+        board.tips.length === 1 && Boolean(itemB) && itemB.tag === noticeRepo.CATEGORY.TIP &&
+        itemB.lv === 'info' && itemB.time === '10:00' &&
+        Array.isArray(board.todo) && board.todo.length === 0,
+        `notices=${JSON.stringify(board.notices)}；tips=${JSON.stringify(board.tips)}；todo=${JSON.stringify(board.todo)}`);
+
+      /* ---- ⑨ 入参校验：一律抛错、一行不写（不归一、不猜） ---- */
+      const gBefore = { n: noticeRepo.count(NC.db), logs: opLogRepo.count(NC.db) };
+      const throwers = [
+        ['content 为空白', () => noticeRepo.publish(NC.db, { content: '   ' }, ctx0), TypeError],
+        ['content 超长（501 > 500）', () => noticeRepo.publish(NC.db, { content: 'x'.repeat(501) }, ctx0), RangeError],
+        ['priority 非整数', () => noticeRepo.publish(NC.db, { content: '合法正文', priority: 1.5 }, ctx0), RangeError],
+        ['priority 负数', () => noticeRepo.publish(NC.db, { content: '合法正文', priority: -1 }, ctx0), RangeError],
+        ['validFrom 非 DR-16', () => noticeRepo.publish(NC.db, { content: '合法正文', validFrom: '2026-10-02T10:00:00' }, ctx0), TypeError],
+        ['now 非 DR-16', () => noticeRepo.publish(NC.db, { content: '合法正文' }, { now: '2026/10/02 10:00:00' }), TypeError],
+        ['edit 的 id 为 0', () => noticeRepo.edit(NC.db, { id: 0, content: '合法正文' }, ctx0), TypeError],
+        ['remove 的 id 非数值', () => noticeRepo.remove(NC.db, { id: 'abc' }, ctx0), TypeError]
+      ];
+      const guard = throwers.map(([label, fn, Ctor]) => {
+        let caught = null;
+        try { fn(); } catch (err) { caught = err; }
+        return { label, kind: caught ? caught.constructor.name : '（未抛）', ok: caught instanceof Ctor };
+      });
+      t.check('DR-10/FR-7.12-9 入参校验（不归一、不猜）：空白/超长 `content`、非整数或负的 `priority`、' +
+        '非 DR-16 的时间（`validFrom`/`now`）、非法 `id`（0／非数值）**逐条抛错**（`TypeError`/`RangeError`），' +
+        '且 `notice` 表与 `op_log` **一行不写** —— 被拒不是"静默改成合法值"',
+        guard.every(g => g.ok) && noticeRepo.count(NC.db) === gBefore.n &&
+        opLogRepo.count(NC.db) === gBefore.logs,
+        `八种非法入参实测=${JSON.stringify(guard)}；notice ${gBefore.n}→${noticeRepo.count(NC.db)}；` +
+        `op_log ${gBefore.logs}→${opLogRepo.count(NC.db)}`);
+
+      /* ---- ⑩ 被拒留痕出口 `auditReject` ---- */
+      const rejectLogsBefore = opLogRepo.count(NC.db);
+      const rejUnknown = noticeRepo.auditReject(NC.db, { now: NC_T1, operator: '王强', teamCode: '检验三班' },
+        'rename', 'bad_action', '动作名不在三态里');
+      const rejPublish = noticeRepo.auditReject(NC.db, { now: NC_T1, operator: '王强', teamCode: '检验三班' },
+        noticeRepo.ACTION.PUBLISH, 'bad_value', '正文缺失');
+      const rejNoDb = noticeRepo.auditReject(null, { now: NC_T1 }, 'publish', 'x', 'y');
+      const rejRows = opLogRepo.list(NC.db, {}, { limit: 200 })
+        .filter(r => r.result === opLogRepo.RESULT.FAILED);
+      t.check('DR-10/FR-7.12-10 被拒留痕出口 `auditReject`：写一条 `result=失败`、`op_type` **按动作归口**' +
+        '（未知动作 ⇒ `公告写入拒绝`，已知动作 ⇒ 该动作词形）、带操作人与班组；**不抛**（留痕写不进去不该把 400 变成 500），' +
+        '无 db 时返 `{id:null, error:\'no_db\'}` 而**不静默**（调用方据此 warn）',
+        rejUnknown.id !== null && rejUnknown.error === null &&
+        rejPublish.id !== null && rejPublish.error === null &&
+        opLogRepo.count(NC.db) === rejectLogsBefore + 2 && rejRows.length === 2 &&
+        rejRows[0].opType === noticeRepo.OP_TYPE.REJECT && rejRows[0].result === opLogRepo.RESULT.FAILED &&
+        rejRows[1].opType === noticeRepo.OP_TYPE.PUBLISH && rejRows[1].result === opLogRepo.RESULT.FAILED &&
+        rejRows.every(r => r.operator === '王强' && r.teamCode === '检验三班') &&
+        /rename/.test(String(rejRows[0].content)) &&
+        rejNoDb.id === null && rejNoDb.error === 'no_db',
+        `两条留痕=${JSON.stringify(rejRows)}；无 db 返=${JSON.stringify(rejNoDb)}`);
+    } finally {
+      /* 本节自建的库当场关闭并删除（第十节"临时区与残留"的口径：不留给下一节、也不留给下次运行） */
+      NC.close();
+    }
+    t.check('FR-7.12：本章自建的临时库跑完**当场关闭并删除**（一用例一库，不留残留）',
+      !fs.existsSync(NC.dir), NC.dir);
   }
 
   t.section('十、临时区与残留');
