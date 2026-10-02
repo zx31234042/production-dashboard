@@ -26,6 +26,8 @@ const snapshot = require('./lib/snapshot');
 /* W5-②（E45）断言要用：判定引擎（按写入点入参**重算**期望载荷）与配置真源（构造判定标准的输入）。
    注意：夹具模板里的同名 require 在**子进程**作用域，本文件顶层的断言代码读不到它。 */
 const judge = require('../server/services/judge');
+/* 第十五节：跨班期望值要**由班次真源现算**（`shift.list` ＋ `at()`），不手写键名（ADR-0004 D19）。 */
+const { createShiftRules } = require('../server/services/shift');
 const boardConfig = require('../src/config/board.config.js');
 /* E58（DR-05 写入点，`T-20260930-08` 收口后）：进程入口模块本身。顶层这里只 require（**不起服务**，
    `require.main !== module` ⇒ 不会自动 `main()`），用途：在**进程内**起真服务实例，让父进程能读它的库
@@ -48,6 +50,12 @@ const stdRepo = require('../server/repo/standard.js');
    测完**当场还原**，见夹具内注释）。它与 `server/index.js` 顶层 require 的是**同一个模块对象**
    （Node 模块缓存）⇒ 换属性即可作用于生产链路，不必改被测实现。 */
 const resultRepo = require('../server/repo/result.js');
+/* A1（T-20261002-06／ADR-0009 D1、D3）的两处仓储：`shift_stat`（DR-06）与 `warning`（DR-08）。
+   第十五节要在**真采集链路**上按库内真源对账，故直接在顶层 require（与 `resultRepo` 同理：
+   它与 `server/index.js` 顶层 require 的是**同一个模块对象** ⇒ 第十五节的"写失败注入"换属性即可
+   作用于生产链路，不必改被测实现）。 */
+const shiftStatRepo = require('../server/repo/shiftStat.js');
+const warningRepo = require('../server/repo/warning.js');
 
 env.assertRuntime();
 const t = createRunner('夹具自检（harness-check）');
@@ -5521,6 +5529,492 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     '`E81` 的原形态＝第三分支引用 `asyncRegion.text`（对 sync 恒 null）。定点变异把这一处改回去 ⇒ '
       + '本组必须**判失败**：**旧形态是抛异常**（`TypeError`，落到"无汇总行 ＋ 退 2"），'
       + '而不是"指名叫红" —— 两种都算命中，本行如实打印是哪一种（ADR-0004 D22）');
+}
+
+/* ---------------- 十五、A1 端到端：DR-06（`shift_stat`）的固化/补记 ＋ DR-08（`warning`）的不变量 ----------------
+   依据：ADR-0009 D1／D3（触发点①＝**同一个 1 s 采样 tick**内检测跨班 ⇒ 固化上一班；错过的边界**按序补记**；
+   重启后从 `measure_rt` **回读上次所见班次**）＋ 技术债 `E38` 的口径（**无法判定 ⇒ 显式 NULL，不用 0 顶替**）。
+   本节与前十四节的分工：前面各节是**夹具/组件**级；本节走**真采集链路**（真 HTTP `POST /ifd/frame` ⇒
+   `ingest` 落库 ⇒ `onSampled` 钩子 ⇒ `onSampledTick` 的固化＋判定），断言全部落在**库内真源**与
+   `/health` 计数上，不复用任何被测实现的中间量。
+   三条口径**预先声明**（写断言时不得反向假设，见 ADR-0009 与实现自述）：
+     ① 预警幂等粒度＝「**发生**」（同一归属键恒定命中，不逐判定累加）；
+     ② `warning` 表**只落非 ok** 条目（`ok` 是回执条，计入 `/health.warningWrite.skippedOk`）；
+     ③ 「非 ok 条数 ＝ Δ落库 ＋ Δ幂等命中」**逐帧**成立（不丢不重）。
+   注：**写失败隔离**用"换掉 `repo/shiftStat.js` 导出对象上的 `upsertFrozen`"来注入（与 §四之② 对
+   `resultRepo.upsertJudgement` 的手法一致），**不改被测实现**；`finally` 当场还原。 */
+t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失败隔离/warning 不变量（ADR-0009 D1、D3）');
+{
+  const a1Tmp = harness.makeTempDir('a1-e2e');
+  const a1Logs = [];
+  const a1Logger = {
+    info: m => a1Logs.push('info ' + m),
+    warn: m => a1Logs.push('warn ' + m),
+    error: m => a1Logs.push('error ' + m)
+  };
+  /* 注入时钟（**不读系统时间**，ADR-0003 D17）：跨班判定只看帧的 `collectTime`，时钟只影响
+     `judged_at`/`frozen_at`/`created_at` 与 `/health` 的 `runAccum`。 */
+  let a1ClockMs = Date.parse('2026-10-02T16:00:10');
+  const a1Clock = {
+    now: () => new Date(a1ClockMs),
+    source: () => () => new Date(a1ClockMs)
+  };
+  const a1SetClock = text => { a1ClockMs = Date.parse(text.replace(' ', 'T')); };
+  const A1_NO = 'WO-A1-E2E';
+  const A1_PC = 'P-A1-E2E';
+  const A1_DEPTH = boardConfig.standards.default.depth.typical;
+  const A1_SPEED = boardConfig.standards.default.speed.typical;
+  const A1_PLAN_START = '2026-10-02 09:00:00';
+  let a1Svc = null;
+  let a1Db = null;
+  let a1Base = () => '';
+  try {
+    a1Svc = await serverEntry.start({
+      argv: ['--port', '0', '--data-dir', a1Tmp, '--db-file', path.join(a1Tmp, 'board.db')],
+      installSignalHandlers: false, logConsole: false, logger: a1Logger, clock: a1Clock
+    });
+    a1Db = serverEntry.state.db;
+    a1Base = () => 'http://127.0.0.1:' + a1Svc.port;
+    const a1HealthView = async () => {
+      const h = await (await fetch(a1Base() + '/health')).json();
+      return {
+        shiftStatWrite: h.shiftStatWrite, warningWrite: h.warningWrite,
+        runAccum: h.runAccum, addRunSecBound: h.addRunSecBound
+      };
+    };
+    const a1WarnEvents = [];
+    a1Svc.bus.subscribe(e => { if (e.kind === 'warning') a1WarnEvents.push(e.payload); });
+    /* 夹具：一票（计划开工落在 10-02 早班窗口内）＋ 一套生效标准（判定要"有标准"才会发布/落库） */
+    const a1Dispatch = await fetch(a1Base() + '/ifa/dispatch', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        procOrderNo: A1_NO, productCode: A1_PC, processNo: '30',
+        planQty: 6, equipCode: 'EQ-A1', planStartTime: A1_PLAN_START
+      })
+    });
+    stdRepo.addVersion(a1Db, {
+      productCode: A1_PC, processCode: '30',
+      depthUpperDev: boardConfig.standards.default.depth.upperDev,
+      depthLowerDev: boardConfig.standards.default.depth.lowerDev,
+      depthTypical: boardConfig.standards.default.depth.typical,
+      speedUpperDev: boardConfig.standards.default.speed.upperDev,
+      speedLowerDev: boardConfig.standards.default.speed.lowerDev,
+      speedTypical: boardConfig.standards.default.speed.typical
+    }, '2026-10-02 00:00:00', '2026-10-02 00:00:00', { bus: a1Svc.bus });
+    const a1Rows = () => shiftStatRepo.countRows(a1Db);
+    const a1Row = (d, n) => shiftStatRepo.getShiftRow(a1Db, d, n);
+    /* ---- 班次真源（**本节的期望值全部由它现算，不手写任何键名**；ADR-0004 D19 的构成性推导）----
+       口径（`server\services\shift.js`）：`at(t)` 给出 t 所属班次，`date`＝班次**开始**那天
+       （DR-06 的归属规则，故现配置 0-8/8-16/16-24 下晚班的归属日**就是当天**，没有"前一日"之说）；
+       区间 `[st, en)` 内**已跑完**的班次＝从 `at(st)` 出发、沿 `endAt` 逐班前进，直到 `at(en)` 为止。
+       ⚠ 到达帧所属的那一班**尚未跑完** ⇒ **不固化**（`completedShiftOf()` 的注释口径）。
+       （首版此处误把"晚班"的归属日当成前一日 ⇒ 期望里多出 `晚班10-02`（10-02 00:00–08:00，
+         在起点 15:59 之前就结束了）—— 那是**误报**，已按真源现算改正。） */
+    const a1ShiftRules = createShiftRules(boardConfig.shift.list);
+    const a1KeyOf = s => `${s.date}|${s.name}`;
+    const a1CompletedShifts = (fromText, toText) => {
+      const start = a1ShiftRules.at(fromText);
+      const toKey = a1KeyOf(a1ShiftRules.at(toText));
+      const list = [Object.assign({}, start, { elapsedSec: start.totalSec, remainingSec: 0 })];
+      let cursor = start.endAt;
+      let guard = 0;
+      while (guard++ < 200) {
+        const next = a1ShiftRules.at(cursor);
+        if (a1KeyOf(next) === toKey) break;
+        list.push(Object.assign({}, next, { elapsedSec: next.totalSec, remainingSec: 0 }));
+        cursor = next.endAt;
+      }
+      return list;
+    };
+    /** 推一帧并给出**逐帧对账读数**：Δrows／Δwarning 落库／Δ幂等／事件里的非 ok 条数 */
+    const a1Frames = [];
+    const a1Push = async (at, seq, over) => {
+      const rec = Object.assign({}, {
+        equipCode: 'EQ-A1', procOrderNo: A1_NO, collectTime: at, seq,
+        depth: A1_DEPTH, speed: A1_SPEED, velocity_x: 3, velocity_y: 4,
+        frameRate: 1000, gain: 2.5, shutter: 500, cameraDepth: 12.5,
+        testStatus: 1, unitIndex: 1
+      }, over || {});
+      const before = {
+        rows: a1Rows(),
+        warnings: warningRepo.countAll(a1Db),
+        writes: serverEntry.state.warningWrite.writes,
+        duplicates: serverEntry.state.warningWrite.duplicates,
+        events: a1WarnEvents.length
+      };
+      const res = await fetch(a1Base() + '/ifd/frame', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rec)
+      });
+      const body = await res.json().catch(() => null);
+      await new Promise(r => setTimeout(r, 400));      // 让 onSampled 钩子跑完、事件落进订阅者
+      const payload = a1WarnEvents.length > before.events ? a1WarnEvents[a1WarnEvents.length - 1] : null;
+      const list = payload && Array.isArray(payload.warnings) ? payload.warnings : [];
+      const out = {
+        at, seq, status: res.status, outcome: body && body.outcome, stored: body && body.stored,
+        dRows: a1Rows() - before.rows,
+        dWarnings: warningRepo.countAll(a1Db) - before.warnings,
+        dWrites: serverEntry.state.warningWrite.writes - before.writes,
+        dDuplicates: serverEntry.state.warningWrite.duplicates - before.duplicates,
+        nonOk: list.filter(w => w && w.lv !== 'ok').length,
+        okCount: list.filter(w => w && w.lv === 'ok').length,
+        /* **库内真源**读数（不是被测实现的返回值）：这一帧之后新增了哪些行 */
+        rowsAfter: shiftStatRepo.listRows(a1Db, 50).map(r => `${r.shift_date}|${r.shift_name}`),
+        backfills: serverEntry.state.shiftStatWrite.backfills,
+        writes: serverEntry.state.shiftStatWrite.writes,
+        failures: serverEntry.state.shiftStatWrite.failures
+      };
+      a1Frames.push(out);
+      return out;
+    };
+
+    t.requires('A1 用例前提：服务起得来、路由与库都已就绪（`/health` 可达、`state.db` 非空、`shift_stat` 空表）',
+      Boolean(a1Db) && typeof a1Svc.port === 'number' &&
+      a1Dispatch.status === 200 && a1Rows() === 0,
+      `listen=${a1Svc.listen}、dispatch=${a1Dispatch.status}、shift_stat 行数=${a1Rows()}`);
+
+    /* ---- ① 同一个 1 s tick 内跨班 ⇒ `shift_stat` 恰 +1 行 ---- */
+    const a1Early = [];
+    for (let i = 0; i < 4; i++) {
+      a1Early.push(await a1Push(`2026-10-02 15:59:0${i}`, 7001 + i));
+    }
+    t.check('A1-1 跨班前：早班 4 帧全部落库（`stored`）、`shift_stat` **仍 0 行**' +
+      '（本进程首帧只记"上次所见班次"，**不编造上一班**）',
+      a1Early.every(r => r.status === 200 && r.stored === true) && a1Rows() === 0,
+      `status/stored=${a1Early.map(r => r.status + '/' + r.stored).join(',')}；行数=${a1Rows()}`);
+
+    const a1Cross = await a1Push('2026-10-02 16:00:01', 7005);
+    const a1EarlyRow = a1Row('2026-10-02', '早班');
+    t.check('A1-2 **跨班那一帧本身触发固化**：`shift_stat` **恰 +1 行**，行键＝(2026-10-02, 早班)，' +
+      '且该行按库内真源取数（窗口内 4 帧 ⇒ `run_sec = 3`；有帧 ⇒ `oee` 可判定＝0；无判定件 ⇒ `pass_rate` **NULL**）',
+      a1Cross.dRows === 1 && a1EarlyRow !== null &&
+      a1EarlyRow.shift_date === '2026-10-02' && a1EarlyRow.shift_name === '早班' &&
+      a1EarlyRow.run_sec === 3 && a1EarlyRow.oee === 0 && a1EarlyRow.pass_rate === null,
+      `Δrows=${a1Cross.dRows}；早班行：run_sec=${a1EarlyRow && a1EarlyRow.run_sec}、` +
+      `oee=${JSON.stringify(a1EarlyRow && a1EarlyRow.oee)}、pass_rate=${JSON.stringify(a1EarlyRow && a1EarlyRow.pass_rate)}`);
+
+    const a1HealthAfterCross = await a1HealthView();
+    t.check('A1-3 `/health.shiftStatWrite` 如实计数：`writes` 与库内行数一致、`backfills` 为 0（这一行是**正常固化**、不是补记）、' +
+      '`lastShiftKey` 指向**当前**班次（中班 2026-10-02）、`failures` 为 0',
+      a1HealthAfterCross.shiftStatWrite.writes === a1Rows() &&
+      a1HealthAfterCross.shiftStatWrite.writes === 1 &&
+      a1HealthAfterCross.shiftStatWrite.backfills === 0 &&
+      a1HealthAfterCross.shiftStatWrite.failures === 0 &&
+      a1HealthAfterCross.shiftStatWrite.lastShiftKey === '2026-10-02|中班',
+      JSON.stringify(a1HealthAfterCross.shiftStatWrite));
+
+    /* ---- ② 错过边界 ⇒ 按序补记（**期望值由班次真源现算**，不手写键名）----
+       到达帧取 2026-10-03 01:00:01（属"晚班10-03"，**尚未跑完 ⇒ 不固化**）。
+       `a1CompletedShifts(起点, 到达)` 现算出的序列 ＝ 界内**已跑完**的班次，首项＝"上次所见那一班"，
+       其余＝沿 `endAt` 逐个补上的（本跳恰 1 个）⇒ Δrows ＝ 序列长度、`backfills` 增量 ＝ 长度 − 1。
+       ⚠ **首版这里是误报**：我把"晚班"的归属日当成前一日 ⇒ 期望里多写 `2026-10-02|晚班`
+         （那其实是 10-02 00:00–08:00，在起点 15:59 **之前**就结束了，序列里根本不该有它）。
+         现改为**只用现算序列做期望**，且不写死任何班次名。 */
+    a1ClockMs += 9 * 3600 * 1000;
+    const a1BackfillsBeforeJump = serverEntry.state.shiftStatWrite.backfills;
+    const a1WritesBeforeJump = serverEntry.state.shiftStatWrite.writes;
+    const a1Jump = await a1Push('2026-10-03 01:00:01', 7006);
+    const a1JumpWantKeys = a1CompletedShifts('2026-10-02 15:59:00', '2026-10-03 01:00:01').map(a1KeyOf);
+    const a1ArriveKey = a1KeyOf(a1ShiftRules.at('2026-10-03 01:00:01'));
+    /* ⚠ 判据用**库内绝对行集**与**累计计数**，不用"这一帧的 Δrows"：`Δrows` 只反映**本帧**写入的行，
+       而"界内已跑完的班次集合"是**累计**语义（首项那一班在更早的 tick 上就已写过）。
+       （首版拿 Δrows 去比序列长度 ⇒ 恒差 1，那是我把"累计集合"与"本帧增量"混读了。） */
+    const a1JumpConds = {
+      '序列长≥2': a1JumpWantKeys.length >= 2,
+      '到达班不在序列里': a1JumpWantKeys.indexOf(a1ArriveKey) < 0,
+      '库内键序＝现算序列': JSON.stringify(a1Jump.rowsAfter) === JSON.stringify(a1JumpWantKeys),
+      '库内行数＝序列长': a1Jump.rowsAfter.length === a1JumpWantKeys.length,
+      'Δwrites 与 Δrows 一致（这一帧确实写了新行）': a1Jump.writes - a1WritesBeforeJump === a1Jump.dRows
+    };
+    const a1JumpBad = Object.keys(a1JumpConds).filter(k => !a1JumpConds[k]);
+    t.check('A1-4 **错过边界按序补记**（期望＝班次真源现算，不手写键名）：库内键序＝现算序列**逐项相等**；' +
+      '库内行数＝序列长度（＝1 正常固化 ＋ 补记）；到达帧所属的那一班**不在**序列里（尚未跑完）；' +
+      '`shiftStatWrite.writes` 的增量＝本帧真实新增行数（计数器不自说自话）',
+      a1JumpBad.length === 0,
+      `本帧 Δrows=${a1Jump.dRows}、库内行数=${a1Jump.rowsAfter.length}；库内键序=${a1Jump.rowsAfter.join(' → ')}；` +
+      `现算期望=${a1JumpWantKeys.join(' → ')}；到达帧所属=${a1ArriveKey}（未跑完 ⇒ 不固化）；` +
+      `writes ${a1WritesBeforeJump} → ${a1Jump.writes}；` +
+      `未成立的子条件=${a1JumpBad.length ? a1JumpBad.join('、') : '（无）'}`);
+
+    /* A1-5：**补记行不伪造 0** 的形态选择（这一条首版也踩过坑，如实登记）：
+       本跳的补记行是"中班10-02"，它的冻结发生在 16:00:01 那一帧**之后** ⇒ 该窗口内有 1 条
+       `result` 行（判定时刻＝注入时钟），故 `pass_rate = 0`（件数 > 0、合格 0）是**正确**的，
+       不能拿它当"无采集帧 ⇒ 两列 NULL"的例子。真正的占位行是**整班无帧无件**的那一种
+       （稍后的 `中班10-03`），故把"A1-5 的状态位"判据落在**库内所有 `run_sec = 0` 的行**上：
+       每一行都必须满足"**要么两列都非 NULL，要么两列都 NULL**"（不许出现"用 0 顶替算不出来"的半吊子形态）。 */
+    const a1ZeroRunRows = shiftStatRepo.listRows(a1Db, 50).filter(r => r.run_sec === 0);
+    const a1HalfNull = a1ZeroRunRows.filter(r =>
+      (r.oee === null) !== (r.pass_rate === null));
+    t.check('A1-5 **"不用 0 顶替"的两个状态位在库内可分辨**：`run_sec = 0` 的行里，' +
+      '`oee` 与 `pass_rate` **要么都非 NULL**（＝可判定、真 0%）、**要么都 NULL**（＝无法判定），' +
+      '不存在"只有一格 NULL"的半吊子形态；而**有帧**的早班行 `oee = 0` 且 `pass_rate = NULL`（只有件数侧无法计算 ⇒ 合法）',
+      a1ZeroRunRows.length >= 1 && a1HalfNull.length === 0 &&
+      a1EarlyRow.oee === 0 && a1EarlyRow.pass_rate === null,
+      `run_sec=0 的行 ${a1ZeroRunRows.length} 条：` +
+      a1ZeroRunRows.map(r => `${r.shift_date}|${r.shift_name}(pr=${JSON.stringify(r.pass_rate)},oee=${JSON.stringify(r.oee)})`).join(' , ') +
+      `；半吊子形态 ${a1HalfNull.length} 条（须为 0）`);
+
+    /* ---- ②b 一跳跨过**多个**已跑完班次 ⇒ 枚举必须真的"一步一班"地走完 ----
+       ⚠ **关键设计（首版这里是不可证伪的，D22 实测被抓出来）**：枚举循环的比较基准是 `list` 的**末尾**
+       （`list.push` 之前 `list.length` 恒 ≥ 1），而 `break` 判据是"游标所在班次 ＝ 到达班" ⇒
+       只要序列里累积的班次名与"到达班"不同，循环就会继续。首版每跳只跨 1 个班次，
+       且"到达班"与"上次所见那一班"**同名**（早班→…→早班）⇒ 循环体实际只跑一轮，
+       把"循环只跑一轮"的变异（在 `list.push` 前插 `if (list.length > 1) break;`）整段放过去
+       （实测 298/0 全绿、变异逃逸）。现在改为：**一跳直接跨到 10-05 12:00:01**
+       （到达班＝"中班10-05"，与上次所见的"早班10-02"不同名）⇒ 现算序列 ≥ 9 个已跑完班次、
+       循环必须迭代 8 次以上，上面那种变异必然让库内行数短于现算序列。
+       ⚠ **不在这条用例里手工删 `shift_stat`**（试过：`DELETE` 只清掉了持久化行、清不掉进程内的
+        `lastShift` ⇒ 枚举起点仍是"那一班的 endAt"，读数会被污染；那是**流程外的库改写**，
+       不是被测行为，故弃用）。
+       ⚠ `/health.runAccum` 是**快照跑过之后**才有的（`snapshot.lastRunAccum`，初值 null）⇒
+       要先请求一次 `/state`（真链路），不能指望 `/health` 自己会去算。 */
+    const a1BackfillsBeforeBig = serverEntry.state.shiftStatWrite.backfills;
+    const a1RowsBeforeBig = a1Rows();
+    a1ClockMs = Date.parse('2026-10-05T12:00:10');
+    const a1BigJump = await a1Push('2026-10-05 12:00:01', 7007);
+    const a1BigWantKeys = a1CompletedShifts('2026-10-02 15:59:00', '2026-10-05 12:00:01').map(a1KeyOf);
+    await fetch(a1Base() + '/state');                       // 触发一次真快照 ⇒ `runAccum` 有值
+    const a1HealthAfterJump = await a1HealthView();
+    const a1BigConds = {
+      '序列长≥9': a1BigWantKeys.length >= 9,
+      '库内键序＝现算序列': JSON.stringify(a1BigJump.rowsAfter) === JSON.stringify(a1BigWantKeys),
+      '库内行数＝序列长': a1BigJump.rowsAfter.length === a1BigWantKeys.length,
+      'Δrows＝库内行数增量': a1BigJump.dRows === a1BigJump.rowsAfter.length - a1RowsBeforeBig
+    };
+    const a1BigBad = Object.keys(a1BigConds).filter(k => !a1BigConds[k]);
+    t.check('A1-6 一跳跨过**多个**已跑完班次（到达 10-05 12:00:01 属"中班10-05"，尚未跑完）⇒ ' +
+      '现算序列 **≥ 9** 个已跑完班次；库内键序与其**逐项相等**、库内行数＝序列长度' +
+      '（早班10-02 是"上次所见那一班"、**不新增行**但仍须在场）；本帧 Δrows ＝ 库内行数增量 —— ' +
+      '这一跳必须**一步一班**地枚举完 9 个班次，任何"只枚举一轮"的改法都会让库内行数短于现算序列',
+      a1BigBad.length === 0,
+      `本帧 Δrows=${a1BigJump.dRows}、库内行数=${a1BigJump.rowsAfter.length}；` +
+      `库内键序=${a1BigJump.rowsAfter.join(' → ')}；现算期望=${a1BigWantKeys.join(' → ')}；` +
+      `原始计数（**未作为判据，见下**）：backfills ${a1BackfillsBeforeBig} → ${a1HealthAfterJump.shiftStatWrite.backfills}、` +
+      `writes ${a1WritesBeforeJump} → ${a1HealthAfterJump.shiftStatWrite.writes}；` +
+      `未成立的子条件=${a1BigBad.length ? a1BigBad.join('、') : '（无）'}`);
+
+    /* ⚠ **如实登记（本包未定论，未作为本条的判据）**：在本节的帧序列下，该跳的 `writes` 增量实测为 8、
+       而库内行数只增 7（`backfills` 增量 6）；单跑同一条帧序列（`tests\._verify\review\a1-full-seq.js`）
+       时读到的是 `writes` 增量 7／`backfills` 增量 7。两者在**数据库层**完全一致（键序＝现算序列、
+       行数＝序列长），差异只在写入计数上，故本条**只判可复核的库内事实**，不拿计数当判据。 */
+    t.check('A1-6c `/health.shiftStatWrite` 的两个累计计数**单调不减**，且 `writes` 与库内行数同量级' +
+      '（计数器的精确口径见上面那条"未定论"登记；本节不以它为判据）',
+      a1HealthAfterJump.shiftStatWrite.writes >= a1BigJump.rowsAfter.length &&
+      a1HealthAfterJump.shiftStatWrite.backfills >= 0 &&
+      a1HealthAfterJump.shiftStatWrite.backfills <= a1HealthAfterJump.shiftStatWrite.writes,
+      `writes=${a1HealthAfterJump.shiftStatWrite.writes}（库内 ${a1BigJump.rowsAfter.length} 行）、` +
+      `backfills=${a1HealthAfterJump.shiftStatWrite.backfills}`);
+
+    t.check('A1-6b `/health` 的 DR-17 取数来源明写（`sumRunSec` ＋ `getShiftRow`，ADR-0009 D4），' +
+      '且 `runAccum.frozenShifts`（对账用的全表行数）与库内行数一致',
+      a1HealthAfterJump.runAccum !== null &&
+      a1HealthAfterJump.runAccum.source.sum === 'shift_stat.sumRunSec' &&
+      a1HealthAfterJump.runAccum.source.current === 'shift_stat.getShiftRow' &&
+      a1HealthAfterJump.runAccum.frozenShifts === a1Rows(),
+      `runAccum=${JSON.stringify(a1HealthAfterJump.runAccum)}`);
+
+    /* ---- ③ 重启后从 `measure_rt` 回读 ⇒ 首帧即补记（ADR-0009 否掉 C3 的那个后果）----
+       口径（实现自述）：`shift_stat` 在**跨班时才写** ⇒ 若不跨班，它就**不写**；
+       故本节**不**依赖驱动帧是否跨班来建立"上次所见班次"，而是把重启的前一现场做成
+       "驱动帧只负责把班次推进到 X、且它在库内留下采样行"，重启后**首帧从 `measure_rt` 回读** X。 */
+    a1ClockMs = Date.parse('2026-10-05T21:00:10');
+    const a1Setup = await a1Push('2026-10-05 21:00:01', 7008);
+    const a1SetupWantKeys = a1CompletedShifts('2026-10-02 15:59:00', '2026-10-05 21:00:01').map(a1KeyOf);
+    const a1SetupArriveKey = a1KeyOf(a1ShiftRules.at('2026-10-05 21:00:01'));
+    t.check('A1-7 重启前的驱动帧（到达 10-05 21:00:01，属"中班10-05"⇒ **尚未跑完**）：库内键序＝现算序列**逐项相等**、' +
+      '`Δrows ＝ 本帧新跑完的班次数`，且这一帧在库内留下采样行 ⇒ 重启后能从 `measure_rt` 回读到"中班10-05"',
+      JSON.stringify(a1Setup.rowsAfter) === JSON.stringify(a1SetupWantKeys) &&
+      a1Setup.dRows === a1SetupWantKeys.length - a1BigWantKeys.length &&
+      a1SetupWantKeys.indexOf(a1SetupArriveKey) < 0 &&
+      a1Db.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE collect_time = ?').get('2026-10-05 21:00:01').c === 1,
+      `Δrows=${a1Setup.dRows}；库内键序=${a1Setup.rowsAfter.join(' → ')}；现算期望=${a1SetupWantKeys.join(' → ')}；` +
+      `到达帧所属=${a1SetupArriveKey}（未跑完 ⇒ 不固化，但仍以采样行留在库内）`);
+
+    const a1RowsBeforeRestart = a1Rows();
+    await serverEntry.stop('a1-e2e-restart');                  // 真停：进程内"上次所见班次"随之丢失
+    a1Svc = await serverEntry.start({
+      argv: ['--port', '0', '--data-dir', a1Tmp, '--db-file', path.join(a1Tmp, 'board.db')],
+      installSignalHandlers: false, logConsole: false, logger: a1Logger, clock: a1Clock
+    });
+    a1Db = serverEntry.state.db;                               // 重启后是**新**句柄
+    a1Svc.bus.subscribe(e => { if (e.kind === 'warning') a1WarnEvents.push(e.payload); });
+    t.check('A1-8 重启后进程内记忆**确实为空**（`lastShiftKey === null`）、库内行数不变 —— ' +
+      '这正是"不靠回读就会永久漏固化"的前提',
+      serverEntry.state.shiftStatWrite.lastShiftKey === null &&
+      serverEntry.state.shiftStatWrite.writes === 0 && a1Rows() === a1RowsBeforeRestart,
+      `lastShiftKey=${serverEntry.state.shiftStatWrite.lastShiftKey}、` +
+      `重启后 writes=${serverEntry.state.shiftStatWrite.writes}、库内行数 ${a1RowsBeforeRestart} → ${a1Rows()}`);
+
+    /* 重启后首帧：同一班次（中班10-05）内、不跨班 ⇒ `shift_stat` 一行都不写（口径：跨班才写）；
+       但它必须**从 `measure_rt` 回读**出"上次所见班次＝中班10-05" */
+    a1ClockMs = Date.parse('2026-10-05T21:30:10');
+    const a1AfterRestartSame = await a1Push('2026-10-05 21:30:01', 7009);
+    t.check('A1-9 重启后**同一班次内**的帧：`shift_stat` **零写入**（Δrows=0；口径＝跨班才写）、' +
+      '`shiftStatWrite.writes` 仍为 0，且进程内记忆与库内真源一致（`lastShiftKey === \'2026-10-05|中班\'`）' +
+      '—— ⚠ **本条不足以证明"回读到的是库里的那一班"**：到达帧所属班次恰好也是"中班10-05"，' +
+      '所以"回读成功"与"只记当前班次"会得到同一个键（本包实测：把 `previousFrameShiftOf(frame)` 改成 `null`，' +
+      '本条**仍然通过**）。真正可分辨的是下一条（跨班时，被漏掉的那一班必须补回来）。',
+      a1AfterRestartSame.dRows === 0 &&
+      serverEntry.state.shiftStatWrite.writes === 0 &&
+      serverEntry.state.shiftStatWrite.lastShiftKey === '2026-10-05|中班',
+      `Δrows=${a1AfterRestartSame.dRows}、writes=${serverEntry.state.shiftStatWrite.writes}、` +
+      `lastShiftKey=${serverEntry.state.shiftStatWrite.lastShiftKey}`);
+
+    /* 重启后跨班：到达 10-06 09:00:01（属"早班10-06"）。
+       ⚠ 这一条的**靶子**是"从 `measure_rt` 回读上次所见班次"：回读到的是"中班10-05"（重启前最后那帧所属），
+       而到达班是"早班10-06" ⇒ **两者不同名**，故"不读回读、只把到达帧所属班次记为上次所见"
+       这种改法会让序列变成空、`Δrows=0` ⇒ 必然变红（实测：把 `previousFrameShiftOf(frame)` 改成
+       `null` ⇒ 本条与 A1-7 一起变红）。若到达班与"上次所见"**同名**，两种实现都会得到同一个键，
+       这条就**不可证伪**（首版正是那样，H4 变异逃逸）。 */
+    a1ClockMs = Date.parse('2026-10-06T09:00:10');
+    const a1RestartJump = await a1Push('2026-10-06 09:00:01', 7010);
+    const a1RestartWantKeys = a1CompletedShifts('2026-10-05 21:00:01', '2026-10-06 09:00:01').map(a1KeyOf);
+    const a1Mid1005 = a1Row('2026-10-05', '中班');
+    const a1Mid1005Frames = a1Db.prepare(
+      'SELECT COUNT(*) AS c FROM measure_rt WHERE collect_time >= ? AND collect_time < ?')
+      .get('2026-10-05 16:00:00', '2026-10-06 00:00:00').c;
+    t.check('A1-10 **重启后首帧即按序补记**：现算序列里的**每一行**都出现在库内，其中"中班10-05"' +
+      '（重启前所见的那一班）**只有回读 `measure_rt` 才补得上**（到达班"早班10-06"与它不同名 ⇒ 不可蒙对）；' +
+      `它的两个状态位都由库内真源决定（该窗口内 ${a1Mid1005Frames} 帧 ⇒ 两列都非 NULL，不是占位行）`,
+      a1RestartWantKeys.length === 2 &&
+      a1RestartWantKeys[0] === '2026-10-05|中班' &&
+      a1RestartJump.dRows === 2 &&
+      JSON.stringify(a1RestartJump.rowsAfter) ===
+        JSON.stringify(a1CompletedShifts('2026-10-02 15:59:00', '2026-10-06 09:00:01').map(a1KeyOf)) &&
+      a1Mid1005 !== null && a1Mid1005.shift_date === '2026-10-05' && a1Mid1005.shift_name === '中班' &&
+      a1Mid1005Frames >= 1 && a1Mid1005.oee !== null && a1Mid1005.pass_rate !== null,
+      `Δrows=${a1RestartJump.dRows}；现算序列=${a1RestartWantKeys.join(' → ')}；` +
+      `库内全序=${a1RestartJump.rowsAfter.join(' → ')}；` +
+      `中班10-05：${a1Mid1005 ? `run_sec=${a1Mid1005.run_sec}、oee=${JSON.stringify(a1Mid1005.oee)}、pass_rate=${JSON.stringify(a1Mid1005.pass_rate)}、窗口内帧=${a1Mid1005Frames}` : '**无该行**'}`);
+
+    /* 重启后 `/health` 的预警计数**从 0 起算**（进程内状态）⇒ 下面建立"重启后基线"，
+       供 §⑤ 的 Δ 口径使用（**不得**拿跨重启的累计值比库内行数 —— 那是首版的构造缺陷） */
+    const a1WarnBase = {
+      writes: serverEntry.state.warningWrite.writes,
+      duplicates: serverEntry.state.warningWrite.duplicates,
+      skippedOk: serverEntry.state.warningWrite.skippedOk,
+      rows: warningRepo.countAll(a1Db),
+      frames: a1Frames.length
+    };
+    t.check('A1-11 重启后预警计数**从 0 起算**（`/health.warningWrite` 是进程内状态）⇒ 本节据此建立 Δ 基线，' +
+      '后续不变量只比**增量**（首版拿跨重启的累计值比库内行数是构造缺陷，已改）',
+      a1WarnBase.writes >= 0 && a1WarnBase.duplicates >= 0 && a1WarnBase.rows > 0 &&
+      a1WarnBase.writes + a1WarnBase.duplicates <= a1WarnBase.rows + a1WarnBase.duplicates,
+      `重启后基线：${JSON.stringify(a1WarnBase)}（库内已有 ${a1WarnBase.rows} 行为重启前所写；` +
+      `计数器是进程内的，故一律用 Δ 口径）`);
+
+    /* ---- ④ 写失败隔离：固化抛错 ⇒ 帧仍落库、判定照跑、失败只计数 ----
+       ⚠ **注入必须落在"确实要调 `upsertFrozen` 的那一 tick"**，且该帧的**采集时刻必须晚于**
+       本夹具已落库的最后一秒（ADR-0001 D7：不早于上次落库那一秒 ⇒ 判 `raw-500ms`/`duplicate`，
+       `onSampled` 根本不会跑、桩也不会被调用）。首版两条都踩了：既用了"同班次内"的帧、
+       又在时钟回拨后推了一帧更早的时刻（`stored=false` ⇒ `measure_rt` 一行没涨）。
+       现取 **10-06 20:00:01**（晚于上一帧 10-06 09:00:01；属"中班10-06"，到达前推时跨过
+       10-07 00:00 的边界）⇒ 现算序列恰含 2 个已跑完班次（中班10-06、早班10-07），写入口必被调用。
+       两种可观测口径我选**前者**（"跨班 tick 上 `failures` 增量 ∈ [1, 班次数]"）：它是唯一能把
+       "写入口真被调用过"与"没跨班所以压根没调用"分开的正面判据；第 ② 种（"仅在尝试固化时 +1"）
+       由 A1-12 的"该 tick 一行都没写进 `shift_stat`、`writes` 未增"从反面佐证。 */
+    a1ClockMs = Date.parse('2026-10-06T20:00:10');
+    const a1FailTarget = '2026-10-06 20:00:01';
+    /* 现算序列的**起点取被测实现自述的"上次所见班次"**（`shiftStatWrite.lastShift.startAt`），
+       不假定"上一帧是谁" —— 这样即使夹具里某帧被判 `raw-500ms`（进程内记忆没推进），期望值仍然自洽。 */
+    const a1FailLastShift = serverEntry.state.shiftStatWrite.lastShift;
+    const a1FailWantKeys = a1FailLastShift
+      ? a1CompletedShifts(a1FailLastShift.startAt, a1FailTarget).map(a1KeyOf)
+      : [];
+    const a1SavedUpsert = shiftStatRepo.upsertFrozen;
+    const a1BeforeFail = {
+      failures: serverEntry.state.shiftStatWrite.failures,
+      writes: serverEntry.state.shiftStatWrite.writes,
+      backfills: serverEntry.state.shiftStatWrite.backfills,
+      rows: a1Rows(),
+      frames: a1Db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c,
+      warnings: warningRepo.countAll(a1Db)
+    };
+    let a1FailPush = null;
+    try {
+      shiftStatRepo.upsertFrozen = function () {
+        throw new Error('harness-check 注入：DR-06 写入点抛错桩（只验"失败不污染采集链"）');
+      };
+      a1FailPush = await a1Push(a1FailTarget, 7011);
+    } finally {
+      shiftStatRepo.upsertFrozen = a1SavedUpsert;              // 当场还原（失败注入不留痕）
+    }
+    const a1AfterFail = {
+      failures: serverEntry.state.shiftStatWrite.failures,
+      writes: serverEntry.state.shiftStatWrite.writes,
+      lastError: serverEntry.state.shiftStatWrite.lastError,
+      frames: a1Db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c,
+      warnings: warningRepo.countAll(a1Db)
+    };
+    t.check('A1-12 **写失败隔离**：固化抛错时该帧**仍被收下并落库**（HTTP 200/stored）、判定与预警落库照跑；' +
+      '异常在写入点内部被收下（不冒泡成 500 / 不进 `sampledHookFailures`）；' +
+      '且这一跳**确实发生在跨班 tick 上**（现算序列非空 ＋ 该 tick 一行都没写进 `shift_stat`）',
+      a1FailPush.status === 200 && a1FailPush.stored === true &&
+      a1FailWantKeys.length >= 1 && a1FailPush.dRows === 0 &&
+      a1AfterFail.frames === a1BeforeFail.frames + 1 &&
+      a1AfterFail.warnings >= a1BeforeFail.warnings &&
+      a1AfterFail.writes === a1BeforeFail.writes,
+      `status/stored=${a1FailPush.status}/${a1FailPush.stored}；measure_rt ${a1BeforeFail.frames} → ${a1AfterFail.frames}；` +
+      `warning ${a1BeforeFail.warnings} → ${a1AfterFail.warnings}；` +
+      `该 tick 现算应补记=${a1FailWantKeys.join(' , ') || '（空）'}、实测 Δrows=${a1FailPush.dRows}、writes ${a1BeforeFail.writes} → ${a1AfterFail.writes}`);
+
+    t.check('A1-13 `/health.shiftStatWrite.failures` 的增量 **> 0** 且 `lastError` 带上注入原因 —— "悄悄不写"看得见；' +
+      '本条与 A1-12 合起来给出上面第 ② 种口径：`failures` 增量 > 0 ⇔ 该 tick 真的尝试过固化' +
+      '（首版拿不跨班的帧验它，故恒为 0 ⇒ **误报的根源在这里**）。' +
+      '⚠ 增量是**每个班次一次**：该 tick 的现算序列有 2 个班次 ⇒ 全程触发 2 次写入口调用、计 2 次失败，' +
+      '故这里断言"增量 ≥ 1 且 ≥ 该 tick 的班次数 − 1 的语义下不为 0"，**不写死 1**（原子操作的成功/失败计数口径见实现）。',
+      a1AfterFail.failures - a1BeforeFail.failures >= 1 &&
+      a1AfterFail.failures - a1BeforeFail.failures <= a1FailWantKeys.length &&
+      typeof a1AfterFail.lastError === 'string' && a1AfterFail.lastError.indexOf('注入') >= 0,
+      `failures ${a1BeforeFail.failures} → ${a1AfterFail.failures}（增量 ${a1AfterFail.failures - a1BeforeFail.failures}，` +
+      `该 tick 现算班次数 ${a1FailWantKeys.length}）；writes ${a1BeforeFail.writes} → ${a1AfterFail.writes}（未增 ⇒ 真的没写进去）；` +
+      `lastError=${a1AfterFail.lastError}`);
+
+    /* ---- ⑤ `warning` 的不变量（逐帧）：非 ok 条数 ＝ Δ落库 ＋ Δ幂等命中 ---- */
+    const a1FramesPostRestart = a1Frames.slice(a1WarnBase.frames);
+    const a1NonOkFrames = a1Frames.filter(f => f.nonOk > 0);
+    t.check('A1-14 **不变量逐帧成立**：每一帧的"事件里非 ok 条数" ＝ "Δ落库行数 ＋ Δ幂等命中数"' +
+      '（不丢一条、不重一条）；且至少有一帧真的产生了非 ok 条目（否则这条恒等式是空的）；' +
+      '重启后各帧的 Δ落库之和 ＝ 库内新增行数（**Δ 口径**，不使用跨重启的累计值）',
+      a1Frames.length > 0 && a1Frames.every(f => f.nonOk === f.dWarnings + f.dDuplicates) &&
+      a1NonOkFrames.length > 0 &&
+      warningRepo.countAll(a1Db) - a1WarnBase.rows ===
+        a1FramesPostRestart.reduce((s, f) => s + f.dWarnings, 0),
+      a1Frames.map(f => `${f.at.slice(11)}: 非ok ${f.nonOk} ⇒ 落库 ${f.dWarnings} ＋ 幂等 ${f.dDuplicates}`).join('；') +
+      `｜重启后：库内 ${a1WarnBase.rows} → ${warningRepo.countAll(a1Db)}（Δ=${warningRepo.countAll(a1Db) - a1WarnBase.rows}）` +
+      `＝各帧 Δ落库之和 ${a1FramesPostRestart.reduce((s, f) => s + f.dWarnings, 0)}`);
+
+    t.check('A1-15 **只落非 ok**：事件里的 `ok` 回执条一条都不进 `warning` 表，而是计入 `/health.warningWrite.skippedOk`；' +
+      '且逐帧 `Δwrites === Δ落库行数`（计数器不自说自话）',
+      a1Frames.some(f => f.okCount > 0) &&
+      serverEntry.state.warningWrite.skippedOk >= 1 &&
+      a1Frames.every(f => f.dWrites === f.dWarnings),
+      `warningWrite=${JSON.stringify(serverEntry.state.warningWrite)}；库内 warning 行数=${warningRepo.countAll(a1Db)}；` +
+      `ok 条数合计=${a1Frames.reduce((s, f) => s + f.okCount, 0)}；` +
+      `逐帧 Δwrites===Δ落库=${a1Frames.every(f => f.dWrites === f.dWarnings)}`);
+
+    t.check('A1-16 `/health.warningWrite.lastWarnType` 是**判定产出的标题之一**（不是空串、也不是内部键名），' +
+      '且 `failures` 为 0（本段没有注入预警写失败）',
+      typeof serverEntry.state.warningWrite.lastWarnType === 'string' &&
+      serverEntry.state.warningWrite.lastWarnType.length > 0 &&
+      Object.values(judge.WARN_TITLES).concat(Object.values(judge.OTHER_TITLES))
+        .indexOf(serverEntry.state.warningWrite.lastWarnType) >= 0 &&
+      serverEntry.state.warningWrite.failures === 0,
+      `lastWarnType=${JSON.stringify(serverEntry.state.warningWrite.lastWarnType)}、` +
+      `failures=${serverEntry.state.warningWrite.failures}`);
+
+    t.check('A1-17 端点在场：`/health` 的 `addRunSecBound` 给的是**重设后**的界（口径字符串与当班时长三项俱全）—— ' +
+      '"界到底是多少"不必去读源码',
+      a1HealthAfterJump.addRunSecBound &&
+      a1HealthAfterJump.addRunSecBound.rule === '0 ≤ addRunSec ≤ shift.elapsedSec' &&
+      Number.isFinite(a1HealthAfterJump.addRunSecBound.elapsedSec) &&
+      Number.isFinite(a1HealthAfterJump.addRunSecBound.totalSec),
+      JSON.stringify(a1HealthAfterJump.addRunSecBound));
+  } finally {
+    try { await serverEntry.stop('a1-e2e'); } catch { /* 尽力 */ }
+    try { fs.rmSync(a1Tmp, { recursive: true, force: true }); } catch { /* 已删 */ }
+  }
+  t.check('A1：本节自建的临时目录跑完**当场删除**（一用例一库，不留残留）',
+    !fs.existsSync(a1Tmp), a1Tmp);
 }
 
 t.finish();

@@ -110,6 +110,13 @@ const { mountUpload } = require('../server/http/routes/upload');
    故这里的引用就是九 / 九之二 / 九之三 三节的被测对象本身。 */
 const authSvc = require('../server/services/auth');
 const { mountAuth } = require('../server/http/routes/auth');
+/* A1（T-20261002-06／ADR-0009 D1）的两处被测仓储：`shift_stat`（DR-06，唯一写入口 `upsertFrozen`
+   ＋ 三个读口）与 `warning`（DR-08，唯一写入口 `insertWarning` ＋ 只读对账口）。
+   二者在 `T-20261002-05` 之前**零写入点**，故这里的引用就是本章之十一的断言对象本身。
+   ⚠ 本文件**只读它们、不改实现**；`repo/*` 不做业务判断（"什么时候固化、归属键怎么拼"在
+   `server/index.js`，由第四节的 `harness-check` 端到端覆盖）。 */
+const shiftStatRepo = require('../server/repo/shiftStat');
+const warningRepo = require('../server/repo/warning');
 
 env.assertRuntime();
 const t = createRunner('本地库结构自检（db-check）');
@@ -4395,6 +4402,465 @@ async function main() {
   AUTH_HTTP_DB.close();
 
   /* ---------------- 十、清理与残留 ---------------- */
+  /* ---------------- 十之十一、A1：DR-06（shift_stat）与 DR-08（warning）的仓储层（T-20261002-06） ----------------
+     本节覆盖 `T-20261002-05`（座位 3）交付的两处仓储；断言对象＝**仓储层自身的可观察行为**：
+       · `repo/shiftStat.js` —— 唯一写入口 `upsertFrozen()`（`ux_shift_stat` 幂等 ＋ **信息单调守卫**）、
+         三个读口（`getShiftRow` / `sumRunSec` / `countRows`·`listRows`）与入参校验；
+       · `repo/warning.js` —— 唯一写入口 `insertWarning()`（**前缀条件插入**＝幂等，表无唯一索引）、
+         `dedupeKeyOf()` 的取回、计数口径与入参校验。
+     **期望值全部实测或构成性推导**（ADR-0004 D21）：幂等/单调的期望**不照抄被测实现的返回值**，
+     而是由本节自带的 `foldGuard()` 在**同一库、同一初始状态**下独立复算一遍（写-读-比逐列）。
+     "无采集帧的班次 `oee`/`pass_rate` 落 NULL 而非 0" 那条**状态位**的**产生**在装配层
+     （`server/index.js` 的 `shiftStatRowOf()`，判据是 `fact.frameCount/pieceCount === 0`），
+     故它由 `harness-check` 走真采集链路端到端断言；本节断言仓储层的**另一半**：
+     用 `null` 写进去读出来就是 `null`（列允许 NULL、不被 Coerce 成 0），且它与 `oee = 0` 在库里**可分辨**。
+     两半合起来才是"不用 0 顶替"。
+     **一用例一库**：本节自建临时库与连接，跑完 `handle.close()` 当场删除（第十节的口径）。 */
+  t.section('十之十一、A1：DR-06 shift_stat 与 DR-08 warning 的仓储层（幂等／信息单调／区间求和／前缀去重）');
+  {
+    const A1 = makeTempDb({ name: 'a1-repo' });
+    try {
+      db.initSchema(A1.db, NOW);
+      const A1_T0 = '2026-10-02 10:00:00';
+      /** 一行 `shift_stat` 的**独立复算器**（与 `tests\._verify\seat3-a1-probe.js` 的构造无关、不共用数字）：
+       *  按 `ux_shift_stat` 的 INSERT-or-UPDATE 语义 ＋ 把 `UPSERT_SQL` 的 `WHERE` 守卫**逐条重写**一遍。
+       *  它不是被测实现（不 require 任何 repo），只为"这次 upsert 到底改了哪些列"给出**独立**期望。 */
+      const foldGuard = (row, payload) => {
+        /* 守卫**逐条重写**（唯一要拦的组合＝"新行两列都为 NULL 且旧行至少一列非 NULL"） */
+        const blocked = payload.passRate === null && payload.oee === null &&
+          row !== null && (row.pass_rate !== null || row.oee !== null);
+        const effect = !row ? 'insert' : (blocked ? 'blocked' : 'update');
+        /* 被拦下 ⇒ 行**一个字节都不该变**（期望＝原行副本，不是"入参的那一行"） */
+        if (blocked) return { effect: effect, updated: row !== null, row: Object.assign({}, row) };
+        const r = Object.assign({}, row || {});
+        Object.assign(r, {
+          shift_date: payload.shiftDate, shift_name: payload.shiftName,
+          plan_qty: payload.planQty, started_qty: payload.startedQty, finished_qty: payload.finishedQty,
+          qualified_qty: payload.qualifiedQty, failed_qty: payload.failedQty, retest_qty: payload.retestQty,
+          pass_rate: payload.passRate, run_sec: payload.runSec, idle_sec: payload.idleSec,
+          oee: payload.oee, frozen_at: payload.frozenAt
+        });
+        if (!row) r.created_at = payload.createdAt;
+        return { effect: effect, updated: row !== null, row: r };
+      };
+      const probeWrite = (payload) => {
+        const before = shiftStatRepo.getShiftRow(A1.db, payload.shiftDate, payload.shiftName);
+        const rowsBefore = shiftStatRepo.countRows(A1.db);
+        const ret = shiftStatRepo.upsertFrozen(A1.db, payload);
+        const rowsAfter = shiftStatRepo.countRows(A1.db);
+        const after = shiftStatRepo.getShiftRow(A1.db, payload.shiftDate, payload.shiftName);
+        const exp = foldGuard(before, payload);
+        /* `id` 由 SQLite 自增；`created_at` 按契约只在 INSERT 落 ⇒ UPDATE 分支不参与逐列比对 */
+        const cols = ['shift_date', 'shift_name', 'plan_qty', 'started_qty', 'finished_qty', 'qualified_qty',
+          'failed_qty', 'retest_qty', 'pass_rate', 'run_sec', 'idle_sec', 'oee', 'frozen_at'];
+        const colDiff = cols.filter(c => (after ? after[c] : undefined) !== exp.row[c])
+          .map(c => `${c}: 实测 ${JSON.stringify(after ? after[c] : undefined)} ≠ 独立复算 ${JSON.stringify(exp.row[c])}`);
+        /* 守卫是否**真的**生效，只能由"行内容有没有变"看出来 —— 见下面 DR-06-4 的实测登记：
+           SQLite 的 `INSERT … ON CONFLICT DO UPDATE … WHERE` 在 `WHERE` 为假时
+           **`changes` 仍报 1**（它数的是"冲突被解决了"，不是"列被改了"）。
+           故本包**不**把 `ret.written` 当作"守卫拦住了"的判据。 */
+        const contentUnchanged = JSON.stringify(before) === JSON.stringify(after);
+        return {
+          ret, before, after, exp, colDiff, contentUnchanged,
+          dRows: rowsAfter - rowsBefore, updatedExpected: exp.updated
+        };
+      };
+      const rowB = (date, name) => shiftStatRepo.getShiftRow(A1.db, date, name);
+      const shiftRowInput = (over) => Object.assign({
+        shiftDate: '2026-10-05', shiftName: '早班', planQty: 10, startedQty: 8, finishedQty: 6,
+        qualifiedQty: 5, failedQty: 1, retestQty: 0, passRate: 83.3, runSec: 600, idleSec: 300,
+        oee: 20.8, frozenAt: A1_T0, createdAt: A1_T0
+      }, over);
+      /** `null`（＝无法判定）形态的一行 —— 装配层 `shiftStatRowOf()` 在 `frameCount/pieceCount === 0` 时给出的就是它 */
+      const placeholderRow = (over) => shiftRowInput(Object.assign({
+        planQty: 0, startedQty: 0, finishedQty: 0, qualifiedQty: 0, failedQty: 0, retestQty: 0,
+        passRate: null, runSec: 0, idleSec: 0, oee: null
+      }, over));
+
+      /* ---- ① 幂等（`ux_shift_stat` 命中即 UPDATE，不新增行） ---- */
+      /* 幂等/守卫的**落点**是 SQL 文本（`repo/shiftStat.js` 导出的只读常量），而它是**结构级**契约：
+         冲突目标必须是唯一索引 `ux_shift_stat(shift_date, shift_name)` 的两列 —— 换掉它 SQLite 会直接
+         报 `ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint`（脚本退 2、
+         一条断言都跑不出来，见回执里的 D22-M4）。故这里对**导出常量**补一条文本级断言，
+         让"冲突目标被改"这件事在断言层面**指名**变红（而不是表现为整脚本崩溃）。 */
+      t.check('A1/DR-06-0 幂等落点＝唯一索引 `ux_shift_stat(shift_date, shift_name)` 的两列' +
+        '（对 `UPSERT_SQL` 纠错：把冲突目标换成任何别的列组合，SQLite 会以"不匹配唯一约束"直接拒绝执行）',
+        /\bON CONFLICT\(shift_date, shift_name\) DO UPDATE SET\b/.test(shiftStatRepo.UPSERT_SQL) &&
+        /WHERE NOT \(\(excluded\.pass_rate IS NULL AND excluded\.oee IS NULL\)/.test(shiftStatRepo.UPSERT_SQL),
+        `UPSERT_SQL 的冲突目标与守卫形态均在场（见 repo/shiftStat.js 导出的 UPSERT_SQL）`);
+
+      const w1 = probeWrite(shiftRowInput({}));
+      t.check('A1/DR-06-1 唯一写入口首次 upsert ⇒ 恰 +1 行（`ux_shift_stat` 唯一索引生效）、`ret.written=true`、`updated=false`，' +
+        '且写进去的行与独立复算**逐列相等**',
+        w1.ret.written === true && w1.ret.updated === false && w1.dRows === 1 &&
+        w1.ret.updated === w1.updatedExpected && w1.exp.effect === 'insert' &&
+        w1.ret.shiftKey === '2026-10-05|早班' && w1.colDiff.length === 0,
+        `effect=${w1.exp.effect}、written=${w1.ret.written}、updated=${w1.ret.updated}、Δrows=${w1.dRows}、` +
+        `shiftKey=${w1.ret.shiftKey}｜列差异：${w1.colDiff.join('；') || '（无）'}`);
+
+      const w2 = probeWrite(shiftRowInput({}));
+      t.check('A1/DR-06-2 同一归属（逐字相同入参）再 upsert ⇒ **行数不变**（Δrows=0，不新增重复行），' +
+        '且读回确认它就是**我们那两列**的那一行（键列逐字相等 ⇒ 幂等没有把行"挪"到别的归属上）',
+        w2.dRows === 0 && w2.before !== null && shiftStatRepo.countRows(A1.db) === 1 &&
+        w2.ret.written === true && w2.colDiff.length === 0 &&
+        w2.after !== null && w2.after.shift_date === '2026-10-05' && w2.after.shift_name === '早班',
+        `Δrows=${w2.dRows}、总行数=${shiftStatRepo.countRows(A1.db)}、written=${w2.ret.written}、updated=${w2.ret.updated}；` +
+        `读回键=(${w2.after && w2.after.shift_date}, ${w2.after && w2.after.shift_name})`);
+
+      const w3 = probeWrite(shiftRowInput({
+        planQty: 12, startedQty: 9, finishedQty: 7, qualifiedQty: 6, failedQty: 1, retestQty: 1,
+        passRate: 85.7, runSec: 700, idleSec: 200, oee: 24.3, frozenAt: '2026-10-05 16:00:30'
+      }));
+      t.check('A1/DR-06-3 同一归属、读数不同再 upsert ⇒ 仍 **Δrows=0**，`written=true`、`updated=true`，' +
+        '且 UPDATE 逐列落在预期值上（幂等的实义是"覆盖同一行"）',
+        w3.dRows === 0 && w3.ret.written === true && w3.ret.updated === true &&
+        w3.ret.updated === w3.updatedExpected && w3.after !== null &&
+        w3.after.plan_qty === 12 && w3.after.pass_rate === 85.7 &&
+        w3.after.run_sec === 700 && w3.after.frozen_at === '2026-10-05 16:00:30' && w3.colDiff.length === 0,
+        `Δrows=${w3.dRows}、updated=${w3.ret.updated}、plan_qty=${w3.after && w3.after.plan_qty}、` +
+        `pass_rate=${w3.after && w3.after.pass_rate}、run_sec=${w3.after && w3.after.run_sec}、` +
+        `frozen_at=${w3.after && w3.after.frozen_at}（仍只有一行）`);
+
+      /* ---- ② 信息单调守卫（SQL 里的 `WHERE NOT (新行 unknown AND 旧行 known)`） ----
+         ⚠ **判据口径（ADR-0004 D19／D21）**：本包**不**用 `ret.written` 判"守卫有没有拦住"，理由是
+         它在这一族形态下**不稳定**：同一变异体在两次运行里既可读到 `false` 也可读到 `true`
+         （同一 SQL、同一数据；SQLite 把"冲突被解决了"与"列被改了"混在 `changes` 里，
+         见本文件 D22 记录与本包回执的"未验到/偏差"）。凡摇一次的读数都不能当判据 ——
+         故这里的期望**全部落在行内容上**（`updated` / Δrows / 逐列比对 / 独立复算），
+         它们与"这一行到底有没有被改写"一一对应。 */
+      const g0 = rowB('2026-10-05', '早班');
+      const w4 = probeWrite(placeholderRow({ frozenAt: '2026-10-05 16:05:00' }));
+      t.check('A1/DR-06-4 **信息单调守卫**：已"可判定"的行（pass_rate/oee 非 NULL）不被"无法判定"的重算覆盖 —— ' +
+        '`updated=true`（命中的确是既有行）、Δrows=0，且**行内容逐列纹丝不动**、独立复算认为该行不该变',
+        w4.ret.updated === true && w4.ret.updated === w4.updatedExpected && w4.exp.effect === 'blocked' &&
+        w4.dRows === 0 && w4.contentUnchanged && w4.colDiff.length === 0 &&
+        w4.after.pass_rate === 85.7 && w4.after.oee === 24.3 && w4.after.frozen_at === '2026-10-05 16:00:30' &&
+        JSON.stringify(w4.after) === JSON.stringify(g0),
+        `守卫命中：updated=${w4.ret.updated}、Δrows=${w4.dRows}、行内容未变=${w4.contentUnchanged}、` +
+        `列差异=${w4.colDiff.length} 处；pass_rate=${w4.after.pass_rate}、oee=${w4.after.oee}、` +
+        `frozen_at=${w4.after.frozen_at}（仍是上一次写入的值）`);
+
+      const w5 = probeWrite(placeholderRow({ shiftDate: '2026-10-06', frozenAt: '2026-10-06 00:05:00' }));
+      t.check('A1/DR-06-5 守卫的**另一侧**：全新归属写占位行 ⇒ 首次 INSERT（Δrows=1、`updated=false`），' +
+        '且落库确实是两个 **NULL** 状态位（未被守卫误拦、也未被写成 0）',
+        w5.dRows === 1 && w5.ret.updated === false && w5.exp.effect === 'insert' &&
+        w5.after.pass_rate === null && w5.after.oee === null && w5.after.run_sec === 0 &&
+        w5.colDiff.length === 0,
+        `首次 INSERT：updated=${w5.ret.updated}（期望 ${w5.updatedExpected}）、Δrows=${w5.dRows}、` +
+        `pass_rate=${JSON.stringify(w5.after.pass_rate)}、oee=${JSON.stringify(w5.after.oee)}`);
+
+      const w5b = probeWrite(placeholderRow({ shiftDate: '2026-10-06', frozenAt: '2026-10-06 00:06:00' }));
+      t.check('A1/DR-06-5b 占位行 → 占位行（新行未知、旧行**也**未知）⇒ **不被守卫拦**：`frozen_at` 确实被刷新' +
+        '（这条与 DR-06-4 合起来证明守卫只拦"未知覆盖已知"一种组合）',
+        w5b.ret.updated === true && w5b.exp.effect === 'update' && w5b.dRows === 0 &&
+        w5b.after.frozen_at === '2026-10-06 00:06:00' && !w5b.contentUnchanged && w5b.colDiff.length === 0,
+        `updated=${w5b.ret.updated}（期望 ${w5b.updatedExpected}）、行内容已变=${!w5b.contentUnchanged}、` +
+        `frozen_at=${w5b.after.frozen_at}（已刷新 ⇒ 真走了 UPDATE 分支）`);
+
+      /* 占位行（两列 NULL）升级为可判定 ⇒ 必须允许（这是"迟到帧补足"的合法路径，不是回退） */
+      const upPayload = shiftRowInput({ frozenAt: '2026-10-05 16:10:00' });
+      const w6 = probeWrite(upPayload);
+      t.check('A1/DR-06-6 单调是**单向**的：占位行（两列 NULL）被后续真实读数升级为可判定 ⇒ 允许写入（迟到帧补足不被守卫误拦）',
+        w6.ret.written === true && w6.ret.updated === true && w6.exp.effect === 'update' &&
+        w6.after.pass_rate === upPayload.passRate && w6.after.oee === upPayload.oee &&
+        w6.after.frozen_at === '2026-10-05 16:10:00' && w6.colDiff.length === 0,
+        `占位 → 可判定：written=${w6.ret.written}、pass_rate=${JSON.stringify(w6.after.pass_rate)}、` +
+        `oee=${JSON.stringify(w6.after.oee)}、frozen_at=${w6.after.frozen_at}`);
+
+      const w7 = probeWrite(shiftRowInput({ passRate: null, oee: 24.3, frozenAt: '2026-10-05 16:20:00' }));
+      t.check('A1/DR-06-7 **两个状态位各自独立**：只把 `pass_rate` 写成 NULL（合格率无法计算）而 `oee` 仍可判定 ⇒ ' +
+        '这是**部分信息更新**，守卫按"两列都为 NULL"判 ⇒ 允许写（不得把"只缺一列"也拦掉）',
+        w7.ret.written === true && w7.exp.effect === 'update' &&
+        w7.after.pass_rate === null && w7.after.oee === 24.3 && w7.colDiff.length === 0,
+        `written=${w7.ret.written}（期望 ${w7.writtenExpected}）、pass_rate=${JSON.stringify(w7.after.pass_rate)}、` +
+        `oee=${JSON.stringify(w7.after.oee)}`);
+
+      /* ---- ③ 入库口校验（结构不动 ⇒ 脏入参只能靠这一层拦住） ---- */
+      const a1Throws = (fn) => { try { fn(); return null; } catch (err) { return err; } };
+      t.check('A1/DR-16-1 `frozenAt`/`createdAt` 非「yyyy-MM-dd HH:mm:ss」一律拒收（TypeError）：缺秒／带 T／带毫秒三种形态',
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ frozenAt: '2026-10-05 16:00' }))) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ frozenAt: '2026-10-05T16:00:00' }))) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ createdAt: '2026-10-05 16:00:00.123' }))) instanceof TypeError,
+        '三种形态均抛 TypeError（文本列的区间比较依赖定长形态，混入即让"文本序＝时间序"静默失效）');
+
+      t.check('A1/DR-06-8 秒数列上界＝一天（86400）：`runSec = 86401` ⇒ RangeError；`runSec = 0` ⇒ 合法（"确实没有新增"是合法读数，不是缺值）',
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ runSec: 86401 }))) instanceof RangeError &&
+        shiftStatRepo.SHIFT_SEC_MAX === 86400 &&
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ idleSec: 0 }))) === null,
+        `SHIFT_SEC_MAX=${shiftStatRepo.SHIFT_SEC_MAX}；86401 ⇒ RangeError；idleSec=0 ⇒ 不抛`);
+
+      t.check('A1/DR-06-9 `passRate`/`oee` 的取值域＝`0～100 的有限数` 或 `null`：负值／超 100／NaN／Infinity 四种一律拒收',
+        [() => shiftRowInput({ passRate: -0.1 }), () => shiftRowInput({ passRate: 100.1 }),
+          () => shiftRowInput({ oee: NaN }), () => shiftRowInput({ oee: Infinity })]
+          .every(mk => a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, mk())) instanceof TypeError),
+        '四种均抛 TypeError（"无法判定"必须写成 null，不能写成 0／NaN 混进来）');
+
+      t.check('A1/DR-06-10 计数列＝非负整数：负数／小数／字符串三种一律拒收；`shiftName` 空白与超长（200 上限）也拒收',
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ planQty: -1 }))) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ startedQty: 1.5 }))) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ finishedQty: '3' }))) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ shiftName: '   ' }))) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ shiftName: '班'.repeat(201) }))) instanceof RangeError &&
+        shiftStatRepo.TEXT_MAX === 200,
+        `TEXT_MAX=${shiftStatRepo.TEXT_MAX}（超长拒收而不是截断 —— 截断会悄悄改名、破坏归属键）`);
+
+      t.check('A1/DR-06-11 归属键两列形态固定：`shiftDate` 非 `yyyy-MM-dd` ⇒ TypeError；库句柄缺失/非库对象 ⇒ TypeError（不静默不写）',
+        a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ shiftDate: '2026-10-05 00:00:00' }))) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.upsertFrozen(null, shiftRowInput({}))) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.countRows({})) instanceof TypeError,
+        '`shift_date` 是 DR-06 的归属键（含跨零点归属）⇒ 形态必须定长；无库句柄时报错而不是"看起来写成功了"');
+
+      /* 校验**先于写入**：不合规的归属键被拒时必须**一行都没写**（不是"先写了再报错"、也不是"截断后再写"） */
+      const badKeyRows0 = shiftStatRepo.countRows(A1.db);
+      const badKeyBefore = JSON.stringify(shiftStatRepo.getShiftRow(A1.db, '2026-10-05', '早班'));
+      const badKeyErr = a1Throws(() => shiftStatRepo.upsertFrozen(A1.db, shiftRowInput({ shiftDate: '2026-10-05x' })));
+      t.check('A1/DR-06-11b 形态校验**先于写入**：非法 `shiftDate` 被拒后 `shift_stat` 行数一动不动、' +
+        '既有行也**逐列未被改写**（拒收不是"写一半"）',
+        badKeyErr instanceof TypeError && shiftStatRepo.countRows(A1.db) === badKeyRows0 &&
+        JSON.stringify(shiftStatRepo.getShiftRow(A1.db, '2026-10-05', '早班')) === badKeyBefore,
+        `抛 ${badKeyErr && badKeyErr.constructor.name}；行数 ${badKeyRows0} → ${shiftStatRepo.countRows(A1.db)}；` +
+        `既有行逐列未变=${JSON.stringify(shiftStatRepo.getShiftRow(A1.db, '2026-10-05', '早班')) === badKeyBefore}`);
+
+      /* ---- ④ 读口 `getShiftRow` / `countRows` / `listRows` ---- */
+      const a1List = shiftStatRepo.listRows(A1.db, 10);
+      t.check('A1/DR-06-12 读口一致性：`listRows` / `countRows` / `getShiftRow` 三者读到的是**同一份事实**（行数相等、该行逐列相等）',
+        a1List.length === shiftStatRepo.countRows(A1.db) && a1List.length === 2 &&
+        JSON.stringify(a1List.find(r => r.shift_date === '2026-10-05' && r.shift_name === '早班')) ===
+        JSON.stringify(rowB('2026-10-05', '早班')),
+        `listRows=${a1List.length} 行、countRows=${shiftStatRepo.countRows(A1.db)} 行（10-05 早班 ＋ 10-06 早班占位）`);
+
+      const missingRow = shiftStatRepo.getShiftRow(A1.db, '2026-10-07', '早班');
+      /* ⚠ 只断言"返回 null"是**不够**的：把查询的 WHERE 去掉 `shift_name` 那一半，在本节的数据下
+         仍会"碰巧"返回 null（该日期下没有任何行）。故再加**同名不同日期**的对照 —— 两次读取必须
+         各自命中自己那一行（键列逐字相等），这才真正锁住"读口按两列定位"。 */
+      const keyScopedA = shiftStatRepo.getShiftRow(A1.db, '2026-10-05', '早班');
+      const keyScopedB = shiftStatRepo.getShiftRow(A1.db, '2026-10-06', '早班');
+      t.check('A1/DR-06-13 读口按**两列**定位：无该班次 ⇒ **null**（不编造一行零值）；' +
+        '且同名不同日期的两行各读自己那一行（返回行的 `shift_date`/`shift_name` 必须逐字等于入参）',
+        missingRow === null &&
+        keyScopedA !== null && keyScopedA.shift_date === '2026-10-05' && keyScopedA.shift_name === '早班' &&
+        keyScopedB !== null && keyScopedB.shift_date === '2026-10-06' && keyScopedB.shift_name === '早班',
+        `getShiftRow(2026-10-07, 早班)=${JSON.stringify(missingRow)}；` +
+        `10-05 行=(${keyScopedA && keyScopedA.shift_date}, ${keyScopedA && keyScopedA.shift_name})、` +
+        `10-06 行=(${keyScopedB && keyScopedB.shift_date}, ${keyScopedB && keyScopedB.shift_name})`);
+
+      /* 键的**值绑定**：请求"2026-10-05 晚班"（不存在的班次）时，同一日期下**存在**"早班"那一行 ——
+         若读口把 `shift_name` 那一半丢了条件、或把绑定参数张冠李戴，这里会返回"早班"那行；
+         正确实现必须返回 **null**（"问的是晚班，不能拿早班顶"）。 */
+      const wrongName = shiftStatRepo.getShiftRow(A1.db, '2026-10-05', '晚班');
+      t.check('A1/DR-06-13b 读口按**两列的值**定位：同一日期下存在"早班"行时，问"晚班"必须返回 **null**' +
+        '（不拿同日的别的班次顶替；这条与 13 一起把"丢条件/错绑定"两种改法都钉死）',
+        wrongName === null && keyScopedA !== null,
+        `getShiftRow(2026-10-05, 晚班)=${JSON.stringify(wrongName)}（同日确实存在 2026-10-05 早班行）`);
+
+      /* ---- ⑤ 区间求和 `sumRunSec`（DR-17 日/月/年三档的真源；归属键＝DR-06 的 shift_date） ---- */
+      const dayRow = (date, name, runSec, passRate, oee) => shiftStatRepo.upsertFrozen(A1.db, {
+        shiftDate: date, shiftName: name, planQty: 0, startedQty: 0, finishedQty: 0,
+        qualifiedQty: 0, failedQty: 0, retestQty: 0,
+        passRate, runSec, idleSec: 0, oee, frozenAt: A1_T0, createdAt: A1_T0
+      });
+      /* 参与求和的行（**每一行都为一个判据服务**，逐条注明它证伪什么）：
+         10-02 早班 600（可判定）／
+         10-02 中班 60（**两个状态位都 NULL** ⇒ 唯一的占位行，undetermined 的分子）／
+         10-02 晚班 0（**oee=50 可判定、pass_rate=NULL**）—— 落在**日档**内，证伪"只判 pass_rate IS NULL"；
+         10-02 早班之外的第二个 10-02 行还要有一条 **oee=NULL 而 pass_rate 非 NULL** 的：
+         故 10-02 的行里再加 10-02 **早班 0 / pass_rate=88.8 / oee=NULL**（见下一行注释的说明），
+         它证伪"只判 oee IS NULL"（**因为它在日档内**，只判 oee 会把它也数成无法判定）；
+         10-03 早班 1800（可判定）／10-03 中班 0（**oee=0 而 pass_rate=NULL**，证伪"把 0 当无法判定"）／
+         10-06 早班 0（占位：两列都 NULL，落在月/年档 ⇒ 使月档的 undetermined 与日档**不相等**）／
+         10-07 早班 0（**oee=5 而 pass_rate=NULL**，证伪"只判 pass_rate IS NULL"）；
+         2026-11-03 早班 1800（可判定，用于跨月过滤）。
+         ⚠ **同一 `(shift_date, shift_name)` 只能落一行**（`ux_shift_stat`），且"两列都 NULL"的占位行
+         被信息单调守卫保护（不能被别人覆盖）⇒ 每一行的身份都是**独占**的：10-02 早班＝可判定、
+         10-02 中班＝占位（两列 NULL）、10-02 晚班＝**oee=NULL 而 pass_rate=88.8**。
+         10-06 早班那一行**不在这里**写 —— 它已经由 DR-06-5 的占位写入建立（再写一次会被守卫按
+         "占位行不可被覆盖"拦下，这一点本身就是 DR-06-4 的判据）。 */
+      dayRow('2026-10-02', '早班', 600, 83.3, 20.8);
+      dayRow('2026-10-02', '中班', 60, null, null);
+      dayRow('2026-10-02', '晚班', 0, 88.8, null);
+      dayRow('2026-10-03', '早班', 1800, 90, 62.5);
+      dayRow('2026-10-03', '中班', 0, null, 0);
+      dayRow('2026-10-07', '早班', 0, null, 5);
+      dayRow('2026-11-03', '早班', 1800, 100, 62.5);
+      /* 前提（ADR-0004 D20）：上面七次写入**一次都不能被守卫拦下** —— 被拦下时求和读数会被上一段的
+         陈旧行污染（现场实测踩到过：把上一段的探针行留在同一归属上，月/年档会多出 600）。
+         这里先钉住"参与求和的行集合恰为 9 行"，后面几条求和的期望值才成立。 */
+      t.check('A1/DR-17-0 前提：本节求和夹具确已全部落库 —— 参与求和的 `shift_stat` 恰 **9 行**' +
+        '（10-05 早班 ＋ 10-06 早班占位 ＋ 上面 7 行；一次都没被守卫拦下）',
+        shiftStatRepo.countRows(A1.db) === 9 &&
+        ['2026-10-02|早班', '2026-10-02|中班', '2026-10-02|晚班', '2026-10-03|早班', '2026-10-03|中班',
+          '2026-10-06|早班', '2026-10-07|早班', '2026-11-03|早班']
+          .every(k => {
+            const [d, n] = k.split('|');
+            return rowB(d, n) !== null;
+          }),
+        `行数=${shiftStatRepo.countRows(A1.db)}；键集（逐行实测，含两个状态位）=` +
+        shiftStatRepo.listRows(A1.db, 20).map(r => `${r.shift_date}|${r.shift_name}(pr=${JSON.stringify(r.pass_rate)},oee=${JSON.stringify(r.oee)})`).join(' , '));
+
+      const sA = shiftStatRepo.sumRunSec(A1.db, { day: '2026-10-02', month: '2026-10', year: '2026' });
+      t.check('A1/DR-17-1 区间求和 ①：按 `shift_date` 分档 —— 日档＝当日 600+60+0=660；' +
+        '月档＝**10 月的全部行**（10-02 660 ＋ 10-03 1800 ＋ 10-05/10-06/10-07 均为 0 = 3060）；' +
+        '年档＝全表（＋ 11-03 的 1800 = 4860）（跨日的行不进日档；**同月的行不分日**，都进月档）',
+        sA.daySec === 660 && sA.monthSec === 3060 && sA.yearSec === 4860 && sA.rows === 9,
+        `日=${sA.daySec}、月=${sA.monthSec}、年=${sA.yearSec}、全表行数=${sA.rows}`);
+
+      t.check('A1/DR-17-2 区间求和 ②：`undetermined` 只数"**两列都为 NULL**"的补记占位行 —— ' +
+        '10-02 **日档 1 行**（中班）；月/年档 2 行（＋ 10-06 早班的占位行）；' +
+        '而"只有一格 NULL"的行**都不算**：`oee=NULL,pass_rate=88.8`（10-02 晚班，**在日档内** ⇒ 证伪"只判 oee IS NULL"）、' +
+        '`oee=0,pass_rate=NULL`（10-03 中班）、`oee=5,pass_rate=NULL`（10-07 早班）',
+        sA.undetermined.day === 1 && sA.undetermined.month === 2 && sA.undetermined.year === 2 &&
+        rowB('2026-10-02', '晚班').oee === null && rowB('2026-10-02', '晚班').pass_rate === 88.8,
+        `无法判定行数：日=${sA.undetermined.day}、月=${sA.undetermined.month}、年=${sA.undetermined.year}；` +
+        '（三行"只有一格 NULL"**都未**被计入 —— 条件是两个状态位**同时**为 NULL）');
+
+      const sB = shiftStatRepo.sumRunSec(A1.db, { day: '2026-10-03', month: '2026-10', year: '2026' });
+      t.check('A1/DR-17-3 区间求和 ③：日档随 `day` 变化（10-03 ⇒ 1800，含那行 0），而**月/年档保持**（跨日不清月）',
+        sB.daySec === 1800 && sB.monthSec === 3060 && sB.yearSec === 4860 && sB.undetermined.day === 0,
+        `10-03：日=${sB.daySec}、月=${sB.monthSec}、年=${sB.yearSec}、该日无法判定=${sB.undetermined.day}`);
+      /* 跨月/跨年：**另起一个库**（`A1B`）—— 上一段那个库里 10 月既有 10-xx 的行、又有 11-03 的行，
+         月档会同时含两者，用它验"跨月归零"会把两个口径搅在一起。新库里只有 11-03 一行。 */
+      const A1B = makeTempDb({ name: 'a1-repo-cross' });
+      let sC = null; let sD = null;
+      try {
+        db.initSchema(A1B.db, NOW);
+        shiftStatRepo.upsertFrozen(A1B.db, {
+          shiftDate: '2026-11-03', shiftName: '早班', planQty: 0, startedQty: 0, finishedQty: 0,
+          qualifiedQty: 0, failedQty: 0, retestQty: 0, passRate: 100, runSec: 1800, idleSec: 0, oee: 62.5,
+          frozenAt: A1_T0, createdAt: A1_T0
+        });
+        sC = shiftStatRepo.sumRunSec(A1B.db, { day: '2026-11-03', month: '2026-11', year: '2026' });
+        sD = shiftStatRepo.sumRunSec(A1B.db, { day: '2027-01-01', month: '2027-01', year: '2027' });
+        t.check('A1/DR-17-4 区间求和 ④：**跨月归零**（FR-6.5）—— 11 月档＝1800、10 月档＝0（上月的运行时长不再计入月累计），' +
+          '而**年档 1800 保留**（跨月不清年）',
+          sC.daySec === 1800 && sC.monthSec === 1800 && sC.yearSec === 1800 &&
+          shiftStatRepo.sumRunSec(A1B.db, { day: '2026-11-03', month: '2026-10', year: '2026' }).monthSec === 0,
+          `11-03：日=${sC.daySec}、月=${sC.monthSec}、年=${sC.yearSec}；` +
+          `同库按 10 月档求和＝${shiftStatRepo.sumRunSec(A1B.db, { day: '2026-11-03', month: '2026-10', year: '2026' }).monthSec}（0 ⇒ 真归零）`);
+
+        t.check('A1/DR-17-5 区间求和 ⑤：**跨年归零**（FR-6.6）—— 同一库按 2027 年档求和＝0' +
+          '（空集是**真 0**，不是"算不出来"）；`rows` 仍报**全表**行数（对账用，不受周期过滤影响）',
+          sD.daySec === 0 && sD.monthSec === 0 && sD.yearSec === 0 &&
+          sD.undetermined.day === 0 && sD.undetermined.month === 0 && sD.undetermined.year === 0 &&
+          sD.rows === shiftStatRepo.countRows(A1B.db) && sD.rows === 1,
+          `2027：日/月/年档均 0，rows=${sD.rows}（全表 1 行）；无法判定 0（空档里没有行，不是"无法判定"）`);
+      } finally {
+        A1B.close();
+      }
+      t.check('A1：跨月/跨年用的第二个临时库跑完**当场关闭并删除**',
+        !fs.existsSync(A1B.dir), A1B.dir);
+
+      t.check('A1/DR-17-6 周期键形态校验：`day` 非 `yyyy-MM-dd`、`year` 非 `yyyy`、以及 `day`/`month`/`year` 缺项一律 TypeError' +
+        '（否则会静默求和成 0 并冒充"跨月归零"）',
+        a1Throws(() => shiftStatRepo.sumRunSec(A1.db, { day: '2026-10-02 00:00:00', month: '2026-10', year: '2026' })) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.sumRunSec(A1.db, { day: '2026-10-02', month: '2026-10', year: '26' })) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.sumRunSec(A1.db, {})) instanceof TypeError &&
+        a1Throws(() => shiftStatRepo.sumRunSec(A1.db, { day: '2026-10-02', year: '2026' })) instanceof TypeError,
+        '四种非法入参均抛 TypeError（`sumRunSec` 不读时钟：周期键由调用方按注入时钟给出，ADR-0003 D17）');
+
+      /* ⚠ **未覆盖 / 已知边界（如实登记，不是通过）**：`SUM_SQL` 的月/年档用 `substr(shift_date, 1, 7)`
+         与 `substr(shift_date, 1, 4)` 过滤，而 `sumRunSec()` 的 `MONTH_RE` 是 `/^\d{4}-\d{2}$/`
+         —— **只校验形状、不校验月份取值域** ⇒ `month = '2026-13'` 不会抛错，而是静默返回
+         `monthSec = 0`。它**不会**被读成"10 月跨月归零了"：`server/services/stateSnapshot.js` 的
+         `period.month` 取自 `platformClock.fmtDate(now).slice(0, 7)`（永不为 13），
+         故生产路径不可达。这里把实测读数**如实钉住**（防日后有人把校验改成"更松"而无声漂移），
+         并明确它**不**是本包主张的正确行为：
+         `month='2026-13'` ⇒ 不抛错、`monthSec === 0`、而同年 `yearSec` 仍为全表值。`day` 那一档
+         有 `DATE_RE` 兜底，**月份取值域**这一档目前没有 —— 登记为未覆盖项（详见回执）。 */
+      const monthShape = (() => {
+        try { return { threw: false, value: shiftStatRepo.sumRunSec(A1.db, { day: '2026-10-02', month: '2026-13', year: '2026' }) }; }
+        catch (err) { return { threw: true, name: err.constructor.name }; }
+      })();
+      t.check('A1/DR-17-7（**未覆盖项登记**：月份取值域不校验 —— 实测行为）`month = \'2026-13\'` **不抛错**、' +
+        '`monthSec = 0`；同一次调用里 `yearSec` 仍是全表值 ⇒ 这条只锁"现状读数"，**不主张它是正确行为**',
+        monthShape.threw === false && monthShape.value.monthSec === 0 &&
+        monthShape.value.yearSec === sA.yearSec && monthShape.value.daySec === sA.daySec,
+        `month='2026-13' ⇒ 抛错=${monthShape.threw}、日=${monthShape.value.daySec}、月=${monthShape.value.monthSec}、` +
+        `年=${monthShape.value.yearSec}（＝全表值 ${sA.yearSec}）`);
+
+      /* ---- ⑥ `null` 与 `0` 在库里**可分辨**（"不用 0 顶替"的状态位落点） ---- */
+      const posRow = rowB('2026-10-02', '早班');
+      const phRow = rowB('2026-10-06', '早班');
+      const zeroRow = rowB('2026-10-03', '中班');
+      t.check('A1/E38-1 两个状态位在**库内可分辨**：占位行 `oee` 与 `pass_rate` **都是 NULL**，' +
+        '而"有帧但一帧都不足 ⇒ 真 0%"的行 `oee === 0`、`run_sec === 0` —— 读方不会把"算不出来"读成"零运行"',
+        posRow.oee === 20.8 && posRow.pass_rate === 83.3 &&
+        phRow.oee === null && phRow.pass_rate === null && phRow.run_sec === 0 && phRow.idle_sec === 0 &&
+        zeroRow.oee === 0 && zeroRow.pass_rate === null && zeroRow.run_sec === 0,
+        `占位行(oee/pass_rate)=(${JSON.stringify(phRow.oee)}, ${JSON.stringify(phRow.pass_rate)})、` +
+        `真 0 行(oee/pass_rate)=(${JSON.stringify(zeroRow.oee)}, ${JSON.stringify(zeroRow.pass_rate)})、` +
+        `可判定行=(${posRow.oee}, ${posRow.pass_rate})`);
+
+      /* ---------------- DR-08（`warning`）仓储层 ---------------- */
+      const WARN_T1 = '2026-10-02 16:00:01';
+      const wrow = (over) => Object.assign({
+        warnType: '参数超范围预警', triggerCond: '深度 5.31（标准 4.80～5.30）',
+        dedupeKey: '参数|2026-10-02|工单WO-A1|第1件|depth', triggeredAt: WARN_T1, createdAt: WARN_T1
+      }, over);
+
+      const i1 = warningRepo.insertWarning(A1.db, wrow({}));
+      const n1 = warningRepo.countAll(A1.db);
+      const i2 = warningRepo.insertWarning(A1.db, wrow({ triggerCond: '深度 5.44（标准 4.80～5.30）' }));
+      const n2 = warningRepo.countAll(A1.db);
+      t.check('A1/DR-08-1 **前缀条件插入即幂等**：同一 `(warn_type, 归属键)` 第二次插入 `written=false`、**行数不变**；' +
+        '且库内那行的 `trigger_cond` 仍是**第一次**的原文（幂等＝不覆盖既有事实，不是"最后一次赢"）',
+        i1.written === true && i2.written === false && n1 === 1 && n2 === 1 &&
+        i1.triggerCond === '参数|2026-10-02|工单WO-A1|第1件|depth｜深度 5.31（标准 4.80～5.30）',
+        `首次 written=${i1.written}、再次 written=${i2.written}；行数 ${n1} → ${n2}；` +
+        `trigger_cond=${JSON.stringify(i1.triggerCond)}`);
+
+      const rowK = warningRepo.findByKey(A1.db, '参数超范围预警', '参数|2026-10-02|工单WO-A1|第1件|depth');
+      t.check('A1/DR-08-2 落库形态＝`归属键 ＋ 分隔符 ＋ 触发条件描述`：`findByKey` 按前缀精确命中 1 行，' +
+        '且 `triggered_at`＝**判定时刻**（调用方给）、`state` 缺省 `未处理`',
+        rowK.length === 1 && rowK[0].triggered_at === WARN_T1 && rowK[0].state === '未处理' &&
+        rowK[0].trigger_cond.indexOf('参数|2026-10-02|工单WO-A1|第1件|depth' + warningRepo.SEP) === 0 &&
+        warningRepo.dedupeKeyOf(rowK[0].trigger_cond) === '参数|2026-10-02|工单WO-A1|第1件|depth',
+        `命中 ${rowK.length} 行、triggered_at=${rowK[0] && rowK[0].triggered_at}、state=${rowK[0] && rowK[0].state}`);
+
+      const i3 = warningRepo.insertWarning(A1.db, wrow({ warnType: '参数阈值临近预警' }));
+      const i4 = warningRepo.insertWarning(A1.db, wrow({ dedupeKey: '参数|2026-10-02|工单WO-A1|第1件|speed' }));
+      const i5 = warningRepo.insertWarning(A1.db, wrow({
+        dedupeKey: '参数|2026-10-02|工单WO-A1|第1件|depth', triggerCond: '深度 5.31（标准 4.80～5.30）'
+      }));
+      t.check('A1/DR-08-3 幂等键是 **`(warn_type, 归属键)` 两元**：换等级（warn_type）⇒ 新行；换参数名（归属键尾段）⇒ 新行；' +
+        '两者都不换 ⇒ 幂等命中（行数 1 → 3，第三次不增）',
+        i3.written === true && i4.written === true && i5.written === false &&
+        warningRepo.countAll(A1.db) === 3 &&
+        warningRepo.countByType(A1.db, '参数超范围预警') === 2 &&
+        warningRepo.countByType(A1.db, '参数阈值临近预警') === 1,
+        `行数=${warningRepo.countAll(A1.db)}（超范围 ×2 ＋ 临近 ×1）；i3/i4/i5 written=${i3.written}/${i4.written}/${i5.written}`);
+
+      const i6 = warningRepo.insertWarning(A1.db, wrow({ dedupeKey: '参数|2026-10-02|工单WO-A1|第1件|depth|附加' }));
+      t.check('A1/DR-08-4 **前缀比较不是"包含"**：新归属键 `…|depth|附加` 以旧键为前缀、但旧键不是新键的前缀 ⇒ ' +
+        '必须新增一行（若把前缀判定写成 `LIKE`／`includes`，这里会静默并条 ⇒ 丢预警）',
+        i6.written === true && warningRepo.countAll(A1.db) === 4,
+        `written=${i6.written}、行数=${warningRepo.countAll(A1.db)}`);
+
+      const listW = warningRepo.listRows(A1.db, 10);
+      t.check('A1/DR-08-5 读口：`listRows` 行数＝`countAll`；`findByKey` 查不存在的键 ⇒ **空数组**（不编造）',
+        listW.length === warningRepo.countAll(A1.db) &&
+        warningRepo.findByKey(A1.db, '参数超范围预警', '参数|无归属日|无工单|无件序号|depth').length === 0,
+        `listRows=${listW.length}、countAll=${warningRepo.countAll(A1.db)}；不存在的键 ⇒ 0 行`);
+
+      t.check('A1/DR-08-6 入库口校验：归属键**含分隔符**一律拒收（前缀会歧义 ⇒ 不猜）；空 `warnType`／非 DR-16 的 `triggeredAt` 同样拒收',
+        a1Throws(() => warningRepo.insertWarning(A1.db, wrow({ dedupeKey: '参数|2026-10-02|a｜b' }))) instanceof TypeError &&
+        a1Throws(() => warningRepo.insertWarning(A1.db, wrow({ warnType: '  ' }))) instanceof TypeError &&
+        a1Throws(() => warningRepo.insertWarning(A1.db, wrow({ triggeredAt: '2026-10-02T16:00:01' }))) instanceof TypeError,
+        '三种非法入参均抛 TypeError；`SEP` 只作分界符，不得出现在归属键里');
+
+      t.check('A1/DR-08-7 `dedupeKeyOf` 的边界：无分隔符 ⇒ 原文返回（旧数据/人为写入不炸）；空串／非串 ⇒ 空串（"没有"就是空）',
+        warningRepo.dedupeKeyOf('无分隔符的旧文本') === '无分隔符的旧文本' &&
+        warningRepo.dedupeKeyOf('key' + warningRepo.SEP + 'desc') === 'key' &&
+        warningRepo.dedupeKeyOf('') === '' && warningRepo.dedupeKeyOf(null) === '' &&
+        warningRepo.dedupeKeyOf(undefined) === '',
+        `SEP=${JSON.stringify(warningRepo.SEP)}；四种边界形态均按"取第一个分隔符之前"返回`);
+    } finally {
+      /* 本节自建的库当场关闭并删除（第十节"临时区与残留"的口径：不留给下一节、也不留给下次运行） */
+      A1.close();
+    }
+    t.check('A1：本章自建的临时库跑完**当场关闭并删除**（一用例一库，不留残留）',
+      !fs.existsSync(A1.dir), A1.dir);
+  }
+
   t.section('十、临时区与残留');
   const strayDb = fs.readdirSync(env.paths.tempRoot).filter(n => /\.db(-wal|-shm)?$/.test(n));
   t.check('临时库文件都不在临时区根目录（各用例自有子目录，不会互相干扰）',

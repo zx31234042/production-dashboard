@@ -32,6 +32,17 @@ const stats = require('../server/services/stats');
 /* W3（判定引擎）：服务端权威实现 ＋ 与前端演示实现对账用的标准换算（**只读复用**，不另写取数） */
 const judgeSvc = require('../server/services/judge');
 const standardSvc = require('../server/services/standard');
+/* A1（T-20261002-06／ADR-0009 D4）的三处被测对象：
+   · `server/repo/shiftStat.js` —— DR-06 的**唯一写入口**（本段只用它**铺夹具行**，不测它本身：仓储层的
+     断言在 `tests\db-check.js` 的第十一章之十一）；
+   · `server/services/stateSnapshot.js` —— DR-17 的**取数改真源**处：日/月/年＝对 `shift_stat` 求和、
+     当班增量＝当班实时 `runSec` − 该班次已固化 `run_sec`；
+   · `platform/clock.js` —— 快照的注入时钟出口（周期键按它算，ADR-0003 D17）。
+   本文件此前**从不建库**（纯函数 + 注入时钟）；本节为了验"取数真的落在 `shift_stat` 上"必须建一个
+   **临时内存库**（`node:sqlite` 的 `:memory:`，不落盘、不进 `._verify`、跑完即关）。 */
+const shiftStatRepo = require('../server/repo/shiftStat');
+const stateSnapshotSvc = require('../server/services/stateSnapshot');
+const platformClock = require('../platform/clock');
 
 const ROOT = path.resolve(__dirname, '..');
 
@@ -1872,6 +1883,211 @@ t.section('十、预警阈值可配：改配置真源（内存覆盖，不落盘
       STD.nearRatio = saved.near;
       fe.config.standards.nearRatio = saved.near;
     }
+  }
+}
+
+/* ---------------- 十一、A1：`addRunSec` 上界重设（ADR-0009 D3） ----------------
+   依据：`server/services/stats.js:207-247`（旧上界 `≤ runSec` 的病灶 ＋ 新上界 `≤ elapsedSec` 的三条依据）。
+   期望值**构成性推导**（D21）：下面先由**入参形态**把"旧形态下 `runSec` 恒 0"推出来（无采集串 ⇒ 不按
+   采集条数截断；无「测试中」件 ⇒ 不按班次进度兜底），再断言"同一组输入下 3600 被收下且累计真的 +3600"。
+   于是"旧上界会对任何非零增量抛错"这句话在本段里是**可复算的**，不是从注释抄的。 */
+t.section('十一、A1：`addRunSec` 上界重设 —— 旧上界形态必红 / 新形态必绿 / `elapsedSec + 1` 必抛');
+{
+  const A1_SHIFT = Object.freeze({
+    name: '早班', date: '2026-10-02', startAt: '2026-10-02 08:00:00', endAt: '2026-10-02 16:00:00',
+    totalSec: 8 * 3600, elapsedSec: 7 * 3600
+  });
+  /** 与 ADR-0009 D3② 的现场同形的入参：**无采集串 ＋ 无「测试中」件** */
+  const A1_INPUT = Object.freeze({
+    shift: A1_SHIFT, orders: [], pieces: [], measures: [],
+    now: '2026-10-02 15:00:00',
+    accum: { daySec: 0, monthSec: 0, yearSec: 0, at: '2026-10-02 15:00:00' }
+  });
+  const a1Run = (over) => {
+    try { return { ok: true, value: stats.computeShiftStats(Object.assign({}, A1_INPUT, over)) }; }
+    catch (err) { return { ok: false, name: err.name, message: String(err.message) }; }
+  };
+
+  const baseRun = a1Run({ addRunSec: 0 });
+  t.check('A1/D3-1 前提（构成性）：无采集串 ＋ 无「测试中」件 ⇒ **当班实时 `runSec` 恒 0**' +
+    '（`measures.length > 0` 为假 ⇒ 不走"按采集条数截断"；`running > 0` 为假 ⇒ 不走"按班次进度兜底"）—— ' +
+    '这正是旧上界 `≤ runSec` 的病灶现场，也是本段后面那条断言的对照量',
+    baseRun.ok && baseRun.value.runSec === 0 && baseRun.value.idleSec === A1_SHIFT.elapsedSec &&
+    baseRun.value.oee === 0,
+    `runSec=${baseRun.ok ? baseRun.value.runSec : 'ERR'}、idleSec=${baseRun.ok ? baseRun.value.idleSec : 'ERR'}、` +
+    `elapsedSec=${A1_SHIFT.elapsedSec}（旧上界形态下 addRunSec > 0 即越界 ⇒ 必然抛错）`);
+
+  const ok3600 = a1Run({ addRunSec: 3600 });
+  t.check('A1/D3-2 新形态必绿：同一组输入下 `addRunSec = 3600` **不抛错**，且累计**真的 +3600**' +
+    '（日/月/年三档同时加；`reset` 三档全 false —— 归零靠周期过滤，不靠 rollAccum）',
+    ok3600.ok && ok3600.value.runSec === 0 && ok3600.value.accumulate.daySec === 3600 &&
+    ok3600.value.accumulate.monthSec === 3600 && ok3600.value.accumulate.yearSec === 3600 &&
+    ok3600.value.accumulate.reset.day === false && ok3600.value.accumulate.reset.month === false &&
+    ok3600.value.accumulate.reset.year === false,
+    ok3600.ok
+      ? `runSec=${ok3600.value.runSec}、accumulate=${JSON.stringify({
+        daySec: ok3600.value.accumulate.daySec, monthSec: ok3600.value.accumulate.monthSec,
+        yearSec: ok3600.value.accumulate.yearSec, reset: ok3600.value.accumulate.reset })}`
+      : `${ok3600.name}: ${ok3600.message}`);
+
+  t.check('A1/D3-3 旧上界形态**必红**（同一输入、同一数字）：`addRunSec = 3600 > runSec = 0` ⇒ ' +
+    '旧形态（`> runSec`）必然抛 RangeError —— 这就是"`shift_stat` 一旦接线即爆"（ADR-0009 D3②）的机制',
+    baseRun.ok && baseRun.value.runSec === 0 && 3600 > baseRun.value.runSec && ok3600.ok,
+    `runSec=${baseRun.value.runSec} < addRunSec=3600 ⇒ 旧形态判越界；而新形态实测` +
+    `${ok3600.ok ? '收下并累计 +3600' : '也抛错（' + ok3600.message + '）'}`);
+
+  const over = a1Run({ addRunSec: A1_SHIFT.elapsedSec + 1 });
+  t.check('A1/D3-4 界不是空的：`addRunSec = elapsedSec + 1`（= 25201）**仍抛 RangeError**，' +
+    '且报错文本里点名上界（`0～25200`）',
+    over.ok === false && over.name === 'RangeError' &&
+    over.message.indexOf('0～' + A1_SHIFT.elapsedSec) >= 0,
+    over.ok ? '未抛错（界被拆掉了）' : `${over.name}: ${over.message.slice(0, 120)}`);
+
+  t.check('A1/D3-5 上界的上界＝`elapsedSec` 本身（闭区间，可取值）：`addRunSec = elapsedSec` ⇒ 收下；' +
+    '`elapsedSec + 0.5` ⇒ 拒收',
+    a1Run({ addRunSec: A1_SHIFT.elapsedSec }).ok === true &&
+    a1Run({ addRunSec: A1_SHIFT.elapsedSec + 0.5 }).ok === false,
+    `elapsedSec=${A1_SHIFT.elapsedSec}：取等号${a1Run({ addRunSec: A1_SHIFT.elapsedSec }).ok ? '收下' : '被拒'}、` +
+    `+0.5${a1Run({ addRunSec: A1_SHIFT.elapsedSec + 0.5 }).ok ? '收下' : '被拒'}`);
+
+  t.check('A1/D3-6 非有限数与负数仍一律拒收（重设上界**不是**"放宽成不校验"）：`NaN`／`Infinity`／`-1` 三种都抛',
+    a1Run({ addRunSec: NaN }).ok === false && a1Run({ addRunSec: Infinity }).ok === false &&
+    a1Run({ addRunSec: -1 }).ok === false && a1Run({ addRunSec: 0 }).ok === true,
+    `NaN/Infinity/-1 均抛；\`addRunSec = 0\` 合法（"本周期确实没有新增运行"是合法读数，不是缺值）`);
+
+  t.check('A1/D3-7 缺省仍是 **0**（不是"当班已运行时长"）：不传 `addRunSec` ⇒ 累计不涨' +
+    '（旧实现缺省取 `runSec`，会把"累计值当增量"重复相加）',
+    (() => {
+      const noAdd = a1Run({ addRunSec: undefined });
+      return noAdd.ok && noAdd.value.accumulate.daySec === 0;
+    })(),
+    `不传 ⇒ accumulate.daySec=${(() => { const x = a1Run({ addRunSec: undefined }); return x.ok ? x.value.accumulate.daySec : 'ERR'; })()}`);
+}
+
+/* ---------------- 十二、A1：DR-17 三档**改真源**（对 `shift_stat` 求和）＋ 跨零点/跨月归属 ----------------
+   依据：`server/services/stateSnapshot.js:350-380`（`statsOf()`：`sumRunSec` ＋ `getShiftRow` ⇒ `addRunSec`）。
+   本段用一个 **`:memory:` 临时库**自铺 `shift_stat` 行（走 DR-06 的唯一写入口），再按三档求和 ＋
+   当班增量复算期望值；**不给被测实现喂任何"已算好的累计值"** ⇒ 验的是"它自己去库里求和"。
+   已知口径（如实登记，不当期望值用）：①`accumulate.reset` 三档恒 false（归零靠周期过滤）；
+   ②跨零点班次按 DR-06 整班归属"班次开始那天"（故次日凌晨不计入次日"当日累计"）；
+   ③跨零点时当班**未固化**增量整段计入 `now` 所在自然日（`accumulateRunTime` 只有一个增量入参）
+   —— 现配置 0-8/8-16/16-24 **无跨零点班次**，②③ 当前不可达，本段只用**已登记的整班归属口径**断言。 */
+t.section('十二、A1：DR-17 三档改真源（对 `shift_stat` 求和）、跨零点归属与"不重复累加"');
+{
+  const { DatabaseSync } = require('node:sqlite');
+  const dbMod = require('../server/db');
+  /** 本段自己的**可推进注入时钟**（不借用别段的局部变量；起点＝2026-09-19 10:00:00 = 早班内） */
+  const clock = createClock({ mode: 'fixed', at: '2026-09-19T10:00:00' });
+  const A1_DB = new DatabaseSync(':memory:');
+  let a1Snapshot = null;
+  try {
+    dbMod.initSchema(A1_DB, '2026-09-19 10:00:00');
+    const T = '2026-09-19 10:00:00';
+    const putShift = (date, name, runSec, passRate, oee) => shiftStatRepo.upsertFrozen(A1_DB, {
+      shiftDate: date, shiftName: name, planQty: 0, startedQty: 0, finishedQty: 0,
+      qualifiedQty: 0, failedQty: 0, retestQty: 0,
+      passRate, runSec, idleSec: 0, oee, frozenAt: T, createdAt: T
+    });
+    putShift('2026-09-18', '晚班', 60, 50, 5);      // 前一天（用于跨零点/跨日对照）
+    putShift('2026-09-19', '早班', 600, 90, 20.8);   // 当班已固化
+    putShift('2026-09-19', '中班', 60, 80, 2);       // 同日、另一班次
+    /* 09-19 的采样帧：**恰 4 条**（10:00:01～10:00:04）⇒ 按 `E68` 的无条件截断口径，当班实时
+       `runSec = min(elapsedSec, 帧数 − 1)`；这是"当班增量"的独立来源（本段不复用被测实现算它）。 */
+    const insFrame = A1_DB.prepare(
+      `INSERT INTO measure_rt(equip_code, proc_order_no, unit_index, collect_time, created_at)
+       VALUES(?, ?, ?, ?, ?)`);
+    for (let i = 1; i <= 4; i++) {
+      insFrame.run('EQ-L', 'WO-L', null, `2026-09-19 10:00:0${i}`, `2026-09-19 10:00:0${i}`);
+    }
+    const liveRunSecAt = (text) => {
+      const d = text.slice(0, 10);
+      const frames = A1_DB.prepare(
+        `SELECT COUNT(*) AS c FROM measure_rt WHERE collect_time >= ? AND collect_time < ?`).get(
+        `${d} 08:00:00`, `${d} 16:00:00`).c;
+      return frames > 0 ? Math.min(6 * 3600, Math.max(0, frames - 1)) : 0;
+    };
+    a1Snapshot = stateSnapshotSvc.createStateSnapshot({
+      db: A1_DB,
+      now: () => clock.now(),
+      config: cfg
+    });
+
+    /* ① 当班已固化 600 ⇒ 实时 3 ⇒ 增量为 max(0, 3 − 600) = 0；三档＝对库求和 */
+    const acc1 = a1Snapshot().stats.accumulate;
+    const live1 = liveRunSecAt('2026-09-19 10:00:00');
+    const sums1 = shiftStatRepo.sumRunSec(A1_DB, { day: '2026-09-19', month: '2026-09', year: '2026' });
+    t.check('A1/D4-1 三档＝**对 `shift_stat` 求和**（归属键＝`shift_date`）：日档 600+60=660、月档＋前一日 60 ⇒ 720、' +
+      '年档同月档；且当班增量 `max(0, 实时 3 − 已固化 600) = 0` ⇒ 日档不再加任何东西（**已固化部分不重复相加**）',
+      acc1.daySec === 660 && acc1.monthSec === 720 && acc1.yearSec === 720 &&
+      sums1.daySec === 660 && live1 === 3 &&
+      Number.isInteger(sums1.undetermined.day) && sums1.rows === 3,
+      `日=${acc1.daySec}（Σ=${sums1.daySec} ＋ 增量 0）、月=${acc1.monthSec}、年=${acc1.yearSec}；` +
+      `当班实时 runSec=${live1}、已固化 600、全表 ${sums1.rows} 行`);
+
+    t.check('A1/D4-2 归零靠**周期过滤**、不靠 `rollAccum`：`accumulate.reset` 三档恒 false；' +
+      '且 `at` 是**注入时钟那一刻**的读数（这里钉住的是 `stateSnapshot.lastRunAccum.at` 的 DR-16 定长文本口径，' +
+      '因为 `services/stats.js` 的 `accumulate.at` 是 `rollAccum` 原样回传的 `toDate(now)`＝**Date 对象**）',
+      acc1.reset.day === false && acc1.reset.month === false && acc1.reset.year === false &&
+      a1Snapshot.lastRunAccum && a1Snapshot.lastRunAccum.at === '2026-09-19 10:00:00' &&
+      a1Snapshot.lastRunAccum.source.sum === 'shift_stat.sumRunSec' &&
+      a1Snapshot.lastRunAccum.source.current === 'shift_stat.getShiftRow',
+      `reset=${JSON.stringify(acc1.reset)}、accumulate.at=${JSON.stringify(acc1.at)}、` +
+      `lastRunAccum.at=${a1Snapshot.lastRunAccum && a1Snapshot.lastRunAccum.at}、` +
+      `取数来源=${JSON.stringify(a1Snapshot.lastRunAccum && a1Snapshot.lastRunAccum.source)}`);
+
+    t.check('A1/D4-3 跨零点/跨月**归属由 `shift_date` 承载**：前一日 09-18 的 60 秒**不进** 09-19 的日档，' +
+      '但**进**月/年档（同一份数据、两个周期口径的读数差恰好是它）',
+      acc1.daySec === 660 && acc1.monthSec === 720 && acc1.monthSec - acc1.daySec === 60,
+      `日=${acc1.daySec}、月=${acc1.monthSec}（差 ${acc1.monthSec - acc1.daySec}＝09-18 晚班那一行的 run_sec）`);
+
+    /* ② 换到中班（同一天、已固化 60）：三档**逐位不变**（同一批行、同一周期）—— 现算求和 ⇒ 同刻连读一致 */
+    clock.at('2026-09-19T18:00:00');                 // 中班
+    const acc2 = a1Snapshot().stats.accumulate;
+    t.check('A1/D4-4 **同班次重复读不重复累加**：同一自然日内换班次、再读一次 ⇒ 三档**逐位相同**' +
+      '（求和是"每次现算"、不是"上次结果 + 增量"）；变的只有 `at`',
+      acc2.daySec === acc1.daySec && acc2.monthSec === acc1.monthSec && acc2.yearSec === acc1.yearSec &&
+      acc2.at !== acc1.at,
+      `第一次 ${JSON.stringify({ daySec: acc1.daySec, monthSec: acc1.monthSec, yearSec: acc1.yearSec, at: acc1.at })}；` +
+      `第二次 ${JSON.stringify({ daySec: acc2.daySec, monthSec: acc2.monthSec, yearSec: acc2.yearSec, at: acc2.at })}`);
+
+    /* ③ 同一班次内连读两次（时钟前进 1 分钟）⇒ 三档仍逐位相同 */
+    clock.advanceMin(1);
+    const acc3 = a1Snapshot().stats.accumulate;
+    t.check('A1/D4-5 同一班次内连读两次（时钟 +1 min）⇒ 三档**逐位相同**（幂等：现算求和，不是累加器）',
+      acc3.daySec === acc2.daySec && acc3.monthSec === acc2.monthSec && acc3.yearSec === acc2.yearSec,
+      `${JSON.stringify({ daySec: acc2.daySec, monthSec: acc2.monthSec, yearSec: acc2.yearSec })} 与 ` +
+      `${JSON.stringify({ daySec: acc3.daySec, monthSec: acc3.monthSec, yearSec: acc3.yearSec })}`);
+
+    /* ④ 跨自然日：直接跳到 2026-09-20 00:30（**用 `at()` 钉死，不靠累加分钟数** —— 累加易算错，
+       也把"这一条到底在看哪个时刻"变得不可读）。该时刻属**晚班**、按 DR-06 归属日＝2026-09-20。
+       库里**没有** 09-20 的行 ⇒ 日档为**真 0**（不是"算不出来"）；月/年档保留（跨日不清月/年）。
+       增量侧：晚班窗口 [00:00,08:00) 内没有采集帧且无「测试中」件 ⇒ 实时 `runSec` = 0 ⇒ 增量 0。 */
+    clock.at('2026-09-20T00:30:00');
+    const acc4 = a1Snapshot().stats.accumulate;
+    const sums4 = shiftStatRepo.sumRunSec(A1_DB, { day: '2026-09-20', month: '2026-09', year: '2026' });
+    t.check('A1/D4-6 **跨自然日**（FR-6.4）：日档＝按 `shift_date = 2026-09-20` 求和（库里 0 行 ⇒ **真 0**）' +
+      '＋ 当班增量 0；而**月/年档保留** 720（跨日不清更大周期）',
+      acc4.daySec === sums4.daySec && sums4.daySec === 0 && acc4.monthSec === 720 && acc4.yearSec === 720 &&
+      sums4.undetermined.day === 0 &&
+      a1Snapshot.lastRunAccum.currentShift.date === '2026-09-20' &&
+      a1Snapshot.lastRunAccum.currentShift.name === '晚班',
+      `09-20 日档 Σ=${sums4.daySec} ⇒ accumulate.daySec=${acc4.daySec}；月=${acc4.monthSec}、年=${acc4.yearSec}；` +
+      `该日"无法判定"行数=${sums4.undetermined.day}（0 行 ⇒ 空档，不是"算不出来"）；` +
+      `当班=${a1Snapshot.lastRunAccum.currentShift.date} ${a1Snapshot.lastRunAccum.currentShift.name}、` +
+      `addRunSec=${a1Snapshot.lastRunAccum.addRunSec}`);
+
+    /* ⑤ 跨月：直接跳到 2026-10-01 08:30（早班）。月档按 `2026-10` 求和（0 行）⇒ 0；年档仍是全表 720 */
+    clock.at('2026-10-01T08:30:00');
+    const acc5 = a1Snapshot().stats.accumulate;
+    const sums5 = shiftStatRepo.sumRunSec(A1_DB, { day: '2026-10-01', month: '2026-10', year: '2026' });
+    t.check('A1/D4-7 **跨月归零**（FR-6.5）：月档＝按 `2026-10` 求和（库里 0 行 ⇒ 0），' +
+      '而**年档仍是全表** 720（跨月不清年）',
+      acc5.monthSec === sums5.monthSec && sums5.monthSec === 0 && acc5.yearSec === 720 &&
+      acc5.daySec === sums5.daySec && sums5.daySec === 0,
+      `2026-10 月档 Σ=${sums5.monthSec} ⇒ accumulate.monthSec=${acc5.monthSec}；` +
+      `日=${acc5.daySec}、年=${acc5.yearSec}（年档＝全表 3 行之和）`);
+  } finally {
+    try { A1_DB.close(); } catch { /* 已关 */ }
   }
 }
 
