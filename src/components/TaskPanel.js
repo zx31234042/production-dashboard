@@ -770,7 +770,9 @@ window.Components.TaskPanel = (function () {
 
     /* 测试实时进度
        ⚠ 缺失值口径（W4 / ADR-0008 D3）：`task.progress` / `task.unitIndex` / `task.result`
-         在**服务端模式下**不在快照的 7 键之内（服务端 `snapshot` 不含单任务进度）⇒ 由
+         在**服务端模式下**不在快照的 8 键之内（快照键集见 `services/stateAdapter.js` 的
+         `snapshotToState()` 注释：link / task / device / frame / stats / standard / upload /
+         notices —— 末项 `notices` 由 `T-20261002-08` 增补；服务端 `snapshot` 不含单任务进度）⇒ 由
          `services/stateAdapter.js` 置 `null`；此处**显式显示"尚未接入服务端"**，
          **不得**把 `null` 当 0 显示（"算不出来"≠"进度为零"），也不得残留演示值。 */
     const pct = isNum(t.progress) ? t.progress * 100 : null;
