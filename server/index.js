@@ -40,6 +40,12 @@ const dbApi = require('./db');
    为什么放在入口而不是 ingest 里：写的是"**本看板判定**的产出"（FR-3.13），
    判定装配的唯一处就是本文件的 `emitWarnings()`（1 s 采样落库之后）—— 见 6e-2/6e-3 两段。 */
 const resultRepo = require('./repo/result');
+/* DR-06（`shift_stat`）／DR-08（`warning`）的仓储层：**唯一写入口**（技术债 E59／E62 的写入归口，
+   依据 ADR-0009 D1／D3；负责人在 2026-10-02 裁定 A1）。接线位置见下方 6e-2／6e-4 两段：
+   · `shiftStatRepo.upsertFrozen()` 由 `freezeCrossedShifts()` 在**既有 1 s 采样 tick 内**调用（不新增定时器）；
+   · `warningRepo.insertWarning()` 由 `persistWarnings()` 在**判定发布点**（`emitWarnings()`）同批调用。 */
+const shiftStatRepo = require('./repo/shiftStat');
+const warningRepo = require('./repo/warning');
 const { createRouter, pathnameOf } = require('./http/router');
 /* W1 的挂载口（`server/http/routes/ifD.js`）：IF-D 采集接入的唯一接线点，见下方 6b 段 */
 const { mountIfD } = require('./http/routes/ifD');
@@ -56,7 +62,10 @@ const { mountAuth } = require('./http/routes/auth');
 /* W5-① 的两块：进程内事件总线（业务写入点 → 推送的唯一通道）与整机快照构造器
    （`hello` 与 `GET /state` **同一构造函数**产出，禁两套拼装）。见下方 6e 段。 */
 const { createEventBus } = require('./services/eventBus');
-const { createStateSnapshot } = require('./services/stateSnapshot');
+const { createStateSnapshot, statsForShift } = require('./services/stateSnapshot');
+/* 班次真源（`services/shift.js`）：DR-06 的固化**不重算班次边界**，一律经它取
+   （`at()` 给出 date/name/startAt/endAt/totalSec；跨零点归属规则只此一处）。 */
+const { createShiftRules } = require('./services/shift');
 /* W5-③ 的鉴权服务（`server/services/auth.js`）：scrypt 哈希 / 错误次数落库锁定 / 内存会话令牌 /
    一次性初始化码。**纯逻辑**，HTTP 适配在 `routes/auth.js`，本处只建实例并接线（见 6d-2 段）。 */
 const { createAuth } = require('./services/auth');
@@ -90,6 +99,9 @@ const SHUTDOWN_TIMEOUT_MS = 8000;
 /** 停机期间**空闲连接回收**的间隔（毫秒）：见 `stop()` 的 F2 说明 —— 在途请求应答完会变成空闲
  *  keep-alive 连接，只回收一次会漏掉它，`server.close()` 于是被对端 FIN 拖住。 */
 const SHUTDOWN_IDLE_SWEEP_MS = 50;
+/** 跨班补记一次最多枚举多少个班次（**只为防"配置异常时无限循环"**，不是业务上限：
+ *  3 班/天 ⇒ 1000 个班次 ≈ 333 天，远大于"服务停摆一天"这种真实场景；枚举超出即如实记错、不静默）。 */
+const MAX_BACKFILL_SHIFTS = 1000;
 /* 技术债 E58 的**临时闸已拆除**（T-20260930-08，负责人 2026-09-30 裁定的第②步）：
    闸的构成（`orderDoneSourceReady` 注入位 + `ORDER_DONE_SUPPRESS_REASON` 字面量 +
    `GET /health.orderWarningSource` 字段 + 启动日志的抑制行）全部随本轮删除 ——
@@ -307,7 +319,28 @@ const state = {
   /** DR-05 写入点（E58 ②）的运行计数：`writes` 累计成功、`failures` 累计失败 + 最后一次原因。
    *  为什么要它：固化失败**不许污染采集链**（故 `persistJudgement()` 只记不抛），
    *  但"悄悄不写"必须看得见 —— 与 `ingest` 计数 `sampledHookFailures` 同一纪律。 */
-  resultWrite: { writes: 0, failures: 0, lastError: null }
+  resultWrite: { writes: 0, failures: 0, lastError: null },
+  /** DR-06（`shift_stat`，技术债 `E59`）写入点的运行计数 ＋ **跨班检测的进程内状态**：
+   *  · `writes` 累计成功固化/补记的班次行数、`backfills` 其中"错过边界后补记"的行数、
+   *    `failures` 累计失败 + 最后一次原因（失败**只记不抛**：固化是派生，不许污染采集链）；
+   *  · `lastShiftKey` ＝ **上次所见班次**（`<班次日期>|<班次名>`）—— 它是"跨班"判据的被减数；
+   *    进程重启后为空，届时由 `previousFrameShiftOf()` 从 `measure_rt` 里**回读**上次采样所属班次
+   *    （ADR-0009 C3 被否掉的那个后果：重启错过边界不得永久漏固化）；
+   *  · `lastShift` 同上的完整班次对象（枚举补记区间要用它的 `endAt`）。 */
+  shiftStatWrite: {
+    writes: 0, backfills: 0, failures: 0, lastError: null,
+    lastShiftKey: null, lastShift: null, staleFrames: 0
+  },
+  /** DR-08（`warning`，技术债 `E62`）写入点的运行计数：
+   *  `writes` 累计**新落**的预警条数、`duplicates` 幂等命中（同一归属键已在库中）的次数、
+   *  `skippedOk` 被过滤掉的 `ok` 回执条数（`ok` 不是预警，见 `repo/warning.js` 文件头）、
+   *  `failures` + `lastError` 同 `resultWrite` 的纪律（只记不抛、不吞）。 */
+  warningWrite: {
+    writes: 0, duplicates: 0, skippedOk: 0, failures: 0, lastError: null, lastWarnType: null
+  },
+  /** 最近一次**整机快照**（`createStateSnapshot()` 的产物）：`/health` 的 `runAccum` 从它只读引用
+   *  （`snapshot.lastRunAccum`）。未生成过 ⇒ null（键恒在，"还没有这个数"与"这个数是 0"分得开）。 */
+  snapshot: null
 };
 
 /**
@@ -347,6 +380,25 @@ function listenAddress() {
     : { address: DEFAULT_HOST, port: DEFAULT_PORT, family: '' };
 }
 
+/** `addRunSec` 上界的**活读数**（ADR-0009 D3，负责人 2026-10-02 授权重设）：
+ *  上界＝**当班班次的 `elapsedSec`**（班次已进行时长），依据与可证伪读数写在
+ *  `server/services/stats.js` 的「五、累计运行」段。为什么放进 `/health`：这个界刚刚从
+ *  `runSec` 换掉，"现场到底按哪个界在拒收增量"必须能被巡检读到（不能只活在注释里）。
+ *  值**现算**（注入时钟 ＋ 班次真源 `services/shift.js`，不另造第二套班次口径）；
+ *  取不到（配置缺口/时钟异常）⇒ 各数值给 `null` 并把原因写进 `error`（**不编造 0**）。 */
+function addRunSecBoundPayload() {
+  const rule = '0 ≤ addRunSec ≤ shift.elapsedSec';
+  const basis = 'ADR-0009 D3（旧上界 `≤ runSec` 在"无采集串且无「测试中」件"时恒为 0 ⇒ 任何非零增量被拒）';
+  try {
+    const cfg = require('../src/config/board.config');
+    const rules = createShiftRules(((cfg && cfg.shift) || {}).list || []);
+    const s = rules.at(currentClock().now());
+    return { rule, basis, elapsedSec: s.elapsedSec, totalSec: s.totalSec, shift: { date: s.date, name: s.name } };
+  } catch (err) {
+    return { rule, basis, elapsedSec: null, totalSec: null, shift: null, error: String((err && err.message) || err) };
+  }
+}
+
 /** `GET /health` 的响应体。字段口径写在 `server\README`（本包无 README，见回执"未决"）与 tests 断言里。 */
 function healthPayload() {
   const addr = listenAddress();
@@ -377,7 +429,32 @@ function healthPayload() {
        `T-20260930-08` 拆除 —— 抑制事实不再需要"可被读到"，因为抑制已不存在：
        件数由写入点（1 s 采样落库之后按件 upsert）驱动，真值是多少就报多少。
        DR-05 写入点的运行计数见 `state.resultWrite`（失败不静默）。 */
-    lastError: state.lastError
+    lastError: state.lastError,
+    /* ---- ADR-0009（T-20261002-05）新增的三块可观测字段（沿 `state.resultWrite` 先例）----
+       DR-06／DR-08 的写入点都是"失败只记不抛"（不许污染采集链），故**必须**能从这里读到"写没写、
+       写失败没有、上次是哪个班次/哪类预警"；`null` 与 `0` 的含义分开（键恒在）。 */
+    shiftStatWrite: {
+      writes: state.shiftStatWrite.writes,
+      backfills: state.shiftStatWrite.backfills,
+      failures: state.shiftStatWrite.failures,
+      lastError: state.shiftStatWrite.lastError,
+      lastShiftKey: state.shiftStatWrite.lastShiftKey,
+      staleFrames: state.shiftStatWrite.staleFrames
+    },
+    warningWrite: {
+      writes: state.warningWrite.writes,
+      duplicates: state.warningWrite.duplicates,
+      skippedOk: state.warningWrite.skippedOk,
+      failures: state.warningWrite.failures,
+      lastError: state.warningWrite.lastError,
+      lastWarnType: state.warningWrite.lastWarnType
+    },
+    /* `addRunSec` 的**上界**（ADR-0009 D3 重设）：现算的活读数（规则串 ＋ 当班 elapsedSec/totalSec） */
+    addRunSecBound: addRunSecBoundPayload(),
+    /* DR-17 累计运行的**取数来源**（最近一次整机快照的读数）：日/月/年＝`shift_stat.sumRunSec()` 求和、
+       当班增量＝`shift_stat.getShiftRow()` 的"上次累计"之差；`undetermined` ＝该档"无法判定"的班次数
+       （状态位，**不是** 0 —— 见 `repo/shiftStat.js` 文件头）。没做过快照 ⇒ null。 */
+    runAccum: state.snapshot && state.snapshot.lastRunAccum ? state.snapshot.lastRunAccum : null
   }, ifd ? { ifd } : {});
 }
 
@@ -415,6 +492,15 @@ async function start(options = {}) {
   state.lastError = null;
   /* DR-05 写入点的运行计数随本轮启动归零（与 lastError 同一处纪律：上一轮的失败不该赖在新一轮头上） */
   state.resultWrite = { writes: 0, failures: 0, lastError: null };
+  /* DR-06／DR-08 写入点的计数与"上次所见班次"同理归零（跨班检测的进程内记忆不得跨启动沿用） */
+  state.shiftStatWrite = {
+    writes: 0, backfills: 0, failures: 0, lastError: null,
+    lastShiftKey: null, lastShift: null, staleFrames: 0
+  };
+  state.warningWrite = {
+    writes: 0, duplicates: 0, skippedOk: 0, failures: 0, lastError: null, lastWarnType: null
+  };
+  state.snapshot = null;
   /* 时钟注入出口（E42）：从这里起，本进程的"现在几点"只有一个来源 */
   state.clock = resolveClock(options);
   const installSignalHandlers = options.installSignalHandlers !== false;
@@ -428,6 +514,11 @@ async function start(options = {}) {
      ⚠ 实测踩过：闭包里直接引用那个局部变量 ⇒ 每次判定挂钩都抛 `ReferenceError`、`warning`
      事件永不发布（`harness-check` 段⑦e **7 条断言当场变红**才是发现它的原因）。 */
   const boardCfg = options.boardConfig || require('../src/config/board.config');
+
+  /* 班次真源（DR-06／FR-4.16）：**只建一次**，全进程共用 —— 跨班检测、固化与补记都经它取班次，
+     绝不在这里另写一套边界算式（`end=24`／跨零点／归属日回退都只在 `services/shift.js` 里）。
+     配置非法（缺口/零长度）时 `createShiftRules()` 会抛错 ⇒ 属启动期致命错误，如实抛出、不兜底。 */
+  const shiftRules = createShiftRules(((boardCfg && boardCfg.shift) || {}).list || []);
 
   /* ---- 2b.（已删除）E58 临时闸 ----
       T-20260930-05 曾在此处按 E58 的裁定①立一道临时闸（`orderDoneSourceReady`，默认 off ⇒
@@ -561,8 +652,10 @@ async function start(options = {}) {
     /* W5-①：`frame` 事件在 ingest 的 **1 s 采样落库**点发布（500 ms 原始帧不发布） */
     bus,
     /* W5-②（E45）：判定挂钩 —— 与 `frame` 事件**同一写入点**（1 s 采样落库成功之后），
-       实现在下方 6e-2 段（`emitWarnings`），此处只把函数引用交给 ingest。 */
-    onSampled: frame => emitWarnings(frame)
+       实现在下方 6e-2 段（`emitWarnings`），此处只把函数引用交给 ingest。
+       `T-20261002-05`（ADR-0009 D1／D3）起，这个 tick 上挂**两件事**（见 `onSampledTick()`）：
+       先 DR-06 的跨班固化（`freezeCrossedShifts`），再 DR-05＋DR-08 的判定与预警落库（`emitWarnings`）。 */
+    onSampled: frame => onSampledTick(frame)
   });
   /* 把 IF-D 状态快照挂到 router 上（**只挂一个只读函数**，不改 router.js）：
      `healthPayload()` 据此把断连状态一并暴露到 `GET /health`（FR-2.6 的"可被读取"），
@@ -677,6 +770,9 @@ async function start(options = {}) {
     upload: upload.instance,
     logger
   });
+  /* `/health.runAccum` 的取数口：快照函数对象上挂着最近一次 DR-17 读数（`snapshot.lastRunAccum`），
+     这里把它登记到进程态，`healthPayload()` 才能只读引用（不做第二份核算）。 */
+  state.snapshot = snapshot;
   const sse = router.mountSSE({ bus, snapshot, logger });
   logger.info(`[路由] SSE 业务推送已接线（${sse.by}）：${sse.routes.join(' , ')}；` +
     `事件种类=${require('./services/eventBus').KINDS.join('/')}；` +
@@ -949,6 +1045,22 @@ async function start(options = {}) {
     }
   }
 
+  /**
+   * **1 s 采样 tick 的挂钩体**（交给 `ingest` 的 `onSampled`；与 `frame` 事件同一写入点）。
+   *
+   * 顺序固定（两条互不依赖，但先固化事实、再做判定装配更符合"先有事实再有通知"）：
+   *   ① `freezeCrossedShifts(frame)` —— DR-06：检测**跨班** ⇒ 固化上一班（含错过补记），
+   *      自带 try/catch（失败只记不抛：不许污染采集链，计数见 `/health.shiftStatWrite`）；
+   *   ② `emitWarnings(frame)` —— DR-05 按件固化 ＋ 判定发布（`warning` 事件）＋ DR-08 预警落库。
+   *  ⚠ ①**不能**放进 `emitWarnings()` 内部："库内没有生效标准 ⇒ 本次不判定"那条早退会把跨班检测
+   *    一并跳掉（没有工单/标准时 DR-06 的固化恰恰**更**需要发生 —— 那些班次的运行时长是真实事实）。
+   *  ⚠ 本 tick 内**不新增任何定时器**（ADR-0009 D3①：沿用"节流而不新起定时器"的工程约定）。
+   */
+  function onSampledTick(frame) {
+    freezeCrossedShifts(frame);
+    return emitWarnings(frame);
+  }
+
   /** 判定挂钩（交给 `ingest` 的 `onSampled`）：算一次判定 → **固化到 result** → 按（固化后的）
    *  **真实件数**发布 `warning` 事件。抛出的异常由 ingest 的 try/catch 收下（见 ③ 段），此处不吞不掩
    *  （固化那一段自带 try/catch —— 见 `persistJudgement()` 的失败口径）。
@@ -1007,7 +1119,7 @@ async function start(options = {}) {
     /* ---- 第二拍：按**固化之后**的真实件数组织发布 ----
        固化成功 ⇒ 用刚写进去的件数**重算**一次（`result` 不依赖它 ⇒ 第二次的 `result` 与第一次相同）；
        固化失败/未固化 ⇒ 件数没变，沿用第一拍那一次算出的件数（该帧的预警事件照发，见真计数④）。 */
-    return judge.evaluate({
+    const published = judge.evaluate({
       now: at,
       real: { depth: frame.depth, speed: frame.speed },
       standard,
@@ -1015,6 +1127,285 @@ async function start(options = {}) {
       shouldDone,
       doneQty: persisted ? doneQtyOf(procOrderNo) : doneQty
     }, { bus });
+    /* ---- DR-08（`warning` 表，技术债 `E62`）：**判定发布点同批落库**（ADR-0009 D1）----
+       与上面那次发布**同一个 tick、同一帧**，紧随其后（顺序理由见 `persistWarnings()` 的 docblock：
+       预警落库不反哺判定，故不需要 `result` 那种"先固化后发布"；发布失败/落库失败互不牵连）。 */
+    persistWarnings(frame, published, at, unitIndex);
+    return published;
+  }
+
+  /* ---- 6e-4. DR-06（`shift_stat`）的写入点 —— 技术债 `E59` 的落地（ADR-0009 D1／D3，T-20261002-05）----
+     背景（E59）：`shift_stat`（DR-06，14 列早已在 `schema.sql` 就绪、**不改表**）此前**零写入点** ⇒
+     `DR-17`「累计运行」名不副实（跨班不清零、跨零点归属失效；`stateSnapshot` 只能写 `addRunSec: 0`）。
+     本段按 ADR-0009 D3① 的触发点落地：**在既有的 1 s 采样 tick 内检测"跨班"后固化上一班**，
+     **不新增定时器**；跨班时刻被跳过的，**下次采样按序补记**（"补记口径须可测"）。
+     固化口径（四条；"正常固化"与"补记"走**同一条**路径，区别只在"这一班我们看没看见过"）：
+       · **窗口**＝该班次的 `[startAt, endAt)`（半开区间；班次真源＝`services/shift.js`，不重算边界）；
+       · **取数**＝`stateSnapshot.statsForShift()`（**唯一取数口**，与 `GET /state` 同一份 SQL）；
+       · **过去的班次** ⇒ `elapsedSec` 取 `totalSec`（整班已过完，不再是"活班次"）；
+       · **不得伪造数据**（技术债 `E38` 的既有口径）：该窗口内**一条采集帧都没有** ⇒ 运行时长
+         **无法判定** ⇒ `oee`/`pass_rate` 落 **NULL**（列约束下 `run_sec`/`idle_sec` 只能是 0，
+         但读方以那两列 NULL 为准，**不得**把 0 读成"零运行"）—— 逐条写在 `repo/shiftStat.js` 的
+         文件头与 `shiftStatRowOf()`。 */
+
+  /** 班次归属键（＝`shift_stat` 唯一索引 `ux_shift_stat(shift_date, shift_name)` 的两列） */
+  function shiftKeyOf(s) { return `${s.date}|${s.name}`; }
+
+  /** 某班次的**完整**班次对象（供固化用）：`elapsedSec` 一律取 `totalSec` ——
+   *  只有"已经跑完的班次"才会被固化/补记（正在跑的那一班不固化，它的读数由 `GET /state` 现算）。 */
+  function completedShiftOf(startAtText) {
+    const s = shiftRules.at(startAtText);
+    return Object.assign({}, s, { elapsedSec: s.totalSec, remainingSec: 0 });
+  }
+
+  /** 上次采样帧所属的班次（**进程重启后的"记忆回读口"**）：取 `measure_rt` 里**早于本帧采集时刻**的
+   *  最近一条 `collect_time`，算出它属于哪个班次。
+   *  为什么需要它：跨班检测的被减数（"上次所见班次"）是**进程内状态**，服务端重启就没了；而
+   *  ADR-0009 否掉 C3 方案的理由正是"服务端重启/卡顿错过边界即永久漏固化"——库里的采样帧还在，
+   *  故从库里回读上次所见班次，重启后照样能按序补记（库是唯一真源，进程内记忆只是缓存）。
+   *  没有更早的帧（新库/首次启动）⇒ `null`：首次 tick 只记当前班次，**不编造上一班**。 */
+  function previousFrameShiftOf(frame) {
+    if (!state.db) return null;
+    const at = collectTimeTextOf(frame);
+    const row = state.db.prepare(
+      `SELECT collect_time AS collectTime FROM measure_rt
+        WHERE collect_time < ? ORDER BY collect_time DESC LIMIT 1`).get(at);
+    if (!row || !row.collectTime) return null;
+    let s = null;
+    try { s = completedShiftOf(row.collectTime); } catch { return null; }   // 该时刻不属任何班次（配置缺口）
+    return { key: shiftKeyOf(s), date: s.date, name: s.name, startAt: s.startAt, endAt: s.endAt };
+  }
+
+  /** 把一个班次的**库内真源读数**装成 `shift_stat` 的一行（固化与补记共用；口径见 6e-4 段头）。
+   *  ⚠ "无法判定"的两个**状态位**（`oee`/`pass_rate` 为 `null`）是本函数**刻意**给出的，别改成 0：
+   *    · `frameCount === 0` ⇒ 该窗口没有采集数据 ⇒ **运行时长无法判定**（设备没跑 / 链路断了 /
+   *      服务没运行，三者**不可区分**）⇒ `oee: null`（`runSec`/`idleSec` 受列约束只能 0，占位而已）；
+   *    · `pieceCount === 0` ⇒ 没有判定件 ⇒ 合格率**无法计算**（分母为 0，不是 0%）⇒ `passRate: null`。 */
+  function shiftStatRowOf(shift) {
+    const taken = statsForShift(state.db, shift, { config: boardCfg, now: shift.endAt, addRunSec: 0 });
+    const s = taken.stats;
+    const f = taken.fact;
+    const runDeterminable = f.frameCount > 0;
+    const rateDeterminable = f.pieceCount > 0;
+    const nowText = platformClock.fmt(currentClock().now());
+    return {
+      shiftDate: shift.date,
+      shiftName: shift.name,
+      planQty: s.planQty,
+      startedQty: s.startedQty,
+      finishedQty: s.doneQty,
+      qualifiedQty: s.passQty,
+      failedQty: s.failQty,
+      retestQty: s.retestQty,
+      passRate: rateDeterminable ? s.firstPassRate : null,
+      runSec: runDeterminable ? s.runSec : 0,
+      idleSec: runDeterminable ? s.idleSec : 0,
+      oee: runDeterminable ? s.oee : null,
+      /* 固化（或补记）**动作发生**的时刻（注入时钟）。补记行的 `frozen_at` 晚于班次结束时刻 ——
+         两者之差就是"补记"这件事的可读证据（本表没有状态位列，且 ADR-0009 D5 不允许新增列）。 */
+      frozenAt: nowText,
+      createdAt: nowText
+    };
+  }
+
+  /** 固化/补记一个班次（唯一写入口＝`repo/shiftStat.js` 的 `upsertFrozen()`）；失败**只记不抛**。 */
+  function freezeShift(shift) {
+    const row = shiftStatRowOf(shift);
+    try {
+      return shiftStatRepo.upsertFrozen(state.db, row);
+    } catch (err) {
+      state.shiftStatWrite.failures++;
+      state.shiftStatWrite.lastError = String((err && err.message) || err);
+      if (logger) {
+        logger.warn('[DR-06] shift_stat 写入失败（帧已落库、判定照跑；本条只影响班次固化的持久化）：' +
+          `${state.shiftStatWrite.lastError}（班次 ${row.shiftDate} ${row.shiftName}）`);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * **跨班检测 ＋ 固化上一班 ＋ 按序补记**（只在既有的 1 s 采样 tick 内跑，**不新增定时器**）。
+   *
+   * 判据：帧的**采集时刻**所属班次（`shiftRules.at(at)`）与"上次所见班次"不同 ⇒ 发生了跨班；
+   *   · 时间**向前**跨（`cur.startAt > lastShift.startAt`）才当作边界；乱序/迟到帧（时间倒退）
+   *     计进 `/health.shiftStatWrite.staleFrames`，**不固化**（否则会把"回头路"当边界、
+   *     去固化一个还没结束的班次）；
+   *   · 中间被跳过的班次**逐个枚举**（从上一班的 `endAt` 起步走班次真源，走到当前班次为止）⇒
+   *     "一跳 N 个边界 ⇒ 补记 N 个班次"，顺序＝旧 → 新。
+   * @returns {{frozen:number, backfilled:number, list:string[]}|null} 自报（日志/探针用；异常时 null）
+   */
+  function freezeCrossedShifts(frame) {
+    const st = state.shiftStatWrite;
+    try {
+      const at = collectTimeTextOf(frame);
+      let cur = null;
+      try {
+        cur = shiftRules.at(at);
+      } catch (err) {
+        /* 配置缺口（该时刻不属任何班次）⇒ 不固化、不猜；如实记一条（`services/shift.js` 的口径就是抛错） */
+        st.failures++;
+        st.lastError = `班次归属失败：${(err && err.message) || err}`;
+        if (logger) logger.warn(`[DR-06] 跨班检测跳过：${st.lastError}`);
+        return null;
+      }
+      const curKey = shiftKeyOf(cur);
+      if (!st.lastShiftKey) {
+        /* 本进程的首次 tick：先尝试**从库回读**上次所见班次（覆盖"重启跨越了边界"的情形）；
+           回读不到 ⇒ 只记当前班次（不编造上一班）。 */
+        const prev = previousFrameShiftOf(frame);
+        if (prev && prev.startAt < cur.startAt) {
+          st.lastShiftKey = prev.key;
+          st.lastShift = prev;
+        } else {
+          st.lastShiftKey = curKey;
+          st.lastShift = cur;
+          return { frozen: 0, backfilled: 0, list: [] };
+        }
+      }
+      if (st.lastShiftKey === curKey) return { frozen: 0, backfilled: 0, list: [] };
+      if (cur.startAt <= st.lastShift.startAt) {          // 时间倒退：不是边界
+        st.staleFrames++;
+        return null;
+      }
+      /* 枚举 [上次所见班次, 当前班次) 之间的**全部**班次（含上次所见那一班，它是"正常固化"）：
+         从"上一班的结束时刻"起步走班次真源 —— 半开区间 `[start, end)` ⇒ 边界时刻恰落在**下一班**，
+         故一步一班、不会重复也不会漏。 */
+      const list = [completedShiftOf(st.lastShift.startAt)];
+      let cursor = st.lastShift.endAt;
+      let truncated = false;
+      while (list.length <= MAX_BACKFILL_SHIFTS) {
+        const next = shiftRules.at(cursor);
+        if (shiftKeyOf(next) === curKey) break;
+        if (next.startAt <= list[list.length - 1].startAt) { truncated = true; break; }   // 不前进 ⇒ 停
+        list.push(completedShiftOf(next.startAt));
+        cursor = next.endAt;
+      }
+      if (list.length > MAX_BACKFILL_SHIFTS) truncated = true;
+      if (truncated) {
+        st.failures++;
+        st.lastError = `补记枚举中断：已达上限 ${MAX_BACKFILL_SHIFTS} 个班次仍未到达 ${curKey}`;
+        if (logger) logger.warn(`[DR-06] ${st.lastError}（已枚举到的班次照常固化，不静默）`);
+      }
+      /* 按时间序（旧 → 新）固化：`list[0]` 是上次所见的那一班，其余（i > 0）是**补记**。 */
+      const written = [];
+      let backfilled = 0;
+      for (let i = 0; i < list.length; i++) {
+        const r = freezeShift(list[i]);
+        if (r && r.written) {
+          written.push(r.shiftKey);
+          if (i > 0) { backfilled++; st.backfills++; }
+        }
+      }
+      if (written.length) st.writes += written.length;
+      /* 记住"当前班次"，下一 tick 的被减数就是它 */
+      st.lastShiftKey = curKey;
+      st.lastShift = cur;
+      if (written.length && logger) {
+        logger.info(`[DR-06] 跨班固化：${written.join(' , ')}（其中补记 ${backfilled} 个错过的边界；` +
+          `固化时刻=${platformClock.fmt(currentClock().now())}）`);
+      }
+      return { frozen: written.length, backfilled, list: written };
+    } catch (err) {
+      st.failures++;
+      st.lastError = String((err && err.message) || err);
+      if (logger) logger.warn(`[DR-06] 跨班固化异常（不污染采集链、判定照跑）：${st.lastError}`);
+      return null;
+    }
+  }
+
+  /* ---- 6e-3 追加：DR-08（`warning` 表）的落库 —— 技术债 `E62` 的落地（ADR-0009 D1，T-20261002-05）----
+     背景（E62）：`warning`（DR-08）此前**零写入点** ⇒ 判定产出经 SSE 发出后**不落库**、无预警历史。
+     写入点＝**判定发布点同批**（`emitWarnings()` 内、`judge.evaluate(…,{bus})` 那次发布之后，
+     同一个 tick、同一帧）—— 与 ADR-0009 D1 的表述逐字一致。
+     **顺序：先发布、后落库**（与 `result` 的"先固化后发布"相反），理由两条：
+       · `result` 必须先固化，是因为 `FR-5.11` 的减数「已完成」读的正是它（**有反馈回路**）；
+         而预警落库**不反哺判定**（`judge.evaluate()` 不读 `warning` 表）⇒ 顺序无因果影响；
+       · 落库失败**只记不抛**（沿 `persistJudgement()` 的纪律）：不该因为库写不进去就把本条预警的
+         SSE 推送也吞掉 —— 推送与落库是两件事。
+     **只落 `lv !== 'ok'` 的条目**：`ok` 是"参数均处于允许范围"的**回执条**（FR-5.8／C-88 的
+     "标准未设定 ⇒ 两条都不产生"同源），把它写进"预警记录表"就是把非预警记成预警（计数见
+     `/health.warningWrite.skippedOk`）。
+     **幂等键**＝`(warn_type, 归属键)`，归属键写在 `trigger_cond` 的前缀里（结构不动 ⇒ 无列可加、
+     无唯一索引可用；逐条理由与形态见 `repo/warning.js` 文件头）。归属成分"拿不到"时一律写成
+     `无工单`／`无件序号`／`无归属日`，**不编造 1 或当天**（E60 裁定①的同一纪律）。 */
+
+  /** 参数类预警的**参数名**（`depth`/`speed`）—— 从 detail 的前缀导出。
+   *  `judge.paramDetail()` 逐字以 `PARAM_CN[kind] + ' '` 开头（"深度 5.22（标准 …）"），
+   *  故这是**确定性**的导出、不是猜；导出不来 ⇒ `null`（调用方退化为"把 detail 也放进键"，不合并）。 */
+  function paramKindOf(detail) {
+    const text = typeof detail === 'string' ? detail : '';
+    for (const kind of judge.PARAMS) {
+      const cn = judge.PARAM_CN[kind];
+      if (cn && text.startsWith(cn + ' ')) return kind;
+    }
+    return null;
+  }
+
+  /** 预警的**归属键**（幂等键的实质；形态与理由见 `repo/warning.js` 文件头）。
+   *  ⚠ 归一化只做到"归属"这一层，**不碰等级**（等级由 `warn_type` 承载）：
+   *    同一件同一参数的 `warn`→`err` 是**新的预警事实**，各记一条。 */
+  function warnDedupeKeyOf(warning, ctx) {
+    const title = warning && warning.title ? String(warning.title) : '';
+    const day = ctx.shiftDate || '无归属日';
+    const owner = ctx.procOrderNo ? `工单${ctx.procOrderNo}` : '无工单';
+    const piece = ctx.unitIndex === null || ctx.unitIndex === undefined ? '无件序号' : `第${ctx.unitIndex}件`;
+    const detail = warning && warning.detail ? String(warning.detail) : '';
+    if (title === judge.WARN_TITLES.warn || title === judge.WARN_TITLES.err) {
+      /* C-88 的两条具名参数类：**一个参数一条**（同态也各出一条）⇒ 键必须含参数名，否则会把
+         "深度超范围"与"速度超范围"合并成一条（静默丢预警）。 */
+      const kind = paramKindOf(detail);
+      return kind
+        ? `参数|${day}|${owner}|${piece}|${kind}`
+        : `参数|${day}|${owner}|${piece}|未知|${detail}`;
+    }
+    if (title === judge.OTHER_TITLES.order) return `工单超时|${day}|${owner}`;
+    if (title === judge.OTHER_TITLES.maintenance) {
+      /* 维保到期按**维保周期**归一（同一周期只记一条）："下次维保日"＝配置真源的纯函数产物
+         （`judge.maintenanceState()`）；算不出来 ⇒ 退化为按 detail（不合并、不丢条）。 */
+      try {
+        const st = judge.maintenanceState(ctx.at);
+        return st && st.next ? `维保|${st.next}` : `维保|${detail}`;
+      } catch { return `维保|${detail}`; }
+    }
+    if (title === judge.OTHER_TITLES.consumable) return `耗材|${day}|${title}`;
+    /* 未知类型（判定引擎日后新增一类而这里没跟上）⇒ 按原文入键：**宁可多记一条，也不合并**。 */
+    return `${title}|${day}|${owner}|${piece}|${detail}`;
+  }
+
+  /** DR-08 落库（在判定发布点**同批**调用）；失败只记不抛。
+   *  `unitIndex` 由调用方**只取一次**后传入（`unitIndexOf()` 每次都会记 warn 日志，重复调用会打两遍）。 */
+  function persistWarnings(frame, out, at, unitIndex) {
+    const w = state.warningWrite;
+    const list = out && Array.isArray(out.warnings) ? out.warnings : [];
+    const rawNo = frame ? frame[FIELD_PROC_ORDER_NO] : undefined;
+    const procOrderNo = rawNo === undefined || rawNo === null ? '' : String(rawNo);
+    let shiftDate = null;
+    try { shiftDate = shiftRules.at(at).date; } catch { shiftDate = null; }
+    const ctx = { shiftDate, procOrderNo, unitIndex, at };
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      if (item.lv === 'ok') { w.skippedOk++; continue; }   // `ok` 回执条不是预警（见上面段头）
+      try {
+        const r = warningRepo.insertWarning(state.db, {
+          warnType: item.title,
+          triggerCond: item.detail,
+          triggeredAt: at,
+          createdAt: platformClock.fmt(currentClock().now()),
+          dedupeKey: warnDedupeKeyOf(item, ctx)
+        });
+        if (r.written) w.writes++; else w.duplicates++;
+        w.lastWarnType = r.warnType;
+      } catch (err) {
+        w.failures++;
+        w.lastError = String((err && err.message) || err);
+        if (logger) {
+          logger.warn('[DR-08] warning 表写入失败（预警已发布；本条只影响预警历史）：' +
+            `${w.lastError}（${JSON.stringify(item.title)}）`);
+        }
+      }
+    }
+    return { writes: w.writes, duplicates: w.duplicates, skippedOk: w.skippedOk, failures: w.failures };
   }
 
   logger.info(`[预警] 判定装配已接线（W5-② / E45）：发布点=ingest 的 onSampled（1 s 采样落库之后）；` +
@@ -1030,6 +1421,18 @@ async function start(options = {}) {
     `待复检不计"已完成"（与 stats.DONE_STATUS 同口径）；写失败只记不抛（state.resultWrite.failures）。` +
     `E58 的临时抑制闸已按裁定**整段拆除** ——「已完成件数」现在由本条写入点说话；` +
     `**拿不到件序号（帧未带/非法 unitIndex）⇒ 本写入点整条不跑**（不再缺省 1，E60 裁定①）`);
+  logger.info(`[DR-06] shift_stat 写入点已接线（技术债 E59 收口／ADR-0009 D1＋D3）：触发点=**同一个 1 s 采样 tick**` +
+    `（不新增定时器）内检测跨班 ⇒ 固化上一班，被跳过的边界**下次采样按序补记**（重启后从 measure_rt 回读上次所见班次）；` +
+    `取数=stateSnapshot.statsForShift()（与 GET /state 同一份 SQL）；` +
+    `**无采集帧的班次不伪造 0**：oee/pass_rate 落 NULL＝"无法判定"（run_sec/idle_sec 受列约束只能 0，读方以 NULL 为准）；` +
+    `幂等=ux_shift_stat 唯一索引 upsert（同班次不新增行）；计数见 /health.shiftStatWrite`);
+  logger.info(`[DR-08] warning 表写入点已接线（技术债 E62 收口／ADR-0009 D1）：与**判定发布点同批**` +
+    `（emitWarnings 内、warning 事件发布之后、同一 tick）；只落 lv≠ok 的预警条（ok 回执条不是预警）；` +
+    `幂等键=(warn_type, 归属键)，归属键写在 trigger_cond 前缀（结构不动 ⇒ 无唯一索引可用，见 repo/warning.js）；` +
+    `归属拿不到就写"无工单/无件序号/无归属日"（不编造）；写失败只记不抛，计数见 /health.warningWrite`);
+  logger.info(`[DR-17] 累计运行取数已改真源：日/月/年＝对 shift_stat 求和（shift_date 归属 ⇒ 跨零点/跨月正确），` +
+    `当班增量＝当班runSec − 该班次已固化run_sec；addRunSec 上界按 ADR-0009 D3 **重设**为 elapsedSec` +
+    `（旧上界 runSec 在"无采集串且无在测件"时恒 0）；活读数见 /health.addRunSecBound 与 /health.runAccum`);
 
   /* ---- 6f. W5-① 追加：静态托管（同源入口）＋ CORS（`file://` / 回环源） ----
      依据负责人 2026-09-28 裁定「选项 A」：

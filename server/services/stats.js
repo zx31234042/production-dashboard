@@ -87,7 +87,10 @@ function pct(a, b) {
  *   @param {object}   input.accum     累计运行上次落库值（DR-17），形如 { daySec, monthSec, yearSec, at }
  *   @param {number}   [input.addRunSec] **本周期增量**秒数（上次核算之后新增的运行时长）。
  *       缺省即 **0**（不是"当班已运行时长"）—— 见下方 P2-4 说明；调用方必须显式给出增量。
- *       边界：必须是 0 ≤ addRunSec ≤ runSec 的有限数，越界即抛错（防重复相加导致累计虚高）。
+ *       边界（ADR-0009 D3，负责人 2026-10-02 **授权重设**）：必须是
+ *       **0 ≤ addRunSec ≤ `elapsedSec`（班次已进行时长）** 的有限数，越界即抛错。
+ *       依据与"为什么不是 `runSec`"逐条写在下方「五、累计运行」段 —— 旧上界会让
+ *       "无采集串且无「测试中」件"时**任何非零增量都被拒收**（`E59` 接线即爆）。
  *   @param {number}   [input.planQty]  当班计划数（FR-4.1）的**显式覆盖值**；
  *       缺省 ＝ `Σ orders[].planQty`。★ 服务端**不得**再拿 `board.config.js` 的 `production.planQty`
  *       顶替（那项自 `E65` 起**仅供前端演示**）—— 无派工 ⇒ 计划数就是 **0**，不编造。
@@ -164,6 +167,8 @@ function computeShiftStats(input) {
        入参分离后，若调用方只喂票级数据（或件级里没有「测试中」行），`running` 恒 0 ⇒ `runSec` 恒 0 ⇒
        `addRunSec` 的上界校验（`addRunSec ≤ runSec`）会对**任何非零增量**抛错，把"读数噪声"升级成
        **异常**（`tests\logic-check.js:395` 与 `tests\contract-check.js:1117` 两个现场实测如此）。
+       ⚠ **该上界已按 ADR-0009 D3（2026-10-02 负责人授权重设）改为 `≤ elapsedSec`** ——
+       见下方「五、累计运行」段；此处保留的只是"为什么 `runSec` 会恒 0"这一**历史成因**，不是现行判据。
        故判据改为按"**当班有没有采样帧**"取有效运行（`measures` 正是那一列的载荷）。
        ⚠ `E65` 自述的"三者组合下**观测等价**"**不成立**（座位 5 的 C·8.4 争议③ 已实测）：旧写法在
        "有采集串且无在测件"时得 0，与下面 `E68` 的新读数不同 —— 该句作废，按 `E68` 重述于下。
@@ -199,17 +204,41 @@ function computeShiftStats(input) {
   const oee = pct(runSec, elapsedSec);                         // FR-4.15 稼动率
   const avgTestSec = done > 0 ? Math.round(testSecSum / done) : 0; // FR-4.13 单台平均测试时长
 
-  /* ---------------- 五、累计运行（DR-17：单调不减、跨班次不清零） ---------------- */
-  /* DR-17 累计运行：`addRunSec` 是"**自上次核算以来**的新增运行时长"（增量），
+  /* ---------------- 五、累计运行（DR-17：单调不减、跨班次不清零） ----------------
+     DR-17 累计运行：`addRunSec` 是"**自上次核算以来**的新增运行时长"（增量），
      而 rollAccum 在同一天是 `daySec + add` —— 两者必须同为增量口径。
      旧实现缺省取 `runSec`（班次**累计**已运行时长），调用方一旦把上次落库的 accum 传回来，
      同日就会把"累计值当增量"重复相加，累计运行虚高（复审 P2-4 复现）。
-     故缺省改为 0，并对越界值直接报错而不是悄悄算错。 */
+     故缺省改为 0，并对越界值直接报错而不是悄悄算错。
+
+     ---- `addRunSec` 上界：**重设**为 `elapsedSec`（班次已进行时长）—— ADR-0009 D3（2026-10-02 负责人
+     **授权重设**），依据三条（**不是**"放宽成不校验"）：
+       ① **物理上界**：`addRunSec` 是"本周期新增的**有效运行**时长"，而有效运行只可能落在**已经过去的
+          时间**里 —— 本文件「三、时长」段自己就是这么取的：有采集串时 `byMeasures = min(elapsedSec, …)`、
+          无采集串但有在测件时直接取 `elapsedSec`。故 `runSec ≤ elapsedSec` 是既有事实，
+          `elapsedSec` 才是那个"任何合法增量都不可能越过"的界。
+       ② **旧上界 `≤ runSec` 是"读数形态"冒充物理界**：`runSec` 由**入参形态**决定
+          （无采集串且无「测试中」件 ⇒ `runSec` 恒 0 —— `E68` 把分档由 3 档收窄为 2 档后连 n=1 都取 0）
+          ⇒ 与 `shift_stat` 一旦接线（增量来自**上一班已固化的 `run_sec`**，与本拍有没有帧无关），
+          任何非零增量都会被判越界（`E59`／ADR-0009 D3② 明写此耦合必爆）。
+       ③ **越界仍是真错**：`addRunSec > elapsedSec` 只可能来自口径错位 —— 把累计值当增量、
+          秒与毫秒混淆（8 h 写成 28 800 000）、把别的周期算进来。一个班次里**跑不出**比班次已进行
+          时长更长的有效运行 ⇒ 拒收而不是收下算错。
+     **可证伪**（读数见 `tests\._verify\seat3-a1-probe.js` 第三节，三条一起给）：
+       · 同一组"无采集串 ＋ 无在测件"输入（`elapsedSec = 25200`）：`addRunSec = 3600`
+         ⇒ 旧形态（`> runSec`）**抛 RangeError**／新形态**通过**；
+       · `addRunSec = elapsedSec + 1` ⇒ 新形态**仍抛 RangeError**（界不是空的）；
+       · 定点变异（把界的表达式换成 `Number.MAX_SAFE_INTEGER`）⇒ 上面那条**由红转绿**
+         ⇒ 该断言真的在测"界"，不是在测"恒真"。
+     ⚠ 保持"必须是有限数且非负"（`0` 合法：本周期确实没有新增运行）。 */
   const rawAdd = input.addRunSec;
   const addRunSec = rawAdd === undefined ? 0 : Number(rawAdd);
-  if (!Number.isFinite(addRunSec) || addRunSec < 0 || addRunSec > runSec) {
+  /* 上界＝班次已进行时长（依据见上：有效运行不可能超过已经过去的时间） */
+  const addRunSecMax = elapsedSec;
+  if (!Number.isFinite(addRunSec) || addRunSec < 0 || addRunSec > addRunSecMax) {
     throw new RangeError(
-      `computeShiftStats: addRunSec 必须是 0～${runSec}（本周期增量）的有限数，收到 ${JSON.stringify(rawAdd)}`);
+      `computeShiftStats: addRunSec 必须是 0～${addRunSecMax}（本周期增量；上界＝班次已进行时长 ` +
+      `elapsedSec，ADR-0009 D3）的有限数，收到 ${JSON.stringify(rawAdd)}`);
   }
   const accum = accumulateRunTime(input.accum, addRunSec, now);
 
