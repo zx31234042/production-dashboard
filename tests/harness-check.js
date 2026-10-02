@@ -4835,7 +4835,18 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
    范围：`tests\*.js`（直下入口脚本）＋ `tests\lib\*.js` ＋ `server\index.js`（同为 `main()` 入口，
    与 `E78` 的普查口径一致：17 个）。`tests\._verify\` 下的历史副本/探针**不在范围** —— 那里存着
    旧写法的字节副本（`zz4b2-*`／`w4\bak\*` 等），纳入只会制造假红，与 `files-check` 的
-   `SKIP_DIRS` 是同一处理。 */
+   `SKIP_DIRS` 是同一处理。
+   `E79` 收口（`T-20261002-01`，由座位 5 在 `T-20260930-33` 用 7 组灰盒等价实验立案）：上面那条
+   "异常路径退 2"原本是**纯文本**判据 —— 它扫 `main().catch(`／`try { main() }` **之后直到文件尾**的
+   整段文本（只由"尾部 ≤ 1500 字符"那一道门限制），于是同一段文本里的**注释**（F1）／**字符串常量**
+   （F3）／**无关函数**（F4）里的 `process.exit(2)` 都被当成"退出证据"：catch 里其实退 1 也**假绿**；
+   而 `process.exit(EXIT_ERROR)`（`tests\env.js:54` 的真常量 2，F5）反被判**红**。本节现按 E79 三步
+   收口：① 先剥注释与字符串/模板串/正则（`stripLiterals`，**长度与换行保持** ⇒ 下标仍可做锚点）；
+   ② 退出证据**只取异常路径自身**的配对区间（async＝`.catch(…)` 的实参区间，sync＝`catch (…) {…}`
+   的块区间）；③ 退出码必须**证出是 2**（字面量 `2`，或 `tests\env.js` 真源里**值为 2** 的常量名）
+   ——"认常量"不等于"认任何常量"（`EXIT_FAIL` 仍判红）。配对/花括号没闭合＝拿不到边界 ⇒ **判红**
+   （判不了不许当通过）。F／G／H 三条新断言把上述四种形态逐一钉住；F 还在 `db-check.js` 的
+   **字节副本**上做定点变异（sha256 留痕、`Buffer.compare` 证还原、全程不落盘、不用 `git checkout`）。 */
 {
   /* 声明识别：取**最早**一处 `main` 声明 —— 注释/字符串里提到另一种写法时不至于误判
      （本文件下方就有 `async function main(` 的样例字符串，取最早即第 55 行的真声明）。
@@ -4863,7 +4874,138 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
 
   const MAIN_CATCH = /main\(\)\s*\.\s*catch\s*\(/;                        /* 推荐接法：.catch 挂在 promise 上 */
   const TOP_TRY_MAIN = /try\s*\{\s*main\s*\(\s*\)\s*;?\s*\}\s*catch/;    /* 靶子形态（对 async 无效） */
-  const EXIT2 = /process\.exit\(\s*2\s*\)|process\.exitCode\s*=\s*2/;
+  /* 入口接线到文件尾的余量上限（`E79` 建议③：把原来的裸 1500 提为**具名常量**，值不变）。
+     它只管"接线是不是落在尾部"，**不再**兼任"退出语句的搜索窗口" —— 退出证据改由下方 `hasExit2` ＋
+     `asyncExitRegion`／`syncExitRegion` 从异常路径**自身**的区间里取（假阳性通道就在那个窗口上）。 */
+  const ENTRY_TAIL_MAX = 1500;
+
+  /* ---------------- `E79`：退出证据只认**异常路径自身的代码** ----------------
+     旧写法把 `main().catch(` 之后的**整段文本**当"异常路径"，于是 F1 注释／F3 字符串/模板串／F4 其后
+     无关函数里的 `process.exit(2)` 都算"退 2"（catch 里其实退 1 ⇒ 假绿）；F5 `process.exit(EXIT_ERROR)`
+     反被判红。三步修法＝① 剥字面量（`stripLiterals`）② 只取异常路径自身的配对区间（`regionOf`）
+     ③ 退出码必须**证出是 2**（`exitCodeOf`，真源＝`tests\env.js`）。 */
+  const { createHash } = require('node:crypto');
+  const sha256Hex = buf => createHash('sha256').update(buf).digest('hex');
+
+  /* 退出码常量真源：**同源**读 `tests\env.js`（规范 9.5-5 的唯一定义处），不在这里写第二份数字 ——
+     写死一份就是埋一个会漂移的副本（F5 的根因正是判据不认这份真源）。读不到就返回空表 ⇒
+     §16-G 会因样本判红而**必红**（不许把"读不到真源"当通过）。 */
+  const readExitConsts = () => {
+    const map = new Map();
+    let src = '';
+    try { src = fs.readFileSync(path.join(env.paths.tests, 'env.js'), 'utf8'); } catch { return map; }
+    const re = /const\s+(EXIT_[A-Z0-9_]+)\s*=\s*(\d+)\s*;/g;
+    let m;
+    while ((m = re.exec(src))) map.set(m[1], Number(m[2]));
+    return map;
+  };
+  const EXIT_CONSTS = readExitConsts();
+
+  /** `/` 是正则字面量还是除号？只看**前一个有效字符**（已剥区是空格 ⇒ 注释/字符串不干扰判断）。
+      判错的代价：正则内容没剥掉（里面的 `{}`／`()` 会干扰配对 —— 由"配不上就判红"兜住），
+      或把除法算式当正则剥掉（只有把 `process.exit` 整段吞掉才可能改变结论）。 */
+  const isRegexStart = (out, i) => {
+    let k = i - 1;
+    while (k >= 0 && /\s/.test(out[k])) k--;
+    if (k < 0) return true;
+    if ('([{,;:=!&|?+-*%~^<>'.includes(out[k])) return true;
+    let w = k;
+    while (w >= 0 && /[A-Za-z_$]/.test(out[w])) w--;
+    return /^(return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await)$/.test(out.slice(w + 1, k + 1).join(''));
+  };
+
+  /** 把注释与字符串/模板串/正则的**内容**换成空格；**长度与换行保持不变** ⇒ 下标仍可直接当锚点。
+      目的：判据只认**代码**里的退出语句（`console.error('process.exit(2)')` 不是退出证据 —— F1/F3/F4）。 */
+  const stripLiterals = src => {
+    const out = src.split('');
+    const n = src.length;
+    const blank = (a, b) => { for (let k = a; k < b && k < n; k++) if (out[k] !== '\n') out[k] = ' '; };
+    let mode = 'code';
+    const stack = [];                                 /* 模板串插值 `${ … }`：braces＝插值内花括号深度 */
+    let i = 0;
+    while (i < n) {
+      const c = src[i], c2 = src[i + 1];
+      if (mode === 'code') {
+        if (c === '/' && c2 === '/') { blank(i, i + 2); mode = 'line'; i += 2; continue; }
+        if (c === '/' && c2 === '*') { blank(i, i + 2); mode = 'block'; i += 2; continue; }
+        if (c === "'") { blank(i, i + 1); mode = 'sq'; i++; continue; }
+        if (c === '"') { blank(i, i + 1); mode = 'dq'; i++; continue; }
+        if (c === '`') { blank(i, i + 1); mode = 'tpl'; i++; continue; }
+        if (c === '/' && isRegexStart(out, i)) { blank(i, i + 1); mode = 're'; i++; continue; }
+        if (stack.length) {                            /* 模板串插值内部按**代码**处理（保留求值语义） */
+          if (c === '{') stack[stack.length - 1].braces++;
+          else if (c === '}') {
+            if (stack[stack.length - 1].braces === 0) { stack.pop(); mode = 'tpl'; }
+            else stack[stack.length - 1].braces--;
+          }
+        }
+        i++; continue;
+      }
+      if (mode === 'line') { blank(i, i + 1); if (c === '\n') mode = 'code'; i++; continue; }
+      if (mode === 'block') {
+        if (c === '*' && c2 === '/') { blank(i, i + 2); mode = 'code'; i += 2; continue; }
+        blank(i, i + 1); i++; continue;
+      }
+      if (mode === 'sq' || mode === 'dq') {
+        const q = mode === 'sq' ? "'" : '"';
+        if (c === '\\') { blank(i, i + 2); i += 2; continue; }
+        if (c === q) { blank(i, i + 1); mode = 'code'; i++; continue; }
+        if (c === '\n') { mode = 'code'; i++; continue; }          /* 容错：未闭合的字符串止于行尾 */
+        blank(i, i + 1); i++; continue;
+      }
+      if (mode === 'tpl') {
+        if (c === '\\') { blank(i, i + 2); i += 2; continue; }
+        if (c === '`') { blank(i, i + 1); mode = 'code'; i++; continue; }
+        if (c === '$' && c2 === '{') { blank(i, i + 2); stack.push({ braces: 0 }); mode = 'code'; i += 2; continue; }
+        blank(i, i + 1); i++; continue;
+      }
+      if (mode === 're') {
+        if (c === '\\') { blank(i, i + 2); i += 2; continue; }
+        if (c === '[') { blank(i, i + 1); mode = 'reclass'; i++; continue; }
+        if (c === '/') { blank(i, i + 1); mode = 'code'; i++; continue; }
+        if (c === '\n') { mode = 'code'; i++; continue; }          /* 容错：未闭合的正则止于行尾 */
+        blank(i, i + 1); i++; continue;
+      }
+      /* mode === 'reclass'：正则的字符类内部（`/` 不结束正则） */
+      if (c === '\\') { blank(i, i + 2); i += 2; continue; }
+      if (c === ']') { blank(i, i + 1); mode = 're'; i++; continue; }
+      blank(i, i + 1); i++; continue;
+    }
+    return out.join('');
+  };
+
+  /** 取 `openIdx` 处那个 `(`／`{` 的**配对**区间（未闭合返回 null ⇒ 调用方**必须判红**）。
+      在**已剥字面量**的文本上做 ⇒ 字符串/注释/正则里的括号不会干扰配对。 */
+  const regionOf = (code, openIdx) => {
+    const open = code[openIdx];
+    if (open !== '(' && open !== '{') return null;
+    const close = open === '(' ? ')' : '}';
+    let depth = 0;
+    for (let i = openIdx; i < code.length; i++) {
+      if (code[i] === open) depth++;
+      else if (code[i] === close) { depth--; if (depth === 0) return { start: openIdx + 1, end: i, text: code.slice(openIdx + 1, i) }; }
+    }
+    return null;
+  };
+
+  /* 退出语句：`process.exit(<实参>)` 或 `process.exitCode = <表达式>`（都在**已剥字面量**的文本里找） */
+  const EXIT_STMT = /process\.exit\s*\(\s*([^()]*)\s*\)|process\.exitCode\s*=\s*([^;\n]*)/g;
+
+  /** 退出码**能证出是 2** 才算"退 2"：字面量 `2`，或 `tests\env.js` 真源里**值为 2** 的常量名（`EXIT_ERROR`）。 */
+  const exitCodeOf = expr => {
+    const e = String(expr == null ? '' : expr).trim();
+    if (/^(?:0[xX][0-9a-fA-F]+|\d+)$/.test(e)) return Number(e);
+    if (/^[A-Za-z_$][\w$]*$/.test(e)) return EXIT_CONSTS.has(e) ? EXIT_CONSTS.get(e) : null;
+    return null;   /* 算不出值（如 `process.exit(code)`）⇒ **不算**退 2：宁可判红，也不给"认任何常量"留口子 */
+  };
+
+  /** 在某段**已剥字面量**的文本里找"退 2"的退出语句 */
+  const hasExit2 = code => {
+    const g = new RegExp(EXIT_STMT.source, 'g');
+    let m;
+    while ((m = g.exec(code))) if (exitCodeOf(m[1] !== undefined ? m[1] : m[2]) === 2) return true;
+    return false;
+  };
 
   /** 取**最后**一处匹配：入口调用按约定在文件尾部（本仓 17 处，尾部都在 700 字符内） */
   const lastMatch = (re, src) => {
@@ -4873,7 +5015,36 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     return last;
   };
 
-  /** 审计一批源码（纯函数，便于下方 D22 定点变异）：返回 { counts, offenders } */
+  /** async 入口的异常路径区间＝**最后一处** `main().catch(` 的**实参**区间（text===null ⇒ 括号没闭合/没有接法） */
+  const asyncExitRegion = code => {
+    const m = lastMatch(MAIN_CATCH, code);
+    if (!m) return { text: null };
+    const r = regionOf(code, m.index + m[0].length - 1);       /* 锚点正则末尾那个 `(` */
+    return { text: r ? r.text : null };
+  };
+
+  /** sync 入口的异常路径区间＝`try { main(); } catch (…) { … }` 里 **`catch` 的块**区间 */
+  const syncExitRegion = code => {
+    const m = TOP_TRY_MAIN.exec(code);
+    if (!m) return { text: null };
+    let i = m.index + m[0].length;                            /* 锚点正则末尾＝`catch` 之后 */
+    while (i < code.length && /\s/.test(code[i])) i++;
+    if (code[i] === '(') {                                    /* `catch (err)` 的参数区 */
+      const params = regionOf(code, i);
+      if (!params) return { text: null };
+      i = params.end + 1;
+    }
+    while (i < code.length && /\s/.test(code[i])) i++;
+    if (code[i] !== '{') return { text: null };
+    const body = regionOf(code, i);
+    return { text: body ? body.text : null };
+  };
+
+  /** 审计一批源码（纯函数，便于下方 D22 定点变异）：返回 { counts, offenders }
+      判据（`E79` 后）＝**先剥字面量，再只看异常路径自身区间里的退出语句**：
+        async ⇒ 必须有 `main().catch(`（`.catch` 挂在 promise 上），且**其实参区间**里退 2；
+        sync  ⇒ 必须有顶层 `try`/`catch`（或 `.catch`），且**`catch` 的块区间**里退 2；
+        禁止形态 ⇒ 对 async 的 `main` 用顶层同步 try 收尾（`E76①` 的原形态）。 */
   const auditEntryShape = sources => {
     const counts = { total: 0, async: 0, sync: 0 };
     const offenders = [];
@@ -4882,26 +5053,34 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       if (!decl) continue;
       counts.total++;
       counts[decl.kind]++;
-      const catchM = lastMatch(MAIN_CATCH, src);
-      const tryM = TOP_TRY_MAIN.exec(src);
-      const tailOf = m => (m ? src.slice(m.index) : '');
+      /* 判据只在**代码**上做：注释/字符串/模板串/正则一律先剥成空格（F1/F3/F4 的诱饵由此失效） */
+      const code = stripLiterals(src);
+      const catchM = lastMatch(MAIN_CATCH, code);
+      const tryM = TOP_TRY_MAIN.exec(code);
+      /* 退出证据只取异常路径**自身**的配对区间（不再是"入口之后直到文件尾"的整段文本） */
+      const asyncRegion = decl.kind === 'async' ? asyncExitRegion(code) : null;
+      const syncRegion = decl.kind === 'sync' && tryM ? syncExitRegion(code) : null;
       if (decl.kind === 'async') {
         if (!catchM) {
           offenders.push(`${name}（${decl.form}）：没有 \`main().catch(\` ⇒ rejection 无人接住（9.5-5 要求退 2）`);
-        } else if (src.length - catchM.index > 1500) {
+        } else if (src.length - catchM.index > ENTRY_TAIL_MAX) {
           offenders.push(`${name}（${decl.form}）：\`main().catch(\` 不在文件尾部（其后还有 ${src.length - catchM.index} 字符）—— 入口接线看不出在哪里收尾`);
-        } else if (!EXIT2.test(tailOf(catchM))) {
-          offenders.push(`${name}（${decl.form} ＋ \`.catch\`）：异常路径**没退 2** —— 应含 process.exit(2) 或 process.exitCode = 2`);
+        } else if (asyncRegion.text === null) {
+          offenders.push(`${name}（${decl.form} ＋ \`.catch\`）：\`main().catch(\` 的括号在文件内没有闭合 ⇒ 拿不到异常路径的边界（判不了就判红）`);
+        } else if (!hasExit2(asyncRegion.text)) {
+          offenders.push(`${name}（${decl.form} ＋ \`.catch\`）：异常路径**没退 2** —— 应在 \`.catch(…)\` **自身**的区间里含 process.exit(2)／process.exitCode = 2／值为 2 的常量退码`);
         }
         if (tryM) {
           offenders.push(`${name}（${decl.form}）：用了顶层同步 try 包 \`main()\` 的**靶子写法** ⇒ 对 async 无效，rejection 会落成"无汇总行 ＋ 退 1"（E76① 的原形态）`);
         }
       } else if (tryM) {
-        if (!EXIT2.test(tailOf(tryM))) {
-          offenders.push(`${name}（${decl.form}）：顶层 \`try\`/\`catch\` 的异常路径**没退 2**（缺 process.exit(2)／process.exitCode = 2）`);
+        if (syncRegion.text === null) {
+          offenders.push(`${name}（${decl.form}）：顶层 \`try\`/\`catch\` 的 \`catch\` 块取不到（括号/块没闭合，或写成别处去了）⇒ 拿不到异常路径的边界（判不了就判红）`);
+        } else if (!hasExit2(syncRegion.text)) {
+          offenders.push(`${name}（${decl.form}）：顶层 \`try\`/\`catch\` 的异常路径**没退 2**（\`catch\` 块内缺 process.exit(2)／process.exitCode = 2／值为 2 的常量退码）`);
         }
       } else if (catchM) {
-        if (!EXIT2.test(tailOf(catchM))) {
+        if (asyncRegion.text === null || !hasExit2(asyncRegion.text)) {
           offenders.push(`${name}（${decl.form}）：\`.catch\` 的异常路径**没退 2**`);
         }
       } else {
@@ -4926,6 +5105,8 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
      数字真的变了（新增/删除入口脚本）就**连同本节地板一起改**，别让判据变成恒真。 */
   const FLOOR = { total: 17, async: 13, sync: 4 };
   t.info(`§16 入口形态普查：${real.counts.total} 个含 \`main()\` 的入口（async ${real.counts.async}／sync ${real.counts.sync}／缺陷形态 ${real.offenders.length}）`);
+  t.info(`§16 E79：退出证据只取异常路径**自身**的区间（注释/字符串/模板串/正则已剥；接线到文件尾的余量上限＝${ENTRY_TAIL_MAX} 字符）；`
+    + `常量退码真源＝tests\\env.js（${[...EXIT_CONSTS].map(([k, v]) => k + '=' + v).join('／') || '**读不到真源**'}）`);
   t.check('§16-A 静态：含 `main()` 的入口形态全部合规（async ⇒ `main().catch(` ＋ 退 2；sync ⇒ `try`/`catch` ＋ 退 2；禁止对 async 用顶层同步 try 包 `main()`）',
     real.offenders.length === 0 && real.counts.total >= FLOOR.total
       && real.counts.async >= FLOOR.async && real.counts.sync >= FLOOR.sync,
@@ -4993,6 +5174,140 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       return a.offenders.length === 0 && s.offenders.length === 0 && a.counts.async === 1 && s.counts.sync === 1;
     })(),
     '合规样本：async ⇒ `main().catch(…退 2)`；sync ⇒ 顶层 `try`/`catch` ＋ 退 2 —— 两者都必须判绿（否则"判红"只是把一切都判红，那种断言没有证据力）');
+
+  /* ---------------- `E79` 收口的四条自证（F／G／H／I，均配 D22 定点变异） ----------------
+     敏感文本（`process.exit(2)`／`try {`＋`main();`）一律**字符串拼接**构造：本文件自己也在 §16 的
+     扫描范围内，原样写出就会命中的自己的文本判据（`E78` 时代的技巧，保留）。 */
+  const E2TEXT = 'process.exit(' + '2)';
+  const mkAsyncEntry = body => 'async function main() { done(); }\n\n'
+    + 'main().catch(err => {\n' + '  console.error(String(err));\n' + body + '\n});\n';
+  /* 诱饵（四种形态都落在旧判据的 1500 字符窗口内）：F1 块注释／F3 字符串／**F4 无关函数（真代码）** ——
+     旧判据把"入口之后直到文件尾"的整段文本当异常路径，于是这些诱饵都成了"退出证据"（catch 里退 1 也判绿）。 */
+  const DECOY_AFTER_ENTRY = '\n/* 诱饵①（块注释）：' + E2TEXT + ' */'
+    + '\n// 诱饵②（行注释）：这里必须 ' + E2TEXT
+    + '\nconst DECOY_NOTE = ' + JSON.stringify(E2TEXT) + ';   /* 诱饵③（字符串常量） */'
+    + '\nfunction unrelatedHelper() {   /* 诱饵④（无关函数，真代码 —— 旧判据会把它当退出证据） */'
+    + '\n  ' + E2TEXT + ';'
+    + '\n}\n';
+
+  /* §16-F：`E79` 的**现场**（D22 变异③）—— catch 里其实**退 1**，只在它之后（旧判据的 1500 字符窗口
+     内）放注释①与**无关函数**④里的 `process.exit(2)`。旧判据实测 `offenders=0`（**假绿**，座位 5 的
+     7 组灰盒实验），新判据必须**判红并指名** `tests\db-check.js`。变异在**字节副本**上做：sha256 留痕、
+     全程不落盘、`Buffer.compare` 证明"还原后的字节"与原文件逐字节相等（不使用 `git checkout`）。 */
+  t.check('§16-F D22 变异③：异常路径其实退 1、但其后注释里有 process.exit(2) ⇒ §16-A 必红并指名',
+    (() => {
+      const target = path.join(env.paths.tests, 'db-check.js');
+      const bytes = fs.readFileSync(target);                     /* 字节副本①（原件只读，不写盘） */
+      const sha0 = sha256Hex(bytes);
+      const anchor = lastMatch(MAIN_CATCH, dbSrc);
+      if (!anchor) { t.info('§16-F 锚点未命中：`db-check.js` 里找不到 `main().catch(`'); return false; }
+      const tail = dbSrc.slice(anchor.index);
+      const cut = tail.indexOf(E2TEXT);
+      if (cut < 0) { t.info('§16-F 锚点未命中：`main().catch` 之后的收尾里没有 process.exit(2)'); return false; }
+      /* 诱饵四种形态都塞进旧判据的窗口里：F1 注释、F3 字符串、F4 其后**无关函数**（真代码） */
+      const DECOY = DECOY_AFTER_ENTRY;
+      /* 变异体：异常路径改成**退 1**（其余原样）＋ 诱饵 */
+      const head = dbSrc.slice(0, anchor.index) + tail.slice(0, cut) + 'process.exit(' + '1)' + tail.slice(cut + E2TEXT.length);
+      const mutantBytes = Buffer.from(head + DECOY, 'utf8');      /* 字节副本②：变异体 */
+      const mutant = auditEntryShape([{ name: dbName, src: mutantBytes.toString('utf8') }]);
+      /* 对照：诱饵原样保留、异常路径的退码**不动** ⇒ 必须判绿（证明诱饵本身不是判红的原因，
+         且"只认异常路径区间"没有把真正的退出语句一起挡掉 —— 防假红式断言） */
+      const controlBytes = Buffer.from(dbSrc + DECOY, 'utf8');
+      const control = auditEntryShape([{ name: dbName, src: controlBytes.toString('utf8') }]);
+      /* 还原证明：由副本①重建 ⇒ 与副本①逐字节相等（sha256 相同）；再复核**盘上文件全程未变** */
+      const restored = Buffer.from(bytes);
+      const byteSame = Buffer.compare(restored, bytes) === 0;
+      const shaSame = sha256Hex(restored) === sha0;
+      const diskSame = sha256Hex(fs.readFileSync(target)) === sha0;
+      const mutantNamed = mutant.offenders.length > 0 && mutant.offenders.every(o => o.startsWith(dbName));
+      t.info(`§16-F 变异体 sha256=${sha256Hex(mutantBytes).slice(0, 12)}…（原件 sha256=${sha0.slice(0, 12)}…）；`
+        + `变异体判红 ${mutant.offenders.length} 条／对照判红 ${control.offenders.length} 条；`
+        + `还原 Buffer.compare=${byteSame}／sha256 一致=${shaSame}／盘上文件未变=${diskSame}`);
+      return mutantNamed && mutant.offenders.some(o => o.includes('没退 2'))
+        && control.offenders.length === 0 && byteSame && shaSame && diskSame;
+    })(),
+    '修正前实测（旧判据＝扫 `main().catch(` 之后的**整段文本**，只由 1500 那道门限制）：同一个变异体 `offenders=0`（**假绿**）—— 这就是 `E79` 的现场；'
+      + '新判据必须判红并**指名** `tests\\db-check.js`（ADR-0004 D22：判据必须被定点变异证伪过才可信）');
+
+  /* §16-G：**常量退码**自证（F5）。常量口径与 `tests\env.js:52-54` **同源**（读它的源码），
+     但"认常量"不等于"认任何常量"：`EXIT_FAIL`(1)／`EXIT_PASS`(0)／叫不出名字的标识符一律判红。 */
+  t.check('§16-G 常量退码自证：process.exit(EXIT_ERROR)/exitCode = EXIT_ERROR（=2）判绿，process.exit(EXIT_FAIL)（=1）判红',
+    (() => {
+      const NAME = '（合成常量退码样本）';
+      const green = [mkAsyncEntry('  process.exit(EXIT_ERROR);'),
+        mkAsyncEntry('  process.exitCode = EXIT_ERROR;')];
+      const red = [mkAsyncEntry('  process.exit(EXIT_FAIL);'),
+        mkAsyncEntry('  process.exit(EXIT_PASS);'),
+        mkAsyncEntry('  process.exit(SOME_OTHER_CODE);')];
+      const greenOffenders = green.map(s => auditEntryShape([{ name: NAME, src: s }]).offenders);
+      const redOffenders = red.map(s => auditEntryShape([{ name: NAME, src: s }]).offenders);
+      /* 同源核对：值必须来自 `tests\env.js`（读源码解析）且与 require 到的那份模块逐名一致 */
+      const sameOrigin = EXIT_CONSTS.get('EXIT_ERROR') === 2 && EXIT_CONSTS.get('EXIT_FAIL') === 1
+        && EXIT_CONSTS.get('EXIT_PASS') === 0 && EXIT_CONSTS.get('EXIT_ERROR') === env.EXIT_ERROR
+        && EXIT_CONSTS.get('EXIT_FAIL') === env.EXIT_FAIL && EXIT_CONSTS.get('EXIT_PASS') === env.EXIT_PASS;
+      const redNamed = redOffenders.every(list => list.length > 0
+        && list.every(o => o.startsWith(NAME) && o.includes('没退 2')));
+      t.info(`§16-G 常量真源（解析 tests\\env.js 源码）：${[...EXIT_CONSTS].map(([k, v]) => k + '=' + v).join('／') || '空'}；`
+        + `与 env 模块逐名一致=${sameOrigin}；退 2 常量样本判红 ${greenOffenders.filter(l => l.length).length} 条`
+        + `（应 0）／非 2 常量样本判红 ${redOffenders.filter(l => l.length).length}/${red.length} 条（应全红）`);
+      return greenOffenders.every(l => l.length === 0) && redNamed && sameOrigin;
+    })(),
+    '同源＝读 `tests\\env.js`（规范 9.5-5 的唯一定义处）解析出 `EXIT_ERROR=2`；反证＝同一位置换成 '
+      + '`EXIT_FAIL`(1)／`EXIT_PASS`(0)／未知标识符 ⇒ 必须判红（"认常量"若做成"认任何常量"，本条必红）');
+
+  /* §16-H：**字面量剥除**自证 —— 字符串/模板串/注释里的 `process.exit(2)` 不构成退出证据；
+     对照样本（同一段诱饵 ＋ 一条**真**退出语句）必须判绿 ⇒ 证明剥除没有把整段区间一起废掉。 */
+  t.check('§16-H 字面量剥除自证：字符串/模板串里的 process.exit(2) 不构成退出证据',
+    (() => {
+      const NAME = '（合成字面量诱饵样本）';
+      const decoys = '  console.error(' + JSON.stringify(E2TEXT) + ');\n'
+        + '  // ' + E2TEXT + '\n'
+        + '  /* ' + E2TEXT + ' */\n'
+        + '  const note = `' + E2TEXT + '`;';
+      const onlyDecoys = auditEntryShape([{ name: NAME, src: mkAsyncEntry(decoys) }]);
+      const withReal = auditEntryShape([{ name: NAME, src: mkAsyncEntry(decoys + '\n  ' + E2TEXT + ';') }]);
+      t.info(`§16-H 诱饵计数：仅字面量 ⇒ 判红 ${onlyDecoys.offenders.length} 条（应 ≥1 并指名）；`
+        + `字面量 ＋ 真退出语句 ⇒ 判红 ${withReal.offenders.length} 条（应 0）`);
+      return onlyDecoys.offenders.length > 0
+        && onlyDecoys.offenders.every(o => o.startsWith(NAME) && o.includes('没退 2'))
+        && withReal.offenders.length === 0;
+    })(),
+    '反证：若不剥字面量（旧判据），"仅字符串/模板/注释里出现 process.exit(2)"会判**绿**（假阳性通道）；'
+      + '对照样本证明剥除没有把真退出语句一起挡掉（防"把一切都判红"）');
+
+  /* §16-I：**sync 分支**同样只认异常路径自身（`catch` 的块区间）—— 被修改过的判据都要被定点变异证伪过。
+     靶子＝`copy-check.js`（4 个 sync 入口之一，写法 `try { main(); } catch`）的**字节副本**：块里退 1 ＋
+     块**外**的四种诱饵 ⇒ 必红并指名；对照（诱饵原样、退码仍是 2）⇒ 必绿。 */
+  t.check('§16-I sync 异常路径自证：`catch` 块里退 1、块外注释/字符串/无关函数里有 process.exit(2) ⇒ 判红并指名（sync 分支也只认自身区间）',
+    (() => {
+      const target = path.join(env.paths.tests, 'copy-check.js');
+      const bytes = fs.readFileSync(target);                     /* 字节副本①（只读，不写盘） */
+      const sha0 = sha256Hex(bytes);
+      const src = bytes.toString('utf8');
+      const tryM = TOP_TRY_MAIN.exec(stripLiterals(src));
+      if (!tryM) { t.info('§16-I 锚点未命中：`copy-check.js` 里找不到 `try { main(); } catch`'); return false; }
+      const cut = src.indexOf(E2TEXT, tryM.index);
+      if (cut < 0) { t.info('§16-I 锚点未命中：`try` 之后没有 process.exit(2)'); return false; }
+      const name = 'tests\\copy-check.js';
+      /* 变异体：catch 块里改成**退 1**（其余原样）＋ 诱饵（都在旧判据扫过的"入口之后"文本里） */
+      const mutantBytes = Buffer.from(src.slice(0, cut) + 'process.exit(' + '1)'
+        + src.slice(cut + E2TEXT.length) + DECOY_AFTER_ENTRY, 'utf8');
+      const mutant = auditEntryShape([{ name, src: mutantBytes.toString('utf8') }]);
+      const controlBytes = Buffer.from(src + DECOY_AFTER_ENTRY, 'utf8');
+      const control = auditEntryShape([{ name, src: controlBytes.toString('utf8') }]);
+      const restored = Buffer.from(bytes);                       /* 还原证明（与 F 同款纪律） */
+      const byteSame = Buffer.compare(restored, bytes) === 0;
+      const shaSame = sha256Hex(restored) === sha0;
+      const diskSame = sha256Hex(fs.readFileSync(target)) === sha0;
+      t.info(`§16-I 变异体 sha256=${sha256Hex(mutantBytes).slice(0, 12)}…（原件 sha256=${sha0.slice(0, 12)}…）；`
+        + `变异体判红 ${mutant.offenders.length} 条／对照判红 ${control.offenders.length} 条；`
+        + `还原 Buffer.compare=${byteSame}／sha256 一致=${shaSame}／盘上文件未变=${diskSame}`);
+      return mutant.offenders.length > 0 && mutant.offenders.every(o => o.startsWith(name))
+        && mutant.offenders.some(o => o.includes('没退 2'))
+        && control.offenders.length === 0 && byteSame && shaSame && diskSame;
+    })(),
+    '修正前实测（旧 sync 判据＝扫 `try { main(); }` 之后的**整段文本**）：同一变异体 `offenders=0`（**假绿**）；'
+      + '新 sync 判据只看 `catch` 块自身的区间 ⇒ 必须判红并**指名** `tests\\copy-check.js`');
 }
 
 t.finish();
