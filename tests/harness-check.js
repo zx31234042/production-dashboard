@@ -5033,12 +5033,18 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     return last;
   };
 
-  /** 从 `catch` 之后取 **catch 块的配对区间**。
-      四种真实形态都要吃得下（本仓实测）：
-        · `} catch (err) { … }`          —— sync 入口的推荐写法；
-        · `main().catch(err => { … })`   —— 最常见：实参是箭头**函数表达式**（参数没有括号！）；
-        · `.catch(async (err) => { … })` —— 实参是带括号的参数表 ＋ 箭头；
+  /** 从 `catch` 之后取 **catch 回调的配对区间**（`E82⒜` 后：块体与**表达式体**都要吃得下）。
+      五种真实形态：
+        · `} catch (err) { … }`              —— sync 入口的推荐写法；
+        · `main().catch(err => { … })`       —— 实参是箭头函数、参数**没有**括号；
+        · `.catch(async (err) => { … })`     —— 实参是带括号的参数表 ＋ 箭头；
+        · `main().catch(err => process.exit(2));` —— **表达式体箭头**（合法简写、括号成对）；
         · 箭头体里出现 `{`/`}`（模板串 `${…}`、对象字面量）—— 见下。
+      `E82⒜` 修正（2026-10-02，座位 5 于 C·17 报出、主代理实测 278/1 指名）：`E81` 的区间**只认块体**
+      （下面的"块级 `{`"扫描）⇒ 表达式体简写会一路扫到文件里**下一个**无关的 `{`（或扫到文件尾）
+      ⇒ 被判"括号在文件内没有闭合"而**假红**（文案与事实相反，`D23` 意义上的名不符实）。
+      修法：在块扫描**之前**先认箭头（`arrowBodyOf`）；是表达式体就取"**外层调用的右括号**"之前的区间，
+      只有真的取不到边界才 `{ text: null }`。
       做法（⚠ 实测坑，勿改回去）：
         ① **不能**从 `catch` 之后的 `(` 直接配起 —— 对 `.catch(` 来说那个 `(` 是"实参表的左括号"，
            直接配对会把**整个回调**当参数区，配完就找不到 `{`（那样全仓 13 个 async 入口会被假判红）；
@@ -5046,8 +5052,34 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
         ③ 找块时**必须按括号深度扫**：`(code.indexOf('=>'), code.indexOf('{'))` 这种"取更早者"的写法
            会被箭头体里的 `${…}`（如 `server\index.js` 的 `const text = \`[启动失败] ${err…}\``）带偏 ——
            那个 `{` 在括号深度 > 0 的位置 ⇒ 正文被截成半句、`process.exit(2)` 落在区间外，**假判红**。
-      故：先按深度扫描找**块级**的 `{`（`(`／`[` 深度为 0 时遇到的那个 `{`），再交给 `regionOf` 配整块。
-      取不到（括号/块没闭合、或写成别处去了）一律 `{ text: null }` ⇒ 调用方**判红**（判不了不许当通过）。 */
+      取不到（括号/块没闭合、或回调写成别处去了）一律 `{ text: null }` ⇒ 调用方**判红**（判不了不许当通过）。 */
+  /** 箭头回调的**表达式体**区间（`=> expr`）：返回 `{ text }`；块体（`=> { … }`）返回 `null`
+      交给下面的块扫描；不是箭头（如 `} catch (err) {`）也返回 `null`。
+      边界算法：`.catch(` 的左括号占一层 ⇒ 从体起点起按 `(`／`[`／`{` 记深度，遇到让深度归零的
+      右括号即**外层调用的右括号**（这就是表达式体的终点）。扫不到 ⇒ `{ text: null }`（判红）。 */
+  const arrowBodyOf = (code, i) => {
+    let k = i;
+    if (code[k] !== '=' || code[k + 1] !== '>') {              /* 无括号的单参形态：`err => …` */
+      if (!/[A-Za-z_$]/.test(code[k] || '')) return null;
+      while (k < code.length && /[\w$]/.test(code[k])) k++;
+      while (k < code.length && /\s/.test(code[k])) k++;
+    }
+    if (code[k] !== '=' || code[k + 1] !== '>') return null;
+    k += 2;
+    while (k < code.length && /\s/.test(code[k])) k++;
+    if (code[k] === '{') return null;                          /* 块体 ⇒ 交给块扫描 */
+    const start = k;
+    let depth = 1;                                             /* `.catch(` 的左括号那一层 */
+    for (; k < code.length; k++) {
+      const ch = code[k];
+      if (ch === '(' || ch === '[' || ch === '{') depth++;
+      else if (ch === ')' || ch === ']' || ch === '}') {
+        depth--;
+        if (depth === 0) return { text: code.slice(start, k) };
+      }
+    }
+    return { text: null };
+  };
   const catchBlockRegion = (code, m) => {
     if (!m) return { text: null };
     let i = m.index + m[0].length;                            /* `catch` 之后（`.catch(` 时已越过左括号） */
@@ -5056,7 +5088,11 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       const params = regionOf(code, i);
       if (!params) return { text: null };
       i = params.end + 1;
+      while (i < code.length && /\s/.test(code[i])) i++;
     }
+    /* `E82⒜`：表达式体简写必须先于块扫描被认出来（否则会去配文件里下一个无关的 `{`）。 */
+    const arrow = arrowBodyOf(code, i);
+    if (arrow) return arrow;
     let depth = 0;                                            /* 块级 `{` ＝ `(`／`[` 深度归零时的第一个 `{` */
     for (let k = i; k < code.length; k++) {
       const ch = code[k];
@@ -5115,7 +5151,9 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
         } else if (src.length - catchM.index > ENTRY_TAIL_MAX) {
           offenders.push(`${name}（${decl.form}）：\`main().catch(\` 不在文件尾部（其后还有 ${src.length - catchM.index} 字符）—— 入口接线看不出在哪里收尾`);
         } else if (asyncRegion.text === null) {
-          offenders.push(`${name}（${decl.form} ＋ \`.catch\`）：\`main().catch(\` 的括号在文件内没有闭合 ⇒ 拿不到异常路径的边界（判不了就判红）`);
+          /* `E82⒜`：这里**只能**说"取不到边界" —— 旧文案写死"括号在文件内没有闭合"，
+             而表达式体简写（括号明明成对）也会走到这一支 ⇒ 文案与事实相反（`D23`）。 */
+          offenders.push(`${name}（${decl.form} ＋ \`.catch\`）：\`main().catch(\` 的异常路径区间**取不到**（实参表的括号没闭合、或回调写成别处去了）⇒ 拿不到边界（判不了就判红）`);
         } else if (!hasExit2(asyncRegion.text)) {
           offenders.push(`${name}（${decl.form} ＋ \`.catch\`）：异常路径**没退 2** —— 应在 \`.catch(…)\` **自身**的区间里含 process.exit(2)／process.exitCode = 2／值为 2 的常量退码`);
         }
@@ -5133,7 +5171,8 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
            （对 sync 恒为 `null`）⇒ 本行抛 TypeError，整轮断言一条都跑不出来。 */
         const syncCatchRegion = syncExitRegion(code);
         if (syncCatchRegion.text === null) {
-          offenders.push(`${name}（${decl.form}）：\`main().catch(\` 的括号在文件内没有闭合 ⇒ 拿不到异常路径的边界（判不了就判红）`);
+          /* 同 `E82⒜`：不得断言"括号没闭合"（表达式体等合法形态也会走到这里）。 */
+          offenders.push(`${name}（${decl.form}）：\`main().catch(\` 的异常路径区间**取不到**（实参表的括号没闭合、或回调写成别处去了）⇒ 拿不到边界（判不了就判红）`);
         } else if (!hasExit2(syncCatchRegion.text)) {
           offenders.push(`${name}（${decl.form}）：\`.catch\` 的异常路径**没退 2**`);
         }
@@ -5155,62 +5194,114 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
   }
 
   const real = auditEntryShape(entrySources);
-  /* 普查地板（`D23` 防空洞）：低于地板说明**扫描器/范围**坏了，不是"脚本变好了"；
-     数字真的变了（新增/删除入口脚本）就**连同本节地板一起改**，别让判据变成恒真。
-     `T-20261002-03`（`E80` 收口）把三个"直下但没入口声明"的门禁脚本（files／logic／platform）
+  /* 普查地板 ＋ 两维**精确**（`D23` 防空洞）。**口径更正（`E82⒝`，2026-10-02，主代理裁定接受）**：
+     ⚠ `FLOOR_TOTAL` 是一条**结构性死项**：`counts.total++` 与 `counts[kind]++` 在 `auditEntryShape()`
+     里**同处发生** ⇒ `total ≡ async ＋ sync` 恒成立，两维精确后 `total` 必然是 20
+     ⇒ "total ≥ 地板"既不会先失效、也没法单独失效（它只是"两维精确"的**算术推论**）。
+     保留它的理由＝**防御性冗余**（万一将来有人删掉两维的精确判据，地板还能挡住"扫描面塌成 0"），
+     但**不得**再把它当成独立的一条覆盖约束 —— 真正的约束是**两维各自精确**：
+     新增/删除入口脚本必须**同批改本节**（连 `FLOOR_TOTAL` 一并改，或至少改两维）。
+     **显式作废 `E78` 时代"实测新增不必改（下界照旧满足）"的说法**：那只对"只保下界"的旧口径成立；
+     在"两维精确"下，新增一个入口就会让 `EXACT_ASYNC`／`EXACT_SYNC` 变红（**必须改本节**），
+     而旧说法正是"形态迁移 ＋ 补偿性新增"这一 `≥` 下真漏洞的来源（严格更严，故保留双维精确）。
+     另：`T-20261002-03`（`E80` 收口）把三个"直下但没入口声明"的门禁脚本（files／logic／platform）
      补成 `main()` 入口后，实跑值由 17/13/4 变为 **20/13/7**（口径：`tests\*.js` 直下 ＋ `tests\lib\*.js`
-     ＋ `server\index.js`）—— 这三个新入口落进扫描面，§16-A 才看得见它们。
-     **口径更正（实测，勿照抄预测）**：进门包的任务书预测"新形态应当 sync ⇒ total 20／async 16／sync 4"，
-     但本包实跑是 **async 13／sync 7**：三个新脚本都是 `function main()`＋顶层 `try`/`catch`（**sync**），
-     没有把任何 async 入口变成 sync ⇒ async 不涨。故地板按"total 只升不降 ＋ async/sync 两维各自**精确**"
-     写：只涨一个维度（例如新增一个 async 入口却不加 sync）就说明形态**漂了**，必须当场说明并同批改本节。 */
+     ＋ `server\index.js`）—— 这三个新入口落进扫描面，§16-A 才看得见它们。 */
   const FLOOR_TOTAL = 20;
   const EXACT_ASYNC = 13;
   const EXACT_SYNC = 7;
   t.info(`§16 入口形态普查：${real.counts.total} 个含 \`main()\` 的入口（async ${real.counts.async}／sync ${real.counts.sync}／缺陷形态 ${real.offenders.length}）`);
   t.info(`§16 E79：退出证据只取异常路径**自身**的区间（注释/字符串/模板串/正则已剥；接线到文件尾的余量上限＝${ENTRY_TAIL_MAX} 字符）；`
     + `常量退码真源＝tests\\env.js（${[...EXIT_CONSTS].map(([k, v]) => k + '=' + v).join('／') || '**读不到真源**'}）`);
+  /* 逐个子条件算出来（`E82⒝` 的第二半）：FAIL 的**首句**必须是"判红 + 未成立的子条件"，
+     而不是旧写法里那句"形态全部合规"（与结论相反 —— 主代理在自己的变异轮里也见到过同一句）。 */
+  const shapeConds = [
+    { name: '缺陷形态逐条指名', ok: real.offenders.length === 0,
+      why: real.offenders.length
+        ? `违规 ${real.offenders.length} 处（逐条指名文件与形态）：${real.offenders.join('；')}`
+        : '（无违规）' },
+    { name: `扫描面 ≥ ${FLOOR_TOTAL}（**结构性死项**：两维精确的算术推论，只作防御性冗余）`,
+      ok: real.counts.total >= FLOOR_TOTAL,
+      why: `实测 total=${real.counts.total}（＝async ${real.counts.async} ＋ sync ${real.counts.sync}）` },
+    { name: `async 维度精确 = ${EXACT_ASYNC}`, ok: real.counts.async === EXACT_ASYNC,
+      why: `实测 async=${real.counts.async}` },
+    { name: `sync 维度精确 = ${EXACT_SYNC}`, ok: real.counts.sync === EXACT_SYNC,
+      why: `实测 sync=${real.counts.sync}` }
+  ];
+  const shapeBad = shapeConds.filter(c => !c.ok);
   t.check('§16-A 静态：含 `main()` 的入口形态全部合规（async ⇒ `main().catch(` ＋ 退 2；sync ⇒ `try`/`catch` ＋ 退 2；禁止对 async 用顶层同步 try 包 `main()`）',
-    real.offenders.length === 0 && real.counts.total >= FLOOR_TOTAL
-      && real.counts.async === EXACT_ASYNC && real.counts.sync === EXACT_SYNC,
-    real.offenders.length
-      ? `违规 ${real.offenders.length} 处（逐条指名文件与形态）：${real.offenders.join('；')}`
+    shapeBad.length === 0,
+    shapeBad.length
+      ? `判红：**未成立的子条件 ${shapeBad.length} 项** —— ${shapeBad.map(c => `${c.name}（${c.why}）`).join('；')}；`
+        + `普查 ${real.counts.total} 个（async ${real.counts.async}／sync ${real.counts.sync}）`
       : `普查 ${real.counts.total} 个（async ${real.counts.async}／sync ${real.counts.sync}），形态全部合规`
-        + `；地板 total ≥ ${FLOOR_TOTAL}（低于地板即判红：那是扫描器坏了，不是脚本变好了）`
-        + `；async／sync 两维须**精确**等于 ${EXACT_ASYNC}／${EXACT_SYNC}（只涨一维＝形态漂了，须说明并同批改本节）`);
+        + `；四个子条件逐项成立：缺陷形态 0 ＋ total ${real.counts.total} ≥ ${FLOOR_TOTAL}（算术推论）`
+        + ` ＋ async = ${EXACT_ASYNC} ＋ sync = ${EXACT_SYNC}`
+        + `（新增/删除入口脚本必须**同批改本节**的这三个数字 —— 显式作废 E78 的"新增不必改"）`);
 
+  /* §16-L 入口覆盖普查（`E80`）：`tests\*.js` 直下的每个门禁脚本都必须是"被 §十六 扫到的入口"。
+     `E82⒞`（FAIL 明细要能**指名**，2026-10-02 收口）：旧写法把 FAIL 的说明**写死**成三个文件名文本
+     （`files-check`／`logic-check`／`platform-check`，即 `E80` 当时缺的那三个）⇒ 只缺 1 个时会被读成缺 3 个；
+     真凶只在 **info 行**上，而 `run-all.js:962` 的明细过滤只认 `[FAIL]`／`失败清单`／编号行／
+     `脚本异常终止`（**不认** info 行）⇒ run-all 明细层面**失去指名能力**（`D23` 未达成）。
+     现在 FAIL 明细**动态拼 `missing`**（只列实测缺的那些）。
+     `E82⒟`（判据自证要**可假**）：旧探针把每条样本的 `src` 写成 `''`，而 `detectMainDecl('') === null`
+     恒真 ⇒ `selfProves` **恒真**（自证力为零）。现在改用**真实入口样本**两问：
+       ① 每个非豁免直下脚本的**真源码**都必须被 `detectMainDecl()` 认出（识别能力的正证）；
+       ② 抽其中**一个**真样本、把它的 `main` 声明**抠掉**（正则替换）⇒ 必须**恰好那一个**被判据指名
+          （判据的**可假**自证）。两问同时成立才算自证 —— 它现在是可假的。 */
+  const l16 = (() => {
+    const baseOf = rel => rel.slice(rel.lastIndexOf('/') + 1);
+    /* **显式豁免清单**（每条都写理由；豁免≠"可以不查"，而是"它不是门禁入口"）：
+       · `env.js`：被 require 的模块 —— 它**实现** `env.assertRuntime()` 并定义退出码/路径常量真源
+         （规范 9.5-5），本身不是门禁入口（`files-check` 第八节也把它排除在"必须调 assertRuntime"之外）；
+       · 范围口径：`tests\lib\*.js` 是夹具层（被 require 的模块），不属"直下入口"，本节既有范围即不含它们。
+       其余直下脚本（含 `capture-baseline`／`screenshot-diff` 这类工具脚本）**都要求有入口声明** ——
+       没有入口的脚本，§16-A 与 `run-all` 的失败明细**都看不见它**（`E80` 的两个盲区）。 */
+    const EXEMPT = new Set(['env.js']);
+    const direct = listJs('tests');                            /* tests\ 直下的 .js 全量（含豁免项） */
+    const nonExempt = direct
+      .map(rel => ({ rel, base: baseOf(rel), name: rel.split('/').join('\\') }))
+      .filter(x => !EXEMPT.has(x.base));
+    const realSrcOf = name => {
+      const hit = entrySources.find(s => s.name === name);
+      return hit ? hit.src : null;                             /* 读不到 ⇒ null（判不了就判红） */
+    };
+    const missing = nonExempt.filter(x => !detectMainDecl(realSrcOf(x.name) || '')).map(x => x.name);
+    /* 自证①：真样本的识别率 */
+    const detectorHits = nonExempt.filter(x => !!detectMainDecl(realSrcOf(x.name) || ''));
+    /* 自证②：抠掉 `main` 声明的**真样本**（两种声明写法都要抠得掉；抠不干净就换下一个样本） */
+    const stripMainDecl = src => src
+      .replace(/function(\s+)main(\s*\()/g, 'function$1__e82StrippedMain$2')
+      .replace(/((?:^|\n)[ \t]*(?:const|let|var)?[ \t]*)main([ \t]*=[ \t]*(?:async\b|function\b|\())/g,
+        '$1__e82StrippedMain$2');
+    const victim = nonExempt.find(x => {
+      const s = realSrcOf(x.name);
+      return !!s && !!detectMainDecl(s) && detectMainDecl(stripMainDecl(s)) === null;
+    }) || null;
+    const probeMissing = victim === null ? [] : [victim.name];
+    const selfProves = victim !== null && detectorHits.length === nonExempt.length &&
+      probeMissing.length === 1 && probeMissing[0] === victim.name;
+    return { direct, EXEMPT, nonExempt, missing, detectorHits, victim, selfProves };
+  })();
+  t.info(`§16-L 直下脚本 ${l16.direct.length} 个：豁免 ${l16.EXEMPT.size} 个（${[...l16.EXEMPT].join('、')}：被 require 的模块，实现 assertRuntime 与常量真源，不是门禁入口）；`
+    + `被 §十六 扫到的入口 ${l16.nonExempt.length - l16.missing.length} 个；`
+    + `缺失入口声明 ⇒ 指名：${l16.missing.join('、') || '（无）'}；`
+    + `判据自证（**真实入口样本**：${l16.detectorHits.length}/${l16.nonExempt.length} 被认出 ＋ 抠掉 `
+    + `${l16.victim ? l16.victim.name : '（无可变异真样本）'} 的 \`main()\` 声明后必被指名）＝${l16.selfProves}`);
   t.check('§16-L 入口覆盖普查：`tests\\*.js` 直下的每个门禁脚本都必须是"被 §十六 扫到的入口"（声明了 `main()`）；缺失者逐条指名，豁免项显式列明理由',
-    (() => {
-      const direct = listJs('tests');                            /* tests\ 直下的 .js 全量（含豁免项） */
-      /* **显式豁免清单**（每条都写理由；豁免≠"可以不查"，而是"它不是门禁入口"）：
-         · `env.js`：被 require 的模块 —— 它**实现** `env.assertRuntime()` 并定义退出码/路径常量真源
-           （规范 9.5-5），本身不是门禁入口（`files-check` 第八节也把它排除在"必须调 assertRuntime"之外）；
-         · 范围口径：`tests\lib\*.js` 是夹具层（被 require 的模块），不属"直下入口"，本节既有范围即不含它们。
-         其余直下脚本（含 `capture-baseline`／`screenshot-diff` 这类工具脚本）**都要求有入口声明** ——
-         没有入口的脚本，§16-A 与 `run-all` 的失败明细**都看不见它**（`E80` 的两个盲区）。 */
-      const EXEMPT = new Set(['env.js']);
-      const missing = direct
-        .map(rel => ({ rel, base: rel.slice(rel.lastIndexOf('/') + 1) }))
-        .filter(x => !EXEMPT.has(x.base))
-        .filter(x => {
-          const hit = entrySources.find(s => s.name === x.rel.split('/').join('\\'));
-          return !hit || !detectMainDecl(hit.src);              /* 读不到 ⇒ 也算"没被扫到"（判不了就判红） */
-        })
-        .map(x => x.rel.split('/').join('\\'));
-      /* 自证：拿一个**合成**的"直下脚本＋无入口声明"喂同一条判据 ⇒ 必须被指名（防这条判据写成恒真） */
-      const probe = direct.map(rel => ({ rel, base: rel.slice(rel.lastIndexOf('/') + 1), src: '' }))
-        .filter(x => x.base !== 'env.js')
-        .map(x => ({ name: x.rel.split('/').join('\\'), src: x.src }));
-      const probeMissing = probe.filter(p => !detectMainDecl(p.src)).map(p => p.name);
-      const selfProves = probeMissing.length > 0;
-      t.info(`§16-L 直下脚本 ${direct.length} 个：豁免 ${EXEMPT.size} 个（${[...EXEMPT].join('、')}：被 require 的模块，实现 assertRuntime 与常量真源，不是门禁入口）；`
-        + `被 §十六 扫到的入口 ${direct.length - EXEMPT.size - missing.length} 个；`
-        + `缺失入口声明 ⇒ 指名：${missing.join('、') || '（无）'}；判据自证（合成无入口样本必被指名）＝${selfProves}`);
-      return missing.length === 0 && selfProves;
-    })(),
-    '每条缺失都点名到文件（`tests\\files-check.js`／`tests\\logic-check.js`／`tests\\platform-check.js` 三个门禁脚本'
-      + '在 `T-20261002-03` 之前就**没有** `main()`：§十六 只审"声明了 main()"的文件 ⇒ 它们在扫描面外，'
-      + '`run-all` 的失败明细也认不出它们的裸栈 ⇒ 两道门同时瞎（`E80`）；豁免只有 `env.js`（理由见 info 行）');
+    l16.missing.length === 0 && l16.selfProves,
+    l16.missing.length
+      ? `判红：缺失入口声明 **${l16.missing.length} 个**（**逐条指名**，只列实测缺的那些）：${l16.missing.join('、')}`
+        + ` —— 没有入口的脚本不在 §十六 的扫描面内，\`run-all\` 的失败明细也认不出它们的裸栈（\`E80\` 的两个盲区）；`
+        + `豁免只有 ${[...l16.EXEMPT].join('、')}（理由见 info 行）；判据自证＝${l16.selfProves}`
+      : (l16.selfProves
+        ? `直下脚本 ${l16.direct.length} 个，非豁免 ${l16.nonExempt.length} 个**全部**被 §十六 扫到（豁免只有 `
+          + `${[...l16.EXEMPT].join('、')}，理由见 info 行）；判据自证成立＝真样本 ${l16.detectorHits.length}/`
+          + `${l16.nonExempt.length} 被认出 ＋ 抠掉 ${l16.victim ? l16.victim.name : '（无）'} 的 \`main()\` 声明后必被指名`
+        : `判红：入口覆盖本身齐了（missing=0），但**判据自证不成立**（真样本被认出 ${l16.detectorHits.length}/`
+          + `${l16.nonExempt.length}；可变异真样本＝${l16.victim ? l16.victim.name : '**一个都找不到**'}）`
+          + ` ⇒ 这条判据可能已退化成恒真，必须先修判据（不得当作通过）`));
 
   t.check('§16-B 扫描器自证：`async function main`／`function main`／`main = async` 三种真实写法都被识别，注释里的 `function main()`（无函数体）与不含 `main` 的源码都不计入',
     (() => {
@@ -5530,6 +5621,95 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     '`E81` 的原形态＝第三分支引用 `asyncRegion.text`（对 sync 恒 null）。定点变异把这一处改回去 ⇒ '
       + '本组必须**判失败**：**旧形态是抛异常**（`TypeError`，落到"无汇总行 ＋ 退 2"），'
       + '而不是"指名叫红" —— 两种都算命中，本行如实打印是哪一种（ADR-0004 D22）');
+
+  /* §16-M：**表达式体箭头**自证（`E82⒜`，2026-10-02 收口）。现场：`E79`／`E81` 的区间解析只认**块体**
+     （要找块级 `{`）⇒ 合法简写 `main().catch(err => process.exit(2));`（**表达式体、括号成对**）被判
+     "括号在文件内没有闭合"而**假红**（主代理实测：投放该形态 ⇒ `§16-A` 278/1 指名；移除后回 279/0）。
+     修法＝在块扫描之前先认箭头（`arrowBodyOf`），表达式体取"外层调用右括号"之前的区间。
+     D22（§16-K 同款手法，**不写盘**）：从**本文件真代码**里抽出 `arrowBodyOf` ＋ `catchBlockRegion`
+     两个函数，只把"认箭头"那一行换成 `const arrow = null;`（＝旧形态：永不认表达式体），
+     交给 `new Function` 编译 ⇒ **旧形态必须在同一批样本上把合法简写判红**（假红复现）。
+     敏感文本一律字符串拼接构造（同 §16-C/E 的理由：本文件自己也在 §16 的扫描范围内）。 */
+  const mkExprBodyEntry = body => 'async function main() { done(); }\n\n'
+    + 'main().catch(err => ' + body + ');\n';
+  t.check('§16-M 表达式体箭头自证：`main().catch(err => process.exit(2));`（合法简写、括号成对）必须**判绿**；' +
+    '同形但退 1 的样本必须**判红并指名**；判红文案不得再说"括号没闭合"；D22＝把"认箭头"那一行换回旧形态 ⇒ 合法样本必被**假判红**',
+    (() => {
+      const NAME_OK = '（合成表达式体简写合规样本）';
+      const NAME_BAD = '（合成表达式体简写退 1 样本）';
+      const okSample = mkExprBodyEntry(E2TEXT);
+      const badSample = mkExprBodyEntry('process.exit(' + '1)');
+      const resOk = auditEntryShape([{ name: NAME_OK, src: okSample }]);
+      const resBad = auditEntryShape([{ name: NAME_BAD, src: badSample }]);
+      const okGreen = resOk.offenders.length === 0 && resOk.counts.total === 1 && resOk.counts.async === 1;
+      const badNamed = resBad.offenders.length === 1 && resBad.offenders[0].startsWith(NAME_BAD)
+        && resBad.offenders[0].includes('没退 2');
+      /* 文案核对（**行为级**，不在源码里搜那句字面量 —— 本检查自己的注释/代码里就有它，搜字面量必假红）：
+         造一个**真的取不到边界**的样本（`.catch(` 的块括号真没闭合）⇒ 判红文案必须说"取不到"，
+         且**不得**出现"括号在文件内没有闭合"那句与事实无关的断言（`D23`：名不符实也是缺陷）。 */
+      const brokenSample = 'async function main() { done(); }\n\nmain().catch(err => {\n  ' + E2TEXT + ';\n';
+      const resBroken = auditEntryShape([{ name: '（合成真没闭合样本）', src: brokenSample }]);
+      const brokenText = String((resBroken.offenders[0] || ''));
+      const wordingFixed = resBroken.offenders.length === 1 && brokenText.includes('取不到')
+        && brokenText.indexOf('括号在文件内没有闭合') < 0;
+      /* ---- D22：从**真代码**抽段 ＋ 一处字面替换造旧形态（全程只读本文件字节，不写盘） ---- */
+      const hsPath = path.join(env.paths.tests, 'harness-check.js');
+      const hsBytes = fs.readFileSync(hsPath);                 /* 字节副本（只读） */
+      const sha0 = sha256Hex(hsBytes);
+      const hsSrc = hsBytes.toString('utf8');
+      const NEW_PRED = 'const arrow = arrowBodyOf(code, i);';
+      const OLD_PRED = 'const arrow = null;';
+      const segStart = hsSrc.indexOf('  const arrowBodyOf = (code, i) => {');
+      const segEnd = hsSrc.indexOf('/** async 入口的异常路径区间');
+      const rawSegment = (segStart >= 0 && segEnd > segStart) ? hsSrc.slice(segStart, segEnd) : null;
+      const mutatedSegment = rawSegment === null ? null : rawSegment.split(NEW_PRED).join(OLD_PRED);
+      const mutateOk = !!rawSegment && !!mutatedSegment && mutatedSegment !== rawSegment
+        && mutatedSegment.indexOf(OLD_PRED) >= 0 && mutatedSegment.indexOf(NEW_PRED) < 0;
+      let oldFormRedOnLegal = false, oldFormText = '', newFormOk = false, thrown = '无';
+      if (mutateOk) {
+        try {
+          /* 迷你审计器：**与 §16 的 async 分支同口径**（剥字面量 → 取 `.catch(` 区间 → 区间内退 2），
+             只把区间解析换成"新形态／旧形态"两份真代码 ⇒ 差值就只可能来自那一处谓词。 */
+          const buildAudit = seg => new Function(
+            'regionOf', 'detectMainDecl', 'stripLiterals', 'lastMatch', 'MAIN_CATCH', 'hasExit2',
+            seg + '\n'
+            + 'const __audit = sources => {\n'
+            + '  const offenders = [];\n'
+            + '  for (const item of sources) {\n'
+            + '    if (!detectMainDecl(item.src)) continue;\n'
+            + '    const code = stripLiterals(item.src);\n'
+            + '    const m = lastMatch(MAIN_CATCH, code);\n'
+            + '    if (!m) { offenders.push(item.name + "：没有 main().catch("); continue; }\n'
+            + '    const region = catchBlockRegion(code, m);\n'
+            + '    if (region.text === null) offenders.push(item.name + "：异常路径区间取不到（判不了就判红）");\n'
+            + '    else if (!hasExit2(region.text)) offenders.push(item.name + "：没退 2");\n'
+            + '  }\n'
+            + '  return { offenders };\n'
+            + '};\n'
+            + 'return { audit: __audit };\n');
+          const bind = seg => buildAudit(seg)(regionOf, detectMainDecl, stripLiterals, lastMatch, MAIN_CATCH, hasExit2).audit;
+          /* 对照（新形态＝本文件现在这一份真代码）：合法简写必须判绿 ⇒ 证明这个小审计器本身没坏 */
+          newFormOk = bind(rawSegment)([{ name: NAME_OK, src: okSample }]).offenders.length === 0;
+          /* 旧形态（`arrow` 恒 null ⇒ 只按块体扫）：合法简写扫不到块级 `{` ⇒ 取不到边界 ⇒ **假判红** */
+          const ores = bind(mutatedSegment)([{ name: NAME_OK, src: okSample }]);
+          oldFormRedOnLegal = ores.offenders.length > 0;
+          oldFormText = String(ores.offenders[0] || '');
+        } catch (err) {
+          oldFormRedOnLegal = true;                            /* 抛异常同样是"判失败"（如实记哪一种） */
+          oldFormText = err.constructor.name + ': ' + err.message;
+          thrown = oldFormText;
+        }
+      }
+      const diskSame = sha256Hex(fs.readFileSync(hsPath)) === sha0;
+      t.info(`§16-M 读数：合法简写 ⇒ 判红 ${resOk.offenders.length} 条（应 0）、退 1 样本 ⇒ 判红 ${resBad.offenders.length} 条（应 1 且含"没退 2"）；`
+        + `判红文案已改为"取不到边界"（真没闭合样本的文案＝${JSON.stringify(brokenText.slice(0, 120))}）＝${wordingFixed}；`
+        + `D22 取到真段＝${!!rawSegment}（${rawSegment ? rawSegment.length : '-'} 字符）、只换了那一个谓词＝${mutateOk}；`
+        + `同一个小审计器下：**新形态**在合法样本上判绿＝${newFormOk}；**旧形态**在合法样本上判红＝${oldFormRedOnLegal}（异常：${thrown}）；`
+        + `旧形态的文案＝${JSON.stringify(oldFormText.slice(0, 160))}；盘上文件未变＝${diskSame}（sha256=${sha0.slice(0, 12)}…）`);
+      return okGreen && badNamed && wordingFixed && mutateOk && newFormOk && oldFormRedOnLegal && diskSame;
+    })(),
+    '修正前实测（`E81` 形态：区间解析只认块体）：同一份合法简写样本 ⇒ `§16-A` **278/1 指名**（文案还写"括号在文件内没有闭合"，与事实相反）；'
+      + '修正后合法简写判绿、退 1 样本仍被指名叫红，且旧形态被同一批样本**假判红**（ADR-0004 D22：判据必须被定点变异证伪过才可信）');
 }
 
 /* ---------------- 十五、A1 端到端：DR-06（`shift_stat`）的固化/补记 ＋ DR-08（`warning`）的不变量 ----------------
@@ -5569,6 +5749,18 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
   let a1Svc = null;
   let a1Db = null;
   let a1Base = () => '';
+  /* ---- `E85⒜`：把 `repo/shiftStat.js` 的 `upsertFrozen` **包一层**（测试侧注入，与 A1-12 换抛错桩
+     同款手法，**不改被测实现**），逐帧记三种次数：
+       `calls`＝调用次数；`written`＝返回 `written:true`（`changes>0`，**INSERT 或 UPDATE 都算**）；
+       `insert`＝`written && !updated`（真的新增了一行）。
+     这是座位 5 给出的"更强替代"（C·18.6⒝，已实跑为绿）：`A1-6c` 由"计数单调不减"（几近恒真）
+     换成**逐帧恒等式** `Δwrites ≡ written 次数`、`Δrows ≡ INSERT 次数`（`ADR-0004 D19`）。
+     ⚠ 声明必须在 `try` **之外**（`finally` 要还原模块导出；`const` 落在 `try` 块里 `finally` 读不到 ——
+     首轮实测就是 `ReferenceError: a1OrigUpsert is not defined`）。
+     ⚠ A1-12 会把这一项临时换成抛错桩；它的 `finally` 还原成**这个包装**（`a1SavedUpsert` 即包装），
+     本节 `finally` 再把模块导出还原成**原件**（失败注入不留痕）。 */
+  const a1Cnt = { calls: 0, written: 0, insert: 0, blocked: 0 };
+  let a1OrigUpsert = null;
   try {
     a1Svc = await serverEntry.start({
       argv: ['--port', '0', '--data-dir', a1Tmp, '--db-file', path.join(a1Tmp, 'board.db')],
@@ -5627,7 +5819,17 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
       }
       return list;
     };
-    /** 推一帧并给出**逐帧对账读数**：Δrows／Δwarning 落库／Δ幂等／事件里的非 ok 条数 */
+    /* ---- 计数包装**装上**（`E85⒜`）：必须在第一帧推入之前 ---- */
+    a1OrigUpsert = shiftStatRepo.upsertFrozen;
+    shiftStatRepo.upsertFrozen = function (db, row) {
+      a1Cnt.calls++;
+      const r = a1OrigUpsert.call(this, db, row);
+      if (r && r.written) { a1Cnt.written++; if (!r.updated) a1Cnt.insert++; } else { a1Cnt.blocked++; }
+      return r;
+    };
+
+    /** 推一帧并给出**逐帧对账读数**：Δrows／Δwarning 落库／Δ幂等／事件里的非 ok 条数
+     *  ＋（`E85⒜`）`shift_stat` 写入点的**逐帧计数**读数（见下方 `a1Cnt` 包装）。 */
     const a1Frames = [];
     const a1Push = async (at, seq, over) => {
       const rec = Object.assign({}, {
@@ -5641,7 +5843,9 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
         warnings: warningRepo.countAll(a1Db),
         writes: serverEntry.state.warningWrite.writes,
         duplicates: serverEntry.state.warningWrite.duplicates,
-        events: a1WarnEvents.length
+        events: a1WarnEvents.length,
+        shiftWrites: serverEntry.state.shiftStatWrite.writes,
+        cnt: { calls: a1Cnt.calls, written: a1Cnt.written, insert: a1Cnt.insert }
       };
       const res = await fetch(a1Base() + '/ifd/frame', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(rec)
@@ -5662,7 +5866,12 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
         rowsAfter: shiftStatRepo.listRows(a1Db, 50).map(r => `${r.shift_date}|${r.shift_name}`),
         backfills: serverEntry.state.shiftStatWrite.backfills,
         writes: serverEntry.state.shiftStatWrite.writes,
-        failures: serverEntry.state.shiftStatWrite.failures
+        failures: serverEntry.state.shiftStatWrite.failures,
+        /* `E85⒜`：`shiftStatWrite.writes` 的**本帧增量** ＋ 写入点桩上的逐帧计数 */
+        dShiftWrites: serverEntry.state.shiftStatWrite.writes - before.shiftWrites,
+        dCntCalls: a1Cnt.calls - before.cnt.calls,
+        dCntWritten: a1Cnt.written - before.cnt.written,
+        dCntInsert: a1Cnt.insert - before.cnt.insert
       };
       a1Frames.push(out);
       return out;
@@ -5736,23 +5945,99 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
       `writes ${a1WritesBeforeJump} → ${a1Jump.writes}；` +
       `未成立的子条件=${a1JumpBad.length ? a1JumpBad.join('、') : '（无）'}`);
 
-    /* A1-5：**补记行不伪造 0** 的形态选择（这一条首版也踩过坑，如实登记）：
-       本跳的补记行是"中班10-02"，它的冻结发生在 16:00:01 那一帧**之后** ⇒ 该窗口内有 1 条
-       `result` 行（判定时刻＝注入时钟），故 `pass_rate = 0`（件数 > 0、合格 0）是**正确**的，
-       不能拿它当"无采集帧 ⇒ 两列 NULL"的例子。真正的占位行是**整班无帧无件**的那一种
-       （稍后的 `中班10-03`），故把"A1-5 的状态位"判据落在**库内所有 `run_sec = 0` 的行**上：
-       每一行都必须满足"**要么两列都非 NULL，要么两列都 NULL**"（不许出现"用 0 顶替算不出来"的半吊子形态）。 */
-    const a1ZeroRunRows = shiftStatRepo.listRows(a1Db, 50).filter(r => r.run_sec === 0);
-    const a1HalfNull = a1ZeroRunRows.filter(r =>
-      (r.oee === null) !== (r.pass_rate === null));
-    t.check('A1-5 **"不用 0 顶替"的两个状态位在库内可分辨**：`run_sec = 0` 的行里，' +
-      '`oee` 与 `pass_rate` **要么都非 NULL**（＝可判定、真 0%）、**要么都 NULL**（＝无法判定），' +
-      '不存在"只有一格 NULL"的半吊子形态；而**有帧**的早班行 `oee = 0` 且 `pass_rate = NULL`（只有件数侧无法计算 ⇒ 合法）',
-      a1ZeroRunRows.length >= 1 && a1HalfNull.length === 0 &&
+    /* A1-5（`E85⒜` **重写**，2026-10-02）：旧判据是"`run_sec = 0` 的行里 `oee`／`pass_rate`
+       **要么都非 NULL、要么都 NULL**"—— 它**不是**实现的不变量：`shiftStatRowOf()` 的两个状态位
+       **各自独立**（`frameCount > 0` ⇒ 运行时长可判定；`pieceCount > 0` ⇒ 合格率可计算），
+       两个方向的合法形态都存在 ⇒ 合法夹具会**假红**（座位 5 实测 `(0,0,NULL)`＝窗口内恰 1 帧、
+       `(0,NULL,0)`＝无帧有件）。这也与 `db-check` 的 `A1/DR-06-7`（"两个状态位各自独立"）口径一致。
+       新判据（**逐行**对齐库内真源计数，`ADR-0004 D19`）：
+         · `oee IS NULL`  ⇔ 该班次窗口内 `measure_rt` **一行都没有**（有帧 ⇒ 非 NULL，即使是真 0%）；
+         · `pass_rate IS NULL` ⇔ 该窗口内 `result` **一件都没有**（有件 ⇒ 非 NULL）。
+       期望值**独立复算**：窗口由**班次真源**（`a1ShiftRules` 的 `at()` 沿 `endAt` 前进）现算，
+       **不手写任何班次起止时刻**；两个计数由本节自写的 SQL 数（与 `statsForShift()` 同一窗口口径，
+       但不复用实现的中间量）。另要求"有帧无件""无帧有件""无帧无件"三种**可分辨**形态各至少 1 行
+       —— 否则这条判据是空的。 */
+    const a1WindowOf = (date, name) => {
+      let cur = a1ShiftRules.at(`${date} 00:00:00`);
+      for (let guard = 0; guard < 10; guard++) {
+        if (cur.date === date && cur.name === name) return { startAt: cur.startAt, endAt: cur.endAt };
+        cur = a1ShiftRules.at(cur.endAt);
+      }
+      return null;
+    };
+    const a1FactOf = (date, name) => {
+      const w = a1WindowOf(date, name);
+      if (!w) return null;
+      return {
+        window: `${w.startAt} → ${w.endAt}`,
+        frames: a1Db.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE collect_time >= ? AND collect_time < ?')
+          .get(w.startAt, w.endAt).c,
+        pieces: a1Db.prepare('SELECT COUNT(*) AS c FROM result WHERE judged_at IS NOT NULL AND judged_at >= ? AND judged_at < ?')
+          .get(w.startAt, w.endAt).c
+      };
+    };
+    /* 逐行**合法性判定**（纯函数，便于拿座位 5 的两个合法反例做负对照）：
+         · 无采集帧 ⇒ `oee` 必须 NULL（不得用 0 顶替"算不出来"）；有帧 ⇒ 必须非 NULL（真 0% 也照写 0）；
+         · 有判定件 ⇒ `pass_rate` 必须非 NULL；
+         · 整班无帧无件 ⇒ `pass_rate` 也必须 NULL（占位行两列都 NULL）。
+       ⚠ **`pass_rate` 侧为什么不写等价（"`pass_rate IS NULL` ⇔ 现在数到的件数 ＝ 0"）**：
+       `result.judged_at` 是**可变列** —— 同一件被后续帧重新判定时会被刷新（`repo/result.js` 的
+       upsert 语义），故"现在数到的件数"可能**小于**"冻结时刻数到的件数" ⇒ `现在 pieces = 0` **不能**
+       反推"冻结时也是 0"。本节实测到该形态：`2026-10-02|中班` 冻在 16:00:01 那一帧之后（当刻
+       `pieceCount > 0` ⇒ `pass_rate = 0`），而 A1-5 时那一件的 `judged_at` 已被后续判定刷到窗外
+       ⇒ 现在 pieces = 0。`measure_rt` 则是**只增不改**（每秒一行、窗口在过去）⇒ `frameCount` 侧
+       可以做等价判定（无帧 ⇔ oee NULL）。 */
+    const a1ShapeVerdict = (row, fact) => {
+      if (!fact) return '取不到班次窗口（判不了就判红）';
+      if (fact.frames === 0 && row.oee !== null) return '无采集帧却给了 oee（用 0 顶替"算不出来"）';
+      if (fact.frames > 0 && row.oee === null) return '有采集帧却把 oee 留 NULL（可判定却不给值）';
+      if (fact.pieces > 0 && row.pass_rate === null) return '有判定件却把 pass_rate 留 NULL';
+      if (fact.frames === 0 && fact.pieces === 0 && row.pass_rate !== null) return '整班无帧无件却给了 pass_rate（占位行必须两列 NULL）';
+      return null;
+    };
+    const a1ShapeAudit = () => {
+      const rows = shiftStatRepo.listRows(a1Db, 50).map(r => {
+        const fact = a1FactOf(r.shift_date, r.shift_name);
+        return { key: `${r.shift_date}|${r.shift_name}`, row: r, fact, bad: a1ShapeVerdict(r, fact) };
+      });
+      const kinds = {
+        '有帧无件': rows.filter(x => x.fact && x.fact.frames > 0 && x.row.oee !== null && x.row.pass_rate === null).length,
+        '有帧有件': rows.filter(x => x.fact && x.fact.frames > 0 && x.row.oee !== null && x.row.pass_rate !== null).length,
+        '无帧无件（占位行）': rows.filter(x => x.fact && x.fact.frames === 0 && x.fact.pieces === 0
+          && x.row.oee === null && x.row.pass_rate === null).length,
+        '无帧有件（本节夹具不产出）': rows.filter(x => x.fact && x.fact.frames === 0 && x.fact.pieces > 0
+          && x.row.oee === null && x.row.pass_rate !== null).length
+      };
+      return { rows, kinds, bad: rows.filter(x => x.bad) };
+    };
+    const a1ShapeAt5 = a1ShapeAudit();
+    /* **合法反例负对照**（`E85⒜` 的现场，也是这条判据的 D22）：座位 5 实测的两个**合法**形态都必须
+       **不被**新判据判红 —— `(run_sec=0, oee=0, pass_rate=NULL)`（窗口内恰 1 帧）与
+       `(run_sec=0, oee=NULL, pass_rate=0)`（无帧有件）。旧判据（"两列同 NULL 或同非 NULL"）
+       会把**后者**判红 ⇒ 这里连同旧判据一起复现，作为"旧判据确实会假红合法形态"的反证。 */
+    const a1LegalShapes = [
+      { name: '(0,0,NULL)＝窗口内恰 1 帧', row: { run_sec: 0, oee: 0, pass_rate: null }, fact: { frames: 1, pieces: 0 } },
+      { name: '(0,NULL,0)＝无帧有件', row: { run_sec: 0, oee: null, pass_rate: 0 }, fact: { frames: 0, pieces: 1 } }
+    ];
+    const a1LegalVerdicts = a1LegalShapes.map(s => ({
+      name: s.name, newBad: a1ShapeVerdict(s.row, s.fact),
+      oldBad: (s.row.oee === null) !== (s.row.pass_rate === null)
+    }));
+    const a1OldFalseReds = a1LegalVerdicts.filter(v => v.oldBad).map(v => v.name);
+    t.check('A1-5 **"不用 0 顶替"的两个状态位（各自独立）逐行对齐库内真源**（`E85⒜` 重写）：' +
+      '无采集帧 ⇒ `oee` 必须 NULL、有帧 ⇒ 非 NULL（真 0% 也照写 0）；有判定件 ⇒ `pass_rate` 非 NULL；' +
+      '整班无帧无件 ⇒ 两列都 NULL（占位行）；且"有帧无件""有帧有件"两种形态在本节的库里都真实存在 —— ' +
+      '**窗口由班次真源现算**、两个计数由本节自写 SQL 数（`ADR-0004 D19`）；' +
+      '负对照：两个**合法**形态（`(0,0,NULL)` 与 `(0,NULL,0)`）都不许被判红，而**旧判据**会把**两个都**假判红',
+      a1ShapeAt5.rows.length >= 1 && a1ShapeAt5.bad.length === 0 &&
+      a1ShapeAt5.kinds['有帧无件'] >= 1 && a1ShapeAt5.kinds['有帧有件'] >= 1 &&
+      a1LegalVerdicts.every(v => v.newBad === null) && a1OldFalseReds.length === a1LegalShapes.length &&
       a1EarlyRow.oee === 0 && a1EarlyRow.pass_rate === null,
-      `run_sec=0 的行 ${a1ZeroRunRows.length} 条：` +
-      a1ZeroRunRows.map(r => `${r.shift_date}|${r.shift_name}(pr=${JSON.stringify(r.pass_rate)},oee=${JSON.stringify(r.oee)})`).join(' , ') +
-      `；半吊子形态 ${a1HalfNull.length} 条（须为 0）`);
+      `逐行：${a1ShapeAt5.rows.map(x => `${x.key}(frames=${x.fact ? x.fact.frames : '?'},pieces=${x.fact ? x.fact.pieces : '?'}` +
+        ` ⇒ run_sec=${x.row.run_sec},oee=${JSON.stringify(x.row.oee)},pass_rate=${JSON.stringify(x.row.pass_rate)})`).join(' , ')}；` +
+      `与独立性判据不符 ${a1ShapeAt5.bad.length} 行（须为 0）${a1ShapeAt5.bad.length ? '：' + a1ShapeAt5.bad.map(x => `${x.key}(${x.bad})`).join('、') : ''}；` +
+      `形态行数＝${JSON.stringify(a1ShapeAt5.kinds)}；` +
+      `负对照（新判据 vs 旧判据）：${a1LegalVerdicts.map(v => `${v.name} ⇒ 新=${v.newBad === null ? '绿' : '红'}／旧=${v.oldBad ? '红（假红）' : '绿'}`).join('；')}`);
 
     /* ---- ②b 一跳跨过**多个**已跑完班次 ⇒ 枚举必须真的"一步一班"地走完 ----
        ⚠ **关键设计（首版这里是不可证伪的，D22 实测被抓出来）**：枚举循环的比较基准是 `list` 的**末尾**
@@ -5761,8 +6046,14 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
        且"到达班"与"上次所见那一班"**同名**（早班→…→早班）⇒ 循环体实际只跑一轮，
        把"循环只跑一轮"的变异（在 `list.push` 前插 `if (list.length > 1) break;`）整段放过去
        （实测 298/0 全绿、变异逃逸）。现在改为：**一跳直接跨到 10-05 12:00:01**
-       （到达班＝"中班10-05"，与上次所见的"早班10-02"不同名）⇒ 现算序列 ≥ 9 个已跑完班次、
-       循环必须迭代 8 次以上，上面那种变异必然让库内行数短于现算序列。
+       （到达班＝"早班10-05"，与上次所见的"晚班10-03"不同名）⇒ 现算序列 ≥ 9 个已跑完班次、
+       循环必须迭代 6 次以上，上面那种变异必然让库内行数短于现算序列。
+       ⚠ **`E85⒠①` 文案更正（2026-10-02，按实测）**：`10-05 12:00:01` 按班次真源属 **早班10-05**
+       （`08:00–16:00`），**不是**"中班10-05"；这一跳之前的"上次所见班次"是 **晚班10-03**
+       （A1-4 那一跳的到达班），**不是**"早班10-02"（早班10-02 只是**枚举序列的首项**、
+       它在更早的 tick 上就已落库）。故本 tick 新写入的是"晚班10-03 → 晚班10-05"之间的 7 个班次，
+       而"中班10-02"是**早已在库、本 tick 不新增**的那一行。（座位 5 的 C·18.7⒠① 实测
+       `lastShiftKey=2026-10-05|早班`。）
        ⚠ **不在这条用例里手工删 `shift_stat`**（试过：`DELETE` 只清掉了持久化行、清不掉进程内的
         `lastShift` ⇒ 枚举起点仍是"那一班的 endAt"，读数会被污染；那是**流程外的库改写**，
        不是被测行为，故弃用）。
@@ -5782,9 +6073,9 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
       'Δrows＝库内行数增量': a1BigJump.dRows === a1BigJump.rowsAfter.length - a1RowsBeforeBig
     };
     const a1BigBad = Object.keys(a1BigConds).filter(k => !a1BigConds[k]);
-    t.check('A1-6 一跳跨过**多个**已跑完班次（到达 10-05 12:00:01 属"中班10-05"，尚未跑完）⇒ ' +
+    t.check('A1-6 一跳跨过**多个**已跑完班次（到达 10-05 12:00:01 属**早班10-05**，尚未跑完）⇒ ' +
       '现算序列 **≥ 9** 个已跑完班次；库内键序与其**逐项相等**、库内行数＝序列长度' +
-      '（早班10-02 是"上次所见那一班"、**不新增行**但仍须在场）；本帧 Δrows ＝ 库内行数增量 —— ' +
+      '（"中班10-02"是**早已在库、本 tick 不新增**的那一行，仍须在场）；本帧 Δrows ＝ 库内行数增量 —— ' +
       '这一跳必须**一步一班**地枚举完 9 个班次，任何"只枚举一轮"的改法都会让库内行数短于现算序列',
       a1BigBad.length === 0,
       `本帧 Δrows=${a1BigJump.dRows}、库内行数=${a1BigJump.rowsAfter.length}；` +
@@ -5793,17 +6084,24 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
       `writes ${a1WritesBeforeJump} → ${a1HealthAfterJump.shiftStatWrite.writes}；` +
       `未成立的子条件=${a1BigBad.length ? a1BigBad.join('、') : '（无）'}`);
 
-    /* ⚠ **如实登记（本包未定论，未作为本条的判据）**：在本节的帧序列下，该跳的 `writes` 增量实测为 8、
-       而库内行数只增 7（`backfills` 增量 6）；单跑同一条帧序列（`tests\._verify\review\a1-full-seq.js`）
-       时读到的是 `writes` 增量 7／`backfills` 增量 7。两者在**数据库层**完全一致（键序＝现算序列、
-       行数＝序列长），差异只在写入计数上，故本条**只判可复核的库内事实**，不拿计数当判据。 */
-    t.check('A1-6c `/health.shiftStatWrite` 的两个累计计数**单调不减**，且 `writes` 与库内行数同量级' +
-      '（计数器的精确口径见上面那条"未定论"登记；本节不以它为判据）',
-      a1HealthAfterJump.shiftStatWrite.writes >= a1BigJump.rowsAfter.length &&
-      a1HealthAfterJump.shiftStatWrite.backfills >= 0 &&
-      a1HealthAfterJump.shiftStatWrite.backfills <= a1HealthAfterJump.shiftStatWrite.writes,
-      `writes=${a1HealthAfterJump.shiftStatWrite.writes}（库内 ${a1BigJump.rowsAfter.length} 行）、` +
-      `backfills=${a1HealthAfterJump.shiftStatWrite.backfills}`);
+    /* ⚠ **计数语义（`E85⒜` 收口；取代旧的"未定论"登记）**：`/health.shiftStatWrite.writes` 数的是
+       "写入语句影响了行"的次数 —— **INSERT 与 UPDATE 都算**（`repo/shiftStat.js` 的 `written` 口径）；
+       而"库内行数"只随 **INSERT** 增长。故**累计读数的差**不能与 `Δrows` 直接比：
+       本节的 `writes ${a1WritesBeforeJump}` 是在 **A1-4 那一跳之前**取的（跨了两个 tick）⇒
+       与 `A1-6` 这一跳的 `Δrows` 不同量纲。**精确口径由 A1-6c 的逐帧恒等式给出**
+       （`Δwrites ≡ written 次数`、`Δrows ≡ INSERT 次数`），本节不再拿累计读数当判据。 */
+    const a1WritesBad = a1Frames.filter(f => f.dShiftWrites !== f.dCntWritten || f.dRows !== f.dCntInsert);
+    t.check('A1-6c **写入点的逐帧计数恒等式**（`E85⒜` 的更强替代，替换旧"两个累计计数单调不减"的弱形态）：' +
+      '包一层 `repo/shiftStat.upsertFrozen` 直接数"本次调用 written／insert 了几行" ⇒ **逐帧** ' +
+      '`Δwrites（/health.shiftStatWrite.writes 的本帧增量）≡ 本帧 written 次数` 且 ' +
+      '`Δrows（库内行数增量）≡ 本帧 INSERT 次数`（`written && !updated`）—— 计数器与库内事实逐帧对账，' +
+      '不再靠"单调不减"这种几近恒真的形态；且至少各有一帧真的 written／insert 过（否则这条恒等式是空的）',
+      a1WritesBad.length === 0 &&
+      a1Frames.some(f => f.dCntWritten > 0) && a1Frames.some(f => f.dCntInsert > 0),
+      `逐帧：${a1Frames.map(f => `${f.at.slice(5)} Δwrites=${f.dShiftWrites}/cntWritten=${f.dCntWritten}` +
+        ` Δrows=${f.dRows}/cntInsert=${f.dCntInsert}`).join('；')}；` +
+      `不符的帧 ${a1WritesBad.length} 帧（须为 0）${a1WritesBad.length ? '：' + a1WritesBad.map(f => f.at).join('、') : ''}；` +
+      `桩上累计 calls=${a1Cnt.calls}／written=${a1Cnt.written}／insert=${a1Cnt.insert}／blocked=${a1Cnt.blocked}`);
 
     t.check('A1-6b `/health` 的 DR-17 取数来源明写（`sumRunSec` ＋ `getShiftRow`，ADR-0009 D4），' +
       '且 `runAccum.frozenShifts`（对账用的全表行数）与库内行数一致',
@@ -5861,11 +6159,13 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
       `lastShiftKey=${serverEntry.state.shiftStatWrite.lastShiftKey}`);
 
     /* 重启后跨班：到达 10-06 09:00:01（属"早班10-06"）。
-       ⚠ 这一条的**靶子**是"从 `measure_rt` 回读上次所见班次"：回读到的是"中班10-05"（重启前最后那帧所属），
-       而到达班是"早班10-06" ⇒ **两者不同名**，故"不读回读、只把到达帧所属班次记为上次所见"
-       这种改法会让序列变成空、`Δrows=0` ⇒ 必然变红（实测：把 `previousFrameShiftOf(frame)` 改成
-       `null` ⇒ 本条与 A1-7 一起变红）。若到达班与"上次所见"**同名**，两种实现都会得到同一个键，
-       这条就**不可证伪**（首版正是那样，H4 变异逃逸）。 */
+       ⚠ **`E85⒠②` 更正（2026-10-02，按实测；旧注释与事实相反）**：旧注释称"把
+       `previousFrameShiftOf(frame)` 改成 `null` ⇒ 本条与 A1-7 一起变红（实测）" —— 座位 5 的
+       C·18.4／C·18.8（H4 组）与本节复跑都读到 **299/0、一条不红**：因为上一条 A1-9 在重启后
+       **先推了一帧同班次帧**（10-05 21:30:01），它把进程内 `lastShift` 重新设成与"回读值"**同名**的
+       `中班10-05` ⇒ `prev=null` 与"真回读"两条路径在这一跳得到**同一把键**、`Δrows` 也相同（2）。
+       ⇒ 本条**不足以**判红 H4；真正可分辨的是本节末尾新增的 `A1-18`（**重启后首帧即跨班**、
+       中间不推同班次帧；那座窗口下 `Δrows` 由 2 变 0）。本条保留，但只主张它自己写明的那些事实。 */
     a1ClockMs = Date.parse('2026-10-06T09:00:10');
     const a1RestartJump = await a1Push('2026-10-06 09:00:01', 7010);
     const a1RestartWantKeys = a1CompletedShifts('2026-10-05 21:00:01', '2026-10-06 09:00:01').map(a1KeyOf);
@@ -6010,7 +6310,86 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
       Number.isFinite(a1HealthAfterJump.addRunSecBound.elapsedSec) &&
       Number.isFinite(a1HealthAfterJump.addRunSecBound.totalSec),
       JSON.stringify(a1HealthAfterJump.addRunSecBound));
+
+    /* ---- ⑥ `E85⒝`：**H4 的可杀窗口** —— 重启后**首帧即跨班**（中间不推同班次帧）----
+       为什么单独补这一段：A1-9 在重启后先推了一帧**同班次**帧，把 `lastShift` 重新设成与"回读值"
+       同名的键 ⇒ `previousFrameShiftOf(frame) → null`（H4 变异体）在 A1-9／A1-10 上**不会被判红**
+       （座位 5 的 C·18.4 实测 299/0）。座位 5 自建的"重启后首帧即跨班"窗口实测 `Δrows` **2 → 0**
+       （变异体 `9a0e3695a746…`）⇒ 这里把它补进本节的**门禁**。
+       期望值仍由**班次真源现算**：`from` ＝ 重启前最后一条采样帧的时刻（`中班10-06` 的窗口内），
+       `to` ＝ 本帧时刻（`早班10-07`）⇒ 现算序列＝[中班10-06, 晚班10-07]（两行都**必须新落库**：
+       中班10-06 落在 A1-12 那一跳（写入点抛错 ⇒ 一行没写）之后，故它**只能**由"回读上次所见班次"
+       推出来）。`prev=null` 时走的 `else` 支把 `lastShift` 记为**当前**班次并直接 return ⇒ `Δrows=0`。 */
+    const a1H4ClockMs = Date.parse('2026-10-07T09:00:10');
+    const a1H4RowsBefore = a1Rows();
+    const a1H4RowsBeforeKeys = shiftStatRepo.listRows(a1Db, 50).map(r => `${r.shift_date}|${r.shift_name}`);
+    const a1H4LastFrame = a1Db.prepare('SELECT collect_time AS t FROM measure_rt ORDER BY collect_time DESC LIMIT 1').get();
+    await serverEntry.stop('a1-e2e-h4-window');               // 真停：进程内"上次所见班次"随之丢失
+    a1ClockMs = a1H4ClockMs;
+    a1Svc = await serverEntry.start({
+      argv: ['--port', '0', '--data-dir', a1Tmp, '--db-file', path.join(a1Tmp, 'board.db')],
+      installSignalHandlers: false, logConsole: false, logger: a1Logger, clock: a1Clock
+    });
+    a1Db = serverEntry.state.db;
+    a1Svc.bus.subscribe(e => { if (e.kind === 'warning') a1WarnEvents.push(e.payload); });
+    const a1H4RestartState = {
+      lastShiftKey: serverEntry.state.shiftStatWrite.lastShiftKey,
+      writes: serverEntry.state.shiftStatWrite.writes
+    };
+    const a1H4Jump = await a1Push('2026-10-07 09:00:01', 7012);
+    const a1H4From = a1H4LastFrame && a1H4LastFrame.t;
+    const a1H4WantKeys = a1CompletedShifts(a1H4From, '2026-10-07 09:00:01').map(a1KeyOf);
+    const a1H4ArriveKey = a1KeyOf(a1ShiftRules.at('2026-10-07 09:00:01'));
+    const a1H4Newly = a1H4Jump.rowsAfter.filter(k => a1H4RowsBeforeKeys.indexOf(k) < 0);
+    t.check('A1-18 **重启后首帧即跨班**（`E85⒝` 补入的 H4 杀窗口）：重启后**不先推同班次帧**，直接推一帧跨班帧 ⇒ ' +
+      '现算序列里的每一行都必须落库（这一跳新写入的＝现算序列**全部**；"中班10-06"只能由 `measure_rt` ' +
+      '回读上次所见班次才推得出，到达班"早班10-07"与它不同名 ⇒ 蒙不对）；`Δrows ≡ 新增行数` —— ' +
+      '把 `previousFrameShiftOf(frame)` 换成 `null`（H4）时该窗口 `Δrows` 由 2 变 0 ⇒ 本条即其判别力所在',
+      a1H4RestartState.lastShiftKey === null && a1H4RestartState.writes === 0 &&
+      a1H4WantKeys.length === 2 && a1H4WantKeys[0] === '2026-10-06|中班' &&
+      a1H4WantKeys.indexOf(a1H4ArriveKey) < 0 &&
+      a1H4Jump.dRows === 2 && a1H4Jump.dRows === a1H4Newly.length &&
+      JSON.stringify(a1H4Newly) === JSON.stringify(a1H4WantKeys) &&
+      a1H4Jump.rowsAfter.length === a1H4RowsBefore + 2,
+      `重启后 lastShiftKey=${a1H4RestartState.lastShiftKey}、writes=${a1H4RestartState.writes}；` +
+      `本帧 Δrows=${a1H4Jump.dRows}（库内 ${a1H4RowsBefore} → ${a1H4Jump.rowsAfter.length}）；` +
+      `本帧新增＝${a1H4Newly.join(' → ')}；现算期望＝${a1H4WantKeys.join(' → ')}（from=${a1H4From}）；` +
+      `到达帧所属=${a1H4ArriveKey}（未跑完 ⇒ 不固化）`);
+
+    /* ---- `E85⒟`：**覆盖缺口显式登记**（不是断言，是"哪几条路今天没人走"的清单）----
+       `H1`（把"时间倒退不是边界"那一支改成 `if (false)`）经座位 5 的 C·18.4 判为**不可达的防御分支**
+       （`ingest` 只接受严格更晚的秒 ＋ `at().startAt` 单调不减），**不是**缺口；但同族的三处在全仓
+       **零断言**（`grep` 全 `tests\` 无命中），这里如实登记（不假装已覆盖）：
+         · `state.shiftStatWrite.staleFrames`（时间倒退计数）—— 该支在公开面上不可达，故无断言；
+         · `MAX_BACKFILL_SHIFTS`（达上限的 `补记枚举中断`／`truncated`，`server\index.js:1311-1323`）
+           —— 要覆盖需要一个"游标不前进"的注入点（属实现侧改造，不在测试写范围内）。
+       `H2`（删掉"本进程首次 tick"支里紧跟 `st.lastShift = cur;` 的 `return`）是**等价变异体**
+       （紧随的守卫返回**同一字面量**、中间无副作用）⇒ 它"未命中"是**正确读数**，不是缺口。 */
+    t.info(`§15 覆盖登记（E85⒞／⒟，均**非缺口**）：H2＝等价变异体（同一字面量、无副作用）；` +
+      `H1＝不可达防御分支（ingest 秒单调 ＋ at().startAt 单调）；**零断言的两处**＝` +
+      `\`shiftStatWrite.staleFrames\` 与 \`MAX_BACKFILL_SHIFTS\` 达上限的 \`补记枚举中断\`（truncated）—— ` +
+      `两处都要覆盖需实现侧注入点，故**只登记**（"首次 tick 且库里没有更早帧 ⇒ prev=null"那一支不是缺口：` +
+      `A1-1 的第一帧就走它，且 A1-8 已断言重启后 lastShiftKey === null）`);
+
+    /* ---- `E85⒜` 收尾：跑完本节**全部**帧之后，再用同一组独立性判据复核**整序** ----
+       此刻库里已同时存在"有帧无件"（早班10-02 等）、"有帧有件"（中班10-02）与"无帧无件"（中班10-03、
+       晚班10-07 等占位行）三种形态 ⇒ 这条非空性条件在这里才立得住（A1-5 时占位行还没产生）。
+       ⚠ "无帧有件"（`(0,NULL,0)`）**本节夹具产不出来**（件数由帧驱动判定、判定的 `judged_at`
+       落不进无帧窗口）⇒ **不要求**它出现，但 A1-5 的负对照已证明这种合法形态**不会**被判红。 */
+    const a1ShapeEnd = a1ShapeAudit();
+    t.check('A1-19 状态位"不用 0 顶替"的**全序复核**（`E85⒜` 收尾）：本节帧序列跑完后，库内**每一行**仍满足 ' +
+      'A1-5 的四条独立性判据，且"有帧无件""有帧有件""无帧无件（占位行）"三种形态各至少 1 行 —— ' +
+      '占位行两列都必须 NULL（`run_sec = 0` 那个 0 **不得**被读成"零运行"）',
+      a1ShapeEnd.rows.length >= 3 && a1ShapeEnd.bad.length === 0 &&
+      a1ShapeEnd.kinds['有帧无件'] >= 1 && a1ShapeEnd.kinds['有帧有件'] >= 1 &&
+      a1ShapeEnd.kinds['无帧无件（占位行）'] >= 1,
+      `共 ${a1ShapeEnd.rows.length} 行；与独立性判据不符 ${a1ShapeEnd.bad.length} 行（须为 0）` +
+      `${a1ShapeEnd.bad.length ? '：' + a1ShapeEnd.bad.map(x => `${x.key}(${x.bad})`).join('、') : ''}；` +
+      `形态行数＝${JSON.stringify(a1ShapeEnd.kinds)}（三种各须 ≥ 1）；逐行＝` +
+      a1ShapeEnd.rows.map(x => `${x.key}(frames=${x.fact ? x.fact.frames : '?'},pieces=${x.fact ? x.fact.pieces : '?'}` +
+        ` ⇒ oee=${JSON.stringify(x.row.oee)},pass_rate=${JSON.stringify(x.row.pass_rate)})`).join(' , '));
   } finally {
+    shiftStatRepo.upsertFrozen = a1OrigUpsert;                // 计数包装当场还原成模块原件（不留痕）
     try { await serverEntry.stop('a1-e2e'); } catch { /* 尽力 */ }
     try { fs.rmSync(a1Tmp, { recursive: true, force: true }); } catch { /* 已删 */ }
   }
@@ -6406,6 +6785,176 @@ t.section('十七、FR-7.12 公告写链路（IF-E `POST /notice`：鉴权／仅
       !fs.existsSync(nSvcTmp) && (!nSvc || nSvc.proc.exitCode !== null || nSvc.proc.killed === true),
       `${nSvcTmp} 存在=${fs.existsSync(nSvcTmp)}`);
   }
+}
+
+/* ---------------- 十八、E87 `POST /upload/retry` 的回环来源闸（方案 b；`T-20261002-10` 交付） ----------------
+   被测对象（**只断言、不改实现**）：`server/http/routes/upload.js` 的 `POST /upload/retry` —— 全仓
+   **唯一**会再次向 MES 发送待补传报文的入口（且按 `created_at,id` 顺序**批量**重发）。
+   裁定（2026-10-02，负责人**方案 b**）：**只加回环校验**（`services/auth.js` 的 `isLoopback()`
+   ＋ `routes/auth.js` 的 `remoteOf()`，取**真源**、不写第二份），非回环 ⇒ **403 `not_loopback`**；
+   登录态那一半留到 `E86①` 的前端令牌接线落定后再加 —— 故本节**不**断言登录态（也不得读成"已鉴权"）。
+   为什么"没发送"必须有**调用计数**证据（`ADR-0004 D19`）：403 只是**应答**，它不排除"先发了再拒"；
+   能把"一条都没发"证成的只有**桩上 `retryPending()` 的调用增量 ＝ 0**（外加 `router.readJson` 的
+   增量 ＝ 0 ⇒ 连请求体都没读，拒绝发生在处理之前）。本节因此**拒绝**任何"只看 403 就算验过"的写法。
+   判据来源**不注入**：`mountUpload()` 的 `isLoopback`/`remoteOf` 两个注入口一律**不传** ⇒ 走的是
+   `server/index.js` 生产接线同一条真源路径（注入口只为探针而设；验注入口 ≠ 验实现）。
+   "非回环"怎么造（`ADR-0007 D4`：只信 `req.socket.remoteAddress`、不信任何请求头）⇒ 只能在**进程内**
+   遮蔽 socket 取值器（`Object.defineProperty`），且本节走**真 HTTP**（`http.createServer` ＋ `fetch`），
+   不是直接调处理器 —— 与 `T-20261002-10` 的探针同款构造，但期望值由本节自持。
+   范围最小化：`GET /upload/pending` 这类**只读**端点不在本包范围内 ⇒ 同一非回环来源进来仍必须 200。 */
+t.section('十八、E87 `POST /upload/retry` 的回环来源闸（非回环 ⇒ 403 且一次都不发）');
+{
+  const { createRouter: createRouterE87 } = require('../server/http/router');
+  const { mountUpload: mountUploadE87 } = require('../server/http/routes/upload');
+  const { isLoopback: isLoopbackE87 } = require('../server/services/auth');
+  const { remoteOf: remoteOfE87 } = require('../server/http/routes/auth');
+  /* RFC 5737 TEST-NET-3：保留给文档的网段，**不可能是**本机回环地址（无副作用，不是真网段） */
+  const E87_FORGED = '203.0.113.7';
+  const E87_LOOPBACKS = ['127.0.0.1', '::1', '::ffff:127.0.0.1'];
+
+  const e87Calls = { retryPending: 0, listPending: 0, readJson: 0, buildReport: 0 };
+  const e87Warns = [];
+  const e87Clock = createClock({ mode: 'fixed', at: '2026-10-02T09:30:00' });
+  const e87Reporter = {
+    retryPending: async input => {
+      e87Calls.retryPending++;
+      return { ok: true, requested: 1, sent: 1, failed: 0, remaining: 0, input: input || {}, results: [] };
+    },
+    listPending: () => { e87Calls.listPending++; return []; },
+    status: () => ({ mount: 'upload', pendingCount: 0, alert: { warn: false }, autoRetry: false }),
+    buildReport: () => { e87Calls.buildReport++; return { ok: false, error: '本节只验重报闸，不组装报文' }; }
+  };
+  const e87Router = createRouterE87({ getHealth: () => ({ ok: true }), now: e87Clock.source() });
+  /* 读体计数：**唯一**能把"拒绝发生在读体之前"证成的读数（不是看源码行号，见本节头注） */
+  const e87ReadJsonOrig = e87Router.readJson.bind(e87Router);
+  e87Router.readJson = async req => { e87Calls.readJson++; return e87ReadJsonOrig(req); };
+  /* **不传** isLoopback/remoteOf ⇒ 真源 */
+  const e87Mount = mountUploadE87(e87Router, {
+    reporter: e87Reporter,
+    logger: { warn: m => e87Warns.push(String(m)), info: () => {}, error: () => {} },
+    now: e87Clock.source()
+  });
+
+  /* `e87Forge` 非空 ⇒ 把**这一条**请求的 socket 来源改写成非回环（进程内伪造；用 defineProperty 建
+     自有属性以遮蔽 `net.Socket.prototype` 上的取值器 —— 直接赋值在严格模式下会抛错）。 */
+  let e87Forge = null;
+  const e87Server = http.createServer((req, res) => {
+    if (e87Forge) {
+      Object.defineProperty(req.socket, 'remoteAddress', { value: e87Forge, configurable: true, enumerable: true });
+    }
+    Promise.resolve(e87Router.handle(req, res)).catch(() => { try { res.destroy(); } catch { /* 已断 */ } });
+  });
+  const e87Port = await harness.allocPort();
+  await new Promise((resolve, reject) => {
+    e87Server.once('error', reject);
+    e87Server.listen(e87Port, '127.0.0.1', resolve);
+  });
+  const e87Post = async body => {
+    const r = await fetch(`http://127.0.0.1:${e87Port}/upload/retry`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    const text = await r.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
+    return { status: r.status, body: parsed, text };
+  };
+  const e87Get = async p => {
+    const r = await fetch(`http://127.0.0.1:${e87Port}${p}`);
+    const text = await r.text();
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch { parsed = null; }
+    return { status: r.status, body: parsed, text };
+  };
+
+  try {
+    t.check('E87-0 装配与判据真源：`mountUpload()` 自报 mounted:true 且注册 4 条路由（含 `POST /upload/retry`）；' +
+      '判据取**真源**（`services/auth.js` 的 `isLoopback()` 认三种回环写法、`routes/auth.js` 的 `remoteOf()` ' +
+      '**只信 socket**、`X-Forwarded-For` 一律不信）—— 本节的装配**没有**注入这两个判据',
+      e87Mount.mounted === true && e87Mount.routes.length === 4 &&
+      e87Mount.routes.indexOf('POST /upload/retry') >= 0 &&
+      E87_LOOPBACKS.every(a => isLoopbackE87(a) === true) && isLoopbackE87(E87_FORGED) === false &&
+      remoteOfE87({ socket: { remoteAddress: '10.0.0.9' }, headers: { 'x-forwarded-for': '127.0.0.1' } }) === '10.0.0.9' &&
+      remoteOfE87({ headers: { 'x-forwarded-for': '127.0.0.1' } }) === '',
+      `mounted=${e87Mount.mounted}；routes=[${e87Mount.routes.join(' , ')}]；` +
+      `真源读数：isLoopback(${E87_LOOPBACKS.join('/')})=` +
+      `${E87_LOOPBACKS.map(a => isLoopbackE87(a)).join('/')}、isLoopback(${E87_FORGED})=${isLoopbackE87(E87_FORGED)}；` +
+      `remoteOf(伪造 XFF ＋ socket 10.0.0.9)=${JSON.stringify(remoteOfE87({ socket: { remoteAddress: '10.0.0.9' }, headers: { 'x-forwarded-for': '127.0.0.1' } }))}`);
+
+    /* ---- 读数①：真回环（真 HTTP）⇒ 仍 200 且**真发一次**（正对照：防"把一切都拒了"也算完成"） ---- */
+    const e87B1 = { ...e87Calls };
+    const e87R1 = await e87Post({});
+    const e87D1 = {
+      retry: e87Calls.retryPending - e87B1.retryPending,
+      read: e87Calls.readJson - e87B1.readJson,
+      handled: e87Mount.counters.retryHandled, forbidden: e87Mount.counters.forbidden
+    };
+    t.check('E87-1 读数①（真回环，真 HTTP）：`POST /upload/retry` ⇒ **HTTP 200** ＋ `ok:true` ＋ `sent:1`，' +
+      '桩上 `retryPending()` 调用 **Δ=1**（回环路径照旧真发送），`counters.retryHandled` 如实为 1、`forbidden` 为 0',
+      e87R1.status === 200 && e87R1.body && e87R1.body.ok === true && e87R1.body.sent === 1 &&
+      e87D1.retry === 1 && e87D1.read === 1 && e87D1.handled === 1 && e87D1.forbidden === 0,
+      `HTTP ${e87R1.status}；body=${JSON.stringify(e87R1.body)}；retryPending Δ=${e87D1.retry}、` +
+      `readJson Δ=${e87D1.read}、counters=${JSON.stringify(e87Mount.counters)}`);
+
+    /* ---- 读数②：非回环（进程内伪造 socket）⇒ 403 且 retryPending／readJson 的增量**都为 0** ---- */
+    e87Forge = E87_FORGED;
+    const e87B2 = { ...e87Calls, warns: e87Warns.length };
+    const e87R2 = await e87Post({});
+    const e87D2 = {
+      retry: e87Calls.retryPending - e87B2.retryPending,
+      read: e87Calls.readJson - e87B2.readJson,
+      warns: e87Warns.length - e87B2.warns,
+      handled: e87Mount.counters.retryHandled, forbidden: e87Mount.counters.forbidden
+    };
+    t.check('E87-2 读数②（**本组核心**）：伪造 `req.socket.remoteAddress=' + E87_FORGED + '` ⇒ **HTTP 403** ' +
+      '`not_loopback`（`ok:false`／`error`／`err.code`／`remote`／`at` 齐全），且桩上 `retryPending()` **Δ=0** ' +
+      '（"一条都没发"是**计数**证据，不是从 403 推出来的）、`counters.retryHandled` 未增、`counters.forbidden` ＋1',
+      e87R2.status === 403 && e87R2.body && e87R2.body.ok === false && e87R2.body.error === 'not_loopback' &&
+      Boolean(e87R2.body.err) && e87R2.body.err.code === 'not_loopback' && e87R2.body.err.httpStatus === 403 &&
+      e87R2.body.remote === E87_FORGED && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(String(e87R2.body.at)) &&
+      e87D2.retry === 0 && e87Calls.retryPending === 1 && e87D2.handled === 1 && e87D2.forbidden === 1,
+      `HTTP ${e87R2.status}；body=${JSON.stringify(e87R2.body)}；retryPending Δ=${e87D2.retry}` +
+      `（累计仍为 ${e87Calls.retryPending}，即只有读数①那一次）；retryHandled=${e87D2.handled}、forbidden=${e87D2.forbidden}`);
+
+    t.check('E87-3 拒绝发生在**读请求体之前**（结构证据）：非回环请求下 `router.readJson()` 的调用增量 **Δ=0**' +
+      ' —— 读体、入参校验、`retryPending()` 三步一步都没走到（"不发送"由此在结构上成立，而不只是"应答是 403"）',
+      e87D2.read === 0 && e87D2.warns === 1 && e87Warns.length === 1 &&
+      /非回环来源/.test(e87Warns[0]) && e87Warns[0].indexOf(E87_FORGED) >= 0,
+      `readJson Δ=${e87D2.read}；` +
+      `留痕口径（只 warn 不写 op_log）：被拒 warn Δ=${e87D2.warns}（每条被拒恰一条，含来源 IP）；` +
+      `原文=${JSON.stringify(e87Warns[0] || '')}`);
+
+    /* ---- 顺序证据：闸在**入参校验之前** —— 非回环 ＋ 非法入参（`limit:0`）必须仍是 403，而不是 400 ---- */
+    const e87R3 = await e87Post({ limit: 0 });
+    t.check('E87-4 顺序：非回环 ＋ **非法入参**（`limit:0`）仍落在来源闸上 ⇒ **403 `not_loopback`**（不是 400 `BAD_VALUE`），' +
+      '且 `retryPending`／`readJson` 的增量在这条上**仍为 0**（闸的位置不是"读体之后再补一道"）',
+      e87R3.status === 403 && e87R3.body && e87R3.body.err && e87R3.body.err.code === 'not_loopback' &&
+      e87Calls.retryPending === 1 && e87Calls.readJson === 1,
+      `HTTP ${e87R3.status}／${e87R3.body && e87R3.body.err && e87R3.body.err.code}；` +
+      `retryPending 累计=${e87Calls.retryPending}（仍只有读数①那一次）、readJson 累计=${e87Calls.readJson}`);
+
+    /* ---- 范围证据：只读端点**未被牵连**（同一非回环来源仍 200） ---- */
+    const e87B4 = e87Calls.listPending;
+    const e87R4 = await e87Get('/upload/pending');
+    t.check('E87-5 范围最小化：同一**非回环**来源下 `GET /upload/pending`（只读）仍 **200** 且 `ok:true`、' +
+      '真的走了读口（`listPending` 被调用）—— 本包只收写入口，未把只读端点一起拒掉',
+      e87R4.status === 200 && e87R4.body && e87R4.body.ok === true && e87Calls.listPending - e87B4 >= 1,
+      `GET /upload/pending ⇒ HTTP ${e87R4.status}（非回环）；listPending 调用 Δ=${e87Calls.listPending - e87B4}`);
+
+    /* ---- 口径：`counters` **不进任何 HTTP 响应体**（前端与契约不动；只在挂载对象上可读） ---- */
+    const e87LeakKeys = ['counters', 'retryHandled', 'forbidden'];
+    const e87Leaks = [e87R1, e87R2, e87R3, e87R4].filter(r =>
+      e87LeakKeys.some(k => r.text.indexOf('"' + k + '"') >= 0));
+    t.check('E87-6 `counters`（`retryHandled`／`forbidden`）**不进任何 HTTP 响应体**：200／403／400 三类应答与只读端点的' +
+      '响应文本里都不出现这三个键 —— 计数只供自检与巡检读，前端契约不动（口径依据见 `forbiddenBody()` 的注释）',
+      e87Leaks.length === 0 &&
+      Object.keys(e87Mount.counters).sort().join(',') === 'forbidden,retryHandled',
+      `被检查的应答 ${[e87R1, e87R2, e87R3, e87R4].length} 条，含计数键的 ${e87Leaks.length} 条；` +
+      `挂载对象上的 counters=${JSON.stringify(e87Mount.counters)}（可读，但不外泄到响应体）`);
+  } finally {
+    await new Promise(resolve => e87Server.close(resolve));
+  }
+  t.check('E87-7 本节自建的 HTTP 服务跑完**当场关停**（不留监听端口/残留进程；伪造只发生在进程内）',
+    e87Server.listening === false, `listening=${e87Server.listening}`);
 }
 
 t.finish();

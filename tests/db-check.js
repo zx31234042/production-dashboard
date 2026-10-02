@@ -4459,10 +4459,17 @@ async function main() {
           'failed_qty', 'retest_qty', 'pass_rate', 'run_sec', 'idle_sec', 'oee', 'frozen_at'];
         const colDiff = cols.filter(c => (after ? after[c] : undefined) !== exp.row[c])
           .map(c => `${c}: 实测 ${JSON.stringify(after ? after[c] : undefined)} ≠ 独立复算 ${JSON.stringify(exp.row[c])}`);
-        /* 守卫是否**真的**生效，只能由"行内容有没有变"看出来 —— 见下面 DR-06-4 的实测登记：
-           SQLite 的 `INSERT … ON CONFLICT DO UPDATE … WHERE` 在 `WHERE` 为假时
-           **`changes` 仍报 1**（它数的是"冲突被解决了"，不是"列被改了"）。
-           故本包**不**把 `ret.written` 当作"守卫拦住了"的判据。 */
+        /* 守卫是否**真的**生效，只能由"行内容有没有变"看出来 —— 见下面 DR-06-4 的实测登记。
+           为什么**不能**拿 `ret.written` 当判据（`E85⒠③` 更正，理由与旧注释**相反**）：
+           `written` 由 `changes > 0` 推出，而 `changes` 只说明"这次 upsert 确实改动了行"——
+           **守卫放行的同值重算也计 1**（`frozen_at` 每次重算都会被刷新）⇒ 它区分不了
+           "守卫拦下"与"放行但值恰好相同"，故不能用它当"守卫生效"的证据。
+           实测（`tests\._verify\review\t2-e85-upsert-changes.js`：出厂 `UPSERT_SQL` ＋ 真仓储、连做两次）：
+             · 守卫**拦下**（新行两列都 NULL / 旧行已知）⇒ SQLite 报 **`changes=0`**（两次都是 0，确定性）、
+               `repo.written=false`／`updated=true`、行内容纹丝不动；
+             · 守卫**放行**的同值重算 ⇒ `changes=1`（`frozen_at` 被刷新）。
+           ⚠ 旧注释曾写"`WHERE` 为假时 `changes` **仍报 1**（它数的是'冲突被解决了'）"——与事实相反，
+           本节据座位 5 的 C·18.6⒟ 与上面这次复测改正（**结论**"不拿 `written` 当判据"不变）。 */
         const contentUnchanged = JSON.stringify(before) === JSON.stringify(after);
         return {
           ret, before, after, exp, colDiff, contentUnchanged,
