@@ -4896,6 +4896,423 @@ async function main() {
     }
   }
 
+  /* ---------------- U9：设置页登录接线（`T-20261002-15` / 技术债 `E86①`；口径＝ADR-0007 D1–D9） ----------------
+     本节管**前端那一侧的行为**（服务端那一侧的真进程/真 HTTP 判据在 `harness-check` 第十九节）：
+       · 服务端模式下"解锁"＝真 `POST /auth/login`（**不存在**明文比对路径）—— 用**演示口令 8888** 都解不开，
+         这是"前端不比对"的行为级证据（静态读数只是旁证，见 U9-a2）；
+       · 401 ⇒ **可见降级**（`未登录或登录已过期`；不黑屏、不抛未捕获异常）；
+       · 423 ⇒ 显示服务端给的**剩余秒数**；409 ⇒ 提示走**本机**一次性初始化；
+       · 改密（FR-8.4）成功后**强制清会话并要求重新登录**；
+       · 自动锁定到点（FR-8.2）**确实调用 `logout`**（前端计时器与服务端令牌不各管一套，D5）；
+       · **演示模式**：显式提示 + 其余行为**逐字不变**（沿用 U8 的字节级口径：期望串是**手写字面量**，
+         不与实现共用任何表达式）；
+       · **静态不变量**：前端源码零 `localStorage`、零哈希/明文比对/失败计数/锁定判定。
+     夹具：真 `services/api.js` + 真 `services/auth.js` + 真 `SettingPanel.js` 在 vm 里跑，
+           `fetch` 是**可编排的桩件**（本节的每条失败路径都要能被精确制造出来），定时器只登记不真跑。
+     ⚠ 为什么"服务端 401 可见降级"要在**真 `Api.httpJson()` 路径**上制造：统一 401 处理挂在
+        `httpJson()` 的 `!res.ok` 分支上（全仓唯一 HTTP 出口）—— 直接调 `BoardSession.noteUnauthorized()`
+        只能证明"记账函数可用"，证明不了"出口真的接了它"（D23 的防空洞）。 */
+  section('U9 FR-8.1/FR-8.2/FR-8.4 设置页登录接线（服务端模式＝POST /auth/login / 401 可见降级 / 423 剩余秒数 / 409 本机初始化 / 改密清会话 / 自动锁定登出 / 演示模式逐字不变 / 静态不变量）');
+  {
+    /** 静态不变量用：剥掉**注释与字符串字面量**（只留可执行代码）。
+     *  为什么必须剥：`src/services/auth.js` 的**注释**里就写着"明令禁止 `localStorage`"与
+     *  "`server/services/auth.js`：scrypt + 独立盐…" —— 对原文直接 grep 会把**禁令声明**判成违规
+     *  （现场实测：原文 localStorage 2 处、scrypt 1 处，全在注释里）。 */
+    function codeOnly(src) {
+      let out = '';
+      for (let i = 0; i < src.length; i++) {
+        const c = src[i];
+        if (c === '/' && src[i + 1] === '/') { while (i < src.length && src[i] !== '\n') i++; out += '\n'; continue; }
+        if (c === '/' && src[i + 1] === '*') { i += 2; while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) i++; i++; out += ' '; continue; }
+        if (c === "'" || c === '"' || c === '`') {
+          const q = c; i++;
+          while (i < src.length && src[i] !== q) { if (src[i] === '\\') i++; i++; }
+          out += ' '; continue;                                  // 字符串整体替换为空格（不改变行结构）
+        }
+        out += c;
+      }
+      return out;
+    }
+
+    const U9_NODES = new Map();
+    const U9_TIMERS = [];
+    const U9_WARN = [];
+    const U9_STORE = new Map();
+    const U9_CALLS = [];
+    let u9TimerSeq = 0;
+    let u9NextFetch = null;
+    const u9Node = id => {
+      if (U9_NODES.has(id)) return U9_NODES.get(id);
+      const classes = new Set();
+      const handlers = {};
+      const o = {
+        __id: id, hidden: false, disabled: false, value: '', className: '', style: {}, dataset: {}, __parent: null,
+        classList: {
+          add: c => classes.add(c), remove: c => classes.delete(c),
+          contains: c => classes.has(c), toggle: () => {}
+        },
+        addEventListener: (type, fn) => { (handlers[type] = handlers[type] || []).push(fn); },
+        __fire: (type, ev) => (handlers[type] || []).forEach(fn => fn(ev || { key: 'Enter' })),
+        setAttribute: (k, v) => { o[k] = String(v); },
+        getAttribute: k => (o[k] === undefined ? null : o[k]),
+        appendChild(child) { if (child && typeof child === 'object') child.__parent = o; return child; },
+        remove() {}, closest: () => null, querySelector: () => null
+      };
+      Object.defineProperty(o, 'parentNode', { get: () => o.__parent, configurable: true });
+      Object.defineProperty(o, 'textContent', {
+        get: () => o.__text || '', set: v => { o.__text = String(v); }, configurable: true
+      });
+      Object.defineProperty(o, 'innerHTML', {
+        get: () => o.__html || '', set: v => { o.__html = String(v); }, configurable: true
+      });
+      U9_NODES.set(id, o);
+      return o;
+    };
+
+    const u9Sandbox = {
+      console: {
+        log() {},
+        warn: (...a) => U9_WARN.push(a.map(x => (x && x.message) ? x.message : String(x)).join(' ')),
+        error: (...a) => U9_WARN.push(a.map(x => (x && x.message) ? x.message : String(x)).join(' '))
+      },
+      /* 定时器只登记（与 `loadAutoLockFixture` 同口径）：自动锁定/2 s 弹窗/4 s 复位都由用例手工触发 */
+      setTimeout: (fn, delay) => { const id = ++u9TimerSeq; U9_TIMERS.push({ id, delay, fn, fired: false, cancelled: false }); return id; },
+      clearTimeout: id => { const t = U9_TIMERS.find(x => x.id === id); if (t) t.cancelled = true; },
+      setInterval: () => 0, clearInterval: () => {},
+      AbortSignal: { timeout: () => ({}) },
+      fetch: (url, init) => {
+        U9_CALLS.push({ url: String(url), init: init || {} });
+        return u9NextFetch ? u9NextFetch(String(url), init || {}) : Promise.reject(new Error('U9 桩 fetch：未接网络'));
+      },
+      sessionStorage: {
+        getItem: k => (U9_STORE.has(k) ? U9_STORE.get(k) : null),
+        setItem: (k, v) => U9_STORE.set(k, String(v)),
+        removeItem: k => U9_STORE.delete(k)
+      },
+      document: { getElementById: u9Node, querySelector: () => null, querySelectorAll: () => [], addEventListener: () => {} }
+    };
+    u9Sandbox.window = u9Sandbox;
+    vm.createContext(u9Sandbox);
+    const u9Run = rel => vm.runInContext(readText(rel), u9Sandbox, { filename: path.join(ROOT, rel) });
+    const U9_RELS = ['src/components/NoticePanel.js', 'src/components/SettingPanel.js'];
+    guardRegistered(U9_RELS.concat(['src/services/auth.js']), 'loadAuthFixture');
+    u9Run('src/config/board.config.js');
+    u9Run('src/config/fieldMap.js');
+    u9Run('src/utils/format.js');
+    u9Sandbox.window.Dom = {
+      $: u9Node,
+      setText: (id, v) => { u9Node(id).__text = String(v); },
+      setHTML: (id, v) => { u9Node(id).__html = String(v); },
+      setClass: (id, v) => { u9Node(id).className = String(v); },
+      setStyle: () => {}, toggleClass: () => {}
+    };
+    u9Run('src/services/mockData.js');
+    u9Run('src/services/api.js');
+    u9Run('src/services/auth.js');
+    U9_RELS.forEach(u9Run);
+
+    const U9 = { w: u9Sandbox.window, err: null };
+    try {
+      const W = u9Sandbox.window;
+      const ST = W.MockData.state;
+      const BS = W.BoardSession;
+      const flush = () => new Promise(r => setTimeout(r, 20));
+      const jsonRes = (status, obj) => ({
+        ok: status >= 200 && status < 300, status, text: () => Promise.resolve(JSON.stringify(obj))
+      });
+      const txt = id => String(u9Node(id).textContent || '');
+      /** 触发尚未触发/未取消的、delay 匹配的**最后一个**定时器回调（同 `loadAutoLockFixture.fire`） */
+      const fire = delay => {
+        const t = U9_TIMERS.filter(x => x.delay === delay && !x.cancelled && !x.fired).pop();
+        if (!t) throw new Error(`没有待触发的 ${delay} ms 定时器（已登记：${U9_TIMERS.map(x => x.delay).join('/') || '无'}）`);
+        t.fired = true;
+        t.fn();
+        return t;
+      };
+      const callsTo = p => U9_CALLS.filter(c => c.url.indexOf(p) >= 0);
+      /** 把界面切到"服务端模式"（判据＝状态位优先、配置兜底，与组件同源） */
+      const intoServerMode = () => {
+        W.BoardConfig.dataSource = 'server';
+        ST.serverMode = true;
+        ST.unlocked = false;
+        ST.notices = { notices: [], tips: [], todo: [] };
+        if (!ST.clock) ST.clock = { date: '2026-10-02', time: '10:00:00' };
+      };
+
+      /* ---- U9-a 服务端模式解锁＝真 `POST /auth/login`（**演示口令 8888 也解不开**＝前端不比对的行为证据） ---- */
+      intoServerMode();
+      W.Components.SettingPanel.bind(ST, () => {});
+      U9_CALLS.length = 0;
+      u9NextFetch = () => Promise.resolve(jsonRes(401, { ok: false, error: 'bad_credentials', reason: '用户名或口令不正确' }));
+      u9Node('setPwd').value = '8888';                      /* ← 演示口令：服务端模式下**必须**被服务端拒 */
+      u9Node('setUnlockBtn').__fire('click');
+      await flush();
+      const aLogin = callsTo('/auth/login');
+      const aBody = aLogin.length ? (() => { try { return JSON.parse(String(aLogin[0].init.body)); } catch { return null; } })() : null;
+      check('U9-a 服务端模式解锁＝真 POST /auth/login：口令**原样**提交给服务端（本用例提交的正是演示口令 `8888`，' +
+        '服务端回 401 `bad_credentials` ⇒ `state.unlocked` 仍为 false、本地无令牌）—— ' +
+        '"前端不做比对"由此在**行为**上成立（若还有明文比对路径，8888 会当场解开）',
+        aLogin.length === 1 && aLogin[0].init.method === 'POST' &&
+        aBody && aBody.password === '8888' && aBody.username === 'admin' &&
+        ST.unlocked === false && BS.token() === '' &&
+        /密码错误/.test(txt('setMsg')) && /服务端/.test(txt('setMsg')),
+        `login 请求=${aLogin.length} 次；body=${JSON.stringify(aBody)}；unlocked=${ST.unlocked}；token='${BS.token()}'；` +
+        `#setMsg=${JSON.stringify(txt('setMsg'))}`);
+
+      /* ---- U9-a2（静态旁证）服务端解锁路径里**没有**本地比对/演示口令 ----
+         取 `tryUnlockServer` 的**函数体**（剥注释与字符串后）判：既无 `unlockPassword`、也无 `8888`。
+         为什么要剥注释/字符串：函数里那句提示文案本身就写着"（口令由服务端校验）"，
+         不剥的话任何文案都会被当成"比对路径"（实测踩不到，但口径要写死）。 */
+      const setSrcRaw = readText('src/components/SettingPanel.js');
+      const setCode = codeOnly(setSrcRaw);
+      const serverBody = functionBody(setCode, 'tryUnlockServer');
+      const uniq = (s, needle) => s.split(needle).length - 1;
+      check('U9-a2（静态读数，**旁证**）`SettingPanel.js` 的服务端解锁路径 `tryUnlockServer()` 体内**不含**' +
+        '`unlockPassword`、也不含字面量 `8888`（剥掉注释与字符串后判定）；且全文件里 `unlockPassword` 的**可执行**出现' +
+        '**恰 1 处**（＝演示路径那一次，`8888` 只允许存在于演示模式，ADR-0007 D4/D5）',
+        Boolean(serverBody) && serverBody.indexOf('unlockPassword') < 0 && serverBody.indexOf('8888') < 0 &&
+        uniq(setCode, 'unlockPassword') === 1 && uniq(setCode, 'localStorage') === 0,
+        `tryUnlockServer 体长=${serverBody ? serverBody.length : '(取不到)'}；` +
+        `体内 unlockPassword=${serverBody ? uniq(serverBody, 'unlockPassword') : 'n/a'}、8888=${serverBody ? uniq(serverBody, '8888') : 'n/a'}；` +
+        `全文件可执行 unlockPassword=${uniq(setCode, 'unlockPassword')} 处（注释里的原文出现 ${uniq(setSrcRaw, 'unlockPassword')} 处）`);
+
+      /* ---- U9-b **统一 401 处理**：在真 `Api.httpJson()` 路径上制造 401 ⇒ 可见降级、不黑屏、不抛 ---- */
+      intoServerMode();
+      U9_WARN.length = 0;
+      BS.save({ token: 'a'.repeat(64), username: 'admin', expiresAt: '2026-10-02 22:00:00' });
+      ST.unlocked = true;                                   /* 人为制造"界面以为已解锁、服务端说不认"的现场 */
+      u9NextFetch = () => Promise.resolve(jsonRes(401, {
+        ok: false, error: 'unauthorized',
+        err: { code: 'unauthorized', httpStatus: 401, message: '会话令牌缺失/伪造/过期/已登出' }
+      }));
+      let bThrew = null;
+      let bFetch = null;
+      try {
+        bFetch = await W.Api.fetchSnapshot();               /* 走**唯一 HTTP 出口**（挂 401 钩子的那一条） */
+        /* 上一条用例的 `flashEntry` 把 `#entryMsg` 置成了粘滞（桩件下 4 s 复位不会自己发生）
+           ⇒ 这里显式清粘滞位，让本帧的 `render()` 真的去写"未登录或登录已过期"（模拟 4 s 后的复位）。 */
+        delete u9Node('entryMsg').dataset.sticky;
+        W.Components.SettingPanel.render(ST);
+      } catch (e) { bThrew = (e && e.message) || String(e); }
+      const bLost = String(BS.lostNote() || '');
+      const bNote = txt('setAuthNote');
+      check('U9-b **统一 401 处理**（真 `Api.httpJson()` 路径）：服务端回 401 `unauthorized` ⇒ 令牌被**清空**、' +
+        '`state.unlocked` 回到**锁定态**、`#setAuthNote` 与 `#entryMsg` 都如实写出「未登录或登录已过期」；' +
+        '**不黑屏**（面板其余文案照常渲染）、**不抛未捕获异常**（`httpJson` 把失败收敛成 `ok:false`）',
+        bThrew === null && bFetch && bFetch.ok === false && String(bFetch.responseCode) === '401' &&
+        BS.token() === '' && ST.unlocked === false &&
+        /未登录或登录已过期/.test(bLost) && /未登录或登录已过期/.test(bNote) &&
+        /未登录或登录已过期/.test(txt('entryMsg')) &&
+        txt('setLockText') === '当前已锁定' && txt('setMsg') !== '',
+        `fetch.ok=${bFetch && bFetch.ok}／responseCode=${bFetch && bFetch.responseCode}；抛错=${bThrew || '无'}；` +
+        `token='${BS.token()}'；unlocked=${ST.unlocked}；` +
+        `lostNote=${JSON.stringify(bLost)}；#setAuthNote=${JSON.stringify(bNote)}；#entryMsg=${JSON.stringify(txt('entryMsg'))}；` +
+        `#setLockText=${JSON.stringify(txt('setLockText'))}`);
+
+      /* ---- U9-b2 与登录态**无关**的 401 不得误清令牌（按机器可读码区分，D5 的细化） ---- */
+      BS.save({ token: 'b'.repeat(64), username: 'admin', expiresAt: '2026-10-02 22:00:00' });
+      BS.clearLost();
+      u9NextFetch = () => Promise.resolve(jsonRes(401, {
+        ok: false, error: 'bad_credentials', err: { code: 'bad_credentials', httpStatus: 401 }
+      }));
+      await W.Api.authLogin('wrong-password');              /* 口令错也是 401，但它**不是**会话失效 */
+      check('U9-b2 401 **按码区分**：`bad_credentials`（口令错/原口令错）这类与会话无关的 401 **不清令牌**、' +
+        '不记账（否则改密时原口令敲错一次就把仍然有效的登录态丢掉，操作人被迫重新解锁）',
+        BS.token() === 'b'.repeat(64) && BS.lostNote() === '',
+        `token 仍在=${BS.token() === 'b'.repeat(64)}；lostNote=${JSON.stringify(String(BS.lostNote() || ''))}`);
+
+      /* ---- U9-c 423 ⇒ **如实显示剩余秒数**（口令正确也拒；剩余秒数由服务端算出） ---- */
+      intoServerMode();
+      U9_CALLS.length = 0;
+      u9NextFetch = () => Promise.resolve(jsonRes(423, {
+        ok: false, error: 'locked', retryAfterSec: 187, lockedUntil: '2026-10-02 10:05:00'
+      }));
+      u9Node('setPwd').value = 'whatever-correct-looking';
+      u9Node('setUnlockBtn').__fire('click');
+      await flush();
+      check('U9-c 423 `locked` ⇒ `#setMsg` 显示**服务端给的剩余秒数**（本用例桩值 187 s）且说明"口令正确也会被拒"；' +
+        '`#entryMsg` 同步给出可见失败（**绝不静默**）；`state.unlocked` 仍 false',
+        ST.unlocked === false && /187 秒/.test(txt('setMsg')) && /口令正确也会被拒/.test(txt('setMsg')) &&
+        /HTTP 423/.test(txt('entryMsg')) && /剩余 187 秒/.test(txt('entryMsg')),
+        `#setMsg=${JSON.stringify(txt('setMsg'))}；#entryMsg=${JSON.stringify(txt('entryMsg'))}；unlocked=${ST.unlocked}`);
+
+      /* ---- U9-d 409 `not_initialized` ⇒ 提示走**本机**一次性初始化，并让初始化行可见 ---- */
+      intoServerMode();
+      u9Node('setInitWrap').hidden = true;                  /* 先复位可视状态，再让 render 决定 */
+      u9NextFetch = () => Promise.resolve(jsonRes(409, {
+        ok: false, error: 'not_initialized', reason: '尚未初始化：请在本机用一次性初始化码设置口令'
+      }));
+      u9Node('setPwd').value = 'anything';
+      u9Node('setUnlockBtn').__fire('click');
+      await flush();
+      fire(4000);                                           /* flashEntry 的 4 s 复位（定时器是桩件，手工触发） */
+      check('U9-d 409 `not_initialized` ⇒ `#setMsg` 提示用**本机**一次性初始化码设置口令（D4：不设默认口令、不许远程初始化）；' +
+        '`render()` 后 `#setInitWrap` **不再 hidden**（初始化入口可见）；`#setAuthNote` 明写"服务端尚未初始化"',
+        /409 not_initialized/.test(txt('setMsg')) && /一次性初始化码/.test(txt('setMsg')) &&
+        u9Node('setInitWrap').hidden === false &&
+        /服务端尚未初始化/.test(txt('setAuthNote')),
+        `#setMsg=${JSON.stringify(txt('setMsg'))}；#setInitWrap.hidden=${u9Node('setInitWrap').hidden}；` +
+        `#setAuthNote=${JSON.stringify(txt('setAuthNote'))}`);
+
+      /* ---- U9-e 改密（FR-8.4）：成功 ⇒ **Bearer 用会话出口的令牌**、清会话、要求重新登录 ---- */
+      intoServerMode();
+      BS.save({ token: 'c'.repeat(64), username: 'admin', expiresAt: '2026-10-02 22:00:00' });
+      ST.unlocked = true;
+      W.Components.SettingPanel.render(ST);
+      u9Node('setOldPwd').value = 'Old-Pass-2026';
+      u9Node('setNewPwd').value = 'New-Pass-2026';
+      u9Node('setNewPwd2').value = 'New-Pass-2026';
+      U9_CALLS.length = 0;
+      u9NextFetch = () => Promise.resolve(jsonRes(200, {
+        ok: true, username: 'admin', requireRelogin: true, sessionsCleared: 1
+      }));
+      u9Node('setPwdChangeBtn').__fire('click');
+      await flush();
+      const eCall = callsTo('/auth/change');
+      const eHdr = eCall.length ? (eCall[0].init.headers || {}) : {};
+      check('U9-e 改密（FR-8.4）成功：真 `POST /auth/change`（`Bearer <令牌>` 取自**会话出口** `BoardSession.token()`）；' +
+        '成功后**强制清当前会话**（`BoardSession.token()` 变空、`state.unlocked=false`、输入框清空）并提示"请用新口令重新解锁"',
+        eCall.length === 1 && eCall[0].init.method === 'POST' &&
+        eHdr.Authorization === 'Bearer ' + 'c'.repeat(64) &&
+        BS.token() === '' && ST.unlocked === false &&
+        u9Node('setOldPwd').value === '' && u9Node('setNewPwd').value === '' && u9Node('setNewPwd2').value === '' &&
+        /重新解锁/.test(txt('setMsg')),
+        `change 请求=${eCall.length} 次；headers=${JSON.stringify(eHdr)}；token='${BS.token()}'；unlocked=${ST.unlocked}；` +
+        `#setMsg=${JSON.stringify(txt('setMsg'))}`);
+
+      /* ---- U9-e2 两次输入不一致 ⇒ **0 次请求**（前端只做"两次是否一致"这一件本地事） ---- */
+      intoServerMode();
+      BS.save({ token: 'd'.repeat(64), username: 'admin', expiresAt: '2026-10-02 22:00:00' });
+      ST.unlocked = true;
+      u9Node('setOldPwd').value = 'Old-Pass-2026';
+      u9Node('setNewPwd').value = 'New-Pass-2026';
+      u9Node('setNewPwd2').value = 'New-Pass-2026-typo';
+      U9_CALLS.length = 0;
+      u9NextFetch = () => Promise.resolve(jsonRes(200, { ok: true }));
+      u9Node('setPwdChangeBtn').__fire('click');
+      await flush();
+      check('U9-e2 改密"确认"框不一致 ⇒ **0 次 HTTP**（服务端不受打扰）且 `#entryMsg` 给出可见提示（"本次不提交"）',
+        callsTo('/auth/change').length === 0 && /不一致/.test(txt('entryMsg')) && /不提交/.test(txt('entryMsg')),
+        `change 请求=${callsTo('/auth/change').length} 次；#entryMsg=${JSON.stringify(txt('entryMsg'))}`);
+
+      /* ---- U9-f 自动锁定到点（FR-8.2）**确实调用 `logout`**（令牌即失效；不各管一套） ---- */
+      intoServerMode();
+      BS.save({ token: 'e'.repeat(64), username: 'admin', expiresAt: '2026-10-02 22:00:00' });
+      ST.unlocked = true;
+      const lockMs = evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS'));
+      W.Components.SettingPanel.armAutoLock();              /* 与 `?unlock=1` 旁路、设置页解锁同一条 arm 路径 */
+      U9_CALLS.length = 0;
+      u9NextFetch = () => Promise.resolve(jsonRes(200, { ok: true, username: 'admin', requireRelogin: true, sessionsRemaining: 0 }));
+      fire(lockMs);
+      await flush();
+      await flush();
+      const fOut = callsTo('/auth/logout');
+      const fHdr = fOut.length ? (fOut[0].init.headers || {}) : {};
+      check('U9-f FR-8.2 自动锁定**到点确实调用 `logout`**：定时器回调（`AUTO_LOCK_MS` 由源码常量实读，本机 ' + lockMs +
+        ' ms）在服务端模式下发出**恰 1 次** `POST /auth/logout`（带同一枚 `Bearer` 令牌），' +
+        '本地令牌当场失效、`state.unlocked=false`（前端计时器与服务端令牌**不各管一套**，ADR-0007 D5）',
+        fOut.length === 1 && fOut[0].init.method === 'POST' &&
+        fHdr.Authorization === 'Bearer ' + 'e'.repeat(64) &&
+        BS.token() === '' && ST.unlocked === false,
+        `logout 请求=${fOut.length} 次；headers=${JSON.stringify(fHdr)}；token='${BS.token()}'；unlocked=${ST.unlocked}；` +
+        `#setMsg=${JSON.stringify(txt('setMsg'))}`);
+
+      /* ---- U9-g **演示模式**：显式提示 + 行为**逐字不变**（含"演示模式不朝服务端发一次请求"） ---- */
+      W.BoardConfig.dataSource = 'mock';
+      ST.serverMode = false;
+      ST.unlocked = false;
+      U9_CALLS.length = 0;
+      const gWarnBase = U9_WARN.length;
+      u9NextFetch = () => Promise.reject(new Error('演示模式**不该**发请求（U9-g）'));
+      delete u9Node('entryMsg').dataset.sticky;              /* 模拟 `flashEntry` 的 4 s 复位（定时器是桩件，手工清粘滞位） */
+      W.Components.SettingPanel.render(ST);
+      const gNote = txt('setAuthNote');
+      const gEntryLocked = txt('entryMsg');
+      /* 期望串是**手写字面量**（ADR-0007 D5 原文 + 被 10 张截图基准冻结的演示文案），
+         不与实现共用任何表达式 —— 否则"自己的输出证明自己没变"（同 U8 的口径）。 */
+      const DEMO_NOTE = '演示模式：未启用服务端口令校验（口令由服务端校验）';
+      const DEMO_ENTRY_LOCKED = '当前已锁定：请先在左侧输入解锁密码（演示密码 8888）';
+      u9Node('setPwd').value = '8888';
+      u9Node('setUnlockBtn').__fire('click');
+      await flush();
+      const gUnlocked = ST.unlocked;
+      const gMsgOk = txt('setMsg');
+      const gEntryUnlocked = txt('entryMsg');
+      u9Node('setPwd').value = 'not-8888';
+      u9Node('setUnlockBtn').__fire('click');
+      await flush();
+      const gMsgWrong = txt('setMsg');
+      const gLockMs = evalNumericExpr(constExpr(readText('src/components/SettingPanel.js'), 'AUTO_LOCK_MS'));
+      fire(gLockMs);                                        /* 演示模式到点也不得朝服务端发请求 */
+      await flush();
+      check('U9-g **演示模式**（`dataSource` 非服务端）：`#setAuthNote` **逐字**＝ADR-0007 D5 那句"未启用服务端口令校验"；' +
+        '锁定/解锁两句 `#entryMsg` 与 `#setMsg`（成功/失败）**逐字**等于被基准冻结的演示文案；' +
+        '演示口令 `8888` 照旧可解锁；**全程 0 次 HTTP**（自动锁定到点同样不发请求）—— 演示模式一行都不改',
+        gNote === DEMO_NOTE && gEntryLocked === DEMO_ENTRY_LOCKED && gUnlocked === true &&
+        gMsgOk === '解锁成功，维保录入与公告修改已开放（5 分钟无操作自动锁定）' &&
+        gEntryUnlocked === '已解锁：录入内容保存后写入本地库并记录操作日志' &&
+        gMsgWrong === '密码错误，请重新输入（演示密码：8888）' &&
+        U9_CALLS.length === 0 && U9_WARN.length === gWarnBase,
+        `#setAuthNote=${JSON.stringify(gNote)}（期望 ${JSON.stringify(DEMO_NOTE)}）；` +
+        `#entryMsg 锁定态=${JSON.stringify(gEntryLocked)}；解锁态=${JSON.stringify(gEntryUnlocked)}；` +
+        `#setMsg 成功=${JSON.stringify(gMsgOk)}、失败=${JSON.stringify(gMsgWrong)}；unlocked=${gUnlocked}；` +
+        `HTTP 调用=${U9_CALLS.length} 次；warn/error Δ=${U9_WARN.length - gWarnBase}`);
+
+      /* ---- U9-h 静态不变量：零 `localStorage` / 零哈希·比对·计数·锁定判定 ----
+         两个扫描面（口径不同，**分别写明**）：
+           · `src\**` ＋ `index.html`（全部前端源码）⇒ 只判 `localStorage`（落点口径，D3/D7）；
+           · **鉴权四件**（`services/auth.js`／`services/api.js`／`components/SettingPanel.js`／`main.js`）
+             ⇒ 判"零哈希/零比对/零计数/零锁定判定"。
+             为什么**不**把 `src/config/board.config.js` 算进来：`maxFailures: 5` 是**服务端口径的配置真源**
+             （`server/services/auth.js` 读它），它是"配置值"不是"前端判定"—— 把它一起扫会变成用文件名白名单
+             排除自己不想看的命中（那正是 D23 要防的"静态防空洞"），故这里把范围写在判据里并说明理由。 */
+      const srcFiles = [];
+      (function walk(dir) {
+        for (const n of fs.readdirSync(dir)) {
+          const p = path.join(dir, n);
+          const st = fs.statSync(p);
+          if (st.isDirectory()) walk(p);
+          else if (/\.(js|css|html)$/.test(n)) srcFiles.push(p);
+        }
+      })(path.join(ROOT, 'src'));
+      srcFiles.push(path.join(ROOT, 'index.html'));
+      const AUTH_LAYER = ['src/services/auth.js', 'src/services/api.js', 'src/components/SettingPanel.js', 'src/main.js'];
+      const lsHits = [];
+      const hashHits = [];
+      for (const f of srcFiles) {
+        const rel = path.relative(ROOT, f);
+        if (codeOnly(fs.readFileSync(f, 'utf8')).indexOf('localStorage') >= 0) lsHits.push(rel);
+      }
+      for (const rel of AUTH_LAYER) {
+        if (/scrypt|timingSafeEqual|fail_count|locked_until/.test(codeOnly(readText(rel)))) hashHits.push(rel);
+      }
+      const authRel = path.join('src', 'services', 'auth.js');
+      const authCode = codeOnly(readText(authRel));
+      const bsDefs = (() => {
+        let n = 0;
+        for (const f of srcFiles) if (codeOnly(fs.readFileSync(f, 'utf8')).indexOf('window.BoardSession =') >= 0) n++;
+        return n;
+      })();
+      check('U9-h **静态不变量**（一律剥掉注释与字符串后判定）：`src\\**` 与 `index.html` 的可执行代码里 **0 处 `localStorage`**' +
+        '（`sessionStorage` 是唯一落点，D3/D7）；**鉴权四件**（`services/auth.js`／`services/api.js`／`components/SettingPanel.js`／`main.js`）里' +
+        '**0 处** `scrypt`／`timingSafeEqual`／`fail_count`／`locked_until`（哈希、口令比对、失败计数、锁定判定**全部**在服务端，D5）；' +
+        '`window.BoardSession =` 全前端**恰 1 处**定义（会话只有这一个出口）且它就定义在 `src\\services\\auth.js`（内部用 `sessionStorage`）',
+        lsHits.length === 0 && hashHits.length === 0 && bsDefs === 1 &&
+        authCode.indexOf('sessionStorage') >= 0,
+        `扫描文件=${srcFiles.length} 个；可执行 localStorage 命中=${JSON.stringify(lsHits)}；` +
+        `鉴权四件的哈希/计数/锁定判定命中=${JSON.stringify(hashHits)}；BoardSession 定义处=${bsDefs}；` +
+        `auth.js 可执行代码含 sessionStorage=${authCode.indexOf('sessionStorage') >= 0}` +
+        `（注释里的禁令原文：localStorage ${readText(authRel).split('localStorage').length - 1} 处、scrypt ${readText(authRel).split('scrypt').length - 1} 处 —— 属**声明**，不参与判定）`);
+
+      /* ---- U9-i 零控制台噪音 ---- */
+      check('U9-i 本节全程**零 `console.warn`/`console.error`**（失败可见一律落在界面提示位，不靠刷控制台）',
+        U9_WARN.length === 0, U9_WARN.join(' | ').slice(0, 240));
+    } catch (e) {
+      U9.err = (e && e.stack) || String(e);
+      check('U9 夹具执行完毕（未抛异常）', false, String(U9.err).slice(0, 400));
+    }
+  }
+
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 ${skipped} 项`);
   if (failures.length) {

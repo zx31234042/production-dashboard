@@ -7072,6 +7072,269 @@ t.section('十八、E87 `POST /upload/retry` 的回环来源闸（非回环 ⇒ 
     e87Server.listening === false, `listening=${e87Server.listening}`);
 }
 
+/* ---------------- 十九、E86①／ADR-0007：登录接线的端到端判据（**真进程 ＋ 真 HTTP**） ----------------
+   立案：技术债 `E86①`（前端"解锁 ⇒ 服务端会话令牌"未接线）由 `T-20261002-15` 交付，其关闭条件是
+        "**带令牌 `POST /notice` ⇒ 200 且库内 `notice` 恰 +1 行**"（路线图 `E86①` 原文）。此前该判据
+        只在座位 3 的**探针**（`tests\._verify\seat3-t15-probe.js`，不进任何门禁）里跑过 ——
+        探针会随 `._verify` 一起被清掉，等于"**交付了却从未被门禁验证**"（R-2026-09-19-02 的 P2-16）。
+        本节把同样的读数**收进门禁**，期望值全部来自本包对真进程的**实测**（见回执的探针读数）。
+   ⚠ 覆盖层级（**如实标注**，照 `ADR-0007` §D8⑤ 的先例）：
+        · 本节的九条读数（未初始化／初始化／令牌／公告落库／无令牌与伪造／登出重放／锁定与到期／
+          改密／留痕）**全部**在 `node server\index.js` 的**真子进程**上经**真 HTTP**（`fetch`）取得，
+          库内读数用 `node:sqlite` 以只读连接直接读该子进程的数据目录；
+        · **"锁定到期"不用注入时钟**：`createAuth({ now })` 只能在**进程内**注入，真进程读的是真实时钟，
+          故到期一律由 **D2 明写的落库真源**（`auth_credential.locked_until` 置为过去时刻）复现 ——
+          这不是绕过判据，而是"状态位的真源就是那一列"（ADR-0007 §D8⑨：可解析且在过去的 `locked_until` ⇒ 放行）。
+          **注入时钟**那条路径（`advanceMin()` 推进到期、滑动续期、绝对上限）由 `db-check` 九之三
+          在**服务层**覆盖，两者互补，本节不重复。
+        · 非回环来源的拒绝（403 `not_loopback`）在真 HTTP 层造不出来（本机 `fetch` 恒为回环）
+          ⇒ 该判据按 `ADR-0007` §D8⑤ 留在服务层探针，本节**不冒充**有它。
+   一用例一库：本节的库是该子进程自己的数据目录（`harness.makeTempDir` 内），跑完连目录一起删。 */
+t.section('十九、E86①／ADR-0007 登录接线的端到端判据（真子进程 ＋ 真 HTTP：未初始化／初始化／令牌／公告落库／登出／锁定／改密／留痕）');
+{
+  const { DatabaseSync } = require('node:sqlite');
+  const AUTH_E2E_PW = 'Harness-Auth-E2E-2026';
+  const AUTH_E2E_PW2 = 'Harness-Auth-E2E-New-2026';
+  const AUTH_E2E_USER = 'admin';
+  /* 「期满」用的过去时刻：D8⑨ 口径下"可解析且早已过期"⇒ 未锁定（放行） */
+  const AUTH_E2E_PAST = '2000-01-01 00:00:00';
+  /* 60 s：与 `startService` 的默认超时同量级；服务端装配（initSchema + auth 初始化码打印）在本机约 2～4 s */
+  const AUTH_E2E_READY_MS = 60000;
+
+  const a19DataDir = harness.makeTempDir('auth-e2e-data');
+  const a19DbFile = path.join(a19DataDir, 'board.db');
+  const a19Port = await harness.allocPort();
+  const a19Svc = await harness.startService({
+    script: require.resolve('../server/index.js'),
+    args: ['--host', '127.0.0.1', '--port', String(a19Port), '--data-dir', a19DataDir],
+    port: a19Port, readyPath: '/health', timeoutMs: 60000
+  });
+
+  /** 一次性初始化码：**只**能来自服务进程的启动日志（D4：仅内存、HTTP 层从不下发） */
+  async function a19InitCode() {
+    const deadline = Date.now() + AUTH_E2E_READY_MS;
+    while (Date.now() < deadline) {
+      const m = /本机一次性初始化码 = ([0-9a-f]{12})/.exec(a19Svc.output());
+      if (m) return m[1];
+      await new Promise(r => setTimeout(r, 150));
+    }
+    return '';
+  }
+  /** 真 HTTP：返回 `{status, body, text}`（解析失败时 body 记 `{raw}`，不静默吞） */
+  async function a19Http(method, p, body, headers) {
+    const init = { method, headers: Object.assign({ Accept: 'application/json' }, headers || {}) };
+    if (body !== undefined) {
+      init.headers['Content-Type'] = 'application/json;charset=UTF-8';
+      init.body = JSON.stringify(body);
+    }
+    const res = await fetch(`http://127.0.0.1:${a19Port}${p}`, init);
+    const text = await res.text();
+    let parsed = null;
+    try { parsed = text ? JSON.parse(text) : null; } catch { parsed = { raw: text }; }
+    return { status: res.status, body: parsed, text };
+  }
+  /** 库内只读读数（服务进程持 WAL 写锁不影响并发读；读连接用完即关） */
+  function a19Ro(sql, params) {
+    const db = new DatabaseSync(a19DbFile, { readOnly: true });
+    try { return db.prepare(sql).all(...(params || [])); } finally { db.close(); }
+  }
+  /** 库内**写**真源（只为"锁定到期"复现状态位；`busy_timeout` 防与服务进程的采样写撞车） */
+  function a19Rw(sql, params) {
+    const db = new DatabaseSync(a19DbFile);
+    try {
+      db.prepare('PRAGMA busy_timeout = 8000').get();
+      db.prepare(sql).run(...(params || []));
+    } finally { db.close(); }
+  }
+  const a19NoticeCount = () => a19Ro('SELECT COUNT(*) AS c FROM notice')[0].c;
+  const a19Cred = () => a19Ro('SELECT * FROM auth_credential WHERE username = ?', [AUTH_E2E_USER])[0] || null;
+
+  try {
+    const a19Code = await a19InitCode();
+    t.requires('服务进程已在启动日志里打印一次性初始化码（D4 的"打印 + op_log"两条登记路径之一）',
+      /^[0-9a-f]{12}$/.test(a19Code),
+      `从 ${path.relative(env.paths.root, a19Svc.logFile)} 读到码=${a19Code ? a19Code.slice(0, 4) + '…' : '(无)'}`);
+    /* 前提（D20）：负向/正向两条写库读数都以"新库 notice 为空"为基线 —— 这是**数据状态**的前提，
+       不写成 check（否则"库里本来就有行"会被误报成实现缺陷）。 */
+    const a19NStart = a19NoticeCount();
+    t.requires('新库 `notice` 初始为 0 行（读数③/④ 的行数基线）', a19NStart === 0,
+      `实测 notice 行数=${a19NStart}`);
+
+    /* ---- 读数①（未初始化态，D4）：`/auth/status` 如实报未初始化；`/auth/login` 一律 409 ---- */
+    const a19St0 = await a19Http('GET', '/auth/status');
+    const a19Login0 = await a19Http('POST', '/auth/login', { password: AUTH_E2E_PW });
+    t.check('E86①-1（未初始化态，D4）真 HTTP：`GET /auth/status` ⇒ 200 且 `initialized=false`／`initCodePending=true`；' +
+      '`POST /auth/login` ⇒ **409 `not_initialized`**（不设默认口令 ⇒ 未初始化时任何口令都进不去）',
+      a19St0.status === 200 && a19St0.body && a19St0.body.ok === true &&
+      a19St0.body.initialized === false && a19St0.body.initCodePending === true &&
+      a19Login0.status === 409 && a19Login0.body && a19Login0.body.error === 'not_initialized',
+      `status=${a19St0.status} initialized=${a19St0.body && a19St0.body.initialized} ` +
+      `initCodePending=${a19St0.body && a19St0.body.initCodePending}；login=${a19Login0.status} ${JSON.stringify(a19Login0.body)}`);
+
+    /* ---- 读数②（初始化 ⇒ 登录 ⇒ 令牌）：本机回环 + 一次性码；库里只有派生值 ---- */
+    const a19Init = await a19Http('POST', '/auth/init', { code: a19Code, password: AUTH_E2E_PW });
+    const a19InitAgain = await a19Http('POST', '/auth/init', { code: a19Code, password: AUTH_E2E_PW });
+    const a19Login = await a19Http('POST', '/auth/login', { password: AUTH_E2E_PW });
+    const a19Token = a19Login.body && a19Login.body.token;
+    const a19Cred0 = a19Cred();
+    t.check('E86①-2（初始化 → 登录 → 令牌）真 HTTP：`POST /auth/init {code,password}`（**本机回环**）⇒ 200；' +
+      '`POST /auth/login`（正确口令）⇒ 200 + **64 位 hex** 会话令牌；库内 `auth_credential` **恰一行**且**不含明文**' +
+      '（`algo=scrypt`、`params=N=16384,r=8,p=1,keylen=32` 逐字照 ADR-0007 D1、`is_initial=1`）；' +
+      '同一枚码**第二次**被拒（用后即废，D4）',
+      a19Init.status === 200 && a19Init.body && a19Init.body.ok === true &&
+      a19Login.status === 200 && a19Login.body && a19Login.body.ok === true &&
+      /^[0-9a-f]{64}$/.test(String(a19Token)) &&
+      Boolean(a19Cred0) && a19Cred0.algo === 'scrypt' &&
+      a19Cred0.params === 'N=16384,r=8,p=1,keylen=32' && Number(a19Cred0.is_initial) === 1 &&
+      JSON.stringify(a19Cred0).indexOf(AUTH_E2E_PW) < 0 &&
+      ((a19InitAgain.status === 409 && a19InitAgain.body.error === 'already_initialized') ||
+        (a19InitAgain.status === 401 && a19InitAgain.body.error === 'bad_init_code')),
+      `init=${a19Init.status}；再 init=${a19InitAgain.status}:${a19InitAgain.body && a19InitAgain.body.error}；` +
+      `login=${a19Login.status} token=${String(a19Token).slice(0, 12)}…(${String(a19Token).length})；` +
+      `credential=${JSON.stringify({ username: a19Cred0 && a19Cred0.username, algo: a19Cred0 && a19Cred0.algo, params: a19Cred0 && a19Cred0.params, is_initial: a19Cred0 && a19Cred0.is_initial })}`);
+
+    /* ---- 读数③（无令牌／伪造令牌 ⇒ 401 且**库内不增**）：负向对照，防"把一切都放行" ---- */
+    const a19N0 = a19NoticeCount();
+    const a19NoTok = await a19Http('POST', '/notice', { action: 'publish', content: '十九：无令牌', subType: '车间公示' });
+    const a19Fake = await a19Http('POST', '/notice', { action: 'publish', content: '十九：伪造令牌', subType: '车间公示' },
+      { Authorization: 'Bearer ' + 'f'.repeat(64) });
+    const a19N1 = a19NoticeCount();
+    t.check('E86①-3（负向对照）真 HTTP：`POST /notice` **无令牌**与**伪造令牌**一律 401 `unauthorized`，' +
+      '且库内 `notice` 行数**逐次不变**（负向路径不写库 —— 判据是**行数**，不是"应答看起来像拒绝"）',
+      a19NoTok.status === 401 && a19NoTok.body && a19NoTok.body.error === 'unauthorized' &&
+      a19Fake.status === 401 && a19Fake.body && a19Fake.body.error === 'unauthorized' &&
+      a19N1 === a19N0,
+      `无令牌=${a19NoTok.status}:${a19NoTok.body && a19NoTok.body.error}；` +
+      `伪造=${a19Fake.status}:${a19Fake.body && a19Fake.body.error}；notice 行数 ${a19N0} → ${a19N1}`);
+
+    /* ---- 读数④（**E86① 的关闭条件**）：带令牌 ⇒ 200 且库内 notice 恰 +1 行、内容逐字落库 ---- */
+    const a19BeforeOk = a19NoticeCount();
+    const a19OkBody = { action: 'publish', content: '十九：E86① 关闭证据（带会话令牌写入的公告）', subType: '生产调整' };
+    const a19Ok = await a19Http('POST', '/notice', a19OkBody, { Authorization: 'Bearer ' + a19Token });
+    const a19AfterOk = a19NoticeCount();
+    const a19Rows = a19Ro('SELECT id, sub_type, content FROM notice ORDER BY id');
+    t.check('E86①-4 **关闭条件**：真 HTTP 下**带令牌 `POST /notice` ⇒ 200 且库内 `notice` 恰新增 1 行**' +
+      '（内容逐字落库；这就是路线图 `E86①` 说的"令牌一接上即通"）',
+      a19Ok.status === 200 && a19Ok.body && a19Ok.body.ok === true &&
+      a19AfterOk === a19BeforeOk + 1 &&
+      a19Rows.some(r => r.content === a19OkBody.content && r.sub_type === a19OkBody.subType),
+      `POST /notice=${a19Ok.status}；行数 ${a19BeforeOk} → ${a19AfterOk}；` +
+      `落库行=${JSON.stringify(a19Rows.map(r => ({ id: r.id, sub_type: r.sub_type, content: r.content })))}`);
+
+    /* ---- 读数⑤（登出 ⇒ 同令牌立刻失效）：令牌的"即刻失效"必须能在**写库**上读到 ---- */
+    const a19Logout = await a19Http('POST', '/auth/logout', {}, { Authorization: 'Bearer ' + a19Token });
+    const a19Replay = await a19Http('POST', '/notice', { action: 'publish', content: '十九：登出后重放', subType: '车间公示' },
+      { Authorization: 'Bearer ' + a19Token });
+    const a19N3 = a19NoticeCount();
+    t.check('E86①-5（登出即失效）真 HTTP：`POST /auth/logout` ⇒ 200 + `requireRelogin=true`；' +
+      '**同一令牌重放**写公告 ⇒ 401 `unauthorized` 且库内**不再新增行**（令牌不是"标了个已登出"的摆设）',
+      a19Logout.status === 200 && a19Logout.body && a19Logout.body.ok === true &&
+      a19Logout.body.requireRelogin === true &&
+      a19Replay.status === 401 && a19Replay.body && a19Replay.body.error === 'unauthorized' &&
+      a19N3 === a19AfterOk,
+      `logout=${a19Logout.status} ${JSON.stringify(a19Logout.body)}；重放=${a19Replay.status}:${a19Replay.body && a19Replay.body.error}；` +
+      `notice 行数 ${a19AfterOk} → ${a19N3}`);
+
+    /* ---- 读数⑥（改密 FR-8.4 / D5 / D8④）：原口令错 401；成功 ⇒ 换盐换派生值 + 清全部在途会话 ---- */
+    const a19Tok2 = (await a19Http('POST', '/auth/login', { password: AUTH_E2E_PW })).body.token;
+    const a19ChBad = await a19Http('POST', '/auth/change', { oldPassword: 'not-the-old-one', newPassword: AUTH_E2E_PW2 },
+      { Authorization: 'Bearer ' + a19Tok2 });
+    const a19ChOk = await a19Http('POST', '/auth/change', { oldPassword: AUTH_E2E_PW, newPassword: AUTH_E2E_PW2 },
+      { Authorization: 'Bearer ' + a19Tok2 });
+    const a19OldLogin = await a19Http('POST', '/auth/login', { password: AUTH_E2E_PW });
+    const a19NewLogin = await a19Http('POST', '/auth/login', { password: AUTH_E2E_PW2 });
+    const a19Cred1 = a19Cred();
+    t.check('E86①-6（改密 FR-8.4）真 HTTP：`POST /auth/change` **原口令错 ⇒ 401 `bad_credentials`**（且会话不清）；' +
+      '改密成功 ⇒ 200 + `requireRelogin` + `sessionsCleared≥1`；**旧口令 401 / 新口令 200**；' +
+      '库内 `is_initial` 由 1 变 0、`changed_by=设置页改密`、`salt`/`hash` 都已换新（换盐换派生值，不是改标记）',
+      a19ChBad.status === 401 && a19ChBad.body && a19ChBad.body.error === 'bad_credentials' &&
+      a19ChOk.status === 200 && a19ChOk.body && a19ChOk.body.requireRelogin === true &&
+      Number(a19ChOk.body.sessionsCleared) >= 1 &&
+      a19OldLogin.status === 401 && a19OldLogin.body && a19OldLogin.body.error === 'bad_credentials' &&
+      a19NewLogin.status === 200 && /^[0-9a-f]{64}$/.test(String(a19NewLogin.body && a19NewLogin.body.token)) &&
+      Boolean(a19Cred1) && Number(a19Cred1.is_initial) === 0 && a19Cred1.changed_by === '设置页改密' &&
+      a19Cred1.salt !== a19Cred0.salt && a19Cred1.hash !== a19Cred0.hash,
+      `原口令错=${a19ChBad.status}:${a19ChBad.body && a19ChBad.body.error}；改密=${a19ChOk.status} ${JSON.stringify(a19ChOk.body)}；` +
+      `旧口令=${a19OldLogin.status}、新口令=${a19NewLogin.status}；换盐=${Boolean(a19Cred1) && a19Cred1.salt !== a19Cred0.salt}、` +
+      `换派生值=${Boolean(a19Cred1) && a19Cred1.hash !== a19Cred0.hash}；is_initial=${a19Cred1 && a19Cred1.is_initial}、changed_by=${a19Cred1 && a19Cred1.changed_by}`);
+
+    /* ---- 读数⑦（D2／D8①：第 5 次**当场** 423 + 剩余秒数；锁定期间口令正确也拒） ---- */
+    const a19Fails = [];
+    for (let i = 1; i <= 5; i++) a19Fails.push(await a19Http('POST', '/auth/login', { password: 'wrong-' + i }));
+    const a19RightInLock = await a19Http('POST', '/auth/login', { password: AUTH_E2E_PW2 });
+    const a19StLocked = await a19Http('GET', '/auth/status');
+    const a19Cred2 = a19Cred();
+    t.check('E86①-7（D2／D8①）真 HTTP：连续 5 次错口令 ⇒ 前 4 次 401 `bad_credentials`、**第 5 次当场** 423 `locked` ' +
+      '＋正整数 `retryAfterSec`（≤ `lockMinutes×60`）；**锁定期间口令正确也拒**（仍 423）；计数**落库**' +
+      '（`fail_count=5`、`locked_until` 非空）；`GET /auth/status` 无需鉴权即如实显示锁定（D8⑦）',
+      a19Fails.slice(0, 4).every(r => r.status === 401 && r.body && r.body.error === 'bad_credentials') &&
+      a19Fails[4].status === 423 && a19Fails[4].body && a19Fails[4].body.error === 'locked' &&
+      Number.isInteger(a19Fails[4].body.retryAfterSec) && a19Fails[4].body.retryAfterSec > 0 &&
+      a19Fails[4].body.retryAfterSec <= 300 &&
+      a19RightInLock.status === 423 && a19RightInLock.body && a19RightInLock.body.error === 'locked' &&
+      a19StLocked.status === 200 && a19StLocked.body && a19StLocked.body.locked === true &&
+      a19StLocked.body.retryAfterSec > 0 &&
+      Boolean(a19Cred2) && Number(a19Cred2.fail_count) === 5 &&
+      typeof a19Cred2.locked_until === 'string' && a19Cred2.locked_until.length > 0,
+      a19Fails.map((r, i) => `#${i + 1}=${r.status}` +
+        `${r.body && r.body.retryAfterSec !== undefined ? '(' + r.body.retryAfterSec + 's)' : ''}`).join('/') +
+      `；锁定中正确口令=${a19RightInLock.status}:${a19RightInLock.body && a19RightInLock.body.error}；` +
+      `status.locked=${a19StLocked.body && a19StLocked.body.locked}/retryAfterSec=${a19StLocked.body && a19StLocked.body.retryAfterSec}；` +
+      `库内 fail_count=${a19Cred2 && a19Cred2.fail_count}、locked_until=${a19Cred2 && a19Cred2.locked_until}`);
+
+    /* ---- 读数⑧（D8②：期满**不自动清零** —— 期满后再错**一次**立即重锁） ----
+       ⚠ "期满"由**库内真源**复现（真进程不能注入时钟，见本节头注）：把 `locked_until` 写到过去，
+       服务进程下一次登录读到的就是"可解析且已过期"（D8⑨）⇒ 放行到口令校验那一步。 */
+    let a19RwErr = '';
+    try { a19Rw('UPDATE auth_credential SET locked_until = ? WHERE username = ?', [AUTH_E2E_PAST, AUTH_E2E_USER]); }
+    catch (e) { a19RwErr = (e && e.message) || String(e); }
+    const a19Cred3 = a19Cred();
+    const a19WrongAfterExpiry = await a19Http('POST', '/auth/login', { password: 'still-wrong' });
+    const a19Cred4 = a19Cred();
+    t.check('E86①-8（D8②）真 HTTP：锁定**到期**（库内 `locked_until` 置为过去＝D8⑨ 的"可解析且已过期 ⇒ 放行"）后，' +
+      '**再错一次立即重新锁定**（423 `locked`，`fail_count` 5→6、`locked_until` 回到未来）—— ' +
+      '期满只是"可以再试"，**没有别的清零路径**（只有登录成功才清零）',
+      a19RwErr === '' && Boolean(a19Cred3) && a19Cred3.locked_until === AUTH_E2E_PAST &&
+      a19WrongAfterExpiry.status === 423 && a19WrongAfterExpiry.body && a19WrongAfterExpiry.body.error === 'locked' &&
+      Boolean(a19Cred4) && Number(a19Cred4.fail_count) === Number(a19Cred3.fail_count) + 1 &&
+      a19Cred4.locked_until !== AUTH_E2E_PAST,
+      `库内写入=${a19RwErr || '无错'}；置过去后 locked_until=${a19Cred3 && a19Cred3.locked_until}；` +
+      `期满后再错一次=${a19WrongAfterExpiry.status}:${a19WrongAfterExpiry.body && a19WrongAfterExpiry.body.error}；` +
+      `fail_count ${a19Cred3 && a19Cred3.fail_count} → ${a19Cred4 && a19Cred4.fail_count}、locked_until=${a19Cred4 && a19Cred4.locked_until}`);
+
+    /* ---- 读数⑨（期满 + 口令正确 ⇒ 恢复并清零）：与读数⑧ 成对，证明"清零只此一路" ---- */
+    a19Rw('UPDATE auth_credential SET locked_until = ? WHERE username = ?', [AUTH_E2E_PAST, AUTH_E2E_USER]);
+    const a19Recover = await a19Http('POST', '/auth/login', { password: AUTH_E2E_PW2 });
+    const a19Cred5 = a19Cred();
+    t.check('E86①-9（D2"成功即清零"）真 HTTP：锁定**到期** + 口令正确 ⇒ 200 登录成功，并**当场清零**' +
+      '（`fail_count=0`、`locked_until=NULL`）—— 与读数⑧成对：清零路径只有"登录成功"这一条',
+      a19Recover.status === 200 && a19Recover.body && a19Recover.body.ok === true &&
+      /^[0-9a-f]{64}$/.test(String(a19Recover.body.token)) &&
+      Boolean(a19Cred5) && Number(a19Cred5.fail_count) === 0 && a19Cred5.locked_until === null,
+      `恢复登录=${a19Recover.status}；库内 fail_count=${a19Cred5 && a19Cred5.fail_count}、locked_until=${a19Cred5 && a19Cred5.locked_until}`);
+
+    /* ---- 读数⑩（D6③：`op_log` 留痕六类各至少一条）—— 读**库内真行**，不是读日志文本 ---- */
+    const a19Ops = a19Ro("SELECT op_type, result, COUNT(*) AS c FROM op_log GROUP BY op_type, result ORDER BY op_type");
+    const a19OpTypes = a19Ops.map(r => `${r.op_type}/${r.result}×${r.c}`);
+    const a19Has = (t2, res) => a19Ops.some(r => r.op_type === t2 && (res === undefined || r.result === res));
+    t.check('E86①-10（D6③ 可审计）库内 `op_log`：**口令初始化码 / 口令初始化 / 解锁 / 解锁失败 / 账号锁定 / 改密 / 登出**' +
+      '七类各至少一条（登出、账号锁定都在真 HTTP 路径上产生；来源 IP 记在 content 里 —— 本判据不读日志文本，只读库内真行）',
+      a19Has('口令初始化码') && a19Has('口令初始化', '成功') && a19Has('解锁', '成功') &&
+      a19Has('解锁失败', '失败') && a19Has('账号锁定', '失败') &&
+      a19Has('改密', '成功') && a19Has('改密', '失败') && a19Has('登出', '成功'),
+      `op_log 实读=${JSON.stringify(a19OpTypes)}`);
+
+    /* ---- 收尾：本节自建的服务进程必须**当场关停**（不留监听端口/残留进程） ---- */
+    await a19Svc.stop();
+    t.check('E86①-11 本节自建的服务子进程跑完**当场关停**（不留监听端口与残留进程）',
+      a19Svc.proc.exitCode !== null || a19Svc.proc.signalCode !== null,
+      `exitCode=${a19Svc.proc.exitCode}、signalCode=${a19Svc.proc.signalCode}`);
+  } finally {
+    try { await a19Svc.stop(); } catch { /* 已停止 */ }
+    try { fs.rmSync(a19DataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 }); } catch { /* 已删 */ }
+  }
+}
+
 t.finish();
 }
 

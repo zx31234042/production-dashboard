@@ -201,7 +201,59 @@ const MAP = [
       '正在编辑公告 #', '改完点「保存修改」（再点一次「编辑」可取消）', '已取消编辑（回到「发布公告」）',
       '找不到这条公告（列表可能已刷新），请重新选择', '删除公告 #',
       '删除后原文仍保留在服务端操作日志（op_log）里。', '已解锁：可录入维保信息、修改公告'],
-    files: ['src/components/SettingPanel.js', 'index.html'] }
+    files: ['src/components/SettingPanel.js', 'index.html'] },
+
+  /* ---------------- ADR-0007 / E86①（`T-20261002-15`）本波新增与变更的文案 ----------------
+     **逐字取自源码**（不写"应该是什么"）；两套模式提示**分开登记**，因为它们承载相反的义务：
+       · 演示模式那句是 ADR-0007 D5 的**原句**、且被 10 张截图基准冻结 ⇒ 改一个字就变红；
+       · 服务端模式**不得**出现演示口令「8888」（D4 明令），故它单独占一条、逐句核。
+     与公告那两条的关系（**复核无遗漏**）：`FR-7.12` 的编辑/删除入口与写入提示已在上面的两条里登记，
+     本波未改动 `NoticePanel.js`／SettingPanel 的公告文案 ⇒ **不重复登记**（重复只会让"命中于哪个文件"变模糊），
+     只把本波**新引入**的鉴权文案补齐（演示模式提示／登录态／未登录过期／锁定剩余秒数／改密三项／本机初始化）。
+     ⚠ 本节只判"文案在哪、逐字对不对"，**行为**判据在 `ui-check` 的 U9 段与 `harness-check` 的第十九节。 */
+  { clause: 'ADR-0007 D5', note: '演示模式提示：ADR-0007 D5 的原句（`index.html` 的静态初值 + `render()` 同句写入；两种模式下都必须显示）',
+    status: 'confirmed',
+    items: ['演示模式：未启用服务端口令校验（口令由服务端校验）'],
+    files: ['index.html', 'src/components/SettingPanel.js'] },
+
+  { clause: 'NFR-14', note: '服务端模式的模式提示与登录态文案（写明校验方＝`POST /auth/login`；登录/未登录/尚未初始化三态，不含任何秘密，D8⑦）',
+    status: 'confirmed',
+    items: ['服务端模式：口令由服务端校验（POST /auth/login）', '；当前已登录（会话令牌在本窗口内）', '；当前未登录',
+      '；服务端尚未初始化：请用一次性初始化码设置口令（ADR-0007 D4）'],
+    files: ['src/components/SettingPanel.js'] },
+
+  { clause: 'FR-8.1', note: '未登录/会话过期的**可见降级**文案（统一 401 处理的记账串 + 设置页锁定位与录入位的服务端口径提示）',
+    status: 'confirmed',
+    items: ['未登录或登录已过期',
+      '当前已锁定：未登录或登录已过期，请先在左侧输入解锁密码（口令由服务端校验）',
+      '已解锁：录入内容保存后写入服务端库并记录操作日志'],
+    files: ['src/components/SettingPanel.js', 'src/services/auth.js'] },
+
+  { clause: 'NFR-14', note: '口令错误与**锁定剩余时间**文案（423 的 `retryAfterSec` 由服务端算出；"锁定期间口令正确也会被拒"必须写在文案里，D2/D8①）',
+    status: 'confirmed',
+    items: ['账号已锁定：请在 ', ' 秒后', '重试（口令正确也会被拒；连续失败 5 次锁定 5 分钟）',
+      '解锁被拒（HTTP 423 locked）：账号锁定中，',
+      '密码错误，请重新输入（服务端校验；连续失败 5 次将锁定 5 分钟）',
+      '解锁被拒（HTTP 401 bad_credentials）：口令不正确（服务端对外不区分原因）'],
+    files: ['src/components/SettingPanel.js'] },
+
+  { clause: 'FR-8.4', note: '改密（FR-8.4）三输入框与按钮，以及三类提示（两次输入不一致／改密成功须重新解锁／原口令不正确）',
+    status: 'confirmed',
+    items: ['id="setOldPwd"', 'id="setNewPwd"', 'id="setNewPwd2"', 'id="setPwdChangeBtn"', '>修改密码</button>',
+      'placeholder="原口令"', 'placeholder="新口令（4～64 位）"', 'placeholder="确认新口令"',
+      '两次输入的新口令不一致：本次不提交（服务端未收到任何改密请求）',
+      '口令已修改：当前会话已被服务端清除，请用新口令重新解锁',
+      '原口令不正确（服务端校验失败，会话未清除）'],
+    files: ['index.html', 'src/components/SettingPanel.js'] },
+
+  { clause: 'ADR-0007 D4', note: '本机一次性初始化（**唯一**初始化入口）的两个输入框与按钮，以及三类提示（提示走本机初始化／初始化成功且码作废／仅回环可用）',
+    status: 'confirmed',
+    items: ['id="setInitCode"', 'id="setInitPwd"', 'id="setInitBtn"', '>初始化口令</button>',
+      'placeholder="一次性初始化码"', 'placeholder="设置新口令（4～64 位）"',
+      '服务端尚未初始化（409 not_initialized）：请在本机用服务端控制台打印的',
+      '口令初始化成功：请用刚设置的口令解锁（一次性初始化码已立即作废）',
+      '初始化只允许来自本机回环（403 not_loopback）：请在本机浏览器打开设置页'],
+    files: ['index.html', 'src/components/SettingPanel.js'] }
 ];
 
 let passed = 0;

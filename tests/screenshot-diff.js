@@ -42,6 +42,74 @@ const TOLERANCE = Number(arg('tolerance', 0.05));       // 不同像素占比上
 const CHANNEL_TOL = Number(arg('channel', 8));          // 单通道容差（0~255）
 const SELF_ONLY = arg('self', false) === true;
 
+/* ---------------- 候选图**新鲜度**（E91：门禁的"绿"必须有依据） ----------------
+   立案（`E91`／`E92`，2026-10-02）：本脚本比的是**候选目录**里的 PNG，而不是当场截图；
+   而 `run-all.js`／`preflight.js` **都不跑** `capture-baseline`（候选图是否新鲜，只取决于上一次手工捕获）。
+   实测后果：至少从 2026-09-28 起，某次 `screenshot-diff 24/0` 用的是**回归之前的候选图** ⇒
+   `05bcf7b` 引入的 **4.59%** 真实版面回归**静默通过约 4 天**（`E92` 定量取证）。故本脚本新增
+   **fail-closed 的新鲜度断言**：候选图**不得**早于"参与渲染的源码"的最新 mtime。
+
+   口径（本节自定义，写在这里以便复核）：
+     · **参与渲染的源码** ＝ `index.html`（脚本注册真源 ＋ 静态 DOM）
+                              ＋ `src\**\*.js`（全部前端脚本，含 `config\`／`services\`／`components\`／`pages\`／`utils\`）
+                              ＋ `src\**\*.css`（样式）。
+       为什么是这三类：本仓无打包器，页面加载的就是这些文件（`ui-check` 的 `indexScriptRels()` 已经证明
+       "每个前端脚本都必须被 `index.html` 显式枚举"）—— 它们任何一处变动都可能改变渲染结果。
+       **不含** `tests\**`（测试改动不改变渲染）、`项目记录\**` 与文档（同上）、基准 PNG 本身。
+     · 判定：**逐张**候选 PNG 的 mtime ≥ `srcNewest − TOLERANCE`；任一张更旧 ⇒ FAIL 并**指名**。
+       取"逐张"而不是"最新那张"：一次局部重捕获会留下新旧混杂的候选目录，取最新那张会把旧的放过去。
+     · 容差 `FRESH_TOLERANCE_MS = 30 s` 的**理由**（不是随手给的数）：
+       捕获流程是"读源码 → 启动 Edge → 逐张截图落盘"，本身要花几秒（本机实测：10 张 PNG 的落盘时间跨度
+       约 **6.1 s**，见 2026-10-02 的候选目录 mtime：19:32:44.541 → 19:32:50.690）；而 `src\styles\global.css`
+       恰在 19:32:41.612 被改（CSS 修复）⇒ 候选比它晚 **2.93 s**。也就是说"源码在捕获窗口内被改"这件事
+       天然无法被候选图反映，30 s 覆盖整个捕获窗口并留足余量。它与要防的失效模式差了 **4 个数量级**
+       （`E92` 的现场是 ≈ 4 天 ＝ 345,600 s），不会把"真的陈旧"放过：任何"先改源码、隔一会儿再看门禁"
+       的节奏（分钟级）都会被判红。
+     · **fail-closed**：候选目录**不存在/为空**时，本组断言一律**红**并给出与陈旧同一条指路提示
+       （`node tests\capture-baseline.js --out tests\._verify\captures`）—— 绝不静默通过。
+       例外只有 `--self`（只验工具自身，文档口径本就不要求候选目录），与本脚本既有设计一致。 */
+const FRESH_TOLERANCE_MS = 30000;
+const CAPTURE_HINT = '先跑 `node tests/capture-baseline.js --out tests\\._verify\\captures` 重新捕获候选图 —— ' +
+  '候选图不新鲜时，本门禁比的是"陈旧的候选图 vs 基准"，绿得没有依据（E91/E92 的现场就是 4.59% 的回归静默通过约 4 天）';
+
+/** 参与渲染的源码集合（口径见上）：`index.html` ＋ `src\**\*.js` ＋ `src\**\*.css` */
+function renderSources() {
+  const out = [];
+  const html = path.join(ROOT, 'index.html');
+  if (fs.existsSync(html)) out.push(html);
+  const walk = dir => {
+    if (!fs.existsSync(dir)) return;
+    for (const n of fs.readdirSync(dir)) {
+      const p = path.join(dir, n);
+      let st;
+      try { st = fs.statSync(p); } catch { continue; }
+      if (st.isDirectory()) walk(p);
+      else if (/\.(js|css)$/i.test(n)) out.push(p);
+    }
+  };
+  walk(path.join(ROOT, 'src'));
+  return out;
+}
+
+/** 最新 mtime（毫秒）与其文件（供"指名"用）；取不到返回 null */
+function newestSource() {
+  let best = null;
+  for (const f of renderSources()) {
+    let st;
+    try { st = fs.statSync(f); } catch { continue; }   // 竞态：刚被删掉的源文件跳过（下一轮会重算）
+    if (!best || st.mtimeMs > best.ms) best = { ms: st.mtimeMs, file: f };
+  }
+  return best;
+}
+
+/** 人读的本地时间（毫秒 → `yyyy-MM-dd HH:mm:ss.SSS`） */
+function stamp(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:` +
+    `${p(d.getMinutes())}:${p(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
+}
+
 let passed = 0;
 const failures = [];
 
@@ -184,6 +252,51 @@ function main() {
 
   console.log('\n=== 候选比对 ===');
   const candFiles = listPngs(CANDIDATE);
+
+  /* ---- E91：候选图**新鲜度**（fail-closed；放在"缺候选"早退之前，保证目录缺失时也走这里变红） ----
+     三条读数：①源码侧可算 ②候选目录存在 ③逐张不早于源码最新 mtime。 */
+  const newest = newestSource();
+  const srcCount = renderSources().length;
+  check('E91① 参与渲染的源码集合可算（`index.html` ＋ `src\\**\\*.js` ＋ `src\\**\\*.css`）—— 新鲜度判据的前提，' +
+    '拿不到就说明目录结构变了（不静默跳过）',
+    srcCount > 0 && Boolean(newest) && Number.isFinite(newest.ms),
+    newest ? `源码 ${srcCount} 个文件；最新 mtime＝${stamp(newest.ms)}（${path.relative(ROOT, newest.file)}）`
+      : `参与渲染的源码一个都没找到（index.html 与 src\\**\\*.{js,css} 都取不到）`);
+
+  const candDirExists = fs.existsSync(CANDIDATE) && (() => {
+    try { return fs.statSync(CANDIDATE).isDirectory(); } catch { return false; }
+  })();
+  check('E91② 候选目录存在且可读（**缺失 ⇒ 明确红**，绝不静默通过）',
+    candDirExists,
+    candDirExists ? `候选目录 ${path.relative(ROOT, CANDIDATE)} 存在`
+      : `候选目录 ${path.relative(ROOT, CANDIDATE)} **不存在**（或不是目录）—— ${CAPTURE_HINT}`);
+
+  /* 逐张判定；陈旧者逐张指名（"哪一张、比源码旧多少"都要能一眼看出） */
+  const stale = [];
+  let newestCandMs = null;
+  if (candDirExists) {
+    for (const n of candFiles) {
+      let st;
+      try { st = fs.statSync(path.join(CANDIDATE, n)); } catch { continue; }
+      if (newestCandMs === null || st.mtimeMs > newestCandMs) newestCandMs = st.mtimeMs;
+      if (newest && Number.isFinite(newest.ms) && st.mtimeMs < newest.ms - FRESH_TOLERANCE_MS) {
+        stale.push(`${n}（候选 ${stamp(st.mtimeMs)}，比源码最新 mtime 旧 ${((newest.ms - st.mtimeMs) / 1000).toFixed(1)} s）`);
+      }
+    }
+  }
+  check(`E91③ 候选图**逐张**不早于"参与渲染源码的最新 mtime"（容差 ${FRESH_TOLERANCE_MS / 1000} s，口径见本文件注释）` +
+    ' —— 陈旧候选 ⇒ 门禁的"绿"没有依据（`E91`／`E92`：4.59% 的真实回归曾因此静默通过约 4 天）',
+    candDirExists && candFiles.length > 0 && Boolean(newest) && stale.length === 0,
+    !candDirExists
+      ? `候选目录不存在 ⇒ 无法判定新鲜度（**按不通过处理**）—— ${CAPTURE_HINT}`
+      : (!candFiles.length
+        ? `候选目录里没有 PNG（0 张）⇒ 没有可比对的候选图 —— ${CAPTURE_HINT}`
+        : (stale.length
+          ? `陈旧候选 ${stale.length}/${candFiles.length} 张：${stale.join('；')}；` +
+            `源码最新 mtime＝${stamp(newest.ms)}（${path.relative(ROOT, newest.file)}）—— ${CAPTURE_HINT}`
+          : `候选 ${candFiles.length} 张，最新候选 mtime＝${stamp(newestCandMs)}` +
+            ` ≥ 源码最新 mtime ${stamp(newest.ms)} − ${FRESH_TOLERANCE_MS / 1000} s（${path.relative(ROOT, newest.file)}）`)));
+
   /* P1-3：候选目录空/不存在时，过去只跑"基准自比"就 finish() → 11 项全 PASS、退出码 0，
      视觉回归形同虚设却报绿。现在把"候选可配对张数"本身当断言：
      候选为空、或同名配对后缺图，一律 FAIL（不是通过）。 */
