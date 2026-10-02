@@ -13,16 +13,35 @@
                               **按序补传**、**幂等**（已成功的不再发）；未配置 MES 地址 ⇒
                               200 + `{ok:false, skipped:true, reason:'未配置 MES 地址（Q-23）'}`，
                               **一条都不发**、也不落"成功"。
+   来源校验（**E87**，2026-10-02 负责人裁定**方案 b**）：`POST /upload/retry` 在**进入处理前**
+     先判来源 —— **非回环 ⇒ 403 `not_loopback`**，且**不读请求体、绝不调用 `reporter.retryPending()`**
+     （"不发送"是硬口径：它是全仓唯一会再次向 MES 发报文的入口，且是**批量**重发）。
+     判据**只取真源、不写第二份**：`services/auth.js` 的 `isLoopback()`（ADR-0007 D4 白名单）
+     ＋ `routes/auth.js` 的 `remoteOf()`（**只信 `req.socket.remoteAddress`**，不信任何请求头）
+     —— 与 `routes/notice.js` 用的是同一个出口。**本轮不做登录态**（裁定原文：登录态那一半留到
+     `E86①` 前端"解锁 ⇒ 会话令牌"接线落定后另行加）⇒ 零前端依赖、不引 `readBearer`、不改前端。
+     留痕口径（**只 `warn`，不写 `op_log`** —— 理由见下方 `forbiddenBody()` 的注释）。
    状态码：200（正常，含"跳过"与"本次仍失败"—— 失败已作为业务结果如实回在响应体里）；
-           400（入参非法：`ids`/`limit` 形态不对）；405/404 由路由器给；500 内部故障（路由器留痕）。
+           400（入参非法：`ids`/`limit` 形态不对）；**403（非回环来源，E87）**；
+           405/404 由路由器给；500 内部故障（路由器留痕）。
    ⚠ 本包**不做**：定时上报/自动重试（W5 接线后才会有周期触发；即使那时也只调 `report()` 一次）、
       SSE 业务推送（W5）、前端切真实源（W5）、登录与口令（后续包）。
-   依赖：`server/services/uploadReporter.js`、`server/http/router.js`（复用 json/readJson）。
+   依赖：`server/services/uploadReporter.js`、`server/http/router.js`（复用 json/readJson）、
+        `server/services/auth.js`（`isLoopback`）、`server/http/routes/auth.js`（`remoteOf`）、
+        `platform/clock.js`（时间唯一出口）。**零第三方依赖**。
    ========================================================================== */
 'use strict';
 
+const platformClock = require('../../../platform/clock');
 const { createUploadReporter } = require('../../services/uploadReporter');
 const { errorBody } = require('../router');
+/* **E87**：回环判据与来源 IP 的**唯一真源**，本文件不另写第二份（两份必然漂移）：
+     · `isLoopback`  —— `services/auth.js`（ADR-0007 D4：127.0.0.1 / ::1 / ::ffff:127.0.0.1）；
+     · `remoteOf`    —— `routes/auth.js`（**只取 socket 地址**，`X-Forwarded-For` 一律不信），
+                        与 `routes/notice.js:41` 复用同一个出口。
+   本轮**不引 `readBearer`**：负责人 2026-10-02 裁定方案 b —— 只加回环校验，登录态留到 `E86①` 之后。 */
+const { isLoopback } = require('../../services/auth');
+const { remoteOf } = require('./auth');
 
 /** 进程内实例池：`POST /upload/*` 是**进程级**端点，而站点实例持有"尝试次数/最近结果"等状态；
  *  每请求各建一份会让 `/upload/status` 永远显示"还没发过"（等于没有状态可观测）。
@@ -122,12 +141,48 @@ function badInputBody(err, path, method) {
 }
 
 /**
+ * **非回环来源**的 403 响应体（E87 / 方案 b）。形状与既有错误体一致：机器可读 `err.code`
+ * ＋ 顶层 `ok:false`（本模块成功/跳过/失败一律带 `ok`，见上方 `badInputBody()` 的说明）
+ * ＋ 顶层 `error`（与 `/auth/*`、`/notice` 的 `error` 同一词形 `not_loopback`，两种读者都能读）。
+ *
+ * **留痕口径＝只 `warn`，不写 `op_log`**（本包的选择，理由三条，均可核查）：
+ *   ① `server/repo/opLog.js:91-92` 明写"**未解锁场景不该写日志**，故这里不设缺省班组" ——
+ *      本包按裁定**没有登录闸** ⇒ 非回环来源连"本机会话"都不成立，正属"未解锁场景"；
+ *   ② `/notice` 的先例（`routes/notice.js:24-25`）已把"**未过鉴权闸**的拒绝"排除在留痕之外
+ *      （那里的 401 只 warn）；本包的 403 发生在**任何身份成立之前**，与那一支同类，
+ *      而**不是**与"过了鉴权闸的 `403 not_loopback`"同类（那需要先有有效会话）；
+ *   ③ 防"给未认证方一个落盘写原语"：E87 的暴露面正是"**LAN 内任意主机**"，若每条 403 都写
+ *      一条 `op_log`，任何局域网主机都能反复触发数据库写入（审计表膨胀／淹没真正的留痕），
+ *      与"把暴露收掉"的目标相悖。
+ * **不静默**：调用方同时打一条 `logger.warn`（含来源、时刻、被拒原因），并在挂载对象的
+ * `counters.forbidden` 上计数（供探针与巡检读取；**不进任何 HTTP 响应体**，前端与契约不动）。
+ * @param {string} path 请求路径
+ * @param {string} method HTTP 方法
+ * @param {string} remote 来源地址（`remoteOf()` 的结果；空串＝读不到，**按非回环从严**）
+ * @param {string} at 本次判定的时刻（注入时钟给出，DR-16 格式）
+ */
+function forbiddenBody(path, method, remote, at) {
+  const b = errorBody('not_loopback',
+    `人工重报（${method} ${path}）只允许来自本机回环（127.0.0.1 / ::1 / ::ffff:127.0.0.1），` +
+    `实际来源 ${remote || '(未知)'} —— 已拒绝：**未读取请求体、未调用 reporter.retryPending()**，` +
+    '一条报文都没有发出（E87 / 2026-10-02 负责人裁定方案 b）', 403);
+  return Object.assign({
+    ok: false, mount: 'upload', path, method,
+    error: 'not_loopback', remote: remote || null, at
+  }, b);
+}
+
+/**
  * 挂载 IF-B 上报的 HTTP 面。
  * @param {object} router `server/http/router.js` 的 createRouter() 产物
  * @param {{db?:object, reporter?:object, logger?:object, now?:Function, config?:object,
  *          fetch?:Function, queue?:object, serviceName?:string, methodName?:string,
- *          capacity?:number, warnThreshold?:number, timeoutMs?:number, bus?:object}} [deps]
- * @returns {{mount:'upload', mounted:boolean, by:'W4', routes:string[], instance:object|null, status:Function}}
+ *          capacity?:number, warnThreshold?:number, timeoutMs?:number, bus?:object,
+ *          isLoopback?:Function, remoteOf?:Function}} [deps]
+ *          `isLoopback`/`remoteOf` 是**判据注入口**（缺省＝上面的真源）：只为自检能把来源伪造为
+ *          非回环地址而设，**不给生产接线用**（`server/index.js` 不传这两项）。
+ * @returns {{mount:'upload', mounted:boolean, by:'W4', routes:string[], instance:object|null,
+ *          counters:object, status:Function}}
  *          `mounted:true` 才是"已接线"的**显式**状态（与 W6 空壳 `router.mountUpload()` 的
  *          `mounted:false` 形成可核查对照，D23 反静默空转）。
  */
@@ -136,7 +191,20 @@ function mountUpload(router, deps = {}) {
     throw new TypeError('mountUpload: 必须传入 server/http/router.js 的 router（缺少 post/get）');
   }
   const routes = [];
+  const logger = deps.logger || null;
   const reporter = (deps.reporter || deps.db) ? resolveReporter(deps) : null;
+  /* 判据注入口（自检用）：缺省一律走**真源**，不另造判定 */
+  const isLoopbackOf = typeof deps.isLoopback === 'function' ? deps.isLoopback : isLoopback;
+  const remoteOfReq = typeof deps.remoteOf === 'function' ? deps.remoteOf : remoteOf;
+  /* 时刻出口（ADR-0003 D17：不裸用 `new Date()`）；缺省＝platform/clock 真实时钟，与 `notice.js` 同款 */
+  const nowFn = typeof deps.now === 'function'
+    ? deps.now
+    : platformClock.createClock({ mode: 'real' }).source();
+  const atNow = () => platformClock.fmt(nowFn());
+  /** 计数（可读、可断言；**不落库**、也不进任何 HTTP 响应体 —— 留痕口径见 `forbiddenBody()`）：
+   *  `retryHandled` ＝ 已过来源校验、**进入发送步骤**的请求数（非回环被拒时它必然是 0，
+   *  这正是"不发送"的结构性证据之一；发送次数的权威读数由探针在 `reporter` 桩上计数）。 */
+  const counters = { retryHandled: 0, forbidden: 0 };
 
   /* ---- ① 待补传清单（UI-20 的主数据源） ---- */
   router.get('/upload/pending', (req, res) => {
@@ -191,8 +259,22 @@ function mountUpload(router, deps = {}) {
   });
   routes.push('GET /upload/last');
 
-  /* ---- ④ 人工一键重报（**唯一**会再次发送待补传报文的入口；按序 + 幂等） ---- */
+  /* ---- ④ 人工一键重报（**唯一**会再次发送待补传报文的入口；按序 + 幂等） ----
+     **E87 来源校验在第一位**：非回环来源**在读请求体之前**就被拒（403），
+     因而"读体/校验入参/调用 `retryPending()`"这三步一步都不会走到（"一条都不发"由此在结构上成立）。 */
   router.post('/upload/retry', async (req, res) => {
+    /* ---- ⓪ 来源校验（E87 / 方案 b）：非回环 ⇒ 403，**绝不调用 reporter.retryPending()** ---- */
+    const remote = remoteOfReq(req);
+    if (!isLoopbackOf(remote)) {
+      counters.forbidden++;
+      const at = atNow();
+      if (logger) {
+        logger.warn(`[上报] 人工重报被拒（非回环来源）：${remote || '(未知)'} 于 ${at} 请求 POST /upload/retry` +
+          ' —— 未读请求体、未调用 retryPending()（**一条报文都没发**）；' +
+          '留痕口径＝只 warn 不写 op_log（理由见 routes/upload.js 的 forbiddenBody()）');
+      }
+      return router.json(res, 403, forbiddenBody('/upload/retry', 'POST', remote, at));
+    }
     if (!reporter) return router.json(res, 503, noServiceBody('/upload/retry', 'POST'));
     /* 读体：坏 JSON ⇒ 400、超限 ⇒ 413（router 的统一口径；空体 ＝ 重报全部待补传） */
     const body = await router.readJson(req);
@@ -202,6 +284,7 @@ function mountUpload(router, deps = {}) {
     } catch (err) {
       return router.json(res, err.status || 400, badInputBody(err, '/upload/retry', 'POST'));
     }
+    counters.retryHandled++;
     const r = await reporter.retryPending(input);
     return router.json(res, 200, Object.assign({ mount: 'upload', path: '/upload/retry', method: 'POST' }, r));
   });
@@ -213,6 +296,8 @@ function mountUpload(router, deps = {}) {
     by: 'W4',
     routes,
     instance: reporter,
+    /** 来源校验的计数（E87；供自检/巡检读取，**不进 HTTP 响应体**） */
+    counters,
     status: () => (reporter ? reporter.status() : { mounted: false, by: 'W4', routes })
   };
 }
