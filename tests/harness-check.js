@@ -4956,7 +4956,16 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       if (mode === 'tpl') {
         if (c === '\\') { blank(i, i + 2); i += 2; continue; }
         if (c === '`') { blank(i, i + 1); mode = 'code'; i++; continue; }
-        if (c === '$' && c2 === '{') { blank(i, i + 2); stack.push({ braces: 0 }); mode = 'code'; i += 2; continue; }
+        if (c === '$' && c2 === '{') {
+          /* 模板串插值 `${ … }`：**保留** `$` 与 `{` 两个字符 —— 它们是**代码**的一部分。
+             `T-20261002-03` 实测的坑（必须留痕）：原写法把 `${` 两个字符一起 blank，插值内的花括号就
+             少了一个左花括号与之配对 ⇒ 后面那个真 `}`（在剥后文本里）会被 `regionOf` 当成块尾提前闭合：
+             例 `server\index.js` 的 `const text = \`[启动失败] ${err && …}\`` ⇒ 正文被截到插值处，
+             `.catch` 区间里就"看不到" `process.exit(2)`（**假判红**）。保留 `${` 后，插值内的
+             `{`／`}` 成对，`regionOf` 才配得准（`$(…)` 之外的字符串/注释/正则仍然照剥 —— §16-H 不受影响）。 */
+          blank(i, i + 1); i++;                                /* 只 blank `$`，保留 `{` */
+          stack.push({ braces: 0 }); mode = 'code'; i++; continue;
+        }
         blank(i, i + 1); i++; continue;
       }
       if (mode === 're') {
@@ -5015,29 +5024,60 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     return last;
   };
 
-  /** async 入口的异常路径区间＝**最后一处** `main().catch(` 的**实参**区间（text===null ⇒ 括号没闭合/没有接法） */
-  const asyncExitRegion = code => {
-    const m = lastMatch(MAIN_CATCH, code);
+  /** 从 `catch` 之后取 **catch 块的配对区间**。
+      四种真实形态都要吃得下（本仓实测）：
+        · `} catch (err) { … }`          —— sync 入口的推荐写法；
+        · `main().catch(err => { … })`   —— 最常见：实参是箭头**函数表达式**（参数没有括号！）；
+        · `.catch(async (err) => { … })` —— 实参是带括号的参数表 ＋ 箭头；
+        · 箭头体里出现 `{`/`}`（模板串 `${…}`、对象字面量）—— 见下。
+      做法（⚠ 实测坑，勿改回去）：
+        ① **不能**从 `catch` 之后的 `(` 直接配起 —— 对 `.catch(` 来说那个 `(` 是"实参表的左括号"，
+           直接配对会把**整个回调**当参数区，配完就找不到 `{`（那样全仓 13 个 async 入口会被假判红）；
+        ② 参数表可能是**带括号**的（`.catch(async (err) => {`），要先把它整段跳过；
+        ③ 找块时**必须按括号深度扫**：`(code.indexOf('=>'), code.indexOf('{'))` 这种"取更早者"的写法
+           会被箭头体里的 `${…}`（如 `server\index.js` 的 `const text = \`[启动失败] ${err…}\``）带偏 ——
+           那个 `{` 在括号深度 > 0 的位置 ⇒ 正文被截成半句、`process.exit(2)` 落在区间外，**假判红**。
+      故：先按深度扫描找**块级**的 `{`（`(`／`[` 深度为 0 时遇到的那个 `{`），再交给 `regionOf` 配整块。
+      取不到（括号/块没闭合、或写成别处去了）一律 `{ text: null }` ⇒ 调用方**判红**（判不了不许当通过）。 */
+  const catchBlockRegion = (code, m) => {
     if (!m) return { text: null };
-    const r = regionOf(code, m.index + m[0].length - 1);       /* 锚点正则末尾那个 `(` */
-    return { text: r ? r.text : null };
-  };
-
-  /** sync 入口的异常路径区间＝`try { main(); } catch (…) { … }` 里 **`catch` 的块**区间 */
-  const syncExitRegion = code => {
-    const m = TOP_TRY_MAIN.exec(code);
-    if (!m) return { text: null };
-    let i = m.index + m[0].length;                            /* 锚点正则末尾＝`catch` 之后 */
+    let i = m.index + m[0].length;                            /* `catch` 之后（`.catch(` 时已越过左括号） */
     while (i < code.length && /\s/.test(code[i])) i++;
-    if (code[i] === '(') {                                    /* `catch (err)` 的参数区 */
+    if (code[i] === '(') {                                    /* 带括号的参数表（`.catch(async (err) => {`） */
       const params = regionOf(code, i);
       if (!params) return { text: null };
       i = params.end + 1;
     }
-    while (i < code.length && /\s/.test(code[i])) i++;
-    if (code[i] !== '{') return { text: null };
-    const body = regionOf(code, i);
-    return { text: body ? body.text : null };
+    let depth = 0;                                            /* 块级 `{` ＝ `(`／`[` 深度归零时的第一个 `{` */
+    for (let k = i; k < code.length; k++) {
+      const ch = code[k];
+      if (ch === '(' || ch === '[') depth++;
+      else if (ch === ')' || ch === ']') { if (depth > 0) depth--; }
+      else if (ch === '{' && depth === 0) {
+        const body = regionOf(code, k);
+        return { text: body ? body.text : null };
+      }
+    }
+    return { text: null };
+  };
+
+  /** async 入口的异常路径区间＝**最后一处** `main().catch(` 的**实参**区间（text===null ⇒ 括号没闭合/没有接法） */
+  const asyncExitRegion = code => catchBlockRegion(code, lastMatch(MAIN_CATCH, code));
+
+  /** sync 入口的异常路径区间＝异常路径**自身**的 `catch` 块区间 —— 两种接法都覆盖：
+        · `try { main(); } catch (…) { … }`（sync 的推荐写法）⇒ `catch` 块的配对区间；
+        · `main().catch(…)`（`E81`：sync 的 `main` 没有 promise，故这里纯属**兜底形态**）⇒ 回调块的配对区间。
+      `E81` 修前：`auditEntryShape` 的第三分支引用了 **async 专用**的 `asyncRegion`（对 sync 恒为 null）
+      ⇒ 走到那里就抛 `TypeError: Cannot read properties of null (reading 'text')`，整轮断言一条都跑不出来
+      （`E76` 的 `.catch` 接线把"主流程异常"落成"无汇总行 ＋ 退 2"）。现在改成**取 sync 自身的区间**，
+      并把"取不到"与"没退 2"一样判红（判不了不许当通过）。 */
+  const syncExitRegion = code => {
+    const tryM = TOP_TRY_MAIN.exec(code);
+    if (tryM) {
+      /* `} catch` 形态：锚点＝`catch` 这个词；`m[0]` 的末 5 个字符就是 `catch` ⇒ 下标回退 5 */
+      return catchBlockRegion(code, { index: tryM.index + tryM[0].length - 5, 0: 'catch' });
+    }
+    return catchBlockRegion(code, lastMatch(MAIN_CATCH, code));
   };
 
   /** 审计一批源码（纯函数，便于下方 D22 定点变异）：返回 { counts, offenders }
@@ -5080,7 +5120,12 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
           offenders.push(`${name}（${decl.form}）：顶层 \`try\`/\`catch\` 的异常路径**没退 2**（\`catch\` 块内缺 process.exit(2)／process.exitCode = 2／值为 2 的常量退码）`);
         }
       } else if (catchM) {
-        if (asyncRegion.text === null || !hasExit2(asyncRegion.text)) {
+        /* `E81`：这里必须取 **sync 自身**的异常路径区间。修前引用的是 async 专用的 `asyncRegion`
+           （对 sync 恒为 `null`）⇒ 本行抛 TypeError，整轮断言一条都跑不出来。 */
+        const syncCatchRegion = syncExitRegion(code);
+        if (syncCatchRegion.text === null) {
+          offenders.push(`${name}（${decl.form}）：\`main().catch(\` 的括号在文件内没有闭合 ⇒ 拿不到异常路径的边界（判不了就判红）`);
+        } else if (!hasExit2(syncCatchRegion.text)) {
           offenders.push(`${name}（${decl.form}）：\`.catch\` 的异常路径**没退 2**`);
         }
       } else {
@@ -5102,18 +5147,61 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
 
   const real = auditEntryShape(entrySources);
   /* 普查地板（`D23` 防空洞）：低于地板说明**扫描器/范围**坏了，不是"脚本变好了"；
-     数字真的变了（新增/删除入口脚本）就**连同本节地板一起改**，别让判据变成恒真。 */
-  const FLOOR = { total: 17, async: 13, sync: 4 };
+     数字真的变了（新增/删除入口脚本）就**连同本节地板一起改**，别让判据变成恒真。
+     `T-20261002-03`（`E80` 收口）把三个"直下但没入口声明"的门禁脚本（files／logic／platform）
+     补成 `main()` 入口后，实跑值由 17/13/4 变为 **20/13/7**（口径：`tests\*.js` 直下 ＋ `tests\lib\*.js`
+     ＋ `server\index.js`）—— 这三个新入口落进扫描面，§16-A 才看得见它们。
+     **口径更正（实测，勿照抄预测）**：进门包的任务书预测"新形态应当 sync ⇒ total 20／async 16／sync 4"，
+     但本包实跑是 **async 13／sync 7**：三个新脚本都是 `function main()`＋顶层 `try`/`catch`（**sync**），
+     没有把任何 async 入口变成 sync ⇒ async 不涨。故地板按"total 只升不降 ＋ async/sync 两维各自**精确**"
+     写：只涨一个维度（例如新增一个 async 入口却不加 sync）就说明形态**漂了**，必须当场说明并同批改本节。 */
+  const FLOOR_TOTAL = 20;
+  const EXACT_ASYNC = 13;
+  const EXACT_SYNC = 7;
   t.info(`§16 入口形态普查：${real.counts.total} 个含 \`main()\` 的入口（async ${real.counts.async}／sync ${real.counts.sync}／缺陷形态 ${real.offenders.length}）`);
   t.info(`§16 E79：退出证据只取异常路径**自身**的区间（注释/字符串/模板串/正则已剥；接线到文件尾的余量上限＝${ENTRY_TAIL_MAX} 字符）；`
     + `常量退码真源＝tests\\env.js（${[...EXIT_CONSTS].map(([k, v]) => k + '=' + v).join('／') || '**读不到真源**'}）`);
   t.check('§16-A 静态：含 `main()` 的入口形态全部合规（async ⇒ `main().catch(` ＋ 退 2；sync ⇒ `try`/`catch` ＋ 退 2；禁止对 async 用顶层同步 try 包 `main()`）',
-    real.offenders.length === 0 && real.counts.total >= FLOOR.total
-      && real.counts.async >= FLOOR.async && real.counts.sync >= FLOOR.sync,
+    real.offenders.length === 0 && real.counts.total >= FLOOR_TOTAL
+      && real.counts.async === EXACT_ASYNC && real.counts.sync === EXACT_SYNC,
     real.offenders.length
       ? `违规 ${real.offenders.length} 处（逐条指名文件与形态）：${real.offenders.join('；')}`
       : `普查 ${real.counts.total} 个（async ${real.counts.async}／sync ${real.counts.sync}），形态全部合规`
-        + `；地板 total/async/sync ≥ ${FLOOR.total}/${FLOOR.async}/${FLOOR.sync}（低于地板即判红：那是扫描器坏了，不是脚本变好了）`);
+        + `；地板 total ≥ ${FLOOR_TOTAL}（低于地板即判红：那是扫描器坏了，不是脚本变好了）`
+        + `；async／sync 两维须**精确**等于 ${EXACT_ASYNC}／${EXACT_SYNC}（只涨一维＝形态漂了，须说明并同批改本节）`);
+
+  t.check('§16-L 入口覆盖普查：`tests\\*.js` 直下的每个门禁脚本都必须是"被 §十六 扫到的入口"（声明了 `main()`）；缺失者逐条指名，豁免项显式列明理由',
+    (() => {
+      const direct = listJs('tests');                            /* tests\ 直下的 .js 全量（含豁免项） */
+      /* **显式豁免清单**（每条都写理由；豁免≠"可以不查"，而是"它不是门禁入口"）：
+         · `env.js`：被 require 的模块 —— 它**实现** `env.assertRuntime()` 并定义退出码/路径常量真源
+           （规范 9.5-5），本身不是门禁入口（`files-check` 第八节也把它排除在"必须调 assertRuntime"之外）；
+         · 范围口径：`tests\lib\*.js` 是夹具层（被 require 的模块），不属"直下入口"，本节既有范围即不含它们。
+         其余直下脚本（含 `capture-baseline`／`screenshot-diff` 这类工具脚本）**都要求有入口声明** ——
+         没有入口的脚本，§16-A 与 `run-all` 的失败明细**都看不见它**（`E80` 的两个盲区）。 */
+      const EXEMPT = new Set(['env.js']);
+      const missing = direct
+        .map(rel => ({ rel, base: rel.slice(rel.lastIndexOf('/') + 1) }))
+        .filter(x => !EXEMPT.has(x.base))
+        .filter(x => {
+          const hit = entrySources.find(s => s.name === x.rel.split('/').join('\\'));
+          return !hit || !detectMainDecl(hit.src);              /* 读不到 ⇒ 也算"没被扫到"（判不了就判红） */
+        })
+        .map(x => x.rel.split('/').join('\\'));
+      /* 自证：拿一个**合成**的"直下脚本＋无入口声明"喂同一条判据 ⇒ 必须被指名（防这条判据写成恒真） */
+      const probe = direct.map(rel => ({ rel, base: rel.slice(rel.lastIndexOf('/') + 1), src: '' }))
+        .filter(x => x.base !== 'env.js')
+        .map(x => ({ name: x.rel.split('/').join('\\'), src: x.src }));
+      const probeMissing = probe.filter(p => !detectMainDecl(p.src)).map(p => p.name);
+      const selfProves = probeMissing.length > 0;
+      t.info(`§16-L 直下脚本 ${direct.length} 个：豁免 ${EXEMPT.size} 个（${[...EXEMPT].join('、')}：被 require 的模块，实现 assertRuntime 与常量真源，不是门禁入口）；`
+        + `被 §十六 扫到的入口 ${direct.length - EXEMPT.size - missing.length} 个；`
+        + `缺失入口声明 ⇒ 指名：${missing.join('、') || '（无）'}；判据自证（合成无入口样本必被指名）＝${selfProves}`);
+      return missing.length === 0 && selfProves;
+    })(),
+    '每条缺失都点名到文件（`tests\\files-check.js`／`tests\\logic-check.js`／`tests\\platform-check.js` 三个门禁脚本'
+      + '在 `T-20261002-03` 之前就**没有** `main()`：§十六 只审"声明了 main()"的文件 ⇒ 它们在扫描面外，'
+      + '`run-all` 的失败明细也认不出它们的裸栈 ⇒ 两道门同时瞎（`E80`）；豁免只有 `env.js`（理由见 info 行）');
 
   t.check('§16-B 扫描器自证：`async function main`／`function main`／`main = async` 三种真实写法都被识别，注释里的 `function main()`（无函数体）与不含 `main` 的源码都不计入',
     (() => {
@@ -5308,6 +5396,131 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     })(),
     '修正前实测（旧 sync 判据＝扫 `try { main(); }` 之后的**整段文本**）：同一变异体 `offenders=0`（**假绿**）；'
       + '新 sync 判据只看 `catch` 块自身的区间 ⇒ 必须判红并**指名** `tests\\copy-check.js`');
+
+  /* §16-J／§16-K：**sync ＋ `.catch`（无顶层 `try`）**这条分支的自证（`E81`）。
+     `E81` 现场：该分支引用的是 **async 专用**的 `asyncRegion`，而它对 sync 恒为 `null`
+     ⇒ 走到那里就抛 `TypeError: Cannot read properties of null (reading 'text')`；由于它在**主流程**
+     `auditEntryShape(entrySources)` 里，整轮断言**一条都跑不出来**（`E76` 的 `.catch` 接线把它落成
+     "无汇总行 ＋ 退 2"，`run-all` 记 `error` —— 可见，但本节整支失效）。
+     敏感文本一律字符串拼接构造（同 §16-C/E 的理由：本文件自己也在 §16 的扫描范围内）。 */
+  const mkSyncCatchEntry = body => 'function main() { done(); }\n\n'
+    + 'main().catch(err => {\n' + '  console.error(String(err));\n' + body + '\n});\n';
+
+  t.check('§16-J sync ＋ `.catch`（无顶层 `try`）分支自证：合规样本（`.catch` 区间内退 2）判绿、非法样本（区间内退 1）判红并指名，且**全程不抛异常**',
+    (() => {
+      const NAME_OK = '（合成 sync＋.catch 合规样本）';
+      const NAME_BAD = '（合成 sync＋.catch 退 1 样本）';
+      const bad = 'process.exit(' + '1)';
+      let ok = null, red = null, thrown = null;
+      try {
+        ok = auditEntryShape([{ name: NAME_OK, src: mkSyncCatchEntry('  ' + E2TEXT + ';') }]);
+        red = auditEntryShape([{ name: NAME_BAD, src: mkSyncCatchEntry('  ' + bad + ';') }]);
+      } catch (err) {                                   /* 修前形态：这里会接到 TypeError */
+        thrown = err.constructor.name + ': ' + err.message;
+      }
+      const okGreen = !!ok && ok.offenders.length === 0
+        && ok.counts.total === 1 && ok.counts.sync === 1 && ok.counts.async === 0;
+      const redNamed = !!red && red.offenders.length > 0
+        && red.offenders.every(o => o.startsWith(NAME_BAD)) && red.offenders.some(o => o.includes('没退 2'));
+      t.info(`§16-J 合规样本判红 ${ok ? ok.offenders.length : '（抛异常，未取到）'} 条（应 0）／`
+        + `非法样本判红 ${red ? red.offenders.length : '（抛异常，未取到）'} 条（应 ≥1 且指名）；`
+        + `异常＝${thrown || '无'}`);
+      return okGreen && redNamed && thrown === null;
+    })(),
+    '`E81` 现场实测（修前）：本组两个样本都抛 `TypeError: Cannot read properties of null (reading \'text\')`'
+      + '（复核脚本 `tests\\._verify\\review\\s5t02-e79-sync-catch-probe.js`）；**修后**必须"合规绿／非法红并指名／不抛"，'
+      + '且"拿不到 `.catch` 区间"也要判红（判不了不许当通过）');
+
+  t.check('§16-K D22 定点变异④：把 `§16-J` 那条分支改回引用 `asyncRegion.text`（`E81` 的原形态）⇒ 同一批样本必须判失败（抛异常或指名叫红），且原文件字节不变',
+    (() => {
+      const hsPath = path.join(env.paths.tests, 'harness-check.js');
+      const bytes = fs.readFileSync(hsPath);                       /* 字节副本①（只读，不写盘） */
+      const sha0 = sha256Hex(bytes);
+      const hsSrc = bytes.toString('utf8');
+      const FROM = 'const syncCatchRegion = syncExitRegion(code);';       /* 新形态锚点（真代码那处） */
+      const TO = 'if (syncCatchRegion.text === null) {';
+      if (hsSrc.indexOf(FROM) < 0 || hsSrc.indexOf(TO) < 0) {
+        t.info('§16-K 锚点未命中：本文件里找不到新形态那两个锚点');
+        return false;
+      }
+      const mkSyncCatchEntry2 = body => 'function main() { done(); }\n\n'
+        + 'main().catch(err => {\n  ' + body + '\n});\n';
+      const srcs = [
+        { name: '（合成 sync＋.catch 合规样本）', src: mkSyncCatchEntry2(E2TEXT + ';') },
+        { name: '（合成 sync＋.catch 退 1 样本）', src: mkSyncCatchEntry2('process.exit(' + '1)' + ';') },
+      ];
+      /* 定点变异体：**只改那一个谓词** —— 把"新形态"那一行换回 `E81` 的旧形态（引用 async 专用的
+         `asyncRegion`，对 sync 恒为 `null` ⇒ `asyncRegion.text` 抛 `TypeError`）。
+         做法：从**本文件真 §十六 节体**里取那一小段（`} else if (catchM) {` … `} else {`），
+         用"新→旧"的字面量替换造出变异体，再把它**整体**交给 `new Function` 编译调用。
+         ⚠ 为什么不用"抽出 §十六 整块 ＋ new Function"的老办法（实测踩过两次、务必别再改回去）：
+           抽整块时，节首若用"块注释尾之后的第一个 `{`"会命中本文件 `main()` 的左花括号 ⇒ 抽出整个 `main()`；
+           那样抽出来的 body 会带 `t.finish();` 之类**字面量**，节尾锚点又命中字符串里的那一处；
+           而把这团东西交给 `new Function` **调用**时，V8 会一路吃内存到 OOM（整轮断言全废）。
+         现在只抽"那一小段真代码"＋只做一次字面量替换 ⇒ 变异点看得见、进程也稳。 */
+      const NEW_PRED = 'const syncCatchRegion = syncExitRegion(code);';
+      const OLD_PRED = 'const syncCatchRegion = asyncRegion;';
+      const segStart = hsSrc.indexOf('} else if (catchM) {');
+      const segEnd = segStart < 0 ? -1 : hsSrc.indexOf('} else {', segStart);
+      const rawSegment = (segStart >= 0 && segEnd > segStart) ? hsSrc.slice(segStart, segEnd) : null;
+      /* 段首是 `} else if (catchM) {`（挂在 async 分支链上的 else）⇒ 单独编译要掐掉开头的 `} else `；
+         段尾：`} else {` 之前的 `\r\n      ` 是**本支闭合 `}` 的缩进**（真源里那样换行）⇒ 必须补回一个 `}`，
+         否则 `if (catchM) {` 永远不闭合（实测：`new Function` 报 `Unexpected token ')'`）。 */
+      const realSegment = rawSegment === null ? null : rawSegment.slice('} else '.length) + '}';
+      const mutatedSegment = realSegment === null ? null : realSegment.split(NEW_PRED).join(OLD_PRED);
+      const mutateOk = !!realSegment && !!mutatedSegment && mutatedSegment !== realSegment
+        && mutatedSegment.includes(OLD_PRED) && !mutatedSegment.includes(NEW_PRED);
+      let detected = false, mode = '未跑（取不到真代码段）', errText = '无', newFormOk = false;
+      if (mutateOk) {
+        const sourceOf = segment => 'const auditEntryShape = (sources) => {\n'
+          + '  const offenders = [];\n'
+          + '  for (const { name, src } of sources) {\n'
+          + '    const code = stripLiterals(src);\n'
+          + '    const catchM = lastMatch(MAIN_CATCH, code);\n'
+          + '    const asyncRegion = null;                          /* 旧形态就是踩在这个 null 上 */\n'
+          + '    const decl = { form: \'（合成 sync 入口）\' };\n'
+          + segment + '\n'
+          + '  }\n'
+          + '  return { offenders };\n'
+          + '};\n'
+          + 'return auditEntryShape;\n';
+        const build = seg => new Function('stripLiterals', 'lastMatch', 'MAIN_CATCH', 'hasExit2', 'syncExitRegion', sourceOf(seg));
+        try {
+          /* 对照（新形态，就是本文件现在这一支）：合规样本判绿、退 1 样本**被指名**判红 ⇒ 变异点确实是分水岭 */
+          const newForm = build(realSegment)(stripLiterals, lastMatch, MAIN_CATCH, hasExit2, syncExitRegion);
+          const nres = newForm(srcs);
+          newFormOk = nres.offenders.length === 1
+            && nres.offenders[0].startsWith(srcs[1].name) && nres.offenders[0].includes('没退 2');
+          /* 变异体（旧形态）：`asyncRegion` 对 sync 恒为 `null` ⇒ 与 `E81` 现场一样炸在这个属性读上 */
+          const oldForm = build(mutatedSegment)(stripLiterals, lastMatch, MAIN_CATCH, hasExit2, syncExitRegion);
+          const ores = oldForm(srcs);
+          detected = ores.offenders.length > 0;
+          mode = detected ? '旧形态**跑完并指名**（判失败）' : '旧形态跑完且未报任何违规 ⇒ 变异**没被检出**';
+        } catch (err) {
+          detected = true;                                     /* 抛异常同样是"判失败"（`E81` 的真实形态） */
+          errText = err.constructor.name + ': ' + err.message;
+          mode = '旧形态**抛异常**（`E81` 的真实形态：无汇总行 ＋ 退 2）';
+        }
+      }
+      /* 判据：① 新形态在**同一批样本**上取得到区间（对照，证明变异点确实是判据的分水岭）；
+              ② 旧形态判失败（抛异常或指名）；③ 变异体只改了那**一个谓词**（其余字面量一一对应）。 */
+      t.info(`§16-K 变异段自证：取到真段＝${!!realSegment}（长度 ${realSegment ? realSegment.length : '-'}）；`
+        + `新谓词命中 ${realSegment ? realSegment.split(NEW_PRED).length - 1 : '-'} 处；`
+        + `替换后含旧谓词＝${!!mutatedSegment && mutatedSegment.includes(OLD_PRED)}；`
+        + `替换后不含新谓词＝${!!mutatedSegment && !mutatedSegment.includes(NEW_PRED)}；mutateOk＝${mutateOk}`);
+      const mutatedBytes = Buffer.from(hsSrc.replace(FROM, 'const __e81OldForm = asyncRegion;'), 'utf8');
+      const restored = Buffer.from(bytes);                   /* 还原证明（同 §16-F/I 的纪律） */
+      const byteSame = Buffer.compare(restored, bytes) === 0;
+      const shaSame = sha256Hex(restored) === sha0;
+      const diskSame = sha256Hex(fs.readFileSync(hsPath)) === sha0;
+      t.info(`§16-K 变异体 sha256=${sha256Hex(mutatedBytes).slice(0, 12)}…（原件 sha256=${sha0.slice(0, 12)}…）；`
+        + `新形态对照（同批样本取得到区间）＝${newFormOk}；变异检出＝${detected}（${mode}；异常：${errText}）；`
+        + `还原 Buffer.compare=${byteSame}／sha256 一致=${shaSame}／盘上文件未变=${diskSame}`);
+      return newFormOk && detected && byteSame && shaSame && diskSame;
+    })(),
+    '`E81` 的原形态＝第三分支引用 `asyncRegion.text`（对 sync 恒 null）。定点变异把这一处改回去 ⇒ '
+      + '本组必须**判失败**：**旧形态是抛异常**（`TypeError`，落到"无汇总行 ＋ 退 2"），'
+      + '而不是"指名叫红" —— 两种都算命中，本行如实打印是哪一种（ADR-0004 D22）');
 }
 
 t.finish();

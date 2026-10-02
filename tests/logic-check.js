@@ -10,6 +10,15 @@
    ========================================================================== */
 'use strict';
 
+/* ---------------- 入口与异常兜底（`E80③`／规范 9.5-5 第 5 条） ----------------
+   本脚本是一道**门禁**，但长期没有 `main()` 声明、也没有任何异常兜底 ⇒ 两个后果：
+     ① `harness-check` 第十六节只审"声明了 `main()`"的文件 ⇒ 本脚本**不在扫描面内**；
+     ② 脚本自身异常时抛裸栈、进程退 **1** ⇒ `run-all` 的失败明细过滤
+        （`/\[FAIL\]|失败清单|^\s+\d+\.|脚本异常终止/`）认不出它，与"有断言失败"逐字同形。
+   现按既有 sync 家族（`copy-check`／`docs-cross-check`／`trace-check`／`screenshot-diff`）同形收口：
+   `function main()` ＋ 顶层 `try`/`catch`，异常**打印出来**（含字面 `脚本异常终止`，供 `run-all` 命中）并退 **2**。
+   **断言与条数一字未改**（本例只是把原来的顶层语句搬进 `main()`）。 */
+function main() {
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -1866,4 +1875,13 @@ t.section('十、预警阈值可配：改配置真源（内存覆盖，不落盘
   }
 }
 
-t.finish();
+  t.finish();
+}
+
+/* 与既有脚本一致：异常以退出码 2 结束（打印行含字面 `脚本异常终止`，`run-all` 的失败明细据此命中） */
+try {
+  main();
+} catch (err) {
+  console.error('\n脚本异常终止：' + (err && err.stack ? err.stack : err));
+  process.exit(2);
+}
