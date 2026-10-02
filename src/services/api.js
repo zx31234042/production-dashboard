@@ -306,7 +306,11 @@ window.Api = (function () {
    *    缺失时**返回失败结论**（`ok:false`）而**不抛** —— 调用方据此走优雅回退。
    *
    * @param {string} path    以 `/` 开头的路径（如 `/state`）
-   * @param {{method?:string, body?:object}} [options]
+   * @param {{method?:string, body?:object, headers?:object}} [options]
+   *   `headers`（可选，**追加型**）：额外请求头。为什么需要它：`FR-7.12` 的公告写路由
+   *   （`POST /notice`）要带 ADR-0007 的会话令牌 `Authorization: Bearer <token>`，
+   *   而"全仓唯一的服务端 HTTP 出口"就是本函数 ⇒ 在这里开一个口子，**不另起第二套 fetch**。
+   *   既有调用方不传该键 ⇒ 请求头与改动前逐字节相同（`Accept` ＋ 有体时的 `Content-Type`）。
    * @returns {Promise<{ok:boolean, status?:number, body?:any, url:string,
    *                    error?:string, failReason?:string, responseCode?:string, responseText?:string}>}
    */
@@ -332,6 +336,14 @@ window.Api = (function () {
     if (opt.body !== undefined) {
       init.headers['Content-Type'] = 'application/json;charset=UTF-8';
       init.body = JSON.stringify(opt.body);
+    }
+    /* 额外请求头（如公告写入的 `Authorization`）：只**追加**，不覆盖上面两条既有头 */
+    if (opt.headers && typeof opt.headers === 'object') {
+      Object.keys(opt.headers).forEach(k => {
+        if (opt.headers[k] !== undefined && opt.headers[k] !== null && opt.headers[k] !== '') {
+          init.headers[k] = String(opt.headers[k]);
+        }
+      });
     }
 
     return fetch(url, init).then(res => res.text().then(text => {

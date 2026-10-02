@@ -56,6 +56,13 @@
                 capacity:number, warnThreshold:number, oldestAt:string|null, alert:object,
                 autoRetry:false }
               来源：**W4 的 `GET /upload/status` 同一真源**（`uploadReporter.status()` 的子集）
+      notices  { notices:Array<{id,tag,text,lv,time}>, tips:Array<{id,tag,text,lv,time}>, todo:[] }
+               来源：`repo/notice.js` 的 `listForBoard()`（`DR-10`；**写入口**同在该仓储，
+               接线见 `server/index.js` 的 6d-3 段，`FR-7.12` P0）。**与前端 `state.notices` 同形**：
+               `notices`/`tips` 的行＝`{id, tag, text, lv, time}`（`tag`←`sub_type`、`text`←`content`
+               原文、`lv` 恒 `info`＝DR-10 没有等级列、`time`←`valid_from` 的 `HH:MM`）；
+               `todo` **恒为空数组** —— 前端 `todo` 的行是派生量（`{name,value,unit,lv}`），
+               `notice` 表里没有这些数 ⇒ 由前端既有空态承担（**不造数**）。
    ---- 口径与边界 --------------------------------------------------------------------
      · 时间：`snapshot` 本体**不含**"现在几点"；需要时刻读信封的 `at`（注入时钟给出，D17）。
        `stats.shift.elapsedSec` 等当班进度**随秒前进**（跨秒两次读取可能差 1 s），这是当班
@@ -86,6 +93,10 @@ const standardSvc = require('./standard');
    累计值，**不写任何表**（写入口在 `repo/shiftStat.js`，接线在 `server/index.js` 的跨班固化点）。
    无循环依赖：`repo/shiftStat.js` 只依赖传入的 db 句柄。 */
 const shiftStatRepo = require('../repo/shiftStat');
+/* `DR-10`（`notice` 表）的**读口**：`FR-7.12`（P0）接线后，快照要带 `notices` 段
+   （前端 `state.notices` 同形）。本文件**只读**该表（写入口在 `repo/notice.js`，接线在
+   `server/index.js` 的 6d-3 段）—— 投影只有 `listForBoard()` 一份，`POST /notice` 的响应复用它。 */
+const noticeRepo = require('../repo/notice');
 
 /** 帧载荷的字段清单（**与 IF-D / fieldMap.upperToBoard 的 key 同名**；顺序只为可读） */
 const FRAME_FIELDS = Object.freeze([
@@ -419,6 +430,14 @@ function createStateSnapshot(options = {}) {
     };
   }
 
+  /** 快照里的公告段（`DR-10` / `FR-7.12`）：**前端 `state.notices` 同形**，读口只有
+   *  `repo/notice.js` 的 `listForBoard()` 一份（`POST /notice` 的响应复用它，禁两套投影）。
+   *  没有库 ⇒ 空态 `{notices:[],tips:[],todo:[]}`（**不编造**公告；前端据此走既有空态 UI-11）。 */
+  function noticesOf() {
+    if (!db) return { notices: [], tips: [], todo: [] };
+    return noticeRepo.listForBoard(db);
+  }
+
   /**
    * 组装整机快照（纯读、同步）。
    * @returns {object} 见文件头的 snapshot schema 表
@@ -440,7 +459,8 @@ function createStateSnapshot(options = {}) {
       frame,
       stats: statsOf(now),
       standard: standardOf(task, at),
-      upload: uploadOf()
+      upload: uploadOf(),
+      notices: noticesOf()
     };
     /* `statsOf()` 里已刷新 `lastRunAccum`；这里把它同步到函数对象上（同一份对象，不复制）。 */
     snapshot.lastRunAccum = lastRunAccum;

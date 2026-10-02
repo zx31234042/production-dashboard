@@ -59,6 +59,11 @@ const { mountUpload } = require('./http/routes/upload');
    见下方 6d-2 段。**本文件只接一次线**，5 条 `/auth/*` 路由的登记全部在 `mountAuth()` 里完成
    （不在入口另起路由表 —— 否则路由清单会分叉成两份真源）。 */
 const { mountAuth } = require('./http/routes/auth');
+/* `FR-7.12`（P0，负责人 2026-10-02 裁定）的挂载口（`server/http/routes/notice.js`）：
+   **IF-E 写路由** `POST /notice`（publish/edit/delete）＋ `op_log` 同批留痕（ADR-0009 D5：不改表）。
+   见下方 6d-3 段。**本文件只接一次线**，路由登记全部在 `mountNotice()` 里完成
+   （不在入口另起路由表 —— 否则路由清单会分叉成两份真源）。 */
+const { mountNotice } = require('./http/routes/notice');
 /* W5-① 的两块：进程内事件总线（业务写入点 → 推送的唯一通道）与整机快照构造器
    （`hello` 与 `GET /state` **同一构造函数**产出，禁两套拼装）。见下方 6e 段。 */
 const { createEventBus } = require('./services/eventBus');
@@ -744,6 +749,35 @@ async function start(options = {}) {
     `${auth.limits.lockMinutes} 分钟；会话 TTL=${auth.limits.sessionHours} h（滑动续期，绝对上限 ` +
     `${auth.limits.absoluteHours} h）；当前状态=${auth.status().initialized
       ? '已初始化' : '未初始化（本机一次性初始化码已打印到控制台并写入 op_log）'}`);
+
+  /* ---- 6d-3（FR-7.12 / P0）. 公告写路由挂载：IF-E（`POST /notice`）＋ `op_log` 同批留痕 ----
+     需求原文（`需求文档\…-V1.41.md:533`）：「**仅本机解锁后可新增/编辑/删除公告**」——
+     编辑/删除本就在 `FR-7.12`（P0）之内（不是需求缺口），"操作记录保留"的依据＝
+     `FR-8.7`／`NFR-15`／`DR-12`；负责人 2026-10-02 已批准开工、**无需需求升版**
+     （`FR-7.11` 的有效期/优先级排序属 P1，**滚动/分页轮播仍不做**＝技术债 `E3`）。
+     三条接线口径：
+       · **鉴权复用既有登录态**（`/auth/*` 的会话令牌，ADR-0007 D3）：未登录 401、
+         非本机回环 403、账号锁定态 403 —— 判据全部取 `services/auth.js` 的真源，不在路由里重算；
+       · **留痕沿用既有唯一写入口** `server/repo/opLog.js`：三个动作的成功路径与 `notice` 表
+         **同一事务**（`repo/notice.js` 里 BEGIN→写表→op_log→COMMIT），过了鉴权闸的被拒也留痕；
+       · **落库与读口同一个仓储**：`GET /state` 快照的 `notices` 段与 `POST /notice` 的响应
+         都走 `repo/notice.js` 的 `listForBoard()`（前端 `state.notices` 同形，**不写第二份投影**）。
+     位置：鉴权挂载之后（本路由要用 `auth.verify()`）、SSE 之前（路由必须在监听前注册完）。 */
+  const notice = mountNotice(router, {
+    db: state.db,
+    logger,
+    now: currentClock().source(),
+    /* 与 `/auth/*` **同一个** auth 实例（同一份会话表）：不新造第二套令牌，也不另建一份状态 */
+    auth,
+    /* 留痕身份：`operator` 由会话用户名给出（见 routes/notice.js），`teamCode` 取当前生效班次的班组
+       —— 真源＝`board.config.js` 的 `shift.roster.team`（与 FR-1.6 头部"所属班组"同一处；
+       取不到就是 null，**不猜**：`repo/opLog.js` 明写"本模块只负责把调用方给的值落库"）。 */
+    teamCode: ((boardCfg.shift || {}).roster || {}).team || null
+  });
+  logger.info(`[路由] 公告写入已接线（${notice.by}）：${notice.routes.join(' , ')}；` +
+    `鉴权=复用 /auth/* 会话令牌（未登录 401 / 非本机回环 403 / 账号锁定 403）；` +
+    `留痕=notice 表写入与 op_log 同一事务（编辑与删除同样留痕；删除＝硬删＋原文进 op_log）；` +
+    `读口=GET /state 的 notices 段与 POST /notice 响应同源（repo/notice.js 的 listForBoard()）`);
 
   /* ---- 6e. W5-① 业务挂载：SSE 业务推送（真实 `/events` ＋ `GET /state`） ----
      依据 `server/http/router.js` 挂载位的指引（"实现这些包时，请把注册写进对应函数体"），
@@ -1511,7 +1545,7 @@ async function start(options = {}) {
     `需求基线=${readBaselineVersion()}；配置来源=${JSON.stringify(cfg.sources)}`);
   logger.info(`[路由] 已注册：${router.list().join(' , ')}；挂载位状态（空壳＝该包只留描述符、真实现由 ` +
     `routes\\*.js 接线；SSE 自 W5-① 起、auth 自 W5-③ 起都是真实挂载）：` +
-    [router.mountIfA(), router.mountIfD(), router.mountUpload(), router.mountSSE(), authMount]
+    [router.mountIfA(), router.mountIfD(), router.mountUpload(), router.mountSSE(), authMount, notice]
       .map(m => `${m.mount}(${m.by})${m.mounted ? '已接线' : '空壳'}`).join(' , '));
 
   /* ⚠ 监听范围告警（NFR-25 / AC-09）：本系统**不得对外**提供服务。
@@ -1553,7 +1587,7 @@ async function start(options = {}) {
     linkMonitor,
     cors,
     site,
-    mounts: { ifd, ifa, upload, sse }
+    mounts: { ifd, ifa, upload, sse, notice }
   };
 }
 

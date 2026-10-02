@@ -25,6 +25,56 @@ window.Components.SettingPanel = (function () {
      计时逻辑仍只有一份（bind 内的 armAutoLock），这里只是把同一份逻辑的引用拿出来。 */
   let autoLockArmer = null;
 
+  /* ---------------- FR-7.12（T-20261002-08）：服务端模式下的公告新增/编辑/删除 ----------------
+     需求原文（`需求文档\…-V1.41.md:533`）：「**仅本机解锁后可新增/编辑/删除公告**」。
+     本模块此前只有"发布"一条内存路径（刷新即丢）⇒ 本波把它接到服务端的 `POST /notice`
+     （唯一写入口＝`server/repo/notice.js`，落 `notice` 表并**同批**写 `op_log`）。
+     边界（本包**不做**、也不假装做）：
+       · **解锁仍走既有演示口令**（`MockData.CFG.unlockPassword`）：服务端会话令牌（ADR-0007 的
+         `POST /auth/login`）的前端接线属 `FR-8.4` 的包，不在本波；`sessionToken()` 留出出口，
+         取不到令牌时 `POST /notice` 会如实回 **401**，本页把该失败**显示出来**（绝不静默）。
+       · **演示模式一行都不改**：服务端分支只在 `serverMode(state)` 为真时进入。 */
+
+  /** 正在编辑的公告 id（服务端模式；`null` ＝ 新增）。演示模式恒为 null、不参与任何分支。 */
+  let noticeEditingId = null;
+
+  /** 是否服务端模式（与 `UploadPanel.serverMode()` **同一判据**：状态位优先，配置兜底） */
+  function serverMode(state) {
+    return !!(state && (state.serverMode === true ||
+      ((window.BoardConfig || {}).dataSource === 'server')));
+  }
+
+  /** 会话令牌（ADR-0007 D3 的 `Bearer`）：提交给 `POST /notice` 的鉴权头。
+   *  **由登录接线包提供**（`window.BoardSession.token()`，或状态位 `state.sessionToken`）；
+   *  取不到就返回空串 —— 调用方**不伪造令牌**，服务端会回 401 并把原因显示给操作人。 */
+  function sessionToken(state) {
+    const bs = window.BoardSession;
+    try {
+      if (bs && typeof bs.token === 'function') {
+        const t = bs.token();
+        if (t) return String(t);
+      }
+    } catch (err) {
+      console.warn('[SettingPanel] 会话令牌出口抛错（按未登录处理，失败会显示在提示位）：' +
+        ((err && err.message) || String(err)));
+    }
+    if (state && typeof state.sessionToken === 'string' && state.sessionToken) return state.sessionToken;
+    return '';
+  }
+
+  /** 从点击目标向上找带 `data-notice-act` 的元素（**不用 `Element.closest`**：桩件 DOM 未必实现它）。
+   *  只向上爬有限层（结构固定＝button → span.notice-acts → div.list-item），避免误命中。 */
+  function actionButtonOf(node) {
+    let el = node;
+    for (let i = 0; el && i < 5; i++) {
+      const get = typeof el.getAttribute === 'function' ? el.getAttribute.bind(el) : null;
+      const act = get ? get('data-notice-act') : null;
+      if (act) return { act: String(act), id: get('data-notice-id'), el };
+      el = el.parentNode || el.__parent || null;
+    }
+    return null;
+  }
+
   /* ---------------- 自动锁定提示弹窗（FR-8.2：自动锁定时弹提示性弹窗，显示 2 s） ----------------
      DOM 契约（测试可断言）：
        节点     index.html `#autoLockTip`（role="status"，初始带 `hidden` 属性）
@@ -61,6 +111,14 @@ window.Components.SettingPanel = (function () {
     /* 维保录入 / 公告发布：解锁后才可编辑（FR-6.11、FR-7.12） */
     ['maintContent', 'maintOwner', 'maintState', 'maintSave',
      'noticeType', 'noticeText', 'noticeSave'].forEach(id => { $(id).disabled = !unlocked; });
+
+    /* FR-7.12（服务端模式）：编辑态把按钮文案换成「保存修改」；锁定时**退出编辑态**
+       （锁定后按钮已 disabled，若留着编辑态，解锁后一次误点就会改到别的那条公告）。
+       ⚠ 演示模式**一字不改**：`serverMode(state)` 为假时下面这段整段不执行。 */
+    if (serverMode(state)) {
+      if (!unlocked && noticeEditingId !== null) noticeEditingId = null;
+      setText('noticeSave', noticeEditingId === null ? '发布公告' : '保存修改');
+    }
 
     /* 关键参数配置：解锁后才可编辑（FR-8.6）；此处只切禁用态，不写 value（避免秒级刷新清空输入） */
     ['cfgEquipCode', 'cfgUpperUrl', 'cfgMesUrl', 'cfgWarnDays', 'cfgSaveBtn']
@@ -258,12 +316,127 @@ window.Components.SettingPanel = (function () {
       noteActivity();
     });
 
+    /* ---- FR-7.12（T-20261002-08）：服务端公告写入（发布/编辑/删除共用一个出口） ----
+       走 `Api.httpJson()`（**全仓唯一的服务端 HTTP 出口**，不另起第二套 fetch）；
+       成功 ⇒ 用响应里的 `notices`（与 `GET /state` 同源、同一份投影）就地刷新，不重拉快照；
+       失败 ⇒ 一律落到 `#entryMsg`（与"锁定后保存"同一处可见反馈位），**绝不静默**。 */
+    function postNotice(st, payload, okText) {
+      const api = window.Api;
+      if (!api || typeof api.httpJson !== 'function') {
+        flashEntry('公告未保存：服务端接口未装配（window.Api.httpJson 不可用）', true);
+        return;
+      }
+      const token = sessionToken(st);
+      const headers = token ? { Authorization: 'Bearer ' + token } : {};
+      api.httpJson('/notice', { method: 'POST', body: payload, headers }).then(r => {
+        if (!r || r.ok !== true) {
+          const body = r && r.body;
+          const code = (body && ((body.err && body.err.code) || body.error)) || '';
+          const why = (body && body.err && body.err.message) || (r && (r.failReason || r.error)) || '未知原因';
+          flashEntry('公告未保存（HTTP ' + ((r && r.status) || '—') + (code ? ' ' + code : '') + '）：' + why, true);
+          return;
+        }
+        /* 服务端已落库（且已写 op_log）⇒ 用响应里的同一份投影刷新界面 */
+        if (r.body && r.body.notices && typeof r.body.notices === 'object') {
+          st.notices = {
+            notices: Array.isArray(r.body.notices.notices) ? r.body.notices.notices : [],
+            tips: Array.isArray(r.body.notices.tips) ? r.body.notices.tips : [],
+            todo: []
+          };
+        }
+        noticeEditingId = null;
+        render(st);
+        try { window.Components.NoticePanel.render(st); } catch (err) {
+          console.warn('[SettingPanel] 公告刷新渲染异常（服务端已保存，界面下一帧会补上）：' +
+            ((err && err.message) || String(err)));
+        }
+        flashEntry(okText, false);
+      }).catch(err => {
+        /* 网络异常/超时：同样**可见**（`httpJson` 通常自己收敛成 ok:false，这里兜最后一层） */
+        flashEntry('公告未保存：' + ((err && err.message) || String(err)), true);
+      });
+    }
+
+    /** 在 `state.notices.notices` 里按 id 找那一条（找不到 ⇒ null：**不猜**） */
+    function noticeById(st, id) {
+      const list = (st && st.notices && st.notices.notices) || [];
+      const key = String(id);
+      for (const x of list) { if (x && String(x.id) === key) return x; }
+      return null;
+    }
+
+    /** 点「编辑」：把该条内容装进 `#noticeText` 并进入编辑态（**再点一次同一条＝取消**） */
+    function startEditNotice(st, id) {
+      const hit = noticeById(st, id);
+      if (!hit) { flashEntry('找不到这条公告（列表可能已刷新），请重新选择', true); return; }
+      if (noticeEditingId !== null && String(noticeEditingId) === String(hit.id)) {
+        noticeEditingId = null;
+        $('noticeText').value = '';
+        render(st);
+        flashEntry('已取消编辑（回到「发布公告」）', false);
+        noteActivity();
+        return;
+      }
+      noticeEditingId = hit.id;
+      $('noticeText').value = hit.text === undefined || hit.text === null ? '' : String(hit.text);
+      /* 类型回填：值不在下拉项里时赋值不生效（select 的选项集**不由本包改动**） */
+      if (hit.tag) $('noticeType').value = String(hit.tag);
+      render(st);
+      flashEntry('正在编辑公告 #' + hit.id + '：改完点「保存修改」（再点一次「编辑」可取消）', false);
+      noteActivity();
+    }
+
+    /** 点「删除」：二次确认后提交（删除是**硬删**；原文由服务端写进 `op_log`，见 `repo/notice.js` 文件头） */
+    function requestDeleteNotice(st, id) {
+      const hit = noticeById(st, id);
+      if (!hit) { flashEntry('找不到这条公告（列表可能已刷新），请重新选择', true); return; }
+      const ask = '删除公告 #' + hit.id + '？\n删除后原文仍保留在服务端操作日志（op_log）里。';
+      /* `confirm` 不可用（桩件/裁剪环境）⇒ 不拦，直接提交：**不得**因为环境缺 API 就让删除静默失效 */
+      if (typeof window.confirm === 'function' && !window.confirm(ask)) return;
+      postNotice(st, { action: 'delete', id: hit.id },
+        '公告 #' + hit.id + ' 已删除（原文已写入服务端操作日志 op_log）');
+      noteActivity();
+    }
+
+    /* FR-7.12：公告列表里的「编辑 / 删除」入口用**一个委托监听**（入口按钮由 `NoticePanel`
+       只在服务端模式渲染；演示模式下这些节点根本不存在 ⇒ 本监听永不命中，行为一字不变）。
+       为什么不改 `pages/Dashboard.js` 的装配顺序、也不给每条公告各挂一个监听：
+       一个监听点即可覆盖"列表整体重渲染"，且不动本页之外的装配生命周期。 */
+    const noticeListEl = $('ntNoticeList');
+    if (noticeListEl && typeof noticeListEl.addEventListener === 'function') {
+      noticeListEl.addEventListener('click', e => {
+        const hit = actionButtonOf(e && e.target);
+        if (!hit) return;
+        if (hit.act !== 'edit' && hit.act !== 'delete') return;   /* 未知动作：忽略（不猜） */
+        if (!state.unlocked) {                                    /* FR-8.2 / C-84③：不静默失效 */
+          denyLocked(hit.act === 'edit' ? '公告编辑' : '公告删除');
+          return;
+        }
+        if (hit.act === 'edit') startEditNotice(state, hit.id);
+        else requestDeleteNotice(state, hit.id);
+      });
+    }
+
     /* 公告发布（FR-7.12） */
     $('noticeSave').addEventListener('click', () => {
       if (!state.unlocked) { denyLocked('公告'); return; }       /* FR-8.2 / C-84③：不静默失效 */
       const text = $('noticeText').value.trim();
       if (!text) { flashEntry('请填写公告内容后再发布', true); return; }
       const type = $('noticeType').value;
+      /* FR-7.12（T-20261002-08）：**服务端模式走真实路由**（`POST /notice`）——失败可见、绝不静默；
+         演示模式保持原行为（写内存 ＋ 操作日志），版面与行为**一字不变**。 */
+      if (serverMode(state)) {
+        const editing = noticeEditingId;
+        postNotice(state, editing === null
+          ? { action: 'publish', content: text, subType: type }
+          : { action: 'edit', id: editing, content: text, subType: type },
+        editing === null
+          ? '公告已发布（服务端已落库并写入操作日志 op_log）'
+          : '公告 #' + editing + ' 已保存修改（服务端已落库并写入操作日志 op_log）');
+        $('noticeText').value = '';
+        noteActivity();
+        return;
+      }
       /* 复用 state.clock（每秒刷新），不再手工拼 HH:MM（P3-7） */
       const hhmm = state.clock.time.slice(0, 5);
       state.notices.notices.unshift({ tag: type, text, lv: 'info', time: hhmm });

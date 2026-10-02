@@ -19,10 +19,14 @@
      ③ **缺失一律 `null`**（W4 已定，ADR-0008 D3）：缺测/未接入一律 `null`，**绝不用 `0` 顶替**
         —— `0` 是合法物理量（0 m 深度、0 件产量），拿它顶"没有数据"会让界面把"测不到"读成"测到 0"。
         唯一例外是 `noData` 这类**显式状态位**（布尔）与 `state.stats.noData`（沿用既有键名）。
-   未接入服务端的模块（ADR-0008 D3 点名）：公告 `notice`、维保 `maintenance`、异常台账 `alarm`、
+   未接入服务端的模块（ADR-0008 D3 点名）：维保 `maintenance`、异常台账 `alarm`、
    `selfCheck` 细项、`opLog`、`warnings` —— 服务端快照**没有**这些键，故本文件把它们**清空**
    （`[]` / `null`），由各组件走**既有的空态/占位**分支（`ui-check` 的 UI-11 已覆盖），
    **不得**残留 `mockData.js` 的演示记录（那会让界面分不清真实值与演示值）。
+   ⚠ **公告 `notice` 已不在"未接入"之列**（`T-20261002-08` / `FR-7.12`，P0）：服务端快照自本轮起
+   带 `notices` 段（`server/services/stateSnapshot.js` 的 `noticesOf()`，读口＝
+   `server/repo/notice.js` 的 `listForBoard()`），本文件按下面的 `applyServerNotices()` **映射**它；
+   **服务端确实没有数据**（`notices` 段缺失/为空）时仍走**既有空态**（UI-11 的"暂无车间公告"）。
    依赖：`services/api.js`（`Api.applyUpperPayload`）、`utils/format.js`（只借 `pad` 拼时刻文本）。
    **不得**依赖任何 DOM：本文件是纯函数适配层（PROJECT_RULES 9.2）。
    ========================================================================== */
@@ -179,16 +183,17 @@ window.StateAdapter = (function () {
 
   /**
    * 把"服务端尚未接入"的模块显式清空（**只清空，不伪造**）。
-   * 服务端快照的 7 个键里**没有**公告/维保/异常台账/自检细项/操作日志/预警，
-   * 故这些模块在服务端模式下一律无数据 —— 由各组件走既有空态/占位分支呈现
-   * （`NoticePanel` 的 UI-11 空态、`AlarmPanel` 的"当班无故障报警"、`MaintPanel` 的空表 …）。
+   * 服务端快照里**没有**维保/异常台账/自检细项/操作日志/预警这几段，故它们在服务端模式下一律无数据
+   * —— 由各组件走既有空态/占位分支呈现（`AlarmPanel` 的"当班无故障报警"、`MaintPanel` 的空表 …）。
+   * ⚠ **公告（`notices`）不在这里清空**（`T-20261002-08` / `FR-7.12`）：它已接入服务端，
+   * 由 `applyServerNotices()` 在 `snapshotToState()` 里**映射**；"服务端没数据 ⇒ 空态"由该函数
+   * 自己保证（拿到 `notices` 段就搬，拿不到就给空态）。
    * @param {object} state 看板状态
    */
   function clearUnservedModules(state) {
     state.warnings = [];
     state.selfCheck = [];
     state.opLog = [];
-    state.notices = { notices: [], tips: [], todo: [] };
     state.alarm = { active: null, queue: [], ledger: [] };
     if (state.maint) {
       /* 维保周期**参数**来自配置（`board.config.js` 的 maintenance 段，是配置真源不是演示数据），
@@ -227,7 +232,7 @@ window.StateAdapter = (function () {
     task.processNo = t.processNo === undefined ? null : t.processNo;
     task.processName = t.processName === undefined ? null : t.processName;
     task.planQty = numOrNull(t.planQty);
-    /* 单任务进度/结果：**不在服务端快照的 7 键之内**（快照的 `stats` 是当班统计，不含单件进度）
+    /* 单任务进度/结果：**不在服务端快照的键集之内**（快照的 `stats` 是当班统计，不含单件进度）
        ⇒ 一律置 `null`（"尚未接入服务端"）。为什么必须显式置 null 而不是"保留上一帧"：
        服务端模式下 `state.task` 的初值是 `mockData.js` 的**演示种子**（`result:'测试中'`、
        `progress:0`），若不清就会把演示值当成真实值显示（ADR-0008 D3 禁止"用演示值顶替"）。 */
@@ -357,6 +362,59 @@ window.StateAdapter = (function () {
     return state.upload;
   }
 
+  /* ---------------- 公告（`FR-7.12`，P0） ---------------- */
+
+  /**
+   * 服务端公告段 → `state.notices`（**与前端既有形状同形**：`{notices, tips, todo}`）。
+   *
+   * 服务端形状（`server/services/stateSnapshot.js` 的 `noticesOf()` ← `repo/notice.js` 的
+   * `listForBoard()`）：`{notices:[{id,tag,text,lv,time}], tips:[同左], todo:[]}` ——
+   * 与 `mockData.js` 的 `state.notices` **逐键同名**（`tag`/`text`/`lv`/`time`），故原样搬运；
+   * 服务端多给一个 `id`（`FR-7.12` 的编辑/删除入口要靠它指到具体某条），前端按**可缺省**处理。
+   *
+   * 三条口径：
+   *  ① **不再清空**（`T-20261002-08` 之前本层把 `notices` 清成空态 ⇒ 服务端模式下图上看不到公告）；
+   *  ② **服务端确实没有数据 ⇒ 走既有空态**：`notices` 段缺失/不是对象，或两列都为空数组 ⇒
+   *     写 `{notices:[],tips:[],todo:[]}`，由 `NoticePanel` 的 UI-11 空态文案承担
+   *     （**不得**残留 `mockData.js` 的演示公告 —— ADR-0008 D3）；
+   *  ③ **不做任何字段派生**（不造 `lv`、不拼 `time`）：那些口径在服务端 `repo/notice.js` 一处。
+   * @param {object} state 看板状态
+   * @param {object|null} n 服务端 `snapshot.notices`
+   * @returns {{notices:Array, tips:Array, todo:Array}} 写进 `state.notices` 的对象
+   */
+  function applyServerNotices(state, n) {
+    if (!state) return null;
+    /* 逐行搬运（**不做字段派生**：`tag`/`text`/`lv`/`time` 与 `id` 都按服务端给的值，
+       缺的给 `null`/`''`，不猜；`id` 只在服务端确实给了时才带 —— 演示期的行没有它，
+       渲染层与编辑/删除入口都按"可缺省"处理）。 */
+    const rows = v => {
+      const out = [];
+      if (!Array.isArray(v)) return out;
+      for (const x of v) {
+        const row = {
+          tag: x && x.tag !== undefined ? x.tag : null,
+          text: x && x.text !== undefined ? x.text : null,
+          lv: x && x.lv !== undefined ? x.lv : 'info',
+          time: x && x.time !== undefined ? x.time : ''
+        };
+        if (x && x.id !== undefined && x.id !== null) row.id = x.id;
+        out.push(row);
+      }
+      return out;
+    };
+    if (!n || typeof n !== 'object') {
+      state.notices = { notices: [], tips: [], todo: [] };
+      return state.notices;
+    }
+    state.notices = {
+      notices: rows(n.notices),
+      tips: rows(n.tips),
+      /* `todo` 是**派生量**列表（`{name,value,unit,lv}`），服务端不提供 ⇒ 恒空 ⇒ 走既有空态 */
+      todo: []
+    };
+    return state.notices;
+  }
+
   /* ---------------- 帧 ---------------- */
 
   /**
@@ -406,7 +464,7 @@ window.StateAdapter = (function () {
    * 把整机快照写进 `state`（`GET /state` 或 SSE `hello` 的首帧）。
    * 纯应用：**不产生**任何服务端没有的数据；未接入的模块显式清空。
    * @param {object} state    看板状态（`MockData.state`）
-   * @param {object} snapshot 服务端 `snapshot`（7 键：link/task/device/frame/stats/standard/upload）
+   * @param {object} snapshot 服务端 `snapshot`（8 键：link/task/device/frame/stats/standard/upload/notices）
    * @param {Date}   [now]    应用时刻
    * @returns {object} 应用结果（供自检/回执读取；非业务状态）
    */
@@ -447,6 +505,9 @@ window.StateAdapter = (function () {
 
     /* ⑥ UI-20 上报段 */
     applyServerUpload(state, s.upload, at);
+
+    /* ⑦ 公告段（`FR-7.12` / DR-10）：**映射**（不再清空）；服务端没有数据就落空态（UI-11） */
+    applyServerNotices(state, s.notices);
 
     state.serverMode = true;
     return result;
@@ -547,6 +608,7 @@ window.StateAdapter = (function () {
     applyServerDevice,
     applyServerLink,
     applyServerUpload,
+    applyServerNotices,
     applyServerFrame,
     clearUnservedModules,
     /* 键名映射表（**只读**；便于自检断言"只此一份"） */
