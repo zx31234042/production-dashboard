@@ -60,6 +60,73 @@ const warningRepo = require('../server/repo/warning.js');
 env.assertRuntime();
 const t = createRunner('夹具自检（harness-check）');
 
+/* ==========================================================================
+   `E70` **受管文件不变量**的共用普查（2026-10-03，`T-20261003-08` 甲组）
+   --------------------------------------------------------------------------
+   事故（同日实证）：`harness-check` 第十节过去**直接改写真文件 `tests\README.md`** 的权威行再还原，
+   某轮改写**未被还原** ⇒ README 权威区（"合计"那一行）被留成 `541` ＝ 多脚本子集通过数之和，
+   正是本段写入的**中间态值**；之后每轮对账都指向错值，只有"逐行比对 HEAD"才发现。
+
+   本普查就是那条不变量的事实来源：**受管文件**（＝入库、且被门禁扫描的文本文件；
+   口径与 `tests\lib\snapshot.js` 的扫描面同源，另按任务要求把 `tests\screenshots-baseline\*`
+   ——二进制基准图，唯一写入点是 `capture-baseline.js --update` 这个**人工开关**，门禁轮从不带它——
+   一并纳入）在"跑一轮/跑一段"前后的 sha256 必须**逐个相同**。
+
+   ⚠ 三个必须说清的边界（否则这条不变量会退化）：
+     ① **不读被重定向的读数**：第十节会给"真 README 绝对路径"装一条读数重定向（指向受控副本），
+        而重定向是打在**共享的 `fs` 模块对象**上的 ⇒ 若普查也走 `fs.readFileSync`，它读到的
+        永远是被改写的**副本**，真文件被污染也照绿（"看起来在守、实际守不住"，ADR-0004 D23）。
+        故这里用**模块加载时抓住的 `REAL_READ`**（`fs.readFileSync` 原函数）读字节 —— 与重定向无关。
+     ② **清单**取自 `snapshot.collectSnapshot()`（受管面的唯一真源，不另抄一份目录规则），
+        但它自带的哈希值**一概不用**（它走被重定向的读）—— 只用它的**键**。
+     ③ `tests\._verify\` 下的产物（各脚本日志、临时库、账本 `run-totals.json`）**不在**受管面内
+        （`snapshot` 已排除 `._verify`）：它们是门禁运行期**正常的**产出，纳进来这条判据就成了恒红。
+   ========================================================================== */
+const REAL_READ = fs.readFileSync;                    /* ← 模块加载时抓住；永不被第十节的重定向影响 */
+const BASELINE_PNG_DIR = path.join(env.paths.tests, 'screenshots-baseline');
+
+/** 取文件字节的 sha256（走 `REAL_READ`，与任何读数重定向无关） */
+function sha256BytesE70(buf) {
+  return require('node:crypto').createHash('sha256').update(buf).digest('hex');
+}
+
+/**
+ * 受管文件普查：`{ files: { 相对路径(posix): sha256 }, extra: 说明, collected, reason }`。
+ * 失败（读不到某个文件）不抛错 —— 记成 `:err:<code>` 参与比对（"读不到"本身也是一种变化）。
+ * @returns {{files:Object<string,string>, textCount:number, pngCount:number, collected:boolean, reason:string}}
+ */
+function managedGuardCensus() {
+  const files = {};
+  const snap = snapshot.collectSnapshot();             /* 只用它的**键**（受管面清单） */
+  for (const rel of Object.keys(snap.files)) {
+    const full = path.join(env.paths.root, rel.split('/').join(path.sep));
+    try { files[rel] = sha256BytesE70(REAL_READ.call(fs, full)); }
+    catch (err) { files[rel] = `:err:${(err && err.code) || 'unknown'}`; }
+  }
+  let pngCount = 0;
+  try {
+    for (const name of fs.readdirSync(BASELINE_PNG_DIR)) {
+      const full = path.join(BASELINE_PNG_DIR, name);
+      if (!fs.statSync(full).isFile()) continue;
+      pngCount++;
+      files[`tests/screenshots-baseline/${name}`] = sha256BytesE70(REAL_READ.call(fs, full));
+    }
+  } catch { /* 基准目录读不到：下面按"取不到证据"处理（collected=false） */ }
+  return {
+    files, textCount: Object.keys(snap.files).length, pngCount,
+    collected: snap.collected === true && pngCount > 0,
+    reason: snap.reason || (pngCount ? '' : '读不到 tests/screenshots-baseline（或是空目录）')
+  };
+}
+
+/** 两次普查的差异（纯函数）：逐条给出 `路径（前 12 位 → 后 12 位）`，按路径字典序 */
+function managedGuardDiff(before, after) {
+  if (!before || !after || !before.files || !after.files) return ['（普查取不到证据：两次快照不完整）'];
+  const keys = [...new Set([...Object.keys(before.files), ...Object.keys(after.files)])].sort();
+  return keys.filter(k => before.files[k] !== after.files[k])
+    .map(k => `${k}（${(before.files[k] || '缺').slice(0, 12)}… → ${(after.files[k] || '缺').slice(0, 12)}…）`);
+}
+
 async function main() {
 t.info(env.describe());
 
@@ -3858,6 +3925,227 @@ t.section('五、临时区与清理');
   t.check('run-all 收尾真的调用了 cleanup（P2-16："测存在 ≠ 在用"）',
     /cleanup\(false\)/.test(fs.readFileSync(path.join(env.paths.tests, 'run-all.js'), 'utf8')),
     'run-all 全绿收尾处应调用一次 cleanup(false)');
+
+  /* ---------------- `E90` 新不变量的门禁守护（`T-20261003-08` 丙组，2026-10-03） ----------------
+     `E90`（同日座位 4，`tests\lib\harness.js`）钉了两件事：
+       （i）**临时区按轮次隔离**：`env.paths.tempRoot` ＝ `env.paths.tempRootBase\run-<pid>-<启动时刻>-<4hex>`
+            —— 本轮独占；任一路的 `cleanup` 物理上只删得到**自己那一轮**（旧版共用 `tests\._verify\tmp`
+            ⇒ 他路的 `cleanup(true)` 会把本轮写进去的日志/临时库一并删掉，实测两次假红）。
+       （ii）**`cleanup(true)` 的返回值由事实推导**：`removed ∈ all|partial|none`、`kept`/`keptDeep`
+            是**回读**到的剩余条目数、`errors` 记失败原因；旧版吞掉异常后**无条件** `{removed:'all', kept:0}`
+            ＝"返回值与事实无关"。不变量：`removed==='all'` ⟺ 目标目录不存在 ⟺ `kept===0 && keptDeep===0`。
+     本段上面那两条旧判据只量了"残留子目录被清掉 ＋ 返回 `'all'`" —— 不变量本身、**失败注入**、
+     以及 `cleanup(false)` 的清扫边界都没验。下面五条按"**返回值与事实两条都量**"的口径补齐。
+     口径不冲突：补守护前实测 `342/0/2`，新三值口径下正常收尾仍是 `'all'`、`kept=0`。 */
+
+  /* ① 轮次隔离（结构性前提） */
+  const runRootE90 = env.paths.tempRoot;                 /* 本轮专属目录 */
+  const baseE90 = env.paths.tempRootBase;                /* 公共根 */
+  t.check('E90① 临时区按轮次隔离：本轮 `tempRoot` 是公共根下的 `run-<pid>-<启动时刻>-<4hex>` 专属子目录' +
+    '（**不是**公共根本身 —— 否则任一路的 `cleanup` 都能删到别人正在用的产物）',
+    Boolean(baseE90)
+      && path.resolve(path.dirname(runRootE90)) === path.resolve(baseE90)
+      && /^run-\d+-\d{8}T\d{6}-[0-9a-f]{4}$/.test(path.basename(runRootE90))
+      && path.basename(runRootE90).startsWith(`run-${process.pid}-`)
+      && path.resolve(runRootE90) !== path.resolve(baseE90),
+    `tempRoot=${path.relative(env.paths.root, runRootE90)}；`
+      + `tempRootBase=${baseE90 ? path.relative(env.paths.root, baseE90) : '（未定义 —— E90 的公共根口径丢了）'}`);
+
+  /* 回读事实**本段自算**（不借 `lib/harness.js` 的私有中间量）：否则"返回值 == 事实"会退化成
+     "返回值 == 返回值"的恒真式（ADR-0004 D23）。口径与 `readTempFacts`/`countEntriesDeep` 逐字同义。 */
+  const e90Facts = (dir) => {
+    const exists = fs.existsSync(dir);
+    return { exists, entries: exists ? fs.readdirSync(dir).length : 0 };
+  };
+  const e90Deep = (dir) => {
+    let n = 0;
+    const walk = (d) => {
+      let names;
+      try { names = fs.readdirSync(d); } catch { return; }
+      for (const name of names) {
+        n++;
+        const full = path.join(d, name);
+        let st;
+        try { st = fs.lstatSync(full); } catch { continue; }
+        if (st.isDirectory() && !st.isSymbolicLink()) walk(full);
+      }
+    };
+    walk(dir);
+    return n;
+  };
+
+  /* `E90` 不变量的判据（**纯函数**，违规逐条指名）：`cleanup(force=true)` 的返回必须与**本段实测的事实**
+     一致 —— `removed==='all'` ⟺ 目标目录不存在 ⟺ `kept===0 && keptDeep===0`，且 `kept`/`keptDeep`
+     必须等于实测剩余。用纯函数是为了让下面的 D22 变异能把"无条件报 all"的返回值喂进来、当场指名。 */
+  const e90Violations = (res, facts, deep) => {
+    const bad = [];
+    if (!res || typeof res !== 'object') return ['返回值不是对象'];
+    if (res.removed === 'all' && facts.exists) {
+      bad.push(`removed='all' 但目标目录**仍存在**（实测顶层剩余 ${facts.entries}）`);
+    }
+    if (res.removed !== 'all' && !facts.exists) {
+      bad.push(`removed='${res.removed}' 但目标目录**已不存在**（实测 0 条）`);
+    }
+    if (res.kept !== facts.entries) bad.push(`kept=${res.kept} ≠ 实测顶层剩余 ${facts.entries}（返回值不是由事实推导）`);
+    if (res.keptDeep !== deep) bad.push(`keptDeep=${res.keptDeep} ≠ 实测递归剩余 ${deep}`);
+    if (res.kept === 0 && facts.exists) bad.push('kept=0 但目标目录仍存在（"清干净了"是自报的）');
+    if (res.removed === 'all' && res.keptDeep !== 0) bad.push(`removed='all' 但 keptDeep=${res.keptDeep} ≠ 0（自相矛盾）`);
+    return bad;
+  };
+
+  /* ② 正常收尾：**返回值与事实两条都量** */
+  const normalSub = harness.makeTempDir('e90-normal-sweep');
+  fs.writeFileSync(path.join(normalSub, 'junk.txt'), 'x', 'utf8');
+  const normalBefore = e90Facts(runRootE90);
+  const normalSwept = harness.cleanup(true);
+  const normalAfter = e90Facts(runRootE90);
+  const normalDeep = e90Deep(runRootE90);
+  const normalBad = e90Violations(normalSwept, normalAfter, normalDeep);
+  t.check('E90② 正常收尾：`cleanup(true)` 的返回值与**回读事实**逐项一致' +
+    '（`removed===\'all\'` ⟺ 目录不存在 ⟺ `kept===0 && keptDeep===0` —— 两条都要，缺一条就是"调用过 rmSync"冒充事实）' +
+    '，且 `errors` 为空、`target` 指向本轮目录',
+    normalBad.length === 0 && normalSwept.removed === 'all' && normalAfter.exists === false
+      && normalSwept.kept === 0 && normalSwept.keptDeep === 0
+      && Array.isArray(normalSwept.errors) && normalSwept.errors.length === 0
+      && path.resolve(normalSwept.target) === path.resolve(runRootE90)
+      && !fs.existsSync(normalSub),
+    `清理前回读=${JSON.stringify(normalBefore)}；返回=${JSON.stringify(normalSwept)}；`
+      + `清理后回读=${JSON.stringify(normalAfter)}（深层 ${normalDeep} 条）；`
+      + `不变量违规 ${normalBad.length} 条${normalBad.length ? '：' + normalBad.join('；') : ''}；`
+      + `被清的子目录仍在=${fs.existsSync(normalSub)}`);
+
+  /* ③ 注入"删不掉"：另起子进程把 `<本轮目录>\…\holder` 当 **cwd** 占住 ⇒ Windows 上递归删除必然
+     `EPERM`（与 E90 现场"他路持有句柄 ⇒ 中途失败"同一机制，且完全可控、不依赖抢占时序）。
+     期望：`removed !== 'all'`、`kept > 0` 且**等于实测剩余**、`errors` 非空 —— **绝不许仍报 `'all'`**。 */
+  const lockSub = harness.makeTempDir('e90-locked');
+  const holder = path.join(lockSub, 'holder');
+  env.ensureDir(holder);
+  fs.writeFileSync(path.join(holder, 'held.txt'), 'held', 'utf8');
+  const holderChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+    { cwd: holder, stdio: 'ignore', windowsHide: true });
+  await new Promise(r => setTimeout(r, 1200));            /* 等子进程真的起在自己那个 cwd 上 */
+  const lockedSwept = harness.cleanup(true);
+  const lockedAfter = e90Facts(runRootE90);
+  const lockedDeep = e90Deep(runRootE90);
+  const lockedBad = e90Violations(lockedSwept, lockedAfter, lockedDeep);
+  t.check('E90③ 注入删除失败（子进程把本轮子目录当 cwd 占住 ⇒ `EPERM`）：必须 `removed !== \'all\'`' +
+    ' ＋ `kept > 0`（且＝回读剩余）＋ `errors` 非空 —— "删不掉"不许被写成"删干净了"',
+    lockedBad.length === 0 && lockedSwept.removed !== 'all' && lockedSwept.kept > 0
+      && lockedSwept.kept === lockedAfter.entries && lockedAfter.exists === true
+      && lockedSwept.keptDeep === lockedDeep && lockedSwept.keptDeep > 0
+      && Array.isArray(lockedSwept.errors) && lockedSwept.errors.length > 0,
+    `占住 ${path.relative(env.paths.root, holder)}（pid=${holderChild.pid}）；返回=${JSON.stringify(lockedSwept)}；`
+      + `回读=${JSON.stringify(lockedAfter)}（深层 ${lockedDeep} 条）；`
+      + `不变量违规 ${lockedBad.length} 条${lockedBad.length ? '：' + lockedBad.join('；') : ''}`);
+
+  /* ④ 释放占用后再收尾：必须回到 `'all'`（证明 ③ 的读数来自"被占住"，不是"清理坏了"） */
+  holderChild.kill();
+  await new Promise(r => setTimeout(r, 1500));
+  const releasedSwept = harness.cleanup(true);
+  const releasedAfter = e90Facts(runRootE90);
+  const releasedDeep = e90Deep(runRootE90);
+  const releasedBad = e90Violations(releasedSwept, releasedAfter, releasedDeep);
+  t.check('E90④ 释放占用后再收尾：回到 `removed===\'all\'` 且目录不存在（⇒ ③ 的读数确实来自"被占住"）',
+    releasedBad.length === 0 && releasedSwept.removed === 'all' && releasedAfter.exists === false
+      && releasedSwept.kept === 0 && releasedSwept.keptDeep === 0 && releasedSwept.errors.length === 0,
+    `释放后返回=${JSON.stringify(releasedSwept)}；回读=${JSON.stringify(releasedAfter)}；`
+      + `不变量违规 ${releasedBad.length} 条${releasedBad.length ? '：' + releasedBad.join('；') : ''}`);
+
+  /* ⑤ `D22` 定点变异：把 `lib/harness.js` 的**回读**去掉、恢复旧版"无条件报 `all`" ⇒ `E90` 不变量
+     必须**红并指名**（旧版就是 `E90` 要消的病灶："返回值与事实无关"）。
+     ⚠ 变异在**内存里的字节副本**上做（`Module._compile`，与第十四节/§16 同一手法）：
+     座位 4 的 `tests\lib\harness.js` **全程只读**，盘上字节不变（`Buffer.compare` ＋ sha256 留痕）。
+     两端都读：变异体在被占住的目录上**谎报** `'all'/0/0` ⇒ 违规清单非空并指名；
+     真实模块在**同一事实**上给出 `'partial'`/实测剩余 ⇒ 违规为空。 */
+  {
+    const harnessPath = path.join(env.paths.tests, 'lib', 'harness.js');
+    const bytes0 = REAL_READ.call(fs, harnessPath);                 /* 字节副本（只读，不写盘） */
+    const sha0 = sha256BytesE70(bytes0);
+    const src0 = bytes0.toString('utf8');
+    const READBACK_ANCHOR = /const after = readTempFacts\(target\);[\s\S]*?return \{ removed, kept: after\.entries, keptDeep: afterDeep, target, errors \};/;
+    const lieBody = 'return { removed: \'all\', kept: 0, keptDeep: 0, target, errors };';
+    const mutatedSrc = READBACK_ANCHOR.test(src0) ? src0.replace(READBACK_ANCHOR, lieBody) : '';
+    let mutant = null;
+    /* ⚠ **陷阱（实测）**：`lib\harness.js` 的顶层**有副作用** —— `E90` 的轮次隔离就是在顶层把
+       `env.paths.tempRoot` 指向本轮专属目录。`Module._compile` 会把这些顶层语句**再跑一遍**
+       ⇒ 若不复原，`env.paths.tempRoot` 会变成"本轮目录里的又一层 run-…"（实测把后面的取样全带偏）。
+       故这里先抓旧值、载入后**当场复原**；下面只调 `cleanup(true)`（它读的就是 `env.paths.tempRoot`），
+       变异体与真实模块因此作用在**同一个**目录上。 */
+    const envTempRootSaved = env.paths.tempRoot;
+    const envTempBaseSaved = env.paths.tempRootBase;
+    try {
+      if (!mutatedSrc) throw new Error('变异锚点未命中：`lib\\harness.js` 里找不到"回读事实"那一段');
+      const Module = require('node:module');
+      const m = new Module(harnessPath, null);
+      m.filename = harnessPath;
+      m.paths = Module._nodeModulePaths(path.dirname(harnessPath));
+      m._compile(mutatedSrc, harnessPath);
+      mutant = m.exports;
+    } catch (err) {
+      t.info('E90-D22 变异体未能载入：' + (err && err.message));
+    } finally {
+      env.paths.tempRoot = envTempRootSaved;                        /* 复原顶层副作用（见上） */
+      env.paths.tempRootBase = envTempBaseSaved;
+    }
+    /* 在**同一个被占住的事实**上分别问真实模块与变异体（③ 刚验过占用有效；这里再占一次）。
+       ⚠ 事实必须在**每次 `cleanup` 之后**回读（`removed/kept/keptDeep` 描述的是"清完之后还剩什么"）。 */
+    const lockSub2 = harness.makeTempDir('e90-d22-locked');
+    const holder2 = path.join(lockSub2, 'holder');
+    env.ensureDir(holder2);
+    fs.writeFileSync(path.join(holder2, 'held.txt'), 'held', 'utf8');
+    const child2 = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+      { cwd: holder2, stdio: 'ignore', windowsHide: true });
+    await new Promise(r => setTimeout(r, 1200));
+    const factsPre = e90Facts(runRootE90);
+    const realRes = harness.cleanup(true);                          /* 真实模块：如实报 partial */
+    const realFacts = e90Facts(runRootE90);
+    const realDeep = e90Deep(runRootE90);
+    const realBad = e90Violations(realRes, realFacts, realDeep);
+    const mutRes = mutant ? mutant.cleanup(true) : null;            /* 变异体：无回读 ⇒ 谎报 all */
+    const mutFacts = e90Facts(runRootE90);
+    const mutDeep = e90Deep(runRootE90);
+    const mutBad = mutant ? e90Violations(mutRes, mutFacts, mutDeep) : ['变异体未载入'];
+    child2.kill();
+    await new Promise(r => setTimeout(r, 1500));
+    try { harness.cleanup(true); } catch { /* 收尾，忽略 */ }
+    const diskSame = Buffer.compare(REAL_READ.call(fs, harnessPath), bytes0) === 0
+      && sha256BytesE70(REAL_READ.call(fs, harnessPath)) === sha0;
+    t.check('E90-D22 定点变异：把 `lib/harness.js` 的**回读**去掉、恢复"无条件报 `all`" ⇒ `E90` 不变量**必红并指名**；' +
+      '同一事实下真实模块仍如实报 `partial`/实测剩余（⇒ 这条不变量不是恒真式）：变异在内存副本上做，`tests\\lib\\harness.js` 盘上字节不变',
+      Boolean(mutant) && realFacts.exists === true && mutFacts.exists === true
+        && mutRes !== null && mutRes.removed === 'all'
+        && mutBad.length > 0 && mutBad.some(v => /仍存在|不是由事实推导/.test(v))
+        && realBad.length === 0 && realRes.removed !== 'all' && realRes.kept > 0
+        && diskSame,
+      `占住 ${path.relative(env.paths.root, holder2)}；清理前回读=${JSON.stringify(factsPre)}；`
+        + `真实模块返回=${JSON.stringify(realRes)}／之后回读=${JSON.stringify(realFacts)}（深层 ${realDeep}）；违规 ${realBad.length} 条`
+        + `${realBad.length ? '：' + realBad.join('；') : ''}；`
+        + `变异体返回=${JSON.stringify(mutRes)}／之后回读=${JSON.stringify(mutFacts)}（深层 ${mutDeep}）；`
+        + `违规 ${mutBad.length} 条：${mutBad.join('；')}；`
+        + `盘上 lib\\harness.js 未变=${diskSame}（sha256=${
+          sha256BytesE70(REAL_READ.call(fs, harnessPath)).slice(0, 12)}…，原件 ${sha0.slice(0, 12)}…）`);
+  }
+
+  /* ⑤ `cleanup(false)`：仍返回**数字**统计，且只清公共根下 **> 24 h** 的**整轮目录**。
+     造一个 mtime 改到 25 h 前的**假整轮目录**，并用"本轮目录"当对照 ⇒ 验"清的正好是它、我的还在"。 */
+  const fakeOldRun = path.join(baseE90, 'run-999999-19700101T000000-dead');
+  env.ensureDir(fakeOldRun);
+  fs.writeFileSync(path.join(fakeOldRun, 'old.txt'), 'old', 'utf8');
+  const old25h = new Date(Date.now() - 25 * 3600 * 1000);
+  fs.utimesSync(path.join(fakeOldRun, 'old.txt'), old25h, old25h);
+  /* 目录**自身**的 mtime 才是判据（`env.cleanupStaleTemp` 用 `statSync(full).mtimeMs`） */
+  fs.utimesSync(fakeOldRun, old25h, old25h);
+  env.ensureDir(runRootE90);                              /* 上一段刚把本轮目录清掉 ⇒ 重建以代表"我的还在" */
+  fs.writeFileSync(path.join(runRootE90, 'mine.txt'), 'mine', 'utf8');
+  const staleSwept = harness.cleanup(false);
+  t.check('E90⑤ `cleanup(false)`：仍返回**数字**统计，且只清公共根下 **> 24 h** 的整轮目录' +
+    '（清掉的正好是那个 25 h 前的假整轮目录；**本轮目录一根毫毛都不少**）',
+    typeof staleSwept.removed === 'number' && typeof staleSwept.kept === 'number'
+      && !fs.existsSync(fakeOldRun) && fs.existsSync(runRootE90)
+      && fs.existsSync(path.join(runRootE90, 'mine.txt')),
+    `返回=${JSON.stringify(staleSwept)}；假整轮目录仍在=${fs.existsSync(fakeOldRun)}；`
+      + `本轮目录仍在=${fs.existsSync(runRootE90)}（mine.txt=${fs.existsSync(path.join(runRootE90, 'mine.txt'))}）`);
+  try { fs.rmSync(fakeOldRun, { recursive: true, force: true }); } catch { /* 已被清掉就忽略 */ }
 }
 
 /* ---------------- 六、断言器自身 ---------------- */
@@ -4097,14 +4385,29 @@ t.section('九、防回潮断言的定点变异（旧实现必须被现有断言
     `keep=30 → 删除 ${legacySlice(30)}/5 份`);
 }
 
-/* ---------------- 十、权威数字校验的定点回归（P2-22 + ADR-0004 D22） ----------------
+/* ---------------- 十、权威数字校验的定点回归（P2-22 + ADR-0004 D22 + E70） ----------------
    机制：`run-all` 收尾会拿"本轮实跑合计"比对 `tests\README.md` 第三节的权威数字。
-   这类"断言别人的数字"的机制最容易写成恒真 —— 这里用**临时改写 README 权威行**的方式
-   逐个场景验证它真会拦住漂移，README 始终会被还原（含异常路径）。
-   踩过的坑：首版探针用 `/合计\s*\*\*\d+\s*通过/` 改写，而 README 实际写作 `合计 470 通过`
-   （**没有加粗**），于是替换静默失效、三轮验证结果全部不可信 —— 故这里用容错正则
-   `/合计\s*\*{0,2}\s*\d+\s*通过/`，并在改完后**回读确认**。 */
-t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTotals）');
+   这类"断言别人的数字"的机制最容易写成恒真 —— 这里用**临时改写权威行**的方式逐个场景验证它
+   真会拦住漂移。踩过的坑：首版探针用 `/合计\s*\*\*\d+\s*通过/` 改写，而 README 实际写作
+   `合计 470 通过`（**没有加粗**），于是替换静默失效、三轮验证结果全部不可信 ——
+   故这里用容错正则 `/合计\s*\*{0,2}\s*\d+\s*通过/`，并在改完后**回读确认**。
+
+   ⚠ **`E70` 收口（2026-10-03，`T-20261003-08` 甲组）：本段过去是"改写真文件 `tests\README.md` 再还原"。**
+   事故（同日实证）：某轮改写**未被还原**（`finally` 没跑到 / 与并发轮次交叠），README 权威区
+   （第 151 行的"合计"）被留成 `541` ＝ **多脚本子集通过数之和** —— 正是本段写入的**中间态值**；
+   权威区被静默污染，之后每轮对账都指向错值，只有"逐行比对 HEAD"才发现。
+   ⇒ 现在一律**指向受控副本**：
+        `<本轮专属临时区>\readme-authority-copy\README.md`
+      · 副本落在 `tests\._verify\tmp\run-…` 内 ⇒ 已被 .gitignore 忽略 ⇒ **不进受管面、不产生扫描漂移**；
+      · 被校验方 `run-all.verifyAuthorityTotals` **一行不改**（它读 `path.join(env.paths.tests,'README.md')`）：
+        本段给**这一条绝对路径**装读数重定向到副本（`finally` 复原；不改全局文件、不改 `env.paths`、
+        不改 `run-all.js`、不落地任何"全局开关"）；
+      · 真文件在本段里**只被读一次**（取字节副本），之后由两条判据守着：
+        `E70-A`（重定向真的生效 ＋ 副本真的被改过 —— 防"替换静默失效"那种假验证）与
+        `E70-B`（**受管文件不变量**：跑完这一段，受管文件逐个 sha256 不变，有变就**指名**）。
+    **没有任何"还原真文件"的收尾**了 —— 因为真文件从头到尾不该被写；这正是本次收口的意义
+   （D22 变异：把副本路径换成真文件路径 ⇒ `E70-B` 必红并指名 `tests/README.md`）。 */
+t.section('十、权威数字校验的定点回归（runAll.verifyAuthorityTotals）');
 {
   const runAll3 = require('./run-all');
   /* 集合口径与实现**同源**（E50，2026-09-28）：权威区覆盖**全部** suite（含浏览器/长跑脚本），
@@ -4123,21 +4426,53 @@ t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTota
       : mkR(n, base[n] || 0, 0));
   };
   const sumOf = rs => rs.reduce((a, r) => a + r.summary.passed, 0);
-  const readmePath = path.join(env.paths.tests, 'README.md');
-  const original = fs.readFileSync(readmePath, 'utf8');
-  const authIndex = () => original.split(/\r?\n/).findIndex(l => l.includes('离线可跑部分'));
-  const setStated = (n) => {
-    const lines = original.split(/\r?\n/);
-    lines[authIndex()] = lines[authIndex()].replace(/合计\s*\*{0,2}\s*\d+\s*通过/, `合计 ${n} 通过`);
-    fs.writeFileSync(readmePath, lines.join('\r\n'), 'utf8');
-    /* 回读确认：替换必须真的生效，否则下面的判定全都白验（首版就栽在这里） */
-    const now = fs.readFileSync(readmePath, 'utf8').split(/\r?\n/)[authIndex()];
-    return /合计\s*\*{0,2}\s*(\d+)\s*通过/.test(now) && Number(RegExp.$1) === n;
+
+  /* ---- `E70-A`：受控副本 ＋ 读数重定向（真文件全程只读） ---- */
+  const censusBefore = managedGuardCensus();                  /* ← 不变量的事实来源（走 REAL_READ） */
+  const realReadme = path.join(env.paths.tests, 'README.md');
+  const copyDir = env.ensureDir(path.join(env.paths.tempRoot, 'readme-authority-copy'));
+  const readmePath = path.join(copyDir, 'README.md');         /* ← 本段所有改写都落在这里 */
+  const realBytes = fs.readFileSync(realReadme);              /* 字节副本①（真文件**只读**，不写盘） */
+  const original = realBytes.toString('utf8');
+  fs.writeFileSync(readmePath, realBytes);                    /* 副本＝字节副本（内容与真文件逐字节相同） */
+  const realSha0 = sha256BytesE70(realBytes);
+
+  /* 读数重定向：**只**认"真 README 的绝对路径"这一条，其余路径原样透传 */
+  const realAbs = path.resolve(realReadme);
+  const copyAbs = path.resolve(readmePath);
+  const isRealReadme = p => typeof p === 'string' && path.resolve(p) === realAbs;
+  const savedReadFileSync = fs.readFileSync;                  /* 与模块级 REAL_READ 是同一个函数 */
+  fs.readFileSync = function (p, ...rest) {
+    return savedReadFileSync.call(fs, isRealReadme(p) ? copyAbs : p, ...rest);
   };
   try {
+    const authIndex = () => original.split(/\r?\n/).findIndex(l => l.includes('离线可跑部分'));
+    const setStated = (n) => {
+      const lines = original.split(/\r?\n/);
+      lines[authIndex()] = lines[authIndex()].replace(/合计\s*\*{0,2}\s*\d+\s*通过/, `合计 ${n} 通过`);
+      fs.writeFileSync(readmePath, lines.join('\r\n'), 'utf8');
+      /* 回读确认：替换必须真的生效，否则下面的判定全都白验（首版就栽在这里） */
+      const now = fs.readFileSync(readmePath, 'utf8').split(/\r?\n/)[authIndex()];
+      return /合计\s*\*{0,2}\s*(\d+)\s*通过/.test(now) && Number(RegExp.$1) === n;
+    };
     const withDev = resultsOf(true);      // docs-check 带 2 项已登记偏差
     const greenRun = resultsOf(false);    // 全绿
     t.check('改盘辅助生效（能真的把权威行改成目标数字）', setStated(sumOf(withDev)), `目标 ${sumOf(withDev)}`);
+    /* `E70-A`：**重定向本身**必须被证明生效 —— 否则"真文件没被改"可能只是因为
+       "本段的改写全打在空气上"（首版探针正是栽在"替换静默失效"）。这里读**真路径**
+       （走重定向 ⇒ 应拿到副本内容）与**真文件字节**（走 `REAL_READ` ⇒ 应仍是原件）作双向对照。 */
+    {
+      const viaRedirect = fs.readFileSync(realReadme, 'utf8');
+      const onDisk = REAL_READ.call(fs, realReadme);
+      const copyMutated = REAL_READ.call(fs, readmePath).toString('utf8') !== original;
+      t.check('E70-A 重定向与副本都**真的生效**（否则"真文件没被改"只是改写打在了空气上）：' +
+        '① 读真路径拿到的是**副本**内容（＝已被改成目标数字）；② 副本字节确实变了；' +
+        '③ 走 `REAL_READ` 读真文件拿到的仍是**原件**、sha256 不变',
+        viaRedirect.includes(`合计 ${sumOf(withDev)} 通过`) && copyMutated
+          && sha256BytesE70(onDisk) === realSha0,
+        `真路径读数含"合计 ${sumOf(withDev)} 通过"=${viaRedirect.includes(`合计 ${sumOf(withDev)} 通过`)}；`
+          + `副本已变=${copyMutated}；真文件 sha256 不变=${sha256BytesE70(onDisk) === realSha0}`);
+    }
     /* P3-6 补：比对通过时打印的**口径行**是有契约的 —— 必须同时含"合计 ＝ 实跑"与
        "含已登记偏差 N 项，真实通过 M"，好让人一眼看出"确实比过了、且把已登记偏差算进去了"，
        而不是"未核对"（后者正是 P3-6 里被当成正常的那种输出）。 */
@@ -4196,10 +4531,53 @@ t.section('十、权威数字校验的定点回归（run-all.verifyAuthorityTota
         `判定 ok=${rmRes.ok}、kind=${rmRes.kind}、detail=${rmRes.detail}`);
     }
   } finally {
-    fs.writeFileSync(readmePath, original, 'utf8');
+    fs.readFileSync = savedReadFileSync;                      /* 复原读数重定向（真文件从未被写 ⇒ 无需还原） */
   }
-  t.check('回归结束后 README 已被还原（不留改写痕迹）',
-    fs.readFileSync(readmePath, 'utf8') === original, '');
+
+  /* ---- `E70-B`：**结构性不变量** —— 跑完上面这一段，受管文件逐个 sha256 必须与开始时相同 ----
+     语义：受管文件＝入库且被门禁扫描的文本文件（`snapshot` 扫描面；含未入库的同类文本文件，宁可为严）
+     ＋ `tests\screenshots-baseline\*`（二进制基准图，唯一写入点是人工开关 `capture-baseline --update`）。
+     `tests\._verify\` 下的产物与账本（`run-totals.json`）**不在**受管面内（运行期正常产出）。
+     **本段没有"还原真文件"的收尾** —— 真文件压根没被写过；D22 变异（把副本路径换成真文件路径）
+     必须让这一条**红并指名**。 */
+  const censusAfter = managedGuardCensus();
+  const managedChanged = managedGuardDiff(censusBefore, censusAfter);
+  t.check('E70-B 结构性不变量：跑完本段（权威数字定点回归）后，**受管文件**的 sha256 与开始时逐个相同' +
+    '（受管文件＝入库且被门禁扫描的文本文件 ＋ `tests\\screenshots-baseline\\*`；有变化即**逐条指名**）',
+    managedChanged.length === 0 && censusBefore.collected && censusAfter.collected,
+    `受管面 ${censusBefore.textCount} 个文本文件 ＋ ${censusBefore.pngCount} 张基准图；`
+      + `采集可用=${censusBefore.collected}/${censusAfter.collected}`
+      + `（${censusBefore.reason || '无异常'}）`
+      + `；被改动的受管文件 ${managedChanged.length} 个`
+      + (managedChanged.length ? `：${managedChanged.join('；')}` : '')
+      + `；真文件 tests\\README.md sha256 仍为 ${realSha0.slice(0, 12)}…`);
+
+  /* `E70-B` 的定点回归（**纯函数真值表**，不碰真文件）：`managedGuardDiff` 必须"有变化就指名"，
+     且指到**具体路径**（含历史事故那个文件 `tests/README.md`）；无变化 ⇒ 空清单。
+     ⚠ 真正把"运行期改写真文件且不还原"打出来的那次变异是**外部定点实验**（见回执的证据文件）：
+     把本段的副本路径换成真文件路径（并关掉读数重定向）⇒ `E70-B` **红并指名 `tests/README.md`**，
+     随后按**字节副本**还原真文件并给出 `Buffer.compare` ＋ sha256 证明（不使用 `git checkout/restore`）。
+     之所以不把那次变异做成常驻断言：它必须**真的写一次 `tests\README.md`**，而"测试自己去写权威区"
+     正是本次收口要消灭的东西 —— 常驻版只保留这条纯函数真值表（同样能证明"指名"不是空转）。 */
+  {
+    const baseP = managedGuardCensus();
+    const sameP = managedGuardDiff(baseP, { files: { ...baseP.files } });
+    const mutP = managedGuardDiff(baseP, { files: { ...baseP.files, 'tests/README.md': 'deadbeefdeadbeef' } });
+    const goneP = managedGuardDiff(baseP, {
+      files: Object.fromEntries(Object.entries(baseP.files).filter(([k]) => k !== 'tests/README.md'))
+    });
+    const pngP = managedGuardDiff(baseP, {
+      files: { ...baseP.files, 'tests/screenshots-baseline/tab-stats.png': 'cafebabecafebabe' }
+    });
+    t.check('E70-B补 定点回归：`managedGuardDiff` 无变化⇒空清单；`tests/README.md` 字节变了⇒**恰指名它一条**' +
+      '（含前后 sha256 前 12 位）；被删同样指名；`tests\\screenshots-baseline\\*` 也在受管面内（不该变）',
+      sameP.length === 0
+        && mutP.length === 1 && mutP[0].startsWith('tests/README.md') && mutP[0].includes('deadbeefdead')
+        && goneP.length === 1 && goneP[0].startsWith('tests/README.md') && goneP[0].includes('缺')
+        && pngP.length === 1 && pngP[0].startsWith('tests/screenshots-baseline/'),
+      `无变化=${sameP.length} 条；改 README=${mutP.join('；') || '（无）'}；删 README=${goneP.join('；') || '（无）'}；`
+        + `改基准图=${pngP.join('；') || '（无）'}`);
+  }
 
   /* ---------------- 十之二、权威校验的"可达性"回归（2026-09-20 补） ----------------
      立案原因：`verifyAuthorityTotals` 写得再对，**只要调用点被放在提前退出之后，它就一次都不会执行**。
@@ -4822,10 +5200,11 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     const tmpOut = path.join(os.tmpdir(), `t1-runall-${process.pid}-${suite}.log`);
     const fd = fs.openSync(tmpOut, 'w');
     const r = spawnSync(process.execPath, [runAllPath, '--no-preflight', '--only', suite],
-      /* `DSH_JOBS: '1'` 是**必须**的：本嵌套轮若继承外层并行度，它会在**另一个进程正在改写
-         `tests\README.md`**（本脚本第十节会把权威数字改掉再还原）时去做工作区稳定性比对，
-         于是判"工作区被改写"、退出码非 0 ⇒ §十四 的端到端断言**假红**（已实测一次）。
-         嵌套轮永远串行 —— 它验的是"结论规则"，不是吞吐。 */
+      /* `DSH_JOBS: '1'` 仍然**必须**：嵌套轮验的是"结论规则"，不许继承外层并行度而引入与被验规则
+         无关的时序差异。⚠ 历史理由已**失效**（`E70` 收口，2026-10-03）：原文写的是"本脚本第十节会把
+         `tests\README.md` 改掉再还原，嵌套轮会撞上它而判'工作区被改写'"—— 第十节现在**只改受控副本**、
+         真文件全程只读 ⇒ 那条通道已关闭。保留 `DSH_JOBS: '1'` 是为确定性（且 `--only` 本就被
+         `run-all.scheduleSuites()` 强制串行），**不是**为绕开那个已消失的写入。 */
       { cwd: path.join(__dirname, '..'), stdio: ['ignore', fd, fd], timeout: 120 * 1000, env: { ...process.env, DSH_JOBS: '1' } });
     fs.closeSync(fd);
     const text = fs.readFileSync(tmpOut, 'utf8');
@@ -4833,9 +5212,17 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     return { status: r.status, text, error: r.error ? (r.error.code || r.error.message) : '' };
   };
   let failRun = null;
+  let censusBeforeC = null;
+  let censusAfterC = null;
+  let managedChangedC = [];
   t.check('端到端：跑含 FAIL 的轮次（`--only docs-check`）⇒ 退出码 1、打印 FAIL 行，且**不含**"门禁全绿"',
     (() => {
+      /* `E70-C` 的取样点：这一轮是**真跑一轮门禁**（`node tests\run-all.js --only docs-check`）——
+         受管文件不变量（"跑一轮门禁后，受管文件的 sha256 与本轮开始时相同"）就挂在这里。 */
+      censusBeforeC = managedGuardCensus();
       failRun = runOnly('docs-check');
+      censusAfterC = managedGuardCensus();
+      managedChangedC = managedGuardDiff(censusBeforeC, censusAfterC);
       const t2 = failRun.text;
       return failRun.status === 1 && /FAIL {2}docs-check/.test(t2) && !t2.includes('门禁全绿') &&
         t2.includes('门禁结论：不通过');
@@ -4845,6 +5232,22 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       return `退出码 ${failRun.status}${failRun.error ? `（spawn 错误 ${failRun.error}）` : ''}`
         + `｜FAIL docs-check ${has('FAIL  docs-check')}｜"门禁全绿" ${has('门禁全绿')}（应为"缺"）`;
     })());
+  /* `E70-C`（甲组的**通用**端到端形态）：**跑一轮门禁后，受管文件的 sha256 与本轮开始时相同**
+     （至少 `tests\README.md`）。受管面清单与"为什么是这些"见文件顶部 `managedGuardCensus()` 的注释
+     （普查结果：受管面共 92 个文本文件 ＋ 11 张基准图；全量门禁轮里**唯一**曾被运行期改写的受管文件
+     就是 `tests\README.md`，写入点正是本脚本第十节 —— `E70` 已把它改成只写受控副本；
+     `tests\screenshots-baseline\*` 的唯一写入点是人工开关 `capture-baseline --update`，门禁轮从不带它）。
+     ⚠ 如实记账（本条的边界）：若**他路**在窗口内改写受管文件（并行开发期），这条同样会红 ——
+     与 `run-all` 自己的"工作区稳定性"同一口径（那时本轮结论不可作证据，须停笔后复跑）；
+     本条窗口只有一轮 `--only docs-check`（≈6 s），比 run-all 自身的全量窗口窄。 */
+  t.check('E70-C 结构性不变量：**真跑一轮门禁**（`run-all --only docs-check`，退出码 1 的失败轮同样要守）之后，' +
+    '受管文件的 sha256 与本轮开始时逐个相同（有变化即**逐条指名**）',
+    managedChangedC.length === 0 && Boolean(censusBeforeC) && censusBeforeC.collected
+      && Boolean(censusAfterC) && censusAfterC.collected,
+    `受管面 ${censusBeforeC ? censusBeforeC.textCount : '?'} 个文本文件 ＋ ${censusBeforeC ? censusBeforeC.pngCount : '?'} 张基准图；`
+      + `采集可用=${censusBeforeC ? censusBeforeC.collected : '?'}/${censusAfterC ? censusAfterC.collected : '?'}`
+      + `（${(censusBeforeC && censusBeforeC.reason) || '无异常'}）；被改动的受管文件 ${managedChangedC.length} 个`
+      + (managedChangedC.length ? `：${managedChangedC.join('；')}` : ''));
   /* E19（登记 2026-09-22，2026-09-29 收口）：`--only contract-check` 这一轮**要求是稳定绿轮**，
      但写方撞上它 ~1 s 的窗口时 `lib/snapshot.js` 会判"工作区被改写 ⇒ 本轮不可作证据" ⇒ 退出码 1、
      且**不会**打印"门禁全绿" ⇒ 断言**假红**（实测 N=30 里 1 次；并行开发期约 3%）。
@@ -4853,46 +5256,153 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
        · unstable（带"工作区被改写／不可作证据"措辞）⇒ **可重试**（最多 3 次尝试）；
        · green（退出码 0 且打出"门禁全绿"）⇒ 通过；
        · bad（其余）⇒ **真失败绝不重试**（不许把 FAIL 重试成绿）；
-     连续都撞上并发写盘 ⇒ **按"环境不满足"跳过**并写明原因 —— 环境问题不得伪装成断言失败。 */
+     连续都撞上并发写盘 ⇒ **按"环境不满足"跳过**并写明原因 —— 环境问题不得伪装成断言失败。
+
+     ---------------- `E98`：这条判据的**第二种**偶发假红（`T-20261003-08` 乙组定位，2026-10-03） ----------------
+     现象：单跑 `harness-check` 时出现过 `341/1/2`，红项就是下面这条，读数是 `尝试序列 1:bad(exit=1)`；
+     随后同命令与 `run-all --fast` 内均 `342/0/2`；**纯净 HEAD 导出上同样复现**（`339/1`）⇒ 与本日改动无关。
+     定位到可复述的机制（既有的**端口硬编码**，不是判据写错）：
+       ① `tests\contract-check.js` 把"假 MES"跑在**进程内**，端口**写死**：18897／18898／18899
+          （`contract-check.js:581-588`）与 18896（`:834`）；`tools\mock-mes\mock-mes.js:197`
+          只有 `server.listen(args.port, …)`，**没有** `'error'` 监听。
+       ② 端口已被占用时 ⇒ Node 抛未捕获事件 `Error: listen EADDRINUSE: address already in use :::18899`
+          ⇒ contract-check **当场退出 1，且来不及打印 `=== 汇总 ===`**
+          ⇒ `run-all` 记 `FAIL  contract-check  — / — / —` ⇒ `finalExitCode` = 1
+          ⇒ 打印 `门禁结论：不通过（有失败/未核实脚本，见上面的明细）。`
+          ⇒ **没有**"门禁全绿"，也**没有**"工作区被改写"措辞。
+       ③ 于是 `attemptKind` 落到 `bad`（不是 `unstable`）⇒ **不重试**，断言当场红。
+          ⇒ 这就是 `1:bad(exit=1)` 的全部来路：**"环境被占"被当成了"真失败"**。
+     现场证据（本机 `tests\._verify\run-all\`，2026-10-03 **15:19:27／15:19:37／15:20:58**）：
+     同一秒里出现成对的 `contract-check-<pid>.log` —— 一对里**一个 12197 B（抢到端口，成功）、
+     另一个 3920 B（`EADDRINUSE` 崩掉）**，且各自配套 `docs-check-/files-check-/logic-check-/
+     db-check-/trace-check-<同样两个 pid>` ⇒ **当时确有两个（乃至四个）门禁轮在并发跑**
+     （每轮 §15 的嵌套子集轮里都含 contract-check）⇒ 固定端口互撞。
+     复现手法（**确定性**，见 `tests\._verify\review\t20261003-08\probe-e98-port.js`）：
+       A 窗口：`node -e "require('net').createServer().listen(18899)"`（务必**不指定 host**，
+               与 mock-mes 同为 `:::18899`；只绑 `127.0.0.1` 时 Windows 允许双栈并存 ⇒ 变成
+               "连上了但没人应答"，而 `startMockMes` 的 `fetch` **无超时** ⇒ 挂到 120 s 超时）
+       B 窗口：`node tests\run-all.js --no-preflight --only contract-check`
+       ⇒ 退出码 1 ＋ 无汇总行 ＋ stdout 含 `listen EADDRINUSE` ＋ 无"门禁全绿" ＋**有**权威对账行。
+     顺手把它修成**确定性**（ADR-0004 D21/D23：**不删判据、不改期望**）：给"**有证据的端口冲突**"
+     单开一类 `collided`，与 `unstable` 同样**可重试**（最多 3 次）。**证据门槛**＝退出码非 0
+     ＋ 输出里真的出现 `EADDRINUSE` ＋ **没有**"门禁全绿"；真失败（断言失败/未核实）照样是 `bad`
+     且**不重试**；连续 3 次都撞 ⇒ 按"环境不满足"**跳过**并写明是端口冲突（不得伪装成通过）。 */
   const UNSTABLE_NEEDLE = /本轮运行期间工作区被改写|不可作为证据/;
+  /* `E98` 的证据门槛：`EADDRINUSE` 只可能来自 contract-check 在进程内绑死端口那一步（见上） */
+  const COLLISION_NEEDLE = /EADDRINUSE/;
+  const GREEN_LINE = '门禁全绿（无失败脚本）。';
   const attemptKind = (code, text) => {
     if (UNSTABLE_NEEDLE.test(text)) return 'unstable';
-    if (code === 0 && text.includes('门禁全绿（无失败脚本）。')) return 'green';
+    if (code === 0 && text.includes(GREEN_LINE)) return 'green';
+    /* ⚠ 顺序与门槛都要紧：`collided` 必须在 `bad` **之前**、且**只**认"非 0 ＋ 有端口冲突证据 ＋
+       没有全绿行"。若把它做成"失败就归环境"（去掉证据门槛），真失败会被重试掉（D21 禁止）。 */
+    if (code !== 0 && COLLISION_NEEDLE.test(text) && !text.includes(GREEN_LINE)) return 'collided';
     return 'bad';
   };
+  /* 旧规则（**没有** `collided` 那一支）—— 供定点回归证明"这条修法是承重的"（去掉即回到 `1:bad(exit=1)`） */
+  const legacyAttemptKind = (code, text) => {
+    if (UNSTABLE_NEEDLE.test(text)) return 'unstable';
+    if (code === 0 && text.includes(GREEN_LINE)) return 'green';
+    return 'bad';
+  };
+  /** 把一次尝试的**逐项读数**摘出来（E98 要求"逐次读数打印"：两行到底有没有、有没有被挤掉/截断） */
+  const readAttempt = (sub, i) => {
+    const text = sub.text || '';
+    const lines = text.split(/\r?\n/);
+    const pick = re => lines.filter(l => re.test(l)).map(l => l.trim()).slice(0, 4);
+    return {
+      n: i + 1, kind: attemptKind(sub.status, text), exit: sub.status, error: sub.error || '',
+      bytes: Buffer.byteLength(text),
+      green: text.includes(GREEN_LINE),
+      authLine: text.includes('权威数字校验：'),
+      authNotRun: text.includes('权威数字校验：**未执行**：本轮未跑全离线门禁'),
+      unstable: UNSTABLE_NEEDLE.test(text),
+      row: pick(/^\s*(PASS|FAIL|ERR |\?\?\? )\s+contract-check\b/),
+      fails: pick(/^\s*FAIL\s+/),
+      collision: pick(/EADDRINUSE|Unhandled 'error' event|门禁结论：/),
+      tail: lines.filter(l => l.trim()).slice(-2).map(l => l.trim().slice(0, 110))
+    };
+  };
+  const fmtAttempt = r => `#${r.n} kind=${r.kind} exit=${r.exit}${r.error ? `（${r.error}）` : ''} bytes=${r.bytes}`
+    + `｜"门禁全绿"=${r.green ? '有' : '缺'}｜权威对账行=${r.authLine ? (r.authNotRun ? '有（未执行：未跑全离线门禁）' : '有') : '缺'}`
+    + `｜不稳定措辞=${r.unstable ? '有' : '缺'}`
+    + (r.row.length ? `｜结果表=${r.row[0]}` : '')
+    + (r.collision.length ? `｜冲突/结论=${r.collision.join(' ／ ').slice(0, 120)}` : '')
+    + `｜尾部=${JSON.stringify(r.tail[r.tail.length - 1] || '')}`;
+
   t.check('E19 定点回归①：`attemptKind` 三态 —— 不稳定轮⇒unstable（可重试）／绿轮⇒green／**真失败⇒bad（不得被重试掉）**',
     attemptKind(1, '本轮运行期间工作区被改写（1 个文件）… 该轮不可作为证据') === 'unstable' &&
-    attemptKind(0, '门禁全绿（无失败脚本）。') === 'green' &&
+    attemptKind(0, GREEN_LINE) === 'green' &&
     attemptKind(1, 'FAIL  docs-check  41 / 2 / 0\n门禁结论：不通过') === 'bad' &&
     attemptKind(0, '（没有"门禁全绿"字样）') === 'bad',
     `unstable=${attemptKind(1, '本轮运行期间工作区被改写（1 个文件）')}；` +
-    `green=${attemptKind(0, '门禁全绿（无失败脚本）。')}；bad=${attemptKind(1, 'FAIL  x')}；` +
+    `green=${attemptKind(0, GREEN_LINE)}；bad=${attemptKind(1, 'FAIL  x')}；` +
     `code0无措辞=${attemptKind(0, '（无措辞）')}`);
   t.check('E19 定点回归②：**不稳定措辞优先于退出码** —— 即使 exit=0，只要带"工作区被改写"也不得当成绿轮证据',
-    attemptKind(0, '门禁全绿（无失败脚本）。\n（本轮运行期间工作区被改写）') === 'unstable',
-    `实测 ${attemptKind(0, '门禁全绿（无失败脚本）。\n（本轮运行期间工作区被改写）')}`);
+    attemptKind(0, GREEN_LINE + '\n（本轮运行期间工作区被改写）') === 'unstable',
+    `实测 ${attemptKind(0, GREEN_LINE + '\n（本轮运行期间工作区被改写）')}`);
+  /* ---------------- `E98` 定点回归：端口硬编码被占 ⇒ 归"有证据的环境条件"，但**不得**吞掉真失败 ---------------- */
+  const COLLISION_TEXT = '  ── 运行 contract-check（字段契约与适配层）──\n'
+    + 'node:events:505\n    throw er; // Unhandled \'error\' event\n\n'
+    + 'Error: listen EADDRINUSE: address already in use :::18899\n'
+    + '    at Server.listen (node:net:2562:7)\n'
+    + '  FAIL  contract-check          — / — / —   字段契约与适配层\n'
+    + '权威数字校验：**未执行**：本轮未跑全离线门禁（缺 15 个：…）\n'
+    + '门禁结论：不通过（有失败/未核实脚本，见上面的明细）。';
+  const REAL_FAIL_TEXT = '  FAIL  contract-check          58 / 4 / 0   字段契约与适配层\n'
+    + '门禁结论：不通过（有失败/未核实脚本，见上面的明细）。';
+  t.check('E98 定点回归①：端口被占（contract-check 进程内绑死 18896～18899 ⇒ 未捕获 `EADDRINUSE`、退出 1、无汇总行）' +
+    '⇒ 归 **`collided`**（有证据的**环境条件**，可重试）；**同一段文本在旧规则下是 `bad`**（＝不重试、当场红 —— 现场那条 `1:bad(exit=1)`）',
+    attemptKind(1, COLLISION_TEXT) === 'collided' && legacyAttemptKind(1, COLLISION_TEXT) === 'bad'
+      && attemptKind(null, COLLISION_TEXT) === 'collided',
+    `新规则=${attemptKind(1, COLLISION_TEXT)}；旧规则=${legacyAttemptKind(1, COLLISION_TEXT)}`);
+  t.check('E98 定点回归②：`collided` **不得**吞掉真失败 —— 同样 exit=1、同样没有"门禁全绿"，' +
+    '只要输出里**没有** `EADDRINUSE` 证据就必须是 `bad`；"既有端口错又有全绿行"这种自相矛盾的输出也不许当环境问题',
+    attemptKind(1, REAL_FAIL_TEXT) === 'bad' && legacyAttemptKind(1, REAL_FAIL_TEXT) === 'bad'
+      && attemptKind(1, COLLISION_TEXT + '\n' + GREEN_LINE) === 'bad'
+      && attemptKind(0, COLLISION_TEXT) === 'bad',
+    `真失败文本=${attemptKind(1, REAL_FAIL_TEXT)}（须 bad）；`
+      + `"冲突＋全绿"矛盾输出=${attemptKind(1, COLLISION_TEXT + '\n' + GREEN_LINE)}（须 bad）；`
+      + `exit=0 但带端口错=${attemptKind(0, COLLISION_TEXT)}（须 bad）`);
   let greenSub = null;
   let lastKind = '';
   const subAttempts = [];
+  const attemptReadings = [];
   for (let i = 0; i < 3; i++) {
     const sub = runOnly('contract-check');
-    const kind = attemptKind(sub.status, sub.text);
+    const reading = readAttempt(sub, i);
+    attemptReadings.push(reading);
+    const kind = reading.kind;
     subAttempts.push(`${i + 1}:${kind}(exit=${sub.status})`);
     lastKind = kind;
-    if (kind !== 'unstable') { greenSub = sub; break; }   /* green/bad 都停（bad 不重试） */
+    /* green/bad 都停（bad **不重试**）；unstable 与 collided 是**可重试的环境条件** */
+    if (kind !== 'unstable' && kind !== 'collided') { greenSub = sub; break; }
   }
-  if (lastKind === 'unstable') {
+  /* **逐次读数一律打印**（E98 定位要求：第几次、退出码、"门禁全绿"与权威对账行到底有没有、
+     有没有被挤掉/截断）。成功轮也打 —— 只有每次都留下读数，偶发才有现场可查。 */
+  t.info('E19/E98 尝试读数（每行一次尝试）：' + (attemptReadings.length
+    ? '\n        ' + attemptReadings.map(fmtAttempt).join('\n        ')
+    : '（无）'));
+  if (lastKind === 'unstable' || lastKind === 'collided') {
     t.skip('端到端：跑 `--only contract-check`（无失败脚本）⇒ 退出码 0，打印"门禁全绿"且同时打印权威对账行',
-      `连续 ${subAttempts.length} 次都撞上并发写盘（工作区被改写 ⇒ 该轮不可作证据）—— **环境不满足、不是实现缺陷**（E19）；` +
-      '停笔后复跑即为证据');
-    t.info('E19：本轮尝试序列 ' + subAttempts.join(' → '));
+      `连续 ${subAttempts.length} 次都没拿到绿轮：${lastKind === 'collided'
+        ? '**本机回环端口 18896～18899 被占**（`contract-check.js:581-588/834` 把假 MES 的端口写死，'
+          + '`tools\\mock-mes\\mock-mes.js:197` 的 `listen` 没有 `error` 监听 ⇒ 未捕获 `EADDRINUSE` ⇒ 退出 1、无汇总行）'
+        : '撞上并发写盘（工作区被改写 ⇒ 该轮不可作证据）'}`
+      + ` —— **环境不满足、不是实现缺陷**（${lastKind === 'collided' ? 'E98' : 'E19'}）；释放端口/停笔后复跑即为证据；`
+      + `尝试读数：${attemptReadings.map(fmtAttempt).join(' ／ ')}`);
   } else {
     const sub = greenSub;
     t.check('端到端：跑 `--only contract-check`（无失败脚本）⇒ 退出码 0，打印"门禁全绿"**且同时打印权威对账行**',
-      sub.status === 0 && sub.text.includes('门禁全绿（无失败脚本）。') &&
+      sub.status === 0 && sub.text.includes(GREEN_LINE) &&
       sub.text.includes('权威数字校验：**未执行**：本轮未跑全离线门禁'),
       `尝试序列 ${subAttempts.join(' → ')}｜退出码 ${sub.status}${sub.error ? `（spawn 错误 ${sub.error}）` : ''}`
       + `｜权威对账行 ${sub.text.includes('权威数字校验：**未执行**') ? '有' : '缺'}｜门禁全绿 ${sub.text.includes('门禁全绿') ? '有' : '缺'}`
+      + (attemptKind(sub.status, sub.text) === 'bad'
+        ? `｜**非环境原因**：${(sub.text.split(/\r?\n/).filter(l => /^\s*(FAIL|ERR |\?\?\? )/.test(l))[0]
+          || '（结果表里没有 FAIL/ERR/??? 行）').trim()}`
+        : '')
+      + `｜逐次读数：${attemptReadings.map(fmtAttempt).join(' ／ ')}`
       + '（绿轮丢弃对账行是同一处重构的第二个缺口：必须"绿轮也打印"）');
   }
 
