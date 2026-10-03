@@ -11,7 +11,11 @@
      node tests\run-all.js --only a,b     只跑指定脚本（逗号分隔，不用写 .js）
      node tests\run-all.js --no-preflight 不跑体检
      node tests\run-all.js --list         只列出脚本清单
-   退出码：0 = 无失败；1 = 有脚本失败；2 = 环境不满足（Node 版本等）。
+   前置（**2026-10-03 起，`E91` 收尾**）：本轮若含 `screenshot-diff`，会在**任何脚本启动之前**
+         先跑一次 `node tests\capture-baseline.js --out tests\._verify\captures` 刷新候选图；
+         刷不出来（无 Edge／沙箱禁命名管道／捕获失败）⇒ **当场判红并写明原因**，绝不静默跳过
+         （`--fast` 也照跑：`--fast` 含 `screenshot-diff`，没有这一步的它就是"绿得没有依据"）。
+   退出码：0 = 无失败；1 = 有脚本失败（含前置刷新失败）；2 = 环境不满足（Node 版本等）。
    ========================================================================== */
 'use strict';
 
@@ -60,8 +64,20 @@ const optValue = name => {
    且 `tests\lib\snapshot.js` 的稳定性扫描已排除 `tests\._verify\` —— 各脚本的日志/临时库写入
    不会被误判成"工作区被改写"。
 
-   **为什么有尾巴必须串行**（`serialTail`）：见 SUITES 里四条标注。
-   并行只改"谁和谁同时跑"，**不改任何断言与判据**；并发度默认 4（`DSH_JOBS` 或 `--jobs` 可覆盖）。 */
+   **为什么有尾巴必须串行**（`serialTail`）：见 SUITES 里逐条标注。
+   并行只改"谁和谁同时跑"，**不改任何断言与判据**；并发度默认 4（`DSH_JOBS` 或 `--jobs` 可覆盖）。
+
+   **2026-10-03（`E70③`，座位 4 的 `T-20261003-01`）：浏览器/CDP 类脚本整批收进串行尾。**
+   实测形态（`E70③` 立案）：同一工作区，`browser-check` 单独跑 33/0 退 0、`--jobs 2` 全量也 33/0，
+   而 `--jobs 4` 那一轮**整脚本失败**（四个浏览器/CDP 类脚本抢 Edge/端口/CPU 的典型形态）——
+   它会打断"一轮全量取权威证据"的纪律（`E52`），且失败时按设计**跳过权威数字比对**。
+   现在 `browser-check`／`overlap-check`／`stress-check` 三条**都标 `serialTail: true`**，
+   与 `capture-baseline`（`E91` 的前置刷新，本就独占运行）一样不再进并行波。
+   **如实记账（代价）**：并行波因此只剩离线脚本，"长杆 `stress-check` 与其余脚本重叠"这条收益消失
+   ⇒ `--jobs N` 的墙钟会比改动前更长（实测见本批回执）。这是**拿墙钟换判据稳定性**的自觉取舍：
+   `E70③` 的偶发红会污染证据，而墙钟只是等待。既有判据"并行波墙钟 < 串行墙钟"的含义不变
+   （`harness-check` 第十五节 D 项按同一批脚本的串行/并行读秒比较），但它在本机
+   `--only` 子集下**本就不判定**（脚本数 < 8；且 `--only` 一律串行，见 `scheduleSuites`）。 */
 
 /** 调度：把 suites 拆成 [并行波, 串行尾]，并保持各自在 SUITES 里的原顺序。 */
 function scheduleSuites(suites, jobs) {
@@ -112,7 +128,11 @@ function resolveJobs() {
    needBrowser 脚本在受限环境（沙箱禁命名管道）会自行 SKIP，runner 据此归类为"跳过"。
    slow 脚本默认在 --fast 下不跑。
    serialTail 脚本**只在串行尾段跑**（见下方 scheduleSuites）：它们对"别的脚本正在跑"敏感，
-   不能进 `--jobs N` 的并行波 —— 详见 serialTail 的逐条理由。 */
+   不能进 `--jobs N` 的并行波 —— 详见 serialTail 的逐条理由。
+   当前共 **6** 条：`docs-check`／`files-check`／`docs-cross-check`（离线三类，原有）
+   ＋ `browser-check`／`overlap-check`／`stress-check`（浏览器/CDP 三类，`E70③` 于 2026-10-03 收进）。
+   另有 `capture-baseline`（`E91` 的截图前置刷新）**不在本清单里**：它由 `refreshCaptureBaseline()`
+   在**并行波之前**独占跑一次，见该函数注释（那是"比串行尾更彻底的串行"，不是新增竞争）。 */
 const SUITES = [
   { name: 'contract-check', desc: '字段契约与适配层', needBrowser: false, slow: false },
   { name: 'ui-check', desc: '界面结构与需求条款', needBrowser: false, slow: false },
@@ -128,16 +148,116 @@ const SUITES = [
   { name: 'trace-check', desc: '需求追溯', needBrowser: false, slow: false },
   { name: 'copy-check', desc: '界面文案与需求条款对照', needBrowser: false, slow: false },
   { name: 'screenshot-diff', desc: '界面视觉回归', needBrowser: false, slow: false },
-  /* 放在**最后**：它是跨文档/总账性质的聚合检查，要靠前面跑完的实跑账去比对
+  /* 放在**离线门禁的最后**：它是跨文档/总账性质的聚合检查，要靠前面跑完的实跑账去比对
      `tests\README.md` 的权威数字（P2-22）；排在前面会读到不完整的账。
-     `serialTail: true` 让它在 `--jobs N` 并行模式下**也**一定落在最后（见 scheduleSuites）。 */
+     `serialTail: true` 让它在 `--jobs N` 并行模式下**也**一定落在串行尾（见 scheduleSuites）。
+     ⚠ `E70③`（2026-10-03）之后，尾段里在它**后面**还有三个浏览器/CDP 脚本 —— 这不影响它：
+     它逐脚本比对的是 `offlineGates`（＝ `!needBrowser`，即 13 个离线门禁），浏览器类**不在其账目来源里**；
+     而那三个脚本的入账由本 runner 收尾的 `verifyAuthorityTotals`（按**全量** SUITES 判定）负责。
+     故"它必须在离线门禁之后"这条含义不变，只是不再字面等于"尾段的最后一条"。 */
   { name: 'docs-cross-check', desc: '跨文档一致性 + 权威数字校验', needBrowser: false, slow: false, serialTail: true },
-  { name: 'browser-check', desc: '真实浏览器（无头 Edge + CDP）', needBrowser: true, slow: false },
-  { name: 'overlap-check', desc: '元素重叠检测', needBrowser: true, slow: false },
+  /* 三条浏览器/CDP 类脚本**整批收进串行尾**（`E70③`，2026-10-03 座位 4）：
+     实测 `--jobs 4` 下四条浏览器/CDP 脚本互抢 Edge/端口/CPU ⇒ `browser-check` 偶发整脚本失败，
+     而那一轮按设计**跳过权威数字比对**（打断 `E52` 的"一轮全量取权威证据"纪律）。
+     串行尾里它们彼此**也**是串行的（逐条跑），故不存在"自己抢自己"。
+     代价（如实）：`stress-check` 这根长杆不再与离线脚本重叠 ⇒ `--jobs N` 墙钟变长。 */
+  { name: 'browser-check', desc: '真实浏览器（无头 Edge + CDP）', needBrowser: true, slow: false, serialTail: true },
+  { name: 'overlap-check', desc: '元素重叠检测', needBrowser: true, slow: false, serialTail: true },
   /* slow 仍为 true：默认 20 分钟虽不再是"整夜浸泡"，但仍是本仓最耗时的一类（起真浏览器 + 采样），
      `--fast` 下跳过它是对的；整班次浸泡改由 `--soak` / `--hours 8` 显式触发（见 stress-check.js）。 */
-  { name: 'stress-check', desc: '长跑稳定性（默认 2 分钟；--soak / --hours 8 为整班次浸泡）', needBrowser: true, slow: true }
+  { name: 'stress-check', desc: '长跑稳定性（默认 2 分钟；--soak / --hours 8 为整班次浸泡）', needBrowser: true, slow: true, serialTail: true }
 ];
+
+/* ==========================================================================
+   **截图候选图前置刷新**（`E91` 收尾；2026-10-03 座位 4 的 `T-20261003-01`）
+   --------------------------------------------------------------------------
+   问题（`E91`，2026-10-02 立案／2026-10-02 由主代理"更正与升级"）：`screenshot-diff` 比的
+   **不是当场截图**，而是候选目录 `tests\._verify\captures\` 里的 PNG（见 `screenshot-diff.js`
+   文件头）。而本 runner 与 `preflight` **都不跑** `capture-baseline` ⇒ 候选图是否新鲜，
+   只取决于"上一次手工捕获"。实测后果（`E92` 定量取证）：`05bcf7b` 引入的 4.59% 真实版面回归，
+   靠**回归之前**的候选图**静默通过了约 4 天**。
+   ⇒ 本批交付：在 `screenshot-diff` 读候选目录**之前**，必须有（且只有）一次刷新。
+
+   **为什么选"前置步骤"而不是"与 `screenshot-diff` 一起放串行尾"**（两案都评估过）：
+     ① **顺序由构造保证**：本步骤在任何门禁脚本启动之前跑完 ⇒ 与 `--jobs N` 无关，也不依赖
+        `screenshot-diff` 最终落在哪一波（它**留在并行波**：它只解码 PNG，不碰 Edge/CDP）。
+     ② **`--fast` 这一档也成立**：`capture-baseline` 是 `needBrowser` 脚本、会被 `--fast` 过滤掉，
+        而 `screenshot-diff` **不会**（`needBrowser:false`）。若把刷新挂在"串行尾的
+        `capture-baseline`"上，`--fast` 就会出现"跑了截图门禁、却没刷新候选图"的组合 ——
+        那正是 `E91` 要堵的洞。
+     ③ **不给权威区添账**：本步骤**不进 `SUITES`** ⇒ `authorityAll`／`offlineGates`／README
+        权威行逐脚本清单都不变（若加进去，权威行必须点名它，否则 `verifyAuthorityTotals` 会判
+        "权威区漏列离线门禁"；`docs-cross-check` 也会把它当离线门禁要求声明数）。
+        它对"断言合计"的贡献恒为 0（`summary: null`）。
+     ④ **资源独占**：它跑的时候没有别的脚本在跑 ⇒ 与 `E70③`（浏览器/CDP 互抢 Edge/CPU）的关系是
+        "比串行尾更彻底的串行"，不是新增竞争。
+
+   **fail-closed（硬要求，不静默跳过、也不让整套门禁崩掉）**：刷不出来时**判红并写明原因**——
+     · `capture-baseline` 退出码非 0 ⇒ 红（原因＝退出码）；
+     · 它自报 `SKIP`（未找到 msedge.exe，或沙箱不允许创建命名管道）⇒ 红（**它这一路是退 0 的**，
+       不单独识别就会被读成"刷新成功"，那正是静默跳过）；
+     · 候选目录里**每一张** PNG 的 mtime 都必须 ≥ 本次刷新开始时刻 − `CAPTURE_FRESH_SLACK_MS`
+       （＝"确实被本次捕获重写"）⇒ 有更旧的就红并**逐张指名**。
+   判据取 **mtime 实证**而不是"解析它打印的汇总行"：前者不依赖被测脚本的文案，后者一旦改文案
+   就会静默失效（那正是 `E91` 的失效形态：判据看着在，实际没在判）。
+   ========================================================================== */
+const CAPTURE_FRESH_SLACK_MS = 2000;      // 文件系统时间戳粒度 + "取时刻到 spawn"之间的余量
+const CAPTURE_SUITE = Object.freeze({
+  name: 'capture-baseline',
+  desc: '截图候选图前置刷新（E91：须在 screenshot-diff 读候选目录之前）',
+  needBrowser: true,
+  slow: false
+});
+
+/**
+ * 跑一次 `capture-baseline --out tests\._verify\captures`，并**核对它真的刷新了候选图**。
+ * 只读/只写 `tests\._verify\` 之下（截图落 `env.paths.captures`、日志落 `run-all\`），
+ * 而工作区稳定性快照已排除 `._verify` ⇒ 不会把自己判成"工作区被改写"。
+ * @returns {{ok:boolean, ms:number, logFile:string, out:string, total:number, fresh:number,
+ *            stale:string[], reasons:string[]}}
+ */
+function refreshCaptureBaseline() {
+  const outDir = env.paths.captures;                       // ＝ tests\._verify\captures（与 screenshot-diff 默认候选目录同源）
+  const logDir = env.ensureDir(path.join(env.paths.verify, 'run-all'));
+  const logFile = path.join(logDir, `capture-baseline-${process.pid}.log`);
+  if (fs.existsSync(logFile)) { try { fs.rmSync(logFile, { force: true }); } catch { /* 忽略 */ } }
+
+  const startedMs = Date.now();
+  const fd = fs.openSync(logFile, 'a');
+  const res = spawnSync(process.execPath,
+    [path.join(env.paths.tests, 'capture-baseline.js'), '--out', outDir],
+    { cwd: env.paths.root, timeout: 10 * 60 * 1000, stdio: ['ignore', fd, fd],
+      env: { ...process.env, DSH_ENV: env.isProd ? 'test' : env.ENV_NAME } });
+  try { fs.closeSync(fd); } catch { /* 忽略 */ }
+  const ms = Date.now() - startedMs;
+
+  let out = '';
+  try { out = fs.readFileSync(logFile, 'utf8'); } catch { out = ''; }
+
+  let pngs = [];
+  try { pngs = fs.readdirSync(outDir).filter(n => n.toLowerCase().endsWith('.png')); } catch { pngs = []; }
+  const stale = [];
+  let fresh = 0;
+  for (const n of pngs) {
+    let st;
+    try { st = fs.statSync(path.join(outDir, n)); } catch { continue; }
+    if (st.mtimeMs >= startedMs - CAPTURE_FRESH_SLACK_MS) fresh++;
+    else stale.push(`${n}（mtime ${new Date(st.mtimeMs).toLocaleString('sv-SE')}）`);
+  }
+
+  const reasons = [];
+  if (res.error) reasons.push(`无法启动 capture-baseline（${res.error.code || res.error.message}）`);
+  else if (res.status !== 0) reasons.push(`capture-baseline 退出码 ${res.status}（应为 0）`);
+  if (/SKIP[:：]/.test(out)) {
+    reasons.push('capture-baseline 自报 SKIP（未找到 msedge.exe，或沙箱不允许创建命名管道）'
+      + '⇒ Edge/CDP 不可用，候选图**没有被刷新**');
+  }
+  if (!pngs.length) reasons.push(`候选目录 ${path.relative(env.paths.root, outDir)} 里没有 PNG`);
+  if (stale.length) {
+    reasons.push(`${stale.length}/${pngs.length} 张 PNG 未被本次刷新重写（mtime 早于本次开始时刻）：${stale.join('、')}`);
+  }
+  return { ok: reasons.length === 0, ms, logFile, out, total: pngs.length, fresh, stale, reasons };
+}
 
 /**
  * 解析子进程输出里的汇总行。**E12（登记 2026-09-20，2026-09-29 收口）：以失败为优先。**
@@ -714,6 +834,41 @@ function finalExitCode(entry) {
   return verdict.exitCode ?? 0;
 }
 
+/* ---------------- 失败明细的行选取（`E88⒝`：余量只有 3 行 ⇒ **不许静默丢"指名"**） ----------------
+   立案（`E88⒝`，2026-10-02 由座位 5 在 C·19 报出）：旧实现是 `filter(…).slice(0, 8)`。
+   现场读数（座位 4b 的 `T-20261002-11`，"只缺 1 个入口"那一轮）：过滤器命中 **8/8 用满**
+   —— 其中 3 条是**名字里带"失败清单"的 `[PASS]` 噪声**，真正点名的 `[FAIL]` 恰在第 5 位、
+   编号行在第 8 位 ⇒ **余量 0 行**。再多一条噪声，"点名的 `[FAIL]`／编号行"就会被**静默丢掉**
+   （`D23`：判据必须能指名）。为什么这一层这么要紧：安静模式（`--tap` / `--fast`）**不回放**
+   子进程输出，失败明细段是读者唯一的"指名"入口（`E88⒝` 的原话："一旦排到第 9 行之后就会丢指名"）。
+   现在改为**按关键字分层选取**（放宽 **8 → 24** ＋ 优先保住指名行）：
+     · 命中行 ≤ `DETAIL_MAX_LINES` ⇒ 全部打印（与旧行为一致，只是不再过早截断）；
+     · 超过 ⇒ **先保住全部"指名行"**（`[FAIL]`／编号行／`脚本异常终止`），
+       再用其余命中行按原顺序补足到上限；
+       · 仍有被丢的行 ⇒ **显式打印"截断了几行 + 去哪看全文"**（截断必须可见，不许无声）。
+   可证伪的判据：**任何一轮里，"含 `[FAIL]`／编号"的行一行都不会因截断而消失**；
+   即使指名行本身多到超过上限，也只丢"非指名"的填充行。
+   定点回归见本批回执（`tests\._verify\T-20261003-01\` 下的选取探针：同一条真输出分别过
+   "旧 `.slice(0,8)`"与 `pickDetailLines()`，比对"点名行是否还在"）。 */
+const DETAIL_LINE_RE = /\[FAIL\]|失败清单|^\s+\d+\.|脚本异常终止/;
+/** "指名行"：真正报告"哪一条断言／哪个文件／哪一处"的行 —— 截断时**最后**才考虑它们（实际不丢） */
+const DETAIL_NAMED_RE = /\[FAIL\]|^\s+\d+\.|脚本异常终止/;
+const DETAIL_MAX_LINES = 24;
+
+/**
+ * 从一个失败脚本的输出里挑出"该打印的明细行"（**纯函数**，供定点回归直接调用）。
+ * @param {string} out 子进程输出全文（拿不到时传 null/undefined ⇒ 返回空）
+ * @returns {{lines:string[], dropped:number, named:number}} `dropped` > 0 表示有行被截掉（调用方必须**明写**）
+ */
+function pickDetailLines(out) {
+  const hits = String(out || '').split('\n').filter(l => DETAIL_LINE_RE.test(l));
+  const named = hits.filter(l => DETAIL_NAMED_RE.test(l));
+  if (hits.length <= DETAIL_MAX_LINES) return { lines: hits, dropped: 0, named: named.length };
+  const rest = hits.filter(l => !DETAIL_NAMED_RE.test(l));
+  const kept = named.concat(rest.slice(0, Math.max(0, DETAIL_MAX_LINES - named.length)));
+  return { lines: kept, dropped: hits.length - kept.length, named: named.length };
+}
+
 async function main() {
   if (hasFlag('--list')) {
     console.log('=== 门禁脚本清单 ===');
@@ -778,7 +933,17 @@ async function main() {
       console.log('  [体检] 关键项通过（未产出可解析的汇总行）');
     } else {
       console.log('  [体检] 未通过 —— 请先排查环境问题，再解读下面的脚本结果');
-      if (preOut) console.log(preOut.split('\n').filter(l => /\[FAIL\]|失败清单|^\s+\d+\./.test(l)).slice(0, 6).map(l => '    ' + l).join('\n'));
+      /* `E88⒝` 的**孪生点**（同一处缺陷的另一份实现）：这里原本也是"硬截断 6 行"，
+         而安静模式（`--tap` / `--fast`）**不回放**体检输出 ⇒ 这一段同样是唯一的指名入口。
+         改用同一个 `pickDetailLines()`（它的过滤器还多认 `脚本异常终止`，能接住 `[脚本异常]` 那种裸栈）。
+         对现状**无行为变化**（体检失败项 ≤ 4 条，远低于上限），只是不再有"排到第 7 行就丢指名"的余量。 */
+      const prePicked = pickDetailLines(preOut);
+      if (prePicked.lines.length) {
+        console.log(prePicked.lines.map(l => '    ' + l).join('\n'));
+        if (prePicked.dropped > 0) {
+          console.log(`    …（体检明细已截断：保住全部 ${prePicked.named} 条指名行，另有 ${prePicked.dropped} 行未展开）`);
+        }
+      }
     }
     console.log(`     体检日志：${path.relative(env.paths.root, preLog)}`);
     console.log('');
@@ -797,6 +962,38 @@ async function main() {
     resultsByName.set(s.name, { suite: s, ...r });
     results.push({ suite: s, ...r });
   };
+
+  /* ---------------- `E91` 截图候选图**前置刷新**（位置必须在并行波之前） ----------------
+     为什么在这里：`screenshot-diff` 读的是候选目录里的 PNG 文件（不是当场截图），
+     故"刷新"必须先于它 —— 放在这里就与 `--jobs N` 的调度无关（见 refreshCaptureBaseline 注释）。
+     只在**本轮确实要跑 `screenshot-diff`** 时才刷新（`--only` 跑别的脚本时不白花这几十秒，
+     也让 `harness-check` 第十五／十四节里那些嵌套的 `run-all --only …` 不受影响）。
+     刷不出来 ⇒ 记一条 failed（fail-closed）：它会进"失败脚本明细"与最终退出码，
+     但**不会**让进程崩掉 —— 后面各脚本照跑，读者能一次看全所有问题。 */
+  if (suites.some(s => s.name === 'screenshot-diff')) {
+    process.stdout.write('  前置刷新 capture-baseline（E91：截图门禁读取候选目录之前必须先刷新候选图）… ');
+    const cap = refreshCaptureBaseline();
+    console.log(`${cap.ok ? '通过' : '失败'} ${(cap.ms / 1000).toFixed(1)}s` + (cap.ok
+      ? `（候选 ${cap.fresh} 张全部被本次刷新重写，目录 ${path.relative(env.paths.root, env.paths.captures)}）`
+      : ` —— ${cap.reasons.join('；')}`));
+    if (!cap.ok && !quiet && cap.out) process.stdout.write(cap.out);
+    pushResult(CAPTURE_SUITE, {
+      status: cap.ok ? 'passed' : 'failed',
+      detail: cap.ok ? '' : `候选图未刷新（fail-closed）：${cap.reasons.join('；')}`,
+      ms: cap.ms,
+      /* 这一行刻意做成**单行**且带 `[FAIL]`：`tail()` 的明细过滤按 `[FAIL]` 命中 ⇒ 失败原因
+         必定出现在"失败脚本明细"里（`E88⒝` 之后仍保证点名）。 */
+      out: cap.ok ? '' : `  [FAIL] capture-baseline 前置刷新（E91）—— 候选图未刷新（fail-closed）：`
+        + `${cap.reasons.join('；')}。处置：确认 Edge 可用（见 preflight 第四节）后手工跑`
+        + ' `node tests\\capture-baseline.js --out tests\\._verify\\captures`；在此之前'
+        + ' `screenshot-diff` 的"绿"没有依据（E91/E92）',
+      summary: null,
+      logFile: cap.logFile,
+      exit: cap.ok ? 0 : 1
+    });
+    console.log(`     刷新日志：${path.relative(env.paths.root, cap.logFile)}`);
+    console.log('');
+  }
 
   if (plan.parallel.length) {
     console.log(`  ▶ 并行波 ${plan.parallel.length} 个（并发 ${plan.jobs}）：${plan.parallel.map(s => s.name).join('、')}`);
@@ -842,11 +1039,15 @@ async function main() {
     console.log(`${mark} ${(r.ms / 1000).toFixed(1)}s ${sum}${r.detail ? ' ' + r.detail : ''}`);
     /* **每跑完一个就更新落盘**，而不是等收尾 —— 因为 `docs-cross-check` 本身是 suite 成员，
        它要在自己运行时读到"截至此刻的实跑账"，等收尾写就永远读到上一轮的旧账（P2-22）。
-       `docs-cross-check` 是串行尾的最后一个，故它运行时账本已含并行波的全部结果。 */
+       `docs-cross-check` 是**离线门禁**里的最后一个，故它运行时账本已含并行波的全部结果
+       ＋ `docs-check`／`files-check`；`E70③` 之后尾段在它后面还有三个浏览器/CDP 脚本，
+       但那些 **不** 是它的账目来源（它不是按全量 SUITES 比对 —— 那由本 runner 收尾做）。 */
     writeRunTotals(results);
   }
 
-  /* 与串行模式逐字一致的"总耗时"参考（并行下墙钟 < 各脚本之和，属预期） */
+  /* 与串行模式逐字一致的"总耗时"参考（并行下墙钟 < 各脚本之和，属预期）。
+     `E91` 之后 `startedAt` 取在**前置刷新之前** ⇒ 这条墙钟**含**候选图刷新那一段，
+     与"各脚本之和"（刷新那条也按 ms 计进 results）同口径。 */
   if (jobs > 1) {
     const sumMs = results.reduce((a, r) => a + (r.ms || 0), 0);
     console.log(`\n  ⏱ 并行模式耗时：墙钟 ${((Date.now() - startedAt) / 1000).toFixed(1)}s ｜ 各脚本之和 ${(sumMs / 1000).toFixed(1)}s ｜ 并发 ${plan.jobs}`);
@@ -957,11 +1158,16 @@ async function main() {
      否则会抢在"失败脚本明细"之前退出，把真正的失败原因盖掉）。 */
   const tail = () => {
     if (failed.length) {
-      console.log('\n失败脚本明细（每个脚本的最关键几行）：');
+      console.log('\n失败脚本明细（每个脚本的最关键几行；`E88⒝`：指名行**不因截断消失**）：');
       for (const r of failed) {
-        const lines = r.out.split('\n').filter(l => /\[FAIL\]|失败清单|^\s+\d+\.|脚本异常终止/.test(l)).slice(0, 8);
+        const picked = pickDetailLines(r.out === undefined ? '' : r.out);
         console.log(`\n  ── ${r.suite.name} ──`);
-        console.log(lines.map(l => '  ' + l).join('\n') || '  （无失败行可解析，请单独运行该脚本）');
+        console.log(picked.lines.map(l => '  ' + l).join('\n') || '  （无失败行可解析，请单独运行该脚本）');
+        if (picked.dropped > 0) {
+          console.log(`  …（明细过长：已**保住全部 ${picked.named} 条指名行**，本段共打印 ${picked.lines.length} 行，`
+            + `另有 ${picked.dropped} 行未展开 —— 完整输出：`
+            + `${r.logFile ? path.relative(env.paths.root, r.logFile) : '（无日志文件）'}）`);
+        }
       }
       console.log('\n提示：单独复跑某个脚本：node tests\\<名称>.js');
       console.log(`\n本次各脚本输出已落盘：${path.relative(env.paths.root, path.join(env.paths.verify, 'run-all'))}\\`);
@@ -1042,7 +1248,9 @@ async function main() {
 /* 被 require 时**不执行**：`harness-check` 要直接引用 classify/parseSummary/authorityBlockers/
    REGISTERED_DEVIATIONS 做规则回归，不能因为 require 一下就把全部门禁跑一遍。 */
 module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals, authorityBlockers,
-  REGISTERED_DEVIATIONS, failedAssertionNames, resolveGateOutcome, finalExitCode };
+  REGISTERED_DEVIATIONS, failedAssertionNames, resolveGateOutcome, finalExitCode,
+  /* `E88⒝` 的明细选取是纯函数 ⇒ 一并导出，供定点回归直接调用（判据见该函数注释） */
+  pickDetailLines, DETAIL_MAX_LINES, CAPTURE_SUITE };
 
 if (require.main === module) {
   main().catch(err => {
