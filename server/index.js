@@ -321,10 +321,15 @@ const state = {
   /** W5-①：事件总线与链路状态监控（优雅退出时都要收尾：退订/清定时器/释放缓冲） */
   bus: null,
   linkMonitor: null,
-  /** DR-05 写入点（E58 ②）的运行计数：`writes` 累计成功、`failures` 累计失败 + 最后一次原因。
+  /** DR-05 写入点（E58 ②）的运行计数：`writes` 累计成功、`failures` 累计失败 + 最后一次原因、
+   *  `skippedNoUnit` 累计"**帧拿不到件序号 ⇒ 本件不固化**"的次数（E60 裁定①）。
    *  为什么要它：固化失败**不许污染采集链**（故 `persistJudgement()` 只记不抛），
-   *  但"悄悄不写"必须看得见 —— 与 `ingest` 计数 `sampledHookFailures` 同一纪律。 */
-  resultWrite: { writes: 0, failures: 0, lastError: null },
+   *  但"悄悄不写"必须看得见 —— 与 `ingest` 计数 `sampledHookFailures` 同一纪律。
+   *  ⚠ **三个计数互不代偿**（`T-20261003-02` 补 `/health` 出口时定下的口径）：
+   *    `writes`＝真的落了行；`failures`＝想落但落不进去；`skippedNoUnit`＝**根本没打算落**
+   *    （件序号拿不到 ⇒ 按"拿不到"处理，见 `unitIndexOf()` 的 docblock）。
+   *    把后两者并成一个数，就等于又把"拿不到"与"真是 0"混了一次 —— 那正是 `E60` 的病灶。 */
+  resultWrite: { writes: 0, failures: 0, lastError: null, skippedNoUnit: 0 },
   /** DR-06（`shift_stat`，技术债 `E59`）写入点的运行计数 ＋ **跨班检测的进程内状态**：
    *  · `writes` 累计成功固化/补记的班次行数、`backfills` 其中"错过边界后补记"的行数、
    *    `failures` 累计失败 + 最后一次原因（失败**只记不抛**：固化是派生，不许污染采集链）；
@@ -433,11 +438,21 @@ function healthPayload() {
        E58 的临时闸（`orderDoneSourceReady` / `orderWarningSource` 抑制字段）已随
        `T-20260930-08` 拆除 —— 抑制事实不再需要"可被读到"，因为抑制已不存在：
        件数由写入点（1 s 采样落库之后按件 upsert）驱动，真值是多少就报多少。
-       DR-05 写入点的运行计数见 `state.resultWrite`（失败不静默）。 */
+       ⚠ `T-20261003-02` 补出口：上一句历史上写的是"运行计数见 `state.resultWrite`"，但那个计数器
+       **只在进程内存里、`/health` 一个字都不搬运它**（`shiftStatWrite` / `warningWrite` 都已搬运）
+       ⇒ "FR-5.11 的减数到底写没写、写失败没有"在外部**读不到**，与 `persistJudgement()` 自述的
+       "悄悄不写必须看得见"相悖。现按**同一风格**搬运（键恒在；`null`＝"还没有过错误"与 `0`
+       分得开），三个计数见下方 `resultWrite` 块。 */
     lastError: state.lastError,
-    /* ---- ADR-0009（T-20261002-05）新增的三块可观测字段（沿 `state.resultWrite` 先例）----
-       DR-06／DR-08 的写入点都是"失败只记不抛"（不许污染采集链），故**必须**能从这里读到"写没写、
-       写失败没有、上次是哪个班次/哪类预警"；`null` 与 `0` 的含义分开（键恒在）。 */
+    /* ---- 三块写入点的可观测字段（`resultWrite` 由 `T-20261003-02` 补齐；另两块沿 ADR-0009 / T-20261002-05）----
+       DR-05／DR-06／DR-08 的写入点都是"失败只记不抛"（不许污染采集链），故**必须**能从这里读到
+       "写没写、写失败没有、上次是哪个班次/哪类预警"；`null` 与 `0` 的含义分开（键恒在）。 */
+    resultWrite: {
+      writes: state.resultWrite.writes,
+      failures: state.resultWrite.failures,
+      lastError: state.resultWrite.lastError,
+      skippedNoUnit: state.resultWrite.skippedNoUnit
+    },
     shiftStatWrite: {
       writes: state.shiftStatWrite.writes,
       backfills: state.shiftStatWrite.backfills,
@@ -496,7 +511,7 @@ async function start(options = {}) {
   state.stopping = null;
   state.lastError = null;
   /* DR-05 写入点的运行计数随本轮启动归零（与 lastError 同一处纪律：上一轮的失败不该赖在新一轮头上） */
-  state.resultWrite = { writes: 0, failures: 0, lastError: null };
+  state.resultWrite = { writes: 0, failures: 0, lastError: null, skippedNoUnit: 0 };
   /* DR-06／DR-08 写入点的计数与"上次所见班次"同理归零（跨班检测的进程内记忆不得跨启动沿用） */
   state.shiftStatWrite = {
     writes: 0, backfills: 0, failures: 0, lastError: null,
@@ -1133,6 +1148,11 @@ async function start(options = {}) {
           最终行为是**该类不产生**，而不是发一条按旧件数算出来的预警。 */
     const unitIndex = unitIndexOf(frame);
     const hasUnit = unitIndex !== null;
+    /* E60 裁定①：件序号拿不到 ⇒ 本件**不固化**。"没写"与"写失败"是两件事（故不并进 `failures`），
+       但也不能是个黑洞 ⇒ 单记一个 `skippedNoUnit`（读口＝`GET /health` 的 `resultWrite.skippedNoUnit`）。
+       ⚠ 与 `ingest.status().frameUnitIndex.withoutIndex`（`/health.frameUnitIndex`）**不是同一个数**：
+       那个数的是**落库的帧**、这个数的是**判定点被跳过的件**，分母不同、不互相代偿（两处都要能读）。 */
+    if (!hasUnit) state.resultWrite.skippedNoUnit++;
     const shouldDone = hasUnit ? shouldDoneOf(task, at) : undefined;
     const doneQty = hasUnit ? doneQtyOf(procOrderNo) : undefined;
     /* ---- 第一拍：取 `result` 去固化（**不发布**：发布权只留下面那一处） ----
@@ -1452,9 +1472,11 @@ async function start(options = {}) {
   logger.info(`[DR-05] result 表写入点已接线（技术债 E58 ② 收口）：与判定同拍（onSampled＝1 s 采样落库之后）` +
     `按件 upsert（键 proc_order_no+unit_index，唯一索引 ux_result_unit）；结果＝**本看板判定**（FR-3.13，` +
     `不采信 IF-D 的 result，C-102）；judged_at=判定时刻（注入时钟）、duration_sec=该件首末有效帧采集时刻差；` +
-    `待复检不计"已完成"（与 stats.DONE_STATUS 同口径）；写失败只记不抛（state.resultWrite.failures）。` +
+    `待复检不计"已完成"（与 stats.DONE_STATUS 同口径）；写失败只记不抛（T-20261003-02 起计数与读口同备：` +
+    `**计数见 /health.resultWrite** 的 writes／failures／skippedNoUnit，三者互不代偿）；` +
     `E58 的临时抑制闸已按裁定**整段拆除** ——「已完成件数」现在由本条写入点说话；` +
-    `**拿不到件序号（帧未带/非法 unitIndex）⇒ 本写入点整条不跑**（不再缺省 1，E60 裁定①）`);
+    `**拿不到件序号（帧未带/非法 unitIndex）⇒ 本写入点整条不跑**（不再缺省 1，E60 裁定①，` +
+    `该次数单记在 /health.resultWrite.skippedNoUnit，**不并进 failures**）`);
   logger.info(`[DR-06] shift_stat 写入点已接线（技术债 E59 收口／ADR-0009 D1＋D3）：触发点=**同一个 1 s 采样 tick**` +
     `（不新增定时器）内检测跨班 ⇒ 固化上一班，被跳过的边界**下次采样按序补记**（重启后从 measure_rt 回读上次所见班次）；` +
     `取数=stateSnapshot.statsForShift()（与 GET /state 同一份 SQL）；` +
