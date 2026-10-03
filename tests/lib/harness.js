@@ -167,8 +167,9 @@ function makeTempDb(options = {}) {
       handles.length = 0;
       try {
         /* `E46`：本用例目录里可能被放进 junction（F4/F9 那类链接实验就在临时树里做）
-           ⇒ 走安全删除（是链接只拆链、否则等价于原 `rmSync`）。 */
-        removeLinkSafe(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 });
+           ⇒ 走安全删除（是链接只拆链、否则等价于原 `rmSync`）。定义已按 `T-20261003-14`
+           搬到 `tests\env.js`（单一真源）⇒ 这里从 `env` 取，取到的是同一个函数对象。 */
+        env.removeLinkSafe(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 });
       } catch (e) {
         problems.push('rm: ' + e.code + ' ' + e.message);
         /* 逐个文件探测：定位到底哪个文件仍被占用（Windows 上常见于 -wal/-shm 未释放） */
@@ -177,7 +178,7 @@ function makeTempDb(options = {}) {
             try { fs.rmSync(path.join(dir, n), { force: true }); }
             catch (e2) { problems.push(`占用: ${n} → ${e2.code}`); }
           }
-          removeLinkSafe(dir, { recursive: true, force: true });
+          env.removeLinkSafe(dir, { recursive: true, force: true });
         } catch { /* 已尽可能清理 */ }
       }
       handle.closeProblems = problems;
@@ -285,7 +286,7 @@ async function startService(opts) {
         while (proc.exitCode === null && Date.now() < until) await new Promise(r => setTimeout(r, 50));
       }
       try { fs.closeSync(fd); } catch { /* 忽略 */ }
-      try { removeLinkSafe(dir, { recursive: true, force: true }); } catch { /* 忽略 */ }   /* E46 安全删除 */
+      try { env.removeLinkSafe(dir, { recursive: true, force: true }); } catch { /* 忽略 */ }   /* E46 安全删除 */
     }
   };
 }
@@ -340,122 +341,30 @@ function countEntriesDeep(dir) {
 }
 
 /* ==========================================================================
-   `E46`（★★★）**链接安全删除** —— 改任何"删目录"的调用点前先读完这一段
+   `E46`（★★★）**链接安全删除** —— 改任何"删目录"的调用点前先读完 `tests\env.js` 的那一段
    --------------------------------------------------------------------------
-   立案（2026-09-28）：座位为 F4 越权实验在仓库里建了 `src\zz-* -> tests` 的 **junction**，
-   第一版探针用 `fs.rmSync(link, { recursive: true, force: true })` 拆链。**纪律结论（保持）**：
-   **拆链接只能用"非递归的 unlink/rmdir 语义"，任何"递归删除"工具一律不得作用在链接目录上。**
-
-   ① **为什么 `rmSync(..., {recursive:true})` 可能**顺着链接**删到目标**
-      本机（win32 / Node v24.21.0）实测：`fs.rmSync(<junction>, {recursive:true,force:true})` 的 **10 种写法
-      都没有跟随**（含 `link\`、`link/`、全套 maxRetries/retryDelay、`rmdirSync(link,{recursive:true})`、
-      把 junction 当 cwd 占住、给 junction 打只读属性），每次都只拆链、目标 3 个文件逐字节仍在
-      （取证见 `tests\._verify\e46\probe-raw*.js`／`probe-danger.js` 的 `..out.json`）。
-      **但"没跟随"是当前实现细节的巧合，不是保证** —— Node 自己的实现里就有两条**会跟随**的分支：
-      `internal/fs/rimraf.js` 先 `lstat(path)`（链接 ⇒ 取 `unlink` 分支，安全），
-      可一旦 `lstat` 或 `unlink` 报 **EPERM**（Windows 上杀软/ACL/被占用都可能），
-      就落到 `fixWinEPERM()` —— 它 `chmod` 之后用的是 **`stat()`（跟随链接！）**，
-      于是 `isDirectory()===true` ⇒ `_rmdir()` ⇒ 目录非空 ⇒ `_rmchildren()` ⇒ **`readdir(link)` 穿过 junction**
-      逐个 `rimraf` ⇒ **目标目录内容被删**；`unlink` 报 `EISDIR` 时走的也是同一条 `_rmdir` 路。
-      ⇒ 结论：**危险分支在源码里可达，只是"当前这台机器/这个错误路径"没被选中**；
-      换 Node/libuv 版本、换 ACL/杀软状态就可能选中。故"别对链接用递归删除"是**纪律级**要求，
-      不能靠"实测没炸"来豁免。
-      另外**真的会跟随**的两件事（实测复现）：`robocopy <空目录> <junction> /MIR` ⇒ 目标 3 文件 → **0**
-      （X4）；`fs.readdirSync(<link>, {recursive:true})` ⇒ 直接列出目标内的条目（T5）。
-      全仓 **零** `robocopy` 调用、**零** `readdirSync(..., {recursive:true})` 调用 —— 继续保持。
-
-   ② **为什么 `lstatSync` 不跟、`statSync` 跟**
-      `lstat` ＝ "link status"：它返回**目录项自身**的信息。Windows 上 junction/符号链接是 reparse point，
-      `lstatSync(link)` 实测给出 `isSymbolicLink()===true`、`isDirectory()===false`（`statSync(link)` 则相反：
-      `isDirectory()===true`）⇒ **用 `lstatSync` 判"是不是链接"这个动作本身不会触碰目标**，
-      这就是本文件 `countEntriesDeep`（上面）与 `tests\harness-check.js` 同名工具的既有正确做法。
-      推论：**凡"要进入某个目录"的遍历，都该用 `lstatSync`（或 `readdirSync(…,{withFileTypes:true})`
-      后判 `isDirectory()`，因为 dirent 对 junction 报 `isSymbolicLink()===true`）；
-      只有确实要"穿透链接读目标"时才用 `statSync`。**（反例：`tests\ui-check.js:5273` 用 `statSync().isDirectory()`
-      递归扫描 `src\` ⇒ 会跟随链接出圈。）
-
-   ③ **为什么 `rmdirSync(link)` 只拆链**
-      `fs.rmdirSync(link)` 在 Windows 上落到 `RemoveDirectoryW`，删的是**那个目录项（reparse point）本身**，
-      不进入目标；**非递归** ⇒ 目录非空也不遍历 ⇒ 目标一条不动（实测 `rmdirSync` 成功、目标 3/3 不变）。
-      它与 `cmd /c rmdir <link>` 是**同一个内核动作**，所以既满足 `E46` 的纪律，又不必起子进程
-      （省掉管道/编码那一族风险，参见 `E40`）。`fs.unlinkSync(link)` 在新 libuv 上对 junction 也成功
-      （`DeleteFileW` 失败后回退 `RemoveDirectoryW`），故作为**兜底**：两法都非递归，
-      物理上都没有"进入目标"的能力。
-   ========================================================================== */
-
-/** 路径**自身**是不是链接（Windows junction／符号链接）——用 `lstatSync`，绝不跟随（见上面 ②）。
- *  @param {string} target @returns {boolean} */
-function isLink(target) {
-  try { return fs.lstatSync(target).isSymbolicLink(); }
-  catch { return false; }                                        /* 不存在/读不到 ⇒ 不是链接 */
-}
-
-/**
- * **安全删除**"可能是链接"的路径（`E46`）：先 `lstatSync` 判链接 ——
- *   · **是链接** ⇒ **只拆链、绝不递归**（`rmdirSync` 优先、`unlinkSync` 兜底）；
- *   · 不是链接 ⇒ 目录且 `recursive` ⇒ 才允许 `rmSync(…, {recursive:true})`；非目录 ⇒ unlink 语义。
- * 与 `rmSync` 的差别**只在链接这一支**：其余分支行为与原来逐字一致（含 `force`／`maxRetries`／`retryDelay`），
- * 故替换现有调用点不改变正常路径的读数（`E90` 的五条不变量判据照样成立）。
- * ⚠ **残余面（据实登记）**：`recursive` 这一支内部仍用 `rmSync` —— 它删的是**真实目录**，
- *   但若那个目录**里面**还有一个链接，理论上仍会落到 ① 里的危险分支。本机实测：`rmSync` 与
- *   `Remove-Item -Recurse` 都不穿（D2/X5/X6），**只有 `robocopy /MIR` 穿**（X7：目标 2 文件 → 0）；
- *   需要连"目录内部的链接"一起防时，调用点必须先按 `lstatSync` 把内部链接逐个拆掉
- *   （`countEntriesDeep` 就是这种 lstat 遍历），或改用只走 lstat 的删除实现。
- * @param {string} target
- * @param {{recursive?:boolean, force?:boolean, maxRetries?:number, retryDelay?:number}} [options]
- *        `recursive` 默认 `true`（＝原 `rmSync` 语义）；`force` 默认 `true`（路径已不存在时**不抛**）
- * @returns {{kind:'link'|'dir'|'file'|'missing', removed:boolean, via:string, target:string}}
- * @throws 非 `force` 的 `ENOENT`；以及"拆链两法都失败"（错误里同时带两个 errno，便于定位）
- */
-function removeLinkSafe(target, options = {}) {
-  const recursive = options.recursive !== false;
-  const force = options.force !== false;
-  const maxRetries = options.maxRetries === undefined ? 0 : options.maxRetries;
-  const retryDelay = options.retryDelay === undefined ? 0 : options.retryDelay;
-
-  let st;
-  try {
-    st = fs.lstatSync(target);                                   /* ← 只取"目录项自身"，不跟随（②） */
-  } catch (err) {
-    if (force && err.code === 'ENOENT') return { kind: 'missing', removed: false, via: 'none', target };
-    throw err;
-  }
-
-  if (st.isSymbolicLink()) {                                     /* ← 链接：只拆链（①③） */
-    try {
-      fs.rmdirSync(target);                                      /* RemoveDirectoryW：删目录项本身 */
-      return { kind: 'link', removed: true, via: 'rmdirSync', target };
-    } catch (e1) {
-      try {
-        fs.unlinkSync(target);                                   /* 兜底（文件型符号链接等） */
-        return { kind: 'link', removed: true, via: 'unlinkSync', target, rmdirError: e1.code };
-      } catch (e2) {
-        if (force && (e2.code === 'ENOENT' || e1.code === 'ENOENT')) {
-          return { kind: 'missing', removed: false, via: 'none', target };
-        }
-        const err = new Error(`拆链失败（rmdirSync=${e1.code || e1.message}／unlinkSync=${e2.code || e2.message}）：${target}`);
-        err.code = e2.code; err.rmdirCode = e1.code;
-        throw err;
-      }
-    }
-  }
-
-  if (st.isDirectory()) {                                        /* 真实目录：原语义 */
-    if (!recursive) { fs.rmdirSync(target); return { kind: 'dir', removed: true, via: 'rmdirSync', target }; }
-    fs.rmSync(target, { recursive: true, force, maxRetries, retryDelay });
-    return { kind: 'dir', removed: true, via: 'rmSync', target };
-  }
-
-  fs.rmSync(target, { force });                                  /* 普通文件：unlink 语义 */
-  return { kind: 'file', removed: true, via: 'rmSync', target };
-}
+   `T-20261003-14`（2026-10-03）**定义搬家**：`isLink()`／`removeLinkSafe()` 的**定义**（连同
+   上面那一整段 `E46` 立案/实测/纪律说明）已经搬到 **`tests\env.js`** —— 因为 `env.js` 的
+   `cleanupStaleTemp()`（`E101`）自己要用它们，而 `env.js` **绝不能**反向 require 本文件
+   （`harness.js` 顶层 `require('../env')` ⇒ 会成环：谁先进谁拿到半成品）。
+   ⇒ 依赖方向永远只有 `lib\harness.js → env.js` 一条单箭头；定义**只有一份**。
+   本文件下面的 `isLink`／`removeLinkSafe` 是**再导出**（`E46` 那批调用点仍然从 `harness` 取，
+   取到的是**同一个函数对象** ⇒ 行为一字不变，只是定义搬了家）；文件内部一律走 `env.*` 调用。
+   **纪律结论（保持）**：**拆链接只能用"非递归的 unlink/rmdir 语义"，任何"递归删除"工具
+   一律不得作用在链接目录上** —— 理由（危险分支可达、`statSync` 跟随／`lstatSync` 不跟、
+   `rmdirSync(link)` 只拆链）与全部实测取证见 `tests\env.js` 顶部那一段。 */
+const isLink = env.isLink;                                     /* E46：lstatSync 判链接（不跟随） */
+const removeLinkSafe = env.removeLinkSafe;                     /* E46：是链接只拆链，否则等价 rmSync */
 
 /**
  * 清理测试临时区。
  *
  * `force=false`（日常收尾，`run-all` 全绿时调用）：只清**公共根**下超过 24 小时的
  *   **整轮目录**（`run-<pid>-…`）—— 本轮目录刚建、mtime 是新的，故自己与别人的这一清理都
- *   命不中它；返回 `{removed, kept}`（**条数**，与旧口径一致，`harness-check` §五按其类型判）。
+ *   命不中它；返回 `{removed, kept, removedLedgers}`（`removed`/`kept` 是**条数**，与旧口径一致，
+ *   `harness-check` §五按其类型判）。`T-20261003-14`（`E105`）起，**同一份 24h 口径**也回收
+ *   `tests\._verify\` 根下过期的**子集轮账本** `run-totals.subset-*.json`，计入 `removedLedgers`
+ *   （**主账本 `run-totals.json` 是 `docs-cross-check` 的取数面，永不被这条清扫碰到**）。
  *   **公共根口径不写第二份**：清扫策略与目标都在 `tests\env.js` 的 `cleanupStaleTemp()` 里
  *   （`T-20261003-10` 收口后它**就是**清公共根，不再需要"临时把 `tempRoot` 指回公共根"那种
  *   改写单源对象的做法 —— 那既容易被别处观察到，也是"同一份数据两处口径"的温床）。
@@ -478,7 +387,7 @@ function cleanup(force = false) {
   try {
     /* `E46`：本轮目录**自身**若被人换成了链接（或别人在它里面留了链接），"递归删"就必须让位给
        "只拆链" —— 辅助里那一步 `lstatSync` 就是判据；非链接时行为与原来逐字一致。 */
-    removeLinkSafe(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 });
+    env.removeLinkSafe(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 });
   } catch (err) {
     errors.push(`${(err && err.code) || 'ERR'}: ${(err && err.message) || String(err)}`);
   }
