@@ -11,6 +11,9 @@
      node tests\run-all.js --only a,b     只跑指定脚本（逗号分隔，不用写 .js）
      node tests\run-all.js --no-preflight 不跑体检
      node tests\run-all.js --list         只列出脚本清单
+     node tests\run-all.js --ledger <p>   指定本轮实跑账落盘路径（默认见下方 `E99` 段：
+                                         全量/`--fast` ⇒ 主账本 `run-totals.json`；
+                                         `--only` 子集轮 ⇒ 自己的 `run-totals.subset-<pid>.json`）
    前置（**2026-10-03 起，`E91` 收尾**）：本轮若含 `screenshot-diff`，会在**任何脚本启动之前**
          先跑一次 `node tests\capture-baseline.js --out tests\._verify\captures` 刷新候选图；
          刷不出来（无 Edge／沙箱禁命名管道／捕获失败）⇒ **当场判红并写明原因**，绝不静默跳过
@@ -122,6 +125,89 @@ function resolveJobs() {
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 1) return 1;
   return Math.max(1, Math.min(16, Math.floor(n)));
+}
+
+/* ==========================================================================
+   **实跑账的落盘路径**（`E99` 收口；2026-10-03 座位 4 的 `T-20261003-13`）
+   --------------------------------------------------------------------------
+   事故形态（`E99`，2026-10-03 由 4b 在 `T-20261003-08` 中顺带实测立案）：账本文件名原先
+   **写死** `tests\._verify\run-totals.json`，而**每一种**模式（全量／`--fast`／`--only`）都写它
+   ⇒ 一次**子集轮**（`--only <子集>`）就把这份**共享账本**覆写成"只剩它跑过的那几个脚本"的子集账。
+   `tests\docs-cross-check.js` 第十一节读的正是这条路径（`docs-cross-check.js:721`），读到子集账 ⇒
+   触发它的"**前提不成立**"分支（`D20`，`docs-cross-check.js:779`）并**退化为逐项实跑**
+   （自己把 12 个离线脚本再跑一遍）⇒ ① 与并发脚本抢 CPU/端口，实测出**假红**
+   （`每个有声明的离线门禁都拿到了实跑值 … 拿不到汇总行 1 个`／`第十一节的实跑值取数不留空洞
+   … 无来源/实跑无结果：tools-check`）；② 任何独立跑 `docs-cross-check` 的人都可能落到慢路径
+   （本机实测探针墙钟 **37.3 s**）。`harness-check` 第十五节的嵌套调用（`--only <6 脚本>`，
+   见 `harness-check.js` §15 的 `S15_SUITES` ＋ `runFast15()`）就是最典型的子集轮调用方
+   （**按符号定位、不引行号** —— 那个文件由 4b 在飞维护，2026-10-03 一天内行号已漂移两次）。
+   ========================================================================== */
+
+/**
+ * 主账本文件名。**这个名字与路径是 `docs-cross-check` 第十一节的取数面，不得改名、不得搬家**：
+ * 它按 `path.join(env.paths.verify, 'run-totals.json')` **写死**读取（`docs-cross-check.js:721`），
+ * 而该文件是别的协作方在维护的文件（本批硬约束：不得改 `tests\docs-cross-check.js`）。
+ * 若为了"绕开 `E99`"而把主账本改名（例如统一改成 `run-totals-<pid>.json`），
+ * `docs-cross-check` 就**永远**读不到本轮账 ⇒ 权威对账的取数面被改坏（每轮都退化 +37 s，
+ * 且"逐脚本声明 ＝ 实跑值"那条断言会改走"逐项实跑"这条路）—— 那是比原缺陷更坏的结果。
+ * ⇒ 修法是让**子集轮写自己的账**，主账本的名字与路径**一字不动**（见 `resolveLedgerFile`）。
+ */
+const MAIN_LEDGER_NAME = 'run-totals.json';
+
+/**
+ * 解析本轮实跑账的落盘路径（**纯函数**：不碰 argv 解析结果之外的状态，便于定点回归）。
+ *
+ * 规则（优先级从高到低）：
+ *   ① `--ledger <path>` 显式指定 ⇒ 用它（相对路径按**仓库根**解析）；任何模式下都优先。
+ *   ② **子集轮**（本轮带 `--only`）⇒ 写**自己的**账本 `run-totals.subset-<pid>.json`，
+ *      主账本**一字不改**。**为什么子集轮不能覆写主账本**（本批的核心判据）：
+ *      主账本是一份"**本轮跑过的全部脚本**的实跑账"（`docs-cross-check` 第十一节拿它当
+ *      "每个离线门禁此刻的实跑通过数"的唯一快路径数据源，并把它与 `tests\README.md` 权威区
+ *      逐脚本比对）；而子集轮的账**天然残缺**（它只跑了几个脚本）。残缺账覆写共享账本 ⇒
+ *      下一位读者（`docs-cross-check`，无论它是被同一个 `run-all` 调的、还是被人**独立单跑**的）
+ *      会把"账本不全"读成"**账本过期/缺失**" ⇒ 退化为逐项实跑并报"前提不成立"。
+ *      即：一个**只为复核单个脚本**的子集轮，副作用是**污染全局对账数据源**并让权威对账变慢、
+ *      与并发脚本抢资源（`E99` 的两条后果）。子集轮**没有**义务也没有权利改写全局账本。
+ *   ③ 其余（**全量轮**与 `--fast`）⇒ 主账本 `run-totals.json`，与历史行为**逐字相同**。
+ *
+ * **为什么 `--fast` 不改道**（与 `--only` 区别对待，不是漏了）：`--fast` 的集合＝全部
+ * `!slow && !needBrowser` 的**离线门禁**（14 个），它落在主账本里照样**覆盖 `docs-cross-check`
+ * 的门禁清单**（那份清单就是"离线门禁"）⇒ 不触发"前提不成立"，无 `E99` 之害；而
+ * `harness-check` 第十五节的 `DSH_HARNESS_S15_FULL=1` 档**就是跑 `--fast`**，跑完随即按
+ * **写死的路径**回读这份账来比对"串行 vs 并行"两轮的 `suites`／`ranSuites`／`assertions`
+ * （§15-C：`runFast15()` 里回读 `run-totals.json` 的那两行 ＋ `okC15` 的顺序判据；
+ * 同样**按符号定位、不引行号**）。把 `--fast` 也改道 ⇒ §15-C 那两轮回读到**同一份
+ * 旧账** ⇒ 会拿"陈旧账 vs 陈旧账"去判"落账顺序"，把一条**本来可判定**的判据变成**假红**
+ * （而 `harness-check.js` 是本批**不得改**的文件）。⇒ 只让"确实会破坏门禁清单覆盖"的
+ * `--only` 改道，其余保持原样：**改动面最小，且不动任何判据**。
+ *
+ * **`[UNMET]` 那条判据必须留着**（本批硬约束，`ADR-0004` D21/D23）：`docs-cross-check` 第十一节的
+ * `t.requires('run-totals.json 的条目覆盖当前门禁清单…')`（`docs-cross-check.js:779`）是有价值的
+ * **护栏**：账本缺失/过期时**不许静默放过**，必须显式报"前提不成立"并退化为逐项实跑（退 1）。
+ * 本批**没有**删弱、放宽或绕过它（`docs-cross-check.js` 一个字节都没动）：要修的是"**正常的全量轮
+ * 与子集轮不该互相污染**"，而不是"让这条判据不再触发"。⇒ 修好之后，它**照样可触发、照样判红**：
+ * 删掉/清空主账本后单跑 `node tests\docs-cross-check.js`，仍会看到 `[UNMET] 前提不成立` 与退 1
+ * （实测证据见本批回执【证据】第 2.d 条：临时移走主账本 ⇒ `前提不成立` ＋ 退出码 1）。
+ *
+ * @param {{explicit?:?string, only?:?string, verifyDir?:string, pid?:number, root?:string}} [o]
+ * @returns {string} 账本绝对路径
+ */
+function resolveLedgerFile(o = {}) {
+  const explicit = o.explicit !== undefined ? o.explicit : optValue('--ledger');
+  const only = o.only !== undefined ? o.only : optValue('--only');
+  const verifyDir = o.verifyDir || env.paths.verify;
+  const pid = o.pid === undefined ? process.pid : o.pid;
+  const root = o.root || env.paths.root;
+  if (explicit) return path.resolve(root, explicit);
+  if (only) return path.join(env.ensureDir(verifyDir), `run-totals.subset-${pid}.json`);
+  return path.join(env.ensureDir(verifyDir), MAIN_LEDGER_NAME);
+}
+
+/** 本轮账本路径（只解析一次；`main` 打印它、`writeRunTotals` 写它，两处必须是同一个值）。 */
+let LEDGER_FILE = null;
+function ledgerFile() {
+  if (!LEDGER_FILE) LEDGER_FILE = resolveLedgerFile();
+  return LEDGER_FILE;
 }
 
 /* ---------------- 门禁清单 ----------------
@@ -479,6 +565,10 @@ function runScriptAsync(suite, pipesOk, quiet, sink) {
 /**
  * 把"截至此刻的实跑账"落盘。**只做留痕，不承担比对** —— 比对在收尾统一做
  * （见 verifyAuthorityTotals）；理由是 suite 成员读不到本轮最终账。
+ *
+ * **落盘路径**＝`ledgerFile()`（判据见上方 `E99` 段）：全量轮/`--fast` 写主账本
+ * `run-totals.json`（`docs-cross-check` 第十一节的取数面，路径不得改），
+ * `--only` 子集轮写自己的 `run-totals.subset-<pid>.json`（**不覆写主账本**，`E99` 的修法）。
  */
 function writeRunTotals(results) {
   try {
@@ -488,10 +578,18 @@ function writeRunTotals(results) {
     }, { passed: 0, failed: 0, skipped: 0 });
     const byStatus = st => results.filter(r => r.status === st).length;
     const offlineNames = SUITES.filter(s => !s.needBrowser).map(s => s.name);
-    const file = path.join(env.ensureDir(env.paths.verify), 'run-totals.json');
+    const file = ledgerFile();
+    const role = optValue('--ledger') ? 'explicit'
+      : (optValue('--only') ? 'subset' : 'main');
     fs.writeFileSync(file, JSON.stringify({
       at: new Date().toISOString(),
       mode: hasFlag('--fast') ? '--fast' : (optValue('--only') ? `--only ${optValue('--only')}` : 'default'),
+      /* 自述字段（**消费方不依赖它们**，只为让 `._verify\` 下的账本可自证来历）：
+         `role`＝main（全量/--fast，主账本）｜subset（--only 子集轮，**不是**主账本）｜explicit（--ledger）；
+         `mainLedger`＝主账本的仓库相对路径（子集轮据此说明"主账本在哪、我没动它"）；`pid`＝写它的进程。 */
+      role,
+      mainLedger: path.relative(env.paths.root, path.join(env.paths.verify, MAIN_LEDGER_NAME)),
+      pid: process.pid,
       expectedOffline: offlineNames,
       ranSuites: results.map(r => r.suite.name),
       assertions: agg,
@@ -905,6 +1003,18 @@ async function main() {
   console.log(`  ${env.describe()}`);
   console.log(`  共 ${suites.length} 个脚本${hasFlag('--fast') ? '（--fast：已跳过浏览器类与长跑）' : ''}${resolveJobs() > 1 ? `（--jobs ${resolveJobs()}：并行波 + 串行尾）` : ''}\n`);
 
+  /* 本轮账本落哪 —— **必须一眼可见**：子集轮改道（`E99`）若只体现在行为上，读者会以为
+     主账本被这轮刷新过（它其实**一字未动**）；反过来，全量轮也要能证明自己写的是主账本。
+     这一行只是**说明**，不参与任何判据。 */
+  {
+    const lf = ledgerFile();
+    const rel = path.relative(env.paths.root, lf);
+    const isSubset = !optValue('--ledger') && Boolean(optValue('--only'));
+    console.log(isSubset
+      ? `  实跑账：${rel}（**子集轮写自己的账**，主账本 ${MAIN_LEDGER_NAME} **一字不改** —— 见 resolveLedgerFile 的 E99 说明）`
+      : `  实跑账：${rel}（主账本：docs-cross-check 第十一节按此路径取"每个离线门禁的实跑值"）`);
+  }
+
   /* **运行开始时**的工作区快照（见上方"工作区稳定性判定"与 lib/snapshot.js）。
      采集点很关键：必须在**任何子进程（含体检）启动之前** —— 体检与各门禁脚本都读工作区，
      它们之间的改写同样属于"运行期间被改写"。快照自身只读、且落点 `tests\._verify\` 已被排除，
@@ -1263,7 +1373,10 @@ async function main() {
 module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals, authorityBlockers,
   REGISTERED_DEVIATIONS, failedAssertionNames, resolveGateOutcome, finalExitCode,
   /* `E88⒝` 的明细选取是纯函数 ⇒ 一并导出，供定点回归直接调用（判据见该函数注释） */
-  pickDetailLines, DETAIL_MAX_LINES, CAPTURE_SUITE };
+  pickDetailLines, DETAIL_MAX_LINES, CAPTURE_SUITE,
+  /* `E99` 的账本路径判定是纯函数 ⇒ 一并导出（主账本名也在内），供定点回归直接调用
+     —— 判据：①全量 ⇒ 主账本；②`--only` ⇒ 自己的账本且**不是**主账本；③`--ledger` ⇒ 显式值优先。 */
+  resolveLedgerFile, MAIN_LEDGER_NAME };
 
 if (require.main === module) {
   main().catch(err => {
