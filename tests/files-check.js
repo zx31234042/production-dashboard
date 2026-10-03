@@ -139,10 +139,51 @@ t.check('仓库内没有 .tmp / ~$* / ._* / *.db / 副本类临时文件', junk.
   junk.slice(0, 5).join('、'));
 
 /* 测试产生的临时库必须落在 tests/._verify 之内（D16） */
-const tempRoot = env.paths.tempRoot;
-const strayDb = fs.existsSync(tempRoot)
-  ? fs.readdirSync(tempRoot).filter(n => /\.db(-wal|-shm)?$/.test(n))
-  : [];
+/* ==========================================================================
+   **散落库判据的扫描范围 —— `T-20261003-10`（2026-10-03）单一真源化后必须这样扫**
+   （`E90` 的临时区定义已从 `lib\harness.js` 搬到 `tests\env.js`；改本段前先读完）
+   --------------------------------------------------------------------------
+   ① **定义在哪**：`tempRootBase`（公共根 `tests\._verify\tmp`）与按轮次的 `tempRoot`
+      （`<base>\run-<pid>-<启动时刻>-<4hex>`）都定义在 `tests\env.js`，
+      **任何**脚本 require 它都看到同一口径（不再"加载 harness 才看到本轮目录"）。
+   ② **谁看到什么（本脚本的处境）**：本脚本**不加载** `lib\harness.js` ⇒ 收口**前**它看到的
+      `tempRoot` 是**公共根**；收口**后**是**本轮专属子目录**（本轮目录通常**不存在**，
+      因为本脚本自己不写临时区）。
+      ⚠ 所以**绝不能**把下面这段写成 `readdirSync(env.paths.tempRoot)` 就完事 ——
+      那会让判据变成"只扫自己那层空目录"⇒ **恒真（空洞化）**，等于把这条防线删掉。
+   ③ **扫什么（"临时区的根级别"，两个层次，都不是递归）**：
+        ① 公共根 `tempRootBase` 的顶层 —— 原判据的语义：散落库不得躺在公共根下；
+        ② 公共根下**每个整轮目录** `run-*` 的顶层 —— 轮次隔离（`E90`）后"根"多了一层，
+           他路（另一个门禁进程／另一个座位）把 `.db` 落在 `run-<pid>-…/` 顶层同样要发现。
+      改动前后"实际扫到了什么"的实测（2026-10-03，`T-20261003-10`）：
+        · 改动前：公共根顶层一个 `stray-probe-t1.db` ⇒ **FAIL（10 通过/1 失败，退 1）**；
+          而 `run-999999-…\stray-in-run.db` ⇒ **11/0 通过（漏掉）** —— `E90` 之后真实产物
+          全在 `run-…` 那一层，旧扫描面已**够不着**它们。
+        · 改动后：两处都 ⇒ **FAIL 并指名文件**；正常情况下（两处都无 `.db`）仍是 11/0。
+   ④ **为什么不递归到各用例自己的子目录**：用例库**按设计**就叫
+      `<run-…>\<case>-…\test.db`（"各用例自有子目录"），递归会把**合法**的用例库判成散落库
+      ⇒ 并发跑门禁时必然假红（`E90` 正是为消这类假红而立的）。故本判据的语义仍是
+      "**临时区的根级别**不许有库文件"，只把 `E90` 新增的那一层补齐。
+   ========================================================================== */
+const tempRootBase = env.paths.tempRootBase;                  /* 公共根（定义在 tests\env.js） */
+/** 公共根下的整轮目录名（`run-<pid>-<启动时刻>-<4hex>`）；读不到就当空（清扫可能刚把它删了） */
+const tempRunDirs = (() => {
+  try {
+    return fs.readdirSync(tempRootBase, { withFileTypes: true })
+      .filter(e => e.isDirectory() && /^run-/.test(e.name))
+      .map(e => e.name);
+  } catch { return []; }
+})();
+/** 在"临时区根级别"（公共根顶层 ＋ 每个整轮目录顶层）找散落库文件 */
+const strayDb = [];
+for (const [label, dir] of [['公共根', tempRootBase],
+  ...tempRunDirs.map(n => [n, path.join(tempRootBase, n)])]) {
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { continue; }    /* 目录可能刚被别的轮次收走 */
+  for (const n of names) if (/\.db(-wal|-shm)?$/.test(n)) strayDb.push(`${label}\\${n}`);
+}
+t.info(`散落库扫描面：公共根顶层 ＋ ${tempRunDirs.length} 个整轮目录顶层`
+  + `（共 ${1 + tempRunDirs.length} 处；**不**递归进各用例自有子目录 —— 用例库按设计就在那些子目录里）`);
 t.check('临时区根目录没有散落的库文件（各用例自有子目录）', strayDb.length === 0,
   strayDb.slice(0, 3).join('、'));
 

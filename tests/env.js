@@ -1,6 +1,9 @@
 /* ==========================================================================
    测试环境常量与校验（tests/env.js）
    作用：集中定义测试侧的环境开关、路径与运行时下限，供 tests/ 下所有脚本引用。
+        其中**临时区的两个键**（`tempRootBase`＝公共根、`tempRoot`＝本轮专属目录）是 `E90`
+        "按轮次隔离"的**唯一定义处** —— 所有脚本（含**不加载** `lib\harness.js` 的那些）
+        看到的都是同一口径；详见下面"临时区"那一段。
         业务代码**不得**引用本文件（业务走 platform/paths.js）。
    依据：ADR-0003（测试环境）D16 环境与目录隔离、D17 夹具与临时库策略；规范 9.5-5。
    依赖：仅 Node 内置模块。
@@ -11,6 +14,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { randomBytes } = require('node:crypto');
 
 /* ---------------- 运行时下限 ----------------
    node:sqlite 在 Node 22.5+ 存在但为实验性（需 --experimental-sqlite），Node 24 起免标志。
@@ -62,11 +66,44 @@ const TESTS = path.join(ROOT, 'tests');
 /** 测试可写区（已被 .gitignore 忽略）；临时库、日志、截图都落在这里 */
 const VERIFY = path.join(TESTS, '._verify');
 
+/* ==========================================================================
+   **临时区：公共根 与 本轮专属目录（`E90` 的唯一定义处）**
+   `T-20261003-10`（2026-10-03）单一真源化 —— 改这里的任何一行前先读完这一段。
+   --------------------------------------------------------------------------
+   ① **定义在哪**：就在下面这三行（`TEMP_ROOT_BASE`／`RUN_STAMP`／`RUN_TEMP_ROOT`）与
+      `paths` 里的 `tempRootBase`／`tempRoot`。**别处一律只读 `env.paths`，不得再定义第二份**。
+      历史（为什么要收口）：`E90`（临时区按轮次隔离）最初把定义**注入式**写在
+      `tests\lib\harness.js` 的顶层 —— require 它时才把这两个键写进 `env.paths`。于是同一份语义
+      出现两处不一致：**加载 harness** 的脚本（`db-check`／`preflight`／`harness-check`…）看到的是
+      **本轮专属**目录；而**不加载 harness** 的脚本（`files-check`／`platform-check`／`docs-check`…）
+      看到的仍是**公共根**。现在两个键在本文件（＝"路径集"的定义处）**一次算好**，
+      任何脚本 require 本文件都看到同一口径；`lib\harness.js` 只**校验**这套语义（见该文件顶部）。
+   ② **谁看到什么**（收口后，与"是否加载 harness"无关）：
+        · `tempRootBase` ＝ **公共根** `tests\._verify\tmp` —— 各轮目录的**父目录**，
+          也是"过期清扫"（`cleanupStaleTemp`）的唯一对象；
+        · `tempRoot`     ＝ **本轮专属** `<base>\run-<pid>-<本地启动时刻>-<4 hex>` ——
+          本轮所有临时目录/临时库/子进程日志都落在它下面 ⇒ 任一路的 `cleanup(true)`
+          物理上删不到他路正在用的产物（`E90` 现场＝共用 `tests\._verify\tmp` 被别的路清掉）。
+      名字与用法**向后兼容**：`tempRoot` 仍是"可写的临时区"（preflight 的写探针、db-check 找
+      散落库文件、harness-check 数目录数、run-all 的 `cleanup(false)` 都照旧），只是它**现在对所有
+      脚本**都指向本轮子目录，而不再只是"加载了 harness 的那些"。
+  ③ **不加载 harness 的脚本要判"临时区根目录"的卫生时，不许只看 `tempRoot`**：本轮目录可能
+      空的、甚至不存在（该脚本自己不写临时区）⇒ 只看它会把判据变成**恒真**（空洞化）。
+      必须**同时**看公共根与各轮目录 —— 见 `tests\files-check.js` 第四节的扫描范围与理由。 */
+const TEMP_ROOT_BASE = path.join(VERIFY, 'tmp');               // 公共根：各轮目录之父
+const RUN_STARTED_AT = new Date();
+const pad2 = (n) => String(n).padStart(2, '0');
+const RUN_STAMP = `${RUN_STARTED_AT.getFullYear()}${pad2(RUN_STARTED_AT.getMonth() + 1)}${pad2(RUN_STARTED_AT.getDate())}`
+  + `T${pad2(RUN_STARTED_AT.getHours())}${pad2(RUN_STARTED_AT.getMinutes())}${pad2(RUN_STARTED_AT.getSeconds())}`;
+/* 随机后缀：Windows 的 pid 会复用 ⇒ 只按 pid ＋ 秒级时刻命名有"同名撞上旧轮残留"的理论窗口 */
+const RUN_TEMP_ROOT = path.join(TEMP_ROOT_BASE, `run-${process.pid}-${RUN_STAMP}-${randomBytes(2).toString('hex')}`);
+
 const paths = {
   root: ROOT,
   tests: TESTS,
   verify: VERIFY,                                              // 自检产物总目录（已忽略）
-  tempRoot: path.join(VERIFY, 'tmp'),                          // 临时库与临时目录
+  tempRootBase: TEMP_ROOT_BASE,                                // 公共根（各轮目录之父 ＋ 24h 清扫对象）
+  tempRoot: RUN_TEMP_ROOT,                                     // **本轮专属**临时区（E90：可写的就是它）
   testData: path.join(VERIFY, 'data', 'test'),                 // D16：测试唯一允许写的数据目录
   captures: path.join(VERIFY, 'captures'),                     // 截图候选目录（screenshot-diff 默认读这里）
   baseline: path.join(TESTS, 'screenshots-baseline')           // 基准图（只读，不要写入）
@@ -85,15 +122,20 @@ function isInsideVerify(target) {
 }
 
 /**
- * 清理过期的临时目录（默认 24 小时前）。
+ * 清理**公共根**（`paths.tempRootBase`）下过期的**整轮**临时目录（默认 24 小时前）。
+ * 为什么目标**不是** `paths.tempRoot`（这是 `T-20261003-10` 明确下来的口径）：`E90` 之后
+ *   `tempRoot` 是**本轮专属**目录 —— 它刚建、mtime 是新的，拿它当目标等于"一圈都清不掉"；
+ *   而"过期清扫"的语义本来就只对公共根下的 `run-<pid>-…` 成立（本轮与他路刚建的都不该被清）。
+ *   `lib\harness.js` 的 `cleanup(false)` 与 `run-all` 的全绿收尾都走这里 ⇒ "24 小时"只有这一份。
  * 返回 { removed, kept }；异常不抛出，避免影响门禁。
  */
 function cleanupStaleTemp(maxAgeMs = 24 * 3600 * 1000) {
   const result = { removed: 0, kept: 0 };
-  if (!fs.existsSync(paths.tempRoot)) return result;
+  const base = paths.tempRootBase;
+  if (!fs.existsSync(base)) return result;
   const now = Date.now();
-  for (const name of fs.readdirSync(paths.tempRoot)) {
-    const full = path.join(paths.tempRoot, name);
+  for (const name of fs.readdirSync(base)) {
+    const full = path.join(base, name);
     try {
       const st = fs.statSync(full);
       if (now - st.mtimeMs > maxAgeMs) { fs.rmSync(full, { recursive: true, force: true }); result.removed++; }

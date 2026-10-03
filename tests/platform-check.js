@@ -271,6 +271,14 @@ t.section('三、日志分级、按日滚动与保留清理（NFR-21）');
     })(), '应出现 -1.log 之类的序号文件');
 
   try { fs.rmSync(logDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  /* `T-20261003-10`（2026-10-03）单一真源化后，`env.paths.tempRoot` 是**本轮专属**目录
+     （定义在 `tests/env.js`：`<公共根>\run-<pid>-<启动时刻>-<4hex>`）—— 收口前本脚本
+     看到的还是公共根。本脚本**不加载** `lib/harness.js`，故没人替它收尾本轮目录。
+     上面已删掉本节自建的日志目录，这里**只在本轮目录已空时**把它一并收掉，免得每跑一次
+     就在公共根下留一个空目录（与 `preflight` 收掉写探针那一轮同一理由，P3-14）。
+     `rmdirSync` **非递归**：目录非空（还有别的产物）或已不存在 ⇒ 抛错被吞 ⇒
+     那些产物归公共根的 24 小时清扫（`env.cleanupStaleTemp`），绝不误删他物。 */
+  try { fs.rmdirSync(env.paths.tempRoot); } catch { /* 非空或已不在：交给 24h 清扫 */ }
 }
 
   t.finish();

@@ -9,6 +9,8 @@
          共用**临时根**会让并发跑的收尾互相删产物（`E90`：假红与"返回值说谎"）。
    依据：ADR-0003 D17；规范 9.5-5 第 3 条（一个用例一个库）；
          `E90`（2026-10-03）：临时区按轮次隔离 ＋ `cleanup(force)` 的返回值必须由**事实**推导。
+   路径口径：临时区两个键（`tempRootBase`＝公共根、`tempRoot`＝**本轮专属**目录）的**定义处**
+         是 `tests\env.js`（`T-20261003-10` 单一真源化）；本文件只**校验**它、不再写第二份。
    依赖：仅 Node 内置模块（node:sqlite 延迟加载，未达标时不因本文件报错）。
    用法：
      const { makeTempDir, makeTempDb, allocPort, startService, stall } = require('./lib/harness');
@@ -22,38 +24,69 @@ const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { randomBytes } = require('node:crypto');
 const env = require('../env');
 
 /* ---------------- 临时目录与临时库 ---------------- */
 
-/* 【E90（2026-10-03，★★★）临时区**按轮次隔离** —— 改任何临时路径前先读完这一段】
+/* 【`E90`（2026-10-03，★★★）临时区**按轮次隔离** —— 改任何临时路径前先读完这一段】
    旧版所有进程共用一个 `tests\._verify\tmp`，于是**任一路的 `cleanup(true)`**
    （＝ `rmSync(共享根, {recursive:true})`）会删掉**另一路正在用**的产物，实测两类假红：
      ① `harness-check` 里两条 `screenshot-diff` 判据读子进程日志**读回空串**（落点
         `harness-check.js:3972`）：另一路的 `cleanup(true)` 把本轮写进 `tmp\` 的日志删了；
      ② `harness-check` §五"`cleanup(true)` 真能清空临时区"因**他路**在 `tmp\` 下持有句柄
         ⇒ `rmSync` 中途 `EPERM`、被 `catch` 吞掉 ⇒ 断言报"残留目录仍在=true"。
-   现在把两个概念**显式分开**（只在这里定义；别处一律读 `env.paths`）：
+   两个概念**显式分开**：
      · `tempRootBase` ＝ **公共根**（＝旧 `tempRoot` 的原意 `tests\._verify\tmp`）：
        只作为"各轮目录的父目录"与 24 小时过期清扫的对象；
      · `tempRoot`     ＝ **本轮专属**目录 `<base>\run-<pid>-<本地启动时刻>-<4 hex>`：
        本轮所有临时目录/临时库/子进程日志都落在它下面 ⇒ **任一路的 `cleanup` 只能删到
        自己的 `run-<pid>-…`，物理上删不到别人的** —— 这就是"并发不再互相删"的全部机制。
-   向后兼容：`tempRoot` 的**名字与用法一字不变**（仍是"可写的临时区"：`preflight` 的写探针、
-   `db-check`/`files-check` 找散落库文件、`harness-check` 数目录数都照旧），只是它现在指向
-   本轮子目录；需要"公共根"的地方**显式**读 `env.paths.tempRootBase`（如 `run-all` 的过期清扫）。
-   落地方式：本文件被 require 时就把这两个键写进 `env.paths`（`env.paths` 是**同一个对象**，
-   故所有 `require('../env')` 的脚本立刻看到同一口径，不必逐个脚本改）。 */
-const tempRootBase = env.paths.tempRoot;                       /* 公共根：tests\._verify\tmp */
-const runStartedAt = new Date();
-const pad2 = (n) => String(n).padStart(2, '0');
-const runStamp = `${runStartedAt.getFullYear()}${pad2(runStartedAt.getMonth() + 1)}${pad2(runStartedAt.getDate())}`
-  + `T${pad2(runStartedAt.getHours())}${pad2(runStartedAt.getMinutes())}${pad2(runStartedAt.getSeconds())}`;
-/* 随机后缀：Windows 的 pid 会复用 ⇒ 只按 pid ＋ 秒级时刻命名有"同名撞上旧轮残留"的理论窗口 */
-const runTempRoot = path.join(tempRootBase, `run-${process.pid}-${runStamp}-${randomBytes(2).toString('hex')}`);
-env.paths.tempRootBase = tempRootBase;                         /* 公共根（显式命名，供清扫与排查） */
-env.paths.tempRoot = runTempRoot;                              /* ← 语义更新：指向本轮专属子目录 */
+   向后兼容：`tempRoot` 的**名字与用法一字不变**（仍是"可写的临时区"），只是它现在指向本轮子目录。
+
+   ⚠ **`T-20261003-10`（2026-10-03）单一真源化：这两个键的**定义**已经搬去 `tests\env.js`**
+   （那里是"路径集"的定义处，且**任何**脚本 require 它都会算好 —— 包括**不加载本文件**的
+   `files-check`／`platform-check`／`docs-check`）。本文件**不再注入式地写这两个键**，
+   只做下面的**口径校验**（第二份定义会漂移：收口前"加载 harness 的脚本看到本轮目录、
+   不加载的看到公共根"，正是这次要消掉的不一致）。
+   ⚠ 推论（别踩）：**不加载本文件**的脚本若要看"临时区根目录"（如 `files-check` 的散落库判据），
+   不能只看 `env.paths.tempRoot` —— 本轮目录可能是空的甚至不存在，那样判据会空洞化；
+   必须同时看 `tempRootBase` 与各轮目录，理由写在 `tests\files-check.js` 第四节。 */
+const tempRootBase = env.paths.tempRootBase;                   /* 只读别名，仅用于下面的校验 */
+
+/** 校验"临时区两键"的语义（定义在 `tests\env.js`）：不满足就**当场抛错**并指名差在哪。
+ *  为什么在这里校验而不是各调用点：`makeTempDir`/`cleanup` 全依赖这两个键，
+ *  语义被改坏时若只是"路径算错"，症状会散落到各门禁的假红里（正是 `E90` 病灶的形态）；
+ *  这里一次说清，且**不产生第二份定义**（下面一律**读** `env.paths.*`，绝不赋值）。 */
+function assertTempRootSemantics() {
+  const problems = [];
+  const runRoot = env.paths.tempRoot;
+  const expectedBase = path.join(env.paths.verify, 'tmp');
+  if (!tempRootBase) {
+    problems.push('`env.paths.tempRootBase` 未定义（定义处＝`tests\\env.js`）');
+  } else if (path.resolve(tempRootBase) !== path.resolve(expectedBase)) {
+    problems.push(`\`env.paths.tempRootBase\`=${tempRootBase} ≠ 公共根 \`tests\\._verify\\tmp\`=${expectedBase}`);
+  }
+  if (!runRoot) {
+    problems.push('`env.paths.tempRoot` 未定义（定义处＝`tests\\env.js`）');
+  } else if (tempRootBase) {
+    if (path.resolve(path.dirname(runRoot)) !== path.resolve(tempRootBase)) {
+      problems.push(`本轮 \`tempRoot\`=${runRoot} **不是**公共根的直接子目录（各轮必须平铺，否则清扫与隔离都不成立）`);
+    }
+    if (!/^run-\d+-\d{8}T\d{6}-[0-9a-f]{4}$/.test(path.basename(runRoot))) {
+      problems.push(`本轮目录名 \`${path.basename(runRoot)}\` 不符合 \`run-<pid>-<yyyyMMddTHHmmss>-<4hex>\``);
+    }
+    if (!path.basename(runRoot).startsWith(`run-${process.pid}-`)) {
+      problems.push(`本轮目录名 \`${path.basename(runRoot)}\` 的 pid 段 ≠ 本进程 pid ${process.pid}`);
+    }
+    if (path.resolve(runRoot) === path.resolve(tempRootBase)) {
+      problems.push('`tempRoot` **等于**公共根 ⇒ 任一路的 `cleanup` 又能删到他路正在用的产物（E90 回归）');
+    }
+  }
+  if (problems.length) {
+    throw new Error('临时区语义校验未通过（定义处＝tests\\env.js）：\n  - ' + problems.join('\n  - '));
+  }
+}
+assertTempRootSemantics();
 
 let seq = 0;
 /** 生成本次运行内唯一的临时目录名（同时带 pid 便于排查残留） */
@@ -310,9 +343,9 @@ function countEntriesDeep(dir) {
  * `force=false`（日常收尾，`run-all` 全绿时调用）：只清**公共根**下超过 24 小时的
  *   **整轮目录**（`run-<pid>-…`）—— 本轮目录刚建、mtime 是新的，故自己与别人的这一清理都
  *   命不中它；返回 `{removed, kept}`（**条数**，与旧口径一致，`harness-check` §五按其类型判）。
- *   **公共根口径不写第二份**：`env.cleanupStaleTemp(maxAgeMs)` 的目标是 `paths.tempRoot`，
- *   `E90` 后它指向本轮子目录 ⇒ 这里**临时**把它指回公共根再调用（同步执行、`finally` 复原，
- *   期间没有别的代码能观察到这个临时态），从而复用同一份"24 小时"策略，避免两份口径漂移。
+ *   **公共根口径不写第二份**：清扫策略与目标都在 `tests\env.js` 的 `cleanupStaleTemp()` 里
+ *   （`T-20261003-10` 收口后它**就是**清公共根，不再需要"临时把 `tempRoot` 指回公共根"那种
+ *   改写单源对象的做法 —— 那既容易被别处观察到，也是"同一份数据两处口径"的温床）。
  *
  * `force=true`（收尾**本轮**临时区）：只删**本轮专属目录** `env.paths.tempRoot`，
  *   且**删完必须回读**（这就是 `E90` 的判据 —— 绝不能用"调用过 `rmSync`"代替事实）：
@@ -325,15 +358,7 @@ function countEntriesDeep(dir) {
  *   **不变量**：`removed==='all'` ⟺ 目标目录不存在 ⟺ `kept===0 && keptDeep===0`。
  */
 function cleanup(force = false) {
-  if (!force) {
-    const runRoot = env.paths.tempRoot;                        /* 本轮子目录（勿动） */
-    env.paths.tempRoot = tempRootBase;                         /* 临时态：清扫目标是公共根 */
-    try {
-      return env.cleanupStaleTemp();
-    } finally {
-      env.paths.tempRoot = runRoot;                            /* 复原：别处读到的仍是本轮目录 */
-    }
-  }
+  if (!force) return env.cleanupStaleTemp();                   /* 目标＝公共根，定义在 env.js */
   const target = env.paths.tempRoot;
   const beforeDeep = countEntriesDeep(target);
   const errors = [];
