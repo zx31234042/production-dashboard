@@ -151,6 +151,111 @@ function main() {
   t.check('ADR 目录索引含 ADR-0001/0002/0003',
     adrReadme.includes('ADR-0001') && adrReadme.includes('ADR-0002') && adrReadme.includes('ADR-0003'));
 
+  /* ---- `E94`（"清单计数"类声明无门禁守护）：**组件数三方一致**的结构性不变量 ----
+     立案事实：文件系统 `src\components\*.js` ＝ **12** 个、`index.html` 注册的
+     `<script src="src/components/…">` 也＝ **12** 条，而根 `README.md` §二 写的是 **11**
+     （从 `UploadPanel.js` 落地起就错、**无人报警** —— `E94` 由座位 9 顺手发现、主代理复核属实）。
+     修法（按 `E94` 的建议）：守"**清单计数 ＝ 文件系统事实**"这一条**通则**，而不是逐个数：
+       `src\components\*.js` 文件数 ＝ `index.html` 注册的 `<script src="src/components/*.js">` 条数
+       ＝ 根 `README.md` §二 声明的条数。
+     ⚠ **不写死 12**：写成"**三者相等**"⇒ 以后新增组件只要三处同步就照样绿（不会假红），
+     而任何一处漂移（改文档不补注册、或补注册不改文档）必红。
+     取数口径的三个坑（都实测过）：
+       ① `index.html` 里 `src/components/` 字样共出现 **15** 次，其中 3 次在**注释**里
+          （`SettingPanel.js`×2、`UploadPanel.js`×1）⇒ 必须锚 `<script … src="…">`，不能只数字符串；
+       ② README 的声明在"源码加载顺序"代码块里，形式为 `components（N 个…）` ⇒ 锚 `components（N 个`；
+       ③ 锚点找不到（文档结构被改）⇒ **判红**（不许静默退化成"检查不了"—— `D23`）。 */
+  {
+    const COMP_DIR = path.join(ROOT, 'src', 'components');
+    /** 真源①：`src\components\*.js` 的文件名（按名排序） */
+    const compFiles = (() => {
+      try { return fs.readdirSync(COMP_DIR).filter(n => n.endsWith('.js')).sort(); } catch { return null; }
+    })();
+    /** 真源②：`index.html` 注册的 `<script … src="src/components/*.js">` 的**文件名逐条**（含重复） */
+    const htmlRegs = [...read('index.html').matchAll(/<script\b[^>]*\bsrc\s*=\s*"src\/components\/([^"\/]+\.js)"/g)]
+      .map(m => m[1]);
+    /** 真源③：根 `README.md` §二 的声明数（`components（N 个…`） */
+    const compDeclMatch = readme.match(/components（\s*\*{0,2}(\d+)\s*个/);
+    const nFiles = compFiles ? compFiles.length : null;
+    const nHtml = htmlRegs.length;
+    const nDecl = compDeclMatch ? Number(compDeclMatch[1]) : null;
+    const threeCounts = `src\\components\\*.js＝${nFiles === null ? '（目录读不到）' : nFiles + ' 个'}；`
+      + `index.html 注册＝${nHtml} 条；README.md §二 声明＝${nDecl === null ? '（锚点未命中）' : nDecl + ' 个'}`;
+    /** **判据本体**（`E94` 的不变量）：三方相等。D22 暗桩复用**同一个函数**，
+        否则暗桩绿了也证明不了这条断言可证伪。 */
+    const compCountVerdict = (filesN, htmlN, readmeN) =>
+      filesN !== null && htmlN > 0 && readmeN !== null && filesN === htmlN && htmlN === readmeN;
+    t.check('E94 结构不变量：`src\\components\\*.js` 文件数 ＝ `index.html` 注册的 `<script src="src/components/…">` 条数 ' +
+      '＝ 根 `README.md` §二 声明的条数（**三者相等**；不写死数字 ⇒ 以后新增组件不会假红）；不一致即**逐项报出三个数**',
+      compCountVerdict(nFiles, nHtml, nDecl), threeCounts);
+
+    /* 计数相等还不够：**逐条名字**也要对得上（"摘掉一条注册再补一条别的"会让计数照样相等）。
+       方向①：注册的每个文件名都真实存在（且无重复注册）；方向②：每个文件都被注册过。
+       两个方向的差集都必须为空 —— 正是 `PROJECT_RULES` 9.1「新增文件时同步在 `index.html` 里补一行」。 */
+    const regSet = [...new Set(htmlRegs)].sort();
+    const dupRegs = [...new Set(htmlRegs.filter((n, i) => htmlRegs.indexOf(n) !== i))];
+    const notOnDisk = compFiles ? regSet.filter(n => compFiles.indexOf(n) < 0) : ['（目录读不到）'];
+    const notRegistered = compFiles ? compFiles.filter(n => regSet.indexOf(n) < 0) : [];
+    t.check('E94 结构不变量·**逐条对账**：`index.html` 注册的每个组件文件都真实存在（无重复注册），' +
+      '且 `src\\components\\*.js` 里每个文件都被注册过（两个方向的差集都要为空）',
+      nFiles !== null && notOnDisk.length === 0 && notRegistered.length === 0 && dupRegs.length === 0,
+      `注册 ${regSet.length} 个（重复注册 ${dupRegs.length} 个${dupRegs.length ? '：' + dupRegs.join('、') : ''}）；` +
+      `注册了但文件不存在：${notOnDisk.join('、') || '（无）'}；文件存在但未注册：${notRegistered.join('、') || '（无）'}`);
+
+    /* `E94` D22 定点变异（**内存文本变异**：字节副本 ＋ sha256 留痕 ＋ 盘上文件未变的复核，
+       与 `harness-check` §16 同款纪律 —— 不落地、不碰仓库、不用 `git checkout`）。
+       ① README 声明数 +1 ⇒ 必红并**指名 README 那一侧**；
+       ② 从 `index.html` 摘掉一条注册 ⇒ 计数与逐条对账**两侧都必红**、且逐条对账**指名**该文件。 */
+    const { createHash } = require('node:crypto');
+    const sha256Hex = buf => createHash('sha256').update(buf).digest('hex');
+    const readmeFile = path.join(ROOT, 'README.md');
+    const htmlFile = path.join(ROOT, 'index.html');
+    const readmeBytes = fs.readFileSync(readmeFile), htmlBytes = fs.readFileSync(htmlFile);
+    const readmeSha0 = sha256Hex(readmeBytes), htmlSha0 = sha256Hex(htmlBytes);
+    t.check('E94 D22 变异①：根 `README.md` §二 的声明数 +1（**内存字节副本变异**）⇒ 上面的"三者相等"判据必红并**指名** README 那一侧；' +
+      '未变异的当前源码必绿；盘上文件全程逐字节未变',
+      (() => {
+        const anchorRe = /components（\s*\*{0,2}(\d+)\s*个/;
+        const mm = readmeBytes.toString('utf8').match(anchorRe);
+        if (!mm) { t.info('E94 D22① 锚点未命中（README 里找不到 `components（N 个`）—— 判红，不许静默放过'); return false; }
+        const mutText = readmeBytes.toString('utf8').replace(anchorRe, 'components（' + (Number(mm[1]) + 1) + ' 个');
+        const mutDecl = Number((mutText.match(anchorRe) || [])[1]);
+        const mutRed = !compCountVerdict(nFiles, nHtml, mutDecl);
+        const curGreen = compCountVerdict(nFiles, nHtml, nDecl);
+        const mutSha = sha256Hex(Buffer.from(mutText, 'utf8'));
+        const diskSame = sha256Hex(fs.readFileSync(readmeFile)) === readmeSha0;
+        t.info(`E94 D22① 变异体 sha256=${mutSha.slice(0, 12)}…（原件 sha256=${readmeSha0.slice(0, 12)}…）；`
+          + `变异后声明＝${mutDecl}（原件 ${nDecl}）⇒ 三者相等判据必红=${mutRed}；当前源码同判据=${curGreen}；`
+          + `盘上文件未变=${diskSame}`);
+        return mutRed && curGreen && mutDecl === nDecl + 1 && diskSame;
+      })(),
+      '变异内容：把根 `README.md` §二 的 `components（N 个…` 改成 `N+1`（＝`E94` 立案时的 11 vs 12 形态）'
+      + '—— 判据必须当场报出三个数并指名 README 那一侧');
+
+    t.check('E94 D22 变异②：从 `index.html` 摘掉**一条**注册（**内存字节副本变异**）⇒ "三者相等"与"逐条对账"两条判据都必红，' +
+      '且逐条对账**指名**被摘掉的那个文件；未变异的当前源码必绿；盘上文件全程逐字节未变',
+      (() => {
+        const htmlText = htmlBytes.toString('utf8');
+        const tagRe = /[ \t]*<script\b[^>]*\bsrc\s*=\s*"src\/components\/([^"\/]+\.js)"[^>]*><\/script>[ \t]*\r?\n/;
+        const tm = htmlText.match(tagRe);
+        if (!tm) { t.info('E94 D22② 锚点未命中（index.html 里找不到成行的 `<script src="src/components/…"></script>`）—— 判红'); return false; }
+        const victim = tm[1];
+        const mutText = htmlText.replace(tagRe, '');
+        const mutRegs = [...mutText.matchAll(/<script\b[^>]*\bsrc\s*=\s*"src\/components\/([^"\/]+\.js)"/g)].map(x => x[1]);
+        const mutRed = !compCountVerdict(nFiles, mutRegs.length, nDecl);
+        const mutUnreg = compFiles ? compFiles.filter(n => mutRegs.indexOf(n) < 0) : [];
+        const curGreen = compCountVerdict(nFiles, nHtml, nDecl) && notRegistered.length === 0;
+        const mutSha = sha256Hex(Buffer.from(mutText, 'utf8'));
+        const diskSame = sha256Hex(fs.readFileSync(htmlFile)) === htmlSha0;
+        t.info(`E94 D22② 变异体 sha256=${mutSha.slice(0, 12)}…（原件 sha256=${htmlSha0.slice(0, 12)}…）；`
+          + `摘掉的那条注册＝${victim}；变异后注册数＝${mutRegs.length}（原件 ${nHtml}）⇒ 计数判据必红=${mutRed}；`
+          + `逐条对账必指名=${JSON.stringify(mutUnreg)}；当前源码同判据=${curGreen}；盘上文件未变=${diskSame}`);
+        return mutRed && curGreen && mutUnreg.length === 1 && mutUnreg[0] === victim && diskSame;
+      })(),
+      '变异内容：删掉 `index.html` 里一条 `<script src="src/components/…"></script>`'
+      + '（＝"文件在、但页面不加载它"的静默形态）—— 判据必须当场指名该文件');
+  }
+
   /* ---------------- 五、技术栈断言 vs ADR ---------------- */
   t.section('五、技术栈断言 vs ADR');
   t.check('运行时 Node.js 24 LTS 三方一致（架构/ADR-0002/快照）',

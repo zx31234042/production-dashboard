@@ -2091,6 +2091,10 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
       out.failuresBefore = serverEntry.state.resultWrite.failures;
       out.writesBefore = serverEntry.state.resultWrite.writes;
       out.warnBeforeFail = out.warnings.length;
+      /* 注入**之前**已推的帧数（`T-20261003-04` 甲-2 用）："冷启动 → 注入失败之前"这一段
+         `/health.resultWrite.writes` 的增量必须**逐帧**等于它 —— 期望值取自"真的推过几帧"这个事实，
+         不写死数字（ADR-0004 D21）。 */
+      out.postsBeforeFail = out.posts.length;
       savedUpsert = resultRepo.upsertJudgement;
       resultRepo.upsertJudgement = function () {
         throw new Error('harness-check 注入：DR-05 写入点抛错桩（本条只验"固化失败不污染采集链"）');
@@ -2719,6 +2723,231 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
         `库里按列名数：unit_index 非空 ${uic.withIndex} 行／为空 ${uic.withoutIndex} 行；` +
         `推帧前 withIndex/withoutIndex=${nu.healthBefore && nu.healthBefore.frameUnitIndex && nu.healthBefore.frameUnitIndex.withIndex}` +
         `/${nu.healthBefore && nu.healthBefore.frameUnitIndex && nu.healthBefore.frameUnitIndex.withoutIndex}`);
+    }
+
+    /* ================= 甲：`/health.resultWrite` 的出口断言（`T-20261003-04`；`E58` 结案更正） =================
+       事实（`E58` 行末「结案更正（2026-10-03）」段）：`DR-05` 的写入点（`persistJudgement()`）自
+       `T-20260930-08` 就已接线，但它的三个运行计数**只在进程内存里**、`/health` **一个字都不搬运**
+       （`shiftStatWrite` / `warningWrite` 早已搬运，独缺这一块）⇒ "到底写没写、写失败没有、有多少件
+       因为拿不到件序号而**根本没打算写**"在**外部读不到**。`server/index.js` 的 `T-20261003-02` 补上了出口。
+       **搬运口径（三者互不代偿，`server/index.js` 的 `state.resultWrite` docblock）**：
+         · `writes`        ＝ **真的落了行**；
+         · `failures`      ＝ **想落但落不进去**（并带 `lastError`）；
+         · `skippedNoUnit` ＝ 帧**拿不到件序号** ⇒ **根本没打算落**（`E60` 裁定①）。
+       下面四条一律读**真 HTTP 的 `/health` 响应体**，**不读** `serverEntry.state`：
+       进程内状态对"出口有没有搬运"零判别力 —— 那正是本条要守的东西。
+       D22 暗桩（两条，与 §16-F/I/K 同款纪律：**字节副本 ＋ sha256 留痕 ＋ `Buffer.compare` 还原证明 ＋
+       全程不落盘**）：① 把搬运块整段摘掉 ⇒ 甲-1 必红并指名；② 把 `skippedNoUnit` 并进 `failures`
+       ⇒ 甲-3 必红并指名。两条都要求"未变异的当前源码必绿"（否则"判红"可能只是把一切都判红）。
+       ⚠ 变异在**内存字节副本**上做（不写 `server\index.js`）：那份文件此刻正被另一路协作方改写（E89），
+       写盘＋还原会与并发写撞车（见本批回执的取舍说明）；"字节副本还原"的**证据力**由下面两端读数给出
+       —— 变异体 sha256 ≠ 原件 sha256，且**盘上文件全程逐字节未变**（`sha256Hex(readFile) === sha0`）。 */
+    {
+      const { createHash } = require('node:crypto');
+      const sha256Hex = buf => createHash('sha256').update(buf).digest('hex');
+      /** `/health` 响应体里的 `resultWrite` 块；**缺块 ⇒ null**（不抛：字段消失须判红并指名，不得中止整轮） */
+      const rwOf = h => (h && typeof h === 'object' && h.resultWrite && typeof h.resultWrite === 'object'
+        ? h.resultWrite : null);
+      const RW_KEYS = ['writes', 'failures', 'lastError', 'skippedNoUnit'];
+      /** 键恒在 ＋ 取值类型合口径 ⇒ 逐项问题清单（空数组＝合规）。ADR-0004 D23：判红必须能**指名**。 */
+      const rwKeyProblems = h => {
+        const rw = rwOf(h);
+        if (!rw) return ['`resultWrite` 整块缺失（"键恒在"是搬运口径的一部分）'];
+        const bad = [];
+        for (const k of RW_KEYS) {
+          if (!Object.prototype.hasOwnProperty.call(rw, k)) { bad.push('缺键 `resultWrite.' + k + '`'); continue; }
+          if (k === 'lastError') {
+            if (rw[k] !== null && typeof rw[k] !== 'string') bad.push('`lastError`＝' + JSON.stringify(rw[k]) + '（须 null 或字符串）');
+          } else if (!Number.isFinite(rw[k])) bad.push('`' + k + '`＝' + JSON.stringify(rw[k]) + '（须有限数字）');
+        }
+        const extra = Object.keys(rw).filter(k => RW_KEYS.indexOf(k) < 0);
+        if (extra.length) bad.push('多了未登记键 ' + extra.join('/'));
+        return bad;
+      };
+      /** 一次读数 → 四个计数（缺块 ⇒ null） */
+      const rwOf4 = h => {
+        const rw = rwOf(h);
+        return rw ? { writes: rw.writes, failures: rw.failures, skippedNoUnit: rw.skippedNoUnit, lastError: rw.lastError } : null;
+      };
+      /** 两次读数之间的增量（任一侧缺块 ⇒ null） */
+      const rwDelta = (a, b) => (a && b ? {
+        writes: b.writes - a.writes, failures: b.failures - a.failures, skippedNoUnit: b.skippedNoUnit - a.skippedNoUnit
+      } : null);
+      /** 甲-3 的判据本体（"`skippedNoUnit` 与 `failures` 分得开"）——
+          D22 暗桩②**复用同一个函数**：暗桩若另抄一份判据，它绿了也不能证明这条断言可证伪。 */
+      const separateNoUnitFromFailures = (before, afterNoUnit, afterControl) => {
+        const dNo = rwDelta(rwOf4(before), rwOf4(afterNoUnit));
+        const dCtl = rwDelta(rwOf4(afterNoUnit), rwOf4(afterControl));
+        return {
+          dNo, dCtl,
+          ok: Boolean(dNo && dCtl) && dNo.skippedNoUnit === 3 && dNo.failures === 0 && dNo.writes === 0 &&
+            dCtl.skippedNoUnit === 0 && dCtl.writes === 1
+        };
+      };
+
+      const coldH = cnt.health, beforeH = nu.healthBefore, afterNoH = nu.healthAfterNoUnit, afterCtlH = nu.healthAfterControl;
+      const cold4 = rwOf4(coldH), before4 = rwOf4(beforeH), afterNo4 = rwOf4(afterNoH), afterCtl4 = rwOf4(afterCtlH);
+      const readings = [
+        ['冷启动（未推任何帧）', coldH],
+        ['四帧成功落库 ＋ 一次注入写失败之后', beforeH],
+        ['三帧不带件序号之后', afterNoH],
+        ['补上件序号那一帧之后', afterCtlH]
+      ];
+      const keyProblems = [];
+      for (const [label, h] of readings) for (const p of rwKeyProblems(h)) keyProblems.push(label + '：' + p);
+
+      /* ---- 甲-1：键恒在（含冷启动的四个 0／null 形状） ---- */
+      t.check('甲-1/`E58` 出口·**键恒在**：四次**真 HTTP** `/health` 读数的 `resultWrite` 块键集恒为 ' +
+        '`{writes, failures, lastError, skippedNoUnit}`（含**冷启动**、含从未写入过时 ' +
+        '`writes=0／failures=0／lastError=null／skippedNoUnit=0`）—— 缺块／缺键／多键／类型不合口径即判红并**逐项指名**',
+        keyProblems.length === 0 && readings.every(([, h]) => Boolean(rwOf(h))) &&
+        Boolean(cold4) && cold4.writes === 0 && cold4.failures === 0 && cold4.lastError === null && cold4.skippedNoUnit === 0,
+        keyProblems.length ? `问题 ${keyProblems.length} 处：${keyProblems.join('；')}`
+          : `四次读数键集齐全、类型合口径；冷启动实测 ${JSON.stringify(cold4)}；` +
+            readings.slice(1).map(([l, h]) => `${l}＝${JSON.stringify(rwOf(h))}`).join('；'));
+
+      /* ---- 甲-2：正侧 —— 一次成功落库 ⇒ `writes` +1（真进程 ＋ 真 HTTP 走采集链） ---- */
+      const pos = rwDelta(afterNo4, afterCtl4);            // 恰一帧（对照帧，unitIndex=1）跨这两次读数
+      const coldToBefore = rwDelta(cold4, before4);
+      t.check('甲-2/`E58` 出口·**正侧**（一次成功落库 ⇒ `writes` **+1**）：真进程 ＋ 真 HTTP 走 ' +
+        '`POST /ifd/frame` → `onSampled` → `persistJudgement`，**恰一帧**（`unitIndex=1`、`testStatus=2`）落在 ' +
+        '两次 `/health` 读数之间 ⇒ `resultWrite.writes` 增量**恰 1**（`failures`／`skippedNoUnit` 均不变）；' +
+        '且"冷启动 → 注入失败之前"那一段的 `writes` 增量**＝该段真的推过的帧数**（逐帧对账，不写死 4）',
+        Boolean(pos) && pos.writes === 1 && pos.failures === 0 && pos.skippedNoUnit === 0 &&
+        Boolean(nuCtl.row) && Boolean(nuCtl.counts) && nuCtl.counts.rows === 1 &&
+        Boolean(coldToBefore) && cnt.postsBeforeFail > 0 && coldToBefore.writes === cnt.postsBeforeFail,
+        `对照帧（${nuCtl.at}，带 unitIndex=1）：${JSON.stringify(afterNo4)} → ${JSON.stringify(afterCtl4)}` +
+        `（Δwrites=${pos && pos.writes}、Δfailures=${pos && pos.failures}、ΔskippedNoUnit=${pos && pos.skippedNoUnit}）；` +
+        `该件库内行=${JSON.stringify(nuCtl.row)}、该票行数=${nuCtl.counts && nuCtl.counts.rows}；` +
+        `冷启动 → 注入失败之前：${JSON.stringify(cold4)} → ${JSON.stringify(before4)}` +
+        `（Δwrites=${coldToBefore && coldToBefore.writes}，该段实测推帧 ${cnt.postsBeforeFail} 帧）`);
+
+      /* ---- 甲-3：`skippedNoUnit` 与 `failures` **分得开** ---- */
+      const sep = separateNoUnitFromFailures(beforeH, afterNoH, afterCtlH);
+      t.check('甲-3/`E60①` 出口·**`skippedNoUnit` 与 `failures` 分得开**：同一票连推 3 帧**不带件序号**' +
+        '（`testStatus=2`、计划开工与生效标准都已就位 ⇒ 若带件序号必固化）⇒ ' +
+        '`/health.resultWrite.skippedNoUnit` **恰 +3**，而 `failures` **一字不变**、`writes` 也**不变**' +
+        '（"根本没打算落" ≠ "落失败"）；随后**补上件序号**（`unitIndex=1`、其余同）⇒ `writes` **+1** 且 ' +
+        '`skippedNoUnit` **不再增**（把两者并成一个数、或让缺件序号的帧也去写 ⇒ 本条必红）',
+        sep.ok && Boolean(nu.countsBefore) && nu.countsBefore.done === 0 && Boolean(nu.countsAfter) &&
+        nu.countsAfter.done === 0 && nu.countsAfter.rows === 0 && nuPosts.every(p => p.frameHasUnitIndex === false),
+        `三帧不带件序号：${JSON.stringify(before4)} → ${JSON.stringify(afterNo4)}` +
+        `（ΔskippedNoUnit=${sep.dNo && sep.dNo.skippedNoUnit}、Δfailures=${sep.dNo && sep.dNo.failures}、` +
+        `Δwrites=${sep.dNo && sep.dNo.writes}）；该票 ` + '`result`' + ` 行数 ` +
+        `${nu.countsBefore && nu.countsBefore.rows}→${nu.countsAfter && nu.countsAfter.rows}、` +
+        `countDone ${nu.countsBefore && nu.countsBefore.done}→${nu.countsAfter && nu.countsAfter.done}；` +
+        `补上件序号那一帧：${JSON.stringify(afterNo4)} → ${JSON.stringify(afterCtl4)}` +
+        `（Δwrites=${sep.dCtl && sep.dCtl.writes}、ΔskippedNoUnit=${sep.dCtl && sep.dCtl.skippedNoUnit}）`);
+
+      /* ---- 甲-4：失败侧（注入一次写失败）＋ 采集链不受影响 ---- */
+      const injPost = cnt.posts.filter(p => p.at === CNT_FAIL)[0] || null;
+      const failDelta = rwDelta(cold4, before4);
+      t.check('甲-4/`E58` 出口·**失败侧**（注入一次写失败 ⇒ `failures` **+1**、`lastError` 非空、' +
+        '`skippedNoUnit` **不变**，且**采集链不受影响**）：注入方式＝把**共享模块对象**上的 ' +
+        '`resultRepo.upsertJudgement` 换成抛错桩（**不改文件**，测完当场还原；见夹具内注释）⇒ ' +
+        '`/health` 的 `failures` 增量**恰 1**、`lastError` 非空且**点名**注入原因、`skippedNoUnit` 不变；' +
+        '该帧仍 `stored`（HTTP 200）、其后一帧照常 `writes` +1（链路没被打断）',
+        Boolean(failDelta) && failDelta.failures === 1 && failDelta.skippedNoUnit === 0 &&
+        Boolean(before4) && typeof before4.lastError === 'string' && before4.lastError.length > 0 &&
+        before4.lastError.indexOf('注入') >= 0 &&
+        Boolean(injPost) && Boolean(injPost.res) && injPost.res.status === 200 &&
+        Boolean(injPost.res.body) && injPost.res.body.outcome === 'stored' &&
+        Boolean(pos) && pos.writes === 1 && cnt.rowsAAfterFail === cnt.rowsA,
+        `冷启动 ${JSON.stringify(cold4)} → 注入之后 ${JSON.stringify(before4)}` +
+        `（Δfailures=${failDelta && failDelta.failures}、ΔskippedNoUnit=${failDelta && failDelta.skippedNoUnit}）；` +
+        `lastError 点名注入＝${Boolean(before4) && typeof before4.lastError === 'string' && before4.lastError.indexOf('注入') >= 0}、` +
+        `实测=${JSON.stringify(before4 && before4.lastError)}；注入了失败的那一帧（${injPost && injPost.at}，第 2 件）：` +
+        `HTTP ${injPost && injPost.res && injPost.res.status}／${injPost && injPost.res && injPost.res.body && injPost.res.body.outcome}` +
+        `（采集链照收）；其后对照帧 Δwrites=${pos && pos.writes}（+1 ⇒ 没被打断）；该票行数 ${cnt.rowsA}→${cnt.rowsAAfterFail}`);
+
+      /* 实测读数**打印出来**（ADR-0004 D21：复核者不跑也能看到"期望值是从哪些现场读数推出来的"；
+         不计入断言数）—— 两处增量分别对应 甲-2（对照帧恰一帧）与 甲-3（三帧不带件序号）。 */
+      t.info(`甲·/health.resultWrite 实测（真 HTTP 四次读数）：冷启动 ${JSON.stringify(cold4)}；`
+        + `四帧落库 ＋ 一次注入写失败后 ${JSON.stringify(before4)}；`
+        + `三帧不带件序号后 ${JSON.stringify(afterNo4)}（相对上一次 ΔskippedNoUnit=+${sep.dNo && sep.dNo.skippedNoUnit}、`
+        + `Δfailures=${sep.dNo && sep.dNo.failures}、Δwrites=${sep.dNo && sep.dNo.writes}）；`
+        + `补上件序号那一帧后 ${JSON.stringify(afterCtl4)}（Δwrites=+${pos && pos.writes}、`
+        + `ΔskippedNoUnit=${pos && pos.skippedNoUnit}）；`
+        + `冷启动 → 注入失败之前 Δwrites=${coldToBefore && coldToBefore.writes}（＝该段实测推帧 ${cnt.postsBeforeFail} 帧）`);
+
+      /* ---- D22 暗桩：两条定点变异（字节副本，不落盘） ---- */
+      const SERVER_FILE = path.join(env.paths.root, 'server', 'index.js');
+      const serverBytes = fs.readFileSync(SERVER_FILE);          /* 字节副本①（只读，全程不写盘） */
+      const serverSha0 = sha256Hex(serverBytes);
+      const serverSrc = serverBytes.toString('utf8');
+      /* ⚠ 锚点必须**行长风格无关**（`\r?\n`）：实测 `server\index.js` 是 **CRLF**，
+         用 `\n` 拼锚点会"锚点未命中"⇒ 暗桩变成假红（本批第一版就踩了这个坑）。 */
+      const RW_BLOCK_RE = /[ \t]*resultWrite: \{\r?\n[ \t]*writes: state\.resultWrite\.writes,\r?\n[ \t]*failures: state\.resultWrite\.failures,\r?\n[ \t]*lastError: state\.resultWrite\.lastError,\r?\n[ \t]*skippedNoUnit: state\.resultWrite\.skippedNoUnit\r?\n[ \t]*\},\r?\n/;
+      const RW_FAIL_LINE_RE = /([ \t]*)failures: state\.resultWrite\.failures,(\r?\n)/;
+      /** 由**内存字节副本**载入一个 `server/index.js` 变异体（`Module._compile`：不落地、不碰仓库；
+          与 §15-E／§16 同款手法）。`require.main !== module` ⇒ 不会自动 `main()`（不起服务）。 */
+      const loadServerVariant = (src, tag) => {
+        const Module = require('node:module');
+        const m = new Module(SERVER_FILE + '#' + tag, null);
+        m.filename = SERVER_FILE;
+        m.paths = Module._nodeModulePaths(path.dirname(SERVER_FILE));
+        m._compile(src, m.filename);
+        return m.exports;
+      };
+      /* 变异体①：把 `healthPayload()` 里的 `resultWrite` 搬运块**整段摘掉**。 */
+      t.check('甲-D22① 定点变异：把 `/health` 里**搬运 `resultWrite` 的那段整块摘掉**（`server/index.js` 的' +
+        '**内存字节副本**变异体）⇒ 甲-1 的"键恒在"判据**必红并指名** `resultWrite`；未变异的当前源码必绿；' +
+        '盘上文件全程逐字节未变',
+        (() => {
+          if (!RW_BLOCK_RE.test(serverSrc)) {
+            t.info('甲-D22① 变异锚点未命中（`resultWrite` 搬运块被改过形状）—— 锚点命不中即判红，不许静默放过');
+            return false;
+          }
+          const mutSrc = serverSrc.replace(RW_BLOCK_RE, '');
+          let mut = null;
+          try { mut = loadServerVariant(mutSrc, 'rw-cut'); }
+          catch (err) { t.info('甲-D22① 变异体载入失败：' + (err && err.message)); return false; }
+          /* 喂给变异体的运行态＝**真·现场读数**（不是编的：就是本次四帧＋一次注入失败之后那一份） */
+          mut.state.resultWrite = Object.assign({}, before4);
+          const mutProblems = rwKeyProblems(mut.healthPayload());
+          const curProblems = rwKeyProblems(afterCtlH);            // 当前源码（真 HTTP 读数）⇒ 必绿
+          const mutSha = sha256Hex(Buffer.from(mutSrc, 'utf8'));
+          const diskSame = sha256Hex(fs.readFileSync(SERVER_FILE)) === serverSha0;
+          t.info(`甲-D22① 变异体 sha256=${mutSha.slice(0, 12)}…（原件 sha256=${serverSha0.slice(0, 12)}…）；`
+            + `变异体 /health.resultWrite 问题 ${mutProblems.length} 条：${mutProblems.join('；')}；`
+            + `当前源码问题 ${curProblems.length} 条；盘上文件未变=${diskSame}`);
+          return mutProblems.length > 0 && mutProblems.join('；').indexOf('resultWrite') >= 0 &&
+            curProblems.length === 0 && diskSame;
+        })(),
+        '变异内容：删掉 `healthPayload()` 里的 `resultWrite: { writes, failures, lastError, skippedNoUnit },` 整块 ' +
+        '（＝回到 `T-20261003-02` 之前的形态：三个计数只在进程内存里、外部读不到）—— ' +
+        '甲-1 的"键恒在"判据必须当场指名该块缺失');
+
+      /* 变异体②：把 `skippedNoUnit` **并进** `failures`（＝恢复"拿不到与失败混一起"）。 */
+      t.check('甲-D22② 定点变异：把 `skippedNoUnit` **并进** `failures`（`failures: failures + skippedNoUnit`，' +
+        '`server/index.js` 的**内存字节副本**变异体）⇒ 甲-3 的"二者分得开"判据**必红并指名**；' +
+        '未变异的当前源码必绿；盘上文件全程逐字节未变',
+        (() => {
+          if (!RW_FAIL_LINE_RE.test(serverSrc)) {
+            t.info('甲-D22② 变异锚点未命中（`failures: state.resultWrite.failures,` 那行）—— 判红，不许静默放过');
+            return false;
+          }
+          const mutSrc = serverSrc.replace(RW_FAIL_LINE_RE,
+            '$1failures: state.resultWrite.failures + state.resultWrite.skippedNoUnit,$2');
+          let mut = null;
+          try { mut = loadServerVariant(mutSrc, 'rw-merge'); }
+          catch (err) { t.info('甲-D22② 变异体载入失败：' + (err && err.message)); return false; }
+          const payloadAt = st => { mut.state.resultWrite = Object.assign({}, st); return mut.healthPayload(); };
+          /* 两个输入态＝**真·现场读数**：注入失败之后 / 三帧不带件序号之后（当前实现里 `/health` 就是搬运，
+             故这两份读数**就是**那两刻的 `state.resultWrite`；没有编造中间态）。 */
+          const mutNo = payloadAt(before4), mutCtl = payloadAt(afterNo4);
+          const mutSep = separateNoUnitFromFailures(mutNo, mutCtl, payloadAt(afterCtl4));
+          const mutSha = sha256Hex(Buffer.from(mutSrc, 'utf8'));
+          const diskSame = sha256Hex(fs.readFileSync(SERVER_FILE)) === serverSha0;
+          t.info(`甲-D22② 变异体 sha256=${mutSha.slice(0, 12)}…（原件 sha256=${serverSha0.slice(0, 12)}…）；`
+            + `变异体三帧读数 ${JSON.stringify(mutNo && mutNo.resultWrite)} → ${JSON.stringify(mutCtl && mutCtl.resultWrite)}`
+            + `（ΔskippedNoUnit=${mutSep.dNo && mutSep.dNo.skippedNoUnit}、Δfailures=${mutSep.dNo && mutSep.dNo.failures}）；`
+            + `当前源码同判据=${sep.ok}；盘上文件未变=${diskSame}`);
+          /* "必红"＝同一判据在变异体上不成立；"当前源码必绿"＝sep.ok（甲-3 本身）⇒ 不是"把一切都判红" */
+          return mutSep.ok === false && sep.ok === true && diskSame;
+        })(),
+        '变异内容：`/health` 的 `failures` 改成 `failures + skippedNoUnit`（把"根本没打算落"并进"落失败"）' +
+        '—— 甲-3 必须当场指名 Δfailures 被污染（这正是 `E60` 病灶的形态）');
     }
   }
 
@@ -4756,17 +4985,40 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
   const S15_SUITES = ['contract-check', 'db-check', 'docs-check', 'files-check', 'logic-check', 'trace-check'];
   const RECURSION_GUARD = "不允许用 --fast/--only harness-check";
   const RUN15_TIMEOUT = 10 * 60 * 1000;
+  /* **`E96` 收口**（`T-20261003-04`，座位 4b）—— 本节"并行 vs 串行"的对照，在**子集场景**下本来
+     **无法失败**：`run-all` 的 `scheduleSuites()` 第一条分支是
+       `if (!(jobs > 1) || optValue('--only')) return { parallel: [], serial: suites.slice(), jobs: 1 };`
+     ⇒ 传 `--jobs 4` 也按**并发 1** 跑（座位 4 实测：`--only <6 脚本> --jobs 4` ⇒
+     `serialMs 9194 / parallelMs 9215` —— 同一条串行路径测了两遍）⇒ 旧写法
+     `t.check('§15-C …', okC15)` 是一条**空洞判据**（D23：看起来守住了、实际守不住）。
+     现按 `§15-D` 的既有护栏统一：**只在"真并行轮"上判定**（脚本数 ≥8 **且**实跑输出里真的打印了
+     并行波），否则**显式打印"本轮为子集/串行 ⇒ 不判定"并以 `t.skip` 记账** ——
+     "不判定"与"通过"在台账上必须分得开（这正是 `D23` 要的口径）：
+       ①**默认档**（本节 fork 的子集轮）：恒为"不判定"（`--only` 强制串行）；
+       ②**`DSH_HARNESS_S15_FULL=1` 档**：改跑 `--fast`（13 个脚本）串行 vs `--fast --jobs 2`
+         ⇒ 该判据回到"**可判定**"（真并行波 10 个）。
+     为什么第②档做成**显式档位**而不是默认：那一档每次给 harness-check 加约 2 分钟
+     （ADR-0004 准则 6"成本可控"），且 `--fast` 含本脚本 ⇒ 需要一层递归护栏
+     （子轮带 `DSH_HARNESS_S15_CHILD=1`，嵌套的那一层 harness-check 不再 fork）。
+     ⚠ 本节**不动** `run-all.js` 的调度（那是另一路协作方的文件）—— 护栏只加在判据侧。 */
+  const S15_FULL = String(process.env.DSH_HARNESS_S15_FULL || '').trim() === '1';
+  const S15_CHILD = String(process.env.DSH_HARNESS_S15_CHILD || '').trim() === '1';
+  const S15_JOBS = S15_FULL ? 2 : 4;
+  const S15_MODE = S15_FULL ? 'fast' : 'subset';
   const runFast15 = (jobs) => {
-    /* ⚠ 必须**逗号分隔的单个 `--only`**：`optValue('--only')` 只取一个值，
+    /* ⚠ 子集档必须**逗号分隔的单个 `--only`**：`optValue('--only')` 只取一个值，
        重复传多个 `--only` 只会生效最后一个（实测过一次"共 1 个脚本"的假象）。 */
-    const args = ['--no-preflight', '--only', S15_SUITES.join(',')];
+    const args = ['--no-preflight'];
+    if (S15_MODE === 'fast') args.push('--fast'); else args.push('--only', S15_SUITES.join(','));
     if (jobs > 1) args.push('--jobs', String(jobs));
     const started = Date.now();
     const res = spawnSync(process.execPath, [path.join(env.paths.tests, 'run-all.js'), ...args], {
       cwd: env.paths.root, encoding: 'utf8', timeout: RUN15_TIMEOUT, maxBuffer: 64 * 1024 * 1024,
       /* 基线轮显式 `DSH_JOBS:'1'`：否则若外层带 `DSH_JOBS`，基线轮自己就并行了，
-         §15-C 会退化成"并行 vs 并行"（对照失效），且可能让子进程再并行化。 */
-      env: { ...process.env, DSH_ENV: env.ENV_NAME, DSH_JOBS: jobs > 1 ? '' : '1' }
+         §15-C 会退化成"并行 vs 并行"（对照失效），且可能让子进程再并行化。
+         `DSH_HARNESS_S15_CHILD:'1'`＝**递归护栏**：`--fast` 档的子轮含本脚本，
+         嵌套那一层必须**不再 fork**（否则无限递归 —— 见上面的历史坑）。 */
+      env: { ...process.env, DSH_ENV: env.ENV_NAME, DSH_JOBS: jobs > 1 ? '' : '1', DSH_HARNESS_S15_CHILD: '1' }
     });
     const ms = Date.now() - started;
     let ledger = null;
@@ -4776,35 +5028,136 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
   const shape15 = L => (L && Array.isArray(L.suites))
     ? L.suites.map(s => `${s.name}:${s.status}:${s.summary ? s.summary.passed + '/' + s.summary.failed + '/' + s.summary.skipped : '-'}`).join(' | ')
     : '（读不到账本）';
+  /** 一轮 run-all 是不是**真并行轮**（判据可判定性的唯一出处，§15-C／§15-D 共用）：
+      请求并发 ≥2 ＋ 实跑脚本数 ≥8 ＋ **输出里真的打印了并行波**。
+      为什么以"输出里真的打印"为准：`scheduleSuites()` 的降级（`--only`／jobs<2）是**静默**的，
+      只有 run-all 自己那行 `▶ 并行波 N 个（并发 M）` 能证明"这一轮确实分了并行波"。 */
+  const parallelRound15 = (run) => {
+    const count = run && run.ledger && Array.isArray(run.ledger.ranSuites) ? run.ledger.ranSuites.length : 0;
+    const m = String((run && run.out) || '').match(/▶ 并行波 (\d+) 个（并发 (\d+)）/);
+    const wave = m ? Number(m[1]) : 0, waveJobs = m ? Number(m[2]) : 0;
+    const judged = S15_JOBS >= 2 && count >= 8 && wave > 0 && waveJobs >= 2;
+    return {
+      judged, count, wave, waveJobs,
+      reason: `请求 --jobs ${S15_JOBS}（档位 ${S15_MODE}）、实跑脚本 ${count} 个、`
+        + (m ? `输出里并行波 ${wave} 个（并发 ${waveJobs}）` : '输出里**没有**并行波行')
+        + `⇒ ${judged ? '真并行轮（可判定）' : '子集/串行（不判定）'}`
+    };
+  };
 
   let ser15 = null, par15 = null;
-  try {
-    ser15 = runFast15(1);
-    /* 递归护栏（D23 意义上的"反自证"）：清单里一旦混进本脚本，就必须当场判红 —— 
-       否则整节会安静地无限递归下去（每轮都"通过"，不报错）。 */
-    if (S15_SUITES.includes('harness-check')) throw new Error(RECURSION_GUARD);
-    par15 = runFast15(4);
-  } catch (err) {
-    t.info('§15-C 未执行：' + (err && err.message));
+  if (S15_CHILD) {
+    /* 嵌套子轮：**不再 fork**（递归护栏）。显式记账，不许"静默少跑两条断言"。 */
+    t.skip('§15-C 行为：并行 vs 串行逐脚本一致（**嵌套子轮不判定**）',
+      '本进程是 §15-C 自己 fork 出来的子轮（`DSH_HARNESS_S15_CHILD=1`）⇒ 不再 fork，避免无限递归');
+    t.skip('§15-D 时效：并行墙钟 < 串行墙钟（**嵌套子轮不判定**）', '同 §15-C（嵌套子轮不再 fork）');
+  } else {
+    try {
+      ser15 = runFast15(1);
+      /* 递归护栏（D23 意义上的"反自证"）：子集档清单里一旦混进本脚本，就必须当场判红 ——
+         否则整节会安静地无限递归下去（每轮都"通过"，不报错）。 */
+      if (S15_MODE === 'subset' && S15_SUITES.includes('harness-check')) throw new Error(RECURSION_GUARD);
+      par15 = runFast15(S15_JOBS);
+    } catch (err) {
+      t.info('§15-C 未执行：' + (err && err.message));
+    }
   }
+  const round15 = S15_CHILD
+    ? { judged: false, count: 0, wave: 0, waveJobs: 0, reason: '嵌套子轮（不再 fork，故没有可判定读数）' }
+    : parallelRound15(par15);
+  /* ---- §15-C 的三个子句（口径）----
+     ① 逐脚本**内容**（状态 ＋ 条数）与串行逐条相同 —— **按名比对、与顺序无关**（并行只改"谁和谁同时跑"）；
+     ② 断言合计（`assertions`）逐字段相同；
+     ③ 账本**落账顺序**合 `run-all` 的既有契约：
+        · 串行轮 ⇒ SUITES 原顺序；
+        · 并行轮 ⇒ **并行波（按 SUITES 顺序）在前 ＋ 串行尾（按 SUITES 顺序）在后**
+          （`run-all.js` 的 `ordered()` 只把**波内**完成顺序归一，而尾段是波跑完之后逐条 append 的
+           —— 故整条账**不可能**与串行轮的 `ranSuites` 逐字相同）。
+     ⚠ **`E96` 第二次现身（本批实测，2026-10-03，`T-20261003-04`）**：旧子句写的是
+     "并行账本的 `ranSuites` 仍按 SUITES 原顺序"＝要求两轮 `ranSuites.join(',')` **逐字相等**。
+     它在**子集轮**里恒真（`--only` 强制串行 ⇒ 两轮账本都恰是 SUITES 顺序）⇒ 又一条
+     "看起来在守、实际守不住"的判据；而在**真并行轮**（`DSH_HARNESS_S15_FULL=1`）里它**必假**
+     （实测：串行 `…docs-check,files-check,harness-check,…` ↔ 并行 `…harness-check,…,docs-check,files-check,docs-cross-check`，
+     见 `tests\._verify\review\hc-s15full.log` 的 §15-C 失败明细）。
+     **判定（ADR-0004 D21）：改期望，不改 `run-all` 的调度** —— 依据是 `run-all` 自己的契约
+     （波内归一 ＋ 尾段后置；增量落账语义下"整条按 SUITES 顺序"本就不成立），
+     而"波内不得按完成顺序落账"这个**原意**由下面 ③ 的两条断言原样保住。 */
+  const suiteNames15 = runAll15.SUITES.map(s => s.name);
+  const tailNames15 = new Set(runAll15.SUITES.filter(s => s.serialTail).map(s => s.name));
+  /** 只保留"真在 SUITES 清单里"的脚本名（`capture-baseline` 是 `E91` 的前置刷新，不在 SUITES 里） */
+  const inSuites15 = ran => (Array.isArray(ran) ? ran : []).filter(n => suiteNames15.indexOf(n) >= 0);
+  /** ⚠ 期望值一律**由 SUITES 现算**（`suiteNames15`），**不得**拿 `ran` 自身当期望 ——
+      否则就是 `x === x` 的恒真式（ADR-0004 D23：这种"自己跟自己比"的判据比空洞还危险）。 */
+  const suiteOrderOf15 = ran => suiteNames15.filter(n => Array.isArray(ran) && ran.indexOf(n) >= 0);
+  const expectSerialOrder15 = ran => suiteOrderOf15(ran);
+  const expectWaveThenTail15 = ran => {
+    const names = suiteOrderOf15(ran);
+    return names.filter(n => !tailNames15.has(n)).concat(names.filter(n => tailNames15.has(n)));
+  };
+  const orderOk15 = (ran, expect) => Array.isArray(ran) && ran.length > 0
+    && inSuites15(ran).join(',') === expect(ran).join(',');
+  /** 逐脚本形态（**按名排序**：内容比对与顺序解耦；顺序另有 ③ 单独判） */
+  const contentShape15 = L => (L && Array.isArray(L.suites))
+    ? L.suites.map(s => `${s.name}:${s.status}:${s.summary ? s.summary.passed + '/' + s.summary.failed + '/' + s.summary.skipped : '-'}`).sort().join(' | ')
+    : '（读不到账本）';
   const okC15 = !!(ser15 && par15 && ser15.ledger && par15.ledger
-    && shape15(ser15.ledger) === shape15(par15.ledger)
+    && contentShape15(ser15.ledger) === contentShape15(par15.ledger)
     && JSON.stringify(ser15.ledger.assertions) === JSON.stringify(par15.ledger.assertions)
-    && ser15.ledger.ranSuites.join(',') === par15.ledger.ranSuites.join(','));
-  t.check('§15-C 行为：`--fast` 串行 vs `--fast --jobs 4` ⇒ 逐脚本状态与条数**完全一致**，且账本仍按 SUITES 原顺序',
-    okC15,
-    `串行【${shape15(ser15 && ser15.ledger)}】\n        并行【${shape15(par15 && par15.ledger)}】\n` +
-    `        串行断言 ${JSON.stringify((ser15 && ser15.ledger && ser15.ledger.assertions) || null)}；` +
-    `并行断言 ${JSON.stringify((par15 && par15.ledger && par15.ledger.assertions) || null)}`);
+    && orderOk15(ser15.ledger.ranSuites, expectSerialOrder15)
+    && orderOk15(par15.ledger.ranSuites, expectWaveThenTail15));
+  const c15Shape = `串行【${contentShape15(ser15 && ser15.ledger)}】\n        并行【${contentShape15(par15 && par15.ledger)}】\n`
+    + `        串行断言 ${JSON.stringify((ser15 && ser15.ledger && ser15.ledger.assertions) || null)}；`
+    + `并行断言 ${JSON.stringify((par15 && par15.ledger && par15.ledger.assertions) || null)}\n`
+    + `        账本顺序：串行 ${JSON.stringify((ser15 && ser15.ledger && ser15.ledger.ranSuites) || null)}`
+    + `（期望＝SUITES 顺序 ${JSON.stringify(expectSerialOrder15(ser15 && ser15.ledger && ser15.ledger.ranSuites))}）；`
+    + `并行 ${JSON.stringify((par15 && par15.ledger && par15.ledger.ranSuites) || null)}`
+    + `（期望＝波＋尾 ${JSON.stringify(expectWaveThenTail15(par15 && par15.ledger && par15.ledger.ranSuites))}）`;
+  if (round15.judged) {
+    t.check('§15-C 行为：串行 vs `--jobs ' + S15_JOBS + '` ⇒ 逐脚本**内容**（状态/条数）与断言合计**按名逐条一致**' +
+      '（与顺序无关），且账本**落账顺序**合 `run-all` 契约（串行＝SUITES 原顺序；' +
+      '并行＝并行波（SUITES 顺序）在前 ＋ 串行尾（SUITES 顺序）在后 —— 见本条上方的 `E96` 二次现身说明）',
+      okC15, `**真并行轮**（${round15.reason}）\n        ` + c15Shape);
+  } else {
+    t.skip('§15-C 行为：串行 vs `--jobs ' + S15_JOBS + '` ⇒ 逐脚本内容与账本顺序逐条一致（**本轮不判定**）',
+      `不判定（本轮为子集/串行）：${round15.reason}。实测读数：串行 ${ser15 ? ser15.ms + ' ms' : '（未跑）'} ↔ `
+      + `并行 ${par15 ? par15.ms + ' ms' : '（未跑）'}（两者几乎相同＝同一条串行路径测了两遍 —— 这正是 E96 的现场）。`
+      + `逐脚本形态：${shape15(ser15 && ser15.ledger)} ／ ${shape15(par15 && par15.ledger)}。`
+      + '【不判定 ≠ 通过】：要拿可判定读数，请跑 `DSH_HARNESS_S15_FULL=1 node tests\\harness-check.js`（真并行波档）');
+    t.info(`§15-C 本轮为**子集/串行 ⇒ 不判定**：${round15.reason}；`
+      + `串行 ${ser15 ? ser15.ms : '?'} ms ↔ 并行 ${par15 ? par15.ms : '?'} ms`
+      + '（`--only` 强制并发 1 由 `run-all.js` 的 `scheduleSuites()` 第一条分支决定，本节不改调度）');
+  }
 
   /* 时效：只在本机确实把"并发"体现出来时才要求（核少或脚本少时并行不一定更快，别拿硬件当缺陷） */
   const cores15 = os.cpus().length;
-  const speedCandidate15 = !!(ser15 && ser15.ledger && ser15.ledger.ranSuites.length >= 8) && cores15 >= 4;
-  t.check('§15-D 时效：并行墙钟 < 串行墙钟（仅在核数与脚本数足够时判定，避免拿硬件差异当缺陷）',
-    !speedCandidate15 || !!(par15 && ser15 && par15.ms < ser15.ms),
-    !speedCandidate15
-      ? `不判定（核 ${cores15}、脚本 ${ser15 && ser15.ledger ? ser15.ledger.ranSuites.length : '?'}）`
-      : `串行 ${(ser15.ms / 1000).toFixed(1)}s → 并行 ${(par15.ms / 1000).toFixed(1)}s`);
+  if (round15.judged && cores15 >= 4) {
+    t.check('§15-D 时效：并行墙钟 < 串行墙钟', !!(par15 && ser15 && par15.ms < ser15.ms),
+      `串行 ${(ser15.ms / 1000).toFixed(1)}s → 并行 ${(par15.ms / 1000).toFixed(1)}s（${round15.reason}）`);
+  } else {
+    t.skip('§15-D 时效：并行墙钟 < 串行墙钟（**本轮不判定**）',
+      `不判定：${round15.reason}；本机核 ${cores15}（须 ≥4 **且**是真并行轮）。`
+      + `读数仅供参考、不构成判据：串行 ${ser15 ? ser15.ms : '?'} ms ↔ 并行 ${par15 ? par15.ms : '?'} ms`);
+  }
+
+  /* §15-C0 构成性：**"可判定"分支可达**（否则上面那个 `if (round15.judged)` 就是死代码 ——
+     那本身就是空洞判据的另一种形态）。取数走 `run-all` **自己的** `scheduleSuites()`
+     （真源，不另抄一份调度规则；`loadVariant15` 在源码尾部**追加一行导出**，不落地、不碰仓库）。 */
+  t.check('§15-C0 构成性：`真并行轮`的配置**存在且确实产出并行波**' +
+    '（`scheduleSuites(13 个 --fast 脚本, --jobs 2)` ⇒ 并行波 ≥8、并发 2）⇒ §15-C 的"可判定"分支可达（不是死代码）',
+    (() => {
+      let plan = null;
+      try {
+        const probe = loadVariant15(src15 + '\nmodule.exports.__s15probe = { scheduleSuites };\n');
+        const fastList = runAll15.SUITES.filter(s => !s.slow && !s.needBrowser);
+        plan = probe.__s15probe.scheduleSuites(fastList, 2);
+      } catch (err) { t.info('§15-C0 取不到 `scheduleSuites()`：' + (err && err.message)); return false; }
+      return Boolean(plan) && Array.isArray(plan.parallel) && plan.parallel.length >= 8 && plan.jobs === 2;
+    })(),
+    '反证：若 `scheduleSuites()` 退化成"任何情况都不并行"（parallel 恒空）⇒ 本条必红。'
+    + '⚠ 本节**默认档**用的子集轮（`--only` 6 个脚本）结构上不可能出现并行波：'
+    + "`scheduleSuites()` 的第一条分支就是 `if (!(jobs > 1) || optValue('--only')) return { parallel: [], …, jobs: 1 }`"
+    + `（源码文本实测命中＝${/if\s*\(!\(jobs > 1\)\s*\|\|\s*optValue\('--only'\)\)/.test(src15)}）——`
+    + '故默认档报"不判定"，`DSH_HARNESS_S15_FULL=1` 档报"可判定"');
 
   /* D22 定点变异：把 docs-cross-check 的 serialTail 去掉 ⇒ A 必须变红（证明不是恒真断言） */
   t.check('§15-E D22 变异：去掉 `docs-cross-check` 的 `serialTail` ⇒ §15-A 判据必红；恢复后回绿',
@@ -4822,7 +5175,10 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     '变异内容：删掉 docs-cross-check 那条的 `serialTail: true`（它并行时会在别的脚本还没跑完时去读账本）');
   try {
     fs.writeFileSync(path.join(env.paths.verify, 's15-parallel-runs.txt'),
-      JSON.stringify({ serialMs: ser15 && ser15.ms, parallelMs: par15 && par15.ms, serial: shape15(ser15 && ser15.ledger), parallel: shape15(par15 && par15.ledger) }, null, 2), 'utf8');
+      JSON.stringify({ mode: S15_MODE, jobs: S15_JOBS, child: S15_CHILD, judged: round15.judged,
+        reason: round15.reason, wave: round15.wave, waveJobs: round15.waveJobs, scripts: round15.count,
+        serialMs: ser15 && ser15.ms, parallelMs: par15 && par15.ms,
+        serial: shape15(ser15 && ser15.ledger), parallel: shape15(par15 && par15.ledger) }, null, 2), 'utf8');
   } catch { /* 忽略 */ }
 }
 
