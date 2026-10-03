@@ -1222,12 +1222,16 @@ async function main() {
   console.log(`\n${verdict.evidence}`);
 
   /* 收尾：清掉 24 小时前的临时区残留（P2-16 —— `harness.cleanup()` 此前只被"测试存在"，
-     从未在真实运行里被调用过；放在全绿收尾处，既不干扰本轮用例，又能防止临时目录无限堆积）。 */
+     从未在真实运行里被调用过；放在全绿收尾处，既不干扰本轮用例，又能防止临时目录无限堆积）。
+     `E90`（2026-10-03）后清扫对象＝**公共根** `tests\._verify\tmp`（`env.paths.tempRootBase`）
+     下的**整轮目录** `run-<pid>-…` —— 本轮自己的那一轮目录刚建（mtime 新）绝不被它命中，
+     另一路正在跑的整轮目录也不会（除非已过期 24 h）。**不要**改成 `cleanup(true)`：
+     那正是 `E90` 的病灶（把"另一轮正在用的产物"当垃圾删）。 */
   try {
     const { cleanup } = require('./lib/harness');
     const swept = cleanup(false);
     if (swept && swept.removed > 0) {
-      console.log(`\n  临时区收尾：清理 24 小时前的残留 ${swept.removed} 项（保留 ${swept.kept} 项，均为本轮产物）`);
+      console.log(`\n  临时区收尾：清理 24 小时前的残留 ${swept.removed} 个整轮目录（保留 ${swept.kept} 个：本轮与其它仍在用的轮次）`);
     }
   } catch (err) {
     console.log(`\n  临时区收尾失败（不影响门禁结论）：${err && err.message}`);

@@ -140,9 +140,9 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `tests/env.js` | 测试环境常量与校验：`MIN_NODE_MAJOR=24`（不达标直接退出码 2）、`DSH_ENV` 解析、路径集（`tempRoot`/`testData`/`captures`/`baseline`）、`ensureDir`、`isInsideVerify`、过期临时目录清理。**业务代码不得引用本文件**（业务走 `platform/paths.js`）。 |
+| `tests/env.js` | 测试环境常量与校验：`MIN_NODE_MAJOR=24`（不达标直接退出码 2）、`DSH_ENV` 解析、路径集（`tempRoot`/`testData`/`captures`/`baseline`）、`ensureDir`、`isInsideVerify`、过期临时目录清理；**`tempRootBase`＝公共临时根**（各轮目录之父 ＋ 24h 清扫对象；`E90` 后临时目录**按轮次隔离**，`tempRoot` 由 `harness` 加载时指向本轮专属 `run-<pid>-<启动时刻>-<4hex>`）。**业务代码不得引用本文件**（业务走 `platform/paths.js`）。 |
 | `tests/lib/assert.js` | 公共断言与汇总：`createRunner()` 提供 `section/check/skip/info/finish`，**汇总行固定为 `通过 N 项，失败 N 项，跳过 N 项`**（runner 与门禁数字机制都解析这一行，**不可改格式**）；`runMain()` 提供异常兜底（退出码 2）。 |
-| `tests/lib/harness.js` | 夹具：`makeTempDir`/`makeTempDb`（**一用例一库**，WAL，跑完删；`reopen()` 供"重启不丢数据"用例）/`allocPort`/`startService`（stdio **落文件而非管道**）/`injectFailure`（错误注入，验 IF-B.9 补传与 IF-D.9 降级）/`cleanup`。 |
+| `tests/lib/harness.js` | 夹具：`makeTempDir`/`makeTempDb`（**一用例一库**，WAL，跑完删；`reopen()` 供"重启不丢数据"用例）/`allocPort`/`startService`（stdio **落文件而非管道**）/`injectFailure`（错误注入，验 IF-B.9 补传与 IF-D.9 降级）/`cleanup`。　**`E90`（2026-10-03）**：临时目录**按轮次隔离**（`tempRoot`≠他路 ⇒ 任一路的 `cleanup` 物理上删不到别人的产物）；**`cleanup(true)` 返回值由事实推导** —— 只删本轮目录、**删完回读**：`removed ∈ all|partial|none`（"目标是否还在 ＋ 递归条目是否变少"推导）＋ `kept`/`keptDeep`＝**实测剩余** ＋ `errors`＝失败原因；**不变量 `removed==='all'` ⟺ 目录不存在**；`cleanup(false)` 仍返回数字并清扫公共根下 **>24h** 的整轮目录。 |
 | `tests/lib/fixture.js` | 确定性样本：固定种子 `SEED=20260919` 的 PRNG；设备/工单/测试标准；`makeFrame`（**自洽**：`speed=√(vx²+vy²)`，且 `cameraDepth ≠ depth`）/`makeFrames`/`makeCurve`（含 `minValue`/`maxValue`/`intervalSec`/`durationSec`）/`makeSnapshot`；`REPORT_FIELDS`＝附录 2 的 13 项。 |
 | `tests/lib/clock.js` | **可注入时钟**：`fixed`（测试推荐）/`real`/`offset` 三种模式，`now/at/advanceMs/advanceSec/advanceMin/reset/source/snapshot`；另导出班次边界时刻常量 `BOUNDARIES`（交班前后、跨零点、跨月、跨年）。**用途**：班次边界（FR-4.16）与累计运行用例若不注入时钟就只能"看运气跑"。 |
 

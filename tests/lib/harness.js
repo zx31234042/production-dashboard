@@ -1,11 +1,14 @@
 /* ==========================================================================
    测试夹具（tests/lib/harness.js）
    作用：为后端自检提供**隔离**的运行环境与临时资源：
-         ①临时库（一用例一库、WAL、跑完删）②临时目录 ③空闲端口分配
-         ④服务进程启停（stdio 落文件，避免管道依赖）⑤错误注入工具
+         ①临时库（一用例一库、WAL、跑完删）②临时目录（**按轮次隔离**：
+           `tests\._verify\tmp\run-<pid>-<启动时刻>-<4hex>`，见文件中部 `E90` 注释）
+         ③空闲端口分配 ④服务进程启停（stdio 落文件，避免管道依赖）⑤错误注入工具
    为什么必须有它：不隔离会写脏生产数据；SQLite WAL 下"服务持锁、测试写入"
-         会出现随机失败；共用库会让用例互相污染（"单跑过、连跑挂"）。
-   依据：ADR-0003 D17；规范 9.5-5 第 3 条（一个用例一个库）。
+         会出现随机失败；共用库会让用例互相污染（"单跑过、连跑挂"）；
+         共用**临时根**会让并发跑的收尾互相删产物（`E90`：假红与"返回值说谎"）。
+   依据：ADR-0003 D17；规范 9.5-5 第 3 条（一个用例一个库）；
+         `E90`（2026-10-03）：临时区按轮次隔离 ＋ `cleanup(force)` 的返回值必须由**事实**推导。
    依赖：仅 Node 内置模块（node:sqlite 延迟加载，未达标时不因本文件报错）。
    用法：
      const { makeTempDir, makeTempDb, allocPort, startService, stall } = require('./lib/harness');
@@ -19,9 +22,38 @@ const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
+const { randomBytes } = require('node:crypto');
 const env = require('../env');
 
 /* ---------------- 临时目录与临时库 ---------------- */
+
+/* 【E90（2026-10-03，★★★）临时区**按轮次隔离** —— 改任何临时路径前先读完这一段】
+   旧版所有进程共用一个 `tests\._verify\tmp`，于是**任一路的 `cleanup(true)`**
+   （＝ `rmSync(共享根, {recursive:true})`）会删掉**另一路正在用**的产物，实测两类假红：
+     ① `harness-check` 里两条 `screenshot-diff` 判据读子进程日志**读回空串**（落点
+        `harness-check.js:3972`）：另一路的 `cleanup(true)` 把本轮写进 `tmp\` 的日志删了；
+     ② `harness-check` §五"`cleanup(true)` 真能清空临时区"因**他路**在 `tmp\` 下持有句柄
+        ⇒ `rmSync` 中途 `EPERM`、被 `catch` 吞掉 ⇒ 断言报"残留目录仍在=true"。
+   现在把两个概念**显式分开**（只在这里定义；别处一律读 `env.paths`）：
+     · `tempRootBase` ＝ **公共根**（＝旧 `tempRoot` 的原意 `tests\._verify\tmp`）：
+       只作为"各轮目录的父目录"与 24 小时过期清扫的对象；
+     · `tempRoot`     ＝ **本轮专属**目录 `<base>\run-<pid>-<本地启动时刻>-<4 hex>`：
+       本轮所有临时目录/临时库/子进程日志都落在它下面 ⇒ **任一路的 `cleanup` 只能删到
+       自己的 `run-<pid>-…`，物理上删不到别人的** —— 这就是"并发不再互相删"的全部机制。
+   向后兼容：`tempRoot` 的**名字与用法一字不变**（仍是"可写的临时区"：`preflight` 的写探针、
+   `db-check`/`files-check` 找散落库文件、`harness-check` 数目录数都照旧），只是它现在指向
+   本轮子目录；需要"公共根"的地方**显式**读 `env.paths.tempRootBase`（如 `run-all` 的过期清扫）。
+   落地方式：本文件被 require 时就把这两个键写进 `env.paths`（`env.paths` 是**同一个对象**，
+   故所有 `require('../env')` 的脚本立刻看到同一口径，不必逐个脚本改）。 */
+const tempRootBase = env.paths.tempRoot;                       /* 公共根：tests\._verify\tmp */
+const runStartedAt = new Date();
+const pad2 = (n) => String(n).padStart(2, '0');
+const runStamp = `${runStartedAt.getFullYear()}${pad2(runStartedAt.getMonth() + 1)}${pad2(runStartedAt.getDate())}`
+  + `T${pad2(runStartedAt.getHours())}${pad2(runStartedAt.getMinutes())}${pad2(runStartedAt.getSeconds())}`;
+/* 随机后缀：Windows 的 pid 会复用 ⇒ 只按 pid ＋ 秒级时刻命名有"同名撞上旧轮残留"的理论窗口 */
+const runTempRoot = path.join(tempRootBase, `run-${process.pid}-${runStamp}-${randomBytes(2).toString('hex')}`);
+env.paths.tempRootBase = tempRootBase;                         /* 公共根（显式命名，供清扫与排查） */
+env.paths.tempRoot = runTempRoot;                              /* ← 语义更新：指向本轮专属子目录 */
 
 let seq = 0;
 /** 生成本次运行内唯一的临时目录名（同时带 pid 便于排查残留） */
@@ -30,7 +62,7 @@ function uniqueName(prefix) {
   return `${prefix}-${process.pid}-${seq}-${Date.now().toString(36)}`;
 }
 
-/** 在 tests/._verify/tmp 下建一个临时目录（**已被 .gitignore 忽略**） */
+/** 在**本轮专属**临时根下建一个临时目录（`tests\._verify\tmp\run-<pid>-…\`，**已被 .gitignore 忽略**） */
 function makeTempDir(prefix = 'case') {
   const dir = path.join(env.paths.tempRoot, uniqueName(prefix));
   env.ensureDir(dir);
@@ -247,13 +279,77 @@ function injectFailure(fn, opts = {}) {
 
 /* ---------------- 收尾 ---------------- */
 
-/** 清理测试临时区（默认只清 24 小时前的；传 force=true 清空全部） */
+/** 回读临时区**事实**（不猜）：目标目录是否存在、还剩多少条目（顶层）。 */
+function readTempFacts(dir) {
+  const exists = fs.existsSync(dir);
+  return { exists, entries: exists ? fs.readdirSync(dir).length : 0 };
+}
+
+/** 递归条目数（含子目录自身）—— 用来判"删掉了一部分"还是"一条没删"。
+ *  用 `lstatSync` **不跟随**链接/junction：本项目有 junction 用例，跟随会出圈。 */
+function countEntriesDeep(dir) {
+  let n = 0;
+  const walk = (d) => {
+    let names;
+    try { names = fs.readdirSync(d); } catch { return; }
+    for (const name of names) {
+      n++;
+      const full = path.join(d, name);
+      let st;
+      try { st = fs.lstatSync(full); } catch { continue; }
+      if (st.isDirectory() && !st.isSymbolicLink()) walk(full);
+    }
+  };
+  walk(dir);
+  return n;
+}
+
+/**
+ * 清理测试临时区。
+ *
+ * `force=false`（日常收尾，`run-all` 全绿时调用）：只清**公共根**下超过 24 小时的
+ *   **整轮目录**（`run-<pid>-…`）—— 本轮目录刚建、mtime 是新的，故自己与别人的这一清理都
+ *   命不中它；返回 `{removed, kept}`（**条数**，与旧口径一致，`harness-check` §五按其类型判）。
+ *   **公共根口径不写第二份**：`env.cleanupStaleTemp(maxAgeMs)` 的目标是 `paths.tempRoot`，
+ *   `E90` 后它指向本轮子目录 ⇒ 这里**临时**把它指回公共根再调用（同步执行、`finally` 复原，
+ *   期间没有别的代码能观察到这个临时态），从而复用同一份"24 小时"策略，避免两份口径漂移。
+ *
+ * `force=true`（收尾**本轮**临时区）：只删**本轮专属目录** `env.paths.tempRoot`，
+ *   且**删完必须回读**（这就是 `E90` 的判据 —— 绝不能用"调用过 `rmSync`"代替事实）：
+ *     · `removed`：目标目录**不在**了 ⇒ `'all'`；还在但递归条目变少（或只剩空壳）⇒ `'partial'`；
+ *       还在且一条都没少 ⇒ `'none'`；
+ *     · `kept`：回读到的**剩余顶层条目数**（另给 `keptDeep` 供排查）；
+ *     · `errors`：失败原因（`catch` 里**也回读**，不再静默吞 —— 旧版吞掉异常后无条件
+ *       `return { removed:'all', kept:0 }`，即"返回值与事实无关"，那正是 `E90` 要消的）；
+ *     · `target`：本轮到底删的是哪个目录（白盒可核）。
+ *   **不变量**：`removed==='all'` ⟺ 目标目录不存在 ⟺ `kept===0 && keptDeep===0`。
+ */
 function cleanup(force = false) {
-  if (force) {
-    try { fs.rmSync(env.paths.tempRoot, { recursive: true, force: true }); } catch { /* 忽略 */ }
-    return { removed: 'all', kept: 0 };
+  if (!force) {
+    const runRoot = env.paths.tempRoot;                        /* 本轮子目录（勿动） */
+    env.paths.tempRoot = tempRootBase;                         /* 临时态：清扫目标是公共根 */
+    try {
+      return env.cleanupStaleTemp();
+    } finally {
+      env.paths.tempRoot = runRoot;                            /* 复原：别处读到的仍是本轮目录 */
+    }
   }
-  return env.cleanupStaleTemp();
+  const target = env.paths.tempRoot;
+  const beforeDeep = countEntriesDeep(target);
+  const errors = [];
+  try {
+    fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 });
+  } catch (err) {
+    errors.push(`${(err && err.code) || 'ERR'}: ${(err && err.message) || String(err)}`);
+  }
+  const after = readTempFacts(target);                         /* ← 事实（回读），不是"调用过" */
+  const afterDeep = countEntriesDeep(target);
+  let removed;
+  if (!after.exists) removed = 'all';                          /* 目录不存在 ⇒ 真清干净了 */
+  else if (afterDeep === 0) removed = 'partial';               /* 只剩空壳目录：也没清干净 */
+  else if (afterDeep < beforeDeep) removed = 'partial';        /* 删掉一部分，仍有残留 */
+  else removed = 'none';                                       /* 一条都没删掉 */
+  return { removed, kept: after.entries, keptDeep: afterDeep, target, errors };
 }
 
 /* 注：`stall(ms)`（挂起执行以验超时/断连）已于 2026-09-19 删除 ——

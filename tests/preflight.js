@@ -17,7 +17,7 @@ const net = require('node:net');
 
 const env = require('./env');
 const { createRunner } = require('./lib/assert');
-const { makeTempDb, allocPort } = require('./lib/harness');
+const { makeTempDb, allocPort, cleanup } = require('./lib/harness');
 
 const t = createRunner('测试环境体检（preflight）');
 const warnings = [];
@@ -72,6 +72,11 @@ async function main() {
     fs.rmSync(probeFile, { force: true });
     t.check('测试临时区可写（tests/._verify/tmp，已被 .gitignore 忽略）', ok,
       path.relative(env.paths.root, dir));
+    /* `E90`（2026-10-03）后临时区是**按轮次隔离**的：`env.paths.tempRoot` ＝
+       `tests\._verify\tmp\run-<pid>-…`（本轮专属）。上面那一步已经证明它可写；
+       这里**只**把本轮这个（现已空的）目录收掉 —— 否则每跑一次体检就在公共根下留一个
+       空目录（与 P3-14 修掉的"唯一性探测留目录"同类病）。不新增断言（判据不变）。 */
+    cleanup(true);
   } catch (err) {
     t.check('测试临时区可写（tests/._verify/tmp，已被 .gitignore 忽略）', false, err.message);
   }
