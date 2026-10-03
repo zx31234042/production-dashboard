@@ -82,6 +82,12 @@ const { mountSite } = require('./http/site');
    与标准取数（`standard` 表按"产品＋工序＋指定时刻生效版本"，DR-03）。见下方 6e-2 段。 */
 const judge = require('./services/judge');
 const standardSvc = require('./services/standard');
+/* `DR-14` 保留策略（**唯一实现**＝`server/db/maintain.js` 的 `applyRetention()`；本处只接线、不重写）。
+   技术债 `E89` 的落地：`DR-14`「统一保留 1 年」实现了却**零生产调用方** ⇒ 库无界增长、而
+   `repo/notice.js` 文件头自述的"审计反地平线＝保留期（1 年）"是**带前提**的。本包按负责人
+   2026-10-03 的裁定接线：**复用既有 1 s 采样 tick、按"跨自然日"触发**（不新增定时器，与 A1 的
+   跨班检测同款）。接线点/去重/`maxDelete` 三处口径见下方 6e-5 段。 */
+const maintain = require('./db/maintain');
 
 /* 注入出口（ADR-0003 D17 / E42）：本文件的时间**一律**经 platformClock 取，不裸写 `new Date()` /
    `Date.now()`；形态与 `server/http/router.js`、`server/services/dispatch.js` 及下方 IF-D/IF-A
@@ -107,6 +113,8 @@ const SHUTDOWN_IDLE_SWEEP_MS = 50;
 /** 跨班补记一次最多枚举多少个班次（**只为防"配置异常时无限循环"**，不是业务上限：
  *  3 班/天 ⇒ 1000 个班次 ≈ 333 天，远大于"服务停摆一天"这种真实场景；枚举超出即如实记错、不静默）。 */
 const MAX_BACKFILL_SHIFTS = 1000;
+/* `DR-14` 裁剪（技术债 `E89`）**不另设上限**：单次删除的行数上限沿用 `maintain.RETENTION_MAX_DELETE`
+   （**单一真源**，不在本文件复制常量 —— 复制一份就会出现"两处口径"）。选值与理由写在 6e-5 段。 */
 /* 技术债 E58 的**临时闸已拆除**（T-20260930-08，负责人 2026-09-30 裁定的第②步）：
    闸的构成（`orderDoneSourceReady` 注入位 + `ORDER_DONE_SUPPRESS_REASON` 字面量 +
    `GET /health.orderWarningSource` 字段 + 启动日志的抑制行）全部随本轮删除 ——
@@ -348,6 +356,20 @@ const state = {
   warningWrite: {
     writes: 0, duplicates: 0, skippedOk: 0, failures: 0, lastError: null, lastWarnType: null
   },
+  /** `DR-14` 保留裁剪（技术债 `E89`）的运行计数 ＋ **跨自然日去重**的进程内记忆：
+   *  · `lastRunDay` ＝"本进程已经为**哪个自然日**跑过裁剪"（`yyyy-MM-dd`，取自**注入时钟**）。
+   *    它是"同一自然日内只跑一次"的判据（详见 6e-5 段）；
+   *  · `lastCutoff` ＝最近一次**成功**算出的保留期截止时刻（`applyRetention()` 的返回值；失败不覆盖 ⇒
+   *    可能停留在上一次成功的值，也可能还是 `null`＝"从未成功过"）；
+   *  · `lastDeleted` ＝**最近一次尝试**删掉的行数（成功时＝`totalDeleted`；失败时该次无删除 ⇒ 0）；
+   *  · `totalDeleted` ＝本进程内**累计**删掉的行数（口径与 `lastDeleted` 并列写明，避免混读）；
+   *  · `runs` 累计"真的调了 `applyRetention()` 的次数"（含失败那几次）、`failures` 其中抛错的次数
+   *    ＋ `lastError` 最后一次原因。
+   *  失败**只记不抛**（与 `shiftStatWrite` / `warningWrite` 同纪律：裁剪是派生，不许污染采集链）。 */
+  retentionWrite: {
+    runs: 0, failures: 0, lastError: null,
+    lastRunDay: null, lastCutoff: null, lastDeleted: 0, totalDeleted: 0
+  },
   /** 最近一次**整机快照**（`createStateSnapshot()` 的产物）：`/health` 的 `runAccum` 从它只读引用
    *  （`snapshot.lastRunAccum`）。未生成过 ⇒ null（键恒在，"还没有这个数"与"这个数是 0"分得开）。 */
   snapshot: null
@@ -469,6 +491,22 @@ function healthPayload() {
       lastError: state.warningWrite.lastError,
       lastWarnType: state.warningWrite.lastWarnType
     },
+    /* `DR-14` 保留裁剪（技术债 `E89`）的可观测出口 —— 与上面三块**同一风格**（键恒在，
+       `null` 与 `0` 分得开："还没跑过"／"上次没删到行"／"删了 0 行"三者可分辨）。
+       ⚠ 两个删除计数的**口径不同**，读方不得混用：
+         · `deleted` ＝**最近一次尝试**删掉的行数（`applyRetention()` 的 `totalDeleted`；失败时 0）；
+         · `totalDeleted` ＝**本进程内累计**删掉的行数（跨自然日累加，随重启归零）。
+       `lastRunDay` 是"本进程已为哪个自然日跑过"（去重判据，见 `runDailyRetention()`）；
+       `lastCutoff` 是最近一次**成功**算出的保留期截止时刻（失败不覆盖 ⇒ 可能停留在上一次成功的值）。 */
+    retentionWrite: {
+      runs: state.retentionWrite.runs,
+      failures: state.retentionWrite.failures,
+      lastError: state.retentionWrite.lastError,
+      lastRunDay: state.retentionWrite.lastRunDay,
+      lastCutoff: state.retentionWrite.lastCutoff,
+      deleted: state.retentionWrite.lastDeleted,
+      totalDeleted: state.retentionWrite.totalDeleted
+    },
     /* `addRunSec` 的**上界**（ADR-0009 D3 重设）：现算的活读数（规则串 ＋ 当班 elapsedSec/totalSec） */
     addRunSecBound: addRunSecBoundPayload(),
     /* DR-17 累计运行的**取数来源**（最近一次整机快照的读数）：日/月/年＝`shift_stat.sumRunSec()` 求和、
@@ -521,6 +559,13 @@ async function start(options = {}) {
     writes: 0, duplicates: 0, skippedOk: 0, failures: 0, lastError: null, lastWarnType: null
   };
   state.snapshot = null;
+  /* `DR-14` 裁剪（技术债 `E89`）的计数与"已跑过的自然日"同理归零 —— 进程重启后同日再跑一次是
+     **刻意的**（裁剪本身幂等：删除是 `WHERE < cutoff` 的集合差，第二次扫描删 0 行），
+     代价＝重启当日多扫一次全表，收益＝"服务每天都会重启的现场"也能真的裁剪到（见 6e-5 段）。 */
+  state.retentionWrite = {
+    runs: 0, failures: 0, lastError: null,
+    lastRunDay: null, lastCutoff: null, lastDeleted: 0, totalDeleted: 0
+  };
   /* 时钟注入出口（E42）：从这里起，本进程的"现在几点"只有一个来源 */
   state.clock = resolveClock(options);
   const installSignalHandlers = options.installSignalHandlers !== false;
@@ -1101,13 +1146,19 @@ async function start(options = {}) {
    *   ① `freezeCrossedShifts(frame)` —— DR-06：检测**跨班** ⇒ 固化上一班（含错过补记），
    *      自带 try/catch（失败只记不抛：不许污染采集链，计数见 `/health.shiftStatWrite`）；
    *   ② `emitWarnings(frame)` —— DR-05 按件固化 ＋ 判定发布（`warning` 事件）＋ DR-08 预警落库。
+   *   ③ `runDailyRetention()` —— DR-14：**跨自然日**时裁剪超期历史（技术债 `E89`），
+   *      自带 try/catch（失败只记不抛，计数见 `/health.retentionWrite`）。
    *  ⚠ ①**不能**放进 `emitWarnings()` 内部："库内没有生效标准 ⇒ 本次不判定"那条早退会把跨班检测
    *    一并跳掉（没有工单/标准时 DR-06 的固化恰恰**更**需要发生 —— 那些班次的运行时长是真实事实）。
+   *  ⚠ ③ 排在**最后**且**不受** `emitWarnings()` 早退影响（形状同①）：没有标准时也要能裁剪，
+   *    "判定不出来"与"历史该不该清"是两件事。
    *  ⚠ 本 tick 内**不新增任何定时器**（ADR-0009 D3①：沿用"节流而不新起定时器"的工程约定）。
    */
   function onSampledTick(frame) {
     freezeCrossedShifts(frame);
-    return emitWarnings(frame);
+    const published = emitWarnings(frame);
+    runDailyRetention();
+    return published;
   }
 
   /** 判定挂钩（交给 `ingest` 的 `onSampled`）：算一次判定 → **固化到 result** → 按（固化后的）
@@ -1368,6 +1419,102 @@ async function start(options = {}) {
     }
   }
 
+  /* ---- 6e-5. DR-14（保留策略 1 年）的**生产调用方** —— 技术债 `E89` 的落地 ----
+     背景（E89）：`server/db/maintain.js` 的 `applyRetention()` 与保留期常量 `RETENTION_DAYS = 365`
+     一直都在、裁剪表清单也含 `op_log`，**但全仓没有任何生产调用方**（只有 `tests/db-check.js` 直接调）
+     ⇒ ①库无界增长（`measure_rt` 等高频表尤其）；②`repo/notice.js` 文件头自述的"审计反查地平线＝
+     保留期（1 年）"**带有前提**（只有真跑过裁剪才成立）。
+     负责人 2026-10-03 的裁定：**复用既有 1 s 采样 tick、按"跨自然日"触发**（**不新增定时器**，
+     与 A1 的跨班检测同款）—— 本段就是它。三处口径（负责人特别要求写在代码里）：
+
+     【① 1 s tick 里怎么判"跨了自然日"】
+     触发点在**既有的 `onSampledTick()`** 内部（`ingest` 的 `onSampled`＝"1 s 采样落库成功之后"，
+     与 DR-05／DR-06／DR-08 **同一拍**），**不新增任何定时器**（ADR-0009 D3①／本包裁定）。
+     判据只用**注入时钟** `currentClock()`：把 `platformClock.fmtDate(now)` 得到的 `yyyy-MM-dd`
+     与"本进程已跑过的那个日子"比对，**不相等即跨日**（或本进程还没跑过）。为什么不用
+     `collectTime`／帧时刻：那会把"上位机补传的旧帧"当成时间前进（甚至倒退），跨日判据必须
+     跟着"服务自己的今天"走；而"今天"只有一个来源 —— `platformClock`（ADR-0003 D17：
+     本文件不裸写 `new Date()`／`Date.now()`）。日期文本由 `platformClock.fmtDate()` 产出，
+     与班次归属用的 `fmtDate` 是**同一个函数**（不另写第二套自然日口径）。
+
+     【② 同一自然日怎么去重】
+     进程内记忆 `state.retentionWrite.lastRunDay`（`yyyy-MM-dd`）。**先记后跑**：离开本函数前
+     无论成败都把 `lastRunDay` 写成"今天" ⇒
+       · 成功 ⇒ 今天不再扫（不是"每 tick 扫一遍全表"）；
+       · **失败也不重扫**：`applyRetention()` 会先对 6 张表各做一次 `COUNT(*)`，若把它失败当成
+         "今天还没跑"而每 tick 重试，就是**每秒一次全表扫描**（正好是 E89 说的日志/负载噪声）——
+         故失败同样计入"已跑过"，代价是"今天剩下的时间不重试"，下一个自然日再来（可观测：`failures`＋
+         `lastError`）。
+     进程重启后记忆清空 ⇒ **同一自然日可能再跑一次**：这是**刻意**的（否掉"必须落表/加列才能幂等"
+     的方案 —— 那要动 `schema.sql`，ADR-0009 D5 与 `E89` 都不许）。理由是**裁剪本身幂等**：
+     `DELETE … WHERE <列> < cutoff` 是集合差，第二次扫描删 0 行；收益是"每天都会重启一次的现场"
+     也真的裁剪得到（不做"首次 tick 不跑、只认日界跳变"，那会让这种现场的裁剪**永不发生**）。
+     上限＝"本进程内每自然日 1 次"；重启次数就是额外扫描次数（扫描成本＝6 次 COUNT＋最多 6 次 DELETE）。
+
+     【③ `maxDelete` 怎么选】
+     **不传，用 `maintain.RETENTION_MAX_DELETE`（5 000 000 行）这一份真源**（本文件不复制常量；
+     上方常量声明处已说明）。理由：
+       · 那个上限的语义是"**参数或口径出问题**就先停下，绝不悄悄清库"（`maintain.js:279` 的原话），
+         它的取值与 `days` 的校验同属**保留策略自己的安全边界** —— 由调用方另填一个数，
+         就等于把这条边界复制成第二份口径（必然漂移）；
+       · 现场首次上线时库里可能**已经攒了**多年的行（"1 年裁剪"从未跑过 ⇒ 首跑要删的正是历史欠账），
+         把上限调大 = 削弱护栏、调小 = 让首跑永久失败 ⇒ 都不该由本包拍脑袋；
+       · 因此**接受"超过上限即中止"**这条既有行为：中止时 `applyRetention()` 抛 `RangeError`，
+         被下面的 catch 计成 `failures++` ＋ `lastError`（消息里带**将删除行数**与 `cutoff`），
+         并写一条 `warn` 日志 ⇒ **如实发声、不静默**；当日不再重试（见②），次日再来。
+         现场若真跑到这一步，处置＝按运维手册先归档/分批清理，再按需调整 `maintain.js` 的那一条常量
+         （改真源、登记一条技术债，而不是在入口塞第二个上限）。
+     口径的另一半：`days` 同样**不传** ⇒ 走 `maintain.RETENTION_DAYS = 365`（"保留期 1 年"的单一真源）。
+
+     【失败隔离】`applyRetention()` 抛错 ⇒ **只记不抛**（下面 `try/catch` 全包），采集链/判定链
+     照跑（本函数在 `onSampledTick()` 里**排在最后**，且它一抛也不会回到 ingest 的 catch 里
+     变成 `sampledHookFailures`）；可观测出口＝`/health.retentionWrite`。
+     【顺序】放在 tick 的**最后**：先让 DR-06 固化、DR-05＋DR-08 判定与落库都做完，再做这件
+     "清理历史"的活 —— 它只影响**超期**数据（≥365 天），与本次采样/判定没有因果关系。 */
+
+  /** 自然日文本（`yyyy-MM-dd`，本地时区）—— 真源＝`platformClock.fmtDate()`，与班次归属用同一个函数。 */
+  function dayTextOf(now) { return platformClock.fmtDate(now); }
+
+  /**
+   * 跨自然日跑一次 `DR-14` 保留裁剪（见 6e-5 段头的三处口径）。**只在既有 1 s 采样 tick 内被调**。
+   * @returns {{ran:boolean, day:string, cutoff:(string|null), deleted:number, error:(string|null)}}
+   *   自报（日志/探针用）；本函数**永不抛**（失败只记不抛）。
+   */
+  function runDailyRetention() {
+    const r = state.retentionWrite;
+    /* 判据用**注入时钟**（不是帧时刻、不是墙钟）：`currentClock()` 与 `uptimeSec`／班次归属同源。 */
+    const day = dayTextOf(currentClock().now());
+    if (r.lastRunDay === day) return { ran: false, day, cutoff: r.lastCutoff, deleted: 0, error: null };
+    /* **先记后跑**（见段头②）：失败也计"今天跑过"，否则会退化成"每 tick 重试一次全表扫描"。 */
+    r.lastRunDay = day;
+    r.runs++;
+    try {
+      /* `days` / `maxDelete` 都**不传** ⇒ 一律走 `maintain.js` 的真源（见段头③）。 */
+      const res = maintain.applyRetention(state.db, { now: currentClock().now() });
+      r.lastCutoff = res.cutoff;
+      r.lastDeleted = res.totalDeleted;
+      r.totalDeleted += res.totalDeleted;
+      r.lastError = null;
+      if (res.totalDeleted > 0 && logger) {
+        logger.info(`[DR-14] 保留裁剪：cutoff=${res.cutoff}（保留 ${maintain.RETENTION_DAYS} 天），` +
+          `删除 ${res.totalDeleted} 行（明细 ${JSON.stringify(res.deleted)}）`);
+      } else if (logger) {
+        logger.info(`[DR-14] 保留裁剪：cutoff=${res.cutoff}，本次无超期数据（0 行）`);
+      }
+      return { ran: true, day, cutoff: res.cutoff, deleted: res.totalDeleted, error: null };
+    } catch (err) {
+      r.failures++;
+      r.lastError = String((err && err.message) || err);
+      /* 失败不写 `lastCutoff`（`applyRetention()` 抛错时没有可信的 cutoff 可报）—— 保留**上一次成功**
+         的那个值：`null`（还没成功过）与"某个具体时刻"分得开，"这次失败"由 `failures`/`lastError` 说话。 */
+      if (logger) {
+        logger.warn('[DR-14] 保留裁剪失败（**只记不抛**：采集链与判定链照跑；当日不再重试，次日再来；' +
+          `读口＝GET /health 的 retentionWrite）：${r.lastError}`);
+      }
+      return { ran: true, day, cutoff: null, deleted: 0, error: r.lastError };
+    }
+  }
+
   /* ---- 6e-3 追加：DR-08（`warning` 表）的落库 —— 技术债 `E62` 的落地（ADR-0009 D1，T-20261002-05）----
      背景（E62）：`warning`（DR-08）此前**零写入点** ⇒ 判定产出经 SSE 发出后**不落库**、无预警历史。
      写入点＝**判定发布点同批**（`emitWarnings()` 内、`judge.evaluate(…,{bus})` 那次发布之后，
@@ -1486,6 +1633,13 @@ async function start(options = {}) {
     `（emitWarnings 内、warning 事件发布之后、同一 tick）；只落 lv≠ok 的预警条（ok 回执条不是预警）；` +
     `幂等键=(warn_type, 归属键)，归属键写在 trigger_cond 前缀（结构不动 ⇒ 无唯一索引可用，见 repo/warning.js）；` +
     `归属拿不到就写"无工单/无件序号/无归属日"（不编造）；写失败只记不抛，计数见 /health.warningWrite`);
+  logger.info(`[DR-14] 保留策略（1 年）已有**生产调用方**（技术债 E89 收口／负责人 2026-10-03 裁定）：` +
+    `触发点=**同一个 1 s 采样 tick**（onSampledTick 的最后一拍，**不新增定时器**）内按"**跨自然日**"触发一次；` +
+    `保留期＝maintain.RETENTION_DAYS（365 天，单一真源，不在入口复制）；单次删除上限＝` +
+    `maintain.RETENTION_MAX_DELETE（超限即中止并计 failures＋lastError，见 6e-5 段头③）；` +
+    `同一自然日内只跑一次（**失败也不重扫**；重启后同日再跑一次是无害的 —— 裁剪幂等）；` +
+    `失败只记不抛（不污染采集链），计数见 /health.retentionWrite；` +
+    `⚠ op_log 因此**有寿命**：审计反查地平线＝保留期（repo/notice.js 文件头的"未自述边界①"由本条提供前提）`);
   logger.info(`[DR-17] 累计运行取数已改真源：日/月/年＝对 shift_stat 求和（shift_date 归属 ⇒ 跨零点/跨月正确），` +
     `当班增量＝当班runSec − 该班次已固化run_sec；addRunSec 上界按 ADR-0009 D3 **重设**为 elapsedSec` +
     `（旧上界 runSec 在"无采集串且无在测件"时恒 0）；活读数见 /health.addRunSecBound 与 /health.runAccum`);
