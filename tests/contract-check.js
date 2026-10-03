@@ -38,6 +38,13 @@ const { execFileSync } = require('node:child_process');
 const env = require('./env');
 env.assertRuntime();
 
+/* `E100`②（2026-10-03）：本脚本要用夹具的**空闲端口分配**（`allocPort`）取代写死的 18896～18899。
+   为什么走夹具而不是自己写一份：端口分配口径只能有一处（`tests\lib\harness.js` 的 `allocPort`
+   已服务 `startService` 与 §15 的嵌套轮），另起一份会各写各的。
+   夹具顶层会做**只读**的"临时区语义校验"（`E90`／`T-20261003-10` 之后它不再注入任何副作用），
+   故本行不改变本脚本的既有行为 —— 断言与条数一字未动。 */
+const harness = require('./lib/harness');
+
 const ROOT = path.resolve(__dirname, '..');
 
 /* ---------------- 极简断言框架 ---------------- */
@@ -284,7 +291,14 @@ function appendix2FieldRows(lines) {
 }
 
 /* ---------------- 在进程内起"假 MES"（tools/mock-mes） ---------------- */
-/* mock-mes.js 是 CLI：入口处读 process.argv 后立刻监听端口，所以在进程内改 argv 再 require 即可 */
+/* mock-mes.js 是 CLI：入口处读 process.argv 后立刻监听端口，所以在进程内改 argv 再 require 即可。
+   ⚠ 端口**不再写死**（`E100`②，2026-10-03）：`harness.allocPort()`（`tests\lib\harness.js`）
+   先 `bind(0)` 拿一个当前空闲的端口再释放 ⇒ 每次运行都不同。
+   改前写死 18896～18899（本文件 `:581-588` 与 `:834`）导致两类现场故障：
+     ① 并发门禁轮（同一工作区跑两路 `run-all`，每路的 §15 嵌套子集轮都含本脚本）**互抢固定端口**；
+     ② 现场机器上只要有常驻进程占着 18899，本脚本就**每次都跑不了**。
+   端口被占时的收场已由 `tools\mock-mes\mock-mes.js` 的 `'error'` 监听改成"打印 `EADDRINUSE`
+   ＋ 非 0 退码"（`E100`①）—— `run-all` 据此归 `collided`（可重试的环境条件），不再崩栈。 */
 async function startMockMes({ port, receipt, failRate }) {
   const mesPath = path.join(ROOT, 'tools', 'mock-mes', 'mock-mes.js');
   const savedArgv = process.argv;
@@ -303,6 +317,23 @@ async function startMockMes({ port, receipt, failRate }) {
     await sleep(100);
   }
   return false;
+}
+
+/**
+ * 取 n 个**互不相同**的空闲端口（`E100`②）。
+ * 为什么要"取满再起服务"而不是"起一个取一个"：`allocPort` 是"先 bind 0 再释放"，
+ * 每次调用都是一个**新鲜的** bind(0)，理论上两次调用可能拿到同一个号；这里做一次去重兜底，
+ * 拿到重复号就重取，保证三个假 MES 不会互相撞。
+ * @param {number} n
+ * @returns {Promise<number[]>}
+ */
+async function allocDistinctPorts(n) {
+  const ports = [];
+  while (ports.length < n) {
+    const p = await harness.allocPort();
+    if (!ports.includes(p)) ports.push(p);
+  }
+  return ports;
 }
 
 /* ---------------- 自检主体 ---------------- */
@@ -578,16 +609,18 @@ async function main() {
     `testStatus=${JSON.stringify(report.testStatus)}`
   );
 
-  const portStatus = 18899;
-  const portCode = 18898;
-  const portFail = 18897;
+  /* `E100`②（2026-10-03）：端口由 `allocPort()` 现取（改前写死 18899／18898／18897）。
+     先取满三个**互不相同**的空闲端口、再起服务 —— 把"取号→绑定"的窗口压到最短，
+     降低与另一路并发门禁抢号的可能。 */
+  const [portStatus, portCode, portFail] = await allocDistinctPorts(3);
   const started = await Promise.all([
     startMockMes({ port: portStatus, receipt: 'status', failRate: 0 }),
     startMockMes({ port: portCode, receipt: 'code', failRate: 0 }),
     startMockMes({ port: portFail, receipt: 'status', failRate: 1 })
   ]);
   if (!started.every(Boolean)) {
-    skip('IF-B 回执与补传联调（6.8～6.10）', '本机回环端口 18897～18899 未能全部监听');
+    skip('IF-B 回执与补传联调（6.8～6.10）',
+      `本机回环端口 ${portStatus}／${portCode}／${portFail} 未能全部监听（端口是现取的，非写死）`);
   } else {
     CFG.mes.baseUrl = `http://127.0.0.1:${portStatus}`;
     CFG.mes.responseStyle = 'status';
@@ -831,12 +864,15 @@ async function main() {
     );
   }
   {
-    const ok = await startMockMes({ port: 18896, receipt: 'status', failRate: 1 });
+    /* `E100`②（2026-10-03）：端口由 `allocPort()` 现取（改前写死 18896）。 */
+    const portSelfCheck = await harness.allocPort();
+    const ok = await startMockMes({ port: portSelfCheck, receipt: 'status', failRate: 1 });
     if (!ok) {
-      skip('自检项与待补传队列/回执风格的一致性', '本机回环端口 18896 未能监听');
+      skip('自检项与待补传队列/回执风格的一致性',
+        `本机回环端口 ${portSelfCheck} 未能监听（端口是现取的，非写死）`);
     } else {
       const h = createIsolatedHarness({});
-      h.window.BoardConfig.mes.baseUrl = 'http://127.0.0.1:18896';
+      h.window.BoardConfig.mes.baseUrl = `http://127.0.0.1:${portSelfCheck}`;
       h.window.BoardConfig.mes.responseStyle = 'status';
       const payload = h.window.Api.buildReportPayload(h.window.MockData.state, h.__at('2026-09-18T15:10:27'));
       const r = await h.window.Api.uploadReport(payload);

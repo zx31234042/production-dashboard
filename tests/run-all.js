@@ -148,6 +148,15 @@ const SUITES = [
   { name: 'trace-check', desc: '需求追溯', needBrowser: false, slow: false },
   { name: 'copy-check', desc: '界面文案与需求条款对照', needBrowser: false, slow: false },
   { name: 'screenshot-diff', desc: '界面视觉回归', needBrowser: false, slow: false },
+  /* `E9`（★★，验收前必做；ADR-0002 待办 3）：**交付包形态**的零依赖/零外网断言。
+     它与 `docs-cross-check` 是两个层次：后者扫的是**源码/文档**里的依赖与外链，
+     本脚本扫的是**打包产物**（`输出文件\离线部署与体检包-V1.2\`）：包内有没有 node_modules、
+     有没有带 dependencies 的 package.json、有没有未登记的外链、便携 Node 版本是否满足 D10。
+     放在**离线门禁的靠后位置**（`docs-cross-check` 之前）：它是"整包扫描 ＋ 真端口冲突实测"，
+     耗时与包体积相关，不该挡在其它脚本前面；且不依赖其它脚本的产物（可独立跑）。
+     ⚠ 它**进 SUITES 就进权威账**：`tests\README.md` 第三节的逐脚本清单与合计会因此漂移
+     （本批由主代理收口），`files-check` 的受管文本扫描数也会 160 → 161。 */
+  { name: 'offline-check', desc: '交付包零依赖/零外网（E9）', needBrowser: false, slow: false },
   /* 放在**离线门禁的最后**：它是跨文档/总账性质的聚合检查，要靠前面跑完的实跑账去比对
      `tests\README.md` 的权威数字（P2-22）；排在前面会读到不完整的账。
      `serialTail: true` 让它在 `--jobs N` 并行模式下**也**一定落在串行尾（见 scheduleSuites）。

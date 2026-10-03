@@ -15,6 +15,13 @@
 
 const http = require('http');
 
+/* 退出码契约（`E100`①，2026-10-03）：
+   0 = 正常（`--help`；或服务被 SIGINT/外部终止）
+   2 = **监听失败**（端口被占等）—— 与 `tests\env.js` 的 `EXIT_ERROR = 2` 同值同义。
+       为什么不用 1：1 在本项目里专指"有断言失败"（`tests\lib\assert.js` 的退码契约），
+       而"起不来"属于**脚本自身异常/环境不满足**，正是 2 的含义（规范 9.5-5）。 */
+const EXIT_LISTEN_FAILED = 2;
+
 /* ---------------- 命令行参数 ---------------- */
 function parseArgs(argv) {
   const a = {
@@ -192,6 +199,31 @@ function startServer(args) {
     }
 
     send(404, { status: 0, msg: '未知路径：' + u.pathname });
+  });
+
+  /* `E100`①（2026-10-03）：`listen` 必须有 `'error'` 监听。
+     改前只有下面这句 `server.listen(args.port, …)`，**没有** `'error'` 处理 ⇒ 端口被占时
+     Node 抛**未捕获**事件 `Error: listen EADDRINUSE: address already in use :::<port>`
+     ⇒ 调用方（`tests\contract-check.js` 在**进程内** require 本文件）**当场退出 1
+     且来不及打印 `=== 汇总 ===`**（`E98` 现场读数 `尝试序列 1:bad(exit=1)`）。
+     处置（照 `E98` 登记的建议②）：
+       · **保持 `EADDRINUSE` 字样可见** —— 它是 `run-all` 把这一轮归为 `collided`
+         （有证据的环境条件、可重试）的**唯一**证据门槛（`tests\harness-check.js` 的
+         `COLLISION_NEEDLE = /EADDRINUSE/`）；把字样藏起来会让 `E98` 的分类**失效**；
+       · **以非 0 退码优雅退出**（`EXIT_LISTEN_FAILED = 2`，与 `tests\env.js` 的 `EXIT_ERROR`
+         同值、同语义："脚本自身异常／环境不满足导致的运行时错误"）并打印可读原因
+         ＋ 一行可照做的处置（换 `--port`）。不再让裸 `EADDRINUSE` 栈把调用方打断。
+     ⚠ 副作用如实记账：进程内调用方（`contract-check`）现在会得到一个"**非 0 退码 ＋ 无汇总行**"的
+     收场，而不是"崩栈"；`run-all` 对这两种形态的归类相同（`failed`／`collided`），
+     故 `E98` 的判据不受影响。真进程调用方（`tools-check`／`harness-check`）不受影响：
+     端口就绪探针照旧拿不到 `/health`，它们本来就按"未就绪 ⇒ skip"处理。 */
+  server.on('error', (err) => {
+    const code = (err && err.code) || '(无 code)';
+    console.error(`[mock-mes] 启动失败：无法监听端口 ${args.port} —— ${err && err.message ? err.message : err}`);
+    console.error(`[mock-mes] 错误码=${code}${code === 'EADDRINUSE'
+      ? `（EADDRINUSE：端口 ${args.port} 已被占用 —— 换一个 --port，或先释放该端口）`
+      : '（非端口占用类错误，请照上面的消息排查）'}`);
+    process.exit(EXIT_LISTEN_FAILED);
   });
 
   server.listen(args.port, () => {

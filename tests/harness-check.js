@@ -4066,11 +4066,24 @@ t.section('五、临时区与清理');
     const lieBody = 'return { removed: \'all\', kept: 0, keptDeep: 0, target, errors };';
     const mutatedSrc = READBACK_ANCHOR.test(src0) ? src0.replace(READBACK_ANCHOR, lieBody) : '';
     let mutant = null;
-    /* ⚠ **陷阱（实测）**：`lib\harness.js` 的顶层**有副作用** —— `E90` 的轮次隔离就是在顶层把
-       `env.paths.tempRoot` 指向本轮专属目录。`Module._compile` 会把这些顶层语句**再跑一遍**
-       ⇒ 若不复原，`env.paths.tempRoot` 会变成"本轮目录里的又一层 run-…"（实测把后面的取样全带偏）。
-       故这里先抓旧值、载入后**当场复原**；下面只调 `cleanup(true)`（它读的就是 `env.paths.tempRoot`），
-       变异体与真实模块因此作用在**同一个**目录上。 */
+    /* ⚠ **`Module._compile` 会把顶层语句再跑一遍 —— 但下面这段 save/restore 现在是**无害 no-op****
+       （2026-10-03，本批更正；旧注释与事实已不符，原文见 `git log`）。
+       旧注释说的是：`lib\harness.js` 顶层**有 tempRoot 副作用**——`E90` 的轮次隔离在顶层把
+       `env.paths.tempRoot` 指向本轮专属目录；`Module._compile` 会把这些顶层语句再跑一遍 ⇒
+       不复原就会变成"本轮目录里的又一层 run-…"。
+       **那个副作用已经不存在了**：`T-20261003-10`（座位 4）做了单一真源化——
+       `tempRootBase`／`tempRoot` 两个键的**定义处**搬到了 `tests\env.js`（那里是"路径集"的定义处，
+       任何脚本 require 它都会算好），`lib\harness.js` **只剩只读校验**（`assertTempRootSemantics()`
+       只读 `env.paths.*` 并比对，**一个字节都不写**；顶层唯一动作就是调用它）。
+       ⇒ 故本段 `envTempRootSaved`／`envTempBaseSaved` 的保存与回写**读写的是同一个值**，
+       它现在是 no-op；`E90-D22` 的断言仍 PASS（判据守的是"变异体谎报 `all`"，与本段无关）。
+       **为什么仍然保留它**（而不是删掉）：`Module._compile` 确实仍会重跑**其它**顶层副作用
+       （`assertTempRootSemantics()` 重跑一次＝重复校验同一事实，无害；模块级 `seq` 归零——变异体
+       只被调 `cleanup`，用不到）。它唯一的作用是：**万一** `lib\harness.js` 顶层将来又被写进路径注入
+       （`E90` 的病灶形态），这段保存＋回写会把变异体隔离在"与真实模块同一个目录"上，
+       而不是让后面的取样被悄悄带偏。代价是两行赋值 ＋ 一个 `finally`，属**廉价的纵深防御**；
+       若将来有人要删，请连同这条注释一起删，并把"顶层不得再出现路径副作用"写进 `lib\harness.js`
+       的文件头（那里的注释已经这么规定了）。 */
     const envTempRootSaved = env.paths.tempRoot;
     const envTempBaseSaved = env.paths.tempRootBase;
     try {
@@ -6072,10 +6085,18 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
      而旧说法正是"形态迁移 ＋ 补偿性新增"这一 `≥` 下真漏洞的来源（严格更严，故保留双维精确）。
      另：`T-20261002-03`（`E80` 收口）把三个"直下但没入口声明"的门禁脚本（files／logic／platform）
      补成 `main()` 入口后，实跑值由 17/13/4 变为 **20/13/7**（口径：`tests\*.js` 直下 ＋ `tests\lib\*.js`
-     ＋ `server\index.js`）—— 这三个新入口落进扫描面，§16-A 才看得见它们。 */
-  const FLOOR_TOTAL = 20;
+     ＋ `server\index.js`）—— 这三个新入口落进扫描面，§16-A 才看得见它们。
+
+     另：`T-20261003-12`（座位 4b，`E9` 收口，2026-10-03）新增 `tests\offline-check.js`
+     （交付包零依赖/零外网门禁；`function main()` sync ＋ 顶层 `try`/`catch` 退 2）⇒ 它是扫描面里的
+     **第 8 个 sync 入口**，三个常数一并改为 **`21 / 13 / 8`**：
+       · `FLOOR_TOTAL` 20 → **21**（`total ≡ async ＋ sync`，故它随两维走）；
+       · `EXACT_SYNC`  7 → **8**；`EXACT_ASYNC` **13 不动**（新脚本是同步入口）。
+     ⚠ 这就是本注释上一段预告的"**新增入口必须同批改本节**"的第一个实例 —— 与新脚本**同一批**落地
+     （`E78` 时代"实测新增不必改（下界照旧满足）"的说法已显式作废）。 */
+  const FLOOR_TOTAL = 21;
   const EXACT_ASYNC = 13;
-  const EXACT_SYNC = 7;
+  const EXACT_SYNC = 8;
   t.info(`§16 入口形态普查：${real.counts.total} 个含 \`main()\` 的入口（async ${real.counts.async}／sync ${real.counts.sync}／缺陷形态 ${real.offenders.length}）`);
   t.info(`§16 E79：退出证据只取异常路径**自身**的区间（注释/字符串/模板串/正则已剥；接线到文件尾的余量上限＝${ENTRY_TAIL_MAX} 字符）；`
     + `常量退码真源＝tests\\env.js（${[...EXIT_CONSTS].map(([k, v]) => k + '=' + v).join('／') || '**读不到真源**'}）`);
