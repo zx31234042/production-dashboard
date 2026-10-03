@@ -59,7 +59,7 @@ production-dashboard/
 
 ```
 config（board.config、fieldMap） → utils（dom、format） → services（api、mockData、mockUpperSource）
-  → components（11 个） → pages（Dashboard） → main.js
+  → components（12 个，与 `index.html` 注册数一致） → pages（Dashboard） → main.js
 ```
 
 被依赖的先加载；新增文件时同步在 `index.html` 里补一行 `<script>`，并在 `PROJECT_RULES.md` 9.1 登记。
