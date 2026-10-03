@@ -34,6 +34,20 @@ const ROOT = env.paths.root;
 const read = rel => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 const exists = rel => fs.existsSync(path.join(ROOT, rel));
 
+/* `T-20261003-12` 追加轮 3：把上面 `DSH_DC_README_OVERRIDE` 那套"**仅调试用**的读数重定向"
+   推广到**第十五节（`E51`）要读的三份"当前值区"文档**。为什么要它：
+   `E51` 的两端取证（数字改坏 ⇒ 断言红；锚点措辞删掉 ⇒ 前提红）必须**在变异体上跑**，
+   而 `E51` 读的是**真受管文档** ⇒ 若像旧做法那样"写真文件→跑→还原"，就会
+   ① 与并发门禁轮**互相污染读数**（实测已发生一次：座位 4b 的探针窗口与主代理的全量轮重叠，
+      让 `docs-cross-check` 读到瞬时态 `门禁 **9999 通过`，被误登记为"运行期改写受管文档"）；
+   ② 让"盘上不变量"无法在**并发**下成立。
+   ⇒ 有了这三个出口，变异与取证可以**只作用于副本**：**真文件全程只读、逐字节不变**。
+   **不设这三个环境变量时，读的就是原来的真文件**（与 `DSH_DC_README_OVERRIDE` 同口径，
+   正式运行不设它们 ⇒ 行为逐字不变）。 */
+const SNAP_REL = process.env.DSH_DC_SNAP_OVERRIDE || '项目记录/当前状态快照.md';
+const ARCH_REL = process.env.DSH_DC_ARCH_OVERRIDE || '项目架构与技术栈.md';
+const ROAD_REL = process.env.DSH_DC_ROAD_OVERRIDE || '项目记录/后续路线图.md';
+
 /** 取需求文档当前基线文件名（只取 需求文档/ 根目录下的当前基线） */
 function baselineReqFile() {
   const dir = path.join(ROOT, '需求文档');
@@ -966,9 +980,9 @@ function main() {
      锚点找不到 ⇒ **判红**（防文档改结构后本检查被静默架空）；某家族在区域内一处都没有 ⇒ 进"未覆盖清单"
      （只提示），但**门禁三元组与可追溯覆盖必须各有 ≥1 处**（防"把声明删掉就没人守了"）。 */
   {
-    const snapSrc51 = read('项目记录/当前状态快照.md');
-    const archSrc51 = read('项目架构与技术栈.md');
-    const roadSrc51 = read('项目记录/后续路线图.md');
+    const snapSrc51 = read(SNAP_REL);
+    const archSrc51 = read(ARCH_REL);
+    const roadSrc51 = read(ROAD_REL);
     const pickLine = (src, pred) => (src.split(/\r?\n/).find(pred) || null);
     /* ⚠ **锚点不许写死"会漂移的计数"**（`T-20261003-12` 追加轮，2026-10-03）——
        实测踩过：本行的旧锚点是 `l.includes('全量 16 个') && l.includes('门禁')`，

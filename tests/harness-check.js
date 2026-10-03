@@ -4631,6 +4631,383 @@ t.section('十、权威数字校验的定点回归（runAll.verifyAuthorityTotal
       : `调用点下标 ${callAt}，提前退出下标 ${earlyExitAt} —— 调用点必须更小`);
 }
 
+/* ---------------- 十之②、静态守护：**不许有把受管文档当写目标的"变异探针"** ----------------
+   立案（`T-20261003-12` 追加轮 3；由**主代理实测**触发，座位 4b 定性与修复）：一次全量轮里
+   `docs-cross-check` 报 **70/2**（单跑 72/0），失败逐字是
+     `失配 1 处：门禁三元组：正文写 9999/2/6 ≠ 期望 1440/2/6（"门禁 **9999 通过 / 2 失败 / 6 跳过"）`
+   —— 那个 `9999` **不是**任何产品缺陷，而是**座位 4b 自己的 `E51` 变异探针**为了可证伪性
+   **在真受管文档 `项目记录\当前状态快照.md` 上写入、随即还原**的瞬时值；该窗口与全量轮**重叠**
+   ⇒ 读者读到瞬时态。**根因＝探针手法（协议缺陷），不是仓库代码**（全仓无任何写 `9999` 到受管文档的写者）。
+   本条要守住的口径（写给后来人）：
+     · **变异/造缺陷只许作用在"受控副本"上**（`tests\._verify\` 之下），**真受管文档全程只读**；
+     · 需要让"读者"看到变异时，走**读数重定向**（先例：本节 §十 对 `tests\README.md` 的
+       `readmePath` 副本；`docs-cross-check` 的 `DSH_DC_{README,SNAP,ARCH,ROAD}_OVERRIDE`），
+       **不是**去改真文件再抢时间还原；
+     · 为什么静态查而不只靠运行期：`E70` 的运行期普查（`managedGuardCensus`）只能证明
+       "**本轮**没变"，证明不了"下次不会有人这么写"；而这类写点**恰恰长在被 gitignore 的目录里**
+       （本轮教训：写者躺在 `tests\._verify\review\`），**运行期门禁与人工 grep 都容易漏掉它**。
+   **扫描面＝磁盘上的 `tests\**\*.js`（含 `._verify\`）＋ `tools\**\*.js`，不看 git 是否跟踪**
+   （被忽略≠不存在：被忽略目录里的写者照样能写文件）；断言里**打印实扫文件数**，
+   免得将来没人知道它到底看了什么。
+   **受管文档清单**：①`snapshot.collectSnapshot()` 的 93 个受管文件（**动态取**，防第二份真源漂移）
+   ＋ ②门禁**按内容校验但不在清单里**的三份"当前值区"文档（`docs-cross-check` 第十五节读它们）
+   ＋ ③`PROJECT_RULES.md`。**刻意不含 `项目记录\工作日志.md`**：它是主代理的**追加式**会话记录
+   （每轮都在写，且**不在** `collectSnapshot` 的 93 个里 ⇒ 没有任何门禁按哈希比对它），
+   把它算进来的话这条守护会被"正常记账"恒常点亮 ⇒ 变成噪音；它的可追溯性由 `docs-check` 负责。
+   **白名单**（只放"写自己那份受控副本"的正当写法，逐条给理由）：
+     · `SELF_COPY_VAR`：目标变量名自带"副本/拷贝"语义（`readmePath`／`copyPath`／`*Copy*`／`副本`／`bak`…）
+       —— 先例＝§十 的 `readmePath`（写入前已用 `realBytes` 做**字节副本**）；
+     · `SELF_COPY_PATH`：目标表达式里出现 `._verify\tmp\`／`._verify\review\` 或 `副本`／`copy`；
+     · `WRITE_ADJUNCTS`：**不是**写目标的那几个"必需的伴随实参"（`{recursive:true}`／`{force:true}`／
+       `'utf8'`／`{encoding:…}`／`{flag:…}`／`mode:`）—— 它们**常与受管文档名同处一个调用**
+       （真正的目标反而是变量），若不排除就会制造假阳性；判据仍以**第 1 实参**为主。
+   **D22**（可证伪，见回执）：①把一份真探针的源码**内存变异**成"写真实 `当前状态快照.md`"⇒ 必红并指名；
+   ②写一个**真的**探针式写点落到 `._verify\review\` 再扫描 ⇒ 必红并指名（上面 ① 证明的是判据，
+   ② 证明的是"扫描面真的覆盖被忽略目录"，两者缺一不可）。 */
+t.section('十之②、静态守护：不许有把受管文档当写目标的"变异探针"（E104 根因守护）');
+{
+  /* ⚠ **本段自身要跳过扫描**：下面 `hitManaged` 的判据定义（`SELF_COPY_VAR` 等）与 `goodSamples`／
+     `badSamples` 两组样本里，**故意**含有受管文档名（那是判据的输入）；扫自己会自伤（实测：
+     `SELF_COPY_VAR = /…PROJECT_RULES…/` 那两行被判成"写 PROJECT_RULES.md"）。
+     处理＝本块从这一行起打上"自跳过"标记，扫描循环遇到它就整块不扫（见 `SELF_SKIP`）。 */
+  const SELF_SKIP_FROM_HERE = true;
+  void SELF_SKIP_FROM_HERE;
+  const WRITE_RX = /\b(writeFileSync|appendFileSync|rmSync|renameSync|copyFileSync|unlinkSync|createWriteStream)\s*\(/;
+  /* ⚠ 副本语义的变量名白名单**必须精确**：第一版写成 `/…|bak|Bak|BAK/`，而 `realSnap` 里
+     "**S**n**ap**"… 并不含 bak —— 真正的坑是 `SELF_COPY_PATH` 里我一度写过 `Snap`（会把
+     `realSnap` 误放行）。这里统一收紧为：变量名含 `copy/Copy/副本/bak/Bak/BAK`，或**ReadmePath**
+     这类"明确的副本路径变量"（先例＝§十 的 `readmePath`）。`realSnap`／`realAbs` **不在**白名单内
+     ⇒ `writeFileSync(realSnap, …)` 会被判红（这正是本次现场要抓的形态）。 */
+  const SELF_COPY_VAR = /readmePath|copyPath|CopyPath|SnapshotCopy|copy|Copy|副本|拷贝|bak|Bak|BAK/;
+  /* ⚠ `SELF_COPY_PATH` 只放"明确的临时/副本目录"：**不放 `Snap` 之类词** ——
+     一度写成含 `Snap`，结果把 `realSnap`（写**真**快照的变量）误当副本放行（假绿）。 */
+  const SELF_COPY_PATH = /\._verify[\\/]|副本|拷贝/;
+  const WRITE_ADJUNCTS = /\brecursive\s*:|\bforce\s*:|\bencoding\s*:|\bflag\s*:|\bmode\s*:|'utf8'|"utf8"|'utf-8'/;
+  const managedDocNames = /README\.md|PROJECT_RULES|当前状态快照|项目架构与技术栈|后续路线图/;
+
+  /** 受管文档清单（动态派生，见段首注释）。
+   *  ⚠ **只收"文档/产物类"扩展名**（`.md`／`.sql` 等），**不收源码**（`.js`／`.css`／`.json`）：
+   *  实测代价 —— 把源码算进来会因"基名撞车"制造大量假阳性（`path.join(ARTIFACTS,'result.json')`
+   *  被判成写 `server\repo\result.js`、`path.join(dir,'index.js')` 被判成写 `server\db\index.js`），
+   *  而那些**其实是往 `._verify` 里写自己的产物**。本条的靶子是"台账**文档**被变异探针改写"
+   *  （`E104` 现场＝`项目记录\当前状态快照.md`），源码改写的守护由 `E70` 的运行期普查负责。 */
+  const CODE_EXT = /\.(js|mjs|cjs|css|json|png)$/i;
+  const managedDocs = new Set();
+  try {
+    for (const rel of Object.keys(snapshot.collectSnapshot().files)) {
+      if (!CODE_EXT.test(rel)) managedDocs.add(rel);
+    }
+  } catch { /* 取不到就只用下面的静态项 */ }
+  ['README.md', 'PROJECT_RULES.md', '项目架构与技术栈.md',
+    '项目记录/当前状态快照.md', '项目记录/后续路线图.md'].forEach(r => managedDocs.add(r));
+
+  /** 递归列磁盘上的 .js（**不跟随符号链接**；不看 git 跟踪状态） */
+  const walkJsOnDisk = (dir, out = []) => {
+    let list = [];
+    try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+    for (const e of list) {
+      const abs = path.join(dir, e.name);
+      if (e.isSymbolicLink()) continue;
+      if (e.isDirectory()) walkJsOnDisk(abs, out);
+      else if (e.isFile() && e.name.endsWith('.js')) out.push(abs);
+    }
+    return out;
+  };
+
+  /** 把"第 1 实参之后"的文本切成顶层实参数组（判据要知道**哪个**实参才是写目标） */
+  const splitTopArgs = tail => {
+    const out = [];
+    let depth = 0, cur = '';
+    for (let k = 0; k < tail.length; k++) {
+      const c = tail[k];
+      if ('([{'.includes(c)) { depth++; cur += c; continue; }
+      if (')]}'.includes(c)) { if (depth === 0) break; depth--; cur += c; continue; }
+      if (c === ',' && depth === 0) { out.push(cur); cur = ''; continue; }
+      cur += c;
+    }
+    if (cur.trim()) out.push(cur);
+    return out;
+  };
+  /** 每个写 API 的"**目标**实参下标"（0 起）：
+   *  · `copyFileSync(src, dst)`／`renameSync(old, new)` 的目标是**第 2 个**实参 ——
+   *    只看第 1 个会把方向搞反（实测：`fs.copyFileSync(src,'PROJECT_RULES.md')` 与
+   *    `fs.renameSync(t,'项目架构与技术栈.md')` 两例漏判）；
+   *  · `createWriteStream(p)`／其余写 API 的目标都是第 1 个。 */
+  const destructiveArgs = fn => (/copyFileSync|renameSync/.test(fn) ? [1] : [0]);
+
+  /** 判据（纯函数，供 D22 内存变异复用）：返回该行命中的"受管文档名"或 null。
+   *  **只认三种"确实指向受管文档"的写法**，其余一律不命中（宁可漏报也不误报 —— 本条守护若常红
+   *  就会被当成噪音关掉，那才是真损失）：
+   *    ① 目标里出现**受管文档整名**的字面量（`'tests/README.md'`／`path.join(ROOT,'项目记录/当前状态快照.md')`）；
+   *    ② 目标是个**裸标识符**，且它**等于**某受管文档的基名（`writeFileSync(README, …)`）；
+   *    ③ 目标里出现**受管文档基名的标识符**（`writeFileSync(README,…)` 之外的 `path.join(README,…)`；
+   *       以及 `writeFileSync(realSnap/snapPath,…)` 这类"变量名即真源"）。
+   *  ⚠ 实测踩过的**两类**假阳性（都已按上面收紧）：
+   *    · 子串匹配 ⇒ 一句中文说明提到 "…`capture-baseline/README.md`…" 被判成写 `README.md`；
+   *    · 裸基名当整名 ⇒ `path.join(ARTIFACTS,'result.json')`／`path.join(dir,'schema.sql')` 被判成
+   *      写 `server\repo\result.js`／`server\db\schema.sql`（共 12 处）。
+   *  ⚠ 也踩过**一类**假阴性：变量名 `realSnap`／`snapPath` 曾被"纯 ASCII 不认"的规则漏掉
+   *    （本次现场正是 `writeFileSync(realSnap, …)`）⇒ 故 ③ 对纯 ASCII 采用**词/驼峰段边界**匹配。 */
+  const hitManaged = (line, managedNames2) => {
+    const m = WRITE_RX.exec(line);
+    if (!m) return null;
+    const fn = m[1];
+    const args = splitTopArgs(line.slice(m.index + m[0].length));
+    /* 本行把受管文档基名赋给某变量（`const README = path.join(…,'tests','README.md')`）⇒ 该变量也算真源 */
+    const docStems = [...managedNames2].map(n => n.split('/').pop().replace(/\.[a-z]+$/i, '')).filter(s => s.length >= 2);
+    /** 变量名 `v` 是否算"指向受管文档的真源"：
+     *  · 中文词干 ⇒ 双向**包含**即可（`v='快照路径'`、`stem='当前状态快照窗口'`）——
+     *    中文里"快照"这类词几乎不会偶然出现，双向包含能把"只用文档名的一段的变量"也认出来；
+     *  · ASCII 词干 ⇒ 要求**词/驼峰段边界**（`snapPath` ✓；`result.json` 里的 `result` ✗）。 */
+    const nameLooksLikeDoc = v => docStems.some(stem => (/[^\x00-\x7F]/.test(stem)
+      ? (v.includes(stem) || stem.includes(v))
+      : (stem.length >= 4 && new RegExp(stem + '(?![\\w.])').test(v))));
+    const varHolding = [...line.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/g)]
+      .map(x => x[1]).filter(nameLooksLikeDoc);
+    for (const idx of destructiveArgs(fn)) {
+      const target = (args[idx] || '').trim();
+      if (!target) continue;
+      if (SELF_COPY_VAR.test(target) || SELF_COPY_PATH.test(target)
+        || varHolding.some(v => new RegExp(`\\b${v}\\b`).test(target))) continue;   // 写自己那份副本：放行
+      const lits = [...target.matchAll(/'([^']*)'|"([^"]*)"/g)].map(x => (x[1] ?? x[2] ?? '').replace(/\\/g, '/'));
+      const targetIsJoin = /\bpath\.join\s*\(/.test(target);
+      const cands = new Set();
+      for (const norm0 of lits) {
+        const norm = norm0.replace(/^\.\//, '');
+        if (!norm) continue;
+        if (norm.includes('/')) cands.add(norm);
+        else if (!targetIsJoin && lits.length === 1) cands.add(norm);   // 该调用只给了这一个裸名 ⇒ 就是目标
+        const base = norm.split('/').pop();
+        if (base) cands.add(base);
+      }
+      const namesArr = [...managedNames2];
+      for (const cand of cands) {
+        const isPath = cand.includes('/');
+        /* `path.join` 的结果、且候选只是**裸基名** ⇒ 要求"没有任何带目录的同名受管项"才算它
+           （这与"整名相等"同义；可判定 `tests/README.md` ✓ 与 `README.e70-d22.bin` ✗） */
+        if (targetIsJoin && !isPath && namesArr.some(n => n.includes('/') && n.split('/').pop() === cand)) continue;
+        const isManaged = isPath
+          ? namesArr.some(n => n === cand || n.endsWith('/' + cand))
+          : namesArr.some(n => n.split('/').pop() === cand);
+        if (isManaged) return { name: cand, target: target.slice(0, 120) };
+      }
+      /* ③ 变量名即真源：目标标识符名里含受管文档的"词干"。
+             ⚠ **只用"词干 ⊆ 目标"这一个方向**：曾试过反向（"目标 ⊆ 词干"）以覆盖更短的变量名，
+             结果 `fs.rmSync(target, ...)` 里的 `target` 被 `项目架构与技术栈` 之类的长词干吸进去
+             ⇒ `tests\lib\harness.js` 出现 2 处假阳性。⇒ 只认"目标里含完整词干"。 */
+      for (const name of namesArr) {
+        const stem = name.split('/').pop().replace(/\.[a-z]+$/i, '');
+        if (stem.length < 3) continue;
+        if (/[^\x00-\x7F]/.test(stem)) {
+          if (target.includes(stem)) return { name, target: target.slice(0, 120) };
+        } else if (stem.length >= 4 && new RegExp(stem + '(?![\\w.])').test(target)) {
+          return { name, target: target.slice(0, 120) };
+        }
+      }
+    }
+    return null;
+  };
+
+  /** 扫描一份源码文本 → [{line, name, target}] */
+  const scanSrc = (src, docs) => {
+    const out = [];
+    src.split(/\r?\n/).forEach((l, i) => {
+      const h = hitManaged(l, docs);
+      if (h) out.push({ line: i + 1, ...h });
+    });
+    return out;
+  };
+
+  /* --------------------------------------------------------------------------
+     **判据的边界（口径，写给后来人）**
+     · **受管文档清单为什么只收"文档/产物类"扩展名**（去 `.js`／`.css`／`.json`／`.png`，实得 8 条）：
+       把**纯源码**算进来会因"**基名撞车**"制造大量假阳性 —— 实测 12 处，例如
+       `path.join(ARTIFACTS, 'result.json')` 被判成"写 `server\repo\result.js`、
+       `path.join(dir, 'index.js')` 被判成"写 `server\db\index.js`"，而它们其实是往 `._verify\`
+       写**自己的产物**。本条守护的靶子是"**台账文档被变异探针改写**"（`E104` 现场＝`项目记录\当前状态快照.md`）；
+       源码写入的守护由 §十 的**运行期**普查（`managedGuardCensus`／`managedGuardDiff`）负责。
+     · **`项目记录\工作日志.md` 为什么刻意不在清单里**：它是主代理的**追加式会话记录**
+       （每轮都在写），且**不在** `snapshot.collectSnapshot()` 的 93 个受管文件里 ⇒ **没有任何门禁
+       按哈希比对它**。把它纳入只会让本判据被"正常记账"**恒常点亮** ⇒ 变成噪音而被关掉（那才是真损失）。
+       它的可追溯性由 `docs-check` 负责。
+     · **历史基线豁免已经清空（2026-10-03，`T-20261003-12` 追加轮 4）**：曾有 9 个**一次性**写入脚本
+       留在磁盘上（`zz-main-*` 记账脚本 ＋ `s5t02-run-old-harness`／`d22-e70-mutation`／
+       `zz4t30-e77-sync-probe` 这类"改真文件→立刻还原"的探针），当时按**文件内容 sha256**核销
+       （内容一改锚即失效）。**主代理已裁定删除这 9 个文件** —— 删掉即从"运行期改写风险面"里
+       彻底消失，豁免清单随之**清空**。故现在的语义最简单：
+         **扫描面里不允许存在任何"把受管文档当写目标"的写点**（`hits` 必须为 0）；
+         下面的计数器只用于**如实打印**"扫了多少、命中多少"，不再有豁免通道。
+         若将来又出现同类存量，**处置是删脚本**（或改写成"只写副本"），**不是**重新开豁免口子 ——
+         口子一开就回到"豁免名头罩住后续改动"的老路（`D21`／`D23`）。
+     -------------------------------------------------------------------------- */
+  const LEGACY_BASELINE = [];                       // 已清空（见上；保留常量名以便断言文案沿用）
+
+  const testRoot = env.paths.tests;
+  const toolRoot = path.join(env.paths.root, 'tools');
+  const onDisk = [...walkJsOnDisk(testRoot), ...walkJsOnDisk(toolRoot)];
+  const verifyCount = onDisk.filter(f => f.includes(`${path.sep}._verify${path.sep}`)).length;
+  /* 本节的**判据定义**（`SELF_COPY_VAR` 等）与**样本数组**里刻意含有"写受管文档"的字面量
+     （那是判据的输入），故扫自己会自伤（实测：`SELF_COPY_VAR = /…PROJECT_RULES…/` 被判成写它）。
+     处理＝扫到本文件的 `SELF_SKIP_FROM_HERE` 标记后**整段跳过**，直到下一个 `t.section(` 为止
+     （用**位置/标记**定界，不靠内容比对；下面样本数组务必保持 `const goodSamples = [` 起头形态）。 */
+  const SKIP_FROM_RX = /const SELF_SKIP_FROM_HERE = true;/;
+  const SKIP_UNTIL_RX = /^t\.section\(/;
+  const hits = [];
+  let skippedSelfLines = 0;
+  for (const abs of onDisk) {
+    let src = '';
+    try { src = fs.readFileSync(abs, 'utf8'); } catch { continue; }
+    const rel = path.relative(env.paths.root, abs).split(path.sep).join('\\');
+    const isSelf = abs === __filename;
+    let inOwnSection = false;
+    src.split(/\r?\n/).forEach((l, i) => {
+      if (isSelf) {
+        if (SKIP_FROM_RX.test(l)) inOwnSection = true;
+        if (inOwnSection) {
+          skippedSelfLines++;
+          if (SKIP_UNTIL_RX.test(l)) inOwnSection = false;      // 下一节开始 ⇒ 恢复扫描
+          return;
+        }
+      }
+      const h = hitManaged(l, managedDocs);
+      if (h) hits.push({ file: rel, line: i + 1, ...h });
+    });
+  }
+  /* 历史基线豁免的核销（**清单已清空**，见上；这段保留是为了"万一将来又开豁免"时有据可依）：
+     · 文件还在、且内容 sha256 与锚相同 ⇒ 核销（`legacyCleared`）；
+     · 文件还在、但内容变了 ⇒ **豁免失效**（`legacyStale`）⇒ 该写点重新参战（判红）；
+     · 文件**已不存在** ⇒ 不算失效也不判红：写点本身已随文件消失（这就是本批的处置结果），
+       但**如实计数**（`legacyObsolete`）并打印 —— 免得"豁免没了"被静默读成"什么都好"。 */
+  const legacyCleared = [];
+  const remaining = [];
+  for (const h of hits) {
+    const abs = path.join(env.paths.root, ...h.file.split('\\'));
+    const base = LEGACY_BASELINE.find(b => b.file === h.file);
+    let cleared = false;
+    if (base) {
+      try {
+        const cur = sha256BytesE70(REAL_READ.call(fs, abs)).slice(0, 32);
+        cleared = cur === base.sha;
+      } catch { cleared = false; }
+    }
+    if (cleared) legacyCleared.push(h); else remaining.push(h);
+  }
+  const legacyStale = LEGACY_BASELINE.filter(b => {
+    const abs = path.join(env.paths.root, ...b.file.split('\\'));
+    if (!fs.existsSync(abs)) return false;                                   // 文件已删 ⇒ 见 legacyObsolete
+    return !legacyCleared.some(h => h.file === b.file);
+  });
+  const legacyObsolete = LEGACY_BASELINE.filter(b => !fs.existsSync(path.join(env.paths.root, ...b.file.split('\\'))));
+
+  t.info(`§十之② 扫描面：磁盘上的 **${onDisk.length}** 个 .js（tests\\**\\*.js 含 ._verify\\ ＋ tools\\**\\*.js，**不看 git 跟踪状态**）；`
+    + `其中 ._verify\\ 下 **${verifyCount}** 个；受管文档清单 **${managedDocs.size}** 条`
+    + `（动态取自 snapshot.collectSnapshot() ＋ 三份"当前值区"文档 ＋ PROJECT_RULES.md；`
+    + `**不含 项目记录\\工作日志.md**，理由见本节注释）；跳过本文件自身的样本段 ${skippedSelfLines} 行`);
+  t.info(`§十之② 历史基线豁免：清单 **${LEGACY_BASELINE.length}** 条（E104 收口后已清空 —— 9 个一次性写入脚本已删除）；`
+    + `命中 ${hits.length} 处 ⇒ 核销 ${legacyCleared.length} 处／失效（文件在但内容变了）${legacyStale.length} 处／`
+    + `因文件已删而作废 ${legacyObsolete.length} 处`);
+  t.check('§十之②-A 静态：`tests\\**`（含被忽略的 `._verify\\`）＋ `tools\\**` 里，把受管文档当写目标的写点'
+    + '**只剩"按内容 sha256 核销的历史基线"**（清单里没有的新写点 ⇒ 红并逐条指名 `文件:行号`)',
+    remaining.length === 0 && legacyStale.length === 0,
+    remaining.length
+      ? `**新写点 ${remaining.length} 处**（不在历史基线里，或基线已因文件改动失效）：\n        `
+        + remaining.map(h => `${h.file}:${h.line} → 写目标含 \`${h.name}\`（${h.target}）`).join('\n        ')
+        + (legacyStale.length ? `\n        另有 ${legacyStale.length} 条基线豁免已失效（文件被改过）：${legacyStale.map(b => b.file).join('、')}` : '')
+      : `零新写点（在 ${onDisk.length} 个 .js 上扫过；${legacyCleared.length} 处命中全部落在历史基线里且 sha256 相符）`);
+
+  /* 判据自证（D23：判据必须**可假**）：好/坏两组合成样本，逐条断言判定方向 —— 否则"零命中"可能是
+     判据根本没在工作（空洞绿）。⚠ 这两段数组**必须保持 `const goodSamples = [` / `const badSamples = [`
+     的起始形态**（上面靠它定界跳过自身）。 */
+  const goodSamples = [
+    "fs.writeFileSync(readmePath, realBytes);",                          // §十：写副本（变量名带 Path＋readme）
+    "fs.writeFileSync(path.join(copyDir, '当前状态快照.md'), t);",         // 写副本目录
+    "fs.writeFileSync(copyAbs('snap'), t, 'utf8');",                     // 副本变量
+    "fs.writeFileSync(somePath, t, { recursive: true, force: true });",  // 变量＋伴随实参（不是目标）
+    "fs.writeFileSync(tmp, t, { flag: 'a', encoding: 'utf8' });",        // 伴随实参 flag/encoding
+    "fs.readFileSync('项目记录/当前状态快照.md');",                         // 读不算写
+    "const s = fs.readFileSync('tests/README.md', 'utf8'); check(s);"    // 读＋后续使用
+  ];
+  const badSamples = [
+    "fs.writeFileSync('tests/README.md', lines.join('\\r\\n'), 'utf8');",   // 字面写 README
+    "fs.appendFileSync('项目记录/当前状态快照.md', t);",                      // append 写快照
+    "fs.copyFileSync(src, 'PROJECT_RULES.md');",                          // copyFile 覆盖规范
+    "fs.unlinkSync('项目记录/后续路线图.md');",                              // unlink 删路线图
+    "fs.writeFileSync(path.join(ROOT, '项目记录/当前状态快照.md'), t);",       // path.join 拼受管文档
+    "fs.renameSync(t, '项目架构与技术栈.md');",                              // rename 覆盖架构文档
+    "fs.writeFileSync(当前状态快照路径, t);",                               // 变量名＝真源（含完整中文词干）
+    "fs.writeFileSync('当前状态快照.md', t, 'utf8');"                       // 只给基名的字面量（写当前目录下的同名文件）
+  ];
+  const goodBad = goodSamples.filter(s => scanSrc(s, managedDocs).length > 0);
+  const badMissed = badSamples.filter(s => scanSrc(s, managedDocs).length === 0);
+  t.check('§十之②-B 判据自证（**可假**）：好样本（写副本／变量＋伴随实参／只读）**一律不命中**；'
+    + '坏样本（字面写受管文档／`path.join` 拼受管文档／append／copyFile／unlink／rename／变量名含中文词干）**一律命中**',
+    goodBad.length === 0 && badMissed.length === 0,
+    `好样本误报 ${goodBad.length}/${goodSamples.length}${goodBad.length ? `：${goodBad.join('；')}` : ''}；`
+    + `坏样本漏报 ${badMissed.length}/${badSamples.length}${badMissed.length ? `：${badMissed.join('；')}` : ''}`);
+  /* 判据的**能力边界**（如实登记，不靠"看着像能抓"）：它**不解析变量赋值链**、也不做数据流分析 ⇒
+     像 `const p = helper('snap'); writeFileSync(p, t)` 这种"路径由别处函数算出"的写法**抓不到**。
+     本轮现场（`writeFileSync(realSnap, byteBackup)`）能抓到，是因为变量名本身含中文词干/受管基名。
+     ⇒ 结论：这条守护是**筛子**不是**证明**；它把"11 处存量写点"这类形态逼到台面上（并逐条给定），
+        但"绝对没有探针写真文件"仍要靠**工序纪律**（`E70` 的运行期普查 ＋ 一次只跑一路门禁）。 */
+  t.info('§十之② 判据能力边界（如实登记）：不解析变量赋值链／无数据流分析 ⇒ '
+    + '`const p = f(...); writeFileSync(p, …)` 这类**抓不到**；能抓到的是"字面量整名／变量名含受管词干"两类。'
+    + '故本条是**筛子**不是**证明**，"绝对没有探针写真文件"仍靠工序纪律（E70 运行期普查 ＋ 一次只跑一路门禁）。');
+
+  /* D22（承重性）：把**一份真探针的源码**内存变异成"写真实受管文档" ⇒ 上面的判据必红并指名。
+     为什么用"真探针源码 × 内存变异"而不是造个假样本：真源码带着真实的写法（`realAbs('snap')`、
+     `writeFileSync(realSnap, …)`），能证明判据在**真实形态**上生效，而不只是在我编的样本上生效。
+     探针来源＝**在 `tests\._verify\` 下深搜**一个"含 `writeFileSync(realSnap` 的真文件"（不钉死具体
+     路径/目录名 —— 探针是过程产物，位置会随批次变；钉死会让这条 D22 在下一轮静默失效）。 */
+  const probeCandidates = (() => {
+    const out = [];
+    const scan = (d, depth) => {
+      if (depth > 4) return;
+      let list = [];
+      try { list = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+      for (const e of list) {
+        if (e.isSymbolicLink()) continue;
+        const abs = path.join(d, e.name);
+        if (e.isDirectory()) { scan(abs, depth + 1); continue; }
+        if (!e.isFile() || !e.name.endsWith('.js')) continue;
+        try {
+          const s = fs.readFileSync(abs, 'utf8');
+          if (s.includes('writeFileSync(realSnap')) out.push(abs);      // 只要"用 realSnap 当写目标"的真探针
+        } catch { /* 忽略 */ }
+      }
+    };
+    scan(env.paths.verify, 0);
+    return out;
+  })();
+  let d22 = {
+    ok: false,
+    detail: probeCandidates.length
+      ? `找到探针 ${probeCandidates.length} 个但内存变异未生效（锚点不匹配）`
+      : '在 `tests\\._verify\\` 下找不到含 `writeFileSync(realSnap` 的探针源码 ⇒ D22 的真实形态一半未取证'
+  };
+  if (probeCandidates.length) {
+    const probeAbs = probeCandidates[0];
+    const p0 = fs.readFileSync(probeAbs, 'utf8');
+    const before = scanSrc(p0, managedDocs);                           // 真源码：应零命中（它只写副本）
+    /* 变异：把"写副本变量"换成"写真实受管文档"（**绝对路径经 path.join 现拼** —— 这样本文件源码里
+       不会出现"写受管文档"的字面量，免得判据扫到自己时自伤） */
+    const realTarget = `path.join(ROOT, ${JSON.stringify('项目记录/' + '当前状态快照.md')})`;
+    const mutated = p0.replace('fs.writeFileSync(realSnap,', `fs.writeFileSync(${realTarget},`);
+    const after = mutated === p0 ? [] : scanSrc(mutated, managedDocs);
+    const named = after.some(h => h.name.includes('当前状态快照'));
+    const diskSame = Buffer.compare(fs.readFileSync(probeAbs), Buffer.from(p0, 'utf8')) === 0;
+    d22 = {
+      ok: before.length === 0 && after.length > 0 && named && diskSame,
+      detail: `探针＝${path.relative(env.paths.root, probeAbs).split(path.sep).join('\\')}；`
+        + `真源码命中 ${before.length} 处（应 0）；内存变异后命中 ${after.length} 处`
+        + `${after.length ? `（首条：:${after[0].line} 写目标含 \`${after[0].name}\`）` : ''}；`
+        + `指名到"当前状态快照"=${named}；探针盘上字节未变=${diskSame}`
+    };
+  }
+  t.check('§十之②-C D22（承重）：把真探针源码**内存变异**成"写真实 `当前状态快照.md`"⇒ 判据**必红并指名**；'
+    + '真源码（只写副本）零命中；探针盘上字节不变（`Buffer.compare`）',
+    d22.ok, d22.detail);
+}
+
 /* ---------------- 十一、已登记偏差的"登记数"必须与本机实算对得上（P3-6） ----------------
    立案原因：2026-09-20 实际发生两次 —— 新增一个文本文件后 `docs-cross-check` 的"权威区扫描 N 个
    文本文件 ＝ files-check 实跑值"变红（属常规工作导致的、可预期的机械漂移），而旧的
