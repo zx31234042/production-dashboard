@@ -9705,7 +9705,7 @@ function e103LinkSafetyChecks(t) {
         + `**在册 ${RM_LEGACY_E103.length} 条**全部满足各自 \`max\` ⇒ 判据视图 0 处命中；未在册 0 处）；`
         + `清单里已消失的条目 ${rmStale.length} 条＝` + (rmStale.map(r => `${r.file}:${r.id}`).join('、') || '无')
         + ` ⇒ 存量只减不增、任一处被修好都会在这里显形（但**不判红**：修好不是缺陷））`
-        + `｜在册条目与理由（**每次跑都印出来**，豁免不许是隐形的）：${rmLegacyWhyText}`);
+        + `｜在册条目与理由（**每轮由紧随其后的 \`t.info\` 印出来** —— \`PASS\` 详情不打印，豁免不许是隐形的）：${rmLegacyWhyText}`);
   t.check('E103-B④ `E117` 显式清单（**不是靠"没扫到"**）：登记在案的 6 处**逐处**都已改走 `removeLinkSafe('
     + '（`文件:标识符` 逐个核对），且受管面**零新增/零超限**（在册条目逐条给 why）—— 其中任一处回潮都会被 B① 当"新增"点名',
     (() => {
@@ -9721,6 +9721,13 @@ function e103LinkSafetyChecks(t) {
       + `；受管面**新增/超限** ${rmManaged.length} 处（应 0）`
       + `；原样扫描命中 ${rmManagedDisk.length} 条 \`(文件,id)\` ＝ 在册 ${RM_LEGACY_E103.length} 条（逐条 why：${rmLegacyWhyText}）`
       + `（⚠ 由 ` + '`E151`' + ` 的裁定㈠**照出来的历史存量**：旧判据先查守护、后查在册 ⇒ 它们被"文件里有同 id 的判别"吃掉、连普查都看不见；本批**登记**而不是放宽判据）`);
+  /* `E151`／`B①`／`B④` 的**受管面读数**：`PASS` 详情不打印 ⇒ 这里用 `t.info` 让"受管面还剩几条在册、
+     每条的 why"**每轮可见**（否则"豁免不许是隐形的"就成了一句印不出来的话）。 */
+  t.info(`E103-B①／B④ **受管面**读数（口径现算）：**未守护的裸递归删**（按登记 + \`max\` 判定后的违规）`
+    + `＝**${rmManaged.length}** 处（应 0）；**原样扫描**（不施加任何豁免）命中 ${rmManagedDisk.length} 条 \`(文件,id)\`；`
+    + `**在册只剩 ${RM_LEGACY_E103.length} 条**：${rmLegacyWhyText}`
+    + `（⚠ \`E151\` 裁定㈡ 已把 \`tests\\env.js\` 的 \`p\` 那一处接缝改走 \`removeLinkSafe\` ⇒ 该条登记**已撤**：`
+    + `受管面回到"**零未守护裸递归删**"，剩下的 \`target\` 是 \`removeLinkSafe()\` 自身的实现、**必须**调 \`fs.rmSync\`）`);
   /* `E117` 的 D22：**内存副本**把其中一处换回裸递归删 ⇒ B① 的同一判据必须红并**指名 `lockDir`**。 */
   {
     const dbPath117 = path.join(env.paths.root, 'tests', 'db-check.js');
