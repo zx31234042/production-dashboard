@@ -344,10 +344,24 @@ const state = {
    *  · `lastShiftKey` ＝ **上次所见班次**（`<班次日期>|<班次名>`）—— 它是"跨班"判据的被减数；
    *    进程重启后为空，届时由 `previousFrameShiftOf()` 从 `measure_rt` 里**回读**上次采样所属班次
    *    （ADR-0009 C3 被否掉的那个后果：重启错过边界不得永久漏固化）；
-   *  · `lastShift` 同上的完整班次对象（枚举补记区间要用它的 `endAt`）。 */
+   *  · `lastShift` 同上的完整班次对象（枚举补记区间要用它的 `endAt`）；
+   *  · `splitDegradedRows`（`E146` 的**更强处置**，2026-10-04）＝本进程内**真的落库**的
+   *    **切段降级行**数（判据真源仍是 `services/stats.js` 的 `splitRunSecondsByDay()` 挂在切段结果上的
+   *    `degraded`；本键只**数**它，不另判一套）。
+   *    ⚠ **它与告警刻意分开、语义不同**（这是本键存在的全部理由）：
+   *      · 告警（`warnedSplitDegraded` ＋ `logger.warn`）是**给人看**的 ⇒ **同原因只报一次**（去重，免得刷屏，
+   *        一刷屏人就不看了）；
+   *      · 本计数是**给门禁/巡检看**的 ⇒ **每次都要算、绝不去重**（一旦去重，降级从 1 行涨到 4 行这种
+   *        "错账在变多"的事实就**读不出来了**）。
+   *    两者**不许互相替代**：只看告警 ⇒ 一个数字都拿不到（正常形态与"降级 1 行"都是静默或一条）；
+   *    只看计数 ⇒ 不知道原因（`degradedReason` 只在告警文案里）。
+   *    口径（沿用本仓零值口径，见 `resultWrite`/`retentionWrite` 同款）：**未发生 ⇒ `0`**
+   *    （不是 `null` —— 它是个**可累加**的计数器，不是"还没有过"的取值位），随 `start()` 一轮归零。
+   *    不变量：`splitDegradedRows ≤ writes`（两者都只数**真的写进库**的行；被 `upsertFrozen()` 的
+   *    "信息单调守卫"拦成空操作的行两边都不算）。 */
   shiftStatWrite: {
     writes: 0, backfills: 0, failures: 0, lastError: null,
-    lastShiftKey: null, lastShift: null, staleFrames: 0
+    lastShiftKey: null, lastShift: null, staleFrames: 0, splitDegradedRows: 0
   },
   /** DR-08（`warning`，技术债 `E62`）写入点的运行计数：
    *  `writes` 累计**新落**的预警条数、`duplicates` 幂等命中（同一归属键已在库中）的次数、
@@ -486,7 +500,13 @@ function healthPayload() {
       failures: state.shiftStatWrite.failures,
       lastError: state.shiftStatWrite.lastError,
       lastShiftKey: state.shiftStatWrite.lastShiftKey,
-      staleFrames: state.shiftStatWrite.staleFrames
+      staleFrames: state.shiftStatWrite.staleFrames,
+      /* `E146`（2026-10-04，`T-20261004-19`）：**切段降级行计数**（`E139` 挂在切段结果上的 `degraded`
+         标记在**写路径**上被读到的次数）—— 让"降级写库"这件事在 `/health` 上**机器可读**。
+         ⚠ 与那条**人读**的告警**刻意分开**：告警同原因**只报一次**（去重，免得刷屏被人无视），
+         本计数**每次都要算、不去重**（否则"降级从 1 行涨到 4 行"这种"错账在变多"的事实读不出来）。
+         零值语义沿用本仓口径：**未发生 ⇒ `0`**（键恒在；不用 `null`，它是可累加计数器）。 */
+      splitDegradedRows: state.shiftStatWrite.splitDegradedRows
     },
     warningWrite: {
       writes: state.warningWrite.writes,
@@ -569,7 +589,7 @@ async function start(options = {}) {
   /* DR-06／DR-08 写入点的计数与"上次所见班次"同理归零（跨班检测的进程内记忆不得跨启动沿用） */
   state.shiftStatWrite = {
     writes: 0, backfills: 0, failures: 0, lastError: null,
-    lastShiftKey: null, lastShift: null, staleFrames: 0
+    lastShiftKey: null, lastShift: null, staleFrames: 0, splitDegradedRows: 0
   };
   state.warningWrite = {
     writes: 0, duplicates: 0, skippedOk: 0, failures: 0, lastError: null, lastWarnType: null
@@ -1317,14 +1337,25 @@ async function start(options = {}) {
   /** `E146`（2026-10-04）**写路径**的降级告警闸：同一原因（同一 `degradedReason` 串）只告警一次。
    *  本 `Set` 随 `start()` 一轮归零（与 `state.shiftStatWrite` 的计数同一处纪律：上一轮的告警不该
    *  让新一轮静默）。判据真源只有一处 —— `services/stats.js` 的 `splitRunSecondsByDay()` 挂在切段
-   *  结果上的 `degraded` 标记（本文件与 `stateSnapshot.js` 都只**读**它，不另判一套）。 */
+   *  结果上的 `degraded` 标记（本文件与 `stateSnapshot.js` 都只**读**它，不另判一套）。
+   *  ⚠ 本闸**只管告警**（人读 ⇒ 去重）。同一件事的**机器可读**出口是 `state.shiftStatWrite.splitDegradedRows`
+   *  （`T-20261004-19` 的更强处置，2026-10-04）—— 那个计数**永不去重**、每次降级都要算。
+   *  **为什么两者必须分开、且不许互相替代**：告警一刷屏就没人看（这是 `warnedSplitDegraded` 存在的理由），
+   *  而"这一轮到底写了几行错账"是**门禁/巡检**要判的量（去重的计数器只能给出"发生过"这一个 bit，
+   *  1 行涨到 4 行这件事就永远读不出来）。两者**语义不同 ⇒ 纪律不同**：一个去重、一个不去重。 */
   const warnedSplitDegraded = new Set();
 
   /** 把一个班次的**库内真源读数**装成 `shift_stat` 的一行（固化与补记共用；口径见 6e-4 段头）。
    *  ⚠ "无法判定"的两个**状态位**（`oee`/`pass_rate` 为 `null`）是本函数**刻意**给出的，别改成 0：
    *    · `frameCount === 0` ⇒ 该窗口没有采集数据 ⇒ **运行时长无法判定**（设备没跑 / 链路断了 /
    *      服务没运行，三者**不可区分**）⇒ `oee: null`（`runSec`/`idleSec` 受列约束只能 0，占位而已）；
-   *    · `pieceCount === 0` ⇒ 没有判定件 ⇒ 合格率**无法计算**（分母为 0，不是 0%）⇒ `passRate: null`。 */
+   *    · `pieceCount === 0` ⇒ 没有判定件 ⇒ 合格率**无法计算**（分母为 0，不是 0%）⇒ `passRate: null`。
+   *  `T-20261004-19`（本函数的**返回形态**）：为了把"这一行的切段是降级兜底形态"这件事交到
+   *  **真的落库**那一步去计数，本函数改为返回 `{row, splitDegraded}`（而不是光返回 `row`）——
+   *  `row` 的**内容与键一字未动**（"方案 A／行留痕"已按负责人裁定**不采纳**：那要依赖
+   *  `upsertFrozen()` 容忍未知键这条**今天无断言守护**的契约）；多出来的 `splitDegraded` 只是
+   *  把上面已经读到的那个判据**交出去**，**不是**另判一套、更**不是**从行值反推（比如拿
+   *  "`runSecDay2 === 0`"当降级证据 —— 那是第二份判据，会与真源漂移）。 */
   function shiftStatRowOf(shift) {
     const taken = statsForShift(state.db, shift, { config: boardCfg, now: shift.endAt, addRunSec: 0 });
     const s = taken.stats;
@@ -1336,17 +1367,30 @@ async function start(options = {}) {
        `repo/shiftStat.js` 的 `segmentsOf()`/`sumRunSec()` 当成"已固化的真源"永久参与日/月/年档求和 ——
        错一次、之后每次读都错，且库里没有任何一列再提示"这一行的切段其实是兜底形态"。
        ⇒ 若降级真的发生在这一支，绝不能**静默**落一行"整段归 day1"的错账。
-       处置＝**标注 ＋ 告警**，一个数都不改（与 `stateSnapshot.statsOf()` 同一口径、同一先例；
+       处置＝**标注 ＋ 告警 ＋ 计数**（`T-20261004-19` 的更强处置：让"降级写库"在 `/health` 上**机器可读**），
+       一个数都不改（与 `stateSnapshot.statsOf()` 同一口径、同一先例；
        出口沿用 `server/db/index.js` 的 F17-3：有 `logger` 走 `logger.warn`，否则 `console.warn`）：
          · **不抛错** —— `stats.js` 的既有取舍是"切段是派生的增强、不该让旧调用方爆掉"（`E139` docblock），
            写路径抛错会把整条固化链（乃至那一拍的判定链）带下来；
-         · **同一原因只告警一次**（`warnedSplitDegraded`）：本函数按班次被反复调用，不设闸会刷屏。
+         · **同一原因只告警一次**（`warnedSplitDegraded`）：本函数按班次被反复调用，不设闸会刷屏；
+          · **计数不去重**（`state.shiftStatWrite.splitDegradedRows`，在 `freezeShift()` 里**落库成功之后**
+            加）：告警与计数**语义不同 ⇒ 纪律不同** —— 告警是**给人看**的（去重，不然刷屏就没人看），
+            计数是**给门禁/巡检看**的（**每次都要算**；一旦去重，"这一轮写了 4 行错账"与"1 行"就分不出来，
+            而"错账在变多"正是最该被机器抓到的信号）。二者不许互相替代：只看告警拿不到数字，
+            只看计数不知道原因（`degradedReason` 只在告警文案里）。
        现况（真源可核）：本函数的 `shift` 来自 `completedShiftOf()` → `shiftRules.at()`，而 `at()`
        （`services/shift.js:237-282`）必给 `start`/`end`/`startAt`/`endAt`/`date` —— 正是 `E139` 收窄后的
        **全部** fault 判据（`totalSec` 不在其中）⇒ **生产路径上 `degraded` 不可达**（本条是"下一根探针/
        下一个调用方"的防线，不是当下在冒烟）。 */
     const split = s.runSecSplit;
+    /* 本行的切段是不是**降级兜底形态**：判据全函数只在这里读一次（真源＝`services/stats.js` 的 `degraded`
+       标记），读出来的**同一个事实**喂两个出口 —— ①上面那条**去重**的告警（人读）；②`freezeShift()` 里
+       **不去重**的落库计数（`state.shiftStatWrite.splitDegradedRows`，门禁/巡检读）。
+       ⚠ 下面的 `if` 判据**一个字都没改**（旧探针 `tests\._verify\e146-probe.js` 的 D22 锚点正是这一行，
+       改它会让那份已验收的取证假红）；标志位在分支体内置位 ⇒ 判据只求值一次、不存在第二份判据。 */
+    let splitDegraded = false;
     if (split && split.degraded === true) {
+      splitDegraded = true;
       const why = String(split.degradedReason || '（未给 degradedReason）');
       if (!warnedSplitDegraded.has(why)) {
         warnedSplitDegraded.add(why);
@@ -1362,7 +1406,7 @@ async function start(options = {}) {
     const runDeterminable = f.frameCount > 0;
     const rateDeterminable = f.pieceCount > 0;
     const nowText = platformClock.fmt(currentClock().now());
-    return {
+    const row = {
       shiftDate: shift.date,
       shiftName: shift.name,
       planQty: s.planQty,
@@ -1388,13 +1432,26 @@ async function start(options = {}) {
       frozenAt: nowText,
       createdAt: nowText
     };
+    return { row, splitDegraded };
   }
 
-  /** 固化/补记一个班次（唯一写入口＝`repo/shiftStat.js` 的 `upsertFrozen()`）；失败**只记不抛**。 */
+  /** 固化/补记一个班次（唯一写入口＝`repo/shiftStat.js` 的 `upsertFrozen()`）；失败**只记不抛**。
+   *
+   *  `E146`（`T-20261004-19`）的**降级行计数**在这里加：`upsertFrozen()` 真的写进了行
+   *  （`written === true`，与 `state.shiftStatWrite.writes` **同一口径**）且该行的切段是**降级兜底形态**
+   *  时，`splitDegradedRows` 才 +1。
+   *  · **判据不在这里**：由 `shiftStatRowOf()` 交出（真源仍是 `stats.js` 的 `degraded` 标记）—— 本函数
+   *    **不另判一套**，也不从行值反推（拿 `runSecDay2 === 0` 当证据 = 第二份判据）。
+   *  · **不去重**：同一原因降级 4 行 ⇒ 计数 +4，而人读的告警**仍然只有 1 条**（那正是两者分开的意义）。
+   *  · **失败那一支（catch）不计数**：那一行**没落库** ⇒ 只记 `failures`/`lastError`。计数的语义是
+   *    "**真的写进库**的降级行数"，故不变量 `splitDegradedRows ≤ writes` 恒成立。 */
   function freezeShift(shift) {
-    const row = shiftStatRowOf(shift);
+    const built = shiftStatRowOf(shift);
+    const row = built.row;
     try {
-      return shiftStatRepo.upsertFrozen(state.db, row);
+      const r = shiftStatRepo.upsertFrozen(state.db, row);
+      if (built.splitDegraded === true && r && r.written === true) state.shiftStatWrite.splitDegradedRows++;
+      return r;
     } catch (err) {
       state.shiftStatWrite.failures++;
       state.shiftStatWrite.lastError = String((err && err.message) || err);
