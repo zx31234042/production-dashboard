@@ -7,6 +7,155 @@
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 Add-Type -AssemblyName System.IO.Compression          # ZipArchive / ZipArchiveMode 所在程序集（FileSystem 只是其包装）
+# ===== E15 入口 BOM 自检（报错文本纯 ASCII，见 tools\Markdown转Word工具说明.md 第十节）=====
+$md2docxScriptPath = $MyInvocation.MyCommand.Path
+if (-not $md2docxScriptPath) { $md2docxScriptPath = $PSCommandPath }
+# 0xEF 0xBB 0xBF 在源码里一律写成 [byte]0xEF 这类形式：ASCII 字节，任何编码下读法相同。
+$md2docxBom = [byte[]]@(0xEF,0xBB,0xBF)
+# 探针字面量必须留着这 4 个汉字本身（UTF-8 字节 E5 BE AE E8 BD AF E9 9B 85 E9 9B 85）：
+# 自检要在本文件自己的字节里找这段序列；写成 [char]0x.. 拼接会找不到自己而误报。
+$md2docxCnProbeText = "微软雅黑"
+if ($md2docxCnProbeText) { $md2docxCnProbe = [System.Text.Encoding]::UTF8.GetBytes($md2docxCnProbeText) } else { $md2docxCnProbe = [byte[]]@() }
+function New-Md2DocxBomFailure([string]$reason) {
+  $lines = @(
+    '',
+    '  [FAIL] BOM SELF-CHECK FAILED - this script cannot produce a trustworthy .docx.',
+    ('         reason   : ' + $reason),
+    ('         script   : ' + $md2docxScriptPath),
+    '         howto    : rewrite the file as UTF-8 WITH BOM (EF BB BF), then re-run.',
+    '         why      : PowerShell 5.1 reads a BOM-less .ps1 as system ANSI, so every',
+    '                    Chinese literal (e.g. the East Asian font name) is silently decoded',
+    '                    wrong and written into the .docx; tests\files-check.js also asserts',
+    '                    that tools/*.ps1 must carry a BOM.',
+    '         doc      : tools\Markdown转Word工具说明.md - see the BOM section',
+    ''
+  )
+  [Console]::Error.WriteLine(($lines -join [Environment]::NewLine))
+  exit 3
+}
+if (-not $md2docxScriptPath) { New-Md2DocxBomFailure 'cannot resolve this script path ($MyInvocation.MyCommand.Path is empty)' }
+$scriptBytes = $null
+try { $scriptBytes = [System.IO.File]::ReadAllBytes($md2docxScriptPath) }
+catch { New-Md2DocxBomFailure ('cannot read this script file: ' + $_.Exception.Message) }
+if ($scriptBytes.Length -lt 3) { New-Md2DocxBomFailure 'file shorter than 3 bytes, so no BOM' }
+# 自查本身要能在"脚本正被按 ANSI 读"的处境下活下来：一律用 @() 包住再取 .Count/.Length，
+# 不用 $x[0] 直接索引（$null 会抛 "Cannot index into a null array"，那又变成不可读的失败）。
+$md2docxBomOk = $false
+if (@($md2docxBom).Count -ge 3 -and $scriptBytes.Length -ge 3) {
+  $md2docxBomOk = ($md2docxBom[0] -eq $scriptBytes[0]) -and ($md2docxBom[1] -eq $scriptBytes[1]) -and ($md2docxBom[2] -eq $scriptBytes[2])
+}
+if (-not $md2docxBomOk) {
+  New-Md2DocxBomFailure 'missing UTF-8 BOM: first 3 bytes are not EF BB BF'
+}
+$md2docxProbeFound = $false
+$md2docxProbeLen = @($md2docxCnProbe).Count
+if ($md2docxProbeLen -ge 4 -and $scriptBytes.Length -ge $md2docxProbeLen) {
+  for ($pi = 0; $pi -le ($scriptBytes.Length - $md2docxProbeLen); $pi++) {
+    $same = $true
+    for ($pj = 0; $pj -lt $md2docxProbeLen; $pj++) {
+      if ($scriptBytes[$pi + $pj] -ne $md2docxCnProbe[$pj]) { $same = $false; break }
+    }
+    if ($same) { $md2docxProbeFound = $true; break }
+  }
+}
+if (-not $md2docxProbeFound) {
+  New-Md2DocxBomFailure 'BOM present but the UTF-8 bytes of the East Asian font literal are gone: the body was re-encoded by an ANSI round-trip'
+}
+
+# ===== E14 目标占用预检（只读探测，不改动目标文件一个字节）=====
+$buildDir = $null          # 本次构建目录（打包结束后删除）
+$targetFile = $null        # 本次目标 .docx（占用时按名清理同目录 ~$ 锁文件）
+$newTargetFile = $false         # 目标原本不存在（保留变量名：文档/自检里引用它）
+$targetExistedBeforeRun = $true # 真实判据：**写出之前**目标是否存在（见清理函数；别在写出后再判）
+$buildCompleted = $false        # 打包成功返回后才置位 ⇒ 正常路径不删任何东西
+$buildOwned = $false       # 构建目录由本次创建/重建 ⇒ 失败清理时才归我删
+$exitCode = 0
+
+function Get-Md2DocxLockInfo([string]$file) {
+  if (-not $file -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { return $null }
+  $fs = $null
+  try {
+    $fs = [System.IO.File]::Open($file, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    return $null
+  } catch {
+    return $_.Exception.Message
+  } finally {
+    if ($null -ne $fs) { $fs.Dispose() }
+  }
+}
+
+function Get-Md2DocxLockSibling([string]$file) {
+  if (-not $file) { return @() }
+  $dir = [System.IO.Path]::GetDirectoryName($file)
+  if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { return @() }
+  $leaf = [System.IO.Path]::GetFileName($file)
+  return @(Get-ChildItem -LiteralPath $dir -Force -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name.StartsWith('~$') -and $_.Name.Substring(2).ToLowerInvariant().Contains($leaf.ToLowerInvariant()) } |
+    ForEach-Object { $_.FullName })
+}
+
+function Write-Md2DocxOccupied([string]$file, [string]$reason) {
+  $leafName = [System.IO.Path]::GetFileName($file)
+  $sibs = Get-Md2DocxLockSibling $file
+  [Console]::Error.WriteLine('')
+  [Console]::Error.WriteLine("  [FAIL] 请先关闭 $leafName（可能被 Word/WPS 打开）—— 目标文件当前被占用，本次转换已中止。")
+  [Console]::Error.WriteLine("         target : $file")
+  [Console]::Error.WriteLine("         cause  : $reason")
+  if ($sibs.Count -gt 0) {
+    [Console]::Error.WriteLine('         lock   : ' + ($sibs -join ' , '))
+    [Console]::Error.WriteLine('                  （~$ 前缀是 Word/WPS 的锁文件；关掉文档后它会自己消失）')
+  } else {
+    [Console]::Error.WriteLine('         lock   : 未见 ~$ 锁文件 —— 可能是别的程序/脚本持有句柄，或只读属性/权限不足')
+  }
+  [Console]::Error.WriteLine('         hint   : 这是"目标被占用"，不是转换工具损坏；关掉该文档后原样重跑即可。')
+  [Console]::Error.WriteLine('')
+}
+
+function Invoke-Md2DocxSafe([string]$what, [scriptblock]$action) {
+  try { & $action }
+  catch {
+    $ex = $_.Exception
+    if ($ex.InnerException) { $ex = $ex.InnerException }
+    if ($ex -is [System.IO.IOException] -or $ex -is [System.UnauthorizedAccessException]) {
+      Write-Md2DocxOccupied $targetFile ($what + '：' + $ex.GetType().Name + ' - ' + $ex.Message)
+      exit 1
+    }
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine("  [FAIL] $what 失败：$($ex.GetType().Name) - $($ex.Message)")
+    [Console]::Error.WriteLine("         target : $targetFile")
+    [Console]::Error.WriteLine('')
+    exit 1
+  }
+}
+
+function Clear-Md2DocxResidue {
+  if (-not $buildDir) { return }
+  # 清构建目录：置空 + [System.IO.Directory]::Delete(path, true)。
+  #   为什么必须先置空：Remove-Item -Recurse -Force 在遇到"外部句柄占住的文件"时会**中途 abort**
+  #   （报错后不再删剩余项）；实测残留只剩被占住的那一项、其余已清干净。
+  #   为什么用 Directory::Delete(_, $true) 而不是 Remove-Item：前者能把"空目录"一并删掉。
+  if ($buildOwned -and (Test-Path -LiteralPath $buildDir -PathType Container)) {
+    Get-ChildItem -LiteralPath $buildDir -Force -ErrorAction SilentlyContinue | ForEach-Object {
+      Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    if (@(Get-ChildItem -LiteralPath $buildDir -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+      try { [System.IO.Directory]::Delete($buildDir, $true) } catch { }
+    }
+  }
+  if ($targetFile) {
+    foreach ($sib in (Get-Md2DocxLockSibling $targetFile)) {
+      Remove-Item -LiteralPath $sib -Force -ErrorAction SilentlyContinue
+    }
+  }
+  # 只在**失败**路径上删除"本次新写出"的目标文件：
+  #   $targetExistedBeforeRun 在**写出之前**取（见预检段）；$buildCompleted 只在打包**成功返回**后置位。
+  #   正常路径（打包成功）什么都不删 ⇒ 与改动前行为逐字一致；失败路径才清掉半成品。
+  #   为什么不用时间戳：刚写出的文件 LastWriteTime 必然晚于运行起始时刻，拿它当判据会把正常产物删掉（实测踩到）。
+  if ($targetExistedBeforeRun -eq $false -and -not $buildCompleted -and $targetFile -and (Test-Path -LiteralPath $targetFile)) {
+    Remove-Item -LiteralPath $targetFile -Force -ErrorAction SilentlyContinue
+  }
+}
+
 
 function Esc([string]$s) {
   if ($null -eq $s) { return "" }
@@ -281,8 +430,17 @@ $appXml = @"
 </Properties>
 "@
 
+# E14 预检：目标 .docx 被 Word/WPS 打开时，先给出"请先关闭 <文件名>"，而不是抛 IO 异常。
+$occupied = Get-Md2DocxLockInfo $OutPath
+if ($occupied) { Write-Md2DocxOccupied $OutPath $occupied; exit 1 }
+$targetFile = $OutPath
+# 占位判定必须在**写出之前**取：写出后再判会恒为 true ⇒ 收尾清理把刚生成的 docx 删掉。
+$targetExistedBeforeRun = Test-Path -LiteralPath $OutPath
+
 $build = Join-Path ([System.IO.Path]::GetDirectoryName($OutPath)) "._docx_build"
-if (Test-Path $build) { Remove-Item $build -Recurse -Force }
+$buildDir = $build
+$buildOwned = $true
+if (Test-Path $build) { Clear-Md2DocxResidue }
 New-Item -ItemType Directory -Path $build | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $build "_rels") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $build "word") | Out-Null
@@ -323,8 +481,12 @@ function New-DocxPackage([string]$SourceDir, [string]$TargetPath) {
     }
   } finally { $zip.Dispose() }
 }
-New-DocxPackage $build $OutPath
+Invoke-Md2DocxSafe '写出 .docx（打包为 OPC 包）' { New-DocxPackage $build $OutPath }
+$buildCompleted = $true
 Remove-Item $build -Recurse -Force
 
+try {
 $fi = Get-Item $OutPath
 Write-Host "OK -> $($fi.FullName) ($($fi.Length) bytes)"
+} finally { Clear-Md2DocxResidue }
+exit $exitCode
