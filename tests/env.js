@@ -346,7 +346,20 @@ function cleanupStaleTemp(maxAgeMs = STALE_MAX_AGE_MS, io = null) {
 
 /**
  * 清扫的**真 IO**（`E114` 的注入面默认值）：每个键都只是把本文件既有的实现包一层 ——
- * 行为与"直接调 `fs`"逐字相同，抽出来只为让 `cleanupStaleTemp(maxAgeMs, io)` 有一个可替换的接缝。
+ * 抽出来只为让 `cleanupStaleTemp(maxAgeMs, io)` 有一个可替换的接缝。
+ *
+ * ⚠ **`E151` 追加（2026-10-04，主代理裁定㈡）：`removeDir` 从 `fs.rmSync(p, {recursive:true})`
+ *   改成走 `removeLinkSafe(p, …)`。** 对**非链接**逐字等价（`removeLinkSafe()` 的 `dir` 支就是
+ *   `fs.rmSync(p, {recursive:true, force, maxRetries, retryDelay})`，本处不传后两项 ⇒ 默认 0），
+ *   对**链接**则只拆链、**不跟随**。
+ *   为什么必须这么改（**不是**"顺手换个封装"）：`removeDir` 是**接缝**，它的安全性原先**只靠调用方**
+ *   （`cleanupStaleTemp()` 先 `fsi.isLink(full)`，顺序判据见上面 `E101` 段）；而门禁只能看到
+ *   "这个文件里有没有该 id 的判别"（`E151` 的**文件级**豁免）⇒ 下面 `isLink: p => isLink(p)`
+ *   这行**转发定义**会被当成"守护"，于是 `(tests\env.js, p)` 的裸递归删被**永久豁免**
+ *   （`max` 不生效 —— 登记一条它，等于把 `E151` 的病搬进受管面）。改成 `removeLinkSafe` 之后
+ *   **接缝自身**就是安全的 ⇒ 受管面回到"**零未守护裸递归删**"（只剩 `removeLinkSafe()` 自己的实现
+ *   那一处**真守护**，它必须调 `fs.rmSync`）。`isLink` 键**保留**：调用方仍按 `E101` 的顺序判，
+ *   两处都不穿链（"先 lstat 再 stat"的口径不变）。
  * @returns {{now:number, existsSync:Function, readdir:Function, isLink:Function, mtimeMs:Function,
  *            removeLink:Function, removeDir:Function, removeFile:Function}}
  */
@@ -358,7 +371,7 @@ function makeRealSweepIo() {
     isLink: p => isLink(p),
     mtimeMs: p => fs.statSync(p).mtimeMs,                        /* 调用点已先判非链接 ⇒ 不穿链 */
     removeLink: p => removeLinkSafe(p, { recursive: true, force: true }),
-    removeDir: p => fs.rmSync(p, { recursive: true, force: true }),
+    removeDir: p => removeLinkSafe(p, { recursive: true, force: true }),
     removeFile: p => fs.rmSync(p, { force: true })
   };
 }
