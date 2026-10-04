@@ -162,4 +162,95 @@ function createRunner(title, options = {}) {
    "给其余脚本也加 `[脚本异常]`"属**可选**后续项（本包**未做**：要动 13 个文件的输出文案，
    收益只是整齐；且必须同时保留 `脚本异常终止`）。 */
 
-module.exports = { createRunner };
+
+/* ==========================================================================
+   **源码字面量剥除器：`isRegexStart` ＋ `stripLiterals`（单一真源）**
+   `T-20261004-01`（2026-10-04，`E103` 甲组）：原先它定义在 `tests\harness-check.js` 第十六节**块内**，
+   于是 `E103` 的新判据（同文件第五节）够不着它 —— 要么复制第二份（必然漂移），要么搬家。选定**搬家**：
+   落点＝本文件（共享的断言／静态判据基建），`harness-check` 顶层 `require` 后**同一个函数对象**两处共用。
+   语义**逐字未变**（与搬迁前字节相同，仅去掉两级缩进）：
+     · 把注释、字符串／模板串、正则的**内容**换成空格，**长度与换行保持不变** ⇒ 下标仍可直接当锚点；
+     · 模板串插值 `${…}` 只 blank `$`、**保留** `{`／`}`（`T-20261002-03` 实测的坑，见下方注释原文）；
+     · 容错：未闭合的字符串／正则止于行尾（宁可多剥，不可漏剥）。
+   用途：判据只认**代码**里的形态 —— 说明文字里的同名写法不算证据（`E79` 的 F1/F3/F4 诱饵）。
+   ========================================================================== */
+const isRegexStart = (out, i) => {
+  let k = i - 1;
+  while (k >= 0 && /\s/.test(out[k])) k--;
+  if (k < 0) return true;
+  if ('([{,;:=!&|?+-*%~^<>'.includes(out[k])) return true;
+  let w = k;
+  while (w >= 0 && /[A-Za-z_$]/.test(out[w])) w--;
+  return /^(return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await)$/.test(out.slice(w + 1, k + 1).join(''));
+};
+
+/** 把注释与字符串/模板串/正则的**内容**换成空格；**长度与换行保持不变** ⇒ 下标仍可直接当锚点。
+    目的：判据只认**代码**里的退出语句（`console.error('process.exit(2)')` 不是退出证据 —— F1/F3/F4）。 */
+const stripLiterals = src => {
+  const out = src.split('');
+  const n = src.length;
+  const blank = (a, b) => { for (let k = a; k < b && k < n; k++) if (out[k] !== '\n') out[k] = ' '; };
+  let mode = 'code';
+  const stack = [];                                 /* 模板串插值 `${ … }`：braces＝插值内花括号深度 */
+  let i = 0;
+  while (i < n) {
+    const c = src[i], c2 = src[i + 1];
+    if (mode === 'code') {
+      if (c === '/' && c2 === '/') { blank(i, i + 2); mode = 'line'; i += 2; continue; }
+      if (c === '/' && c2 === '*') { blank(i, i + 2); mode = 'block'; i += 2; continue; }
+      if (c === "'") { blank(i, i + 1); mode = 'sq'; i++; continue; }
+      if (c === '"') { blank(i, i + 1); mode = 'dq'; i++; continue; }
+      if (c === '`') { blank(i, i + 1); mode = 'tpl'; i++; continue; }
+      if (c === '/' && isRegexStart(out, i)) { blank(i, i + 1); mode = 're'; i++; continue; }
+      if (stack.length) {                            /* 模板串插值内部按**代码**处理（保留求值语义） */
+        if (c === '{') stack[stack.length - 1].braces++;
+        else if (c === '}') {
+          if (stack[stack.length - 1].braces === 0) { stack.pop(); mode = 'tpl'; }
+          else stack[stack.length - 1].braces--;
+        }
+      }
+      i++; continue;
+    }
+    if (mode === 'line') { blank(i, i + 1); if (c === '\n') mode = 'code'; i++; continue; }
+    if (mode === 'block') {
+      if (c === '*' && c2 === '/') { blank(i, i + 2); mode = 'code'; i += 2; continue; }
+      blank(i, i + 1); i++; continue;
+    }
+    if (mode === 'sq' || mode === 'dq') {
+      const q = mode === 'sq' ? "'" : '"';
+      if (c === '\\') { blank(i, i + 2); i += 2; continue; }
+      if (c === q) { blank(i, i + 1); mode = 'code'; i++; continue; }
+      if (c === '\n') { mode = 'code'; i++; continue; }          /* 容错：未闭合的字符串止于行尾 */
+      blank(i, i + 1); i++; continue;
+    }
+    if (mode === 'tpl') {
+      if (c === '\\') { blank(i, i + 2); i += 2; continue; }
+      if (c === '`') { blank(i, i + 1); mode = 'code'; i++; continue; }
+      if (c === '$' && c2 === '{') {
+        /* 模板串插值 `${ … }`：**保留** `$` 与 `{` 两个字符 —— 它们是**代码**的一部分。
+           `T-20261002-03` 实测的坑（必须留痕）：原写法把 `${` 两个字符一起 blank，插值内的花括号就
+           少了一个左花括号与之配对 ⇒ 后面那个真 `}`（在剥后文本里）会被 `regionOf` 当成块尾提前闭合：
+           例 `server\index.js` 的 `const text = \`[启动失败] ${err && …}\`` ⇒ 正文被截到插值处，
+           `.catch` 区间里就"看不到" `process.exit(2)`（**假判红**）。保留 `${` 后，插值内的
+           `{`／`}` 成对，`regionOf` 才配得准（`$(…)` 之外的字符串/注释/正则仍然照剥 —— §16-H 不受影响）。 */
+        blank(i, i + 1); i++;                                /* 只 blank `$`，保留 `{` */
+        stack.push({ braces: 0 }); mode = 'code'; i++; continue;
+      }
+      blank(i, i + 1); i++; continue;
+    }
+    if (mode === 're') {
+      if (c === '\\') { blank(i, i + 2); i += 2; continue; }
+      if (c === '[') { blank(i, i + 1); mode = 'reclass'; i++; continue; }
+      if (c === '/') { blank(i, i + 1); mode = 'code'; i++; continue; }
+      if (c === '\n') { mode = 'code'; i++; continue; }          /* 容错：未闭合的正则止于行尾 */
+      blank(i, i + 1); i++; continue;
+    }
+    /* mode === 'reclass'：正则的字符类内部（`/` 不结束正则） */
+    if (c === '\\') { blank(i, i + 2); i += 2; continue; }
+    if (c === ']') { blank(i, i + 1); mode = 're'; i++; continue; }
+    blank(i, i + 1); i++; continue;
+  }
+  return out.join('');
+};
+
+module.exports = { createRunner, stripLiterals };

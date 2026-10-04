@@ -5270,7 +5270,7 @@ async function main() {
       (function walk(dir) {
         for (const n of fs.readdirSync(dir)) {
           const p = path.join(dir, n);
-          const st = fs.statSync(p);
+          const st = fs.lstatSync(p);
           if (st.isDirectory()) walk(p);
           else if (/\.(js|css|html)$/.test(n)) srcFiles.push(p);
         }

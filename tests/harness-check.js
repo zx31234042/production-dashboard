@@ -18,7 +18,7 @@ const os = require('node:os');
 const { spawnSync, spawn } = require('node:child_process');
 
 const env = require('./env');
-const { createRunner } = require('./lib/assert');
+const { createRunner, stripLiterals } = require('./lib/assert');   /* stripLiterals：§十六 与 §五 的 E103 判据共用（单一真源＝tests\lib\assert.js） */
 const { createClock, parseTime, BOUNDARIES } = require('./lib/clock');
 const fixture = require('./lib/fixture');
 const harness = require('./lib/harness');
@@ -297,7 +297,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
   let down = false;
   try { await fetch(`http://127.0.0.1:${p1}/health`); } catch { down = true; }
   t.check('stop() 之后端口不再响应（进程确实被停掉）', down, '');
-  fs.rmSync(dir, { recursive: true, force: true });
+  harness.removeLinkSafe(dir, { recursive: true, force: true });
 
   /* ====================== W6：进程入口与运行骨架（server\index.js / server\http\router.js） ======================
      本节原来只验"夹具自身能起停一个临时 mini-server"，验不到**真交付的进程入口**。
@@ -587,7 +587,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
           stillUp ? '仍在响应（缺陷）' : `已停止（日志目录已清=${!fs.existsSync(logFileAfterStop)}）`);
       } finally {
         if (authSvc) await authSvc.stop();
-        fs.rmSync(authTmp, { recursive: true, force: true });
+        harness.removeLinkSafe(authTmp, { recursive: true, force: true });
       }
     }
 
@@ -635,7 +635,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
           `日志行=${f20Line || '(未出现)'}；op_log=${JSON.stringify(f20Rows.map(r => ({ id: r.id, result: r.result })))}`);
       } finally {
         if (f20Svc) await f20Svc.stop();
-        fs.rmSync(f20Tmp, { recursive: true, force: true });
+        harness.removeLinkSafe(f20Tmp, { recursive: true, force: true });
       }
     }
 
@@ -919,7 +919,7 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
         `起来过=${wasUp} exit=${JSON.stringify(exitC)} 日志尾部=${logC.trim().split('\n').slice(-2).join(' ｜ ').slice(0, 200)}`);
     }
 
-    try { fs.rmSync(w6Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    try { harness.removeLinkSafe(w6Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
     /* 只删本节点的夹具文件，不删整个 w6 目录（并发轮次共用该目录，见上方 w6RunTag 说明） */
     for (const f of w6Written) { try { fs.rmSync(f, { force: true }); } catch { /* 忽略 */ } }
   } else {
@@ -2312,7 +2312,7 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
       try { out.stopResult = await serverEntry.stop('harness-check E58 真计数：' + label); }
       catch (err) { out.stopError = String(err && err.message); }
       try { out.serverAfterStop = serverEntry.state.server === null; } catch { /* 读不到就算了 */ }
-      try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 }); }
+      try { harness.removeLinkSafe(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 }); }
       catch (err) { out.rmError = String(err && err.message); }
     }
     return out;
@@ -3467,7 +3467,7 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
       `closeAllStreams 清掉 ${hv.cleared.length} 个定时器；在途 ${streamsBefore}→${routerH.streamCount()}`);
   }
 
-  try { fs.rmSync(w5Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  try { harness.removeLinkSafe(w5Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
   /* 只删本节点名的**夹具文件**，不删整个 tests\._verify\w5sse\：
      该目录是同座位复核/定点变异的工作区（整目录 rm 会把别人的临时产物一并清掉）。 */
   for (const f of [fSse, fNonLoop]) { try { fs.rmSync(f, { force: true }); } catch { /* 忽略 */ } }
@@ -3881,7 +3881,7 @@ t.section('四之③、W7-A-3 DoD：mock-upper（真进程）→ 服务端 → m
     ]),
     `实际清单（${mx.routes ? mx.routes.length : 0} 条，冻结基线 21）=${JSON.stringify(mx.routes)}`);
 
-  try { fs.rmSync(w7Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  try { harness.removeLinkSafe(w7Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
   try { fs.rmSync(w7File, { force: true }); } catch { /* 忽略 */ }
 }
 
@@ -3897,10 +3897,10 @@ t.section('五、临时区与清理');
   const u1 = harness.makeTempDir('u');
   const u2 = harness.makeTempDir('u');
   t.check('临时目录名唯一（同进程连续两次不冲突）', u1 !== u2, `${path.basename(u1)} ≠ ${path.basename(u2)}`);
-  for (const d of [u1, u2]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* 忽略 */ } }
+  for (const d of [u1, u2]) { try { harness.removeLinkSafe(d, { recursive: true, force: true }); } catch { /* 忽略 */ } }
   t.check('P3-14：唯一性探测不残留目录（本节建完即删，目录数不增长）',
     tmpCount() === beforeCount, `探测前 ${beforeCount} → 探测后 ${tmpCount()}`);
-  fs.rmSync(dir, { recursive: true, force: true });
+  harness.removeLinkSafe(dir, { recursive: true, force: true });
 
   const stale = harness.cleanup(false);
   t.check('cleanup(false) 只清过期项并返回统计',
@@ -4158,7 +4158,7 @@ t.section('五、临时区与清理');
       && fs.existsSync(path.join(runRootE90, 'mine.txt')),
     `返回=${JSON.stringify(staleSwept)}；假整轮目录仍在=${fs.existsSync(fakeOldRun)}；`
       + `本轮目录仍在=${fs.existsSync(runRootE90)}（mine.txt=${fs.existsSync(path.join(runRootE90, 'mine.txt'))}）`);
-  try { fs.rmSync(fakeOldRun, { recursive: true, force: true }); } catch { /* 已被清掉就忽略 */ }
+  try { harness.removeLinkSafe(fakeOldRun, { recursive: true, force: true }); } catch { /* 已被清掉就忽略 */ }  e103LinkSafetyChecks(t);   /* `E103`：链接安全门禁守护（定义在本文件尾部，抬头有口径与偏差说明） */
 }
 
 /* ---------------- 六、断言器自身 ---------------- */
@@ -4338,7 +4338,7 @@ t.section('八、platform/log.js 的保留策略（P2-7：keepDays 过去只赋�
   t.check('P2-7：缺省 keepDays 为 30（NFR-21 的"保留 ≥30 天"）',
     createLogger({ dir: logDir, clock: { now: () => new Date(fixedNow.getTime()) }, console: false })
       .prune().keepDays === 30, '');
-  try { fs.rmSync(logDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  try { harness.removeLinkSafe(logDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
 }
 
 /* ---------------- 九、防回潮断言的定点变异（ADR-0004 D22） ----------------
@@ -5314,7 +5314,7 @@ t.section('十二、工作区稳定性判定的真值表（运行期间被改写
       diff.some(c => c.path === 'src/a.js') &&
       !beforeList.some(p => p.endsWith('.png')),
       `清单含 ${beforeList.filter(p => p.startsWith('src/')).join('、')}`);
-    try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* 忽略 */ }
+    try { harness.removeLinkSafe(root, { recursive: true, force: true }); } catch { /* 忽略 */ }
   }
 
   t.check('`describeChange` 的中文标签与 kind 一一对应（不稳定横幅直接复用它，不另写一份）',
@@ -6169,84 +6169,10 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
   /** `/` 是正则字面量还是除号？只看**前一个有效字符**（已剥区是空格 ⇒ 注释/字符串不干扰判断）。
       判错的代价：正则内容没剥掉（里面的 `{}`／`()` 会干扰配对 —— 由"配不上就判红"兜住），
       或把除法算式当正则剥掉（只有把 `process.exit` 整段吞掉才可能改变结论）。 */
-  const isRegexStart = (out, i) => {
-    let k = i - 1;
-    while (k >= 0 && /\s/.test(out[k])) k--;
-    if (k < 0) return true;
-    if ('([{,;:=!&|?+-*%~^<>'.includes(out[k])) return true;
-    let w = k;
-    while (w >= 0 && /[A-Za-z_$]/.test(out[w])) w--;
-    return /^(return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await)$/.test(out.slice(w + 1, k + 1).join(''));
-  };
-
-  /** 把注释与字符串/模板串/正则的**内容**换成空格；**长度与换行保持不变** ⇒ 下标仍可直接当锚点。
-      目的：判据只认**代码**里的退出语句（`console.error('process.exit(2)')` 不是退出证据 —— F1/F3/F4）。 */
-  const stripLiterals = src => {
-    const out = src.split('');
-    const n = src.length;
-    const blank = (a, b) => { for (let k = a; k < b && k < n; k++) if (out[k] !== '\n') out[k] = ' '; };
-    let mode = 'code';
-    const stack = [];                                 /* 模板串插值 `${ … }`：braces＝插值内花括号深度 */
-    let i = 0;
-    while (i < n) {
-      const c = src[i], c2 = src[i + 1];
-      if (mode === 'code') {
-        if (c === '/' && c2 === '/') { blank(i, i + 2); mode = 'line'; i += 2; continue; }
-        if (c === '/' && c2 === '*') { blank(i, i + 2); mode = 'block'; i += 2; continue; }
-        if (c === "'") { blank(i, i + 1); mode = 'sq'; i++; continue; }
-        if (c === '"') { blank(i, i + 1); mode = 'dq'; i++; continue; }
-        if (c === '`') { blank(i, i + 1); mode = 'tpl'; i++; continue; }
-        if (c === '/' && isRegexStart(out, i)) { blank(i, i + 1); mode = 're'; i++; continue; }
-        if (stack.length) {                            /* 模板串插值内部按**代码**处理（保留求值语义） */
-          if (c === '{') stack[stack.length - 1].braces++;
-          else if (c === '}') {
-            if (stack[stack.length - 1].braces === 0) { stack.pop(); mode = 'tpl'; }
-            else stack[stack.length - 1].braces--;
-          }
-        }
-        i++; continue;
-      }
-      if (mode === 'line') { blank(i, i + 1); if (c === '\n') mode = 'code'; i++; continue; }
-      if (mode === 'block') {
-        if (c === '*' && c2 === '/') { blank(i, i + 2); mode = 'code'; i += 2; continue; }
-        blank(i, i + 1); i++; continue;
-      }
-      if (mode === 'sq' || mode === 'dq') {
-        const q = mode === 'sq' ? "'" : '"';
-        if (c === '\\') { blank(i, i + 2); i += 2; continue; }
-        if (c === q) { blank(i, i + 1); mode = 'code'; i++; continue; }
-        if (c === '\n') { mode = 'code'; i++; continue; }          /* 容错：未闭合的字符串止于行尾 */
-        blank(i, i + 1); i++; continue;
-      }
-      if (mode === 'tpl') {
-        if (c === '\\') { blank(i, i + 2); i += 2; continue; }
-        if (c === '`') { blank(i, i + 1); mode = 'code'; i++; continue; }
-        if (c === '$' && c2 === '{') {
-          /* 模板串插值 `${ … }`：**保留** `$` 与 `{` 两个字符 —— 它们是**代码**的一部分。
-             `T-20261002-03` 实测的坑（必须留痕）：原写法把 `${` 两个字符一起 blank，插值内的花括号就
-             少了一个左花括号与之配对 ⇒ 后面那个真 `}`（在剥后文本里）会被 `regionOf` 当成块尾提前闭合：
-             例 `server\index.js` 的 `const text = \`[启动失败] ${err && …}\`` ⇒ 正文被截到插值处，
-             `.catch` 区间里就"看不到" `process.exit(2)`（**假判红**）。保留 `${` 后，插值内的
-             `{`／`}` 成对，`regionOf` 才配得准（`$(…)` 之外的字符串/注释/正则仍然照剥 —— §16-H 不受影响）。 */
-          blank(i, i + 1); i++;                                /* 只 blank `$`，保留 `{` */
-          stack.push({ braces: 0 }); mode = 'code'; i++; continue;
-        }
-        blank(i, i + 1); i++; continue;
-      }
-      if (mode === 're') {
-        if (c === '\\') { blank(i, i + 2); i += 2; continue; }
-        if (c === '[') { blank(i, i + 1); mode = 'reclass'; i++; continue; }
-        if (c === '/') { blank(i, i + 1); mode = 'code'; i++; continue; }
-        if (c === '\n') { mode = 'code'; i++; continue; }          /* 容错：未闭合的正则止于行尾 */
-        blank(i, i + 1); i++; continue;
-      }
-      /* mode === 'reclass'：正则的字符类内部（`/` 不结束正则） */
-      if (c === '\\') { blank(i, i + 2); i += 2; continue; }
-      if (c === ']') { blank(i, i + 1); mode = 're'; i++; continue; }
-      blank(i, i + 1); i++; continue;
-    }
-    return out.join('');
-  };
+  /* `E79` 的字面量剥除器（`isRegexStart` ＋ `stripLiterals`）已**迁到 `tests\lib\assert.js`**
+     （`T-20261004-01`，`E103` 甲组）：`E103` 的 A/B 判据（§五 的 `e103LinkSafetyChecks`）要用**同一份**
+     剥法 —— 留两份必然漂移（本仓的"单一真源"纪律）。语义**逐字未变**（长度与换行保持、`${` 只 blank `$`），
+     顶部 `require` 已把**同一个函数对象**解构进来。 */
 
   /** 取 `openIdx` 处那个 `(`／`{` 的**配对**区间（未闭合返回 null ⇒ 调用方**必须判红**）。
       在**已剥字面量**的文本上做 ⇒ 字符串/注释/正则里的括号不会干扰配对。 */
@@ -7770,7 +7696,7 @@ t.section('十五、A1 端到端：跨班固化/按序补记/重启回读/写失
   } finally {
     shiftStatRepo.upsertFrozen = a1OrigUpsert;                // 计数包装当场还原成模块原件（不留痕）
     try { await serverEntry.stop('a1-e2e'); } catch { /* 尽力 */ }
-    try { fs.rmSync(a1Tmp, { recursive: true, force: true }); } catch { /* 已删 */ }
+    try { harness.removeLinkSafe(a1Tmp, { recursive: true, force: true }); } catch { /* 已删 */ }
   }
   t.check('A1：本节自建的临时目录跑完**当场删除**（一用例一库，不留残留）',
     !fs.existsSync(a1Tmp), a1Tmp);
@@ -8158,7 +8084,7 @@ t.section('十七、FR-7.12 公告写链路（IF-E `POST /notice`：鉴权／仅
     } finally {
       if (nLive) { try { nLive.db.close(); } catch { /* 已关 */ } }
       if (nSvc) { try { await nSvc.stop(); } catch { /* 尽力 */ } }
-      try { fs.rmSync(nSvcTmp, { recursive: true, force: true }); } catch { /* 已删 */ }
+      try { harness.removeLinkSafe(nSvcTmp, { recursive: true, force: true }); } catch { /* 已删 */ }
     }
     t.check('FR-7.12 端到端：本节自建的服务与临时目录跑完**当场停掉并删除**（一用例一库，不留残留）',
       !fs.existsSync(nSvcTmp) && (!nSvc || nSvc.proc.exitCode !== null || nSvc.proc.killed === true),
@@ -8595,11 +8521,520 @@ t.section('十九、E86①／ADR-0007 登录接线的端到端判据（真子进
       `exitCode=${a19Svc.proc.exitCode}、signalCode=${a19Svc.proc.signalCode}`);
   } finally {
     try { await a19Svc.stop(); } catch { /* 已停止 */ }
-    try { fs.rmSync(a19DataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 }); } catch { /* 已删 */ }
+    try { harness.removeLinkSafe(a19DataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 }); } catch { /* 已删 */ }
   }
 }
 
 t.finish();
+}
+
+/* ==========================================================================
+   `E103`（链接安全的**门禁守护**，`T-20261004-01` 甲组，2026-10-04）
+   --------------------------------------------------------------------------
+   为什么要有这一段：`E46`（对 junction 递归删除危险）与 `E101`（24h 清扫跟随链接）都改好了，
+   但"不得对**可能**是链接的路径递归删除"这条此前**只有纪律、没有门禁** —— `E46` 的事故正是
+   **探针的第一版**踩出来的。没有门禁 ⇒ 下一个人、下一支探针还会踩，且删除是合法 git 操作、
+   事后无从追责。本节把 `E103` 行给出的 A–E 五条判据落地（口径与偏差逐条写在判据旁边）：
+     A 静态禁入清单（剥注释与字符串后）：`robocopy`／`readdirSync(…,{recursive:true})`／
+       `rmdir /s`／`rd /s`。
+     B 组合判据：`fs.rmSync(id, {recursive:true})` 要求**同文件**存在 `lstatSync(id)`／`isLink(id)`
+       （或该调用点已改用 `removeLinkSafe(`）。
+     C 行为探针：`._verify\` 内一次性 junction ＋ 5 个 victim 文件 ⇒ `removeLinkSafe()` 必须返回
+       `kind==='link'`、`via ∈ {rmdirSync,unlinkSync}`、victim 逐文件 sha256 守恒、链接消失；
+       ＋ D22：`lstatSync → statSync` 的**内存字节副本**变异体 ⇒ 同一判据必须**红并指名**。
+     D 安全闸：全部实验路径必须落在 `tests\._verify\` 内（`path.relative` 不以 `..` 开头）。
+     E 清扫回归：`tempRootBase` 下的链接 ⇒ `cleanupStaleTemp()` **只拆链**、目标一条不少；
+       并给出"新鲜真实目录不被回收／过期真实目录被回收"两端读数。
+     （丙 `E97`）探针纪律的**调用形态**守护：见下面第三段。
+
+   ⚠ **偏差与口径（据实登记，不照抄台账）**
+   ① `E103` 行写"现状应为 **0 命中**"（A）—— 对**受管面**成立（实测 0），但**对全盘不成立**：
+      `tests\._verify\e46\` 的两支**取证探针**（`E46` 自己的实物）里有 **3 处** `readdirSync(…,
+      {recursive:true})` —— 它们**故意**调用被禁 API 来实测"递归读会跟着 junction 出圈"。
+      处置＝受管面**零容忍**（A①）＋ `._verify\` 面用"**已登记取证残留**"逐条判定、**新增即红**（A②）。
+      不删那两支探针：它们是 `E46` 的实证（`tests\env.js` 的注释就指着它们）。
+   ② `E103` 行写"E：另造**新鲜**链接 ⇒ **不被回收**" —— 与 `env.js` 的实现**不符**：
+      `cleanupStaleTemp()` 对链接是**无条件拆链**（不看年龄；理由＝链接不是合法的临时产物，
+      见 `tests\env.js` 的 `E101` 段）。本节按**实测口径**断言（新鲜链接**也**被拆链、但目标不受损），
+      并把这条偏差写进判据文案。
+   ③ B 的判据在**受管面**上今天**不可能**全绿：`tests\db-check.js`／`tests\offline-check.js`／
+      `tests\platform-check.js` 合计 **6 处**未防护的递归删除（本座位**无写权限**，不改他人文件）。
+      处置＝"**零新增 ＋ 存量逐条登记**"（新增即红）；**本门禁自身的面**（`tests\harness-check.js`
+      ＋ `tests\lib\**`）**不靠存量清单**：那 15 处已全部改走 `removeLinkSafe()`（B②）。
+   ⚠ 为什么判据要有"形状"这一条腿：本机 `fs.rmSync(<junction>, {recursive:true})` **只拆链**
+   （`E46` 的实测更正）⇒ **纯行为读数区分不出改动前后**（`E101` 的结论）。故 B（形状）与 C（行为）
+   缺一不可：形状证明"判据来自 lstat"，行为证明"目标一条不少"。
+   ========================================================================== */
+function e103LinkSafetyChecks(t) {
+  const crypto = require('node:crypto');
+  const Module = require('node:module');
+  const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+
+  /* ---------------- 扫描面：磁盘上的 `tests\**\*.js` ＋ `tools\**\*.js`（不看 git 跟踪状态） ----------------
+     遍历自身也守同一条纪律：`withFileTypes` 报 `isSymbolicLink()` 的条目不进入（不跟随链接）。 */
+  const walkJsE103 = (dir, out = []) => {
+    let list = [];
+    try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+    for (const e of list) {
+      const abs = path.join(dir, e.name);
+      if (e.isSymbolicLink()) continue;
+      if (e.isDirectory()) walkJsE103(abs, out);
+      else if (e.isFile() && e.name.endsWith('.js')) out.push(abs);
+    }
+    return out;
+  };
+  const allJsE103 = [...walkJsE103(env.paths.tests), ...walkJsE103(path.join(env.paths.root, 'tools'))];
+  const relOfE103 = (abs) => path.relative(env.paths.root, abs).split(path.sep).join('\\');
+  const isUnderVerifyE103 = (abs) => relOfE103(abs).includes('._verify\\');   /* 相对**仓库根** ⇒ `tests\._verify\…` */
+  const managedJsE103 = allJsE103.filter(f => !isUnderVerifyE103(f));
+  const verifyJsE103 = allJsE103.filter(isUnderVerifyE103);
+  const readOrEmpty = (abs) => { try { return fs.readFileSync(abs, 'utf8'); } catch { return ''; } };
+
+  /* ==================== 甲-A：静态禁入清单 ==================== */
+  const BAN_PATTERNS_E103 = [
+    ['robocopy 外部镜像复制工具', /\brobocopy\b/],
+    ['readdirSync(…, {recursive:true})', /readdirSync\([^)]*recursive:\s*true/],
+    ['rmdir 的 /s 开关', /rmdir\s+\/s/],
+    ['rd 的 /s 开关', /\brd\s+\/s/]
+  ];
+  /** 判据（纯函数，供 A③ 的 D22 复用）：**剥注释与字符串/模板串/正则**后逐行找禁入形态。
+   *  为什么必须剥：`tests\env.js` 的 `E46` 注释里**逐字**写着 `robocopy … /MIR`、`readdirSync(…,
+   *  {recursive:true})` —— 不剥就会把"说明文字"判成"调用"（自伤假红，实测踩过）。
+   *  @returns {Array<{line:number, pat:string, text:string}>（text＝该行**原文**，便于人工核）} */
+  const scanBanlist = (source) => {
+    const code = stripLiterals(source).split('\n');
+    const raw = source.split('\n');
+    const out = [];
+    code.forEach((l, i) => {
+      for (const [name, re] of BAN_PATTERNS_E103) {
+        if (re.test(l)) out.push({ line: i + 1, pat: name, text: String(raw[i] || '').trim().slice(0, 100) });
+      }
+    });
+    return out;
+  };
+  const banHitsE103 = (list) => list.flatMap((f) => scanBanlist(readOrEmpty(f)).map(h => ({ file: relOfE103(f), ...h })));
+  const banManaged = banHitsE103(managedJsE103);
+  const banVerify = banHitsE103(verifyJsE103);
+  /** `._verify\` 下**已登记的取证残留**（逐条判定；按 `文件＋形态` 登记，**不含行号** —— scratch 探针随时会动）。
+   *  语义＝"**多一处就红**"（不是"允许这个文件里的一切"）：同一个文件里出现**新形态**照样判红。 */
+  const BAN_RESIDUE_E103 = [
+    { file: 'tests\\._verify\\e46\\probe-raw2.js', pat: 'readdirSync(…, {recursive:true})',
+      why: '`E46` 取证探针：**故意**调用被禁 API，实测"`readdirSync(<link>,{recursive:true})` 会跟着 junction 出圈"（该项已记入 `tests\\env.js` 的 `E46` 段与路线图 `E46` 行）' },
+    { file: 'tests\\._verify\\e46\\probe-twoside.js', pat: 'readdirSync(…, {recursive:true})',
+      why: '同上（同一支取证脚本的第二次调用：受控复现"越界读"）' }
+  ];
+  t.check('E103-A① 静态禁入清单（**受管面零容忍**）：剥注释与字符串后，`tests\\*.js` ＋ `tests\\lib\\**` ＋ `tools\\**` 里没有 robocopy／`readdirSync(…,{recursive:true})`／rmdir 与 rd 的 /s 开关（命中即红并指名 `文件:行号`）',
+    banManaged.length === 0,
+    banManaged.length
+      ? `判红：命中 ${banManaged.length} 处 —— ` + banManaged.map(h => `${h.file}:${h.line} [${h.pat}]`).join('；')
+      : `零命中（扫 ${managedJsE103.length} 个受管 .js；剥注释与字符串后查 ${BAN_PATTERNS_E103.length} 类形态；`
+        + `当前全仓这类调用点**为零**，与 tests\\env.js 的 E46 段自述一致）`);
+  t.check('E103-A② `tests\\._verify\\**`（含被 gitignore 的）静态禁入命中**只剩已登记的取证残留**（清单外的任何一处 ⇒ 红并指名 `文件:行号`）',
+    banVerify.every(h => BAN_RESIDUE_E103.some(r => r.file === h.file && r.pat === h.pat)),
+    banVerify.length
+      ? `实存 ${banVerify.length} 处：` + banVerify.map(h => `${h.file}:${h.line} [${h.pat}]`).join('；')
+        + `；已登记 ${BAN_RESIDUE_E103.length} 条（` + BAN_RESIDUE_E103.map(r => `${r.file}——${r.why}`).join('；') + '）'
+      : `._verify\\ 下零命中（扫 ${verifyJsE103.length} 个 .js）`);
+  /* 样本一律**拼接构造**：若把靶子形态逐字写在本文件里，判据会先扫到自己的样本（自伤假红，
+     实测踩过 —— 与 §16 的"靶子形态用拼接构造"同一手法）。 */
+  const Q_E103 = String.fromCharCode(39);
+  const sampleBanBad = 'const c = robocopy(empty, link);\n'
+    + 'const rd = fs.' + 'readdirSync(link, { recursive: ' + 'true });\n';
+  const sampleBanGood = '// 说明：拆链接只许用非递归语义（本行是注释，讲的是 robocopy 的镜像模式会穿链）\n'
+    + 'const rd = fs.readdirSync(link);\n'
+    + 'const t2 = ' + Q_E103 + 'readdirSync(link, { recursive: ' + 'true })' + Q_E103 + ';\n';
+  const banBadHits = scanBanlist(sampleBanBad);
+  const banGoodHits = scanBanlist(sampleBanGood);
+  t.check('E103-A③ D22（可证伪）：同一判据喂**合成样本** ⇒ 禁入形态**必红且逐类指名**；而"注释里的同名词"与"字符串里的示例写法"**必绿**（⇒ 判据不是恒真式，也不会自伤）',
+    banBadHits.length === 2
+      && banBadHits.some(h => h.pat === BAN_PATTERNS_E103[0][0]) && banBadHits.some(h => h.pat === BAN_PATTERNS_E103[1][0])
+      && banGoodHits.length === 0,
+    `坏样本命中 ${banBadHits.length} 处（${banBadHits.map(h => `L${h.line}:${h.pat}`).join('、')}，应 2 且两类各 1）；`
+      + `好样本命中 ${banGoodHits.length} 处（应 0：注释与字符串都被剥掉）`);
+
+  /* ==================== 甲-B：递归删除的组合判据 ==================== */
+  /** 判据（纯函数，供 B③ 的 D22 复用）：剥字面量后，凡 `fs.rmSync(<标识符>, … recursive:true)`
+   *  的**标识符**，必须能在同文件里找到 `lstatSync(<同一标识符>)` 或 `isLink(<同一标识符>)`
+   *  —— 二者都是**不跟随**的判别（`E46` ②）。已改走 `removeLinkSafe(` 的调用点根本不出现
+   *  在 `fs.rmSync(` 形态里 ⇒ 天然满足。
+   *  @returns {Array<{id:string, line:number}>（line＝该标识符**首次**出现的行号）} */
+  const scanUnprotectedRm = (source) => {
+    const code = stripLiterals(source);
+    const lineOf = (idx) => code.slice(0, idx).split('\n').length;
+    const seen = new Map();
+    const re = /fs\.rmSync\((\w+)[^)]*recursive:\s*true/g;
+    let m;
+    while ((m = re.exec(code))) if (!seen.has(m[1])) seen.set(m[1], lineOf(m.index));
+    const out = [];
+    for (const [id, line] of seen) {
+      const guarded = new RegExp(`(?:lstatSync|isLink)\\(\\s*${id}\\b`).test(code);
+      if (!guarded) out.push({ id, line });
+    }
+    return out.sort((a, b) => a.line - b.line);
+  };
+  const rmHitsE103 = (list) => list.flatMap((f) => scanUnprotectedRm(readOrEmpty(f)).map(h => ({ file: relOfE103(f), ...h })));
+  const rmManaged = rmHitsE103(managedJsE103);
+  /** 存量清单（`文件 ＋ 标识符`；**不含行号**）：全部是**他人文件**里"删自建临时目录"的调用点，
+   *  本座位无写权限、不擅改；逐条定性见 `why`。语义＝"**零新增**"：清单外的任何一处 ⇒ 红。 */
+  const RM_LEGACY_E103 = [
+    { file: 'tests\\db-check.js', id: 'lockDir', line0: 510, why: '删自建锁目录（`._verify` 下一次性目录）；无 `lstat` 判别' },
+    { file: 'tests\\db-check.js', id: 'd', line0: 3852, why: '删自建临时目录；无 `lstat` 判别' },
+    { file: 'tests\\db-check.js', id: 'backupDir', line0: 5112, why: '删自建备份目录；无 `lstat` 判别' },
+    { file: 'tests\\offline-check.js', id: 'd', line0: 762, why: '删自建临时目录（`madeDirs.reverse()` 逐个删）；无 `lstat` 判别' },
+    { file: 'tests\\offline-check.js', id: 'root', line0: 771, why: '删自建临时根；无 `lstat` 判别' },
+    { file: 'tests\\platform-check.js', id: 'logDir', line0: 273, why: '删自建日志目录；无 `lstat` 判别' }
+  ];
+  const rmNew = rmManaged.filter(h => !RM_LEGACY_E103.some(r => r.file === h.file && r.id === h.id));
+  const rmStale = RM_LEGACY_E103.filter(r => !rmManaged.some(h => h.file === r.file && h.id === r.id));
+  const ownFace = rmManaged.filter(h => h.file === 'tests\\harness-check.js' || h.file.startsWith('tests\\lib\\'));
+  t.check('E103-B① 组合判据（**零新增**）：受管面里凡 `fs.rmSync(<标识符>, … recursive:true)`，同文件必须有 `lstatSync(<同一标识符>)`／`isLink(<同一标识符>)`（或已改走 `removeLinkSafe(`）—— 存量按 `文件＋标识符` **逐条登记**，清单外的任何一处 ⇒ 红并指名',
+    rmNew.length === 0,
+    rmNew.length
+      ? `判红：**新增未防护调用点 ${rmNew.length} 处** —— ` + rmNew.map(h => `${h.file}:${h.line}（id=${h.id}）`).join('；')
+        + `；已登记存量 ${RM_LEGACY_E103.length} 条 = ` + RM_LEGACY_E103.map(r => `${r.file}:${r.id}`).join('、')
+      : `零新增（受管面共 ${rmManaged.length} 处未防护，全部在存量清单里：`
+        + RM_LEGACY_E103.map(r => `${r.file}:${r.id}`).join('、') + '；'
+        + `清单里已消失的条目 ${rmStale.length} 条＝` + (rmStale.map(r => `${r.file}:${r.id}`).join('、') || '无')
+        + ` ⇒ 存量只减不增、任一处被修好都会在这里显形（但**不判红**：修好不是缺陷））`);
+  t.check('E103-B② **本门禁自身的面**（`tests\\harness-check.js` ＋ `tests\\lib\\**`）零未防护 —— 不靠存量清单（那 15 处已改走 `harness.removeLinkSafe()`／`env.removeLinkSafe()`，行为对非链接逐字等价）',
+    ownFace.length === 0,
+    ownFace.length
+      ? `判红：${ownFace.map(h => `${h.file}:${h.line}（id=${h.id}）`).join('；')}`
+      : `零未防护（tests\\harness-check.js 与 tests\\lib\\** 里已无 fs.rmSync(…, {recursive:true}) 形态）`);
+  const sampleOldEnvShape = 'const st = fs.statSync(full);\n'
+    + 'if (now - st.mtimeMs > maxAgeMs) { fs.rmSync(full, { recursive: true, force: true }); }\n';
+  const sampleNewEnvShape = 'if (isLink(full)) { removeLinkSafe(full, { recursive: true, force: true }); continue; }\n'
+    + 'const st = fs.statSync(full);\n'
+    + 'if (now - st.mtimeMs > maxAgeMs) { fs.rmSync(full, { recursive: true, force: true }); }\n';
+  const oldShapeHits = scanUnprotectedRm(sampleOldEnvShape);
+  const newShapeHits = scanUnprotectedRm(sampleNewEnvShape);
+  t.check('E103-B③ D22（可证伪）：把 `tests\\env.js` 的 `cleanupStaleTemp()` 变回**旧形态**（`statSync` 判过期 ＋ 递归删、无 `lstat`）⇒ 同一判据**必红并指名 `full`**；而**现行形态**（`isLink(full)` 在场）判绿 —— 两条读数给出"能证伪"',
+    oldShapeHits.length === 1 && oldShapeHits[0].id === 'full' && newShapeHits.length === 0,
+    `旧形态命中 ${oldShapeHits.length} 处（${oldShapeHits.map(h => `id=${h.id}`).join('、')}，应 1）；`
+      + `现行形态命中 ${newShapeHits.length} 处（应 0）；盘上 tests\\env.js 当前命中 `
+      + `${rmManaged.filter(h => h.file === 'tests\\env.js').length} 处（应 0，与 B① 同源）`);
+
+  /* ==================== 甲-D：安全闸（先于一切链接/删除实验） ==================== */
+  const e103Room = path.join(env.paths.tempRoot, 'e103-link');
+  const e103VictimA = path.join(e103Room, 'victim-a');
+  const e103VictimB = path.join(e103Room, 'victim-b');
+  const e103LinkA = path.join(e103Room, 'zz-e103-link-a');
+  const e103LinkB = path.join(e103Room, 'zz-e103-link-b');
+  const e103Tag = `${process.pid}-${crypto.randomBytes(2).toString('hex')}`;
+  const e103SweepVictim = path.join(env.paths.tempRoot, `e103-sweep-victim-${e103Tag}`);
+  const e103SweepVictim2 = path.join(env.paths.tempRoot, `e103-sweep-victim2-${e103Tag}`);
+  const e103StaleLink = path.join(env.paths.tempRootBase, `zz-e103-stale-${e103Tag}`);
+  const e103FreshLink = path.join(env.paths.tempRootBase, `zz-e103-fresh-${e103Tag}`);
+  const e103FreshDir = path.join(env.paths.tempRootBase, `zz-e103-keep-${e103Tag}`);
+  const e103OldDir = path.join(env.paths.tempRootBase, `zz-e103-old-${e103Tag}`);
+  const e103Paths = [e103Room, e103VictimA, e103VictimB, e103LinkA, e103LinkB, e103SweepVictim,
+    e103SweepVictim2, e103StaleLink, e103FreshLink, e103FreshDir, e103OldDir];
+  /** 安全闸判据（纯函数）：路径**自身**是否落在 `tests\._verify\` 之外（`..` 开头／绝对路径）。 */
+  const outsideVerifyE103 = (p) => {
+    const rel = path.relative(env.paths.verify, path.resolve(p));
+    return rel.startsWith('..') || path.isAbsolute(rel);
+  };
+  const gateOk = e103Paths.every(p => !outsideVerifyE103(p));
+  const gateControl = outsideVerifyE103(path.join(env.paths.root, 'src'));   /* 反例：仓内真实目录必须判"越界" */
+  const RUN_E103 = gateOk && gateControl;                                   /* 闸不开 ⇒ 一个字节都不动 */
+  t.check('E103-D 安全闸：全部实验路径都在 `tests\\._verify\\` 内（`path.relative(env.paths.verify, p)` 不以 `..` 开头）—— 且**反例**（仓内真实目录 `src\\`）必须被判"越界"（否则判据恒真）',
+    RUN_E103,
+    `实验路径 ${e103Paths.length} 条全部在 \`._verify\\\` 内=${gateOk}；`
+      + `反例 \`src\\\` 被判越界=${gateControl}（应 true）；`
+      + `越界项=${e103Paths.filter(outsideVerifyE103).map(p => relOfE103(p)).join('、') || '无'}`);
+
+  /* ---------------- 一次性 victim（5 文件，逐个留 sha256 读数） ---------------- */
+  const mkVictimE103 = (dir, n) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const files = {};
+    for (let i = 1; i <= n; i++) {
+      const p = path.join(dir, `v${i}.bin`);
+      fs.writeFileSync(p, `e103-victim-${i}-` + 'x'.repeat(i * 7) + '\n', 'utf8');
+      files[`v${i}.bin`] = sha256(fs.readFileSync(p));
+    }
+    return files;
+  };
+  const shaOfDirE103 = (dir) => {
+    const out = {};
+    for (const n of fs.readdirSync(dir).sort()) {
+      const p = path.join(dir, n);
+      const st = fs.lstatSync(p);
+      out[n] = st.isFile() ? sha256(fs.readFileSync(p)) : (st.isSymbolicLink() ? ':link' : ':dir');
+    }
+    return out;
+  };
+  /** 判据（纯函数，C① 与 C③ 共用同一份 —— D22 的"必红"才与"必绿"同源）：
+   *  返回违规清单（空＝合规）。 */
+  const linkRemovalViolations = (res, before, after, gone) => {
+    const bad = [];
+    if (!res) return ['调用没返回（判不了就判红）'];
+    if (res.error) return [`调用抛错：${res.error}`];
+    if (res.kind !== 'link') bad.push(`kind='${res.kind}'（应为 'link' —— 判别来源不是 lstat 时这里必然变红）`);
+    if (res.via !== 'rmdirSync' && res.via !== 'unlinkSync') bad.push(`via='${res.via}'（应为 rmdirSync／unlinkSync ＝**非递归**拆链）`);
+    if (!gone) bad.push('链接仍在（没拆掉）');
+    const names = Object.keys(before || {});
+    if (names.length !== 5) bad.push(`victim 文件数=${names.length}（应 5）`);
+    for (const n of names) {
+      if (!after || after[n] !== before[n]) {
+        bad.push(`victim ${n} 的 sha256 变了或丢了（${String(before[n]).slice(0, 8)}… → ${String(after && after[n]).slice(0, 8)}…）`);
+      }
+    }
+    return bad;
+  };
+
+  /* ==================== 甲-C：行为探针 ＋ D22 ==================== */
+  if (RUN_E103) { env.ensureDir(e103Room); }
+  const cBeforeA = RUN_E103 ? mkVictimE103(e103VictimA, 5) : {};
+  if (RUN_E103) { fs.symlinkSync(e103VictimA, e103LinkA, 'junction'); }
+  const cIsLinkJunction = RUN_E103 ? env.isLink(e103LinkA) : null;
+  const cIsLinkRealDir = RUN_E103 ? env.isLink(e103VictimA) : null;
+  let cResA = null;
+  if (RUN_E103) { try { cResA = env.removeLinkSafe(e103LinkA, { recursive: true, force: true }); } catch (err) { cResA = { error: String((err && err.message) || err) }; } }
+  const cAfterA = RUN_E103 ? shaOfDirE103(e103VictimA) : {};
+  const cLinkAGone = RUN_E103 ? !fs.existsSync(e103LinkA) : false;
+  const cBadA = RUN_E103 ? linkRemovalViolations(cResA, cBeforeA, cAfterA, cLinkAGone) : ['（安全闸未通过 ⇒ 未执行）'];
+  t.check('E103-C① 行为：`env.removeLinkSafe(<junction>, {recursive:true})` ⇒ `kind===\'link\'`、`via ∈ {rmdirSync,unlinkSync}`、链接消失、**victim 5/5 逐文件 sha256 守恒**（同一条判据 C③ 也用）',
+    cBadA.length === 0,
+    cBadA.length
+      ? `判红：${cBadA.join('；')}（返回=${JSON.stringify(cResA)}）`
+      : `kind=${cResA.kind}／via=${cResA.via}；victim 5/5 sha256 逐字节相同（${Object.keys(cAfterA).length} 个文件）；链接已消失=true`);
+  t.check('E103-C② 判据来源（`E46` ② 的形状读数）：`isLink(<junction>)===true` 且 `isLink(<真实目录>)===false` —— 判别用 `lstatSync`，**不跟随**',
+    RUN_E103 && cIsLinkJunction === true && cIsLinkRealDir === false,
+    `isLink(junction)=${cIsLinkJunction}（应 true）／isLink(真实目录)=${cIsLinkRealDir}（应 false）`);
+
+  /* D22：把辅助里的 `fs.lstatSync(` 全换成 `fs.statSync(`（**内存字节副本**，盘上不落一个字节） */
+  const envFileE103 = path.join(env.paths.tests, 'env.js');
+  const envBytes0 = fs.readFileSync(envFileE103);
+  const envSha0 = sha256(envBytes0);
+  const envText0 = envBytes0.toString('utf8');
+  const lstatCount = (envText0.match(/fs\.lstatSync\(/g) || []).length;
+  const mutantEnvBytes = Buffer.from(envText0.split('fs.lstatSync(').join('fs.statSync('), 'utf8');
+  /** 由**内存字节副本**载入一个 `env.js` 变异体（`Module._compile`：不落地、不碰仓库）。 */
+  const loadEnvVariantE103 = (bytes) => {
+    const m = new Module(envFileE103, null);
+    m.filename = envFileE103;
+    m.paths = Module._nodeModulePaths(path.dirname(envFileE103));
+    m._compile(bytes.toString('utf8'), envFileE103);
+    return m.exports;
+  };
+  let cResB = null;
+  let cBadB = null;
+  let cAfterB = null;
+  if (RUN_E103) {
+    const cBeforeB = mkVictimE103(e103VictimB, 5);
+    fs.symlinkSync(e103VictimB, e103LinkB, 'junction');
+    const mutantEnv = loadEnvVariantE103(mutantEnvBytes);
+    try { cResB = mutantEnv.removeLinkSafe(e103LinkB, { recursive: true, force: true }); } catch (err) { cResB = { error: String((err && err.message) || err) }; }
+    cAfterB = shaOfDirE103(e103VictimB);
+    cBadB = linkRemovalViolations(cResB, cBeforeB, cAfterB, !fs.existsSync(e103LinkB));   /* ← 同一份判据 */
+    try { env.removeLinkSafe(e103LinkB, { recursive: true, force: true }); } catch { /* 收尾：不许留残留 */ }
+  }
+  const envBytes1 = fs.readFileSync(envFileE103);
+  t.check('E103-C③ D22（可证伪）：把辅助里的 `fs.lstatSync(` **全部**换成 `fs.statSync(`（`Module._compile` 的**内存字节副本**，盘上文件全程只读）⇒ 同一判据**必红并指名**（`kind` 不再是 `link`）；且 `tests\\env.js` 盘上字节**逐字节未变**',
+    RUN_E103 && Array.isArray(cBadB) && cBadB.length > 0
+      && cResB && cResB.kind !== 'link'
+      && Buffer.compare(envBytes0, envBytes1) === 0 && sha256(envBytes1) === envSha0,
+    `变异体：替换 ${lstatCount} 处 fs.lstatSync→fs.statSync、变异体 sha256=${sha256(mutantEnvBytes).slice(0, 12)}…（原件 ${envSha0.slice(0, 12)}…）；`
+      + `变异体读数 kind=${cResB && cResB.kind}／via=${cResB && cResB.via} ⇒ 判据指名：${Array.isArray(cBadB) ? cBadB.join('；') : '（未执行）'}；`
+      + `victim-b 5/5 仍在=${cAfterB ? Object.keys(cAfterB).length === 5 : '（未执行）'}；`
+      + `盘上 tests\\env.js 逐字节未变=${Buffer.compare(envBytes0, envBytes1) === 0}`);
+
+  /* ==================== 甲-E：清扫回归（`E101` 落地后的行为面） ==================== */
+  const oldStamp = new Date(Date.now() - 25 * 3600 * 1000);
+  const eBefore1 = RUN_E103 ? mkVictimE103(e103SweepVictim, 5) : {};
+  const eBefore2 = RUN_E103 ? mkVictimE103(e103SweepVictim2, 5) : {};
+  if (RUN_E103) {
+    fs.utimesSync(e103SweepVictim, oldStamp, oldStamp);            /* 目标"年龄"回拨 >24h（旧版 statSync 会顺链取到它） */
+    fs.symlinkSync(e103SweepVictim, e103StaleLink, 'junction');
+    fs.symlinkSync(e103SweepVictim2, e103FreshLink, 'junction');   /* 新鲜链接（目标 mtime＝现在） */
+    fs.mkdirSync(e103FreshDir, { recursive: true });
+    fs.writeFileSync(path.join(e103FreshDir, 'f.txt'), 'keep', 'utf8');
+    fs.utimesSync(e103FreshDir, new Date(), new Date());
+    fs.mkdirSync(e103OldDir, { recursive: true });
+    fs.writeFileSync(path.join(e103OldDir, 'f.txt'), 'sweep', 'utf8');
+    fs.utimesSync(e103OldDir, oldStamp, oldStamp);
+  }
+  const eSweep = RUN_E103 ? env.cleanupStaleTemp() : null;
+  const eAfter1 = RUN_E103 ? shaOfDirE103(e103SweepVictim) : {};
+  const eAfter2 = RUN_E103 ? shaOfDirE103(e103SweepVictim2) : {};
+  const eStaleLinkGone = RUN_E103 ? !fs.existsSync(e103StaleLink) : false;
+  const eFreshLinkGone = RUN_E103 ? !fs.existsSync(e103FreshLink) : false;
+  const eVictim1Kept = RUN_E103 && Object.keys(eAfter1).length === 5
+    && Object.keys(eBefore1).every(n => eAfter1[n] === eBefore1[n]);
+  const eVictim2Kept = RUN_E103 && Object.keys(eAfter2).length === 5
+    && Object.keys(eBefore2).every(n => eAfter2[n] === eBefore2[n]);
+  t.check('E103-E① 清扫回归（**过期**链接）：`tempRootBase` 下 `zz-e103-stale-* -> victim`（victim mtime 回拨 >24 h）⇒ `env.cleanupStaleTemp()` 后**链接消失**、且 victim **5/5 逐文件 sha256 守恒**（旧形态会顺着链接进目标目录 —— 那时这里就不是"只拆链"了）',
+    RUN_E103 && eStaleLinkGone && eVictim1Kept,
+    `链接已消失=${eStaleLinkGone}；victim 文件=${Object.keys(eAfter1).length}（应 5）、逐文件 sha256 守恒=${eVictim1Kept}；`
+      + `清扫返回=${JSON.stringify(eSweep)}`);
+  t.check('E103-E② 两端读数（**真实目录**）：**新鲜**真实目录**不被回收**、**过期**真实目录**被回收** —— 这一条把"清扫还在正常工作"钉住（否则 E① 可能只是"清扫坏了、什么都不删"的假绿）',
+    RUN_E103 && fs.existsSync(e103FreshDir) && !fs.existsSync(e103OldDir),
+    `新鲜目录仍在=${RUN_E103 && fs.existsSync(e103FreshDir)}（应 true）／过期目录仍在=${RUN_E103 && fs.existsSync(e103OldDir)}（应 false）`);
+  t.check('E103-E③ **口径更正**（据实断言）：`cleanupStaleTemp()` 对链接是**无条件拆链**（不看年龄）⇒ **新鲜**链接**也**被拆掉，但目标 5/5 一条不少。`E103` 行原写"新鲜链接不被回收"与实现不符，本判据按**实测口径**守（理由见 `tests\\env.js` 的 `E101` 段：链接不是合法的临时产物）',
+    RUN_E103 && eFreshLinkGone && eVictim2Kept,
+    `新鲜链接已拆=${eFreshLinkGone}（**应 true**：口径＝链接无条件拆链）／其目标 victim2 5/5 守恒=${eVictim2Kept}；`
+      + `（E103 行原文"不被回收"按此更正；若将来改成"按年龄回收链接"，这条判据会红，届时同批改文案）`);
+
+  /* ---------------- 收尾：删掉本段自建的一切，并给"残留＝[]"的核对 ---------------- */
+  const residue = [];
+  if (RUN_E103) {
+    for (const p of [e103LinkA, e103LinkB, e103StaleLink, e103FreshLink, e103FreshDir, e103OldDir,
+      e103Room, e103SweepVictim, e103SweepVictim2]) {
+      try { env.removeLinkSafe(p, { recursive: true, force: true }); } catch { /* 已被清扫收走 */ }
+    }
+    for (const p of e103Paths) if (fs.existsSync(p)) residue.push(relOfE103(p));
+    for (const d of fs.existsSync(env.paths.tempRootBase) ? fs.readdirSync(env.paths.tempRootBase) : []) {
+      if (d.includes(e103Tag)) residue.push(`tests\\._verify\\tmp\\${d}`);
+    }
+  }
+  t.check('E103-收尾：本段自建的一次性链接/目录/victim **全部清理干净**（残留＝[]；`tempRootBase` 下带本段标签的条目也必须为空）',
+    RUN_E103 && residue.length === 0,
+    `残留=${JSON.stringify(residue)}`);
+
+  /* ==================== 丙（`E97`）：探针纪律的调用形态守护 ==================== */
+  /** **只剥注释、保留字符串**的剥法（与 `stripLiterals` 的语义**故意不同**）：
+   *  因为"用版本控制命令还原变异"在真探针里长在**命令字符串**里（`execSync('…')`／
+   *  `spawnSync('git', ['checkout', …])`）；把字符串一起剥掉就等于**看不见病灶**（假绿）。
+   *  为什么不直接扫原文：本仓的注释/文案里**大量**出现"不用它还原"这类**否定句**（实测 16 处），
+   *  扫原文会被这些说明文字自伤假红 ⇒ 先剥注释，再用**调用形态**（子命令后面必须跟参数）
+   *  把"否定句"与"真调用"分开。 */
+  const stripCommentsOnlyE103 = (src) => {
+    const out = src.split('');
+    const n = src.length;
+    const blank = (a, b) => { for (let k = a; k < b && k < n; k++) if (out[k] !== '\n') out[k] = ' '; };
+    let mode = 'code';
+    let i = 0;
+    while (i < n) {
+      const c = src[i], c2 = src[i + 1];
+      if (mode === 'code') {
+        if (c === '/' && c2 === '/') { blank(i, i + 2); mode = 'line'; i += 2; continue; }
+        if (c === '/' && c2 === '*') { blank(i, i + 2); mode = 'block'; i += 2; continue; }
+        if (c === "'") { mode = 'sq'; i++; continue; }
+        if (c === '"') { mode = 'dq'; i++; continue; }
+        if (c === '`') { mode = 'tpl'; i++; continue; }
+        i++; continue;
+      }
+      if (mode === 'line') { blank(i, i + 1); if (c === '\n') mode = 'code'; i++; continue; }
+      if (mode === 'block') {
+        if (c === '*' && c2 === '/') { blank(i, i + 2); mode = 'code'; i += 2; continue; }
+        blank(i, i + 1); i++; continue;
+      }
+      if (mode === 'sq' || mode === 'dq') {
+        const q = mode === 'sq' ? "'" : '"';
+        if (c === '\\') { i += 2; continue; }
+        if (c === q) { mode = 'code'; i++; continue; }
+        if (c === '\n') { mode = 'code'; i++; continue; }          /* 容错：未闭合的字符串止于行尾 */
+        i++; continue;
+      }
+      if (c === '\\') { i += 2; continue; }                        /* tpl：内容保留（宁可多报，不可漏报） */
+      if (c === '`') { mode = 'code'; i++; continue; }
+      i++; continue;
+    }
+    return out.join('');
+  };
+  /** **调用形态**判据（纯函数）：① shell 形态＝子命令后**跟参数**；② 参数数组形态＝子命令是独立引号项、
+   *  后面还有引号项。两类的**否定句**（`不用 <命令>`／`<命令>/restore/stash` 连写）都不命中。
+   *  ⚠ 判据边界（据实登记）：**裸**子命令（无参数的 `stash`）与"命令与参数都写在两个变量里"不覆盖。 */
+  const GIT_RESTORE_PATTERNS_E103 = [
+    ['shell 形态（子命令后跟参数）', /\bgit\s+(?:checkout|restore|stash)\b(?=\s+\S)/],
+    ['参数数组形态（子命令作独立引号项）', /['"](?:checkout|restore|stash)['"]\s*,\s*['"]/]
+  ];
+  const scanGitRestore = (source) => {
+    const code = stripCommentsOnlyE103(source).split('\n');
+    const raw = source.split('\n');
+    const out = [];
+    code.forEach((l, i) => {
+      for (const [name, re] of GIT_RESTORE_PATTERNS_E103) {
+        if (re.test(l)) out.push({ line: i + 1, pat: name, text: String(raw[i] || '').trim().slice(0, 100) });
+      }
+    });
+    return out;
+  };
+  const gitHitsE103 = (list) => list.flatMap((f) => scanGitRestore(readOrEmpty(f)).map(h => ({ file: relOfE103(f), ...h })));
+  const gitManaged = gitHitsE103(managedJsE103);
+  const gitVerify = gitHitsE103(verifyJsE103);
+  /** `._verify\` 下的**已登记**命中（逐条判定；按 `文件＋形态` 登记）：两条是"把 `E97` 台账原文
+   *  写进文档"的**记录脚本**（原文里转述了旧探针的还原手法 ⇒ 只是**引用**，不是**调用**），
+   *  一条是 `['mutate','restore','verify']` 这种**与版本控制无关**的模式名枚举。 */
+  const GIT_RESIDUE_E103 = [
+    { file: 'tests\\._verify\\zz-main-20261003-e89-records.js', pat: 'shell 形态（子命令后跟参数）',
+      why: '记录脚本：把 `E97` 台账原文（含"旧探针曾用版本控制命令还原、方法不合规"的**转述**）写进路线图与快照 ⇒ 是**引文**，不是调用' },
+    { file: 'tests\\._verify\\zz4t32-mutate.js', pat: '参数数组形态（子命令作独立引号项）',
+      why: '`[\'mutate\', \'restore\', \'verify\']` —— 探针自己的**模式名枚举**，与版本控制无关（纯词形撞车）' }
+  ];
+  /* ---------------- 甲-A④／A⑤：**外部工具调用形态**（与丙共用"剥注释、保留字符串"的同一个剥器） ----------------
+     为什么单独补这一条：A①② 按要求**剥掉字符串**，于是 `spawnSync('robocopy', [link, '/MIR'])` 这类
+     **命令字符串形态**在 A①② 里**看不见** —— 而 `E46` 实测**真毁伤**（目标 5 → 0）的正是这个形态。
+     这里用两条**窄**判据补上（窄＝不被说明文字自伤）：① 引号包住的工具名**作实参**（后跟逗号）；
+     ② 字符串里出现 rmdir／rd 的 /s 开关。窄判据的代价是"两个变量拼出来的命令"覆盖不到 —— 已登记。
+     ⚠ 扫描面＝**受管面**（零容忍）；`._verify\` 面**不纳入**：实测那里有 19 处（`E46` 取证探针的
+     真调用 ＋ 把 `E46` 台账原文写进路线图的**记录脚本**），逐条登记会把清单撑成噪音。
+     这条边界是**据实登记**（数字见 `T-20261004-01` 回执），不是"没查"。 */
+  const TOOL_CALL_PATTERNS_E103 = [
+    ['引号包住的工具名作实参', /['"](?:robocopy)['"]\s*,/],
+    ['字符串里的 rmdir／rd 的 /s 开关', /['"][^'"]*\b(?:rmdir|rd)\s+\/s\b[^'"]*['"]/]
+  ];
+  const scanToolCalls = (source) => {
+    const code = stripCommentsOnlyE103(source).split('\n');
+    const raw = source.split('\n');
+    const out = [];
+    code.forEach((l, i) => {
+      for (const [name, re] of TOOL_CALL_PATTERNS_E103) {
+        if (re.test(l)) out.push({ line: i + 1, pat: name, text: String(raw[i] || '').trim().slice(0, 100) });
+      }
+    });
+    return out;
+  };
+  const toolCallManaged = managedJsE103.flatMap((f) => scanToolCalls(readOrEmpty(f)).map(h => ({ file: relOfE103(f), ...h })));
+  t.check('E103-A④ 外部工具调用形态（**受管面零容忍**）：剥注释、**保留字符串**后，没有"引号包住的工具名作实参"与"字符串里的 rmdir／rd 的 /s 开关"（`E46` 实测会毁伤的两类形态；`._verify\` 面除外，理由见本段注释）',
+    toolCallManaged.length === 0,
+    toolCallManaged.length
+      ? `判红：命中 ${toolCallManaged.length} 处 —— ` + toolCallManaged.map(h => `${h.file}:${h.line} [${h.pat}]`).join('；')
+      : `零命中（扫 ${managedJsE103.length} 个受管 .js；剥注释、保留字符串 ⇒ **命令字符串形态看得见**，`
+        + `这是 A①② 剥字符串时看不到的那一类）`);
+  const sampleToolBad = 'const r = spawnSync(' + Q_E103 + 'robocopy' + Q_E103 + ', [empty, link]);\n'
+    + 'execSync(' + Q_E103 + 'cmd /c rmdir ' + '/s /q ' + Q_E103 + ' + link);\n';
+  const sampleToolGood = '// 说明：本仓禁用 robocopy 的镜像模式（本行是注释，不构成调用）\n'
+    + 'const note = ' + Q_E103 + '禁用 robocopy 的镜像模式' + Q_E103 + ';\n';
+  const toolBadHits = scanToolCalls(sampleToolBad);
+  const toolGoodHits = scanToolCalls(sampleToolGood);
+  t.check('E103-A⑤ D22（可证伪）：同一判据喂**合成样本** ⇒ 引号工具名作实参 与 字符串里的 /s 开关 **必红且两类各一**；而"注释里的同名词"与"只提工具名的说明字符串"**必绿**（⇒ 判据不是恒真式、也不自伤）',
+    toolBadHits.length === 2
+      && toolBadHits.some(h => h.pat === TOOL_CALL_PATTERNS_E103[0][0])
+      && toolBadHits.some(h => h.pat === TOOL_CALL_PATTERNS_E103[1][0])
+      && toolGoodHits.length === 0,
+    `坏样本命中 ${toolBadHits.length} 处（${toolBadHits.map(h => `L${h.line}:${h.pat}`).join('、')}，应 2 且两类各 1）；`
+      + `好样本命中 ${toolGoodHits.length} 处（应 0：注释被剥、说明字符串不构成调用形态）`);
+  t.check('E103-丙① 探针纪律（**受管面零容忍**）：`tests\\*.js` ＋ `tests\\lib\\**` ＋ `tools\\**` 里，严格剥注释后**没有任何**"版本控制命令做还原"的**调用形态**（`git <子命令> <参数>` ／ 参数数组形态）',
+    gitManaged.length === 0,
+    gitManaged.length
+      ? `判红：命中 ${gitManaged.length} 处 —— ` + gitManaged.map(h => `${h.file}:${h.line} [${h.pat}]`).join('；')
+      : `零命中（扫 ${managedJsE103.length} 个受管 .js；剥注释、**保留字符串** ⇒ 命令字符串里的病兆看得见；`
+        + `注释与"否定句"文案不参与判定）`);
+  t.check('E103-丙② `tests\\._verify\\**`（含被 gitignore 的）命中**只剩已登记的引文/词形撞车**（清单外的任何一处 ⇒ 红并指名 `文件:行号`）',
+    gitVerify.every(h => GIT_RESIDUE_E103.some(r => r.file === h.file && r.pat === h.pat)),
+    gitVerify.length
+      ? `实存 ${gitVerify.length} 处：` + gitVerify.map(h => `${h.file}:${h.line} [${h.pat}]`).join('；')
+        + `；已登记 ${GIT_RESIDUE_E103.length} 条（` + GIT_RESIDUE_E103.map(r => `${r.file}——${r.why}`).join('；') + '）'
+      : `._verify\\ 下零命中（扫 ${verifyJsE103.length} 个 .js）`);
+  const SP_E103 = String.fromCharCode(32);
+  const gitSampleBad = 'execSync(' + "'" + 'git' + SP_E103 + 'checkout' + SP_E103 + '--' + SP_E103 + 'server/db/maintain.js' + "');\n"
+    + 'spawnSync(' + "'git', ['" + 'checkout' + "', '--', file]);\n";
+  const gitSampleGood = '// 还原纪律：一律字节副本 ＋ Buffer.compare ＋ SHA-256，不用 ' + 'git' + SP_E103 + 'checkout' + SP_E103 + '／restore／stash；\n'
+    + 'const note = ' + "'全程不用 " + 'git' + SP_E103 + 'checkout/restore/stash' + "';\n";
+  const gitBadHits = scanGitRestore(gitSampleBad);
+  const gitGoodHits = scanGitRestore(gitSampleGood);
+  t.check('E103-丙③ D22（可证伪）：同一判据喂**合成样本** ⇒ `execSync` 里的 shell 形态与 `spawnSync` 里的数组形态**必红并逐类指名**；而**注释里的否定句**与**字符串里的否定句**必绿（⇒ 判据不是恒真式、也不自伤）',
+    gitBadHits.length === 2
+      && gitBadHits.some(h => h.pat === GIT_RESTORE_PATTERNS_E103[0][0])
+      && gitBadHits.some(h => h.pat === GIT_RESTORE_PATTERNS_E103[1][0])
+      && gitGoodHits.length === 0,
+    `坏样本命中 ${gitBadHits.length} 处（${gitBadHits.map(h => `L${h.line}:${h.pat}`).join('、')}，应 2 且两类各 1）；`
+      + `好样本命中 ${gitGoodHits.length} 处（应 0：注释被剥、否定句不构成调用形态）`);
+
+  t.info(`E103/E97 扫描面：磁盘上的 ${allJsE103.length} 个 .js（受管 ${managedJsE103.length} ＋ \`._verify\\\` ${verifyJsE103.length}；`
+    + `tests\\**\\*.js ＋ tools\\**\\*.js，**不看 git 跟踪状态**）；禁令形态 ${BAN_PATTERNS_E103.length} 类；`
+    + `探针纪律形态 ${GIT_RESTORE_PATTERNS_E103.length} 类（剥注释、保留字符串）`);
 }
 
 /* 先例写法（同 browser-check.js:828、contract-check.js:1624、docs-check.js:547 …）：
