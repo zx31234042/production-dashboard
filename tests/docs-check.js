@@ -62,6 +62,74 @@ function exists(rel) {
   return fs.existsSync(path.join(ROOT, rel));
 }
 
+/* ---------------- 可见文字归一化（`E13` 的判据本体；纯函数，供定点回归直接调用） ----------------
+   **为什么剥的是「行内标记」而不是把比对改宽松（回执里也复述了这一段）**：
+     ① 同源断言要判的是"**md 与 docx 的可见文字**是否同源"，而不是"markdown 源码是否同源"。
+        md 一侧的 `\`` / `**` 是**排版标记**，不是可见文字 ⇒ 比较前剥掉，比的是"剥完之后的可见文字"，
+        而且仍然是**逐字比对**（`scanPairContent` 里那句 `body.includes(...)`：标题必须**整串出现**在
+        docx 正文里）。**语义正确**，改动小（`E13` 行给的建议②）。
+     ② 若改成"包含即可 / 模糊比对 / 只比前 N 字"这类**弱判据**，就是给门禁开防空洞（违反 `ADR-0004`
+        `D21`/`D23`：判据只许收紧、不许放松；弱判据会让"docx 真缺标题"这一类真缺陷静默变绿）——
+        所以**不动**判据强度，只把"两侧拿来做比较的文字"对齐到同一个口径。
+     ③ 剥掉哪些标记，**由实测决定**（`E13` 要求"逐个判断后纳入"）：`tools\md2docx.ps1` 的行内解析
+        只认两种标记 —— `InlinePattern()`（`md2docx.ps1:175-177`）＝ `` `代码` `` 与 `**粗体**`，
+        `Runs()`（`md2docx.ps1:205-216`）把它们的定界符**丢掉**、只把内容写进 `w:t`（可换成等宽红字
+        或 `<w:b/>`）；而 `*斜体*`／`_下划线_`／`~~删除线~~` **不在**该正则里 ⇒ 定界符**原样写进 docx**。
+        2026-10-04 本座位实测（样本 `tests\._verify\t20261004-09\probe-e13-out\readouts\heading-inline-sample.md`
+        真跑 `md2docx.ps1`，读数见同目录 `probe-md2docx-heading-inline.out.txt`）：
+          · `## 反引号：关键参数上传（\`PARAM_INFO_RECV\`）` ⇒ docx 纯文本 `反引号：关键参数上传（PARAM_INFO_RECV）`
+            （runs：`(Segoe UI)` ｜ `PARAM_INFO_RECV(Consolas/A31515)` ｜ `）(Segoe UI)`）—— **反引号被丢掉**
+          · `## 加粗：**加粗词**在后（\`CODE_BOLD\`）` ⇒ `加粗：加粗词在后（CODE_BOLD）`（`<w:b/>` ＋ Consolas）
+          · `## 斜体：*斜体词*在后` ⇒ `斜体：*斜体词*在后`（**逐字相等，星号留着**）
+          · `## 下划线：_下划线词_在后` ⇒ `下划线：_下划线词_在后`（**逐字相等**）
+          · `## 删除线：~~删除线词~~在后` ⇒ `删除线：~~删除线词~~在后`（**逐字相等**）
+        ⇒ **只剥 `\`` 与 `**`**。多剥 `*`/`_`/`~` 会让"md 写了标记而 docx 真缺"的标题假绿（**假阴性**，
+        与弱判据同罪：`D23` 要求判据有判别力，不许"把两边都抹平"）。
+   判据来源：`E13`（2026-09-21 暴露：第二批澄清函第五节标题里的内联代码让本断言由 41/2 → 40/3；
+   当时的规避是"把标题里的反引号去掉"）；修法＝`E13` 行的建议②。
+   @param {string} text 标题原文（可含行内标记）
+   @returns {string} 剥掉「会被 md2docx 丢掉的行内标记定界符」之后的可见文字 */
+const MD_INLINE_TICK = '`';
+const MD_INLINE_STAR = '*';
+const MD_INLINE_ANY = /[`*]/;
+
+function stripInlineMarkup(text) {
+  const src = String(text == null ? '' : text);
+  if (!MD_INLINE_ANY.test(src)) return src;   /* 绝大多数标题：一个标记都没有 ⇒ 一个字都不动 */
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === MD_INLINE_TICK || ch === MD_INLINE_STAR) {
+      /* 定界符游程：```` ```` 这种「更多反引号」是合法定界符（`md2docx.ps1:172-177` 同样口径）。
+         工具侧是 `[regex]::Split` ＋ `InlinePattern()` 的最左匹配 ⇒ 定界符是**整个游程**；
+         实测（`probe-multi-tick.js`，2026-10-04）：游程 n≥2 时，工具**先按"下一个 n 连反引号"收尾**
+         （宽松写法 `` a`b `` ⇒ 内容 ` a`b `），**收不到就退到单反引号收尾**
+         （紧邻写法 ``a`b`` ⇒ 内容 `a`b`）。本函数按同一顺序试，读出的可见文字与工具逐字一致
+         ——"多吃了/少吃了可见文字"就是判据的假红/假绿，所以这里必须与工具同口径。
+         找不到任何配对 ⇒ 当字面量原样保留（宁可判红也不吃掉可见文字）。 */
+      let j = i;
+      while (j < src.length && src[j] === ch) j++;
+      const run = j - i;
+      if (ch === MD_INLINE_STAR && run < 2) {
+        /* 单个 `*` 是**字面量**（工具不认斜体）⇒ 原样保留，避免把可见文字吃掉 */
+        out += src.slice(i, j); i = j; continue;
+      }
+      let hit = -1, delim = 0;
+      for (let n = run; n >= 1; n--) {
+        if (ch === MD_INLINE_STAR && n < 2) break;
+        const close = src.indexOf(ch.repeat(n), j);
+        if (close >= j) { hit = close; delim = n; break; }
+      }
+      if (hit >= 0) { out += src.slice(j, hit); i = hit + delim; continue; }
+      /* 定界符找不到配对 ⇒ 当字面量保留 */
+      out += src.slice(i, j); i = j; continue;
+    }
+    out += ch; i++;
+  }
+  return out;
+}
+
 /* ---------------- ZIP（OOXML）读取：不用第三方库 ---------------- */
 /** 解析中央目录，返回 Map(条目名 → { method, offset, compSize }) */
 function zipEntries(file) {
@@ -112,6 +180,48 @@ function zipEntryText(file, name) {
 /** 去掉 XML 标签得到纯文本，便于做"内容包含"判断 */
 function stripXml(xml) {
   return xml.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
+}
+
+/* ---------------- md ↔ docx 同源扫描（`E13` 的判据；纯函数，roots 可传入 ⇒ 定点回归用受控副本直接调） ----------------
+   判据不变：凡有同名 docx 的 md，其 **1～2 级标题**都应当**逐字出现**在该 docx 正文里；
+   变的只是"md 侧拿什么去比"——先 `stripInlineMarkup()` 剥掉会被 `md2docx` 丢掉的行内标记
+   （`\`` 与 `**`；依据见 `stripInlineMarkup()` 抬头与同目录实测读数），再逐字比对。
+   @param {string[]} roots 扫描根（相对仓库根或绝对路径）
+   @returns {{pairs:number, stale:string[], roots:string[]}} stale 每项＝"某 docx 缺 N 个标题（如「…」）"
+   @throws 中央目录/条目读取失败由调用方兜底（本函数把它记进 stale，不抛） */
+function scanPairContent(roots) {
+  const pairs = [];
+  const collectPairs = dir => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) { collectPairs(full); continue; }
+      if (!e.name.endsWith('.md')) continue;
+      const docx = full.replace(/\.md$/, '.docx');
+      if (fs.existsSync(docx)) pairs.push([full, docx]);
+    }
+  };
+  const list = Array.isArray(roots) ? roots : [];
+  for (const d of list) {
+    const full = path.isAbsolute(d) ? d : path.join(ROOT, d);
+    if (fs.existsSync(full)) collectPairs(full);
+  }
+  const stale = [];
+  for (const [mdFile, docxFile] of pairs) {
+    const mdText = fs.readFileSync(mdFile, 'utf8');
+    const headings = [...mdText.matchAll(/^#{1,2}\s+(.+)$/gm)]
+      .map(m => stripInlineMarkup(m[1]).trim());
+    if (!headings.length) continue;
+    let body;
+    try {
+      body = stripXml(zipEntryText(docxFile, 'word/document.xml'));
+    } catch (e) {
+      stale.push(`${path.relative(ROOT, docxFile)}（读取失败：${e.message}）`);
+      continue;
+    }
+    const missing = headings.filter(h => !body.includes(h.replace(/\s+/g, '')));
+    if (missing.length) stale.push(`${path.relative(ROOT, docxFile)} 缺 ${missing.length} 个标题（如「${missing[0]}」）`);
+  }
+  return { pairs: pairs.length, stale, roots: list.slice() };
 }
 
 /* ---------------- 调 PowerShell 跑文档转换脚本（输出重定向到文件，避开沙箱管道限制） ----------------
@@ -493,37 +603,12 @@ async function main() {
   check('9.8 目录结构变更记录表无重复版本行', dupVersions.length === 0,
     dupVersions.length ? `重复登记：v${[...new Set(dupVersions)].join('、v')}（共 ${changeRows.length} 行）` : `共 ${changeRows.length} 行`);
 
-  /* md ↔ docx 同源：凡是有同名 docx 的 md，其 1～2 级标题都应出现在 docx 正文里 */
-  const pairs = [];
-  const collectPairs = dir => {
-    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, e.name);
-      if (e.isDirectory()) { collectPairs(full); continue; }
-      if (!e.name.endsWith('.md')) continue;
-      const docx = full.replace(/\.md$/, '.docx');
-      if (fs.existsSync(docx)) pairs.push([full, docx]);
-    }
-  };
-  for (const d of ['输出文件', '需求文档', 'tools']) {
-    const full = path.join(ROOT, d);
-    if (fs.existsSync(full)) collectPairs(full);
-  }
-  const stale = [];
-  for (const [mdFile, docxFile] of pairs) {
-    const mdText = fs.readFileSync(mdFile, 'utf8');
-    const headings = [...mdText.matchAll(/^#{1,2}\s+(.+)$/gm)].map(m => m[1].replace(/\*\*/g, '').trim());
-    if (!headings.length) continue;
-    let body;
-    try {
-      body = stripXml(zipEntryText(docxFile, 'word/document.xml'));
-    } catch (e) {
-      stale.push(`${path.relative(ROOT, docxFile)}（读取失败：${e.message}）`);
-      continue;
-    }
-    const missing = headings.filter(h => !body.includes(h.replace(/\s+/g, '')));
-    if (missing.length) stale.push(`${path.relative(ROOT, docxFile)} 缺 ${missing.length} 个标题（如「${missing[0]}」）`);
-  }
-  check(`有 .docx 的 .md 与其 Word 版本内容同源（共 ${pairs.length} 对）`, stale.length === 0, stale.join('；'));
+  /* md ↔ docx 同源：凡是有同名 docx 的 md，其 1～2 级标题都应出现在 docx 正文里。
+     判据本体＝`scanPairContent()`（`E13`：md 侧先剥行内标记再逐字比对；依据见该函数抬头）。 */
+  const sameSrc = scanPairContent(['输出文件', '需求文档', 'tools']);
+  const pairs = sameSrc.pairs;
+  const stale = sameSrc.stale;
+  check(`有 .docx 的 .md 与其 Word 版本内容同源（共 ${pairs} 对）`, stale.length === 0, stale.join('；'));
 
   /* ===== D6 需求清单"改名升级版本"必修项 ===== */
   /* 立案原因（2026-09-27 补）：需求清单是"改名升版本"的交付物。V1.34→V1.35、V1.35→V1.36、V1.36→V1.37
@@ -602,6 +687,17 @@ async function main() {
   }
   process.exit(0);
 }
+
+/* ---------------- 入口接线 ----------------
+   `E13`（T-20261004-09）：把两个纯函数显式导出，**供定点回归在进程内直接调用**
+   （`E116` 立的规矩：换的是"被测输入"，不是去改真工具/真产物）。
+   作为脚本运行时行为一字不变（`node tests\docs-check.js` ⇒ 仍跑 `main()`）；
+   被 `require()` 时不再自动跑门禁（否则探针 require 一下就整轮退 1）。
+   注意：`main().catch(...)` 必须留在**文件尾**（`harness-check` 十六节的要求），故这里用
+   `require.main !== module` 的提前退出来跳过入口，`.catch` 仍是最后一条语句；导出写在它**之前**。 */
+module.exports = { stripInlineMarkup, scanPairContent };
+
+if (require.main !== module) return;   /* 被 require ⇒ 只当纯函数库用，不跑门禁（脚本运行不受影响） */
 
 main().catch(err => {
   console.error('\n自检脚本异常终止：' + (err && err.stack ? err.stack : err));
