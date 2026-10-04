@@ -2091,6 +2091,261 @@ t.section('十二、A1：DR-17 三档改真源（对 `shift_stat` 求和）、�
   }
 }
 
+/* ---------------- 十三、`E83` 的两个投影（自然日按零点切段）与 `E128` 跨零点准入闸 ----------------
+   立案：技术债 `E83`（口径 2026-10-04 由负责人裁定）＋ `E128`（跨零点配置的防变更守护）。
+   本节覆盖**两条投影**与**一道闸**（仓储侧的守据在 `tests\db-check.js` 十之十三）：
+     甲⑤ 现配置（0-8／8-16／16-24）**无跨零点班次** ⇒ 两个投影**逐字相同**、且与改动前既有期望值一致；
+     乙⑥ 跨零点配置（夜班 22→6）⇒ 自然日投影**按零点切段**（配置**只在测试内构造**、用**注入时钟**推进）；
+     乙⑦ `E128`：配置段形态含 `end <= start` 而未声明 `allowCrossMidnight` ⇒ **启动期拒绝**并指名
+          "先做 `E83` 的两个投影"；声明了 ⇒ 允许；**裸数组形态**保持放行（有意的取舍）但必须如实自述。
+   可证伪性（D22）：M-Y1 把 `assertCrossMidnightAllowed()` 的构成条件改成恒真 ⇒ `E128-1` 必红并指名
+   （靶子见 `tests\._verify\t20261004-11-d22-mutation.js`，**字节副本**还原）。
+   边界（如实登记，不冒领）：本节只断言"**读数的两个投影**"与"**配置准入**"，**不**动
+   `E129`（`statsForShift()` 的 `LIMIT 1000` 采样上限）—— 该上限不在本票范围（本包未改它、
+   也**不**为它加断言）；本节所有夹具的帧数都远小于 1000，故与它无交互。 */
+t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128` 跨零点准入闸');
+{
+  const { DatabaseSync } = require('node:sqlite');
+  const dbMod = require('../server/db');
+
+  /* ================= 甲⑤ 无跨零点配置 ⇒ 两投影逐字相同 ================= */
+  {
+    /* (a) 纯函数层：现配置三段班一个都不跨自然日 ⇒ `splitRunSecondsByDay()` 必须直接返回整段
+       （不查半点、不做除法）—— 这是"改动前行为逐字保留"的第一条可证伪点。 */
+    const probes = [
+      ['2026-09-19T04:00:00', 1200],      // 晚班 0-8
+      ['2026-09-19T12:00:00', 3600],      // 早班 8-16
+      ['2026-09-19T20:00:00', 2400],      // 中班 16-24
+      ['2026-09-19T23:59:59', 60]         // 中班最后一秒（`end = 24` 也不跨自然日）
+    ];
+    const splits = probes.map(([t0, runSec]) => {
+      const sh = shifts.at(t0);
+      return { t0, runSec, sh, s: stats.splitRunSecondsByDay(sh, runSec) };
+    });
+    t.check('E83-甲5-1 现配置（0-8／8-16／16-24）下 `splitRunSecondsByDay()` 走"不跨自然日"那一支：' +
+      '`crossing = false`、`day1 = runSec`、`day2 = 0`、两段的日期归属都是**班次开始那天**（不查半点、不做除法）',
+      splits.every(x => x.s.crossing === false && x.s.day1 === x.runSec && x.s.day2 === 0 &&
+        x.s.day1Date === x.sh.date && x.s.day2Date === x.sh.date),
+      splits.map(x => `${x.t0.slice(11)}=${JSON.stringify(x.s)}`).join('；'));
+
+    /* (b) 增量层：`accumulateRunTime()` 的第 4 入参**缺省**（＝`E83` 之前的调用形态）与
+       **显式给非跨零点切段**必须给出**逐位相同**的三档读数（期望值由入参构成性给出：660 ＋ 7）。 */
+    const prev = { daySec: 660, monthSec: 720, yearSec: 720, at: '2026-09-19T10:00:00' };
+    const shapeLegacy = stats.accumulateRunTime(prev, 7, '2026-09-19T12:00:00');
+    const shapeSplit = stats.accumulateRunTime(prev, 7, '2026-09-19T12:00:00',
+      stats.splitRunSecondsByDay(shifts.at('2026-09-19T12:00:00'), 7));
+    const briefShape = o => JSON.stringify({ daySec: o.daySec, monthSec: o.monthSec, yearSec: o.yearSec });
+    t.check('E83-甲5-2 `accumulateRunTime()` 的第 4 入参（`E83` 的切段）**缺省**与**显式给非跨零点切段**' +
+      '给出逐位相同的三档（`daySec`/`monthSec`/`yearSec` 与 `reset` 全相同）—— 现配置下"多传一个切段"不改变任何读数',
+      briefShape(shapeLegacy) === briefShape(shapeSplit) &&
+      JSON.stringify(shapeLegacy.reset) === JSON.stringify(shapeSplit.reset) &&
+      shapeLegacy.daySec === 667 && shapeLegacy.yearSec === 727,
+      `缺省=${briefShape(shapeLegacy)}；给切段=${briefShape(shapeSplit)}；` +
+      `reset 相同=${JSON.stringify(shapeLegacy.reset) === JSON.stringify(shapeSplit.reset)}`);
+
+    /* (c) 端到端（真临时库 ＋ 真快照）：三行**全部带切段**（现配置下切段＝整段/0，正是
+       `computeShiftStats()` 给出的形态），数字与本章十二 `A1/D4-1` 同一组。 */
+    const C_DB = new DatabaseSync(':memory:');
+    try {
+      dbMod.initSchema(C_DB, '2026-09-19 10:00:00');
+      const cClock = createClock({ mode: 'fixed', at: '2026-09-19T10:00:00' });
+      const C_T = '2026-09-19 10:00:00';
+      const cPut = (date, name, runSec, split) => shiftStatRepo.upsertFrozen(C_DB, Object.assign({
+        shiftDate: date, shiftName: name, planQty: 0, startedQty: 0, finishedQty: 0,
+        qualifiedQty: 0, failedQty: 0, retestQty: 0, passRate: 90, runSec, idleSec: 0, oee: 10,
+        frozenAt: C_T, createdAt: C_T
+      }, split));
+      cPut('2026-09-18', '晚班', 60, { runSecDay1: 60, runSecDay2: 0 });
+      cPut('2026-09-19', '早班', 600, { runSecDay1: 600, runSecDay2: 0 });
+      cPut('2026-09-19', '中班', 60, { runSecDay1: 60, runSecDay2: 0 });
+      const cSnap = stateSnapshotSvc.createStateSnapshot({ db: C_DB, now: () => cClock.now(), config: cfg });
+      cSnap();
+      const cL1 = cSnap.lastRunAccum;
+      t.check('E83-甲5-3 端到端（真临时库 ＋ 真快照）：现配置下 `naturalDay` 与 `shiftProjection` 的日/月/年' +
+        '**三档逐字相等**，且＝**改动前既有断言钉住的那三个数** 660／720／720（本章十二 `A1/D4-1`；' +
+        '现配置无跨零点班次 ⇒ 两投影同值是**硬保证**、不是巧合）',
+        JSON.stringify(cL1.naturalDay) === JSON.stringify(cL1.shiftProjection) &&
+        cL1.naturalDay.daySec === 660 && cL1.naturalDay.monthSec === 720 && cL1.naturalDay.yearSec === 720 &&
+        cL1.shiftProjection.daySec === 660 && cL1.shiftProjection.monthSec === 720 && cL1.shiftProjection.yearSec === 720 &&
+        cL1.currentShift.crossing === false,
+        `naturalDay=${JSON.stringify(cL1.naturalDay)}；shiftProjection=${JSON.stringify(cL1.shiftProjection)}；` +
+        `crossing=${cL1.currentShift.crossing}`);
+
+      /* 老行形态（两列 NULL，＝`E83` 之前的行）与已切段的行**并存在同一张表**：读口按
+         "整段归开始日"兜底 ⇒ 两投影仍必须逐字相等（日档 600＋60＋30＝690、月/年 750）。 */
+      cPut('2026-09-19', '晚班', 30, {});
+      cSnap();
+      const cL2 = cSnap.lastRunAccum;
+      t.check('E83-甲5-4 **老行形态**（两列 `NULL`）与已切段的行**共存**时两个投影仍逐字相等：' +
+        'NULL 行按"整段归班次开始日"读 ⇒ 与班次投影同值（日档 600＋60＋30＝**690**、月/年 **750**）',
+        JSON.stringify(cL2.naturalDay) === JSON.stringify(cL2.shiftProjection) &&
+        cL2.naturalDay.daySec === 690 && cL2.naturalDay.monthSec === 750 && cL2.naturalDay.yearSec === 750 &&
+        cL2.shiftProjection.daySec === 690,
+        `naturalDay=${JSON.stringify(cL2.naturalDay)}；shiftProjection=${JSON.stringify(cL2.shiftProjection)}`);
+    } finally {
+      try { C_DB.close(); } catch { /* 已关 */ }
+    }
+  }
+
+  /* ================= 乙⑥ 跨零点配置 ⇒ 按零点切段 ================= */
+  {
+    const N_DB = new DatabaseSync(':memory:');
+    try {
+      dbMod.initSchema(N_DB, '2026-10-04 22:00:00');
+      const nClock = createClock({ mode: 'fixed', at: '2026-10-04T23:00:00' });
+      /* 配置**只在测试内构造**（不改 `board.config.js`）：夜班 22→6 跨零点、显式开闸（`E128`）；
+         另两段把它补成覆盖完整 24 h，免得 `at()` 在别的时刻抛"配置缺口"。 */
+      const nightSeg = {
+        list: [
+          { name: '夜班', start: 22, end: 6 },
+          { name: '白班', start: 6, end: 14 },
+          { name: '中班', start: 14, end: 22 }
+        ],
+        allowCrossMidnight: true
+      };
+      const nRules = createShiftRules(nightSeg);
+      const nSnap = stateSnapshotSvc.createStateSnapshot({
+        db: N_DB, now: () => nClock.now(), config: { shift: nightSeg }
+      });
+      /* 10 帧采样（22:00:01～22:00:10，全落在夜班窗口 [22:00, 次日 06:00) 内）
+         ⇒ 运行中 `runSec = min(elapsedSec, 帧数 − 1) = 9`（`E68` 的无条件截断口径）。
+         ⚠ 帧数远小于 `statsForShift()` 的 `LIMIT 1000`（技术债 `E129`，**不在本票范围**）⇒ 无交互。 */
+      const insN = N_DB.prepare(
+        `INSERT INTO measure_rt(equip_code, proc_order_no, unit_index, collect_time, created_at)
+         VALUES(?, ?, ?, ?, ?)`);
+      for (let i = 1; i <= 10; i++) {
+        const ts = `2026-10-04 22:00:${String(i).padStart(2, '0')}`;
+        insN.run('EQ-N', 'WO-N', 1, ts, ts);
+      }
+      const liveAt = (t0) => { nClock.at(t0); nSnap(); return nSnap.lastRunAccum; };
+      const sumOf = (L) => L.currentShift.liveDay1 + L.currentShift.liveDay2;
+      const L23 = liveAt('2026-10-04T23:00:00');
+      const L0030 = liveAt('2026-10-05T00:30:00');
+      const L03 = liveAt('2026-10-05T03:00:00');
+      t.check('E83-乙6-1 运行中（零点前 23:00）：切段＝`{day1: 9, day2: 0}`（整段还在班次开始日）、' +
+        '`liveDay1 + liveDay2 === liveRunSec`（＝9）、`crossing = true`；自然日档（10-04）＝9 而班次档＝0（尚未固化）',
+        L23.currentShift.crossing === true && L23.liveRunSec === 9 &&
+        L23.currentShift.liveDay1 === 9 && L23.currentShift.liveDay2 === 0 &&
+        sumOf(L23) === L23.liveRunSec &&
+        L23.naturalDay.daySec === 9 && L23.shiftProjection.daySec === 0,
+        `23:00：live=${L23.currentShift.liveDay1}/${L23.currentShift.liveDay2}（liveRunSec=${L23.liveRunSec}）；` +
+        `natural.day=${L23.naturalDay.daySec}、shift.day=${L23.shiftProjection.daySec}`);
+
+      t.check('E83-乙6-2 运行中（次日 00:30）：`liveDay2` 随时刻**推进**（0 → 2）、`liveDay1` 相应变小，' +
+        '两段之和仍 **=== `liveRunSec`（9）**；此时自然日档（10-05）只含后段 ⇒ 2，而班次档仍是 0（未固化）',
+        L0030.currentShift.liveDay2 > L23.currentShift.liveDay2 &&
+        L0030.currentShift.liveDay1 === 7 && L0030.currentShift.liveDay2 === 2 &&
+        sumOf(L0030) === L0030.liveRunSec && L0030.liveRunSec === 9 &&
+        L0030.naturalDay.daySec === 2 && L0030.shiftProjection.daySec === 0 &&
+        L0030.currentShift.date === '2026-10-04',
+        `00:30：live=${L0030.currentShift.liveDay1}/${L0030.currentShift.liveDay2}（liveRunSec=${L0030.liveRunSec}）；` +
+        `归属日=${L0030.currentShift.date}；natural.day=${L0030.naturalDay.daySec}、shift.day=${L0030.shiftProjection.daySec}`);
+
+      t.check('E83-乙6-3 运行中（次日 03:00）：`liveDay2` 继续增长（2 → 5）、`liveDay1` 继续变小，' +
+        '两段之和仍 **=== `liveRunSec`**（两段是**划分**：总额恒定、随时刻在两段间移动）',
+        L03.currentShift.liveDay1 === 4 && L03.currentShift.liveDay2 === 5 &&
+        L03.currentShift.liveDay2 > L0030.currentShift.liveDay2 &&
+        L03.currentShift.liveDay1 < L0030.currentShift.liveDay1 &&
+        sumOf(L03) === L03.liveRunSec && L03.liveRunSec === 9,
+        `03:00：live=${L03.currentShift.liveDay1}/${L03.currentShift.liveDay2}（liveRunSec=${L03.liveRunSec}）`);
+
+      /* ---- 固化（模拟 `server/index.js` 在班次收口时写 `shift_stat`）：用**真实的班次对象**
+         （05:59:59 那一拍：归属日 2026-10-04、整班 28800 s）算切段，整班读数取 180 s。 */
+      const nEnd = nRules.at('2026-10-05T05:59:59');
+      const nFull = stats.splitRunSecondsByDay(nEnd, 180);
+      const nWrite = shiftStatRepo.upsertFrozen(N_DB, {
+        shiftDate: nEnd.date, shiftName: nEnd.name, planQty: 0, startedQty: 0, finishedQty: 0,
+        qualifiedQty: 0, failedQty: 0, retestQty: 0, passRate: 90, runSec: 180, idleSec: 0, oee: 10,
+        runSecDay1: nFull.day1, runSecDay2: nFull.day2,
+        frozenAt: '2026-10-05 06:00:00', createdAt: '2026-10-05 06:00:00'
+      });
+      t.check('E83-乙6-4 **固化后**：写入口落盘的 `run_sec_day1 + run_sec_day2 === run_sec`（180 ＝ 45 ＋ 135）、' +
+        '且读回的 `runDays` 是同一份段列表（`[{10-04, 45}, {10-05, 135}]`）—— 恒等式在**真库**上成立',
+        nFull.day1 === 45 && nFull.day2 === 135 && nFull.day1 + nFull.day2 === 180 &&
+        nWrite.written === true && nWrite.runSecDay1 === 45 && nWrite.runSecDay2 === 135 &&
+        JSON.stringify(nWrite.runDays) === JSON.stringify([{ day: '2026-10-04', sec: 45 }, { day: '2026-10-05', sec: 135 }]),
+        `切段=${JSON.stringify(nFull)}；落库=${nWrite.runSecDay1}/${nWrite.runSecDay2}；runDays=${JSON.stringify(nWrite.runDays)}`);
+
+      /* ---- ③④ 固化后的两个档（回到 10-04 档读一次、再在 10-05 档读一次） ---- */
+      const L04 = liveAt('2026-10-04T23:00:00');
+      const L05 = liveAt('2026-10-05T06:30:00');
+      t.check('E83-乙6-5 **自然日档与班次档分道**（10-04 档）：natural ＝ `day1` ＝ **45**、' +
+        'shift ＝ **整段 180**（`DR-06`：整班归班次开始那天）；两者之差 135 ＝落到次日的那一段',
+        L04.naturalDay.daySec === 45 && L04.shiftProjection.daySec === 180 &&
+        L04.shiftProjection.daySec - L04.naturalDay.daySec === 135 &&
+        L04.currentShift.frozenDay1 === 45 && L04.currentShift.frozenDay2 === 135,
+        `10-04 档：natural=${L04.naturalDay.daySec}、shift=${L04.shiftProjection.daySec}；` +
+        `frozenDay1/2=${L04.currentShift.frozenDay1}/${L04.currentShift.frozenDay2}`);
+
+      t.check('E83-乙6-6 **自然日档与班次档分道**（10-05 档）：natural ＝ **次日段 `day2`** ＝ 135、' +
+        'shift ＝ **0**（`shift_date` 没有任何 10-05 的行 —— 班次投影里这一整班都算在 10-04）',
+        L05.naturalDay.daySec === 135 && L05.shiftProjection.daySec === 0 &&
+        L05.currentShift.name === '白班' && L05.currentShift.crossing === false,
+        `10-05 档：natural=${L05.naturalDay.daySec}、shift=${L05.shiftProjection.daySec}；` +
+        `当班=${L05.currentShift.date} ${L05.currentShift.name}`);
+
+      t.check('E83-乙6-7 **不丢秒、不重复计**：两日档之和（45 ＋ 135）＝ **总运行 180**；' +
+        '月/年两档在两个投影下都 ＝ **180**（两段必落同月/同年 ⇒ 只有"日"这一档会被零点切开）',
+        L04.naturalDay.daySec + L05.naturalDay.daySec === 180 &&
+        L04.naturalDay.monthSec === 180 && L04.naturalDay.yearSec === 180 &&
+        L04.shiftProjection.monthSec === 180 && L04.shiftProjection.yearSec === 180 &&
+        L05.naturalDay.monthSec === 180 && L05.naturalDay.yearSec === 180,
+        `日档和=${L04.naturalDay.daySec + L05.naturalDay.daySec}；10-04 月/年 natural=` +
+        `${L04.naturalDay.monthSec}/${L04.naturalDay.yearSec}、shift=${L04.shiftProjection.monthSec}/${L04.shiftProjection.yearSec}`);
+    } finally {
+      try { N_DB.close(); } catch { /* 已关 */ }
+    }
+  }
+
+  /* ================= 乙⑦ `E128`：跨零点配置的准入闸 ================= */
+  {
+    const throwOf = (fn) => { try { return { ok: true, out: fn() }; } catch (err) { return { ok: false, err }; } };
+    const cmOf = (r) => (r.ok ? r.out.crossMidnight() : null);
+
+    const gateOff = throwOf(() => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }] }));
+    t.check('E128-1 **配置段形态**（`createShiftRules(整个 shift 段)`）＋ 跨零点规则（`end <= start`）＋ 未声明' +
+      '`allowCrossMidnight` ⇒ **拒绝**（`RangeError`，fail-closed），且消息**指名"先做 `E83` 的两个投影"**' +
+      '（＝不留"能配但算错"的窗口）',
+      gateOff.ok === false && gateOff.err instanceof RangeError &&
+      /E83/.test(String(gateOff.err.message)) && /两个投影/.test(String(gateOff.err.message)) &&
+      /allowCrossMidnight/.test(String(gateOff.err.message)) && /夜班 22-6/.test(String(gateOff.err.message)),
+      gateOff.ok ? '**未抛错**（闸失明）' : `${gateOff.err.constructor.name}：${String(gateOff.err.message).slice(0, 150)}…`);
+
+    const segOn = throwOf(() => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }], allowCrossMidnight: true }));
+    const ruleOn = throwOf(() => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6, allowCrossMidnight: true }] }));
+    t.check('E128-2 **显式开闸即允许**：段级 `allowCrossMidnight: true` 与**规则级** `{…, allowCrossMidnight: true}`' +
+      '两种写法都放行（口径等价），且 `crossMidnight()` 如实自述 `{count: 1, allowed: true, keys: [夜班 22-6]}`',
+      segOn.ok && ruleOn.ok &&
+      cmOf(segOn).count === 1 && cmOf(segOn).allowed === true &&
+      JSON.stringify(cmOf(segOn).keys) === JSON.stringify(['夜班 22-6']) &&
+      cmOf(ruleOn).count === 1 && cmOf(ruleOn).allowed === true &&
+      JSON.stringify(cmOf(ruleOn).keys) === JSON.stringify(['夜班 22-6']),
+      `段级=${segOn.ok ? JSON.stringify(cmOf(segOn)) : String(segOn.err)}；` +
+      `规则级=${ruleOn.ok ? JSON.stringify(cmOf(ruleOn)) : String(ruleOn.err)}`);
+
+    /* 裸数组形态**有意放行**，但"放行"**不等于"生产可用"** ⇒ 必须如实自述 `allowed: false`。
+       Why 放行（如实登记的代价，`server/services/shift.js` 的 docblock 同此）：`tests\logic-check.js`
+       的 `:215`／`:267`／`:300` 在**模块顶层**就用裸数组建夜班规则（验"跨零点归属日／边界半开／总时长"
+       这些**与配置闸无关**的规则）；若裸数组也抛 ⇒ 本脚本变成**整脚本异常**（无汇总行 ＋ 退 2、
+       `run-all` 记 `error`），**158 条断言一条都跑不出来** —— 那不是"红一条"，而是"把证据全丢掉"。
+       ⇒ 取舍：**危险的入口（配置段）fail-closed，纯规则引擎入口保持可用**。 */
+    const bareOn = throwOf(() => createShiftRules([{ name: '夜班', start: 22, end: 6 }]));
+    t.check('E128-3 裸数组形态 `createShiftRules([{name,start:22,end:6}])` **保持放行**（有意取舍：本脚本在' +
+      '**模块顶层**就用它，若也拒 ⇒ 整脚本异常、全部断言丢失）—— **但必须如实自述** ' +
+      '`crossMidnight() = {count: 1, allowed: false}`（防"放行"被误读成"生产可用"）',
+      bareOn.ok === true && cmOf(bareOn).count === 1 && cmOf(bareOn).allowed === false &&
+      JSON.stringify(cmOf(bareOn).keys) === JSON.stringify(['夜班 22-6']),
+      bareOn.ok ? JSON.stringify(cmOf(bareOn)) : `抛错：${String(bareOn.err)}`);
+
+    const curCm = shifts.crossMidnight();
+    t.check('E128-4 `allowed` 只在**真有**跨零点班次时才可能为 `true`：现配置（0-8／8-16／16-24，无跨零点）' +
+      '下 `crossMidnight() = {count: 0, allowed: false}`（否则 `/health` 上会出现 `count:0 / allowed:true`' +
+      '这种自相矛盾、读方无法据此报警的读数）',
+      curCm.count === 0 && curCm.allowed === false && JSON.stringify(curCm.keys) === JSON.stringify([]),
+      `现配置 crossMidnight()=${JSON.stringify(curCm)}`);
+  }
+}
+
   t.finish();
 }
 

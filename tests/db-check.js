@@ -165,8 +165,16 @@ const REQUIRED_COLUMNS = {
   measure_rt: ['equip_code', 'proc_order_no', 'unit_index', 'measure_depth', 'speed', 'velocity_x',
     'velocity_y', 'frame_rate', 'gain', 'shutter', 'camera_depth', 'test_status', 'collect_time'],
   result: ['proc_order_no', 'unit_index', 'result', 'judged_at', 'retest_count'],
+  /* `E83`（2026-10-04，跨零点口径的**两个投影**）：`shift_stat` 增列 `run_sec_day1`/`run_sec_day2`
+     （**自然日投影**：本班运行秒数按零点切成"班次开始日 day1 ＋ 次日 day2"两段，
+     供 `FR-6.4/6.5/6.6` 的当日/本月/年度累计运行按**自然日**归零；班次指标仍整班归开始日，`DR-06`）。
+     为什么登记进这份**独立于 `schema.sql` 的需求锚**：它们是需求点名的落盘（一行 `shift_stat`
+     必须能表达"这一班里多少秒属于 D、多少属于 D+1"）⇒ "有人把这两列从 `schema.sql` 删掉"必须让
+     本锚**响**（＝本章第一节"各表关键列齐全"当场变红），而不是等读代码时顺手发现。
+     ⚠ 与 `LEGACY_BASELINE_COLUMNS.shift_stat` 的分工见那个常量上方的注释：
+     **锚要求它们在、基线要求它们不在** —— 两处都写才是不矛盾的一致口径。 */
   shift_stat: ['shift_date', 'shift_name', 'plan_qty', 'started_qty', 'qualified_qty',
-    'failed_qty', 'pass_rate', 'run_sec', 'idle_sec', 'oee'],
+    'failed_qty', 'pass_rate', 'run_sec', 'run_sec_day1', 'run_sec_day2', 'idle_sec', 'oee'],
   alarm: ['alarm_code', 'alarm_type', 'level', 'occurred_at', 'brief', 'action', 'close_state'],
   warning: ['warn_type', 'trigger_cond', 'triggered_at', 'state'],
   maintenance: ['content', 'maint_time', 'handler', 'accept_state', 'cycle_days', 'next_due_at'],
@@ -250,6 +258,18 @@ const LEGACY_BASELINE_COLUMNS = {
     'created_at'],
   result: ['id', 'proc_order_no', 'unit_index', 'result', 'judged_at', 'retest_count',
     'duration_sec', 'created_at', 'updated_at'],
+  /* ⚠ `E83`（2026-10-04）：`run_sec_day1`/`run_sec_day2` **有意不在**这一行（老库基线）里 ——
+     它们是给**已存在**的 `shift_stat` 加的列，由 `STRUCTURE_UPGRADES` 的两条
+     `ALTER TABLE shift_stat ADD COLUMN run_sec_day1/2 INTEGER` 交付。
+     Why（本门禁最容易失明的一处）：把这两列写进基线＝向六之九的判据**声明"老库不缺它们"**
+     ⇒ **正方向**那条（"基线之外的列必须有同表同列 `ADD COLUMN` 步骤"）对它们**立刻失明**：
+     删掉那两条 `ALTER` 也不会红，而现场老库升级后写 `run_sec_day1` 会报
+     `table shift_stat has no column named run_sec_day1`（自然日投影整段拿不到数据）。
+     这是与 `measure_rt.unit_index`／`upload_log.fail_reason`／`op_log.team_code` 三条先例**同一条纪律**：
+     **新增列不要写进这里**。另外，十之十三的 `E83-2` 有一条**正面断言**把"它们不在基线里、
+     且确有补列步骤"钉住 —— 免得日后有人"为了让某条断言变绿"把这两列顺手补进来。
+     （若将来**确实不再支持**缺这两列的老库版本，按本常量上方的规则 ③ 把它们移进来，并同批改
+     `E83-2` 与写明被放弃的版本号 —— 那是一次**有意的口径变更**，不是顺手补列。） */
   shift_stat: ['id', 'shift_date', 'shift_name', 'plan_qty', 'started_qty', 'finished_qty',
     'qualified_qty', 'failed_qty', 'retest_qty', 'pass_rate', 'run_sec', 'idle_sec', 'oee',
     'frozen_at', 'created_at'],
@@ -5110,6 +5130,199 @@ async function main() {
     }
     t.check('FR-7.12：本章自建的临时库跑完**当场关闭并删除**（一用例一库，不留残留）',
       !fs.existsSync(NC.dir), NC.dir);
+  }
+
+  /* ---------------- 十之十三、`E83`：`shift_stat` 的自然日切段两列与**两套投影** ----------------
+     立案：技术债 `E83`（`2026-10-04` 负责人裁定口径、座位 3 于 `T-20261004-10` 落地并提交）——
+     「当日」＝**自然日**（按零点切段），而**班次指标**仍整班归"班次开始那天"（`DR-06`）
+     ⇒ 同一份运行秒数要有**两套投影**：`shift_stat.run_sec`（整班，班次投影）与
+     `run_sec_day1`/`run_sec_day2`（前段归 D、后段归 D+1，自然日投影，`FR-6.4/6.5/6.6`）。
+     本节只做**表结构与口径守据**（读数的端到端落在 `tests\logic-check.js` 第十三节）：
+       ① **登记**：两列必须写在 `REQUIRED_COLUMNS.shift_stat`（独立于 `schema.sql` 的需求锚）；
+       ② **老库基线不得含它们**（写了＝声明"老库不缺它" ⇒ 六之九的正方向门禁对该列失明）；
+       ③ **切段恒等式**（对表行逐行扫描）：两列**同为 NULL 或同为非 NULL**（禁半给），
+          同为非 NULL 时 `run_sec_day1 + run_sec_day2 === run_sec`（不丢秒、不重复计）；
+       ④ **NULL 语义**：两列都为 NULL 的行（老库形态／旧写入口写的行）⇒ 读口按
+          "**整段归班次开始日**"兜底 —— 与 `E83` 之前逐字相同；用**真的老库形态**
+          （`DROP COLUMN` 退回上一版 ＋ 升版补列）验一次读数。
+     可证伪性（D22，靶子见 `tests\._verify\t20261004-11-d22-mutation.js`，**字节副本**还原）：
+       M-J1 把读口的 NULL 当 0（`segmentsOf()` 两处 `? null :` → `? 0 :`）⇒ `E83-6/7/8/10` 必红并指名；
+       M-J2 关掉写入口的半给守卫（`if (hasD1 !== hasD2)` → `if (false)`）⇒ `E83-4/5` 必红（半给行落库）。
+     **一用例一库**：本节自建临时库、跑完当场 `close()`（第十节口径）。 */
+  t.section('十之十三、`E83`：`shift_stat` 自然日切段两列（`run_sec_day1/2`）与两套投影');
+  {
+    const E83 = makeTempDb({ name: 'e83-split' });
+    try {
+      db.initSchema(E83.db, NOW);
+      const e83Cols = db.listColumns(E83.db, 'shift_stat');
+      /* ① 登记（**独立锚**）。为什么不能只靠第一节那条"各表关键列齐全"：那一条读的**就是**
+         `REQUIRED_COLUMNS` —— 若有人"实现与锚一起改"（删列 ＋ 删锚），它就永远绿。
+         本条把**锚自身的内容**也钉住 ⇒ 删锚必红（删列而不删锚由第一节那条红）。 */
+      t.check('E83-1 `REQUIRED_COLUMNS.shift_stat` 登记了 `run_sec_day1`/`run_sec_day2`（独立于 `schema.sql` 的' +
+        '需求锚：删列 ⇒ 第一节"各表关键列齐全"必红，删锚 ⇒ 本条必红），且库内该表确有这两列',
+        REQUIRED_COLUMNS.shift_stat.includes('run_sec_day1') &&
+        REQUIRED_COLUMNS.shift_stat.includes('run_sec_day2') &&
+        e83Cols.includes('run_sec_day1') && e83Cols.includes('run_sec_day2'),
+        `锚=[${REQUIRED_COLUMNS.shift_stat.join(', ')}]；库内列=[${e83Cols.join(', ')}]`);
+
+      /* ② 老库基线**不得**含这两列；且它们必须**由** `STRUCTURE_UPGRADES` 的两条 `ADD COLUMN` 交付 ——
+         两件事要一起断言才有意义：只证"不在基线里"而步骤不存在 ⇒ 六之九的正方向会红（不是失明，是缺步骤）；
+         只证"有步骤"而基线也写了 ⇒ 六之九 ⑧ 口径冲突会红（本条把**失明**的那种改法单独钉住）。 */
+      const e83Base = LEGACY_BASELINE_COLUMNS.shift_stat || [];
+      const e83Steps = Array.from(db.STRUCTURE_UPGRADES, s => String(s));
+      const e83StepOf = col => e83Steps.some(s =>
+        new RegExp(`ALTER\\s+TABLE\\s+shift_stat\\s+ADD\\s+COLUMN\\s+${col}\\b`, 'i').test(s));
+      t.check('E83-2 老库基线 `LEGACY_BASELINE_COLUMNS.shift_stat` **有意不含**这两列（写进去＝声明"老库不缺它"' +
+        ' ⇒ 六之九的**正方向**门禁对该列**失明**：删掉补列步骤也不会红），而 `STRUCTURE_UPGRADES` 确有两条同列 `ADD COLUMN`',
+        !e83Base.includes('run_sec_day1') && !e83Base.includes('run_sec_day2') &&
+        e83StepOf('run_sec_day1') && e83StepOf('run_sec_day2'),
+        `基线列=[${e83Base.join(', ')}]；补列步骤命中 day1=${e83StepOf('run_sec_day1')}、day2=${e83StepOf('run_sec_day2')}`);
+
+      /* ---- ③ 切段恒等式（真临时库：三种行形态共存） ---- */
+      const E83_T = '2026-10-05 00:10:00';
+      const e83Put = (over) => shiftStatRepo.upsertFrozen(E83.db, Object.assign({
+        shiftDate: '2026-10-04', shiftName: '夜班', planQty: 0, startedQty: 0, finishedQty: 0,
+        qualifiedQty: 0, failedQty: 0, retestQty: 0, passRate: 90, runSec: 180, idleSec: 0, oee: 10,
+        runSecDay1: 120, runSecDay2: 60, frozenAt: E83_T, createdAt: E83_T
+      }, over));
+      const e83Throws = (fn) => { try { fn(); return null; } catch (err) { return err; } };
+      const e83Row = (name) => shiftStatRepo.getShiftRow(E83.db, '2026-10-04', name);
+
+      const e83w1 = e83Put({});                                                    // 跨零点、已切段 120＋60＝180
+      const e83w2 = e83Put({ shiftName: '白班', runSec: 600, runSecDay1: 600, runSecDay2: 0 });
+      const e83w3 = e83Put({ shiftName: '中班', runSec: 300, runSecDay1: null, runSecDay2: null });  // 老行形态
+      const e83NightFrozen = JSON.stringify(e83Row('夜班'));                        // 切段行的"之前"副本（逐字节）
+      const e83w4 = e83Put({ runSecDay1: null, runSecDay2: null });                 // 同归属但**没算切段**的重算
+      const e83NightAfterGuard = JSON.stringify(e83Row('夜班'));
+      const e83Rows = shiftStatRepo.listRows(E83.db, 50);
+      const e83HalfRows = e83Rows.filter(r => (r.run_sec_day1 === null) !== (r.run_sec_day2 === null));
+      const e83BrokenRows = e83Rows.filter(r => r.run_sec_day1 !== null && r.run_sec_day1 + r.run_sec_day2 !== r.run_sec);
+
+      const e83Premise = t.requires('E83 夹具前提：三行都在库（夜班已切段 120/60、白班已切段 600/0、中班未切段 NULL）',
+        e83Rows.length === 3 && Boolean(e83Row('夜班')) && Boolean(e83Row('白班')) && Boolean(e83Row('中班')) &&
+        e83w1.written === true && e83w2.written === true && e83w3.written === true,
+        `行数=${e83Rows.length}；键=[${e83Rows.map(r => `${r.shift_date}|${r.shift_name}`).join(' , ')}]`);
+      if (e83Premise) {
+        t.check('E83-3 **信息单调守卫的 `E83` 第二条**（`UPSERT_SQL` 的第二个 `WHERE NOT`）：已切段的行' +
+          '（`run_sec_day1` 非 NULL）不被"没算切段"的重算（两列 NULL）清空 —— 写入口报 `written=false`、' +
+          '`updated=true`，且该行**逐字节纹丝不动**',
+          e83w4.written === false && e83w4.updated === true &&
+          e83NightAfterGuard === e83NightFrozen && e83Row('夜班').run_sec_day1 === 120,
+          `written=${e83w4.written}（期望 false）、updated=${e83w4.updated}；行内容未变=${e83NightAfterGuard === e83NightFrozen}；` +
+          `day1/day2=${JSON.stringify(e83Row('夜班').run_sec_day1)}/${JSON.stringify(e83Row('夜班').run_sec_day2)}`);
+
+        const e83Half1 = e83Throws(() => e83Put({ runSecDay1: 180, runSecDay2: null }));
+        const e83Half2 = e83Throws(() => e83Put({ runSecDay1: null, runSecDay2: 0 }));
+        const e83SumBad = e83Throws(() => e83Put({ runSecDay1: 120, runSecDay2: 61 }));
+        const e83RowsAfterReject = shiftStatRepo.countRows(E83.db);
+        t.check('E83-4 写入口**拒收半给**（只给 `runSecDay1`／只给 `runSecDay2` ⇒ `TypeError`）与' +
+          '**不构成划分的切段**（`day1 + day2 ≠ run_sec` ⇒ `RangeError`）：切段是**划分**、不是估计；' +
+          '且三次拒收**一行未写**（校验先于写入）',
+          e83Half1 instanceof TypeError && e83Half2 instanceof TypeError && e83SumBad instanceof RangeError &&
+          e83RowsAfterReject === 3 && JSON.stringify(e83Row('夜班')) === e83NightFrozen,
+          `半给①=${e83Half1 && e83Half1.constructor.name}、半给②=${e83Half2 && e83Half2.constructor.name}、` +
+          `不等等式=${e83SumBad && e83SumBad.constructor.name}；行数仍=${e83RowsAfterReject}；` +
+          `夜班行未变=${JSON.stringify(e83Row('夜班')) === e83NightFrozen}`);
+
+        t.check('E83-5 **切段恒等式**（对表行**逐行扫描**）：两列**同为 NULL 或同为非 NULL**（**禁半给**），' +
+          '且同为非 NULL 时 `run_sec_day1 + run_sec_day2 === run_sec`（不丢秒、不重复计）',
+          e83Rows.length === 3 && e83HalfRows.length === 0 && e83BrokenRows.length === 0,
+          `行数=${e83Rows.length}、半给行=${e83HalfRows.length}、恒等式破的行=${e83BrokenRows.length}；` +
+          `行=[${e83Rows.map(r => `${r.shift_name}(run=${r.run_sec},d1=${JSON.stringify(r.run_sec_day1)},` +
+            `d2=${JSON.stringify(r.run_sec_day2)})`).join(' , ')}]`);
+
+        /* NULL 语义的**定点**断言（读口纯函数，不依赖上面的夹具）：三种形态各给一次。 */
+        const e83SegNull = shiftStatRepo.segmentsOf({ fromDate: '2026-10-04', runSec: 300, runSecDay1: null, runSecDay2: null });
+        const e83SegCut = shiftStatRepo.segmentsOf({ fromDate: '2026-10-04', runSec: 180, runSecDay1: 120, runSecDay2: 60 });
+        const e83SegFlat = shiftStatRepo.segmentsOf({ fromDate: '2026-10-04', runSec: 600, runSecDay1: 600, runSecDay2: 0 });
+        t.check('E83-6 NULL 语义（读口定点 `segmentsOf()`）：两列都为 NULL ⇒ **整段归班次开始日**' +
+          '（`[{day: D, sec: runSec}]` —— 与 `E83` 之前逐字相同，**不用 0 顶替**、也不切成两段）；' +
+          '已切段 ⇒ 前段归 D、后段归 D+1；不跨零点（`day2 = 0`）⇒ 一段且恒等于整段',
+          JSON.stringify(e83SegNull) === JSON.stringify([{ day: '2026-10-04', sec: 300 }]) &&
+          JSON.stringify(e83SegCut) === JSON.stringify([{ day: '2026-10-04', sec: 120 }, { day: '2026-10-05', sec: 60 }]) &&
+          JSON.stringify(e83SegFlat) === JSON.stringify([{ day: '2026-10-04', sec: 600 }]),
+          `NULL ⇒ ${JSON.stringify(e83SegNull)}；切段 ⇒ ${JSON.stringify(e83SegCut)}；day2=0 ⇒ ${JSON.stringify(e83SegFlat)}`);
+
+        /* ---- 两套投影在同一份行上分道（读口 `sumRunSec()` 一次给全） ---- */
+        const e83S04 = shiftStatRepo.sumRunSec(E83.db, { day: '2026-10-04', month: '2026-10', year: '2026' });
+        const e83S05 = shiftStatRepo.sumRunSec(E83.db, { day: '2026-10-05', month: '2026-10', year: '2026' });
+        t.check('E83-7 **两套投影分道**（同一份行、两个口径）：10-04 档 自然日投影＝`day1` 之和（120＋600＋300＝**1020**）、' +
+          '班次投影＝**整段**（180＋600＋300＝**1080**，差 60 ＝夜班跨到次日的那一段）；' +
+          '10-05 档 自然日投影＝**次日段 `day2`**（**60**）、班次投影＝**0**（没有 `shift_date = 10-05` 的行）',
+          e83S04.daySec === 1020 && e83S04.shiftDaySec === 1080 &&
+          e83S05.daySec === 60 && e83S05.shiftDaySec === 0,
+          `10-04：natural=${e83S04.daySec} / shift=${e83S04.shiftDaySec}；` +
+          `10-05：natural=${e83S05.daySec} / shift=${e83S05.shiftDaySec}`);
+
+        t.check('E83-8 **不丢秒、不重复计**：自然日投影的**日档之和**（1020 ＋ 60）＝ **总运行**（180＋600＋300＝1080）；' +
+          '月/年两档**两套投影都**等于总运行 1080（一个班次最长 24 h、且月/年边界与零点同刻 ⇒ 两段必落同月/同年）',
+          e83S04.daySec + e83S05.daySec === 1080 &&
+          e83S04.monthSec === 1080 && e83S04.yearSec === 1080 &&
+          e83S04.shiftMonthSec === 1080 && e83S04.shiftYearSec === 1080 &&
+          e83S05.monthSec === 1080 && e83S05.yearSec === 1080,
+          `日档和=${e83S04.daySec + e83S05.daySec}；10-04 月/年 natural=${e83S04.monthSec}/${e83S04.yearSec}、` +
+          `shift=${e83S04.shiftMonthSec}/${e83S04.shiftYearSec}；10-05 月/年 natural=${e83S05.monthSec}/${e83S05.yearSec}`);
+      }
+
+      /* ---- ④ 老库形态（**无这两列**）经升版补列后，读口按"整段归开始日"兜底 ----
+         手法与六之八（`unit_index`）同源：按**当前**结构建库 ＋ 写一行，再退回上一版形态
+         （`DROP COLUMN` ＋ `schema_version` 退回**现算**的上一版），走一次 `initSchema()`。
+         为什么值得建这个库（而不是只造 `runSecDay1: null` 的行）：老库的真实形态是**列都不存在**，
+         它同时验证两件事 —— ①两条 `ADD COLUMN` 真的把列补回、既有行一行不丢、新列是 `NULL`（**不回填 0**）；
+         ②补列之后的读口对 NULL 行给出的读数＝`E83` 之前的读数（整段归开始日）。 */
+      const E83LEG = makeTempDb({ name: 'e83-legacy' });
+      try {
+        db.initSchema(E83LEG.db, NOW);
+        shiftStatRepo.upsertFrozen(E83LEG.db, {
+          shiftDate: '2026-10-04', shiftName: '夜班', planQty: 0, startedQty: 0, finishedQty: 0,
+          qualifiedQty: 0, failedQty: 0, retestQty: 0, passRate: 90, runSec: 180, idleSec: 0, oee: 10,
+          runSecDay1: 120, runSecDay2: 60, frozenAt: E83_T, createdAt: E83_T
+        });
+        E83LEG.db.exec('ALTER TABLE shift_stat DROP COLUMN run_sec_day1');
+        E83LEG.db.exec('ALTER TABLE shift_stat DROP COLUMN run_sec_day2');
+        const e83PrevVersion = String(Number(SCHEMA_VERSION) - 1);
+        E83LEG.db.prepare('UPDATE schema_meta SET value = ? WHERE key = ?')
+          .run(e83PrevVersion, 'schema_version');
+        const legColsBefore = db.listColumns(E83LEG.db, 'shift_stat');
+        if (t.requires('E83 老库前提：`shift_stat` 确已退回"无 `run_sec_day1`/`run_sec_day2`"的上一版形态，' +
+          '且库内结构版本＝上一版',
+          !legColsBefore.includes('run_sec_day1') && !legColsBefore.includes('run_sec_day2') &&
+          db.getSchemaVersion(E83LEG.db) === e83PrevVersion,
+          `退回后列=[${legColsBefore.join(', ')}]；库内版本=${db.getSchemaVersion(E83LEG.db)}` +
+          `（期望上一版 ${e83PrevVersion}）；当前 SCHEMA_VERSION=${SCHEMA_VERSION}`)) {
+          db.initSchema(E83LEG.db, NOW);
+          const legColsAfter = db.listColumns(E83LEG.db, 'shift_stat');
+          const legRow = shiftStatRepo.getShiftRow(E83LEG.db, '2026-10-04', '夜班');
+          const legRowCount = shiftStatRepo.countRows(E83LEG.db);
+          t.check('E83-9 老库形态经 `initSchema()` **补列**：两列补上、**既有行一行不丢且读数原样**' +
+            '（`run_sec = 180`）、新列是 `NULL`（＝"**未做切段**"，**绝不回填 0** —— 0 与 NULL 在' +
+            '"跨没跨零点"上是两个相反的事实）、库内版本升到 `SCHEMA_VERSION`',
+            legColsAfter.includes('run_sec_day1') && legColsAfter.includes('run_sec_day2') &&
+            legRowCount === 1 && legRow !== null && legRow.run_sec === 180 &&
+            legRow.run_sec_day1 === null && legRow.run_sec_day2 === null &&
+            db.getSchemaVersion(E83LEG.db) === SCHEMA_VERSION,
+            `补列后列含 day1/day2=${legColsAfter.includes('run_sec_day1')}/${legColsAfter.includes('run_sec_day2')}；` +
+            `行数=${legRowCount}、行=${JSON.stringify(legRow)}；版本 ${e83PrevVersion} → ${db.getSchemaVersion(E83LEG.db)}`);
+
+          const legS04 = shiftStatRepo.sumRunSec(E83LEG.db, { day: '2026-10-04', month: '2026-10', year: '2026' });
+          const legS05 = shiftStatRepo.sumRunSec(E83LEG.db, { day: '2026-10-05', month: '2026-10', year: '2026' });
+          t.check('E83-10 老库形态的**读数**（③ 的现场形态）：两列 NULL ⇒ 读口按"**整段归班次开始日**"兜底 ——' +
+            '10-04 档自然日＝班次＝**180**（**不**切成 120/60：老行没有切段信息，读口不许凭空猜）、' +
+            '10-05 档两套投影都是 **0**；即 `E83` 之前的老库读数**逐字保留**、两套投影同值',
+            legS04.daySec === 180 && legS04.shiftDaySec === 180 &&
+            legS04.monthSec === 180 && legS04.yearSec === 180 &&
+            legS05.daySec === 0 && legS05.shiftDaySec === 0,
+            `10-04：natural=${legS04.daySec} / shift=${legS04.shiftDaySec}（月=${legS04.monthSec}、年=${legS04.yearSec}）；` +
+            `10-05：natural=${legS05.daySec} / shift=${legS05.shiftDaySec}`);
+        }
+      } finally {
+        E83LEG.close();
+      }
+      t.check('E83：本节自建的两个临时库跑完**当场关闭并删除**（一用例一库，不留残留）',
+        !fs.existsSync(E83LEG.dir), E83LEG.dir);
+    } finally {
+      E83.close();
+    }
   }
 
   t.section('十、临时区与残留');
