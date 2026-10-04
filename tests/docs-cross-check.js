@@ -521,17 +521,29 @@ function main() {
    *      机器有负载（并发跑门禁、`--jobs N`）时复核探针会超时。
    *    · 超时后被 `probeOne()` 记成"拿不到汇总行"，断言 6 判红、`actualOf` 回落到**旧账** ⇒
    *      读者看到的像"**权威区漂移**"，于是去查一个**不存在**的漂移（`E110` 同族的"症状指向错方向"）。
+   *      **`E141`（2026-10-04，本座位 `T-20261004-16` 甲）**：这条修法原先**只做了一半** —— 第十一节
+   *      （`declaredMismatchE135()` 有 `probeFailed` 前置）说得对，但**第十六节**的真源仍走
+   *      `actualOf()` ⇒ 同一次超时里 §11 说"不是漂移"、§16 却打印"正文写 407 ≠ 真源 406"
+   *      （`C·22` 靶子②实测）。§16 现已接上同一前提（`truthReason16()`）⇒ 两节**同口径**。
    *  ⇒ 两条修法：①**按脚本给余量**（下表：默认 300 s＝旧值 2.5×；最重的 `harness-check` 360 s
-   *  ＝对它 84.1 s 的 **4.28×** 余量，且**最坏墙钟与旧实现持平**，见下）；②把"**探针超时**"
+   *  ＝对它 84.1 s 的 **4.28×** 余量）；②把"**探针超时**"
    *  （＝**前提不成立**：判据没能在预算内跑完被测脚本）与"**取不到汇总行**"（＝被测脚本真的没产出）
    *  分开分类、分开计数、分开报（`classifyProbeE135()`／`probeShortfallNoteE135()` 是纯函数，
    *  D22 复用同一份 ⇒ "变异后变红"能证伪这条断言）。
    *
-   *  **超时不重试**（`nosummary` 仍重试到 3 次）：超时的成因是"机器忙/预算不够"，
-   *  重试既不改诊断、又会把最坏墙钟乘上重试次数（3×360 s ＝ 18 min）。**旧实现的最坏墙钟是
-   *  3×120 s ＝ 6 min**；现在超时只跑 1 次 ⇒ **6 min，与旧实现持平**，但换来"不再假报漂移"。
-   *  而"输出来不及落盘"那一类（子进程正常退出、汇总行没落盘）本来就表现为 `nosummary`，
-   *  重试语义**逐字保留**。
+   *  **最坏墙钟的真实算法（`E143`，2026-10-04，本座位 `T-20261004-16` 丙）** —— 旧抬头写的
+   *  "最坏 360 s ＝旧实现 3×120 s ＝**持平**"**不成立**，实测/读码更正如下：
+   *    · **`nosummary` 重试 3 次、`timeout` 不重试**（`probeOne()` 的 `maxAttempts(kind)`）⇒
+   *      **单脚本混合路径最坏 ＝ 首次 `nosummary` 已经跑满 360 s（子进程"正常退出但没汇总行"也可能跑满）
+   *      ＋ 第 2、3 次各超时 360 s ＝ 3×360 s ＝ 1080 s（18 min）**；纯超时路径＝1×360 s；
+   *      纯 `nosummary` 路径＝3×360 s（若每次都跑满）。
+   *    · **多脚本**：`probeWallMs` 会遍历 `offlineGates`，凡"声明 ≠ 账"的脚本各跑一次 `probeOne()`
+   *      ⇒ 最坏墙钟**随冲突脚本个数线性增长**（N 个 ⇒ 最坏 N×1080 s）。
+   *    · 旧实现（无条件实跑、12 个脚本串行、每个 120 s 兜底）的最坏是 12×120 s ＝ 1440 s，
+   *      但**逐脚本**看它是 120 s；本改造把单脚本上界抬到 1080 s ⇒ "持平"只在
+   *      "恰好一个脚本、且第一次就超时"这一种形态下成立。
+   *    · **为什么仍然接受这个上界**：正常预算下（`harness-check` 84.1 s / 360 s）路径根本走不到
+   *      重试与超时；这两条只在"机器极忙"或"受控 1 ms 变异"下出现，且此时**判据仍然红**（不静默）。
    *
    *  `DSH_DC_PROBE_TIMEOUT_MS`（**受控输入口**，与 `DSH_DC_*_OVERRIDE` 同口径）：设了就用它当
    *  所有脚本的超时 —— 只为 `E135` 的 D22（把超时压到 1 ms，实测"报探针超时、不报权威漂移"），
@@ -601,18 +613,67 @@ function main() {
     ? `${name}（**探针超时**：预算 ${timeoutMs} ms 内没跑完 ⇒ **前提不成立**，` +
       '**不是"权威区漂移"** —— 先看机器负载/并发，或 `--fast` 刷新账本后重跑）'
     : `${name}（实跑未产出可解析的汇总行）`);
-  const probeOne = (script, overrideMs) => {
-    let last = { kind: 'nosummary', attempts: 0, timeoutMs: probeTimeoutFor(script, overrideMs) };
+  const probeOne = (script, overrideMs) => retryProbePolicyE143(() => probeOneOnceE143(script, overrideMs));
+  /**
+   * **重试策略（`E143` 的单一真源，纯函数）**：`nosummary` 重试到 3 次、`timeout` **不重试**。
+   * 抽成纯函数有两个目的：① `probeOne()` 与"最坏墙钟的算术"用**同一份**策略（不会各写一份而漂移）；
+   * ② 可以喂**合成的 attempt 序列**（`nosummary` → `timeout` → `timeout`）⇒ "混合路径最坏 3×预算"
+   *    这件事**可被定点证伪**，而不是只在注释里写一句上界。
+   * @param {(attempt:number)=>({kind:'ok'|'timeout'|'nosummary', passed?:number, timeoutMs:number})} attemptOnce
+   * @returns {{kind:string, attempts:number}} 最终一次的分类与**实际跑了几次**
+   */
+  const retryProbePolicyE143 = (attemptOnce) => {
     const maxAttempts = (kind) => (kind === 'timeout' ? 1 : 3);   /* 超时不重试，理由见抬头 */
+    let last = { kind: 'nosummary', attempts: 0 };
     for (let attempt = 1; attempt <= 3; attempt++) {
-      const r = probe(script, overrideMs);
-      const c = classifyProbeE135(r);
-      last = { ...c, attempts: attempt, timeoutMs: r.timeoutMs };
+      const c = attemptOnce(attempt);
+      last = { ...c, attempts: attempt };
       if (c.kind === 'ok') return last;
       if (attempt >= maxAttempts(c.kind)) return last;
     }
     return last;
   };
+  /** 单次探针（`probeOne` 的一次尝试；拆出来只为把重试策略抽成纯函数） */
+  const probeOneOnceE143 = (script, overrideMs) => {
+    const r = probe(script, overrideMs);
+    const c = classifyProbeE135(r);
+    return { ...c, timeoutMs: r.timeoutMs };
+  };
+  /** `E143`（2026-10-04，本座位 `T-20261004-16` 丙）：**让墙钟读数自解释** ——
+   *  单看"实跑探针墙钟 1080 ms"分不清"多个脚本各重试了一次 nosummary"与"某个脚本超时"。
+   *  这里把每个实跑过的脚本的 `attempts` 与最终 `kind` 一并打进同一行输出。
+   *  @param {Array<{name:string, kind:string, attempts:number}>} records 实跑记录（**逐次**）
+   *  @returns {string} 形如 `harness-check=timeout(1 次)、logic-check=ok(2 次)` */
+  const fmtProbeDetailE143 = (records) => (records.length
+    ? records.map(r => `${r.name}=${r.kind}(${r.attempts} 次)`).join('、')
+    : '无');
+  /* `E143` 的 D22（**合成 attempt 序列**，不依赖任何真实脚本的耗时）：
+     ① 混合路径 `nosummary → timeout` ⇒ 跑 **2** 次、最终 `timeout`（第 2 次就停：超时不重试）；
+     ② `nosummary → timeout → timeout` 的**上界**：若第 1 次 `nosummary`、第 2 次才超时，最多 2 次；
+        真正的最坏 3 次由"第 1、2 次都 `nosummary`、第 3 次超时"给出 ⇒ 断言它停在 3 次；
+     ③ `ok` 第 1 次就返回（1 次）；④ 纯 `timeout` 只 1 次；⑤ 纯 `nosummary` 满 3 次。
+     这四条合起来把"最坏墙钟 ＝ 3×预算／脚本"钉成**可证伪**的读数。 */
+  {
+    const seq = (kinds) => { let i = 0; return () => ({ kind: kinds[Math.min(i++, kinds.length - 1)], timeoutMs: 360000 }); };
+    const mixed1 = retryProbePolicyE143(seq(['nosummary', 'timeout', 'timeout']));
+    const mixed2 = retryProbePolicyE143(seq(['nosummary', 'nosummary', 'timeout']));
+    const pureTimeout = retryProbePolicyE143(seq(['timeout']));
+    const pureNoSummary = retryProbePolicyE143(seq(['nosummary']));
+    const okFirst = retryProbePolicyE143(seq(['ok']));
+    t.check('E143 D22（可证伪）：重试策略（**纯函数**，`probeOne()` 与"最坏墙钟算术"共用同一份）—— ' +
+      '`nosummary` 最多 3 次、`timeout` **不重试** ⇒ 单脚本**混合路径最坏跑 3 次**（＝最坏墙钟 3×预算，' +
+      '而不是旧注释写的"1×预算、与旧实现持平"）；`ok` 第 1 次即返回',
+      mixed1.kind === 'timeout' && mixed1.attempts === 2
+        && mixed2.kind === 'timeout' && mixed2.attempts === 3
+        && pureTimeout.kind === 'timeout' && pureTimeout.attempts === 1
+        && pureNoSummary.kind === 'nosummary' && pureNoSummary.attempts === 3
+        && okFirst.kind === 'ok' && okFirst.attempts === 1,
+      `混合（nosummary→timeout）：${mixed1.kind}／${mixed1.attempts} 次；`
+        + `最坏混合（nosummary→nosummary→timeout）：${mixed2.kind}／${mixed2.attempts} 次（**上界**）；`
+        + `纯 timeout：${pureTimeout.attempts} 次；纯 nosummary：${pureNoSummary.attempts} 次；ok 首跑：${okFirst.attempts} 次；`
+        + `⇒ 单脚本最坏墙钟 ＝ 3×预算（\`harness-check\` 360 s ⇒ **1080 s**），`
+        + `多脚本冲突复核**线性叠加**（N 个 ⇒ N×1080 s）—— 见抬头注释的更正`);
+  }
 
   /** 说明：`run-totals.json` 里"断言合计"的那本账，**本脚本不做比对** ——
    *  "权威值 vs 实跑合计"要等本轮全部脚本跑完才有最终账，suite 成员按定义读不到，
@@ -793,18 +854,20 @@ function main() {
    *
    * 落盘方 `run-all` 的契约**不要求预建父目录**（它自己 `ensureDir` 后写），故本读取端
    * 以"文件不存在"为一条正常分支（单独跑本脚本、或账本还没生成过），**不当异常**。
-   * @returns {{ok:boolean, why:string, error:?(Error|null), suites:Array, file:string}}
+   * @returns {{ok:boolean, why:string, error:?(Error|null), suites:Array, ranSuites:string[], file:string}}
    */
   const readRunTotals = (mode) => {
     const file = path.join(env.paths.verify, 'run-totals.json');
     const prefix = mode === 'hard' ? '**不可读**：' : '';
     try {
-      if (!fs.existsSync(file)) return { ok: false, why: prefix + '不存在（本轮不是经 run-all 启动，账本还没生成过）', error: null, suites: [], file };
+      if (!fs.existsSync(file)) return { ok: false, why: prefix + '不存在（本轮不是经 run-all 启动，账本还没生成过）', error: null, suites: [], ranSuites: [], file };
       const json = JSON.parse(fs.readFileSync(file, 'utf8'));
-      if (!Array.isArray(json.suites)) return { ok: false, why: prefix + '结构不对（缺 suites 数组）', error: null, suites: [], file };
-      return { ok: true, why: '', error: null, suites: json.suites, file };
+      if (!Array.isArray(json.suites)) return { ok: false, why: prefix + '结构不对（缺 suites 数组）', error: null, suites: [], ranSuites: [], file };
+      /* `E142`（2026-10-04）：另带出 `ranSuites`（`run-all.writeRunTotals()` 落盘时写的**本轮真跑过的脚本名**）。
+         它是"**本轮没轮到它跑**"与"**上一轮有、这一轮账里没了**"唯一的分辨依据 —— 详见断言 10 的抬头。 */
+      return { ok: true, why: '', error: null, suites: json.suites, ranSuites: Array.isArray(json.ranSuites) ? json.ranSuites : [], file };
     } catch (err) {
-      return { ok: false, why: prefix + '读取失败：' + (err && err.message), error: err || null, suites: [], file };
+      return { ok: false, why: prefix + '读取失败：' + (err && err.message), error: err || null, suites: [], ranSuites: [], file };
     }
   };
 
@@ -908,6 +971,7 @@ function main() {
   const probeTimeouts = [];     // `E135`：跑了但**超时**的（前提不成立，**不是**权威区漂移）
   const probeFailed = {};       // 脚本名 → 'timeout' | 'nosummary'（断言 1/2 据此**不判漂移**）
   const probedNames = [];       // 实跑过的脚本名（含冲突复核与账本不覆盖两类）
+  const probeRecordsE143 = [];  // `E143`：逐脚本的实跑记录 `{name, kind, attempts}`（墙钟读数自解释用）
   const rechecked = [];         // 其中"因声明 ≠ 账而复核"的脚本名
   const sourceOf = {};          // 脚本名 → 最终取数来源（'ledger' | 'probe'）
   const probeWallMs = (() => {
@@ -923,6 +987,8 @@ function main() {
       probedNames.push(name);
       if (logged !== undefined) rechecked.push(name);           // ② 声明 ≠ 账 → 冲突复核
       const re = probeOne(name);                                // ②/③ 实跑
+      /* `E143`：把"谁、跑了几次、最后是哪一类"逐条留痕（墙钟读数靠它自解释） */
+      probeRecordsE143.push({ name, kind: re && re.kind ? re.kind : 'nosummary', attempts: re && re.attempts ? re.attempts : 0 });
       if (re && re.kind === 'ok') {
         actualProbe[name] = re.passed; sourceOf[name] = 'probe';
       } else {
@@ -1030,7 +1096,8 @@ function main() {
   t.info(`实跑值来源：run-totals.json（本轮账，${ledgerUsed.length} 个脚本）` +
     ` ＋ 冲突复核 ${recheckNames.length} 个（${recheckNames.join('、') || '无'}）` +
     `＋ 账本不覆盖实跑 ${probedNames.length - recheckNames.length} 个` +
-    `｜账本 ${totals.ok ? '可读' : '不可读：' + totals.why}｜实跑探针墙钟 ${probeWallMs} ms`);
+    `｜账本 ${totals.ok ? '可读' : '不可读：' + totals.why}｜实跑探针墙钟 ${probeWallMs} ms` +
+    `｜` + '`E143` 逐脚本探针读数（`kind(attempts)` ⇒ 墙钟自解释）：' + fmtProbeDetailE143(probeRecordsE143));
   if (envSkipped.length) t.info('**环境跳过（本机无 git）**：' + envSkipped.join('、') + ' —— 其条数依赖提交历史，不参与按数比对（E55）');
 
   /* ---- 断言 3：解析必须**全覆盖**，解析不到的不得静默放过 ---- */
@@ -1287,36 +1354,80 @@ function main() {
   const browserGatesE136 = (SUITES_READ || []).filter(s => s.needBrowser).map(s => s.name);
   const browserDeclOfE136 = (nm) => nameDecl(nm, [{ text: authLine, from: '权威区逐脚本清单' },
     { text: readmeSrc, from: 'tests/README.md 全文' }]);
-  /** 判据本体（**纯函数**：D22 复用它 ⇒ "变异后变红"能证伪这条断言）。 */
-  const browserLedgerAuditE136 = (declOf, sumOfName) => {
+  /** 判据本体（**纯函数**：D22 复用它 ⇒ "变异后变红"能证伪这条断言）。
+   *  `E142`（2026-10-04，本座位 `T-20261004-16` 乙）：**加第三参 `ranRound`** —— 账本自述的"上一轮真跑过的脚本"
+   *  （`run-all.writeRunTotals()` 落的 `ranSuites`）＋ 可选的"本轮真跑过的脚本"。
+   *
+   *  **为什么必须把两种"缺"分开**（本件要求写进注释并在回执复述）：
+   *    · **"本轮没轮到它跑"**（正常形态）：`browser-check`／`overlap-check`／`stress-check` 在
+   *      `run-all.__serialTail` 里排在 `docs-cross-check` **之后** ⇒ 本轮账本**天然不含**它们；
+   *      而且 `--only` 子集轮**根本不跑**它们 ⇒ 那时账本里"没有这几条"是**预期**。
+   *      `D20` 的边界正是为它立的：**不可比、点名、不判 FAIL**。
+   *    · **"上一轮有、这一轮没了"**（异常）：账本是**增量落盘、不清空**的，`ranSuites` 记着上一轮
+   *      **真的跑过**它、账里也**真的有过**它的条目 ⇒ 这一轮它不见了，只可能是**条目被删/被改写**
+   *      （座位 5 实测：只删 `browser-check` 一条 ⇒ 失配 0、`已核对 2／不可比 1`、主断言**仍 PASS**）。
+   *      这一条**必须判红并指名是哪只脚本消失了** —— 否则一个已登记的权威数字（33／27／11）
+   *      可以"没人守"，而报告上完全看不出来。
+   *    ⇒ 判据：`planned = (ranRound 若有 ⇒ 本轮实跑集合) 否则 (账本自述的 ranSuites)`；
+   *      凡 `planned` 里有、而**本轮账本条目缺失**的浏览器/长跑脚本 ⇒ **finding（判红、指名）**；
+   *      `planned` 里**没有**的 ⇒ 照旧走 `D20` 的 `unmet`（不可比、不判红）。
+   *      两个方向都读 ⇒ "删条目绕过"被堵死（`C·22` 靶子③的②④两种形态）。
+   *  @param {(nm:string)=>({declared:number}|null)} declOf 声明访问器
+   *  @param {(nm:string)=>({passed:number}|undefined)} sumOfName 账本访问器
+   *  @param {{ranLedger?:string[], ranRound?:string[]}} [ran] 上一轮/本轮"真跑过"的脚本名
+   */
+  const browserLedgerAuditE136 = (declOf, sumOfName, ran) => {
     const findings = [];
     const covered = [];
     const unmet = [];
+    const disappeared = [];      /* `E142`：**上一轮跑过、这一轮账里消失**的脚本名（第三只桶） */
+    const ranLedger = (ran && Array.isArray(ran.ranLedger)) ? ran.ranLedger : [];
+    const ranRound = (ran && Array.isArray(ran.ranRound)) ? ran.ranRound : [];
+    /* "本轮该在账里"的集合：优先用**本轮实跑集合**（最准）；拿不到就退回账本自述的上一轮集合。 */
+    const planned = ranRound.length ? ranRound : ranLedger;
+    const plannedSrc = ranRound.length ? '本轮实跑集合（ranSuites）' : '账本自述的上一轮实跑集合';
     for (const nm of browserGatesE136) {
       const d = declOf(nm);
       if (!d) { findings.push(`${nm}：权威区里解析不出 \`通过/失败\` 声明`); continue; }
       const sum = sumOfName(nm);
-      /* `D20`：账本覆盖不到 ⇒ **本轮不可比**（它们在 `serialTail` 里排在本脚本之后，属正常形态） */
-      if (!sum) { unmet.push(`${nm}（本轮账本无该脚本条目）`); continue; }
+      if (!sum) {
+        /* `E142` 的单向标记：**该跑/上一轮跑过、而这一轮账里没有** ⇒ 异常（判红并指名）。
+           `D20` 的 `unmet` 只留给"确实没轮到它跑"（`planned` 里没有它）。 */
+        if (planned.includes(nm)) {
+          disappeared.push(nm);
+          findings.push(`${nm}：**上一轮账里有、这一轮账里消失了**（${plannedSrc} 含它，`
+            + `而本轮账本不含 ⇒ 条目被删/被改写 ⇒ 一个已登记的权威数字**没人守**；`
+            + `这不是"本轮没轮到它跑"，不许按 \`D20\` 当不可比放过）`);
+          continue;
+        }
+        unmet.push(`${nm}（本轮账本无该脚本条目）`);
+        continue;
+      }
       covered.push(nm);
       if (d.declared !== sum.passed) {
         findings.push(`${nm}：权威区写 **${d.declared} 通过** ≠ 账本 ${sum.passed}（**通过数逐脚本漂移**；` +
           `该数只来自全量轮，故它就是真漂移 —— 重跑一次全量轮刷新账本，不要改判据）`);
       }
     }
-    return { findings, covered, unmet };
+    return { findings, covered, unmet, disappeared, planned, plannedSrc };
   };
   {
-    const brAudit = browserLedgerAuditE136(browserDeclOfE136, nm => ledgerSummary[nm]);
+    /* `E142`：把"上一轮真跑过"（`totals.ranSuites`，账本自述）与"本轮真跑过"（同一份账本的 ranSuites ——
+       本轮若经 `run-all` 启动，这个字段就是**本轮**写的）都喂给判据，用来分辨两种"缺"。 */
+    const ranInfoE136 = { ranLedger: totals.ranSuites, ranRound: totals.ranSuites };
+    const brAudit = browserLedgerAuditE136(browserDeclOfE136, nm => ledgerSummary[nm], ranInfoE136);
     t.check('E136 三只**浏览器/长跑**脚本的**通过数**逐脚本对账（**只读账本**，不实跑）：权威区声明的通过数 = ' +
       '`run-totals.json` 里该脚本的 `passed`；**账本覆盖不到 ⇒ 按 `D20` 报"本轮不可比"并点名**' +
-      '（不判 FAIL、也不计入已核对）；`已核对 ＋ 不可比 === 应有值`（**不许装绿**）',
+      '（不判 FAIL、也不计入已核对）；`已核对 ＋ 不可比 ＋ **上轮有这轮没了** === 应有值`（**一只都不许消失**）；' +
+      '**`E142`：账本自述"上一轮跑过"而本轮条目消失 ⇒ 判红并指名**（"本轮没轮到"与"上轮有这轮没了"必须分得开）',
       browserGatesE136.length > 0 && brAudit.findings.length === 0
-        && brAudit.covered.length + brAudit.unmet.length === browserGatesE136.length,
+        && brAudit.covered.length + brAudit.unmet.length + brAudit.disappeared.length === browserGatesE136.length,
       (brAudit.findings.length ? `**失配 ${brAudit.findings.length} 条**：${brAudit.findings.join('；')}`
         : `逐脚本一致（${brAudit.covered.map(n => `${n}=${ledgerSummary[n].passed}/${ledgerSummary[n].failed}/${ledgerSummary[n].skipped}`).join('、') || '（无可比项）'}）`) +
       `｜**已核对 ${brAudit.covered.length}／${browserGatesE136.length} 个**` +
       `｜**本轮不可比 ${brAudit.unmet.length} 个**：${brAudit.unmet.join('、') || '（无）'}` +
+      `｜**\`E142\` 上轮有这轮没了 ${brAudit.disappeared.length} 个**：${brAudit.disappeared.join('、') || '（无）'}` +
+      `｜\`E142\` 计划集合来源＝${brAudit.plannedSrc}（${brAudit.planned.length} 个）` +
       `｜声明：${browserGatesE136.map(n => { const d = browserDeclOfE136(n); return `${n}=${d ? d.declared : '（解析不到）'}`; }).join('、')}` +
       `｜账本 ${totals.ok ? `可读（${path.relative(env.paths.root, totals.file)}）` : '不可用：' + totals.why}`);
     if (brAudit.unmet.length) {
@@ -1341,14 +1452,34 @@ function main() {
     const synthBaseE136 = browserLedgerAuditE136(synthDeclE136, synthSumE136);
     const synthMutE136 = browserLedgerAuditE136(synthDeclE136,
       (nm) => (nm === targetE136 ? { passed: 99, failed: 0, skipped: 0 } : synthSumE136(nm)));
+    /* ⚠ 这一支（"置空"）的**原意**是 `D20` 边界：账本覆盖不到 ⇒ 不可比、**不判红**。
+       `E142` 之后"覆盖不到"分两种 —— 要保住原意就必须显式说明"**账本自述里也从没跑过它**"
+       （`{ranLedger: []}`）；不给第三参会退回"账本自述"那一侧，于是"上轮跑过、这轮没了"会**判红**
+       （那是 `E142` 想要的，但会把这一支的原意读反）。本座位第一版就踩了这个（实测读数见回执）。 */
     const synthHideE136 = browserLedgerAuditE136(synthDeclE136,
-      (nm) => (nm === targetE136 ? undefined : synthSumE136(nm)));
+      (nm) => (nm === targetE136 ? undefined : synthSumE136(nm)), { ranLedger: [] });
     const mutSumE136 = (nm) => (nm === targetE136
       ? { passed: (baseE136 ? baseE136.passed : 0) + 66, failed: 0, skipped: 0 }
       : ledgerSummary[nm]);
     const hideSumE136 = (nm) => (nm === targetE136 ? undefined : ledgerSummary[nm]);
     const mutAuditE136 = browserLedgerAuditE136(browserDeclOfE136, mutSumE136);
     const hideAuditE136 = browserLedgerAuditE136(browserDeclOfE136, hideSumE136);
+    /* `E142`（2026-10-04，本座位 `T-20261004-16` 乙）的三支**受控合成读数**（复用同一个纯函数）：
+       ① `removed`：账本自述"上一轮跑过全部三只"（`ranLedger=应有值`、`ranRound=[]` ⇒ 退化为用账本自述），
+          而本轮某只**条目消失** ⇒ 必须**判红并指名它**（旧口径下这里 `findings=0`、主断言 PASS）；
+       ② `neverPlanned`：账本自述里**本来就没有**它（＝"本轮没轮到"或"`--only` 子集轮不跑它"）
+          ⇒ 照旧 `unmet`、**不判红**（`D20` 边界**不被新规则破坏**）；
+       ③ `allRemoved`：三只**全部消失**、而本轮仍报"跑过它们"（这一侧从 `ranRound` 来）
+          ⇒ 三条都要红（不许"全部不可比就万事大吉"）。 */
+    const audit142 = {
+      removed: browserLedgerAuditE136(synthDeclE136,
+        (nm) => (nm === targetE136 ? undefined : synthSumE136(nm)),
+        { ranLedger: browserGatesE136.slice() }),
+      neverPlanned: browserLedgerAuditE136(synthDeclE136,
+        (nm) => (nm === targetE136 ? undefined : synthSumE136(nm)),
+        { ranLedger: [] }),
+      allRemoved: browserLedgerAuditE136(synthDeclE136, () => undefined, { ranRound: browserGatesE136.slice() })
+    };
     const diskLedgerShaE136 = require('node:crypto').createHash('sha256')
       .update(totals.ok ? fs.readFileSync(totals.file) : Buffer.from('')).digest('hex').slice(0, 12);
     t.check('E136 D22（可证伪）：用**受控合成三元组**（不依赖盘上账本的当前状态）把某只浏览器/长跑脚本的' +
@@ -1361,11 +1492,29 @@ function main() {
         && synthMutE136.covered.length + synthMutE136.unmet.length === browserGatesE136.length
         && !synthHideE136.covered.includes(targetE136)
         && synthHideE136.unmet.some(x => x.startsWith(targetE136)) && synthHideE136.findings.length === 0
-        && synthHideE136.covered.length + synthHideE136.unmet.length === browserGatesE136.length,
+        && synthHideE136.covered.length + synthHideE136.unmet.length === browserGatesE136.length
+        /* `E142` 的三支读数（同一纯函数）：①**上一轮跑过、这轮条目消失** ⇒ 判红并**指名**；
+           ②**账本自述里就没有它**（＝"本轮没轮到/子集轮不跑它"）⇒ 照旧 `unmet`、不判红；
+           ③**三条全删**（基线已被删干净）⇒ "这一轮仍在实跑集合里"这一侧兜住红灯（不许空转）。 */
+        && audit142.removed.findings.length === 1
+        && audit142.removed.findings[0].includes(targetE136)
+        && audit142.removed.findings[0].includes('消失了')
+        /* 三只桶合起来仍是"应有值"（`E142` 把"消失"单列成第三只桶，不是把它从计数里抹掉） */
+        && audit142.removed.covered.length + audit142.removed.unmet.length + audit142.removed.disappeared.length === browserGatesE136.length
+        && audit142.removed.disappeared.includes(targetE136)
+        && audit142.neverPlanned.findings.length === 0
+        && audit142.neverPlanned.unmet.some(x => x.startsWith(targetE136))
+        && audit142.neverPlanned.disappeared.length === 0
+        && audit142.allRemoved.findings.length === browserGatesE136.length
+        && audit142.allRemoved.disappeared.length === browserGatesE136.length
+        && browserGatesE136.every(nm => audit142.allRemoved.findings.some(f => f.includes(nm))),
       `合成基线：失配 ${synthBaseE136.findings.length} 条／已核对 ${synthBaseE136.covered.length}（应 0／${browserGatesE136.length}）；` +
       `合成变异（33 ⇒ 99）：失配 ${synthMutE136.findings.length} 条 ⇒ ${synthMutE136.findings.join('；') || '（无，异常）'}；` +
       `合成置空：已核对 ${synthHideE136.covered.length}／不可比 ${synthHideE136.unmet.length}（总数 ${browserGatesE136.length} 不变）、` +
       `已移入不可比=${!synthHideE136.covered.includes(targetE136)}；` +
+      `【\`E142\` 三支】**上轮跑过/这轮消失**：失配 ${audit142.removed.findings.length} 条 ⇒ ${audit142.removed.findings.join('；') || '（无，异常）'}；` +
+      `**从来自述没跑过**：失配 ${audit142.neverPlanned.findings.length} 条（应 0）／不可比 ${audit142.neverPlanned.unmet.length}；` +
+      `**三条全删**：失配 ${audit142.allRemoved.findings.length} 条（应 ${browserGatesE136.length}）；` +
       `【真实账本读数（只留痕、不判红）】基线失配 ${brAudit.findings.length} 条（正常 = 0，由上面那条主断言判）；` +
       `内存改「${targetE136} 的 passed ⇒ ${(baseE136 ? baseE136.passed : 0) + 66}」后失配 ${mutAuditE136.findings.length} 条、` +
       `置空后已核对 ${hideAuditE136.covered.length}／不可比 ${hideAuditE136.unmet.length}；` +
@@ -1376,9 +1525,10 @@ function main() {
   const notCompared = offlineGates.filter(n => n !== SELF_REF && sourceOf[n] === undefined);
   t.info(`未纳入逐脚本比对的离线门禁：${SELF_REF}（自指）` +
     (notCompared.length ? `；另有未取到值的：${notCompared.join('、')}` : '') +
-    '（docs-cross-check 为**自指**：它声明的条数 = 它自己这次跑出来的通过数，本节结束时才确定，' +
+    `（docs-cross-check 为**自指**：它声明的条数 = 它自己这次跑出来的通过数，本节结束时才确定，` +
     '账本里那条还只是它中途落盘的数；其漂移由 run-all 收尾的 verifyAuthorityTotals 按合计拦截）' +
-    `｜实跑探针墙钟 ${probeWallMs} ms`);
+    `｜实跑探针墙钟 ${probeWallMs} ms` +
+    `｜` + '`E143` 逐脚本探针读数：' + fmtProbeDetailE143(probeRecordsE143));
 
   /* ---------------- 十五、正文"当前值"穷举校验（E51，2026-09-29 补） ----------------
      立案（2026-09-28 登记）：本文件原先只校验**权威区**（`tests\README.md` 第三节）的数字，
@@ -1528,8 +1678,57 @@ function main() {
     })();
     const jsTop16 = fs.readdirSync(env.paths.tests).filter(n => n.endsWith('.js')).length;
     const offlineCount16 = offlineGates.length;
+    /**
+     * **`E141`（2026-10-04，本座位 `T-20261004-16` 甲）：§16 与 §11 同口径 —— 前提不成立 ⇒ 本轮不可比。**
+     *
+     * 立案（座位 5 在 `C·22` 靶子②实测、主代理登记 `E141`）：同一次 `DSH_DC_PROBE_TIMEOUT_MS=1` 里，
+     * §11 正确报"**探针超时…不是权威区漂移**"，而 §16 仍打印
+     * 「`项目架构与技术栈.md:297` … `harness-check` 正文写 407 项 ≠ 真源 406（实跑通过数）」——
+     * **症状仍指向"文档没同步"**，会让人去改**正确**的数字。
+     * 根因：§16 的真源取数走 `actualOf()`，而它在探针失败时**回落滞后账本**（`:948-951`）；§11 的
+     * `declaredMismatchE135()` 有 `probeFailed` 前置，§16 没有。
+     *
+     * **为什么"前提不成立"仍要判红、但报的话必须不同**（本件要求写进注释并在回执复述）：
+     *   · **仍然判红**：拿不到真源就**不许静默放过**（`D19`/`D21`/`D23`）—— "这轮没比成"必须有人看见，
+     *     否则一个取不到值的脚本会让整节悄悄变绿，那正是本仓最贵的一类缺陷。
+     *   · **报的话必须不同**：超时的成因是"**判据没能跑完被测脚本**"（机器忙/预算不够），
+     *     而"声明 ≠ 真源"的成因是"**文档写错了**"——**两者方向相反**。旧写法把前者渲染成后者，
+     *     等于把读者送去改**对的**数字（`E110` 同族）。故这里把"不可比"单列，`msg` 里只出现
+     *     "**本轮不可比**"＋原因，**绝不出现"≠ 真源"话术**。
+     *
+     * **§16 里还有没有别的取数路径会回落滞后账本**（要求：自己 grep 一遍 `actualOf(`／账本读取点，
+     * 逐处判定并写进注释）——本座位逐处核过，结论如下（§16 共 3 处取数）：
+     *   ① `scriptTruth16()`（原 `:1532`）＝ 家庭 ③b／③c 的真源 ⇒ **已接前提**（本件）；
+     *   ② `sumMissing16`（原 `:1533`）⇒ **已接前提**（用的就是 ①）；
+     *   ③ `sumTruth16`（原 `:1534`）＝ 家庭 ④ 的真源 ⇒ **已接前提**（本件）。
+     *   其余"数字"要么来自**文件系统**（`compCount16`＝`src\components\*.js` 文件数、`jsTop16`＝
+     *   `tests\*.js` 顶层数、`offlineCount16`＝`SUITES` 过滤结果）—— 它们**不经账本、不受探针影响**；
+     *   要么来自 `declaredOf()`（**声明侧**，不是真源）。⇒ §16 **没有第二处**未接前提的账本回落。
+     *   （§11 另有 `actualOf()` 的调用点：断言 1／2 走 `declaredMismatchE135` 的 `probeFailed` 前置；
+     *     断言 6 的 `cannotVerify` 本就是"取不到 ⇒ 判红"那一条；调试 info 行只是留痕。均已合规。）
+     * @returns {{value:(number|undefined), data:boolean, reason:string}} `data=true` ⇒ 真源有效；
+     *          `data=false` ⇒ **本轮不可比**（`reason` 给出可读原因）
+     */
+    const truthReason16 = (name) => {
+      if (name === SELF_REF) {
+        const d = declaredOf(name);
+        return d === null
+          ? { value: undefined, data: false, reason: `自指脚本 \`${SELF_REF}\` 连权威区声明都解析不到` }
+          : { value: d, data: true, reason: '' };
+      }
+      if (probeFailed[name]) {
+        return { value: undefined, data: false, reason: probeShortfallNoteE135(name, probeFailed[name], probeTimeoutFor(name)) };
+      }
+      if (actualOf(name) === undefined) {
+        return { value: undefined, data: false, reason: `${name} 本轮既没有账本条目、也没能实跑到` };
+      }
+      return { value: actualOf(name), data: true, reason: '' };
+    };
+    /** 家庭 ④ 的**可比性**：和值＝Σ(非自指门禁实跑值) ＋ 自指声明 ⇒ 任一非自指门禁不可比，和值也不可比 */
+    const sumProbeFailed16 = offlineGates.filter(n => n !== SELF_REF && Boolean(probeFailed[n]));
+    const sumTruthReady16 = sumProbeFailed16.length === 0;
     /** `<脚本名>`（N 项）族的期望值：实跑通过数（与第十一节同源）；自指脚本 ⇒ 权威区声明。 */
-    const scriptTruth16 = (name) => (name === SELF_REF ? declaredOf(name) : actualOf(name));
+    const scriptTruth16 = (name) => truthReason16(name).value;
     const sumMissing16 = offlineGates.filter(n => n !== SELF_REF && actualOf(n) === undefined);
     const sumTruth16 = offlineGates.filter(n => n !== SELF_REF)
       .reduce((a, n) => a + (actualOf(n) === undefined ? 0 : actualOf(n)), 0)
@@ -1585,17 +1784,24 @@ function main() {
                   findings.push({ key, msg: `${where} ${fam.id}：正文写 ${got} ≠ 真源 ${exp === null ? '（取不到）' : exp}（"${raw}"）` });
                 }
               } else if (fam.kind === 'script') {
-                const name = m[1]; const got = Number(m[2]); const exp = scriptTruth16(name);
-                if (exp === null || exp === undefined) {
-                  findings.push({ key, msg: `${where} ${fam.id}：\`${name}\`（${got} 项）**取不到真源**（该脚本没有实跑值/权威区声明）` });
-                } else if (got !== exp) {
-                  findings.push({ key, msg: `${where} ${fam.id}：\`${name}\` 正文写 ${got} 项 ≠ 真源 ${exp}` +
+                const name = m[1]; const got = Number(m[2]);
+                const t16 = truthReason16(name);
+                if (!t16.data) {
+                  /* `E141`：**前提不成立 ⇒ 本轮不可比**（不产出"声明 ≠ 真源"失配项；仍由下面那条
+                     专门的断言判红并指名）—— 文案里只出现"本轮不可比"，**不出现"≠ 真源"话术**。 */
+                  findings.push({ key, incomparable: true, msg: `${where} ${fam.id}：\`${name}\`（${got} 项）**本轮不可比**（${t16.reason}）` });
+                } else if (got !== t16.value) {
+                  findings.push({ key, msg: `${where} ${fam.id}：\`${name}\` 正文写 ${got} 项 ≠ 真源 ${t16.value}` +
                     `${name === SELF_REF ? '（自指 ⇒ 与权威区声明比对）' : '（实跑通过数）'}（"${raw}"）` });
                 }
               } else {
                 const n2 = Number(m[1]); const got = Number(m[2]);
                 if (n2 !== offlineCount16) {
                   findings.push({ key, msg: `${where} ${fam.id}："${raw}" 的"${n2} 个"≠ 离线门禁实数 ${offlineCount16}` });
+                } else if (!sumTruthReady16) {
+                  /* `E141`：和值的真源依赖"每个非自指门禁的实跑值都在" ⇒ 有探针失败即**不可比** */
+                  findings.push({ key, incomparable: true, msg: `${where} ${fam.id}："${raw}" **本轮不可比**`
+                    + `（和值真源里的 ${sumProbeFailed16.length} 个脚本取不到实跑值：${sumProbeFailed16.join('、')}）` });
                 } else if (got !== sumTruth16) {
                   findings.push({ key, msg: `${where} ${fam.id}："${raw}" 写 ${got} ≠ 真源 ${sumTruth16}` +
                     `（＝离线门禁实数中的 ${n2 - 1} 个**非自指**脚本实跑值之和 ＋ 权威区对自指脚本 \`${SELF_REF}\` 的声明）` });
@@ -1621,21 +1827,38 @@ function main() {
       `｜真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／和值 ${sumTruth16}` +
       (sumMissing16.length ? `（**和的取数不完整**：${sumMissing16.join('、')} 无实跑值）` : ''));
 
-    const badNum16 = A16.findings.filter(f => f.key !== 'sum');
-    const badSum16 = A16.findings.filter(f => f.key === 'sum');
+    const badNum16 = A16.findings.filter(f => f.key !== 'sum' && !f.incomparable);
+    const badSum16 = A16.findings.filter(f => f.key === 'sum' && !f.incomparable);
+    /* `E141`：**不可比**单列一桶 —— 它仍判红（见下一条），但**不许**混进"声明 ≠ 真源"的失配清单
+       （否则同一次探针超时会被读成"文档没同步"，正是本件要消掉的那个误导方向）。 */
+    const incomp16 = A16.findings.filter(f => f.incomparable);
     t.check('E112 §16 断言（数量族 ①②③）：正文内部引数（N 个组件／N 个（离线）门禁／N 个 `tests\\*.js`／' +
       '`<脚本名>`（N 项））与真源**零失配**（逐处指名 `文件:行号`；真源＝`src\\components\\*.js` 文件数／' +
-      '`run-all` 的 `SUITES` 过滤结果／各脚本**实跑**条数）',
+      '`run-all` 的 `SUITES` 过滤结果／各脚本**实跑**条数）；**前提不成立（探针超时/取不到汇总行）的项走"本轮不可比"**，' +
+      '不在此清单里（`E141`：两节的判定口径现已一致）',
       badNum16.length === 0,
       badNum16.length ? `失配 ${badNum16.length} 处：${badNum16.map(f => f.msg).join('；')}`
         : `零失配（${Object.keys(FAM16).filter(k => k !== 'sum').map(k => `${FAM16[k].id}=${A16.hits[k] || 0} 处`).join('、')}）；` +
-          `真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／各脚本实跑条数`);
+          `真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／各脚本实跑条数` +
+          (incomp16.length ? `；**本轮不可比 ${incomp16.length} 处**（见下一条断言）` : ''));
 
     t.check('E112 §16 断言（和值族 ④）：「N 个的和是 M」的 N ＝ 离线门禁实数、M ＝ 真源和值' +
       '（真源＝13 个非自指离线门禁的实跑通过数之和 ＋ 权威区对自指脚本的声明数）',
       badSum16.length === 0,
       badSum16.length ? `失配 ${badSum16.length} 处：${badSum16.map(f => f.msg).join('；')}`
-        : `零失配（命中 ${A16.hits.sum || 0} 处，和值真源 ${sumTruth16}）`);
+        : `零失配（命中 ${A16.hits.sum || 0} 处，和值真源 ${sumTruthReady16 ? sumTruth16 : '（本轮不可比）'}）`);
+
+    /* `E141`（2026-10-04，本座位 `T-20261004-16` 甲）：**§16 与 §11 同口径** —— 前提不成立（探针超时／
+       取不到汇总行）⇒ **本轮不可比**，**不产出"声明 ≠ 真源"失配项**；但**仍然判红**（取不到不得静默放过，
+       `D19`/`D21`/`D23`），只是**报的话不同**（"本轮不可比"＋具体原因，绝不出现"≠ 真源"话术）。
+       为什么两件事必须分开报（回执里也复述）：超时的成因是"**判据没能在预算内跑完被测脚本**"，
+       "声明 ≠ 真源"的成因是"**文档写错了**"—— 成因相反，混报会把读者送去改**正确**的数字（`E110` 同族）。 */
+    t.check('E141 §16 与 §11 同口径：**前提不成立（探针超时／取不到汇总行）⇒ 本轮不可比**、' +
+      '不产出"声明 与 真源 不一致"的失配项 —— 但仍**判红**并逐处指名（"取不到不得静默放过"），只是报的话不同',
+      incomp16.length === 0,
+      incomp16.length
+        ? `**本轮不可比 ${incomp16.length} 处**（前提不成立 ⇒ 不是"文档漂移"）：${incomp16.map(f => f.msg).join('；')}`
+        : `本轮无"前提不成立"的取数（探针失败 ${Object.keys(probeFailed).length} 个）`);
 
     /* ---- `D22` 定点变异（**内存文本变异**：字节副本 ＋ sha256 留痕 ＋ 盘上文件未变的复核；
        不落地、不碰仓库、不用 `git checkout`／`restore`／`stash`）----

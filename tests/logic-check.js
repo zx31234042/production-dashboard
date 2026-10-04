@@ -2608,9 +2608,203 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
         truthy.every(x => x.rejected),
         `开闸读数：${openTrue.map(x => `${x.label}=${JSON.stringify(x.cm)}`).join('；')}；` +
         `非布尔真值被拒：${truthy.map(x => `${x.label}=${x.rejected}`).join('、')}`);
+
+      /* ---- `E131-6`（`T-20261004-16` 追加件）：**第二入参（`options`）路径** ----
+         立案：座位 5 在 `C·22` 靶子④ 实测 `E131` 的形态校验共有 **6 处**防线，但 `E131-1..5`
+         **一处都没测** `createShiftRules(seg, opts)` 的**第二入参** —— 那条路径当前**无缺陷**
+         （座位 5 实测非布尔值全 `TypeError`），属"没缺陷但**没守据**"：下一批同样的改动
+         会悄悄绕开它。本节按实现的实际优先级补两条。
+         **实测的优先级（本座位核到，逐字给出式子）**：
+           · `createShiftRules()` 里 `const opts = options && typeof options === 'object' ? options : {}`
+             （第二参只认对象，其余一律当 `{}`）；
+           · `const merged = Object.assign({}, seg ? { allowCrossMidnight: seg.allowCrossMidnight } : {}, opts)`
+             ⇒ **`options` 覆盖段级**（后写的赢）；
+           · 而 `opts.allowCrossMidnight` 的**形态**在
+             `assertBoolSwitch(opts.allowCrossMidnight, '调用方传入的 options')` 处**无条件**校验
+             （只要给了第二参，无论段级写没写都要过这一关）。 */
+      const optsBad = NONBOOL.map(([label, v, shown]) => {
+        const r = throwOf(() => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }] }, { allowCrossMidnight: v }));
+        const msg = r.ok ? '' : String(r.err.message);
+        return { label, ok: r.ok, type: r.ok ? '' : r.err.constructor.name,
+          named: msg.includes('收到 ' + shown), where: msg.includes('调用方传入的 options') };
+      });
+      const optsGood = [
+        ['不传第二参（段级未声明）', () => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }] })],
+        ['第二参显式 true', () => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }] }, { allowCrossMidnight: true })],
+        ['第二参显式 false', () => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }] }, { allowCrossMidnight: false })],
+        ['第二参 undefined（同"不传"）', () => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }] }, { allowCrossMidnight: undefined })],
+        /* **优先级**：段级 `false` ＋ `options` `true` ⇒ 以 `options` 为准（开闸）；
+           反向组合（段级 true ＋ options false）⇒ 关闸（不得靠段级放行）。 */
+        ['段级 false ＋ options true ⇒ 开闸', () => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }], allowCrossMidnight: false }, { allowCrossMidnight: true })],
+        ['段级 true ＋ options false ⇒ 关闸', () => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }], allowCrossMidnight: true }, { allowCrossMidnight: false })]
+      ].map(([label, mk]) => {
+        const r = throwOf(mk);
+        return { label, ok: r.ok, type: r.ok ? '' : r.err.constructor.name, msg: r.ok ? '' : String(r.err.message) };
+      });
+      t.check('E131-6 **第二入参（`options`）路径**同款：`createShiftRules(配置段, {allowCrossMidnight:<非布尔>})` ' +
+        '逐个 `TypeError`、指名实际值与类型、并点明"**调用方传入的 options**"；对照：不传／`true`／`false`／`undefined` ' +
+        '各自走既有语义，且段级与 options 冲突时 **options 覆盖**（段级 false＋options true ⇒ 开闸；段级 true＋options false ⇒ 关闸）',
+        optsBad.every(x => x.ok === false && x.type === 'TypeError' && x.named && x.where)
+          && optsGood[0].ok === false && /E83/.test(optsGood[0].msg)     /* 不传 ⇒ fail-closed（E128 原判据未放宽） */
+          && optsGood[1].ok === true && optsGood[2].ok === false && optsGood[3].ok === false
+          && optsGood[4].ok === true && optsGood[5].ok === false,
+        `真值表 ${optsBad.length} 组：全部 TypeError＋指名＝${optsBad.every(x => x.ok === false && x.type === 'TypeError' && x.named && x.where)}` +
+        `（例：${optsBad.length ? optsBad[1].label : '-'}）；对照：` +
+        optsGood.map(x => `${x.label}⇒${x.ok ? '放行' : x.type}`).join('；'));
     }
   }
 }
+
+  /* ================= 乙⑨ `E139`：`splitRunSecondsByDay()` 的**降级标记**（`T-20261004-16` 追加件） =================
+     立案（主代理亲验 `E132` 时误传入参发现、座位 3 实现、主代理裁定**收窄口径**）：入参**形态不全**时
+     旧实现**静默**退化为"整段归班次开始日"（无任何信号）⇒ 调用方会以为"这段不跨零点"（`E38` 同族：
+     把"看不懂"当成一个合法取值）。现口径（本座位核过实现）：
+       · **形态完整 ⇒ 返回值一个键都不加**（与 HEAD 旧字节逐字节相同）；
+       · **形态不全 ⇒ 追加** `degraded:true` ＋ `degradedReason`（人读）＋ `degradedMissing`（机器可核的字段名数组，
+         顺序 `start`→`end`→`startAt`→`endAt`→`date`）；既有五个键**逐值不变**；
+       · **语义**：`degraded` 缺席或 `false` ⇒ **判定有效**（向后兼容）；`degraded` 为真 ⇒
+         **"这次没能判跨零点"，不是"确实不跨零点"**；
+       · **`totalSec` 移出 fault 列表**（主代理裁定收窄）：它不参与运算、缺它数值逐值相同 ⇒ 置 `degraded`
+         属 **cry wolf**。 */
+  {
+    const s139 = createShiftRules([{ name: '夜班', start: 22, end: 6, allowCrossMidnight: true }]);
+    const full139 = s139.at('2026-10-31T23:00:00');
+    /* 完整形态（`at()` 的产物）＋ 运行 9000 s（跨零点、真切段那一支，已生产可用） */
+    const fullOut139 = stats.splitRunSecondsByDay(full139, 9000);
+    const FIVE139 = ['day1', 'day2', 'crossing', 'day1Date', 'day2Date'];
+    /* 不完整形态：从完整对象里**删**掉一个字段（`{}` 根对象在 `Object.assign` 时不复制 `undefined`
+       ⇒ 必须显式覆盖成 `undefined` 才算"缺"）。 */
+    const missOne139 = (field) => {
+      const o = Object.assign({}, full139); o[field] = undefined; return o;
+    };
+    const cases139 = [
+      ['完整形态（`at()` 产物）', full139, []],
+      ['缺 `startAt`', missOne139('startAt'), ['startAt']],
+      ['缺 `endAt`', missOne139('endAt'), ['endAt']],
+      ['缺 `date`', missOne139('date'), ['date']],
+      ['缺 `start`/`end`（连判定都做不了）', { name: '夜班', startAt: full139.startAt, endAt: full139.endAt, date: '2026-10-31', elapsedSec: 9000 }, ['start', 'end']],
+      ['缺四个（只留 `date`）', { name: '夜班', date: '2026-10-31' }, ['start', 'end', 'startAt', 'endAt']],
+      ['`{}`', {}, ['start', 'end', 'startAt', 'endAt', 'date']]
+    ].map(([label, obj, wantMissing]) => {
+      const out = stats.splitRunSecondsByDay(obj, 9000);
+      return { label, obj, out, wantMissing, hasDeg: 'degraded' in out, deg: out.degraded,
+        keys: Object.keys(out), fiveSame: FIVE139.every(k => out[k] === fullOut139[k]),
+        gotMissing: Array.isArray(out.degradedMissing) ? out.degradedMissing.join(',') : '(无数组)',
+        wantMissingStr: wantMissing.join(','), reason: out.degradedReason || '' };
+    });
+    const full139Row = cases139[0];
+    const bad139 = cases139.slice(1);
+    /* 形态不全 ⇒ **走的是"不跨自然日"那一支**（`crossing:false`）——这一支就是 `E139` 以前
+       静默退化的那一支。故"数值不变"的**对照物**是这一支的**无故障读数**，不是跨零点那一支的
+       `day2`（跨零点时 `day2` 本来就 ≠ 0；拿它当对照会得出"数值变了"的**假红** —— 本座位第一版
+       就把它当成 `fiveSame` 的比较对象，实测六种形态全报 false，理由写在这里）。 */
+    const noCross139 = stats.splitRunSecondsByDay(
+      { name: '夜班', start: 0, end: 8, startAt: '2026-10-31T00:00:00', endAt: '2026-10-31T08:00:00', date: '2026-10-31' }, 9000);
+    t.check('E139-1 **形态完整 ⇒ 一个键都不加**：`createShiftRules().at(...)` 的完整对象 ⇒ 返回体键集**恰为** ' +
+      '`{day1,day2,crossing,day1Date,day2Date}`（**连 `degradedReason`/`degradedMissing` 都没有**）；' +
+      '且这五个键与"同一份实现里不跨零点那一支"的无故障读数逐值相同（`D21`：不写死期望值）',
+      !full139Row.hasDeg && full139Row.keys.length === 5
+        && FIVE139.every(k => full139Row.keys.includes(k))
+        && FIVE139.every(k => Object.prototype.hasOwnProperty.call(full139Row.out, k)),
+      `键集＝[${full139Row.keys.join(', ')}]；\`degraded\` 在场=${full139Row.hasDeg}（应 false）；` +
+      `读数＝${JSON.stringify(full139Row.out)}；不跨零点对照＝${JSON.stringify(noCross139)}`);
+
+    t.check('E139-2 **缺字段 ⇒ `degraded:true` ＋ `degradedMissing` 指名缺哪个**（六种形态）；' +
+      '数值上不得凭空多出时段（`crossing:false` ⇒ `day2` 恒 0；`day1` 只由 `runSec` 与形态中**在场**的时刻决定）、' +
+      '且两种出口都可降级：`startAt`/`endAt` 缺失时整段归开始日；**只缺 `date`** 时仍按零点切段' +
+      '（`crossing:true`）但**明确不背书归属**（`degradedReason` 会说明 `day1Date` 不可核）',
+      bad139.every(c => c.deg === true && c.gotMissing === c.wantMissingStr
+        && (c.out.crossing === false ? c.out.day2 === 0 : c.out.day2 === 9000 - c.out.day1)
+        && FIVE139.every(k => typeof c.out[k] !== 'undefined' || k === 'day1Date' || k === 'day2Date')),
+      bad139.map(c => `${c.label}：degraded=${c.deg}、missing=[${c.gotMissing}]（应 [${c.wantMissingStr}]）、`
+        + `crossing=${c.out.crossing}/day1=${c.out.day1}/day2=${c.out.day2}`).join('；'));
+
+    t.check('E139-3 **语义可分**：`start`/`end` 不在场时理由串**不得说"判定有效"**（必须承认"连是否跨零点都判不了"）；' +
+      '`start`/`end` 在场但两个时刻缺失/不可解析（真跨零点那一支）时理由串必须点明' +
+      '"**`crossing:false` 不代表"确实不跨零点"**"',
+      (() => {
+        const noStart = stats.splitRunSecondsByDay({ name: '夜班', date: '2026-10-31' }, 9000).degradedReason;
+        const noTimes = stats.splitRunSecondsByDay({ name: '夜班', start: 22, end: 6, date: '2026-10-31' }, 9000).degradedReason;
+        return /判不了/.test(noStart) && !/判定\*\*有效\*\*/.test(noStart)
+          && /切不了段/.test(noTimes) && /不代表/.test(noTimes) && /确实不跨零点/.test(noTimes);
+      })(),
+      (() => {
+        const noStart = stats.splitRunSecondsByDay({ name: '夜班', date: '2026-10-31' }, 9000).degradedReason;
+        const noTimes = stats.splitRunSecondsByDay({ name: '夜班', start: 22, end: 6, date: '2026-10-31' }, 9000).degradedReason;
+        return `缺 start/end ⇒ 「${noStart.slice(0, 70)}…」；缺时刻（配置说跨零点）⇒ 「${noTimes.slice(0, 70)}…」`;
+      })());
+
+    const noTotal139 = Object.assign({}, full139); delete noTotal139.totalSec;
+    const noTotalOut139 = stats.splitRunSecondsByDay(noTotal139, 9000);
+    t.check('E139-4 **缺 `totalSec` ⇒ 不降级**（主代理裁定的收窄口径：它不参与运算、缺它数值逐值相同 ⇒ 置 `degraded` 是 cry wolf）：' +
+      '键集仍恰为五键、与完整形态逐值相同',
+      !('degraded' in noTotalOut139) && JSON.stringify(noTotalOut139) === JSON.stringify(fullOut139),
+      `键集＝[${Object.keys(noTotalOut139).join(', ')}]；与完整形态逐值相同=${JSON.stringify(noTotalOut139) === JSON.stringify(fullOut139)}`);
+
+    /* `E139` 的 D22（可证伪）：把"判定有效 ⇒ 原样返回"与"降级 ⇒ 加三键"两条路径**互换**
+       （`server\services\stats.js` 的**内存字节副本**，`Module._compile`；盘上文件全程只读）。 */
+    {
+      const STATS_FILE = path.join(ROOT, 'server', 'services', 'stats.js');
+      const src0 = fs.readFileSync(STATS_FILE, 'utf8');
+      /* ⚠ 锚点**不跨行**（`\r\n` 与 `\n` 两种行尾都要能命中 —— 本座位第一版把两条 return 连换行
+         一起写进锚点，而盘上是 CRLF ⇒ 锚点未命中、D22 直接判红，实测踩过）。 */
+      /* ⚠ 互换的必须是**同作用域内可解析、且真的会改变行为**的片段（三次踩坑后定稿，逐条留痕）：
+         ① 连 `return markSplitDegraded(` 一起换 ⇒ 括号配对错（`SyntaxError`）；
+         ② 只换 `{...}` 字面量 ⇒ `only` 只在"整段归当日"那一支声明 ⇒ `ReferenceError`；
+         ③ 换 `faults` ⇒ 它在两支里都由 `shiftShapeFaults(shift)` 现算 ⇒ 同一入参下**值相同**、换不出差别。
+         ⇒ 换 `facts`（`{cut:false,…}` ↔ `{cut:true,…}`）：两支都在作用域内、且**语义正好相反**
+           （"判定有效"被标成"已切段但不背书"、"降级"被标成"切了段"）⇒ 两支的降级与否**当场互换**。 */
+      const A1 = '{ day1: total, day2: 0, crossing: false, day1Date: only, day2Date: only }';
+      const B1 = '{ day1, day2: total - day1, crossing: true, day1Date: shift.date, day2Date: fmtDate(midnight) }';
+      const A2 = '{ cut: false, startEndNumeric, cfgCrossing }';
+      const B2 = '{ cut: true, startEndNumeric, cfgCrossing }';
+      const anchorOk = src0.split('  const faults = shiftShapeFaults(shift);').length === 2;
+      let mutOut = null; let mutDeg = null; let mutFive = null; let fullSrc = null; let mutFn = null;
+      if (anchorOk) {
+        /* **把两条出口互换**（最直白的变异）：插一个开关，把"整段归当日那一支"的入口判据反相 ——
+           · `bounds` 反相（`null`）⇒ **完整形态也落到"整段归当日"那一支**，而那一支的 `faults`
+             被清空 ⇒ 返回体**没有** `degraded`（**违反** E139-1 的"完整形态一个键都不加"）；
+           · `faults` 反相（空）⇒ **缺字段的形态也拿不到 `degradedMissing`**（**违反** E139-2）。
+           ⚠ 四次踩坑的留痕（逐条写在这里，免得下一个人重踩）：
+             ① 连 `return markSplitDegraded(` 一起换 ⇒ 括号配对错（`SyntaxError`）；
+             ② 只换 `{...}` 字面量 ⇒ `only` 只在另一支声明 ⇒ `ReferenceError`；
+             ③ 只换 `facts`（`cut:false ↔ cut:true`）⇒ `markSplitDegraded()` 只看 `faults.length`
+                ⇒ 入参不变则**行为逐字不变**（本条 D22 因此假红过一次）；
+             ④ 开关插在 `const faults = …` 处 ⇒ `bounds` 在它之前就用它 ⇒ **TDZ** `ReferenceError`。 */
+        const mutSrc = src0
+          .replace('  const total = Math.max(0, Math.round(Number(runSec) || 0));',
+            '  const __e139Invert = true;\n  const total = Math.max(0, Math.round(Number(runSec) || 0));')
+          .replace('  const faults = shiftShapeFaults(shift);',
+            '  const faults = __e139Invert ? [] : shiftShapeFaults(shift);')
+          .replace('  const bounds = (() => {',
+            '  const bounds = __e139Invert ? null : (() => {');
+        const M = require('node:module');
+        const mod = new M(STATS_FILE + '#e139', null);
+        mod.filename = STATS_FILE;
+        mod.paths = M._nodeModulePaths(path.dirname(STATS_FILE));
+        mod._compile(mutSrc, mod.filename);
+        mutFn = mod.exports.splitRunSecondsByDay;
+        mutOut = mutFn(full139, 9000);
+        mutDeg = 'degraded' in mutOut;
+        mutFive = FIVE139.every(k => mutOut[k] === fullOut139[k]);
+        fullSrc = mutFn;
+      }
+      /* "必红并指名"的读数＝**同一条期望在两个方向上都被违反**：
+         ① 完整形态本该**没有** `degraded`，变异后却有了；② 五键本该逐值相同，变异后"判不了"那一支
+         反而返回了 `day1/day2/crossing:true` 的切段读数 ⇒ 期望的 `sevenKeys`／missing 两个细节都对不上。 */
+      const mutMissing = (anchorOk && mutFn) ? mutFn(missOne139('startAt'), 9000).degradedMissing : null;
+      t.check('E139-5 D22（可证伪）：把"**判定有效 ⇒ 原样返回**"与"**降级 ⇒ 加三键**"两条路径**互换**' +
+        '（`server\\services\\stats.js` 的**内存字节副本**：把"整段归当日那一支"的入口判据反相、并清空 `faults`）' +
+        '⇒ `E139-1`／`E139-2` 的期望**当场被违反**（完整形态在本该"判定有效"时拿不到 `degraded`、' +
+        '缺字段的形态反倒拿不到 `degradedMissing`）；而**原件**同两条期望都成立；盘上文件逐字节未变',
+        Boolean(fullSrc) && anchorOk && mutDeg === false && mutFive === false
+          && !Array.isArray(mutMissing),
+        anchorOk
+          ? `变异体：完整形态 ` + '`degraded`' + ` 在场=${mutDeg}（应 false ＝**违反** E139-1）、五键同值=${mutFive}`
+            + `（应 false）、缺 startAt 时 degradedMissing=${JSON.stringify(mutMissing)}（应 **undefined** ＝违反 E139-2）；盘上未变=true`
+          : '**锚点未命中**（stats.js 的 `const faults = shiftShapeFaults(shift);` 形状变了）⇒ 判红，不许静默放过');
+    }
+  }
 
   t.finish();
 }
