@@ -114,7 +114,44 @@ function stripXml(xml) {
   return xml.replace(/<[^>]+>/g, '').replace(/\s+/g, '');
 }
 
-/* ---------------- 调 PowerShell 跑文档转换脚本（输出重定向到文件，避开沙箱管道限制） ---------------- */
+/* ---------------- 调 PowerShell 跑文档转换脚本（输出重定向到文件，避开沙箱管道限制） ----------------
+   **`E116`（2026-10-04）**：工具脚本的**受控输入口**。设 `DSH_DOCS_TOOL_DIR` ⇒ 从该目录按**同样的相对布局**
+   取 `.ps1`（供定点回归用一把"退 0 但不产出"的假工具）；**不设**就还是 `tools\<同名>`，正式运行的读入面一字不变。
+   与 `docs-cross-check` 的 `DSH_DC_*_OVERRIDE`／`offline-check` 的 `DSH_OFFLINE_PKG` 同一口径：
+   换"被测输入"的**受控副本**，而不是去改真工具或真产物。 */
+function toolPath(scriptRel) {
+  return path.join(process.env.DSH_DOCS_TOOL_DIR || ROOT, scriptRel);
+}
+
+/**
+ * **工具调用的处置口径**（纯函数；`E116` 的判据本体，D1 与 D1b 共用这一份 —— 不许两处各写一套）。
+ *
+ * 立案（座位 5 在 `C·20.7` `F-9` 报出）：原式是 `code !== 0 || !existsSync(产物)` ⇒ `skip(...)`，
+ * 于是"**工具自报成功（退 0）却删掉了自己的产物**"（2026-10-04 真实出现过）被记成 **SKIP**：
+ * D1/D1b 的 17 条断言压成 2 条 SKIP、`docs-check` 由 46/2 掉到 29/2/2、连带 `docs-cross-check`
+ * 第十一节红、整轮权威对账被挡（护栏是对的，**症状描述误导**）。
+ * 现口径：
+ *   · **退 0 但产物不存在/为空** ⇒ **fail**，文案点明"**工具自报成功但无产物**"（不是"工具不可用"）；
+ *   · **退出码非 0** ⇒ **fail**（工具真失败，不是环境问题）；
+ *   · **SKIP 只留给真·环境不满足**，且两种理由**分开表述**：① PowerShell 解释器不可用；
+ *     ② 工具脚本文件不存在。既有语义保留：环境不满足**不算失败**（`9.5-5` 的 skip 通道不删）。
+ * @param {{toolExists:boolean, spawnError:string, code:number, artifactBytes:?number,
+ *          artifactRel:string, toolLabel:string}} r
+ * @returns {{verdict:'skip'|'fail'|'ok', why:string}}
+ */
+function classifyToolRun(r) {
+  if (!r.toolExists) return { verdict: 'skip', why: `环境不满足（工具脚本文件不存在）：${r.toolLabel}` };
+  if (r.spawnError) return { verdict: 'skip', why: `环境不满足（无法启动 PowerShell）：${r.spawnError}` };
+  if (r.code !== 0) return { verdict: 'fail', why: `${r.toolLabel} 退出码 ${r.code}（工具自报失败）` };
+  if (r.artifactBytes === null || r.artifactBytes === undefined) {
+    return { verdict: 'fail', why: `${r.toolLabel} **工具自报成功但无产物**：退出码 0，产物文件不存在（${r.artifactRel}）` };
+  }
+  if (r.artifactBytes <= 0) {
+    return { verdict: 'fail', why: `${r.toolLabel} **工具自报成功但产物为空**：退出码 0，产物 0 字节（${r.artifactRel}）` };
+  }
+  return { verdict: 'ok', why: '' };
+}
+
 function runPowerShell(scriptRel, args, logName) {
   const shell = process.env.DSH_POWERSHELL || 'powershell.exe';
   const log = path.join(TMP, logName);
@@ -122,11 +159,17 @@ function runPowerShell(scriptRel, args, logName) {
   try {
     execFileSync(shell, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-      '-File', path.join(ROOT, scriptRel)
+      '-File', toolPath(scriptRel)
     ].concat(args), { stdio: ['ignore', fd, fd], cwd: ROOT });
-    return { code: 0, log: fs.readFileSync(log, 'utf8') };
+    return { code: 0, spawnError: '', log: fs.readFileSync(log, 'utf8') };
   } catch (e) {
-    return { code: e.status === undefined ? -1 : e.status, log: fs.readFileSync(log, 'utf8') };
+    /* `status === undefined` ＝ **没能跑起来**（解释器不在／被策略拒绝／超时）⇒ 环境不满足的那一类，
+       由 `classifyToolRun()` 判 SKIP；有 status 就是工具自己的退出码 ⇒ 归 fail。 */
+    return {
+      code: e.status === undefined ? -1 : e.status,
+      spawnError: e.status === undefined ? String(e.code || e.message || e) : '',
+      log: fs.readFileSync(log, 'utf8')
+    };
   } finally {
     fs.closeSync(fd);
   }
@@ -197,8 +240,16 @@ async function main() {
   for (const f of [basicDocx, imgDocx]) if (fs.existsSync(f)) fs.unlinkSync(f);
 
   const basic = runPowerShell('tools/md2docx.ps1', ['-InPath', sampleMd, '-OutPath', basicDocx, '-DocTitle', '自检样例'], 'md2docx-basic.log');
-  if (basic.code !== 0 || !fs.existsSync(basicDocx)) {
-    skip('md2docx 基础版语法覆盖', `脚本退出码 ${basic.code}；日志：${basic.log.trim().split('\n').slice(-3).join(' / ')}`);
+  /* `E116`：**退 0 但无产物 ⇒ FAIL 并指名**（不再记 SKIP）；SKIP 只留给真·环境不满足。 */
+  const basicStat = fs.existsSync(basicDocx) ? fs.statSync(basicDocx).size : null;
+  const basicVerdict = classifyToolRun({
+    toolExists: fs.existsSync(toolPath('tools/md2docx.ps1')), spawnError: basic.spawnError, code: basic.code,
+    artifactBytes: basicStat, artifactRel: path.relative(ROOT, basicDocx), toolLabel: 'md2docx 基础版'
+  });
+  if (basicVerdict.verdict !== 'ok') {
+    const why = `${basicVerdict.why}；工具日志末 3 行：${basic.log.trim().split('\n').slice(-3).join(' / ')}`;
+    if (basicVerdict.verdict === 'skip') skip('md2docx 基础版语法覆盖', why);
+    else check('md2docx 基础版语法覆盖', false, why);
   } else {
     const doc = zipEntryText(basicDocx, 'word/document.xml');
     const styles = zipEntryText(basicDocx, 'word/styles.xml');
@@ -223,8 +274,16 @@ async function main() {
   /* ===== D1b md2docx-img 增强版 ===== */
   section('D1b md2docx-img 图片能力（工具说明第五章）');
   const img = runPowerShell('tools/md2docx-img.ps1', ['-InPath', sampleMd, '-OutPath', imgDocx, '-DocTitle', '自检样例图片版'], 'md2docx-img.log');
-  if (img.code !== 0 || !fs.existsSync(imgDocx)) {
-    skip('md2docx-img 图片能力', `脚本退出码 ${img.code}；日志：${img.log.trim().split('\n').slice(-3).join(' / ')}`);
+  /* `E116`：同一份处置判据（`classifyToolRun`）—— D1 与 D1b **不各写一套**。 */
+  const imgStat = fs.existsSync(imgDocx) ? fs.statSync(imgDocx).size : null;
+  const imgVerdict = classifyToolRun({
+    toolExists: fs.existsSync(toolPath('tools/md2docx-img.ps1')), spawnError: img.spawnError, code: img.code,
+    artifactBytes: imgStat, artifactRel: path.relative(ROOT, imgDocx), toolLabel: 'md2docx-img 图片版'
+  });
+  if (imgVerdict.verdict !== 'ok') {
+    const why = `${imgVerdict.why}；工具日志末 3 行：${img.log.trim().split('\n').slice(-3).join(' / ')}`;
+    if (imgVerdict.verdict === 'skip') skip('md2docx-img 图片能力', why);
+    else check('md2docx-img 图片能力', false, why);
   } else {
     const names = [...zipEntries(imgDocx).keys()];
     const media = names.filter(n => n.includes('media'));

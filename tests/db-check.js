@@ -507,7 +507,13 @@ async function main() {
       detail = '未抛错（前提不成立）';
     } catch (err) { threw = true; detail = err.message.slice(0, 50); }
     let removable = false;
-    try { fs.rmSync(lockDir, { recursive: true, force: true }); removable = true; }
+    /* `E117`（2026-10-04）：改用 `env.removeLinkSafe()` —— 它先 `lstatSync` 判"目录项自身"是不是链接
+       （是链接 ⇒ **只拆链、不递归**），**不是**链接时走的仍是原来的 `rmSync(…, {recursive:true, force})`
+       ⇒ 对"自建临时目录"这条正常路径**逐字等价**（`env.js` 的 `E46`/`E90` 段有实现与不变量说明）。
+       本处 `lockDir` 是 `fs.mkdtempSync(tempRoot, 'openDb-lock-')` 刚建的一次性目录，
+       **结构上不可能是链接**；改走安全删除是"即使判断错了也不会连带删到目标"的兜底，
+       同时让 `harness-check` 的 `E103-B①` 判据不必再为它开存量豁免。 */
+    try { env.removeLinkSafe(lockDir, { recursive: true, force: true }); removable = true; }
     catch (err) { detail += ` | 删除失败:${err.code}（连接泄漏，文件被锁）`; }
     t.check('P2-6：openDb 在 PRAGMA 失败时抛错且不泄漏连接（临时文件可删，不锁文件）',
       threw && removable, detail);
@@ -3849,7 +3855,9 @@ async function main() {
      不删就会在临时区里堆 e44-* 目录（与第十节"临时区与残留"的口径一致）。 */
   const e44OwnDirs = [e44Dir, e44SyncDir, e44EqDir, e44LegacyDir, e44PreDir, e44MixDir, e44RollDir];
   for (const d of e44OwnDirs) {
-    try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* 删不掉要能看见，故下面单独断言 */ }
+    /* `E117`（2026-10-04）：`env.removeLinkSafe()` —— 非链接时与原 `rmSync(recursive)` 逐字等价；
+       这些目录全部由 `makeTempDir()` 在本轮临时区里刚建（结构上不可能是链接）。 */
+    try { env.removeLinkSafe(d, { recursive: true, force: true }); } catch { /* 删不掉要能看见，故下面单独断言 */ }
   }
   t.check('E44：本段自建的备份目录（含同秒 5 份的那几个）用完即删，临时区不留 e44-* 残留',
     e44OwnDirs.every(d => !fs.existsSync(d)),
@@ -5109,7 +5117,9 @@ async function main() {
   t.check('临时库文件都不在临时区根目录（各用例自有子目录，不会互相干扰）',
     strayDb.length === 0, strayDb.slice(0, 3).join(', '));
 
-  fs.rmSync(backupDir, { recursive: true, force: true });
+  /* `E117`（2026-10-04）：`env.removeLinkSafe()` —— 非链接时与 `rmSync(recursive)` 逐字等价（含 force）。
+     `backupDir` 是本节自建的备份目录（`makeTempDir()`），结构上不可能是链接。 */
+  env.removeLinkSafe(backupDir, { recursive: true, force: true });
   const tempDir = handle.dir;
   const closeProblems = handle.close();
   const leftover = fs.existsSync(tempDir);

@@ -4407,7 +4407,7 @@ t.section('九、防回潮断言的定点变异（旧实现必须被现有断言
 
    ⚠ **`E70` 收口（2026-10-03，`T-20261003-08` 甲组）：本段过去是"改写真文件 `tests\README.md` 再还原"。**
    事故（同日实证）：某轮改写**未被还原**（`finally` 没跑到 / 与并发轮次交叠），README 权威区
-   （第 151 行的"合计"）被留成 `541` ＝ **多脚本子集通过数之和** —— 正是本段写入的**中间态值**；
+   （**权威行的"合计"** —— 按**内容**定位：`tests\README.md` 里形如「合计 N 通过 / 2 失败 / 6 跳过」的那一行；`E113`（2026-10-04）核出原注释写的"第 151 行"**已漂移**（该行此刻在 **152** 行），故本行起**不再写行号**）被留成 `541` ＝ **多脚本子集通过数之和** —— 正是本段写入的**中间态值**；
    权威区被静默污染，之后每轮对账都指向错值，只有"逐行比对 HEAD"才发现。
    ⇒ 现在一律**指向受控副本**：
         `<本轮专属临时区>\readme-authority-copy\README.md`
@@ -5624,9 +5624,19 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     })());
   /* `E70-C`（甲组的**通用**端到端形态）：**跑一轮门禁后，受管文件的 sha256 与本轮开始时相同**
      （至少 `tests\README.md`）。受管面清单与"为什么是这些"见文件顶部 `managedGuardCensus()` 的注释
-     （普查结果：受管面共 92 个文本文件 ＋ 11 张基准图；全量门禁轮里**唯一**曾被运行期改写的受管文件
+     （普查结果：受管面共 **93** 个文本文件 ＋ **11** 个基准目录条目（＝`tests\screenshots-baseline\` 下
+      **10 张 PNG** ＋ 该目录的 `README.md`；`pngCount` 数的是"目录里的文件数"，那个 `README.md`
+      同时也在 93 里 ⇒ 打印值要按"93 文本 ＋ 11 条目"读，**不是**"93 ＋ 11 张图"）；全量门禁轮里**唯一**曾被运行期改写的受管文件
      就是 `tests\README.md`，写入点正是本脚本第十节 —— `E70` 已把它改成只写受控副本；
      `tests\screenshots-baseline\*` 的唯一写入点是人工开关 `capture-baseline --update`，门禁轮从不带它）。
+     ⚠ **`E113`（2026-10-04）：同一个"受管文本数"为什么会在本文件里出现 92 与 93 两个值** ——
+     本行原写的 `92` 是 `dfb6e45`（`E70` 收口那一笔）**当时实测的正确值**；同一批紧接着的
+     `6973c47`（`E9` 新增 `tests\offline-check.js`）把受管文本 **92 → 93**（新增的 `.js` 落在
+     `tests\` 下，正是 `snapshot.PROJECT_DIRS` 的四个目录之一，且扩展名在 `TEXT_EXTS` 里），
+     而稍后 `22b2a53`（`E104`）新写的那两处已经写 93 ⇒ **不是"谁算错了"，是"先写下的数字被同一批
+     的后一笔改动追上了"**。逐版本实算（只列文件名、不引入行号）：`dfb6e45`=92／`6973c47`=93／
+     `22b2a53`=93／`HEAD`=93。**防再漂的写法**：受管面数字**只从运行时打印取**（`textCount` 是
+     动态算出来的）；注释里再引用它时，要么写"见运行时打印"，要么与本节一起同步改。
      ⚠ 如实记账（本条的边界）：若**他路**在窗口内改写受管文件（并行开发期），这条同样会红 ——
      与 `run-all` 自己的"工作区稳定性"同一口径（那时本轮结论不可作证据，须停笔后复跑）；
      本条窗口只有一轮 `--only docs-check`（≈6 s），比 run-all 自身的全量窗口窄。 */
@@ -5867,10 +5877,34 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     return m.exports;
   };
   const serialTailNames15 = runAll15.SUITES.filter(s => s.serialTail).map(s => s.name);
-  const needTail15 = ['docs-cross-check', 'docs-check', 'files-check'];
-  t.check('§15-A 静态：对并发敏感的三个脚本必须标 `serialTail`（并行时只落在串行尾）',
-    needTail15.every(n => serialTailNames15.includes(n)),
-    `实际 serialTail = [${serialTailNames15.join('、') || '（空）'}]；期望包含 [${needTail15.join('、')}]`);
+  /* **`E111`（2026-10-04）：期望集由真源现算，不再只手写三条**（座位 5 在 `C·20.7` `F-4` 立案：
+     原判据只断言"**必须包含**手写的三条"，于是本批给 `browser-check`／`overlap-check`／
+     `stress-check` 加的 `serialTail: true` **不在期望集里** ⇒ 改回去（或只改一条）门禁照绿）。 */
+  /* ① **浏览器/CDP 类**：`needBrowser === true` 的脚本在 `--jobs N` 下会互抢 Edge/CDP/端口
+        （`E70③` 的现场：`browser-check` 偶发整脚本失败）⇒ **凡 `needBrowser` 必 `serialTail`**。
+        这一条**从 `SUITES` 现算** —— 将来新增一个需浏览器的脚本，不改本判据也会自动被要求。 */
+  const needTailBrowser15 = runAll15.SUITES.filter(s => s.needBrowser).map(s => s.name);
+  /* ② **离线并发敏感三类**：`docs-cross-check` 要读全量账本；`docs-check` 会真跑 PowerShell **写盘**；
+        `files-check` 要全树扫描 —— 后两者并行会互相干扰。这三条机器读不出"敏感"这个属性
+        （`SUITES` 里没有对应字段）⇒ 只能**显式列名 ＋ 逐条理由**（理由见本节抬头与 §15-A 的说明），
+        并靠下面的 **§15-A′ 反向断言** 与 **§15-E／§15-F 的定点变异**一起守着（不让它悄悄漂）。 */
+  const needTailOffline15 = ['docs-cross-check', 'docs-check', 'files-check'];
+  const needTail15 = Array.from(new Set(needTailOffline15.concat(needTailBrowser15)));
+  const missingTail15 = needTail15.filter(n => !serialTailNames15.includes(n));
+  const extraTail15 = serialTailNames15.filter(n => !needTail15.includes(n));
+  t.check('§15-A 静态（**期望集由真源现算**）：凡 `needBrowser === true` 的脚本**必须**标 `serialTail`'
+    + '（`E70③`：浏览器/CDP 类并行互抢 Edge/端口/CPU），再加上离线并发敏感的三类'
+    + '（`docs-cross-check`／`docs-check`／`files-check`，理由见本节抬头）',
+    missingTail15.length === 0,
+    `实际 serialTail = [${serialTailNames15.join('、') || '（空）'}]；期望包含 [${needTail15.join('、')}]`
+      + `（其中浏览器类由 \`needBrowser\` **现算** = [${needTailBrowser15.join('、') || '（无）'}]）`
+      + (missingTail15.length ? `；**判红：缺标 ${missingTail15.length} 条并指名** —— ${missingTail15.join('、')}` : ''));
+  t.check('§15-A′ 静态**反向**：`serialTail` 集合 **⊆** 期望集（没有脚本"偷偷"进串行尾 ——'
+    + '串行尾是拿墙钟换稳定，多标一条就是白付代价，且会让 §15-A 的期望集失去意义）',
+    extraTail15.length === 0,
+    extraTail15.length
+      ? `判红：**期望集之外多标 ${extraTail15.length} 条并指名** —— ${extraTail15.join('、')}`
+      : `零多标（实际 ${serialTailNames15.length} 条全部在期望集里：${serialTailNames15.join('、') || '（空）'}）`);
 
   t.check('§15-B 静态：并发度默认 1（串行）—— 并行必须显式开启，不改"作证据的默认路径"（E52）',
     /function\s+resolveJobs\(\)\s*\{[\s\S]{0,400}?if\s*\(!String\(raw\)\.trim\(\)\)\s*return\s+1;/.test(src15),
@@ -5895,7 +5929,8 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
      并行波），否则**显式打印"本轮为子集/串行 ⇒ 不判定"并以 `t.skip` 记账** ——
      "不判定"与"通过"在台账上必须分得开（这正是 `D23` 要的口径）：
        ①**默认档**（本节 fork 的子集轮）：恒为"不判定"（`--only` 强制串行）；
-       ②**`DSH_HARNESS_S15_FULL=1` 档**：改跑 `--fast`（13 个脚本）串行 vs `--fast --jobs 2`
+       ②**`DSH_HARNESS_S15_FULL=1` 档**：改跑 `--fast`（**14** 个脚本 —— `!slow && !needBrowser` 的离线门禁，
+          `E113`（2026-10-04）核出原写"13 个"是 `offline-check` 入册前的旧数，与 `run-all.js` 注释里的 14 不符）串行 vs `--fast --jobs 2`
          ⇒ 该判据回到"**可判定**"（真并行波 10 个）。
      为什么第②档做成**显式档位**而不是默认：那一档每次给 harness-check 加约 2 分钟
      （ADR-0004 准则 6"成本可控"），且 `--fast` 含本脚本 ⇒ 需要一层递归护栏
@@ -5905,6 +5940,17 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
   const S15_CHILD = String(process.env.DSH_HARNESS_S15_CHILD || '').trim() === '1';
   const S15_JOBS = S15_FULL ? 2 : 4;
   const S15_MODE = S15_FULL ? 'fast' : 'subset';
+  /** **该轮自己声明的实跑账路径**（`E110`，2026-10-04）：`run-all` 在开跑前会打印
+   *  `  实跑账：<repo 相对路径>（…）`（见 `run-all.js` 开头 `ledgerFile()` 那一段）——
+   *  子集轮＝`run-totals.subset-<子进程 pid>.json`，全量/`--fast` 轮＝主账本 `run-totals.json`。
+   *  **为什么不写死主账本**（`F-3` 的病灶）：`E99` 之后子集轮**不再写主账本** ⇒ 写死路径读到的是
+   *  **上一轮全量**的账，于是 §15-C 打印的"实测读数"会被读成"**本轮的**"（读数**归属错**）。
+   *  这里只做"取路径"这一件事，判据仍旧是 `§15-C`/`§15-D` 原有的那两条，**不改期望、不删判据**。
+   *  @returns {?string} 绝对路径（解析不到就返回 null，由调用方回落到"本轮应有路径"） */
+  const ledgerPathFromOut15 = (out) => {
+    const m = String(out || '').match(/实跑账：(.+?)（/);
+    return m ? path.resolve(env.paths.root, m[1].trim()) : null;
+  };
   const runFast15 = (jobs) => {
     /* ⚠ 子集档必须**逗号分隔的单个 `--only`**：`optValue('--only')` 只取一个值，
        重复传多个 `--only` 只会生效最后一个（实测过一次"共 1 个脚本"的假象）。 */
@@ -5921,9 +5967,29 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       env: { ...process.env, DSH_ENV: env.ENV_NAME, DSH_JOBS: jobs > 1 ? '' : '1', DSH_HARNESS_S15_CHILD: '1' }
     });
     const ms = Date.now() - started;
+    const out = (res.stdout || '') + (res.stderr || '');
+    /* **读该轮自己的账**（`E110`）：① 先认子进程 stdout 里**它自己声明**的那条路径；
+       ② 认不到就按 `run-all` 导出的 `resolveLedgerFile()`（**同一个真源**，pid 取子进程的）
+       算"本轮应有的路径" —— 两条都拿不到才回落主账本（并如实记 `from`，见下面的归属判据）。 */
+    let readPath = ledgerPathFromOut15(res.stdout);
+    let from = 'child-declared';
+    if (!readPath) {
+      from = 'resolveLedgerFile';
+      try {
+        readPath = runAll15.resolveLedgerFile({
+          explicit: null, only: S15_MODE === 'subset' ? S15_SUITES.join(',') : null,
+          verifyDir: env.paths.verify, pid: res.pid === undefined ? process.pid : res.pid, root: env.paths.root
+        });
+      } catch { readPath = null; }
+    }
+    if (!readPath) { from = 'fallback-main'; readPath = path.join(env.paths.verify, 'run-totals.json'); }
     let ledger = null;
-    try { ledger = JSON.parse(fs.readFileSync(path.join(env.paths.verify, 'run-totals.json'), 'utf8')); } catch { ledger = null; }
-    return { out: (res.stdout || '') + (res.stderr || ''), ms, ledger, code: res.status };
+    try { ledger = JSON.parse(fs.readFileSync(readPath, 'utf8')); } catch { ledger = null; }
+    return {
+      out, ms, ledger, code: res.status, childPid: res.pid,
+      ledgerPath: readPath, ledgerRel: path.relative(env.paths.root, readPath).split(path.sep).join('\\'),
+      ledgerFrom: from, ledgerExists: fs.existsSync(readPath)
+    };
   };
   const shape15 = L => (L && Array.isArray(L.suites))
     ? L.suites.map(s => `${s.name}:${s.status}:${s.summary ? s.summary.passed + '/' + s.summary.failed + '/' + s.summary.skipped : '-'}`).join(' | ')
@@ -5965,6 +6031,55 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
   const round15 = S15_CHILD
     ? { judged: false, count: 0, wave: 0, waveJobs: 0, reason: '嵌套子轮（不再 fork，故没有可判定读数）' }
     : parallelRound15(par15);
+  /* ---- `E110`（2026-10-04）：**读数归属** —— §15-C／§15-D 打印的"实测读数"必须来自**本轮** ----
+     立案（座位 5 `C·20.7` `F-3`）：本节过去写死 `path.join(env.paths.verify,'run-totals.json')` 回读，
+     而 `E99` 之后**子集轮不再写主账本** ⇒ 子集档读到的是**上一轮全量**的账：
+     同一段 `§15-C` 文字在"跑全量之前"是 `docs-check:failed:46/2/0`、在"跑完全量之后"变成
+     `29/2/2`，而中间 §15 的嵌套轮**什么都没做** ⇒ 那串数字被读成"**本轮的**"是**归属错**。
+     改法**只在读的那一侧**：`runFast15()` 改为读**该轮自己声明的账本**（见它上方的
+     `ledgerPathFromOut15()`），**不动** `run-all.js` 的调度（`--fast` 刻意不改道 —— 那条意图由
+     下面这条断言的 `fast` 分支**从读者侧**锁住，见 `readme`／`run-all.js` 的 `resolveLedgerFile` 注释）。
+     **两端口径**（都从 `runFast15()` 实际读到的路径推出，不另抄一份规则）：
+       · 子集档：两轮必须各读**自己的子集账**（`run-totals.subset-<子进程 pid>.json`）、
+         **都不是主账本**，且账内 `ranSuites` ＝本轮请求的那 6 个脚本（这就是"读的是本轮"的实证）；
+       · `DSH_HARNESS_S15_FULL=1`（`--fast`）档：两轮读的**必须都是主账本** ——
+         把"`--fast` 不改道"这条 `run-all.js` 的刻意意图钉在判据里（若哪天有人给 `--fast` 也改道，
+         这里会红，而不是悄悄退回"拿两份旧账互比"）。 */
+  const mainLedgerName15 = runAll15.MAIN_LEDGER_NAME;   /* 'run-totals.json'：按**文件名**比，
+     因为 `ledgerRel` 是"相对仓库根的路径"（`tests\._verify\run-totals.json`），两者不是一回事 */
+  if (S15_CHILD) {
+    t.skip('§15-C′ 读数归属（`E110`）：§15 打印的读数必须来自**本轮**（**嵌套子轮不判定**）',
+      '本进程是 §15-C 自己 fork 出来的子轮（`DSH_HARNESS_S15_CHILD=1`）⇒ 本轮没有 fork 过任何轮次，无读数可归属');
+  } else {
+    const reqSuites15 = (S15_MODE === 'subset'
+      ? S15_SUITES.slice()
+      : runAll15.SUITES.filter(s => !s.slow && !s.needBrowser).map(s => s.name)).slice().sort();
+    /* ⚠ 账本里会多一条 **`capture-baseline`**（`E91` 的截图前置刷新）—— 它**不在 `SUITES` 里**
+       （见 `run-all.js` 的 `CAPTURE_SUITE` 注释），但 `--fast` 轮含 `screenshot-diff` ⇒ 前置刷新会跑，
+       并随并行波一起落账。故比对前先按 `SUITES` 名单过滤（与 §15-C 的 `inSuites15` 同一口径）。 */
+    const suitesAll15 = runAll15.SUITES.map(s => s.name);
+    const ranOf15 = (run) => (run && run.ledger && Array.isArray(run.ledger.ranSuites)
+      ? run.ledger.ranSuites.filter(n => suitesAll15.indexOf(n) >= 0).sort() : null);
+    const bothPresent15 = Boolean(ser15 && par15 && ser15.ledger && par15.ledger);
+    const nameOfLedger15 = (run) => (run && run.ledgerPath ? path.basename(run.ledgerPath) : null);
+    const ownSubsetOk15 = S15_MODE !== 'subset' || (
+      nameOfLedger15(ser15) !== mainLedgerName15 && nameOfLedger15(par15) !== mainLedgerName15
+      && ser15.ledgerPath !== par15.ledgerPath
+      && ser15.ledgerExists && par15.ledgerExists
+      && JSON.stringify(ranOf15(ser15)) === JSON.stringify(reqSuites15)
+      && JSON.stringify(ranOf15(par15)) === JSON.stringify(reqSuites15));
+    const fastMainOk15 = S15_MODE !== 'fast' || (
+      nameOfLedger15(ser15) === mainLedgerName15 && nameOfLedger15(par15) === mainLedgerName15);
+    t.check('§15-C′ 读数归属（`E110`）：§15-C／§15-D 打印的"实测读数"来自**本轮自己的账本**'
+      + '（子集档＝各自的 `run-totals.subset-<pid>.json`、**都不是**主账本、账内脚本清单＝本轮请求；'
+      + '`DSH_HARNESS_S15_FULL=1` 档＝两轮都读主账本，把"`--fast` 不改道"的意图从读者侧锁住）',
+      bothPresent15 && ownSubsetOk15 && fastMainOk15,
+      `档位 ${S15_MODE}（请求脚本 ${reqSuites15.length} 个：${reqSuites15.join('、')}）；`
+        + `串行轮读到 \`${ser15 ? ser15.ledgerRel : '（未跑）'}\`（来源 ${ser15 ? ser15.ledgerFrom : '-'}，`
+        + `账内 ranSuites=${JSON.stringify(ranOf15(ser15))}）；`
+        + `并行轮读到 \`${par15 ? par15.ledgerRel : '（未跑）'}\`（来源 ${par15 ? par15.ledgerFrom : '-'}，`
+        + `账内 ranSuites=${JSON.stringify(ranOf15(par15))}）`);
+  }
   /* ---- §15-C 的三个子句（口径）----
      ① 逐脚本**内容**（状态 ＋ 条数）与串行逐条相同 —— **按名比对、与顺序无关**（并行只改"谁和谁同时跑"）；
      ② 断言合计（`assertions`）逐字段相同；
@@ -6006,6 +6121,8 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     && orderOk15(ser15.ledger.ranSuites, expectSerialOrder15)
     && orderOk15(par15.ledger.ranSuites, expectWaveThenTail15));
   const c15Shape = `串行【${contentShape15(ser15 && ser15.ledger)}】\n        并行【${contentShape15(par15 && par15.ledger)}】\n`
+    + `        账本归属（\`E110\`）：串行 \`${ser15 ? ser15.ledgerRel : '（未跑）'}\`、`
+    + `并行 \`${par15 ? par15.ledgerRel : '（未跑）'}\` —— **读的是各轮自己声明的那一份**，不是写死的路径\n`
     + `        串行断言 ${JSON.stringify((ser15 && ser15.ledger && ser15.ledger.assertions) || null)}；`
     + `并行断言 ${JSON.stringify((par15 && par15.ledger && par15.ledger.assertions) || null)}\n`
     + `        账本顺序：串行 ${JSON.stringify((ser15 && ser15.ledger && ser15.ledger.ranSuites) || null)}`
@@ -6022,6 +6139,8 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       `不判定（本轮为子集/串行）：${round15.reason}。实测读数：串行 ${ser15 ? ser15.ms + ' ms' : '（未跑）'} ↔ `
       + `并行 ${par15 ? par15.ms + ' ms' : '（未跑）'}（两者几乎相同＝同一条串行路径测了两遍 —— 这正是 E96 的现场）。`
       + `逐脚本形态：${shape15(ser15 && ser15.ledger)} ／ ${shape15(par15 && par15.ledger)}。`
+      + `账本归属（\`E110\`）：串行读 \`${ser15 ? ser15.ledgerRel : '（未跑）'}\`、`
+      + `并行读 \`${par15 ? par15.ledgerRel : '（未跑）'}\` —— **本轮的账**，不再随主账本漂。`
       + '【不判定 ≠ 通过】：要拿可判定读数，请跑 `DSH_HARNESS_S15_FULL=1 node tests\\harness-check.js`（真并行波档）');
     t.info(`§15-C 本轮为**子集/串行 ⇒ 不判定**：${round15.reason}；`
       + `串行 ${ser15 ? ser15.ms : '?'} ms ↔ 并行 ${par15 ? par15.ms : '?'} ms`
@@ -6043,7 +6162,7 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
      那本身就是空洞判据的另一种形态）。取数走 `run-all` **自己的** `scheduleSuites()`
      （真源，不另抄一份调度规则；`loadVariant15` 在源码尾部**追加一行导出**，不落地、不碰仓库）。 */
   t.check('§15-C0 构成性：`真并行轮`的配置**存在且确实产出并行波**' +
-    '（`scheduleSuites(13 个 --fast 脚本, --jobs 2)` ⇒ 并行波 ≥8、并发 2）⇒ §15-C 的"可判定"分支可达（不是死代码）',
+    '（`scheduleSuites(14 个 --fast 脚本, --jobs 2)` ⇒ 并行波 ≥8、并发 2）⇒ §15-C 的"可判定"分支可达（不是死代码）',
     (() => {
       let plan = null;
       try {
@@ -6059,27 +6178,211 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     + `（源码文本实测命中＝${/if\s*\(!\(jobs > 1\)\s*\|\|\s*optValue\('--only'\)\)/.test(src15)}）——`
     + '故默认档报"不判定"，`DSH_HARNESS_S15_FULL=1` 档报"可判定"');
 
-  /* D22 定点变异：把 docs-cross-check 的 serialTail 去掉 ⇒ A 必须变红（证明不是恒真断言） */
-  t.check('§15-E D22 变异：去掉 `docs-cross-check` 的 `serialTail` ⇒ §15-A 判据必红；恢复后回绿',
-    (() => {
-      const anchor = "{ name: 'docs-cross-check', desc: '跨文档一致性 + 权威数字校验', needBrowser: false, slow: false, serialTail: true }";
-      if (!src15.includes(anchor)) { t.info('§15-E 变异锚点未命中（清单那行被改过）'); return false; }
-      const mutatedSrc = src15.replace(anchor, anchor.replace(', serialTail: true', ''));
-      let mutated = null;
-      try { mutated = loadVariant15(mutatedSrc); } catch (err) { t.info('§15-E 变异体载入失败：' + (err && err.message)); return false; }
-      const mutatedTails = mutated.SUITES.filter(s => s.serialTail).map(s => s.name);
-      const mutatedRed = !needTail15.every(n => mutatedTails.includes(n));
-      const currentGreen = needTail15.every(n => serialTailNames15.includes(n));
-      return mutatedRed && currentGreen;
-    })(),
-    '变异内容：删掉 docs-cross-check 那条的 `serialTail: true`（它并行时会在别的脚本还没跑完时去读账本）');
+  /* D22 定点变异：把某条脚本的 `serialTail` 去掉 ⇒ §15-A 必须变红（证明不是恒真断言）。
+     **`E111`（2026-10-04）**：原来只覆盖 `docs-cross-check`（离线类），而本批新收进串行尾的正是
+     三条**浏览器/CDP 类** ⇒ 按 `F-4` 的建议把 D22 **扩到至少一条浏览器类脚本**，并且两条走
+     **同一份判据**（`missingTail15` 的计算方式与 §15-A 逐字同源：都拿 `needTail15` 逐个比对）。
+     实现细节（可证伪性的门槛）：锚点**按符号定位、不引行号**（清单那行由别人维护，行号会漂），
+     且**回读命中数**——`!== 1` 就判红（锚点再漂移时明确报"锚点回读失败"，不许静默空转）。 */
+  const dropTailMutant15 = (name) => {
+    const re = new RegExp(`\\{ name: '${name}',[^\\n]*?, serialTail: true`);
+    const hits = src15.match(new RegExp(re.source, 'g'));
+    if (!hits || hits.length !== 1) return { ok: false, why: `变异锚点命中 ${hits ? hits.length : 0} 处（应恰 1）` };
+    let mutated = null;
+    try { mutated = loadVariant15(src15.replace(re, hits[0].replace(', serialTail: true', ''))); }
+    catch (err) { return { ok: false, why: '变异体载入失败：' + (err && err.message) }; }
+    const mutatedTails = mutated.SUITES.filter(s => s.serialTail).map(s => s.name);
+    const missing = needTail15.filter(n => !mutatedTails.includes(n));
+    return {
+      ok: true, mutatedTails, missing,
+      /* 变异体上"§15-A 会红"＝ missing 非空；**且必须指名它**；现行源码上必须绿（否则断言恒红） */
+      mutatedRedNamed: missing.includes(name),
+      currentGreen: missingTail15.length === 0
+    };
+  };
+  const e15 = dropTailMutant15('docs-cross-check');
+  t.check('§15-E D22 变异（离线类）：去掉 `docs-cross-check` 的 `serialTail` ⇒ §15-A 判据必红**并指名它**'
+    + '（留出缺口 ⇒ 它在别的脚本还没跑完时就去读账本）；现行源码上判绿',
+    e15.ok && e15.mutatedRedNamed && e15.currentGreen,
+    e15.ok
+      ? `变异体 serialTail=[${e15.mutatedTails.join('、')}]；**缺标并指名** = [${e15.missing.join('、')}]`
+        + `（含 docs-cross-check=${e15.missing.includes('docs-cross-check')}，应 true）；现行源码 §15-A 绿=${e15.currentGreen}`
+      : `**判红：${e15.why}** —— 锚点漂了就等于 D22 没跑，不许当通过`);
+  const e15b = dropTailMutant15('browser-check');
+  t.check('§15-F D22 变异（**浏览器/CDP 类**，`E111` 新增）：去掉 `browser-check` 的 `serialTail` ⇒'
+    + ' §15-A 判据必红**并指名 `browser-check`**（`E70③` 的现场就是它）；现行源码上判绿',
+    e15b.ok && e15b.mutatedRedNamed && e15b.currentGreen,
+    e15b.ok
+      ? `变异体 serialTail=[${e15b.mutatedTails.join('、')}]；**缺标并指名** = [${e15b.missing.join('、')}]`
+        + `（含 browser-check=${e15b.missing.includes('browser-check')}，应 true）；现行源码 §15-A 绿=${e15b.currentGreen}`
+      : `**判红：${e15b.why}** —— 锚点漂了就等于 D22 没跑，不许当通过`);
   try {
     fs.writeFileSync(path.join(env.paths.verify, 's15-parallel-runs.txt'),
       JSON.stringify({ mode: S15_MODE, jobs: S15_JOBS, child: S15_CHILD, judged: round15.judged,
         reason: round15.reason, wave: round15.wave, waveJobs: round15.waveJobs, scripts: round15.count,
         serialMs: ser15 && ser15.ms, parallelMs: par15 && par15.ms,
+        /* `E110`：把"读数归属"（每一轮实际读的是哪份账）一并留痕，便于复核者核对 */
+        serialLedger: ser15 && ser15.ledgerRel, parallelLedger: par15 && par15.ledgerRel,
+        serialLedgerFrom: ser15 && ser15.ledgerFrom, parallelLedgerFrom: par15 && par15.ledgerFrom,
         serial: shape15(ser15 && ser15.ledger), parallel: shape15(par15 && par15.ledger) }, null, 2), 'utf8');
   } catch { /* 忽略 */ }
+}
+
+/* ---------------- 十五之②、`E88⒝`／`E99` 的定点回归（`E109`；2026-10-04） ----------------
+   立案（座位 5 在 `C·20.7` `F-2` 报出，`T-20261004-05` 甲组收口）：`tests\run-all.js` 把
+   `pickDetailLines`／`DETAIL_MAX_LINES`／`resolveLedgerFile`／`MAIN_LEDGER_NAME` 导出，并在注释里
+   明写"一并导出，**供定点回归直接调用**"—— 但全仓 `git grep` **除定义处与 `module.exports` 外没有任何调用方**
+   ⇒ 那条"定点回归"**根本不存在**：把 `--only` 改回写主账本、或把明细截断改回 `.slice(0,8)`，**门禁全绿**。
+   本节按 `F-2` 的建议把它补上（**纯函数真值表 ＋ 一条端到端**），编号对应如下：
+     ① `pickDetailLines`：命中 > 上限时**保住每一条"指名"行**（且"指名行比上限还多"时也只丢填充行）／
+        命中 ≤ 上限时**全打**／`null`／`undefined`／空串**不炸**；
+     ② `resolveLedgerFile` 三态：`--ledger` 显式优先（相对路径按**仓库根**解析）／`--only` ⇒ **自己的账本**／
+        其余（**全量轮**与 `--fast`）⇒ **主账本** `run-totals.json`；
+     ③ `failureNote` **刻意不在这里重复** —— 它已由座位 4 在 §十四 自检覆盖（同一件事写第二份真源，
+        本身就是本仓反复出问题的"第二份口径"形态）；
+     ④ **端到端**：`run-all --only <某脚本>` 一轮**前后主账本 `Buffer.compare` 逐字节不变**，
+        且该轮确实声明并写出了**自己的子集账**（这是 `E99` 的实质守据 —— 只测纯函数测不到"谁写了盘"）。
+   纪律：真源一律**直接 require `tests\run-all.js`**（`E99` 的实现就在那儿，不另抄一份规则）；
+   变异一律走 `Module._compile` 的**内存副本**（不落地、不碰仓库、**不用**任何版本控制还原命令）。 */
+t.section('十五之②、E88⒝／E99 的定点回归（E109：纯函数真值表 ＋ 主账本端到端）');
+{
+  const runAll9 = require('./run-all.js');
+  const src9 = fs.readFileSync(path.join(env.paths.tests, 'run-all.js'), 'utf8');
+  const loadVariant9 = (src) => {
+    const Module = require('node:module');
+    const m = new Module(path.join(__dirname, 'run-all.js'), null);
+    m.filename = path.join(__dirname, 'run-all.js');
+    m.paths = Module._nodeModulePaths(__dirname);
+    m._compile(src, m.filename);
+    return m.exports;
+  };
+  /* ---------------- ① `pickDetailLines` 真值表 ---------------- */
+  const pick9 = runAll9.pickDetailLines;
+  const max9 = runAll9.DETAIL_MAX_LINES;
+  /** 造一份"命中 K 行噪声 ＋ N 行指名"的子进程输出：**指名行故意排在最后** ——
+      旧实现 `.slice(0,8)` 丢的正是它们（`E88⒝` 的现场：真 `[FAIL]` 恰排在第 5 位、余量为 0）。 */
+  const out9 = (noiseK, namedK) => Array.from({ length: noiseK }, (_, i) => `  [PASS] 失败清单 噪声条目 ${i + 1}`)
+    .concat(Array.from({ length: namedK }, (_, i) => `  [FAIL] 定点断言 ${i + 1}`)).join('\n') + '\n';
+  const namedIn9 = (lines) => lines.filter(l => /\[FAIL\]/.test(l)).length;
+  const r9a = pick9(out9(30, 3));
+  const r9b = pick9(out9(8, 3));
+  const r9c = pick9(out9(10, max9 + 6));
+  t.check('E109-①a `pickDetailLines`：命中 **33 行**（30 条"失败清单"噪声 ＋ 3 条指名，指名排在最后）'
+    + ' ⇒ 只打上限行数，但 **3 条指名行一条不丢**（余量不足时也先保指名 —— `E88⒝` 的核心口径）',
+    r9a.lines.length === max9 && r9a.dropped === 3 + 30 - max9 && r9a.named === 3 && namedIn9(r9a.lines) === 3,
+    `上限=${max9}；实打 ${r9a.lines.length} 行、丢 ${r9a.dropped} 行、指名 ${r9a.named} 条；`
+      + `打出来的指名行 ${namedIn9(r9a.lines)}/3（应 3/3）`);
+  t.check('E109-①b `pickDetailLines`：命中 **11 行**（≤ 上限）⇒ **全部打印**、`dropped=0`'
+    + '（未触上限时不得提前截断 —— 与旧行为一致的那一半）',
+    r9b.lines.length === 11 && r9b.dropped === 0 && r9b.named === 3,
+    `实打 ${r9b.lines.length} 行（应 11）、丢 ${r9b.dropped} 行（应 0）、指名 ${r9b.named} 条`);
+  t.check('E109-①c `pickDetailLines`：`null`／`undefined`／空串**一律不炸**且返回空清单'
+    + '（拿不到子进程输出的那一路不许把主控台打崩）',
+    (() => {
+      try {
+        const a = pick9(null), b = pick9(undefined), c = pick9('');
+        return a.lines.length === 0 && a.dropped === 0 && b.lines.length === 0 && c.lines.length === 0;
+      } catch { return false; }
+    })(),
+    '三种"没有输出"的入参都必须返回 `{lines:[],dropped:0,named:0}`');
+  t.check('E109-①d `pickDetailLines` 真值表**可证伪**（旧实现在同一输入上必丢指名）：'
+    + '`hits.filter(…).slice(0, 8)` 这条旧写法在①a 的同一份输入上**一条指名行都留不下**（0/3），'
+    + '而现行实现 3/3 —— 两侧读数都给出，证明 ①a 不是恒真式',
+    (() => {
+      const hits = String(out9(30, 3)).split('\n')
+        .filter(l => /\[FAIL\]|失败清单|^\s+\d+\.|脚本异常终止/.test(l));
+      /* 旧实现＝ `hits.filter(过滤器).slice(0, 8)`：**不区分指名/填充，直接砍到 8 行** */
+      const oldShape = hits.slice(0, 8);
+      return hits.length === 33 && oldShape.length === 8 && namedIn9(oldShape) === 0
+        && namedIn9(r9a.lines) === 3;
+    })(),
+    '旧形态（`slice(0,8)`）打出来的 8 行 = 全噪声、指名 0/3；现行实现指名 3/3（同一份输入）');
+  t.check('E109-①e `pickDetailLines`：**指名行比上限还多**时，超出的只能是填充行'
+    + '（口径＝"任何一轮里含 `[FAIL]`／编号的行一行都不会因截断而消失"）',
+    r9c.lines.length === max9 + 6 && r9c.named === max9 + 6 && r9c.dropped === 10 && namedIn9(r9c.lines) === max9 + 6,
+    `输入 ${10} 噪声 ＋ ${max9 + 6} 指名 ⇒ 实打 ${r9c.lines.length} 行（应 ${max9 + 6}）、`
+      + `丢 ${r9c.dropped} 行（应 10，全是噪声）、指名 ${namedIn9(r9c.lines)}/${max9 + 6}`);
+
+  /* ---------------- ② `resolveLedgerFile` 三态真值表（＋ ③ 的边界说明见段首） ---------------- */
+  const rl9 = runAll9.resolveLedgerFile;
+  const verifyDir9 = env.paths.verify;           /* 只用来拼路径：`resolveLedgerFile` 不写任何文件 */
+  const base9 = { verifyDir: verifyDir9, pid: 4242, root: env.paths.root };
+  const pExplicit9 = rl9({ ...base9, explicit: path.join('e', 'x.json'), only: 'copy-check' });
+  const pOnly9 = rl9({ ...base9, explicit: null, only: 'copy-check' });
+  const pFull9 = rl9({ ...base9, explicit: null, only: null });
+  const pFast9 = rl9({ ...base9, explicit: null, only: null });   /* `--fast` ＝ **不带 `--only`** 的全量集合，走同一支 */
+  const nameOf9 = (p) => path.basename(p);
+  t.check('E109-②a `resolveLedgerFile`：**`--ledger` 显式优先**（即使同时带 `--only`），'
+    + '且相对路径按**仓库根**解析（不是按 cwd —— 调用方可能从别处起进程）',
+    pExplicit9 === path.resolve(env.paths.root, path.join('e', 'x.json')),
+    `显式 \`--ledger e\\x.json\` ＋ \`--only copy-check\` ⇒ ${pExplicit9}（应 ${path.resolve(env.paths.root, 'e/x.json')}）`);
+  t.check('E109-②b `resolveLedgerFile`：**子集轮**（带 `--only`）⇒ 写**自己的账本**'
+    + '`run-totals.subset-<pid>.json`，**不是**主账本（`E99` 的实质：残缺账不得覆写共享账本）',
+    nameOf9(pOnly9) === `run-totals.subset-4242.json` && nameOf9(pOnly9) !== runAll9.MAIN_LEDGER_NAME
+      && path.dirname(pOnly9) === path.resolve(verifyDir9),
+    `\`--only copy-check\` ⇒ ${pOnly9}；主账本名 = ${runAll9.MAIN_LEDGER_NAME}`);
+  t.check('E109-②c `resolveLedgerFile`：**全量轮与 `--fast`**（都不带 `--only`）⇒ **主账本**'
+    + '`run-totals.json`，与历史行为逐字相同（`--fast` 刻意不改道：`docs-cross-check` 按这条路径取数）',
+    pFull9 === pFast9 && nameOf9(pFull9) === runAll9.MAIN_LEDGER_NAME
+      && path.dirname(pFull9) === path.resolve(verifyDir9),
+    `无 \`--only\` ⇒ ${pFull9}；\`--fast\`（同一支）⇒ ${pFast9}；主账本名 = ${runAll9.MAIN_LEDGER_NAME}`);
+  t.check('E109-②d 主账本**名字与位置一字不动**（`docs-cross-check` 第十一节按 `verify\\run-totals.json`'
+    + '写死读取 ⇒ 改名/搬家会把权威对账的取数面改坏）',
+    runAll9.MAIN_LEDGER_NAME === 'run-totals.json' && nameOf9(pFull9) === 'run-totals.json',
+    `MAIN_LEDGER_NAME=${runAll9.MAIN_LEDGER_NAME}；主账本路径=${pFull9}`);
+  /* D22（甲组要求：**把 `resolveLedgerFile` 的 `--only` 分支改回主账本 ⇒ 新断言必红并指名**）：
+     变异在**内存副本**上做（`Module._compile`），盘上 `tests\run-all.js` 全程只读（下面用 `Buffer.compare` 证明）。 */
+  const anchorOnly9 = 'if (only) return path.join(env.ensureDir(verifyDir), `run-totals.subset-${pid}.json`);';
+  const onlyHits9 = src9.split(anchorOnly9).length - 1;
+  const bytes9Before = fs.readFileSync(path.join(env.paths.tests, 'run-all.js'));
+  let mutOnly9 = null, mutErr9 = '';
+  try {
+    if (onlyHits9 === 1) {
+      mutOnly9 = loadVariant9(src9.replace(anchorOnly9,
+        'if (only) return path.join(env.ensureDir(verifyDir), MAIN_LEDGER_NAME);'));
+    } else { mutErr9 = `变异锚点命中 ${onlyHits9} 处（应恰 1，按符号定位、不引行号）`; }
+  } catch (err) { mutErr9 = '变异体载入失败：' + (err && err.message); }
+  const mutPath9 = mutOnly9 ? mutOnly9.resolveLedgerFile({ ...base9, explicit: null, only: 'copy-check' }) : null;
+  const bytes9After = fs.readFileSync(path.join(env.paths.tests, 'run-all.js'));
+  t.check('E109-② D22（可证伪）：把 `resolveLedgerFile` 的 `--only` 分支**改回主账本**'
+    + '（`Module._compile` 内存副本，不落地）⇒ ②b 的判据**当场变红并指名**（返回的是主账本）；'
+    + '且 `tests\\run-all.js` 盘上字节**逐字节未变**',
+    Boolean(mutOnly9) && mutPath9 !== null && nameOf9(mutPath9) === runAll9.MAIN_LEDGER_NAME
+      && nameOf9(pOnly9) !== runAll9.MAIN_LEDGER_NAME && Buffer.compare(bytes9Before, bytes9After) === 0,
+    mutOnly9
+      ? `变异体对 \`--only copy-check\` 返回 \`${mutPath9}\`（= 主账本名 ⇒ ②b 的 \`!== MAIN_LEDGER_NAME\` 与`
+        + ` \`run-totals.subset-4242.json\` 两条同时失败）；现行实现返回 \`${pOnly9}\`；`
+        + `盘上 run-all.js 未变=${Buffer.compare(bytes9Before, bytes9After) === 0}`
+      : `**判红：${mutErr9}** —— 锚点漂了就等于 D22 没跑，不许当通过`);
+
+  /* ---------------- ④ 端到端：`--only` 一轮前后，主账本逐字节不变 ---------------- */
+  const mainLedger9 = path.join(env.paths.verify, runAll9.MAIN_LEDGER_NAME);
+  const readMain9 = () => { try { return fs.readFileSync(mainLedger9); } catch { return null; } };
+  const before9 = readMain9();
+  const beforeMtime9 = (() => { try { return fs.statSync(mainLedger9).mtimeMs; } catch { return null; } })();
+  const sub9 = spawnSync(process.execPath,
+    [path.join(env.paths.tests, 'run-all.js'), '--no-preflight', '--only', 'platform-check'],
+    { cwd: env.paths.root, encoding: 'utf8', timeout: 5 * 60 * 1000, maxBuffer: 32 * 1024 * 1024,
+      env: { ...process.env, DSH_JOBS: '1' } });
+  const after9 = readMain9();
+  const out9full = (sub9.stdout || '') + (sub9.stderr || '');
+  const declared9 = (out9full.match(/实跑账：(.+?)（/) || [null, null])[1];
+  const declaredAbs9 = declared9 ? path.resolve(env.paths.root, declared9.trim()) : null;
+  const declaredName9 = declaredAbs9 ? path.basename(declaredAbs9) : '';
+  let subLedger9 = null;
+  try { subLedger9 = declaredAbs9 ? JSON.parse(fs.readFileSync(declaredAbs9, 'utf8')) : null; } catch { subLedger9 = null; }
+  const sameMain9 = (before9 === null && after9 === null)
+    || (before9 !== null && after9 !== null && Buffer.compare(before9, after9) === 0);
+  t.check('E109-④ **端到端**（`E99` 的实质守据）：`run-all --no-preflight --only platform-check` 一轮，'
+    + '**前后主账本 `run-totals.json` 逐字节不变**（`Buffer.compare`），而该轮**确实声明并写出了自己的子集账**'
+    + '（子集账里 `ranSuites` ＝ 本轮那一个脚本）',
+    sameMain9 && Boolean(declaredAbs9) && declaredName9 !== runAll9.MAIN_LEDGER_NAME
+      && Boolean(subLedger9) && Array.isArray(subLedger9.ranSuites)
+      && subLedger9.ranSuites.length === 1 && subLedger9.ranSuites[0] === 'platform-check',
+    `主账本 ${mainLedger9}（${before9 ? before9.length : 0} B，mtime ${beforeMtime9}）`
+      + ` ⇒ 子集轮后 ${after9 ? after9.length : 0} B；逐字节不变=${sameMain9}；`
+      + `该轮声明的账本=\`${declared9 || '（输出里没有"实跑账："行）'}\`（应非主账本）；`
+      + `子集账 ranSuites=${JSON.stringify(subLedger9 && subLedger9.ranSuites)}；退出码 ${sub9.status}`);
 }
 
 /* ---------------- 十六、脚本入口形态（`E78`：`main()` 的异常必须被接住、并按 9.5-5 退 2） ----------------
@@ -8674,15 +8977,25 @@ function e103LinkSafetyChecks(t) {
   };
   const rmHitsE103 = (list) => list.flatMap((f) => scanUnprotectedRm(readOrEmpty(f)).map(h => ({ file: relOfE103(f), ...h })));
   const rmManaged = rmHitsE103(managedJsE103);
-  /** 存量清单（`文件 ＋ 标识符`；**不含行号**）：全部是**他人文件**里"删自建临时目录"的调用点，
-   *  本座位无写权限、不擅改；逐条定性见 `why`。语义＝"**零新增**"：清单外的任何一处 ⇒ 红。 */
-  const RM_LEGACY_E103 = [
-    { file: 'tests\\db-check.js', id: 'lockDir', line0: 510, why: '删自建锁目录（`._verify` 下一次性目录）；无 `lstat` 判别' },
-    { file: 'tests\\db-check.js', id: 'd', line0: 3852, why: '删自建临时目录；无 `lstat` 判别' },
-    { file: 'tests\\db-check.js', id: 'backupDir', line0: 5112, why: '删自建备份目录；无 `lstat` 判别' },
-    { file: 'tests\\offline-check.js', id: 'd', line0: 762, why: '删自建临时目录（`madeDirs.reverse()` 逐个删）；无 `lstat` 判别' },
-    { file: 'tests\\offline-check.js', id: 'root', line0: 771, why: '删自建临时根；无 `lstat` 判别' },
-    { file: 'tests\\platform-check.js', id: 'logDir', line0: 273, why: '删自建日志目录；无 `lstat` 判别' }
+  /** 存量清单（`文件 ＋ 标识符`；**不含行号**）：语义＝"**零新增**"：清单外的任何一处 ⇒ 红。
+   *  **`E117`（2026-10-04，本座位收口）：原先那 6 处已全部改走 `env.removeLinkSafe()` ⇒ 清单清空。**
+   *  为什么不"保留豁免"：留着清单就等于"这几处再退回裸 `fs.rmSync(recursive)` 也照样绿"，
+   *  正是本仓反复吃亏的"看起来在守、实际守不住"（`D23`）。清空后**任一处回潮都会被 B① 当"新增"点名**，
+   *  而"判据不许为了变绿而放宽"这条（`D21`／`D23`）**没有被动过**：B① 的式子一字未改，
+   *  变的只是"清单里有几条"这个**事实**（6 → 0，因为缺陷真的被修掉了）。 */
+  const RM_LEGACY_E103 = [];
+  /** **`E117` 的已修复留档**（只作说明 ＋ 定向回归的靶子；**不参与 B① 的豁免**）：
+   *  逐处给"为什么它结构上不可能是链接、以及为什么仍然改走安全删除"。
+   *  这 6 处的共同点＝**删自建的一次性临时目录/文件**（`mkdtempSync`／`mkdirSync`／`makeTempDir` 刚建出来的），
+   *  所以"是链接"在结构上不可能；改走 `env.removeLinkSafe()` 是**兜底**（判错了也不会连带删到目标），
+   *  且对非链接**逐字等价**（`env.js` 的 `E46` 段）。 */
+  const RM_FIXED_E117 = [
+    { file: 'tests\\db-check.js', id: 'lockDir', line0: 510, why: '`fs.mkdtempSync(tempRoot, \'openDb-lock-\')` 刚建的一次性目录：删它只为证明"连接没泄漏、文件没被锁"' },
+    { file: 'tests\\db-check.js', id: 'd', line0: 3852, why: '本节自建的备份目录（`makeTempDir()`）的收尾清理' },
+    { file: 'tests\\db-check.js', id: 'backupDir', line0: 5112, why: '本节自建的备份目录的收尾清理（原先连 `try` 都没有）' },
+    { file: 'tests\\offline-check.js', id: 'd', line0: 762, why: '夹具 `madeDirs`（自己 `mkdirSync` 出来的投放目录）的字节级还原' },
+    { file: 'tests\\offline-check.js', id: 'root', line0: 771, why: '夹具自建的临时包根（`输出文件` 交付包形态）的收尾' },
+    { file: 'tests\\platform-check.js', id: 'logDir', line0: 273, why: '本节自建的日志目录收尾（本脚本不加载 `lib/harness.js`，故用 `env` 已导出的同名函数）' }
   ];
   const rmNew = rmManaged.filter(h => !RM_LEGACY_E103.some(r => r.file === h.file && r.id === h.id));
   const rmStale = RM_LEGACY_E103.filter(r => !rmManaged.some(h => h.file === r.file && h.id === r.id));
@@ -8691,11 +9004,41 @@ function e103LinkSafetyChecks(t) {
     rmNew.length === 0,
     rmNew.length
       ? `判红：**新增未防护调用点 ${rmNew.length} 处** —— ` + rmNew.map(h => `${h.file}:${h.line}（id=${h.id}）`).join('；')
-        + `；已登记存量 ${RM_LEGACY_E103.length} 条 = ` + RM_LEGACY_E103.map(r => `${r.file}:${r.id}`).join('、')
-      : `零新增（受管面共 ${rmManaged.length} 处未防护，全部在存量清单里：`
-        + RM_LEGACY_E103.map(r => `${r.file}:${r.id}`).join('、') + '；'
+        + `；已登记存量 ${RM_LEGACY_E103.length} 条 = ` + (RM_LEGACY_E103.map(r => `${r.file}:${r.id}`).join('、') || '（空）')
+      : `零新增（受管面共 ${rmManaged.length} 处未防护${rmManaged.length ? '：'
+        + RM_LEGACY_E103.map(r => `${r.file}:${r.id}`).join('、') : ' ⇒ \`E117\` 之后**存量清零**'}；`
         + `清单里已消失的条目 ${rmStale.length} 条＝` + (rmStale.map(r => `${r.file}:${r.id}`).join('、') || '无')
         + ` ⇒ 存量只减不增、任一处被修好都会在这里显形（但**不判红**：修好不是缺陷））`);
+  t.check('E103-B④ `E117` 显式清单（**不是靠"没扫到"**）：登记在案的 6 处**逐处**都已改走 `removeLinkSafe('
+    + '（`文件:标识符` 逐个核对），且受管面**已无**裸递归删形态 —— 其中任一处回潮都会被 B① 当"新增"点名',
+    (() => {
+      const miss = [];
+      for (const r of RM_FIXED_E117) {
+        const src = readOrEmpty(path.join(env.paths.root, r.file.split('\\').join(path.sep)));
+        if (!new RegExp(`removeLinkSafe\\(\\s*${r.id}\\b`).test(src)) miss.push(`${r.file}:${r.id}（清单里说已改走安全删除，但源码里找不到 \`removeLinkSafe(${r.id}\``);
+      }
+      return RM_FIXED_E117.length === 6 && miss.length === 0 && rmManaged.length === 0;
+    })(),
+    `显式登记 ${RM_FIXED_E117.length} 处（应 6）：`
+      + RM_FIXED_E117.map(r => `${r.file}:${r.id}`).join('、')
+      + `；受管面仍未防护 ${rmManaged.length} 处（应 0）`);
+  /* `E117` 的 D22：**内存副本**把其中一处换回裸递归删 ⇒ B① 的同一判据必须红并**指名 `lockDir`**。 */
+  {
+    const dbPath117 = path.join(env.paths.root, 'tests', 'db-check.js');
+    const dbBytes117 = fs.readFileSync(dbPath117);
+    const guardCall117 = 'env.removeLinkSafe(lockDir, { recursive: true, force: true })';
+    const bareCall117 = 'fs.rmSync(lockDir, { recursive: true, force: true })';
+    const curHit117 = scanUnprotectedRm(dbBytes117.toString('utf8')).filter(h => h.id === 'lockDir');
+    const mutSrc117 = dbBytes117.toString('utf8').replace(guardCall117, bareCall117);
+    const mutHit117 = scanUnprotectedRm(mutSrc117).filter(h => h.id === 'lockDir');
+    t.check('E103-B⑤ D22（可证伪，`E117`）：把 `tests\\db-check.js` 里 `lockDir` 那处**换回**裸 `fs.rmSync(lockDir, {recursive:true})`'
+      + '（`Module._compile` 级别的**内存字符串副本**，盘上文件全程只读）⇒ 同一判据必红**并指名 `lockDir`**；现行源码零命中',
+      mutSrc117 !== dbBytes117.toString('utf8') && mutHit117.length === 1 && mutHit117[0].id === 'lockDir'
+        && curHit117.length === 0 && Buffer.compare(dbBytes117, fs.readFileSync(dbPath117)) === 0,
+      `现行源码命中 ${curHit117.length} 处（应 0）；内存变异体命中 ${mutHit117.length} 处`
+        + `（应 1，id=${mutHit117.map(h => h.id).join('、') || '无'}）；`
+        + `盘上 \`tests\\db-check.js\` 逐字节未变=${Buffer.compare(dbBytes117, fs.readFileSync(dbPath117)) === 0}`);
+  }
   t.check('E103-B② **本门禁自身的面**（`tests\\harness-check.js` ＋ `tests\\lib\\**`）零未防护 —— 不靠存量清单（那 15 处已改走 `harness.removeLinkSafe()`／`env.removeLinkSafe()`，行为对非链接逐字等价）',
     ownFace.length === 0,
     ownFace.length

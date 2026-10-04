@@ -270,7 +270,10 @@ t.section('三、日志分级、按日滚动与保留清理（NFR-21）');
       return lg2.list().length >= 2;
     })(), '应出现 -1.log 之类的序号文件');
 
-  try { fs.rmSync(logDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
+  /* `E117`（2026-10-04）：`env.removeLinkSafe()` —— 判"目录项自身"是不是链接（是则只拆链、不递归），
+     非链接时与 `fs.rmSync(recursive)` 逐字等价。`logDir` 由本节 `fs.mkdirSync` 自建，结构上不可能是链接；
+     本脚本仍**不加载** `lib/harness.js`（用 `env` 已导出的同名函数，不新增依赖）。 */
+  try { env.removeLinkSafe(logDir, { recursive: true, force: true }); } catch { /* 忽略 */ }
   /* `T-20261003-10`（2026-10-03）单一真源化后，`env.paths.tempRoot` 是**本轮专属**目录
      （定义在 `tests/env.js`：`<公共根>\run-<pid>-<启动时刻>-<4hex>`）—— 收口前本脚本
      看到的还是公共根。本脚本**不加载** `lib/harness.js`，故没人替它收尾本轮目录。

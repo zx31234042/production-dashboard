@@ -759,7 +759,9 @@ function buildSelfFixture() {
     /** 字节级还原：丢弃 overrides ＋ 删掉投放时新建的目录，再逐文件 `Buffer.compare` 对快照（禁用 git） */
     restore() {
       for (const k of Object.keys(overrides)) delete overrides[k];
-      for (const d of madeDirs.reverse()) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* 忽略 */ } }
+      /* `E117`（2026-10-04）：`env.removeLinkSafe()` —— 判"目录项自身"是不是链接（是则只拆链、不递归），
+         非链接时与 `rmSync(recursive)` 逐字等价；`madeDirs` 全部是本夹具自己 `mkdirSync` 出来的。 */
+      for (const d of madeDirs.reverse()) { try { env.removeLinkSafe(d, { recursive: true, force: true }); } catch { /* 忽略 */ } }
       madeDirs.length = 0;
       for (const [r, bytes] of snapshot) {
         const abs = path.join(root, ...r.split('\\'));
@@ -768,7 +770,9 @@ function buildSelfFixture() {
       }
       snapshot.clear();
     },
-    cleanup() { try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* 收尾忽略 */ } }
+    /* `E117`（2026-10-04）：`env.removeLinkSafe()` —— 非链接时与 `rmSync(recursive)` 逐字等价；
+       `root` 是本夹具为"交付包形态"自建的临时包根，结构上不可能是链接。 */
+    cleanup() { try { env.removeLinkSafe(root, { recursive: true, force: true }); } catch { /* 收尾忽略 */ } }
   };
 }
 
