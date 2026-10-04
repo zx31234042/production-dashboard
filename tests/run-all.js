@@ -184,7 +184,17 @@ const MAIN_LEDGER_NAME = 'run-totals.json';
  * **`[UNMET]` 那条判据必须留着**（本批硬约束，`ADR-0004` D21/D23）：`docs-cross-check` 第十一节的
  * `t.requires('run-totals.json 的条目覆盖当前门禁清单…')`（`docs-cross-check.js:779`）是有价值的
  * **护栏**：账本缺失/过期时**不许静默放过**，必须显式报"前提不成立"并退化为逐项实跑（退 1）。
- * 本批**没有**删弱、放宽或绕过它（`docs-cross-check.js` 一个字节都没动）：要修的是"**正常的全量轮
+ * **`E115` 更正（只说这一笔，不再说"整批"）**：**本笔（`E99`）**未改 `tests\docs-cross-check.js`、
+ * 也没有删弱/放宽/绕过上面那条判据。但这个文件**确实被改过**，准确表述只能是"本笔未改"：
+ *   · **同一天（2026-10-03）三笔**都动过它 —— `73e35e1`（＋105／−0）、`6973c47`（＋16／−1）、
+ *     `22b2a53`（＋17／−3），合计 **＋138／−4 行**（`git log --numstat 33a5649..cea9664 --
+ *     tests/docs-cross-check.js`；座位 5 在 `C·20.7` `F-8` 里记作"＋142 行"＝变更行数）；
+ *     其中 `22b2a53`（`E104` 收口）为"**读数重定向**"加了三个调试出口
+ *     `DSH_DC_{SNAP,ARCH,ROAD}_OVERRIDE`（同族的 `DSH_DC_README_OVERRIDE` 更早，由 2026-09-20 的
+ *     `eb1e843` 引入）。这些出口**仅调试用**：不设环境变量时读的就是原来的真文件
+ *     ⇒ 正式运行的判据行为逐字不变（`[UNMET]` 护栏实测仍会开火）。
+ *   · 所以原文"`docs-cross-check.js` 一个字节都没动"**按"本批＝10-03 整批"读就是假陈述**（`E115`
+ *     立案事实），按"本笔"读也只是语义不清 ⇒ 本行起改为上面的写法。要修的是"**正常的全量轮
  * 与子集轮不该互相污染**"，而不是"让这条判据不再触发"。⇒ 修好之后，它**照样可触发、照样判红**：
  * 删掉/清空主账本后单跑 `node tests\docs-cross-check.js`，仍会看到 `[UNMET] 前提不成立` 与退 1
  * （实测证据见本批回执【证据】第 2.d 条：临时移走主账本 ⇒ `前提不成立` ＋ 退出码 1）。
@@ -695,6 +705,195 @@ function isRegisteredDeviation(r) {
     if (names.some(n => !reg.assertions.includes(n))) return false; /* 出现未登记断言 → 不算已登记偏差 */
   }
   return true;
+}
+
+/* ==========================================================================
+   **`E108`：失败戳不得把"未登记的失败"说成"已登记偏差"**
+   --------------------------------------------------------------------------
+   立案（座位 5 的 `C·20.7` `F-1`，★★，2026-10-03 整批复核的实测）：旧实现在
+   `failed.length > 0 && verdict.exitCode === 0` 时**无条件**打印
+   "失败项仅为已登记偏差（… N 项；见 PROJECT_RULES 6.4）" —— **从不查** `REGISTERED_DEVIATIONS`
+   （那张表只有 `docs-check` 一个键）；而 `--only` 子集轮的"判定层面"永远判过（对账被有意标成
+   `skipped`）⇒ **任何子集轮的任何失败**都吃这句话，且句尾 `N` 是**未插值的字面量**。
+   实测形态（改动前可复跑）：`$env:MSEDGE_PATH='C:\Windows\System32\hostname.exe';`
+   `node tests\run-all.js --only screenshot-diff --no-preflight` ⇒ `E91` 的 fail-closed 红灯
+   （`capture-baseline` 候选图未刷新）被盖上"6.4 已登记偏差（长期容忍、决定不修）"的戳 ——
+   恰好把这批最想建立的那道防线说成"已知容忍项"，后续复核者可能据此放过。
+   ⇒ 修法（本函数）：**逐条**过 `isRegisteredDeviation()`（唯一真源）：
+     · 全部认可 ⇒ 照旧打印既有那句（文案一词不改，只把 `N` 插值成失败脚本数）；
+     · 有未登记的 ⇒ 打印"失败 N 项（**未登记**）"并**逐条点名（脚本名 ＋ 失败数）**，
+       且**不出现**"已登记偏差"字样（免得下一位读者又把它读成长期容忍项）。
+   判据语义**不变**（`ADR-0004` D21/D23）：本函数只决定**打印哪句话**；退出码仍由 `finalExitCode`
+   的组合判据给（有 failed/unverified 一律 1），"门禁全绿"仍只在失败集合为空时可打印。
+   @param {Array<{suite:{name:string},status:string,summary?:object,out?:string}>} failed
+   @param {{exitCode?:number}} verdict `resolveGateOutcome` 的结果
+   @returns {string} 要打印的说明行（空串＝不打）
+*/
+function failureNote(failed, verdict) {
+  const list = Array.isArray(failed) ? failed : [];
+  const v = verdict || {};
+  /* 与旧实现**同一处**触发条件：判定层面（稳定性 ＋ 对账）判过、但脚本层面有失败 —— 不满足就不打。 */
+  if (list.length === 0 || v.exitCode !== 0) return '';
+  const registered = list.filter(r => isRegisteredDeviation(r));
+  const unregistered = list.filter(r => !isRegisteredDeviation(r));
+  if (unregistered.length === 0) {
+    /* 既有文案（**唯一一处**允许出现"已登记偏差"的地方）：只把字面量 `N` 换成 `list.length`。 */
+    return `\n门禁未全绿：失败项仅为已登记偏差（${list.map(r => r.suite.name).join('、')} ${list.length} 项；`
+      + '见 PROJECT_RULES 6.4）—— 按规范 9.5-5 仍退 1。';
+  }
+  const per = r => {
+    const f = r.summary && Number.isFinite(r.summary.failed) ? r.summary.failed : null;
+    const kind = r.status === 'error' ? '异常' : '失败';
+    return f === null ? `${r.suite.name}（${kind}，无汇总行）` : `${r.suite.name}（${kind} ${f} 项断言）`;
+  };
+  const head = unregistered.length === list.length
+    ? `失败 ${list.length} 项（**未登记**）`
+    : `失败 ${list.length} 项（其中**未登记** ${unregistered.length} 项，另有 ${registered.length} 项属 PROJECT_RULES 6.4 登记项）`;
+  return `\n门禁未全绿：${head}：${unregistered.map(per).join('、')}`
+    + ' —— 这些失败**不在** PROJECT_RULES 6.4 的登记清单里，**不得**当成已容忍项放过；按规范 9.5-5 仍退 1。';
+}
+
+/**
+ * `E108` 的**自检真值表**（纯函数、无副作用）—— 让"失败戳分得清登记/未登记"这件事有门禁守护。
+ * 为什么写在本文件而不是 `harness-check`：本批硬约束不许动那个文件（另一路在制）；而 `run-all`
+ * 是唯一持有"本轮失败集合"的地方，故做成**收尾自检**：不通过 ⇒ 打印 `[FAIL]` 行并让本轮退 1
+ * （**收紧**，不放宽任何既有判据；通过时一个字都不打印）。
+ * 判别力（`D22`）：把 `isRegisteredDeviation()` 改成**恒真** ⇒ 下面第 ① 组必红并**指名**那个未登记脚本。
+ * ⚠ 夹具**从真源现算**（`REGISTERED_DEVIATIONS` 的键 ＋ `SUITES`／`CAPTURE_SUITE` 的名单）：
+ * 将来真的给某个脚本登记了偏差，本条**不会假红**（它会自动换一个仍未登记的名字做夹具）。
+ * @returns {string[]} 问题清单（空数组＝通过）
+ */
+function failureNoteSelfCheck() {
+  const problems = [];
+  const mk = (name, status, failed) => ({
+    suite: { name }, status, out: '',
+    summary: failed === null ? null : { passed: 1, failed, skipped: 0 }
+  });
+  /* ①「未登记」那端：从真源里挑一个**当前没有登记**的脚本名。`capture-baseline` 是 `E91` 的
+     fail-closed 红灯，也是 `F-1` 现场读到的那一条；若将来它被登记，本夹具自动换名。 */
+  const unregName = [CAPTURE_SUITE.name, ...SUITES.map(s => s.name)].find(n => !REGISTERED_DEVIATIONS[n]);
+  if (!unregName) {
+    problems.push('E108 判据自检：找不到"未登记脚本"夹具（`REGISTERED_DEVIATIONS` 覆盖了全部脚本？）—— 本条判据失去判别力');
+  } else {
+    const unreg = mk(unregName, 'failed', null);
+    if (isRegisteredDeviation(unreg)) {
+      problems.push(`E108 判据自检：**未登记**的脚本被 \`isRegisteredDeviation()\` 认成已登记：${unregName}`);
+    }
+    const noteA = failureNote([unreg], { exitCode: 0 });
+    if (noteA.includes('已登记偏差')) problems.push(`E108 判据自检：未登记的失败被说成「已登记偏差」：${unregName}`);
+    if (!noteA.includes(unregName)) problems.push(`E108 判据自检：未登记的失败**没有点名脚本**：${unregName}`);
+    if (!noteA.includes('未登记')) problems.push(`E108 判据自检：未登记的失败没有「未登记」字样：${unregName}`);
+    if (!/失败\s*1\s*项/.test(noteA)) problems.push(`E108 判据自检：计数未插值（应出现「失败 1 项」）：${unregName}`);
+  }
+  /* ②「已登记」那端：任取一个真源里在册的脚本 ⇒ 文案必须仍是既有那句（含 6.4 ＋ 脚本名 ＋ 已登记偏差）。 */
+  const regName = Object.keys(REGISTERED_DEVIATIONS)[0];
+  if (!regName) {
+    problems.push('E108 判据自检：`REGISTERED_DEVIATIONS` 为空 —— 已登记偏差那端的文案无从判定');
+  } else {
+    const reg = mk(regName, 'failed', REGISTERED_DEVIATIONS[regName].failedAssertions);
+    if (!isRegisteredDeviation(reg)) problems.push(`E108 判据自检：在册偏差未被认到（真源＝REGISTERED_DEVIATIONS）：${regName}`);
+    const noteB = failureNote([reg], { exitCode: 0 });
+    for (const needle of ['已登记偏差', '6.4', regName]) {
+      if (!noteB.includes(needle)) problems.push(`E108 判据自检：已登记偏差那端的既有文案丢了「${needle}」：${regName}`);
+    }
+  }
+  /* ③ 触发条件不得被放宽：没有失败脚本、或判定层面已判不通过时，都**不打**这句失败戳。 */
+  if (failureNote([], { exitCode: 0 }) !== '') problems.push('E108 判据自检：没有失败脚本时也打印了失败戳');
+  const probe = mk(regName || 'docs-check', 'failed', 2);
+  if (failureNote([probe], { exitCode: 1 }) !== '') {
+    problems.push('E108 判据自检：判定层面已判不通过时仍打印失败戳（`verdict.exitCode === 0` 这个触发条件被放宽）');
+  }
+  return problems;
+}
+
+/**
+ * `E114` 的**自检真值表**：清扫读数必须把「清掉的整轮目录」「拆掉的链接」「回收的子集账本」分开。
+ * 怎么做到"对着真实函数体跑真值表、又**不产生任何副作用**"：`env.cleanupStaleTemp(maxAgeMs, io)`
+ * 的第二个参数是注入面（默认＝真文件系统，见 `tests\env.js`）—— 这里传一份**内存假体**
+ * （假时钟 ＋ 假布局 ＋ 假删除），于是跑的是**生产代码的同一个函数体**（含每个分支的调用点），
+ * 却一根链接都不建、一个目录都不删。判据同族：`verifyAuthorityTotals(…, { gitAvailable })`。
+ * 判别力（`D22`）：把链接那一支的计数改回"混在一起"（`removedRounds++` 而不是 `removedLinks++`）
+ * ⇒ 下面 `removedLinks`／`removedRounds` 两条必红并**指名字段**。
+ * @returns {string[]} 问题清单（空数组＝通过）
+ */
+function sweepCountSelfCheck() {
+  const problems = [];
+  const base = env.paths.tempRootBase;
+  const verify = env.paths.verify;
+  const nowMs = Date.now();
+  const oldMs = nowMs - 25 * 3600 * 1000;                        /* > 24h：过期 */
+  const freshMs = nowMs - 60 * 1000;                             /* 新鲜 */
+  const layout = new Map([
+    [base, [
+      { name: 'run-900001-20200101T000000-aaaa', link: false, mtimeMs: oldMs },   /* 过期整轮目录 ⇒ 清 */
+      { name: 'run-900002-20200101T000000-bbbb', link: false, mtimeMs: freshMs }, /* 本轮形态 ⇒ 留 */
+      { name: 'zz-e114-fake-link', link: true, mtimeMs: freshMs }                 /* 链接：无条件拆链 ⇒ 拆 */
+    ]],
+    [verify, [
+      { name: env.MAIN_LEDGER_NAME, link: false, mtimeMs: oldMs },                /* 主账本：绝不碰 */
+      { name: 'run-totals.subset-900000.json', link: false, mtimeMs: oldMs },     /* 过期子集账本 ⇒ 回收 */
+      { name: 'run-totals.subset-fresh.json', link: false, mtimeMs: freshMs },    /* 新鲜 ⇒ 留 */
+      { name: 'README.md', link: false, mtimeMs: oldMs }                          /* 非账本名形状：不看 */
+    ]]
+  ]);
+  const find = p => {
+    for (const [dir, list] of layout) {
+      if (path.dirname(p) === dir) return list.find(e => path.join(dir, e.name) === p) || null;
+    }
+    return null;
+  };
+  const calls = [];
+  const io = {
+    now: nowMs,
+    existsSync: p => layout.has(p),
+    readdir: p => (layout.get(p) || []).map(e => e.name),
+    isLink: p => Boolean((find(p) || {}).link),
+    mtimeMs: p => (find(p) || {}).mtimeMs,
+    removeLink: p => calls.push(`link:${p}`),                    /* 假体：只拆链，没有"递归"这个动作 */
+    removeDir: p => calls.push(`dir:${p}`),
+    removeFile: p => calls.push(`file:${p}`)
+  };
+  const realKeys = Object.keys(env.makeRealSweepIo()).sort().join(',');
+  const fakeKeys = Object.keys(io).sort().join(',');
+  if (realKeys !== fakeKeys) {
+    problems.push('E114 判据自检：注入面形状与真实现不一致（真实现＝[' + realKeys + ']／假体＝[' + fakeKeys
+      + ']）—— "对着真实函数体跑真值表"的前提不成立');
+  }
+  const r = env.cleanupStaleTemp(env.STALE_MAX_AGE_MS, io);
+  if (!calls.length) {
+    problems.push('E114 判据自检：注入面**未被使用**（`env.cleanupStaleTemp` 可能忽略了第二个参数）—— 本判据失去判别力，请先修接缝');
+    return problems;
+  }
+  const expect = { removed: 2, removedRounds: 1, removedLinks: 1, removedLedgers: 1, kept: 2 };
+  for (const k of Object.keys(expect)) {
+    if (r[k] !== expect[k]) {
+      problems.push(`E114 判据自检：\`${k}\`=${r[k]}（应 ${expect[k]}）—— 三类计数被"混在一起"或算错`
+        + '（夹具＝1 个过期整轮目录 ＋ 1 个链接 ＋ 1 个过期子集账本 ＋ 各 1 个新鲜项）');
+    }
+  }
+  if (r.removed !== r.removedRounds + r.removedLinks) {
+    problems.push(`E114 判据自检：\`removed\`=${r.removed} ≠ \`removedRounds\`+\`removedLinks\`=`
+      + `${r.removedRounds + r.removedLinks}（旧口径的合计必须仍等于两者之和）`);
+  }
+  const touched = p => calls.some(c => c.endsWith(p));
+  if (!touched(path.join(base, 'zz-e114-fake-link'))) problems.push('E114 判据自检：链接没有被拆（`removedLinks` 那条路没走到）');
+  if (calls.some(c => c.startsWith('dir:') && c.endsWith('zz-e114-fake-link'))) {
+    problems.push('E114 判据自检：链接被当成目录**递归删**（`E101` 的纪律被破坏）');
+  }
+  if (touched(path.join(verify, env.MAIN_LEDGER_NAME))) {
+    problems.push(`E114 判据自检：**主账本被碰**（${env.MAIN_LEDGER_NAME}）—— 它是 docs-cross-check 第十一节的取数面`);
+  }
+  if (touched(path.join(verify, 'run-totals.subset-fresh.json'))) problems.push('E114 判据自检：**新鲜**子集账本被回收（24 h 口径被破坏）');
+  if (touched(path.join(base, 'run-900002-20200101T000000-bbbb'))) {
+    problems.push('E114 判据自检：**新鲜**整轮目录被清（本轮/他路正在用的产物不该被清）');
+  }
+  if (touched(path.join(verify, 'README.md'))) problems.push('E114 判据自检：非账本文件被清扫碰到（`._verify\\` 根下只认子集账本名形状）');
+  return problems;
+}
+
+/** 收尾自检的合并入口（`E108` ＋ `E114`）——**纯函数**：不写盘、不起子进程。 */
+function runAllSelfCheck() {
+  return [...failureNoteSelfCheck(), ...sweepCountSelfCheck()];
 }
 
 /**
@@ -1253,15 +1452,33 @@ async function main() {
     ? [{ path: `快照不可用：${snapshotProblem || snapshotProblem2}`, kind: 'changed' }]
     : rewriteChanges;
   const verdict = resolveGateOutcome(changedForVerdict, auth);
+
+  /* ---------------- 收尾自检（`E108` ＋ `E114`；纯函数，无副作用） ----------------
+     为什么把"判据自检"放在 runner 里：这两条判据的真源分别是本文件的 `isRegisteredDeviation`／
+     `failureNote` 与 `tests\env.js` 的 `cleanupStaleTemp` 计数，而本批硬约束不许动
+     `tests\harness-check.js`（另一路在制）。自检**不通过 ⇒ 打印 `[FAIL]`（逐条指名）并让本轮退 1**；
+     通过时**一个字都不打印**（与"稳定轮不打印任何东西"的既有风格一致）。判别力（`D22`）见两个
+     自检函数各自的注释：`isRegisteredDeviation` 改恒真 ⇒ 指名那个未登记脚本；
+     `env.js` 把"拆链"计进整轮目录 ⇒ 指名 `removedLinks`／`removedRounds`。 */
+  const selfCheckProblems = runAllSelfCheck();
+  if (selfCheckProblems.length) {
+    console.log('\n判据自检未通过（run-all 收尾判据的真值表；逐条点名 ⇒ 先修它们，本轮结论不作证据）：');
+    for (const p of selfCheckProblems) console.log(`  [FAIL] ${p}`);
+    /* 只**收紧**退出码：既有判据（有 failed/unverified 一律 1、"门禁全绿"只在失败集合为空时打印）
+       一个字都不改，这里只是把"自检不通过"也接进同一个组合判据。 */
+    verdict.exitCode = 1;
+    verdict.titles = (Array.isArray(verdict.titles) ? verdict.titles : []).concat([
+      '\n失败：run-all 收尾判据自检未通过（见上面的 `[FAIL]` 行）。',
+      '处置：修 `tests\\run-all.js` 的 `failureNote`／`isRegisteredDeviation` 或 `tests\\env.js` 的 `cleanupStaleTemp` 计数，再重跑。']);
+  }
+
   /* 最终退出码 = "脚本层面有没有失败/未核实" **与** "判定层面过没过" 的组合（见 finalExitCode）。
      只取其中一半就是本次要修的回归：只看 `verdict.exitCode` 会把"有 FAIL"的轮次退成 0。 */
   const finalCode = finalExitCode({ failed, unverified, verdict });
-  /* 有失败脚本、但判定层面（稳定性 + 对账）仍然判过（典型：失败项**仅为已登记偏差**）时，
-     必须**明写**为什么最终仍退 1 —— 否则读者只看到"权威数字校验：合计一致"会以为全绿。 */
-  const failedNote = (failed.length > 0 && verdict.exitCode === 0)
-    ? `\n门禁未全绿：失败项仅为已登记偏差（${failed.map(r => r.suite.name).join('、')} N 项；`
-      + '见 PROJECT_RULES 6.4）—— 按规范 9.5-5 仍退 1。'
-    : '';
+  /* 有失败脚本、但判定层面（稳定性 + 对账）仍然判过时的**说明行** —— 文案由 `failureNote`（纯函数）
+     按 `isRegisteredDeviation()` 的真源判定生成：**只有**全部失败都被认可的已登记偏差才说"已登记偏差"，
+     其余一律说"未登记"并逐条点名（`E108`；旧实现是不查真源的一句固定文案 ＋ 未插值的 `N`）。 */
+  const failedNote = failureNote(failed, verdict);
   /* 不稳定轮**不打**权威数字校验那一行 —— 无论那一行写什么都容易被读成"比过了"（T2 既有设计，
      2026-09-20 由静态断言守着：`verdict.unstable ? ''`）。稳定轮则**一律打印**（含全绿轮）：
      旧实现只在失败分支打印它，绿轮把它丢掉，于是"这一轮到底核过没有"只能靠证据状态文字去猜 ——
@@ -1349,8 +1566,18 @@ async function main() {
   try {
     const { cleanup } = require('./lib/harness');
     const swept = cleanup(false);
-    if (swept && swept.removed > 0) {
-      console.log(`\n  临时区收尾：清理 24 小时前的残留 ${swept.removed} 个整轮目录（保留 ${swept.kept} 个：本轮与其它仍在用的轮次）`);
+    /* `E114`：**三类分开打印**。旧文案把 `swept.removed`（＝整轮目录 ＋ 拆掉的链接）统称
+       "N 个整轮目录"，于是"拆了 1 个链接"会被读成"清了 1 个过期轮次目录"（`E114` 立案事实：
+       座位 5 实测 `removed:1` 其实是它植入的链接）；且 `removedLedgers`（`E105` 新增字段）
+       此前**全仓无调用方读取** ⇒ `E105` 到底回收了什么在正常日志里看不见。
+       ⚠ 打印口径变了，**清扫行为一字未变**（链接只拆链、主账本绝不碰、只清 >24h，见 env.js）。 */
+    if (swept && (swept.removed > 0 || swept.removedLedgers > 0)) {
+      const parts = [];
+      if (swept.removedRounds > 0) parts.push(`${swept.removedRounds} 个整轮目录`);
+      if (swept.removedLinks > 0) parts.push(`${swept.removedLinks} 个链接（只拆链，未递归）`);
+      if (swept.removedLedgers > 0) parts.push(`${swept.removedLedgers} 个过期子集账本（run-totals.subset-*.json）`);
+      if (!parts.length) parts.push(`${swept.removed} 个条目（分类字段缺失：cleanupStaleTemp 未给 removedRounds/removedLinks）`);
+      console.log(`\n  临时区收尾：清理 24 小时前的残留 —— ${parts.join('、')}（保留 ${swept.kept} 个：本轮与其它仍在用的轮次）`);
     }
   } catch (err) {
     console.log(`\n  临时区收尾失败（不影响门禁结论）：${err && err.message}`);
@@ -1376,7 +1603,11 @@ module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTot
   pickDetailLines, DETAIL_MAX_LINES, CAPTURE_SUITE,
   /* `E99` 的账本路径判定是纯函数 ⇒ 一并导出（主账本名也在内），供定点回归直接调用
      —— 判据：①全量 ⇒ 主账本；②`--only` ⇒ 自己的账本且**不是**主账本；③`--ledger` ⇒ 显式值优先。 */
-  resolveLedgerFile, MAIN_LEDGER_NAME };
+  resolveLedgerFile, MAIN_LEDGER_NAME,
+  /* `E108`／`E114`（`T-20261004-04`）的收尾判据是纯函数 ⇒ 一并导出，供定点回归（含 D22 变异）直接调用：
+     · `failureNote`：失败戳文案（登记/未登记分道）；· `failureNoteSelfCheck`／`sweepCountSelfCheck`：
+     两条自检的真值表（`main` 每次收尾都会跑）；· `runAllSelfCheck`：两者的合并入口。 */
+  failureNote, failureNoteSelfCheck, sweepCountSelfCheck, runAllSelfCheck };
 
 if (require.main === module) {
   main().catch(err => {

@@ -288,43 +288,76 @@ const MAIN_LEDGER_NAME = 'run-totals.json';
  *     的取数面，删了就等于把权威对账的取数面弄坏（`E99` 的教训）；
  *   · 本函数**只读一层**（`readdirSync` 不带 `recursive`）⇒ 不可能被链接带出圈（`E46` T5）。
  *
- * 返回 `{ removed, kept, removedLedgers }`：`removed`＝清掉的**目录**条数、`kept`＝留下的条目数、
- *   `removedLedgers`＝回收的**子集账本**个数（单列是为了让调用方能分别读两件事）。
- *   异常不抛出，避免影响门禁。
+ * 返回 `{ removed, kept, removedRounds, removedLinks, removedLedgers }`（`E114` 拆分口径）：
+ *   · `removed`＝**拆掉/删掉的条目总数** ＝ `removedRounds + removedLinks`（与 `E114` 之前**逐字同口径**：
+ *     旧实现把"拆掉的链接"也计进这个数，`harness-check` §五与 `E103-E①/E③` 读的就是它 ⇒ 不改义，
+ *     免得为一次"读数口径"改动去动别的文件；新读者请**优先读后三个分类字段**）；
+ *   · `removedRounds`＝按过期口径**递归删掉的真实条目**（本仓的形态＝公共根下的整轮目录 `run-<pid>-…`）；
+ *   · `removedLinks`＝**只拆链**拆掉的链接条数（`E101`：链接不看年龄、无条件拆链 —— 所以它
+ *     **不是**"过期整轮目录"，这正是 `E114` 立案的读数误导：旧日志把两者打成一个数）；
+ *   · `removedLedgers`＝回收的**过期子集账本** `run-totals.subset-*.json` 个数（`E105`）；
+ *   · `kept`＝**留下的条目数**（两个清扫面上未被命中、且成功判定的条目）。
+ *   异常不抛出（逐条 `try/catch`），避免影响门禁；计数**只在动作成功返回后**自增（与旧实现一致）。
+ *
+ * **注入面（`E114`）**：第二个参数 `io` 是给**定点回归**用的清扫 IO 替身（默认 `null` ＝真文件系统）。
+ *   形状与 `makeRealSweepIo()` 逐键一致：`{ now, existsSync, readdir, isLink, mtimeMs, removeLink,
+ *   removeDir, removeFile }`。它与 `verifyAuthorityTotals(agg, results, { gitAvailable })` 同一手法：
+ *   **默认真实现、只在自检里注入假体** ⇒ 判据可以对着"真实函数体"跑真值表而**不产生任何副作用**
+ *   （不建链接、不删目录）。⚠ 注入体必须自己保证"拆链非递归"（真实现走 `removeLinkSafe`）。
  */
-function cleanupStaleTemp(maxAgeMs = STALE_MAX_AGE_MS) {
-  const result = { removed: 0, kept: 0, removedLedgers: 0 };
+function cleanupStaleTemp(maxAgeMs = STALE_MAX_AGE_MS, io = null) {
+  const fsi = io || makeRealSweepIo();
+  const result = { removed: 0, kept: 0, removedRounds: 0, removedLinks: 0, removedLedgers: 0 };
   const base = paths.tempRootBase;
-  const now = Date.now();
-  if (fs.existsSync(base)) {
-    for (const name of fs.readdirSync(base)) {
+  const now = fsi.now;
+  if (fsi.existsSync(base)) {
+    for (const name of fsi.readdir(base)) {
       const full = path.join(base, name);
       try {
-        if (isLink(full)) {                                      /* ① 链接：只拆链，绝不递归（E101/E46） */
-          removeLinkSafe(full, { recursive: true, force: true });
-          result.removed++;
+        if (fsi.isLink(full)) {                                  /* ① 链接：只拆链，绝不递归（E101/E46） */
+          fsi.removeLink(full);
+          result.removedLinks++; result.removed++;
           continue;
         }
-        const st = fs.statSync(full);                            /* ② 已确认非链接，stat 不再有"穿链"语义 */
-        if (now - st.mtimeMs > maxAgeMs) { fs.rmSync(full, { recursive: true, force: true }); result.removed++; }
+        const mtimeMs = fsi.mtimeMs(full);                       /* ② 已确认非链接，stat 不再有"穿链"语义 */
+        if (now - mtimeMs > maxAgeMs) { fsi.removeDir(full); result.removedRounds++; result.removed++; }
         else result.kept++;
       } catch { /* 忽略：被别人占用或已删除 */ }
     }
   }
   /* `E105`：`._verify\` 根下的子集轮账本（与上面**同一份** `maxAgeMs` 口径）。
      `VERIFY` 尚未建出时（极早的单脚本调用）跳过 —— 没有目录就没有账本可回收。 */
-  const verifyEntries = fs.existsSync(VERIFY) ? fs.readdirSync(VERIFY) : [];
+  const verifyEntries = fsi.existsSync(VERIFY) ? fsi.readdir(VERIFY) : [];
   for (const name of verifyEntries) {
     if (!SUBSET_LEDGER_RX.test(name)) continue;                  /* 主账本/别的东西一律不碰 */
     const full = path.join(VERIFY, name);
     try {
-      if (isLink(full)) { removeLinkSafe(full, { recursive: true, force: true }); result.removedLedgers++; continue; }
-      const st = fs.statSync(full);
-      if (now - st.mtimeMs > maxAgeMs) { fs.rmSync(full, { force: true }); result.removedLedgers++; }
+      if (fsi.isLink(full)) { fsi.removeLink(full); result.removedLedgers++; continue; }
+      const mtimeMs = fsi.mtimeMs(full);
+      if (now - mtimeMs > maxAgeMs) { fsi.removeFile(full); result.removedLedgers++; }
       else result.kept++;
     } catch { /* 忽略：被占用或已删除 */ }
   }
   return result;
+}
+
+/**
+ * 清扫的**真 IO**（`E114` 的注入面默认值）：每个键都只是把本文件既有的实现包一层 ——
+ * 行为与"直接调 `fs`"逐字相同，抽出来只为让 `cleanupStaleTemp(maxAgeMs, io)` 有一个可替换的接缝。
+ * @returns {{now:number, existsSync:Function, readdir:Function, isLink:Function, mtimeMs:Function,
+ *            removeLink:Function, removeDir:Function, removeFile:Function}}
+ */
+function makeRealSweepIo() {
+  return {
+    now: Date.now(),
+    existsSync: p => fs.existsSync(p),
+    readdir: p => fs.readdirSync(p),
+    isLink: p => isLink(p),
+    mtimeMs: p => fs.statSync(p).mtimeMs,                        /* 调用点已先判非链接 ⇒ 不穿链 */
+    removeLink: p => removeLinkSafe(p, { recursive: true, force: true }),
+    removeDir: p => fs.rmSync(p, { recursive: true, force: true }),
+    removeFile: p => fs.rmSync(p, { force: true })
+  };
 }
 
 /** 供日志/报告展示的简短环境摘要 */
@@ -391,6 +424,9 @@ module.exports = {
   SUBSET_LEDGER_RX,
   MAIN_LEDGER_NAME,
   cleanupStaleTemp,
+  /* `E114`：清扫的**注入面真实现** —— 一并导出是为了让收尾自检能比对"假体与真实现的键集一致"
+     （见 `tests\run-all.js` 的 `sweepCountSelfCheck`），不改变任何调用点的行为。 */
+  makeRealSweepIo,
   describe,
   skipSuite,
   reportSummary
