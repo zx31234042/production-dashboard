@@ -730,12 +730,28 @@ function main() {
     }
   };
 
-  /* ---- 解析：脚本名（两种形式之一）→ 声明通过数 ---- */
+  /* ---- 解析：脚本名（两种形式之一）→ 声明三元（通过/失败/跳过） ----
+     `E112`（2026-10-04）：原来只抓「`name` P/F」两元，于是"逐脚本跳过数"根本没有解析入口
+     （权威区实际**两种写法并存**，都必须认）：
+       · **三元**：`` `stress-check` **11/0/3** ``（第 3 位＝跳过数）
+       · **后缀**：`` `ui-check` **175/0**（+1 跳过；…） ``
+     `declared` 仍是**通过数**（既有断言 1/2 的口径一字不动）；`failed`／`skipDeclared` 是新增的两位。
+     ⚠ 只认"名字紧跟数字/数字"这一形态 —— 权威行里 `` `ui-check` **1 项** `` 那种**跳过枚举**
+       不会命中（它没有 `数字/数字`），故不会与枚举混淆。 */
   const nameDecl = (name, textAndSource) => {
-    const re = new RegExp('`' + name + '`\\s*\\*{0,2}\\s*(\\d+)\\s*/\\s*(\\d+)', 'g');
+    const re = new RegExp('`' + name + '`\\s*\\*{0,2}\\s*(\\d+)\\s*/\\s*(\\d+)' +
+      '(?:\\s*/\\s*(\\d+))?\\s*\\*{0,2}\\s*(?:[（(]\\s*\\+\\s*(\\d+)\\s*跳过)?', 'g');
     for (const { text, from } of textAndSource) {
       const m = re.exec(text);
-      if (m) return { name, declared: Number(m[1]), from };
+      if (m) {
+        const skip3 = m[3] === undefined ? null : Number(m[3]);
+        const skipSuffix = m[4] === undefined ? null : Number(m[4]);
+        return {
+          name, declared: Number(m[1]), failed: Number(m[2]),
+          skipDeclared: skip3 !== null ? skip3 : skipSuffix, from,
+          declForm: skip3 !== null ? '三元 P/F/S' : (skipSuffix !== null ? '后缀 (+N 跳过)' : '两位 P/F')
+        };
+      }
     }
     return null;
   };
@@ -760,8 +776,17 @@ function main() {
 
   const totals = readRunTotals();
   const ledger = {};                   // 脚本名 → 账本里的通过数（**本轮** run-all 的逐脚本实跑账）
+  /* `E112`（2026-10-04）：另存一份**完整三元**（通过/失败/跳过）。为什么不改 `ledger` 的形状：
+     它被本节多处按"通过数"直接参与算术（合计/取数/来源统计），改形状会牵连一片；
+     而"三元"只有下面**断言 8** 用 ⇒ 单开一张表，语义清楚、影响面为零。 */
+  const ledgerSummary = {};
   for (const s of totals.suites) {
-    if (s && s.name && s.summary) ledger[s.name] = Number(s.summary.passed);
+    if (s && s.name && s.summary) {
+      ledger[s.name] = Number(s.summary.passed);
+      ledgerSummary[s.name] = {
+        passed: Number(s.summary.passed), failed: Number(s.summary.failed || 0), skipped: Number(s.summary.skipped || 0)
+      };
+    }
   }
   /**
    * 自指脚本：**两条逐脚本断言都不比它**。
@@ -960,6 +985,140 @@ function main() {
     (sourceGaps.length ? `｜**无来源**（既没读账也没实跑）：${sourceGaps.join('、')}` : '') +
     (unlocatedProbes.length ? `｜**实跑无结果**：${unlocatedProbes.join('、')}` : ''));
 
+  /* ---- 断言 8（`E112`，2026-10-04 追加）：权威区逐脚本按**通过/失败/跳过**三元写全 ----
+     立案（`E112` / 座位 5 的 `C·20` `F-5`）：权威区对 `harness-check` 只写 `391/0`、
+     **漏它那 2 条跳过**；而"跳过"在本项目是"**不算通过**"的语义（规范 9.5-5 第 6 条）⇒
+     漏写在报表里会被读成"这两条也过了"（数得出来的后果：按枚举去对账**总是差 2**）。
+     判据（三条，缺一不可）：
+       ① **写了就必须对**：写出跳过数的（`P/F/S` 三元 或 `（+N 跳过）` 后缀）必须 ＝ 实跑跳过数；
+          三元里的第 2 位（失败数）同理。
+       ② **跳过了就必须写**：实跑跳过数 > 0 的脚本，权威区**必须**写出该跳过数 —— 这正是 `E112` 的缺口。
+       ③ **取不到实跑值 ⇒ 判红**（不静默放过，`D19/D21/D23`）。
+     两种写法都已在权威区**实际存在**（实测）：`` `stress-check` **11/0/3** ``（三元）与
+     `` `ui-check` **175/0**（+1 跳过；…） ``（后缀）⇒ 解析器**两种都认**，**不要求**统一改写
+     （改写权威区的排版不是本门禁的职责；门禁只要求"写了的对、跳过的写了"）。
+     ⚠ 自指脚本 `docs-cross-check` 不在本断言内（其实跑值要到本节结束才确定，理由同 `SELF_REF`）。
+     ⚠ **`D20` 边界（2026-10-04 追加轮，实测修正）**：`--fast` 档的主账本**不含**浏览器/长跑脚本
+       （`browser-check`／`overlap-check`／`stress-check`；`E99` 之后 `--fast` 仍写主账本）⇒
+       **"账本覆盖不到" ≠ "权威区写错"**：前者是**前提不成立**（该脚本本轮**不可比**），
+       必须报"本轮不可比"并点名，**不得判 FAIL**（旧写法把 3 条"账本没有该脚本"当失配 ⇒
+       全量轮内假红 2 条、权威对账被拒，实证见该轮回执）；反过来，
+       **账本里有且数不符 ⇒ 仍必红并指名**（判据强度**不许降**，`D21`/`D23`）。
+       两种情形分别计数、互不混淆：
+         · `covered` ＝ 账本里有条目 ⇒ 逐项比失败数/跳过数，不符即进 `findings`（红）；
+         · `unmet`   ＝ 账本里**没有**条目 ⇒ 记"本轮不可比"**只列清单**（不红、**也不计入已核对**）。
+       ⇒ 不许"装绿"：`covered ＋ unmet === 应有值`（一个都不许消失、也不许两边都算）。
+     ⚠ 判据本体抽成**纯函数** `tripleAudit()`：D22 定点变异必须复用**同一个函数**，
+       否则"变异后变红"证明不了这条断言可证伪。 */
+  const tripleAudit = (authText, summaryOfName) => {
+    const findings = [];
+    const covered = [];
+    const unmet = [];
+    for (const s of (SUITES_READ || [])) {
+      const nm = s.name;
+      if (nm === SELF_REF) continue;
+      const d = nameDecl(nm, [{ text: authText, from: '权威区逐脚本清单' }]);
+      if (!d) { findings.push(`${nm}：权威区里解析不出 \`通过/失败\` 声明`); continue; }
+      const sum = summaryOfName(nm);
+      /* `D20`：账本覆盖不到 ⇒ **本轮不可比**（前提不成立），不是失败 —— 但必须点名并计数 */
+      if (!sum) { unmet.push(`${nm}（本轮账本无该脚本条目）`); continue; }
+      covered.push(nm);
+      if (d.failed !== sum.failed) {
+        findings.push(`${nm}：权威区写**失败 ${d.failed}** ≠ 实跑失败 ${sum.failed}（${d.declForm}）`);
+      }
+      if (sum.skipped > 0 && d.skipDeclared === null) {
+        findings.push(`${nm}：实跑**跳过 ${sum.skipped} 条**，而权威区只写了两位 ` +
+          `\`${d.declared}/${d.failed}\` —— **跳过数漏写**（\`E112\` 的原始缺口；"跳过"≠"通过"）`);
+      } else if (d.skipDeclared !== null && d.skipDeclared !== sum.skipped) {
+        findings.push(`${nm}：权威区写**跳过 ${d.skipDeclared}** ≠ 实跑跳过 ${sum.skipped}（${d.declForm}）`);
+      }
+    }
+    return { findings, covered, unmet };
+  };
+  {
+    const tri = tripleAudit(authLine, nm => ledgerSummary[nm]);
+    const expectCovered = (SUITES_READ || []).length - 1;      /* 减去自指脚本 */
+    t.check('E112 权威区逐脚本**三元写全**（通过/失败/跳过）：写出的失败数与跳过数都＝实跑值，' +
+      '且**凡实跑有跳过项的脚本都必须在权威区写出跳过数**（两种写法都认：`P/F/S` 三元 或 `（+N 跳过）` 后缀；' +
+      '实跑三元取本轮账本 `run-totals.json` —— 与本节其它断言同源）；' +
+      '**账本覆盖不到的脚本按 `D20` 报"本轮不可比"（不判 FAIL、也不计入已核对），但账本里有且数不符仍必红并指名**',
+      tri.findings.length === 0 && tri.covered.length + tri.unmet.length === expectCovered,
+      (tri.findings.length ? `**失配/漏写 ${tri.findings.length} 条**：${tri.findings.join('；')}` : '逐脚本三元一致') +
+      `｜**已核对 ${tri.covered.length}／${expectCovered} 个**` +
+      `（${tri.covered.map(n => `${n}=${ledgerSummary[n].passed}/${ledgerSummary[n].failed}/${ledgerSummary[n].skipped}`).join('、')}）` +
+      `｜**本轮不可比 ${tri.unmet.length} 个**：${tri.unmet.join('、') || '（无）'}` +
+      `｜自指 \`${SELF_REF}\` 不在本断言内`);
+
+    /* ---- 断言 9（`D20` 边界自证："覆盖不足**不许装绿**"）----
+       危险形态：把"账本缺该脚本"随手 `continue` 掉 ⇒ 该脚本既不进"已核对"也不进"不可比"，
+       于是**总数悄悄变少**、门禁照绿（`D23` 的"静默缩小校验范围"）。
+       判据＝**一个都不许消失或重复**：`已核对 ＋ 不可比 === 应有值`，且每个不可比项都点名。
+       可证伪（内存注入）：把某个**已核对**脚本的实跑三元置为 `undefined` ⇒ 它必须
+       **从"已核对"移到"不可比"**（两侧各变 1、总数不变），而不是"两边都在"或"两边都不在"。 */
+    {
+      const probeName = tri.covered[0] || (offlineGates.find(n => n !== SELF_REF) || 'ui-check');
+      const hiddenTri = tripleAudit(authLine, nm => (nm === probeName ? undefined : ledgerSummary[nm]));
+      const moved = !hiddenTri.covered.includes(probeName)
+        && hiddenTri.unmet.some(x => x.startsWith(probeName));
+      t.check('E112 §11 断言 9（`D20` 边界自证）：**账本覆盖不足的脚本一律报"本轮不可比"并逐条点名** —— ' +
+        '既不得据此判 FAIL（把"前提不成立"当成"权威区写错"），也不得**装绿**（悄悄算作已核对通过）；' +
+        '判据＝`已核对 ＋ 不可比 === 应有值`（一个都不许消失或重复）；**内存注入**：把某已核对脚本的实跑三元置空 ' +
+        '⇒ 它必须**从"已核对"移到"不可比"**',
+        tri.covered.length + tri.unmet.length === expectCovered
+          && hiddenTri.covered.length === tri.covered.length - 1
+          && hiddenTri.unmet.length === tri.unmet.length + 1
+          && moved,
+        `已核对 ${tri.covered.length} ＋ 本轮不可比 ${tri.unmet.length} ＝ ${tri.covered.length + tri.unmet.length}` +
+        `（应有 ${expectCovered}）｜不可比清单：${tri.unmet.join('、') || '（无）'}｜` +
+        `注入「${probeName} 无实跑三元」⇒ 已核对 ${hiddenTri.covered.length}／不可比 ${hiddenTri.unmet.length}、` +
+        `该脚本已移入不可比=${moved}（**两侧计数各变 1、总数不变**）`);
+      if (tri.unmet.length) {
+        t.info(`§11「三元写全」**本轮不可比 ${tri.unmet.length} 个**（账本不含该脚本条目 ⇒ 不判 FAIL、` +
+          '**也不计入已核对**）：' + tri.unmet.join('、') +
+          ' —— `--fast` 形态的主账本不含浏览器/长跑脚本时属**正常形态**；' +
+          '权威对账由 run-all 收尾按**全量** SUITES 判定（与 `E50`／`E55` 同口径）');
+      }
+    }
+
+    /* `D22` 定点变异：把 `ui-check` 的 `（+1 跳过）` 后缀改成 `（+9 跳过）`（**内存文本变异**，
+       不落地、不碰仓库、不用 `git checkout`）⇒ 本判据必红**并指名 `ui-check`**；未变异的当前源码必绿。
+       ⚠ **两种账本语境下都要成立**（`D20` 边界的核心要求；`--fast` 档实测踩到过）：
+         · ㈠**账本覆盖不足**（`--fast` 形态主账本不含浏览器/长跑脚本）⇒ 那些脚本进 `unmet`
+           （**本轮不可比**）而**不是 `findings`** ⇒ 基线**必绿**、判据**不红**；
+         · ㈡**账本覆盖充分**（全量形态）⇒ 基线同样必绿，变异后**必红并指名 `ui-check`**。
+       ⚠ 基线仍用"按需补齐待同步项"的内存副本：只在"权威区还没写出该跳过数、且账本里**有**该脚本"
+         时才补（否则会拿"本来就红"当基线，证明不了可证伪性）。补齐只作用于**内存副本**。 */
+    const baselineAuth = (() => {
+      const m = nameDecl('harness-check', [{ text: authLine, from: 'x' }]);
+      const hs = ledgerSummary['harness-check'];
+      if (!m) return null;
+      if (!hs || m.skipDeclared !== null) return authLine;   /* 本轮不可比 或 已写跳过数 ⇒ 无需补齐 */
+      return authLine.replace(
+        new RegExp('(`harness-check`\\s*\\*{0,2}\\s*' + m.declared + '\\s*/\\s*' + m.failed + ')\\s*\\*{0,2}'),
+        `$1/${hs.skipped}** `);
+    })();
+    const baseTri = baselineAuth === null ? null : tripleAudit(baselineAuth, nm => ledgerSummary[nm]);
+    const mutAuth = baselineAuth === null ? null
+      : baselineAuth.replace(/(`ui-check`\s*\*{0,2}\s*\d+\s*\/\s*\d+\s*\*{0,2}\s*[（(]\s*\+\s*)(\d+)(\s*跳过)/,
+        (_, a, n, c) => a + (Number(n) + 8) + c);
+    const mutTri = mutAuth === null ? null : tripleAudit(mutAuth, nm => ledgerSummary[nm]);
+    const mutSha = mutAuth === null ? null : require('node:crypto').createHash('sha256').update(mutAuth).digest('hex');
+    const diskAuth = (readmeSrc.split(/\r?\n/).find(l => l.includes('离线可跑部分')) || '');
+    t.check('E112 D22 定点变异（**两种账本语境下都要成立**）：把 `ui-check` 的 `（+1 跳过）` 后缀改成 ' +
+      '`（+9 跳过）`（**内存文本变异**）⇒ "三元写全"判据必红**并指名 `ui-check`**；' +
+      '而**账本覆盖不足**（`--fast` 形态主账本不含浏览器/长跑脚本）时，那些脚本按 `D20` 记**本轮不可比**，' +
+      '基线在**两种语境下都必绿**（不把"前提不成立"当失败）；权威行在盘上逐字未变',
+      baseTri !== null && mutTri !== null && mutSha !== null
+        && baseTri.findings.length === 0
+        && mutTri.findings.length > 0
+        && mutTri.findings.some(f => f.includes('ui-check') && f.includes('跳过 9'))
+        && diskAuth === authLine,
+      `基线失配 ${baseTri ? baseTri.findings.length : '（锚点未命中）'} 条（基线不可比 ${baseTri ? baseTri.unmet.length : '-'} 个）；` +
+      `变异体 sha256=${mutSha ? mutSha.slice(0, 12) + '…' : '（无）'}；` +
+      `变异后失配 ${mutTri ? mutTri.findings.length : '（无）'} 条：` +
+      `${mutTri ? mutTri.findings.join('；') : ''}｜盘上权威行逐字未变=${diskAuth === authLine}`);
+  }
+
   /* ---- 自指排除的如实交代：docs-cross-check 自身的声明值不在本节比对范围内 ---- */
   const notCompared = offlineGates.filter(n => n !== SELF_REF && sourceOf[n] === undefined);
   t.info(`未纳入逐脚本比对的离线门禁：${SELF_REF}（自指）` +
@@ -1050,6 +1209,252 @@ function main() {
     const zeroList51 = fams51.map((f, i) => ({ n: f.name, c: Number(String(counts51[i] || '0').split('=')[1] || 0) }))
       .filter(x => x.c === 0).map(x => x.n);
     t.info(`E51 未覆盖清单（该家族在"当前值区"里没出现，属正常，仅记录以免"悄悄删掉"）：${zeroList51.join('、') || '无'}`);
+  }
+
+
+  /* ---------------- 十六、正文「内部引数」对账（`E112`，2026-10-04 补） ----------------
+     【为什么要有这一节】第十节只管**权威区**（`tests\README.md` 第三节）、第十五节只管
+     **被唯一标记圈出来的"当前值区"**；两者之外的**正文内部引数**此前**没有任何对账** ⇒ 已实测
+     漂移：架构文档 4 处 `11 个组件`（真源 12，`E119`）、同一文档 `db-check` 238／220／权威 285
+     **三值并存**（`E120`）、权威行内部 `4 跳过`（真值 6）／`16 个脚本`（真值 17）／
+     `那 13 个`（真值 14）（`E112` 第二批），以及座位 2 在 `T-20261004-08` 里逐处报出的 6 处
+     同族陈旧引数（`docs-cross-check` 68／`harness-check` 258／`logic-check` 120 等）。
+     本节把**可机器核实的引数**与**真源**逐处比对。
+
+     【⚠ 为什么范围**必须显式列明**、绝不能做成"扫全文找数字"】
+     本节的命中口径是"**文件 × 行范围 × 形态**"三元组，三者都写死在下面的 `SRC16`／`FAM16` 里。
+     依据是**本机实测**的两处反例（2026-10-04，探针
+     `tests\._verify\t20261004-07\probe-arch-refs2.js`，只读）：
+       · 若允许在 `tests\README.md` 里抓「N 个组件」⇒ 会命中权威行中的
+         「单次 tick + **10 个组件**全量重绘约 0.1 ms」—— 那是**性能微基准的历史读数**，
+         与"组件清单有几项"毫无关系（真源 12）⇒ 白白造出一条**归属错**的假红；
+       · 若允许在该行里抓「`<脚本名>`（N 项）」⇒ 会命中
+         「唯一失败脚本＝`docs-check`（**2 项**＝6.4 已登记偏差）」—— 那个 2 是**该轮的失败条数**，
+         不是"该脚本有多少条断言"（真源 46）⇒ 同族假红。
+     ⇒ 结论：**数字本身没有归属，归属只由"它出现在哪一行的哪一种形态里"决定**（`E110` 同族
+       教训）。故本节只认**紧贴锚点短语**的形态，且**逐文件登记允许的形态族**（`SRC16[].fams`）。
+
+     【⚠ 为什么必须排除 dated 历史记录】
+     变更记录／历史台账里的数字是"**当时的真值**"，不是"现在的错值"：改它等于**改写历史**
+     （硬纪律 10）。同一份架构文档里的**真实例子**：
+       · `:365`（§十一 变更记录 2026-09-29 行）写「逐脚本条数（… `db-check` **220** …）」——
+         `220` 是那一轮的真实口径，**不许动**，也不许被判红（座位 2 已就地补注
+         "（均为 2026-09-29 当时口径）"）；
+       · `:292` 的「权威区合计 **1248 ＝ 1248**」是 2026-10-02 的 dated 引文，同理排除；
+       · 「13 张表」全族**本条判据不碰**：`schema.sql` 实为 15 条 `CREATE TABLE`、
+         `tests\db-check.js` 的 `REQUIRED_TABLES` 为 14、而权威区与本节同文件 `:445` 都写 13
+         ⇒ 牵涉**口径裁定未定**（已另立 `E123`），纳入会把 `docs-cross-check` 打红。
+     ⇒ 排除口径（**两条，取并集**；都是"按小节/行前缀限定"，不是"按数字大小猜"）：
+       ① 行前缀是 `| <4 位年>-<2 位月>-<2 位日>` 的行（dated 表格行）；
+       ② 位于「变更记录」小节标题之后的**所有**行（该小节整体是历史）。
+
+     【范围总表 `SRC16` —— 逐文件登记"扫哪些行、允许哪些形态"】
+       · `项目架构与技术栈.md`：**非 dated 行**；允许 ①②③a③b③c④（全族）。
+       · `tests\README.md`：**仅权威行**（含 `离线可跑部分` 的那一行）；只允许 ②③a④
+         （① 与 ③b/③c 在该行的实测假命中见上）。
+       · `项目记录\当前状态快照.md`／根 `README.md`／`PROJECT_RULES.md`／`项目记录\后续路线图.md`：
+         **本节不扫**，逐条给理由（**显式排除，不是漏掉**）：
+           - 快照：正文数字已由第十五节按**当前值区**锚点守护；整份扫描会命中早期阶段行
+             （如 `tests\ 现有 **20 个** *.js（**13 个** 离线门禁）`＝2026-09-19 当时的真值）⇒ 假红；
+           - 根 `README.md`：「N 个组件」的清单口径已由 **`E94`** 的三方不变量守着
+             （`src\components\*.js` ＝ `index.html` 注册数 ＝ README §二声明数），本节不重复实现；
+           - `PROJECT_RULES.md`／`后续路线图.md`：其中的数字多属 **dated 台账/债号行**，
+             纳入只会带来假红，而同族的重复守护收益为零。
+       · **「14 个的和是 M」这一族的真源**＝`Σ(13 个非自指离线门禁的实跑通过数) ＋ 权威区对
+         自指脚本 docs-cross-check 的声明数`（自指脚本的实跑值本节结束时才确定 ⇒ 见下）。
+       · **③ `<脚本名>`（N 项）⇒ 该脚本实跑条数**：取数与**第十一节同源**
+         （账本快路径 ＋「声明≠账」时冲突复核），**唯一例外＝自指脚本 `docs-cross-check` 自身**
+         —— 第十一节已按同一理由把它排除逐脚本比对，故它与**权威区 README 的同名声明**比对，
+         并在详情里如实标注"自指 ⇒ 与权威区比对"。
+     【口径】按 `D19`：本节只证明"文档里的数字与真源一致"，**不构成**任何实现证据。 */
+  {
+    /* —— 真源取数 —— */
+    const compCount16 = (() => {
+      try { return fs.readdirSync(path.join(ROOT, 'src', 'components')).filter(n => n.endsWith('.js')).length; }
+      catch { return null; }
+    })();
+    const jsTop16 = fs.readdirSync(env.paths.tests).filter(n => n.endsWith('.js')).length;
+    const offlineCount16 = offlineGates.length;
+    /** `<脚本名>`（N 项）族的期望值：实跑通过数（与第十一节同源）；自指脚本 ⇒ 权威区声明。 */
+    const scriptTruth16 = (name) => (name === SELF_REF ? declaredOf(name) : actualOf(name));
+    const sumMissing16 = offlineGates.filter(n => n !== SELF_REF && actualOf(n) === undefined);
+    const sumTruth16 = offlineGates.filter(n => n !== SELF_REF)
+      .reduce((a, n) => a + (actualOf(n) === undefined ? 0 : actualOf(n)), 0)
+      + (declaredOf(SELF_REF) === null ? 0 : declaredOf(SELF_REF));
+
+    /* —— 范围与形态表（**唯一**的命中口径；改口径必须同步这段注释） —— */
+    /** dated 历史记录的排除口径（三条，取并集；都是"按小节/行前缀/显式锚点限定"，不按数字大小猜）：
+     *  ① 行前缀是 `| <4 位年>-<2 位月>-<2 位日>`（变更记录表格行）；
+     *  ② 位于「变更记录」小节标题之后的**所有**行（该小节整体是历史）；
+     *  ③ 带**dated 引文标记**的行（`原始输出引文`／`（最近一轮：2026-10-02`／`截至 <日期>`）——
+     *     实测例子：`项目架构与技术栈.md:292` 的「权威区合计 **1248 ＝ 1248**（最近一轮：2026-10-02 …）」
+     *     是**当轮的原始输出引文**（≠ 现在的真值，也不该改），但它**不带日期行前缀、也在变更记录之前**
+     *     ⇒ 只靠 ①② 抓不到它（本轮如实补上 ③，并把理由写在这里）。 */
+    const isDated16 = s => /^\s*\|?\s*\d{4}-\d{2}-\d{2}/.test(s)
+      || /原始输出引文|最近一轮[:：]|截至\s*\d{4}-\d{2}-\d{2}/.test(s);
+    const archAll16 = read(ARCH_REL).split(/\r?\n/);
+    const cutPos16 = archAll16.findIndex(l => /^#+\s*.*变更记录/.test(l));
+    const archRows16 = archAll16.map((text, i) => ({ file: ARCH_REL, no: i + 1, text }))
+      .filter(r => !isDated16(r.text) && (cutPos16 < 0 || r.no - 1 < cutPos16));
+    const archExcluded16 = archAll16.length - archRows16.length;
+    const readmeNo16 = readmeSrc.split(/\r?\n/).findIndex(l => l.includes('离线可跑部分')) + 1;
+    const authRows16 = [{ file: 'tests/README.md', no: readmeNo16, text: authLine }];
+    const FAM16 = {
+      comp: { id: '①N 个（界面）组件', re: /(\d+)\s*个\s*\*{0,2}(?:界面)?组件/g, kind: 'count', truth: () => compCount16 },
+      gates: { id: '②N 个（离线）门禁', re: /(\d+)\s*个\s*\*{0,2}(?:为)?(?:带断言的)?(?:（离线）|\(离线\)|离线)?\s*门禁/g, kind: 'count', truth: () => offlineCount16 },
+      js: { id: '③a N 个 `tests\\*.js`', re: /(\d+)\s*个\*{0,2}\s*`(?:\*\.js|tests\\\*\.js)`/g, kind: 'count', truth: () => jsTop16 },
+      scriptJ: { id: '③b `脚本.js`（N 项）', re: /`([a-z0-9-]+)\.js`\s*（\s*\*{0,2}\s*(\d+)\s*项/g, kind: 'script' },
+      scriptC: { id: '③c `脚本`（…N 项）', re: /`([a-z0-9-]+)`\s*（[^（）|]{0,14}?\*{0,2}(\d+)\s*项/g, kind: 'script' },
+      sum: { id: '④N 个的和是 M', re: /(\d+)\s*\*{0,2}\s*个\s*\*{0,2}\s*的和是\s*\*{0,2}(\d+)/g, kind: 'sum' }
+    };
+    const SRC16 = [
+      { file: ARCH_REL, rows: archRows16, fams: ['comp', 'gates', 'js', 'scriptJ', 'scriptC', 'sum'], must: ['comp', 'gates', 'js', 'scriptJ'] },
+      { file: 'tests/README.md', rows: authRows16, fams: ['gates', 'js', 'sum'], must: ['gates', 'sum'] }
+    ];
+    /** 判据本体（**纯函数**：D22 复用同一个函数，否则变异绿了也证明不了可证伪）。
+     *  @returns {{hits:Object, findings:Array<{key:string,msg:string}>, lost:Array<string>, checked:number}} */
+    const audit16 = (srcs) => {
+      const hits = {}; const findings = []; const lost = []; let checked = 0;
+      for (const src of srcs) {
+        for (const key of src.fams) {
+          const fam = FAM16[key];
+          let n = 0;
+          for (const row of src.rows) {
+            fam.re.lastIndex = 0;
+            let m;
+            while ((m = fam.re.exec(row.text)) !== null) {
+              n++; checked++;
+              const where = `${src.file}:${row.no}`;
+              const raw = m[0].replace(/\s+/g, ' ');
+              if (fam.kind === 'count') {
+                const got = Number(m[1]); const exp = fam.truth();
+                if (exp === null || got !== exp) {
+                  findings.push({ key, msg: `${where} ${fam.id}：正文写 ${got} ≠ 真源 ${exp === null ? '（取不到）' : exp}（"${raw}"）` });
+                }
+              } else if (fam.kind === 'script') {
+                const name = m[1]; const got = Number(m[2]); const exp = scriptTruth16(name);
+                if (exp === null || exp === undefined) {
+                  findings.push({ key, msg: `${where} ${fam.id}：\`${name}\`（${got} 项）**取不到真源**（该脚本没有实跑值/权威区声明）` });
+                } else if (got !== exp) {
+                  findings.push({ key, msg: `${where} ${fam.id}：\`${name}\` 正文写 ${got} 项 ≠ 真源 ${exp}` +
+                    `${name === SELF_REF ? '（自指 ⇒ 与权威区声明比对）' : '（实跑通过数）'}（"${raw}"）` });
+                }
+              } else {
+                const n2 = Number(m[1]); const got = Number(m[2]);
+                if (n2 !== offlineCount16) {
+                  findings.push({ key, msg: `${where} ${fam.id}："${raw}" 的"${n2} 个"≠ 离线门禁实数 ${offlineCount16}` });
+                } else if (got !== sumTruth16) {
+                  findings.push({ key, msg: `${where} ${fam.id}："${raw}" 写 ${got} ≠ 真源 ${sumTruth16}` +
+                    `（＝离线门禁实数中的 ${n2 - 1} 个**非自指**脚本实跑值之和 ＋ 权威区对自指脚本 \`${SELF_REF}\` 的声明）` });
+                }
+              }
+            }
+          }
+          hits[key] = (hits[key] || 0) + n;
+          if (n === 0 && src.must.includes(key)) lost.push(`${src.file} 的「${fam.id}」锚点一处都没命中`);
+        }
+      }
+      return { hits, findings, lost, checked };
+    };
+
+    const A16 = audit16(SRC16);
+    const famCounts16 = Object.keys(FAM16).map(k => `${FAM16[k].id}=${A16.hits[k] || 0} 处`).join('、');
+    t.check('E112 §16 前提：正文「内部引数」的范围锚点都可定位（**文件 × 行范围 × 形态**三元组；' +
+      '必守形态族命中 0 处即判红 —— 文档改结构必须同步本节，不许静默架空）',
+      A16.lost.length === 0 && A16.checked > 0,
+      `${A16.checked} 处命中｜${famCounts16}｜范围：${SRC16.map(s => `${s.file}（${s.rows.length} 行）`).join('、')}` +
+      `｜dated 历史记录**已排除** ${archExcluded16} 行（口径：日期行前缀 ／ 变更记录小节之后 ／ dated 引文标记）` +
+      (A16.lost.length ? `｜**锚点丢失**：${A16.lost.join('；')}` : '') +
+      `｜真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／和值 ${sumTruth16}` +
+      (sumMissing16.length ? `（**和的取数不完整**：${sumMissing16.join('、')} 无实跑值）` : ''));
+
+    const badNum16 = A16.findings.filter(f => f.key !== 'sum');
+    const badSum16 = A16.findings.filter(f => f.key === 'sum');
+    t.check('E112 §16 断言（数量族 ①②③）：正文内部引数（N 个组件／N 个（离线）门禁／N 个 `tests\\*.js`／' +
+      '`<脚本名>`（N 项））与真源**零失配**（逐处指名 `文件:行号`；真源＝`src\\components\\*.js` 文件数／' +
+      '`run-all` 的 `SUITES` 过滤结果／各脚本**实跑**条数）',
+      badNum16.length === 0,
+      badNum16.length ? `失配 ${badNum16.length} 处：${badNum16.map(f => f.msg).join('；')}`
+        : `零失配（${Object.keys(FAM16).filter(k => k !== 'sum').map(k => `${FAM16[k].id}=${A16.hits[k] || 0} 处`).join('、')}）；` +
+          `真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／各脚本实跑条数`);
+
+    t.check('E112 §16 断言（和值族 ④）：「N 个的和是 M」的 N ＝ 离线门禁实数、M ＝ 真源和值' +
+      '（真源＝13 个非自指离线门禁的实跑通过数之和 ＋ 权威区对自指脚本的声明数）',
+      badSum16.length === 0,
+      badSum16.length ? `失配 ${badSum16.length} 处：${badSum16.map(f => f.msg).join('；')}`
+        : `零失配（命中 ${A16.hits.sum || 0} 处，和值真源 ${sumTruth16}）`);
+
+    /* ---- `D22` 定点变异（**内存文本变异**：字节副本 ＋ sha256 留痕 ＋ 盘上文件未变的复核；
+       不落地、不碰仓库、不用 `git checkout`／`restore`／`stash`）----
+       **同一次变异**把四个族各改坏一处 ⇒ 四条判据必须各自**红并逐处指名 `文件:行号`**。
+       基线＝"把本轮待同步的引数先按真源就地改正"的**内存副本**（改正只作用于内存）：
+       理由如实交代 —— 那几处属座位 2／主代理本轮 `E119`/`E120`/`E121` 与追加清单的同步范围，
+       拿"当前（尚未同步）的正文"当基线，D22 会因**别人的在飞改动**而恒红，失去"可证伪"这一层意思。 */
+    const sha16 = s => require('node:crypto').createHash('sha256').update(String(s)).digest('hex');
+    const archFile16 = path.join(ROOT, ARCH_REL);
+    const readmeFile16 = path.join(ROOT, 'tests', 'README.md');
+    const archSha0 = sha16(fs.readFileSync(archFile16, 'utf8'));
+    const readmeSha0 = sha16(fs.readFileSync(readmeFile16, 'utf8'));
+    /** 把**每一处**被识别到的引数按真源就地改写（只作用于传入的字符串副本） */
+    const repair16 = (srcs) => srcs.map(src => ({
+      ...src,
+      rows: src.rows.map(row => {
+        let text = row.text;
+        for (const key of src.fams) {
+          const fam = FAM16[key];
+          let out = ''; let last = 0; let m;
+          fam.re.lastIndex = 0;
+          while ((m = fam.re.exec(text)) !== null) {
+            let rep = m[0];
+            if (fam.kind === 'count') rep = rep.replace(/\d+/, String(fam.truth()));
+            else if (fam.kind === 'script') {
+              const exp = scriptTruth16(m[1]);
+              if (exp !== undefined && exp !== null) rep = rep.replace(/(\d+)(\s*项)/, exp + '$2');
+            } else if (Number(m[1]) === offlineCount16) rep = rep.replace(/(的和是\s*\*{0,2}\s*)\d+/, '$1' + sumTruth16);
+            out += text.slice(last, m.index) + rep; last = m.index + m[0].length;
+          }
+          text = out + text.slice(last);
+        }
+        return { ...row, text };
+      })
+    }));
+    /** 把**第一个**命中该族的引数的**最后一个数字** +1（＝"改错一处"的最小形态） */
+    const bump16 = (srcs, key) => {
+      const fam = FAM16[key];
+      for (const src of srcs) {
+        for (const row of src.rows) {
+          fam.re.lastIndex = 0;
+          const m = fam.re.exec(row.text);
+          if (!m) continue;
+          const bumped = m[0].replace(/(\d+)(?=[^\d]*$)/, x => String(Number(x) + 1));
+          return { srcs: srcs.map(s => s === src ? { ...s, rows: s.rows.map(r => r === row ? { ...r, text: row.text.slice(0, m.index) + bumped + row.text.slice(m.index + m[0].length) } : r) } : s),
+            where: `${src.file}:${row.no}`, from: m[0].replace(/\s+/g, ' ') };
+        }
+      }
+      return null;
+    };
+    const base16 = repair16(SRC16);
+    const A16base = audit16(base16);
+    const mutants = ['comp', 'gates', 'scriptC', 'sum'].map(k => ({ k, m: bump16(base16, k) }))
+      .map(x => ({ ...x, a: x.m ? audit16(x.m.srcs) : null }));
+    const directed = mutants.every(x => x.m && x.a
+      && x.a.findings.some(f => f.key === x.k && f.msg.startsWith(x.m.where)));
+    t.check('E112 §16 D22 定点变异（**内存文本变异**，同一次变异改坏四个族各一处）：' +
+      '①「N 个组件」改错、②「N 个（离线）门禁」改错、③一处「`<脚本>`（N 项）」改错、④「N 个的和是 M」改错 ⇒ ' +
+      '四条判据必须各自**红并逐处指名 `文件:行号`**；按真源更正后的基线必绿；盘上两个文件逐字节未变',
+      A16base.findings.length === 0 && A16base.lost.length === 0 && directed
+        && sha16(fs.readFileSync(archFile16, 'utf8')) === archSha0
+        && sha16(fs.readFileSync(readmeFile16, 'utf8')) === readmeSha0,
+      `基线失配 ${A16base.findings.length} 处（锚点丢失 ${A16base.lost.length} 处）；` +
+      mutants.map(x => x.m
+        ? `${FAM16[x.k].id}：变异 ${x.m.where} 的「${x.m.from}」⇒ 命中该族且指名该行=${Boolean(x.a && x.a.findings.some(f => f.key === x.k && f.msg.startsWith(x.m.where)))}`
+        : `${FAM16[x.k].id}：**锚点未命中，无法变异**`).join('；') +
+      `｜盘上未变 arch=${sha16(fs.readFileSync(archFile16, 'utf8')) === archSha0}` +
+      ` readme=${sha16(fs.readFileSync(readmeFile16, 'utf8')) === readmeSha0}`);
+    if (badNum16.length || badSum16.length) {
+      t.info('§16 的失配**逐处**照录（`E118`：失败明细一律留全）：\n      ' +
+        [...badNum16, ...badSum16].map(f => f.msg).join('\n      '));
+    }
   }
 
 

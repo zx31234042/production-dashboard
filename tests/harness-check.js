@@ -93,7 +93,15 @@ function sha256BytesE70(buf) {
 /**
  * 受管文件普查：`{ files: { 相对路径(posix): sha256 }, extra: 说明, collected, reason }`。
  * 失败（读不到某个文件）不抛错 —— 记成 `:err:<code>` 参与比对（"读不到"本身也是一种变化）。
- * @returns {{files:Object<string,string>, textCount:number, pngCount:number, collected:boolean, reason:string}}
+ *
+ * ⚠ **`pngCount` 的准确含义**（`E113`，2026-10-04 补注）：它是
+ * `tests\screenshots-baseline\` 下的**文件条目数**，**不是"基准图张数"** —— 该目录里还有
+ * 一份 `README.md`（说明捕获参数与更新流程），它也在这 11 个条目里、**同时也在
+ * `snapshot` 的文本受管面里**（故受管面要按"93 文本 ＋ 11 条目"读，不能读成"两个不相交的集合"）。
+ * 真正的"基准图"是 `pngFiles` 个 `*.png`。旧打印模板曾把 `${pngCount}` 念成"N **张基准图**"
+ * （＝把 11 个目录条目读成 11 张图）⇒ 本次（`E113` 第二批）改由 `baselineEntriesPhrase()` 统一措辞。
+ * @returns {{files:Object<string,string>, textCount:number, pngCount:number, pngFiles:number,
+ *            pngOther:number, collected:boolean, reason:string}}
  */
 function managedGuardCensus() {
   const files = {};
@@ -103,20 +111,29 @@ function managedGuardCensus() {
     try { files[rel] = sha256BytesE70(REAL_READ.call(fs, full)); }
     catch (err) { files[rel] = `:err:${(err && err.code) || 'unknown'}`; }
   }
-  let pngCount = 0;
+  let pngCount = 0;        /* 目录**条目**数（含该目录的 README.md） */
+  let pngFiles = 0;        /* 其中 *.png（＝真正的"基准图"张数） */
   try {
     for (const name of fs.readdirSync(BASELINE_PNG_DIR)) {
       const full = path.join(BASELINE_PNG_DIR, name);
       if (!fs.statSync(full).isFile()) continue;
       pngCount++;
+      if (/\.png$/i.test(name)) pngFiles++;
       files[`tests/screenshots-baseline/${name}`] = sha256BytesE70(REAL_READ.call(fs, full));
     }
   } catch { /* 基准目录读不到：下面按"取不到证据"处理（collected=false） */ }
   return {
-    files, textCount: Object.keys(snap.files).length, pngCount,
+    files, textCount: Object.keys(snap.files).length, pngCount, pngFiles, pngOther: pngCount - pngFiles,
     collected: snap.collected === true && pngCount > 0,
     reason: snap.reason || (pngCount ? '' : '读不到 tests/screenshots-baseline（或是空目录）')
   };
+}
+
+/** 把"基准目录"的读数渲染成**准确**措辞（`E113` 第二批，2026-10-04）——
+ *  一律从运行时的 `census` 取数，**不写死任何数字**（防再漂的写法，见 `E113` 的成因记）。 */
+function baselineEntriesPhrase(census) {
+  if (!census || !Number.isFinite(census.pngCount)) return '基准目录条目（取不到）';
+  return `${census.pngCount} 个目录条目（＝ ${census.pngFiles} 张 PNG ＋ 该目录 ${census.pngOther} 个非 PNG 条目，如 README.md）`;
 }
 
 /** 两次普查的差异（纯函数）：逐条给出 `路径（前 12 位 → 后 12 位）`，按路径字典序 */
@@ -4549,7 +4566,8 @@ t.section('十、权威数字校验的定点回归（runAll.verifyAuthorityTotal
 
   /* ---- `E70-B`：**结构性不变量** —— 跑完上面这一段，受管文件逐个 sha256 必须与开始时相同 ----
      语义：受管文件＝入库且被门禁扫描的文本文件（`snapshot` 扫描面；含未入库的同类文本文件，宁可为严）
-     ＋ `tests\screenshots-baseline\*`（二进制基准图，唯一写入点是人工开关 `capture-baseline --update`）。
+     ＋ `tests\screenshots-baseline\` 下的**全部目录条目**（PNG 基准图 ＋ 该目录的 `README.md`；
+       措辞见 `baselineEntriesPhrase()` 与 `E113` 第二批：**不写死张数**）
      `tests\._verify\` 下的产物与账本（`run-totals.json`）**不在**受管面内（运行期正常产出）。
      **本段没有"还原真文件"的收尾** —— 真文件压根没被写过；D22 变异（把副本路径换成真文件路径）
      必须让这一条**红并指名**。 */
@@ -4558,7 +4576,7 @@ t.section('十、权威数字校验的定点回归（runAll.verifyAuthorityTotal
   t.check('E70-B 结构性不变量：跑完本段（权威数字定点回归）后，**受管文件**的 sha256 与开始时逐个相同' +
     '（受管文件＝入库且被门禁扫描的文本文件 ＋ `tests\\screenshots-baseline\\*`；有变化即**逐条指名**）',
     managedChanged.length === 0 && censusBefore.collected && censusAfter.collected,
-    `受管面 ${censusBefore.textCount} 个文本文件 ＋ ${censusBefore.pngCount} 张基准图；`
+    `受管面 ${censusBefore.textCount} 个文本文件 ＋ ${baselineEntriesPhrase(censusBefore)}；`
       + `采集可用=${censusBefore.collected}/${censusAfter.collected}`
       + `（${censusBefore.reason || '无异常'}）`
       + `；被改动的受管文件 ${managedChanged.length} 个`
@@ -4589,7 +4607,7 @@ t.section('十、权威数字校验的定点回归（runAll.verifyAuthorityTotal
         && goneP.length === 1 && goneP[0].startsWith('tests/README.md') && goneP[0].includes('缺')
         && pngP.length === 1 && pngP[0].startsWith('tests/screenshots-baseline/'),
       `无变化=${sameP.length} 条；改 README=${mutP.join('；') || '（无）'}；删 README=${goneP.join('；') || '（无）'}；`
-        + `改基准图=${pngP.join('；') || '（无）'}`);
+        + `受管面有变化的基准目录条目=${pngP.join('；') || '（无）'}`);
   }
 
   /* ---------------- 十之二、权威校验的"可达性"回归（2026-09-20 补） ----------------
@@ -5644,7 +5662,7 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     '受管文件的 sha256 与本轮开始时逐个相同（有变化即**逐条指名**）',
     managedChangedC.length === 0 && Boolean(censusBeforeC) && censusBeforeC.collected
       && Boolean(censusAfterC) && censusAfterC.collected,
-    `受管面 ${censusBeforeC ? censusBeforeC.textCount : '?'} 个文本文件 ＋ ${censusBeforeC ? censusBeforeC.pngCount : '?'} 张基准图；`
+    `受管面 ${censusBeforeC ? censusBeforeC.textCount : '?'} 个文本文件 ＋ ${baselineEntriesPhrase(censusBeforeC)}；`
       + `采集可用=${censusBeforeC ? censusBeforeC.collected : '?'}/${censusAfterC ? censusAfterC.collected : '?'}`
       + `（${(censusBeforeC && censusBeforeC.reason) || '无异常'}）；被改动的受管文件 ${managedChangedC.length} 个`
       + (managedChangedC.length ? `：${managedChangedC.join('；')}` : ''));

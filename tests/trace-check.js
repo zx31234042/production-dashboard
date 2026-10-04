@@ -718,17 +718,20 @@ const REQ_LINES = REQ_FILE
 /** 本文件自身源码（**被检对象**：注释里的行号引用就在这里）。
  *  ⚠️ **锚点表与形态表所在的区块整段掩掉**：那些行里写的是"引用该长什么样"的**模式**，
  *  自身也含 `需求 …:805` 之类的字面 —— 不掩掉就会被当成真的引用（本节的自指陷阱，实测踩过）。
- *  掩码用空串替换，**行号与其余行的偏移量不变**。 */
-const ANCHOR_REGION = (() => {
-  const lines = fs.readFileSync(__filename, 'utf8').split('\n').map(s => s.replace(/\r$/, ''));
+ *  掩码用空串替换，**行号与其余行的偏移量不变**。
+ *  `E88⒣`（2026-10-04）：掩码抽成 `maskSelfRegion()` —— `九⑯` 的 D22 要在**内存变异副本**上
+ *  跑**同一条扫描管线**（不抽出来就会出现"变异副本没掩码 ⇒ 凭空多出引用"的假红）。 */
+function maskSelfRegion(lines) {
   const a = lines.findIndex(l => /^const ANCHORS = \{/.test(l));
   const b = a < 0 ? -1 : lines.findIndex((l, i) => i > a && /^\};/.test(l));
   const c = lines.findIndex(l => /^const CITATION_PATTERNS = \[/.test(l));
   const d = c < 0 ? -1 : lines.findIndex((l, i) => i > c && /^\];/.test(l));
-  return { lines, spans: [a >= 0 && b > a ? [a, b] : null, c >= 0 && d > c ? [c, d] : null].filter(Boolean) };
-})();
-const SELF_LINES = ANCHOR_REGION.lines.map((l, i) =>
-  ANCHOR_REGION.spans.some(([a, b]) => i >= a && i <= b) ? '' : l);
+  const spans = [a >= 0 && b > a ? [a, b] : null, c >= 0 && d > c ? [c, d] : null].filter(Boolean);
+  return lines.map((l, i) => (spans.some(([x, y]) => i >= x && i <= y) ? '' : l));
+}
+const SELF_RAW_LINES = fs.readFileSync(__filename, 'utf8').split('\n').map(s => s.replace(/\r$/, ''));
+const ANCHOR_REGION = { lines: SELF_RAW_LINES };
+const SELF_LINES = maskSelfRegion(SELF_RAW_LINES);
 
 /** 引用形态表（"需求行号引用"的**定义**）。要增删形态必须同步第九节的冻结基线，
  *  否则"清单 ⊆ 扫描"或"扫描 ⊆ 清单"当场变红 —— 形态表本身也是被对账的对象。 */
@@ -892,36 +895,103 @@ const CITATION_LEDGER = [
   ['L516', 1, 808, 'req'],
   ['L589', 0, 844, 'req'],
   ['L602', 0, 815, 'req'],
-  ['L1351', 0, 838, 'req'],
+  ['L1478', 0, 838, 'req'],
   /* —— 跨文件 / 示例：引的是**别的文件**自己的行号，或本节注释里的示例写法 —— */
   ['L13', 0, 287, 'xfile', '需求文档\\…-V1.42.md'],
   ['L409', 0, 288, 'xfile', '需求文档\\…-V1.42.md'],
   ['L685', 0, 265, 'xfile', '需求文档\\…-V1.42.md（示例）'],
   ['L720', 0, 805, 'xfile', '本节注释里的示例写法（裸 :A–B 补全）'],
-  ['L1530', 0, 805, 'xfile', '本节注释里第二次举同一示例']
+  ['L1657', 0, 805, 'xfile', '本节注释里第二次举同一示例']
 ];
 
 /** 清单 → 引用对象（带源码行原文），供锚点表与对账共用。
  *  `hit` 为 null 表示该处**扫不到**（清单登记错了或源码被改坏）。
- *  in-scope 用严格扫描（反引号里的不算）；xfile 用放宽扫描（它们本来就在反引号里）。 */
+ *  in-scope 用严格扫描（反引号里的不算）；xfile 用放宽扫描（它们本来就在反引号里）。
+ *
+ *  ⚠ **`E88⒣`（2026-10-04）：本函数的"行号"改成"按内容定位"** ——
+ *  清单里写的 `L###` **不再直接当行号用**，它只作**声明值**（用于锚点表／豁免表的键 `key`
+ *  与人工可读）；真实行号由 `locateSelfLine()` 按**内容签名**求出来。
+ *  为什么必须这样（立案事实，见 `E88⒣`）：清单是**逐处绝对行号**，
+ *  **本文件任何整行增删都会整体挪行号** ⇒ 旧实现下 `九③/⑤/⑦/⑨/⑩` 会**一片红**
+ *  （`E102` 那次只因为"同行内改一个词"才没触发）。改成内容定位后，行号漂移由签名吸收：
+ *  整行增删 ⇒ 定位照样命中、判据照样绿；而**真正的**引用被改坏（引用原文／被引行号变了）
+ *  ⇒ 签名定位不到（命中数 ≠ 1）⇒ `九⑮` **红并逐条指名该引用**（不是一片红）。
+ *  **维护提示（逐处处置见 `LOCATE_SNIPPETS` 与 `九⑮`）**：
+ *    · 能按内容定位的一律按内容定位（21/26 条签名已唯一；余 5 条补**独特片段**）；
+ *    · **`L###` 声明值与内容定位不一致时不是缺陷**（那是漂移，`九⑮` 会打印差集，非红）；
+ *    · 但**引用原文／被引用行号**变了就必须同步本清单 —— 否则 `九⑮`／`九⑥` 会指名点出来。
+ *    · ⚠ **此文件（`tests\trace-check.js`）整行增删会挪行号，改动者需同步本清单**。 */
 function buildManifest(ledger, allLines) {
   const out = [];
+  const pre = prescanLines(allLines);        /* 逐行只扫一遍（26 处 × 全文件各扫一次＝4.6 万次扫描） */
   for (const [srcRaw, idx, reqNo, type, file, rangeStart] of ledger) {
-    const srcNo = typeof srcRaw === 'number' ? srcRaw : Number(String(srcRaw).replace(/^L/, ''));
-    const line = allLines[srcNo - 1];
+    const declaredSrcNo = typeof srcRaw === 'number' ? srcRaw : Number(String(srcRaw).replace(/^L/, ''));
+    const key = `${declaredSrcNo}:${idx}`;
     /* 源码行号用 `L123` 写：这样本节源码里就不会出现形如 `[123, 0, 456, 'req'],` 的"裸数字 + 冒号"
        片段被自己的扫描器当成引用（自指陷阱的第三道闸）。
        第 6 个元素（可选）＝**区间起点**：仅"区间引用"用，`reqNo` 取的是区间**止点**
        （因为锚点核的就是止点那一行；起点由第九节⑭的端点断言按**位置严格相等**核）。 */
+    const loc = locateSelfLine({ declaredSrcNo, idx, reqNo, type, rangeStart: rangeStart || null, key }, allLines, pre);
+    /* 定位失败 ⇒ 退回声明行号"尽力而为"（`九⑮` 会判红并指名，不静默） */
+    const srcNo = loc.srcNo === null ? declaredSrcNo : loc.srcNo;
+    const line = allLines[srcNo - 1];
     const hits = line === undefined ? [] : (type === 'xfile' ? scanCitationsRaw(line) : scanCitations(line));
     const hit = hits[idx] || null;
     out.push({
-      srcNo, idx, reqNo, type, file: file || '', line, hit, rangeStart: rangeStart || null,
+      srcNo, declaredSrcNo, idx, reqNo, type, file: file || '', line, hit, rangeStart: rangeStart || null,
+      locateHits: loc.hits.length, locateCands: loc.cands, locateSnippet: loc.usedSnippet,
       text: hit ? hit.text : '**扫不到引用（清单登记错 / 源码被改坏，需人工核）**',
-      key: `${srcNo}:${idx}`
+      key
     });
   }
   return out;
+}
+
+/** 逐行**预扫**一次（严格 ＋ 放宽两种口径），供"按内容定位"复用。
+ *  26 处清单若各自全文件扫一遍＝约 4.6 万次扫描；预扫只需 2 遍全文件。 */
+function prescanLines(allLines) {
+  return allLines.map(l => (l ? { strict: scanCitations(l), raw: scanCitationsRaw(l) } : { strict: [], raw: [] }));
+}
+
+/** 「按内容定位」的**独特片段**表（键＝清单的**声明键** `L<行号>:<第几处>`）。
+ *  为什么需要它（实测，2026-10-04）：签名＝「该行第几处」＋「期望的被引用行号」对
+ *  **21/26** 条已经唯一；剩下 5 条会各命中**两行**（同一句／同一写法在文件里出现两次）：
+ *    · `449:0` ↔ `602:0`（两处都写 `交付方式见需求 :815` 这一句）
+ *    · `409:0` ↔ `1191:0`（两处都写「`需求文档\…-V1.42.md:288`」）
+ *    · `720:0` ↔ `1657:0`（两处都举 `需求 …:805` 这个例子）
+ *  ⇒ 这 5 条各补一段**取自该行本身**的独特片段即可唯一。
+ *  ⚠ 片段一律是**行内容**（不是行号）⇒ 整行增删后照样命中。 */
+const LOCATE_SNIPPETS = {
+  '449:0': '尚未产出"在 10 月开发冲刺之前',
+  '602:0': 'AC-12 的判定对象是',
+  '409:0': 'AC 走独立分母，绝不并入',
+  '720:0': '自身也含',
+  '1657:0': '（形如'
+};
+
+/**
+ * **按内容定位**一条清单在**本文件源码**里的真实行号（`E88⒣`，2026-10-04）。
+ *  签名＝(`该行第几处`, `期望的被引用行号`)；多候选时再按 `LOCATE_SNIPPETS` 的独特片段筛一次。
+ *  「命中数回读」就是本函数的返回值：**必须恰 1 行**，≠1 ⇒ `九⑮` 判红并指名该引用
+ *  （**此处刻意不"自动选最近的一行"** —— 猜出来的一行会让判据变成恒真）。
+ *  ⚠ **此文件整行增删会挪行号，改动者需同步本清单**：本函数正是为了让"挪行号"不再打红而存在；
+ *  但**引用原文／被引用行号**被改动时，清单必须同步（`九⑥`／`九⑮` 会指名）。
+ * @param {{declaredSrcNo:number, idx:number, reqNo:number, type:string, rangeStart:?number, key:string}} e
+ * @param {string[]} allLines 源码行（生产＝本文件；D22＝内存变异副本）
+ * @param {Array<{strict:Array, raw:Array}>} pre 预扫结果
+ * @returns {{srcNo:?number, hits:number[], cands:number[], usedSnippet:boolean}}
+ */
+function locateSelfLine(e, allLines, pre) {
+  const expect = e.rangeStart === null || e.rangeStart === undefined ? e.reqNo : e.rangeStart;
+  const cands = [];
+  allLines.forEach((l, i) => {
+    if (!l) return;
+    const h = (e.type === 'xfile' ? pre[i].raw : pre[i].strict)[e.idx];
+    if (h && h.lineNo === expect) cands.push(i + 1);
+  });
+  const snip = LOCATE_SNIPPETS[e.key];
+  const hits = snip ? cands.filter(n => allLines[n - 1].includes(snip)) : cands;
+  return { srcNo: hits.length === 1 ? hits[0] : null, hits, cands, usedSnippet: Boolean(snip) };
 }
 
 const CITATIONS = buildManifest(CITATION_LEDGER, SELF_LINES);
@@ -960,6 +1030,63 @@ function sourceAnchorHolds(c, srcHalf) {
   return true;
 }
 
+/**
+ * 把一条 in-scope 引用的「需求行侧锚点」在**给定的需求行数组**上求值（`E88⒣`，2026-10-04）。
+ *   · `docMatch` ＝ **登记的那一行**（`:reqNo`）上各锚点的命中情况 —— 这就是**生产判据**
+ *      （与抽函数之前逐字同口径：占位替换、目标行、跨行唯一性 `linesHit` 全在这里）；
+ *   · `drift`    ＝ **只在未命中时**才算：该锚点**现在**在整份需求文件的哪几行命中
+ *      （`lines` 为 `null` ＝ 模式非法，如实标出，**不假装**"全文找不到"）。
+ *  为什么抽成函数（`D21`：不许写第二份真源）：`九⑰` 的 D22 必须**模拟一次"被引用的上游文件
+ *  整行增删"**并在**内存副本**上跑**同一份逻辑**，才能证明"红会指名到具体引用"不是另写的一套。
+ *  ⚠ **此文件与被引用的需求文件整行增删都会挪行号，改动者需同步清单**：需求侧的行号**就是**
+ *  被引用的东西、无法按内容定位 ⇒ 只能靠 `drift` 的"现在落在 :N"逐处指名（`九⑰` 守着）。
+ * @param {{key:string, reqNo:number, hit:?object}} c 清单条目
+ * @param {string[]} reqLines 需求行数组（生产＝当轮真源；D22＝内存变异副本）
+ * @param {Object<string,{anchor:string}>} anchors 锚点表（生产＝`ANCHORS`；D22 用同一份）
+ * @returns {{anchored:boolean, srcHalf:string, docMatch:Array, drift:Array}}
+ */
+function docAnchorOf(c, reqLines, anchors) {
+  const a = anchors[c.key];
+  if (!a) return { anchored: false, srcHalf: '', docMatch: [], drift: [] };
+  const parts = String(a.anchor).split('¦');
+  const rangeStartNo = c.hit && c.hit.range ? c.hit.range[0] : c.reqNo;
+  /* 源码侧锚点的**字面部分**：去掉**所有** `${…}` 占位（含 `${rangeStart}` / `${rangeEnd}`）与「」。
+     此前只去掉 `${n…}` ⇒ 区间那条的字面里还留着 `${rangeStart}`，源码侧核对必然假红（实测踩过）。 */
+  const srcHalf = parts[0].replace(/\$\{[^}]*\}/g, '').replace(/[「」]/g, '');
+  const sub = (s) => s
+    .replace(/\$\{rangeStart\}/g, String(rangeStartNo))
+    .replace(/\$\{rangeEnd\}/g, String(c.hit && c.hit.range ? c.hit.range[1] : c.reqNo))
+    .replace(/\$\{n \+ (\d+)\}/g, (_, d) => String(c.reqNo + Number(d)))
+    .replace(/\$\{n - (\d+)\}/g, (_, d) => String(c.reqNo - Number(d)))
+    .replace(/\$\{n\}/g, String(c.reqNo));
+  const docP = parts.slice(1).map(sub);
+  const target = normSpace(reqLines[c.reqNo - 1] || '');
+  const docMatch = docP.map((p) => {
+    let re = null, m2 = null, linesHit = 0;
+    try {
+      re = new RegExp(normSpace(p));
+      m2 = target.match(re);
+      /* **跨行干扰检查**：该锚点模式在整份需求文件里应当**只**命中被引用那一行 */
+      linesHit = reqLines.filter(l => re.test(normSpace(l))).length;
+    } catch { /* 模式非法 ⇒ 下面如实报 */ }
+    return {
+      pat: p, re, ok: Boolean(m2), linesHit,
+      hit: m2 ? String(m2[0]).slice(0, 60) : '',
+      index: m2 ? +((target.indexOf(m2[0]) / Math.max(1, target.length)).toFixed(3)) : null
+    };
+  });
+  const drift = docMatch.some(d => !d.ok) ? docP.map((p) => {
+    let lines = null;
+    try {
+      const re = new RegExp(normSpace(p));
+      lines = [];
+      reqLines.forEach((l, j) => { if (re.test(normSpace(l))) lines.push(j + 1); });
+    } catch { /* 模式非法 ⇒ lines 保持 null */ }
+    return { pat: p, lines };
+  }) : [];
+  return { anchored: true, srcHalf, docMatch, drift };
+}
+
 /** 锚点表（键＝`源码行号:第几处`，与 `CITATION_LEDGER` 的 **in-scope** 条目一一对应）。
  *  每项的 `anchor` 格式为 `源码侧写法（含锚点）¦需求那一行该含的正则`。
  *  · **源码侧**是字面短语（去掉 `${n}` 与 `「」` 后须逐字出现在该行源码里）；
@@ -986,7 +1113,7 @@ const ANCHORS = {
   '516:1': { anchor: '需求 DEP-14（:${n}¦^\\|DEP-${n - 794}\\|', name: 'DEP-14 条款行（锚点＝条款编号本身；偏移量随需求升版重导，V1.42 起为 794）' },
   '589:0': { anchor: '连续运行 ≥7 天无重启、无崩溃、无内存泄漏"（需求¦^\\|AC-07\\|稳定性测试\\|', name: 'AC-07 判定标准原文（含"≥7 天"）' },
   '602:0': { anchor: '交付方式见需求 :${n}¦^\\*\\*交付方式：\\*\\*', name: '第 10 章"交付方式"整段（与 :397 同源、两处都核）' },
-  '1351:0': { anchor: 'AC-01（需求 :${n}¦^\\|AC-01\\|功能完整性\\|', name: 'AC-01 判定标准原文（锚点＝AC 编号本身）' }
+  '1478:0': { anchor: 'AC-01（需求 :${n}¦^\\|AC-01\\|功能完整性\\|', name: 'AC-01 判定标准原文（锚点＝AC 编号本身）' }
 };
 
 /** 区间引用的**端点说明**（键＝`源码行号:第几处`）：
@@ -1009,7 +1136,7 @@ const XFILE_EXEMPT = {
   '409:0': '`需求文档\\…-V1.42.md:288` —— AC 段口径说明里的跨文件引用；同行的 in-scope 引用由锚点表覆盖，此处仅为"文件名 + 行号"写法。',
   '685:0': '`需求文档\\…-V1.42.md:287` —— 本文件注释里**举例说明**"跨文件写法"的一处；该行位于 `CITATION_PATTERNS` 区块内（已掩码，严格扫描看不到）。',
   '720:0': '本节注释里**举例说明**裸 `:A–B` 写法的示例（位于锚点代码块内、已掩码）；不是本文件对需求清单的行号引用。',
-  '1530:0': '本节注释里第二次举同一示例（说明"裸写法会被补全成引用"）；在代码段内，不是对需求清单的引用。'
+  '1657:0': '本节注释里第二次举同一示例（说明"裸写法会被补全成引用"）；在代码段内，不是对需求清单的引用。'
 };
 
 /** 无锚点且**不属于跨文件/示例引用**的 in-scope 引用（必须为空）。
@@ -1537,54 +1664,33 @@ function main() {
     console.log(`  计数对账：源码里「需求…:数字」出现 ${rawReqColon} 次、裸「:数字」出现 ${bareColon} 次；` +
       `冻结基线 in-scope ${CITATION_BASELINE_INSCOPE} / 跨文件 ${CITATION_BASELINE_XFILE} / 合计 ${CITATION_BASELINE_TOTAL}。`);
 
-    /* 逐处解析锚点：源码侧在哪、锚点是什么、需求那一行该含什么、实际命中没有 */
+    /* 逐处解析锚点：源码侧在哪、锚点是什么、需求那一行该含什么、实际命中没有。
+       `E88⒣`（2026-10-04）：需求侧的求值**抽成 `docAnchorOf()`**（模块级纯函数）——
+       D22 定点变异必须跑**同一份判据**（`D21`：不许写第二份真源），否则"变异后能指名"
+       证明不了生产路径能指名。这里只补源码侧的两项（`badSeparator` / `srcOk`）。 */
     const resolved = IN_SCOPE.map(c => {
       const a = ANCHORS[c.key];
       if (!a) return { c, anchored: false };
       const parts = String(a.anchor).split('¦');
       /* 源码侧锚点里若残留 `|` 分隔符 ⇒ 该条还没按新写法迁移（`|` 同时是正则元字符） */
       const badSeparator = parts.length < 2 || parts[0].split('¦')[0].includes('|');
-      const rangeStartNo = c.hit && c.hit.range ? c.hit.range[0] : c.reqNo;
-      /* 源码侧锚点的**字面部分**：去掉**所有** `${…}` 占位（含 `${rangeStart}` / `${rangeEnd}`）与「」。
-         此前只去掉 `${n…}` ⇒ 区间那条的字面里还留着 `${rangeStart}`，源码侧核对必然假红（实测踩过）。 */
-      const srcHalf = parts[0].replace(/\$\{[^}]*\}/g, '').replace(/[「」]/g, '');
-      const srcP = parts[0]
-        .replace(/\$\{rangeStart\}/g, String(rangeStartNo))
-        .replace(/\$\{rangeEnd\}/g, String(c.hit && c.hit.range ? c.hit.range[1] : c.reqNo))
-        .replace(/\$\{n\}/g, String(c.reqNo));
-      const docP = parts.slice(1).map(s => s
-        .replace(/\$\{rangeStart\}/g, String(rangeStartNo))
-        .replace(/\$\{rangeEnd\}/g, String(c.hit && c.hit.range ? c.hit.range[1] : c.reqNo))
-        .replace(/\$\{n \+ (\d+)\}/g, (_, d) => String(c.reqNo + Number(d)))
-        .replace(/\$\{n - (\d+)\}/g, (_, d) => String(c.reqNo - Number(d)))
-        .replace(/\$\{n\}/g, String(c.reqNo)));
-      const target = normSpace(REQ_LINES[c.reqNo - 1] || '');
-      const srcTarget = normSpace(c.line || '');
-      const docMatch = docP.map((p, i) => {
-        let re = null, m2 = null, lines_hit = 0;
-        try {
-          re = new RegExp(normSpace(p));
-          m2 = target.match(re);
-          /* **跨行干扰检查**：该锚点模式在整份需求文件里应当**只**命中被引用那一行 */
-          lines_hit = REQ_LINES.filter(l => re.test(normSpace(l))).length;
-        } catch (e) { /* 模式非法 ⇒ 下面如实报 */ }
-        return {
-          pat: String(parts[i + 1]), re, ok: Boolean(m2), linesHit: lines_hit,
-          hit: m2 ? String(m2[0]).slice(0, 60) : '',
-          index: m2 ? +((target.indexOf(m2[0]) / Math.max(1, target.length)).toFixed(3)) : null
-        };
-      });
+      const doc16 = docAnchorOf(c, REQ_LINES, ANCHORS);
       return {
-        c, anchored: true, a, srcHalf, badSeparator,
+        c, anchored: true, a, badSeparator, srcHalf: doc16.srcHalf,
         /* 源码侧核对（**只认字面锚点**）：锚点里写的字面部分（去掉 ${…} 占位与「」）与
            **该处引用原文**必须互相包含（锚点可带语义前缀如「交付方式见需求 」，也可只是引用原文的一部分）
            —— 即"这条锚点还锚在这一处引用上"。
            ⚠️ 不能拿含 `${n}` 的整串去比源码行：区间引用的被引用行号是**止点**（777），
            而源码行里写的是区间起止（`:782 起、表在 :785–798`），整串比对必然假红（实测踩过）。 */
-        srcOk: !badSeparator && sourceAnchorHolds(c, srcHalf),        reqLine: REQ_LINES[c.reqNo - 1] || '',
-        docMatch
+        srcOk: !badSeparator && sourceAnchorHolds(c, doc16.srcHalf),
+        reqLine: REQ_LINES[c.reqNo - 1] || '',
+        docMatch: doc16.docMatch, drift: doc16.drift
       };
     });
+    /* 旧的逐处计算（保留一段等价说明，防止后来人"顺手简化"回去）：
+       它把 docP 的占位替换、目标行取 `REQ_LINES[c.reqNo - 1]`、跨行唯一性 `lines_hit`
+       全写在 `resolved` 的 map 里 ⇒ D22 无法在**内存变异的需求文本**上跑同一份逻辑。
+       现全部搬进 `docAnchorOf(c, reqLines, anchors)`，`reqLines` 是参数（生产＝`REQ_LINES`）。 */
 
     const anchoredKeys = new Set(resolved.filter(r => r.anchored).map(r => r.c.key));
     const exemptKeys = new Set(Object.keys(CITATION_EXEMPT));
@@ -1748,6 +1854,130 @@ function main() {
             return `${e.name} 应在 :${at} ⇒ ${ok ? '命中' : '**未命中**'}（该行=${line.slice(0, 40)}）`;
           }).join('；');
       }).join(' ｜ '));
+
+    /* ---------- `E88⒣`（2026-10-04）：引用清单的**脆弱性**处置与定点回归 ----------
+       立案（`E88⒣`，座位 5 于 `T-20261002-12` 报出、主代理登记）：`CITATION_LEDGER`／`ANCHORS`／
+       `RANGE_ANCHORS`／`XFILE_EXEMPT` 的键曾经是**逐处绝对行号** ⇒ **本文件任何整行增删都会整体
+       挪行号**，把 `九③/⑤/⑥/⑦/⑨/⑩` **一片打红**（`E102` 那次只因为"同行内改一个词"才没触发；
+       而 HEAD 上已有 2 条真不符却**无人报警** —— 陈旧期静默）。
+       **逐处处置（三条，见各断言）**：
+         ① **能按内容定位的一律按内容定位**：`buildManifest` → `locateSelfLine`，签名＝
+            「该行第几处 ＋ 期望的被引用行号」（21/26 唯一）＋ `LOCATE_SNIPPETS` 的独特片段（余 5 条）
+            ⇒ 行号漂移被签名吸收（`九⑮` 自证"逐处恰命中 1 行"）。`L###` 退化为**声明值**。
+         ② **确实必须以行号定位的**＝**需求侧的行号本身**（它就是被引用的东西，无法按内容定位）
+            ⇒ 加**命中数回读 ＋ 漂移指名**：`九⑥/⑬` 核"命中了没有／唯一不唯一"，
+            `docAnchorOf` 的 `drift` 核"没命中时**现在**落在 :N"（`九⑰` 守着）。
+         ③ **D22 两端**：`九⑯`（本文件整行增删）＋ `九⑰`（需求文件整行增删），都在**内存副本**上做。
+       ⚠ **维护提示**：**`tests\trace-check.js` 与 `需求文档\*.md` 整行增删都会挪行号，
+         改动者需同步本清单**（前者已被内容定位吸收，只有"引用原文/被引号"变了才需改；
+         后者必须逐条重导 —— `九⑰` 会把每一处漂移指出来）。 */
+    const locateBad = CITATIONS.filter(c => c.locateHits !== 1);
+    const locateDrift = CITATIONS.filter(c => c.locateHits === 1 && c.srcNo !== c.declaredSrcNo);
+    t.check('九⑮ 逐处**按内容定位**自证（`E88⒣` ①）：26 处清单在本文件源码里各**恰命中 1 行**' +
+      '（签名＝该行"第几处"＋"期望的被引用行号"；多候选的 5 处再补一段**独特片段**）——' +
+      '命中数 ≠ 1 ⇒ 红并**逐条指名**该引用；声明行号与内容定位行号的**差集照录但不判红**（那是漂移，不是缺陷）',
+      CITATIONS.length === CITATION_BASELINE_TOTAL && locateBad.length === 0,
+      locateBad.length
+        ? `**定位失败/多候选 ${locateBad.length} 条**：` +
+          locateBad.map(c => `${c.key}（命中 ${c.locateHits} 行；候选 ${c.locateCands.join('/') || '无'}）`).join('；')
+        : `${CITATIONS.length} 处全部唯一定位（其中 ${CITATIONS.filter(c => c.locateSnippet).length} 处靠独特片段：` +
+          `${CITATIONS.filter(c => c.locateSnippet).map(c => c.key).join('、') || '无'}）；` +
+          `声明行号 ≠ 内容定位行号的：${locateDrift.map(c => `${c.key}→:${c.srcNo}`).join('、') || '（无，本文件当前未被整行增删）'}`);
+
+    /* `D22`-A（`九⑯`）：**模拟一次"本文件整行增删"**（内存副本，不落地）——
+       ① **旧实现**（直接拿清单的 `L###` 当行号）：必然**一片红**（这是脆弱性的**实证**）；
+       ② **现实现**（按内容定位）：同一输入上**全绿**（行号漂移被签名吸收）；
+       ③ 盘上文件逐字节未变。 */
+    const rawSha = (p) => require('node:crypto').createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    const D22A_BEFORE = rawSha(__filename);
+    const REQ_ABS = REQ_FILE ? path.join(REQ_DIR, REQ_FILE) : null;
+    const D22B_BEFORE = REQ_ABS ? rawSha(REQ_ABS) : null;
+    const d22a = (() => {
+      const selfRaw = SELF_RAW_LINES;
+      /* 插在**文件首部**：整份文件整体下移 3 行（"整行增删"的最强形态）。
+         插入行刻意不含任何引用形态（否则等于同时改了引用集合，不是纯行号漂移）。
+         ⚠ 变异副本必须过**同一条掩码管线** `maskSelfRegion()`，否则"锚点表/形态表区块"
+         里那些**模式字面**会被当成真引用 ⇒ 造出与生产无关的假红（这条坑本轮实测踩到过）。 */
+      const mutSelfRaw = ['/* D22-A 变异：整行插入第 1 行（`E88⒣` 现场） */',
+        '/* D22-A 变异：整行插入第 2 行 */', '/* D22-A 变异：整行插入第 3 行 */'].concat(selfRaw);
+      const mutSelf = maskSelfRegion(mutSelfRaw);
+      const oldManifest = CITATION_LEDGER.map(([srcRaw, idx, reqNo, type]) => {
+        const decl = Number(String(srcRaw).replace(/^L/, ''));
+        const line = mutSelf[decl - 1];
+        const hits = line === undefined ? [] : (type === 'xfile' ? scanCitationsRaw(line) : scanCitations(line));
+        return { srcNo: decl, idx, reqNo, type, hit: hits[idx] || null };
+      });
+      const mutFound = [];
+      mutSelf.forEach((l, i) => scanCitations(l).forEach((h, k) => mutFound.push({ srcNo: i + 1, idx: k })));
+      const oldScanMissing = oldManifest.filter(c => !c.hit);
+      const oldManifestMissing = mutFound.filter(f => !oldManifest.some(c => c.srcNo === f.srcNo && c.idx === f.idx));
+      const newManifest = buildManifest(CITATION_LEDGER, mutSelf);
+      const newScanMissing = newManifest.filter(c => !c.hit);
+      const newManifestMissing = mutFound.filter(f => !newManifest.some(c => c.srcNo === f.srcNo && c.idx === f.idx));
+      const newLocateBad = newManifest.filter(c => c.locateHits !== 1);
+      /* **现实现的红必须指名到具体引用**（这里是"真把一处引用改坏"的形态：把该处**引用原文里的号码**
+         换成一个任何引用都不可能出现的值）—— 与"一片红"对照：只坏 **1 处**时旧实现的红条数远大于 1，
+         现实现**恰 1 处**且指名 `key`。基线取**未插入**的 `SELF_LINES`（行号与 `c.srcNo` 同坐标系）。 */
+      const one = IN_SCOPE[0];
+      const selfOne = one ? SELF_LINES.map((l, i) =>
+        (i + 1 === one.srcNo && one.hit) ? l.replace(one.hit.text, one.hit.text.replace(/\d+/, '9999')) : l) : SELF_LINES;
+      const oneBad = one ? buildManifest(CITATION_LEDGER, selfOne) : [];
+      const oneBadHit = oneBad.filter(c => c.locateHits !== 1);
+      const oneChanged = one ? selfOne[one.srcNo - 1] !== SELF_LINES[one.srcNo - 1] : false;
+      return {
+        oldRed: oldScanMissing.length + oldManifestMissing.length,
+        oldScanMissing: oldScanMissing.map(c => c.key), newLocateBad: newLocateBad.map(c => c.key),
+        newGreen: newScanMissing.length === 0 && newManifestMissing.length === 0 && newLocateBad.length === 0,
+        oneBadKey: one ? one.key : null, oneBadHit: oneBadHit.map(c => c.key), oneBadCount: oneBadHit.length,
+        oneChanged, diskSame: rawSha(__filename) === D22A_BEFORE
+      };
+    })();
+    t.check('九⑯ D22-A 定点变异（`E88⒣` ③-a，**内存副本**）：在本文件**首部整行插入 3 行**（整份文件整体下移）⇒' +
+      '① **旧实现**（清单 `L###` 直接当行号）**一片红**（实测条数见详情）；' +
+      '② **现实现**（按内容定位）**全绿**（`九③/⑤/⑦/⑨/⑩` 的真值全 0）；' +
+      '③ 而"真把**一处**引用改坏"时，现实现**恰 1 处**红且**指名该引用的 `key`**（不是一片红）；' +
+      '④ 盘上本文件逐字节未变',
+      d22a.oldRed > 0 && d22a.newGreen && d22a.oneChanged
+        && d22a.oneBadCount === 1 && d22a.oneBadHit[0] === d22a.oneBadKey && d22a.diskSame,
+      `①旧实现红：扫描不到 ${d22a.oldScanMissing.length} 条 ＋ 双向对账多出 ${d22a.oldRed - d22a.oldScanMissing.length} 条` +
+      `（合计 ${d22a.oldRed}；逐条：${d22a.oldScanMissing.slice(0, 6).join('、') || '无'}…）｜` +
+      `②现实现仍绿=${d22a.newGreen}（定位失败 ${d22a.newLocateBad.length} 条）｜` +
+      `③只坏一处 ⇒ 变异真的生效=${d22a.oneChanged}、红 ${d22a.oneBadCount} 条、指名 ${d22a.oneBadHit.join('、') || '（无）'}（应恰为 ${d22a.oneBadKey}）｜` +
+      `④盘上未变=${d22a.diskSame}`);
+
+    /* `D22`-B（`九⑰`）：**模拟一次"被引用的上游文件（当轮需求清单）整行增删"**（内存副本）——
+       ① **旧判据**（只看"登记的 `:reqNo` 那一行命中没有"）：**一片红**，却**只说"未命中"**，
+          读者拿不到"它现在漂到哪一行"；
+       ② **现判据**：每条未命中的引用都带 `drift` 读数 ⇒ **逐处指名**（`key` ＋ 引用原文 ＋
+          该锚点**现在**命中的行号；全文找不到时显式写"找不到"）；
+       ③ 盘上需求文件与清单逐字节未变。 */
+    const d22b = (() => {
+      const mutReq = ['<!-- D22-B 变异：在需求清单首部整行插入 1 行（`E88⒣` 现场） -->'].concat(REQ_LINES);
+      const rows = IN_SCOPE.map((c) => {
+        const d = docAnchorOf(c, mutReq, ANCHORS);
+        const bad = d.docMatch.filter(x => !x.ok).length;
+        const pointed = d.drift.filter(x => x.lines !== null && x.lines.length > 0 &&
+          x.lines.every(n => n === c.reqNo + 1));
+        return { key: c.key, reqNo: c.reqNo, bad, drift: d.drift, pointed: pointed.length };
+      });
+      const badRows = rows.filter(r => r.bad > 0);
+      return {
+        badCount: badRows.length,
+        badAnchors: badRows.reduce((a, r) => a + r.bad, 0),
+        allPointed: badRows.length > 0 && badRows.every(r => r.pointed === r.bad),
+        first: badRows[0] ? `${badRows[0].key}（登记 :${badRows[0].reqNo}）` : '（无）',
+        reqDiskSame: REQ_ABS ? rawSha(REQ_ABS) === D22B_BEFORE : false,
+        selfDiskSame: rawSha(__filename) === D22A_BEFORE
+      };
+    })();
+    t.check('九⑰ D22-B 定点变异（`E88⒣` ③-b，**内存副本**）：在当轮需求清单**首部整行插入 1 行**⇒' +
+      '① 登记的 `:reqNo` 全部错位（**一片红**，这是旧实现的真实形态）；' +
+      '② **漂移读数逐处指名** —— 每条未命中的引用都报出"该锚点**现在**命中 :N（＝登记行号＋1）"，' +
+      '指名粒度＝**具体引用**（`key`），不是一片红；③ 盘上需求文件与清单逐字节未变',
+      d22b.badCount > 0 && d22b.allPointed && d22b.reqDiskSame && d22b.selfDiskSame,
+      `①错位引用 ${d22b.badCount} 条、未命中锚点 ${d22b.badAnchors} 个（首条 ${d22b.first}）；` +
+      `②**逐处指到"现在命中 :N"**=${d22b.allPointed}｜` +
+      `③盘上未变＝需求文件 ${d22b.reqDiskSame}／本文件 ${d22b.selfDiskSame}`);
     console.log(`  （本节按上述断言计 ${t.counts.passed - before} 条；数字不写死，以汇总行为准）`);
   }
 

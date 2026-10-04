@@ -5313,6 +5313,202 @@ async function main() {
     }
   }
 
+  /* ===== U10 `E92` 残项的**结构性不变量**（2026-10-04，`T-20261004-07` 丙组） =====
+     立案：`E92` 的两处版面回归（`05bcf7b` 引入、截图门禁静默通过约 4 天）修好之后，
+     路线图 `E92` 行尾留了一项"**待 4b 补结构性不变量断言**"：
+       · `#panel-setting` 的 **used 轨道数 ＝ 实际子元素数**（病灶①：`grid-template-rows`
+         由 `auto 1fr` 变成 `auto 1fr auto` ⇒ 第三条 `auto` 轨道**塌缩为 0 却照样吃
+         `.tab-panel{gap:24px}` 的 24 CSS px 行距**）；
+       · 带 `hidden` 的页脚行**不得生成盒子**（病灶②：`#board-status > div{display:flex}`
+         是作者样式 ⇒ 恒胜 UA 的 `[hidden]{display:none}`，`hidden` 形同不存在）。
+     ⚠ **硬约束：一律用结构（元素数／属性／声明）判定，不写死任何像素值或尺寸阈值。**
+        理由＝病灶本身就是"**结构**错了但像素看起来还正常"（那条 `auto` 轨道塌缩为 0，
+        单看任何尺寸断言都发现不了它），且写死像素会在任何视觉调整下假红。
+     ⚠ **为什么放在 `ui-check`**：`#panel-setting` / `#board-status` 是**界面结构**事实，
+     而本文件已经拥有"CSS 声明层 ＋ `index.html` 静态结构"这两样真源（`parseCss` / `#stage`
+     的轨道断言就是先例）；放进 `browser-check` 会被 `--fast` 过滤、放进 `harness-check`
+     则与"夹具自检"的职责不符。 */
+
+  /** `index.html` 里某元素的**直接子元素**（深度感知；只认元素标签，忽略注释与文本）。
+   *  为什么需要它：`used 轨道数` 这类不变量的事实来源是"这个容器**实际有几个子元素**"，
+   *  而本仓无 DOM 依赖 ⇒ 用一个最小解析器（够用即可，不追求完整 HTML 词法）。 */
+  function directChildrenOf(htmlText, id) {
+    const openRe = new RegExp('<([a-zA-Z][\\w-]*)\\b[^>]*\\bid\\s*=\\s*"' + id + '"[^>]*>');
+    const head = openRe.exec(htmlText);
+    if (!head) return null;
+    const VOID = new Set(['br', 'hr', 'img', 'input', 'meta', 'link', 'source', 'col', 'area',
+      'base', 'wbr', 'embed', 'track', 'param']);
+    const tagRe = /<(\/)?([a-zA-Z][\w-]*)\b([^>]*)>/g;
+    tagRe.lastIndex = head.index + head[0].length;
+    const kids = [];
+    let depth = 0, m;
+    while ((m = tagRe.exec(htmlText)) !== null) {
+      const closing = Boolean(m[1]);
+      const name = m[2].toLowerCase();
+      const attrs = m[3] || '';
+      if (closing) { if (depth === 0) break; depth--; continue; }
+      if (VOID.has(name) || /\/\s*$/.test(attrs)) { if (depth === 0) kids.push({ tag: name, attrs }); continue; }
+      if (depth === 0) kids.push({ tag: name, attrs });
+      depth++;
+    }
+    return { tag: head[1].toLowerCase(), kids };
+  }
+
+  /** 子元素的结构摘要（tag／id／class 列表／是否带 `hidden` 属性） */
+  function childInfo(node) {
+    const attrs = node.attrs || '';
+    const idM = /\bid\s*=\s*"([^"]*)"/.exec(attrs);
+    const clsM = /\bclass\s*=\s*"([^"]*)"/.exec(attrs);
+    return {
+      tag: node.tag,
+      id: idM ? idM[1] : null,
+      classes: clsM ? clsM[1].trim().split(/\s+/).filter(Boolean) : [],
+      hidden: /(?:^|\s)hidden(?:\s|=|$|\/)/.test(attrs) || /\shidden(?=[\s/>])/.test(attrs),
+      where: `${node.tag}${idM ? '#' + idM[1] : ''}${clsM ? '.' + clsM[1].trim().split(/\s+/).join('.') : ''}`
+    };
+  }
+
+  /** `grid-template-rows/-columns` 的**显式轨道数**（本项目 CSS 无 `repeat()`／无嵌套 ⇒ 按空白切段即可）。
+   *  取不到声明时返回 `null`（调用方判红，**不许**当 0 或 1 猜）。 */
+  function explicitTrackCount(rulesMap, selector, prop) {
+    const decls = rulesMap.get(selector);
+    if (!decls || decls[prop] === undefined) return null;
+    const v = String(decls[prop]).trim();
+    if (!v || /repeat\(|minmax\(|\[/.test(v)) return null;   /* 出现本例未覆盖的写法 ⇒ 判红，不猜 */
+    return v.split(/\s+/).filter(Boolean).length;
+  }
+
+  /** 选择器的**最后一个复合选择器**（先按空白与 `>` 切开，取末段） */
+  function lastCompound(sel) {
+    return String(sel).trim().split(/\s+|>/).filter(Boolean).pop() || '';
+  }
+
+  /** 该复合选择器是否命中该子元素（按 tag／#id／.class 的静态口径；不实现完整 CSS 选择器引擎） */
+  function compoundMatches(compound, child) {
+    if (!compound) return false;
+    const idM = /#([\w-]+)/.exec(compound);
+    if (idM && idM[1] !== child.id) return false;
+    for (const cls of [...compound.matchAll(/\.([\w-]+)/g)].map(x => x[1])) {
+      if (!child.classes.includes(cls)) return false;
+    }
+    const bare = compound.replace(/[#.][\w-]+/g, '').replace(/\[[^\]]*\]/g, '').replace(/::?[\w-]+(\([^)]*\))?/g, '');
+    const tagM = /^([a-zA-Z][\w-]*)/.exec(bare);
+    if (tagM && tagM[1].toLowerCase() !== child.tag) return false;
+    return true;
+  }
+
+  /** 纯函数判据本体（D22 复用**同一个函数**，否则变异绿了也证明不了这条断言可证伪）：
+   *  `#panel-setting` 的**显式行轨道数 ≤ 子元素在网格里至少要占的行数下界**。
+   *  为什么取"下界"：显式轨道**恒存在**（即使塌缩为 0），而"子元素至少要占几行"由 CSS 自身
+   *  的 `grid-row` 声明（显式放置）与自动放置推出的**下界** ⇒ 判据是"显式轨道数不得多于
+   *  连下界都占不满的条数"，方向上是**保守**的（只会漏报，不会因估算偏差假红）。 */
+  function ghostTrackVerdict(rulesMap, container) {
+    const T = explicitTrackCount(rulesMap, '#' + container.id, 'grid-template-rows');
+    const C = explicitTrackCount(rulesMap, '#' + container.id, 'grid-template-columns');
+    if (T === null || C === null || !container.kids.length) return { ok: false, T, C, rowsUsed: null, why: '取不到轨道声明或子元素' };
+    /* 子元素先归一成结构摘要（`childInfo` 是唯一口径；原始解析结果是 {tag, attrs}） */
+    const kids = container.kids.map(k => (k.classes === undefined ? childInfo(k) : k));
+    /* 显式放置：凡有"末段复合选择器命中该子元素"且声明了 grid-row(-start) 的规则，取其行号 */
+    const rowRules = [];
+    for (const [sel, decls] of rulesMap.entries()) {
+      const v = decls['grid-row'] !== undefined ? decls['grid-row'] : decls['grid-row-start'];
+      if (v === undefined) continue;
+      if (!String(sel).includes('#' + container.id)) continue;
+      const start = /^\s*(\d+)/.exec(String(v));
+      if (start) rowRules.push({ compound: lastCompound(sel), row: Number(start[1]) });
+    }
+    let maxExplicit = 0, autoKids = 0;
+    const placed = [];
+    for (const k of kids) {
+      const hit = rowRules.find(r => compoundMatches(r.compound, k));
+      if (hit) { maxExplicit = Math.max(maxExplicit, hit.row); placed.push(`${k.where}→第 ${hit.row} 行`); }
+      else { autoKids++; placed.push(`${k.where}→自动放置`); }
+    }
+    const autoRows = Math.ceil(autoKids / C);
+    const rowsUsed = Math.max(1, maxExplicit, autoRows);
+    return { ok: T <= rowsUsed, T, C, maxExplicit, autoKids, autoRows, rowsUsed, placed };
+  }
+
+  /** 纯函数判据本体②：带 `hidden` 的**页脚行**必须有作者样式把它 `display:none`
+   *  （否则 `#board-status > div{display:flex}` 会盖掉 UA 的 `[hidden]{display:none}`）。
+   *  判据＝存在一条规则：`display:none` ∧ 选择器含 `#board-status` ∧ 含 `[hidden]` ∧ 命中该子元素。 */
+  function hiddenRowBoxVerdict(rulesMap, container) {
+    const hiddenKids = container.kids.map(k => (k.classes === undefined ? childInfo(k) : k)).filter(k => k.hidden);
+    const fails = hiddenKids.filter(k => ![...rulesMap.entries()].some(([sel, decls]) =>
+      String(decls.display || '').trim() === 'none'
+      && String(sel).includes('#' + container.id)
+      && /\[hidden\]/.test(String(sel))
+      && compoundMatches(lastCompound(sel), k)));
+    return { hiddenKids, fails };
+  }
+
+  section('U10 `E92` 残项：版面**结构性不变量**（幽灵网格轨道 / `hidden` 行仍占位；**禁写死像素**）');
+  {
+    const settingEl = directChildrenOf(html, 'panel-setting');
+    const boardEl = directChildrenOf(html, 'board-status');
+    check('U10-前提：`#panel-setting` 与 `#board-status` 两个容器都能从 `index.html` 解析出直接子元素' +
+      '（解析不到即判红 —— 不许静默退化成"检查不了"）',
+      Boolean(settingEl && settingEl.kids.length) && Boolean(boardEl && boardEl.kids.length),
+      `#panel-setting 子元素 ${settingEl ? settingEl.kids.length : '（未解析到）'} 个；` +
+      `#board-status 子元素 ${boardEl ? boardEl.kids.length : '（未解析到）'} 个`);
+
+    const gv = ghostTrackVerdict(rules, { id: 'panel-setting', kids: settingEl ? settingEl.kids : [] });
+    /* 把结构读数**打印出来**（`E92` 残项的取证要求：两端读数要能一眼看到；不是断言，不改判定） */
+    console.log(`  [读数] #panel-setting 显式行轨道 ${gv.T} 条／列 ${gv.C} 条；显式放置最大行号 ${gv.maxExplicit}、` +
+      `自动放置 ${gv.autoKids} 个子元素（≥${gv.autoRows} 行）⇒ 至少要占 ${gv.rowsUsed} 行；逐子元素：${(gv.placed || []).join('、')}`);
+    check('U10-a（`E92` 病灶①：幽灵网格轨道）`#panel-setting` 的**显式行轨道数 ≤ 子元素至少要占的行数下界**' +
+      '（显式轨道**恒存在** ⇒ 多出来的那条无人占用，照样吃 `.tab-panel{gap:24px}` 的行距；' +
+      '判据只用"轨道条数／`grid-row` 声明／子元素数"这些**结构量**，**不含任何像素值**）',
+      gv.ok === true && gv.rowsUsed >= 1,
+      gv.rowsUsed === null ? `取不到判据输入：${gv.why}`
+        : `显式行轨道 ${gv.T} 条、列 ${gv.C} 条；` +
+          `显式放置最大行号 ${gv.maxExplicit}、自动放置子元素 ${gv.autoKids} 个（≥${gv.autoRows} 行）` +
+          `⇒ 至少要占 ${gv.rowsUsed} 行；逐子元素：${gv.placed.join('、')}` +
+          (gv.ok ? '' : `　⇒ **显式轨道比"至少要占的行数"还多 ⇒ 幽灵轨道**`));
+
+    const bv = hiddenRowBoxVerdict(rules, { id: 'board-status', kids: boardEl ? boardEl.kids : [] });
+    console.log(`  [读数] #board-status 直接子元素 ${boardEl ? boardEl.kids.length : 0} 个；带 hidden 的 ${bv.hiddenKids.length} 个` +
+      `（${bv.hiddenKids.map(k => k.where).join('、')}）⇒ 仍会生成盒子的 ${bv.fails.length} 个` +
+      `（[hidden]{display:none} 的作者样式覆盖规则在场=${bv.hiddenKids.length > 0 && bv.fails.length === 0}）`);
+    check('U10-b（`E92` 病灶②：`hidden` 行仍生成盒子）`#board-status` 里**每一个带 `hidden` 的直接子元素**' +
+      '都必须有一条作者样式把它 `display:none`（选择器含 `#board-status` 与 `[hidden]` 且命中该元素）——' +
+      '`#board-status > div{display:flex}` 是作者样式，恒胜 UA 的 `[hidden]{display:none}`',
+      bv.hiddenKids.length > 0 && bv.fails.length === 0,
+      `带 hidden 的页脚行 ${bv.hiddenKids.length} 个（${bv.hiddenKids.map(k => k.where).join('、') || '（无）'}）；` +
+      (bv.fails.length ? `**仍会生成盒子**：${bv.fails.map(k => k.where).join('、')}` : '全部被作者样式压成 display:none'));
+
+    /* ---- `D22` 定点变异（**内存**，绝不落地；不碰 `src\*`／`index.html`）----
+       ① 给 `#panel-setting` 的**内存副本**加回第三条显式 `auto` 轨道（＝`05bcf7b` 的真实形态）
+          ⇒ U10-a 必红；
+       ② 从 `rules` 的内存副本里摘掉 `#board-status > div[hidden]{display:none}`
+          ⇒ U10-b 必红并**指名**那一行；
+       两者都要求"命名到具体元素/规则"，而不是一片红。 */
+    {
+      const cssFile = path.join(ROOT, 'src', 'styles', 'global.css');
+      const htmlFile = path.join(ROOT, 'index.html');
+      const sha = b => require('node:crypto').createHash('sha256').update(b).digest('hex');
+      const before = { css: sha(fs.readFileSync(cssFile)), html: sha(fs.readFileSync(htmlFile)) };
+      const mutRules = new Map(rules);
+      const panel = mutRules.get('#panel-setting') || {};
+      mutRules.set('#panel-setting', { ...panel, 'grid-template-rows': (panel['grid-template-rows'] || 'auto 1fr') + ' auto' });
+      const gvMut = ghostTrackVerdict(mutRules, { id: 'panel-setting', kids: settingEl ? settingEl.kids : [] });
+      const rulesNoHidden = new Map([...rules].filter(([sel]) => !/\[hidden\]/.test(String(sel))));
+      const bvMut = hiddenRowBoxVerdict(rulesNoHidden, { id: 'board-status', kids: boardEl ? boardEl.kids : [] });
+      const after = { css: sha(fs.readFileSync(cssFile)), html: sha(fs.readFileSync(htmlFile)) };
+      check('U10-D22 定点变异（**内存副本**）：①`#panel-setting` 的 `grid-template-rows` 加回第三条**显式** `auto` 轨道' +
+        '（`05bcf7b` 的真实形态）⇒ U10-a 必红；②摘掉所有含 `[hidden]` 的 `display:none` 规则 ⇒ U10-b 必红' +
+        '**并逐条指名**仍会生成盒子的页脚行；未变异的当前源码两条判据都必绿；`src\\styles\\global.css` 与 ' +
+        '`index.html` 盘上字节全程未变',
+        gv.ok === true && gvMut.ok === false && gvMut.T === gv.T + 1
+          && bv.fails.length === 0 && bvMut.fails.length > 0
+          && bvMut.fails.every(f => bv.hiddenKids.some(k => k.where === f.where))
+          && before.css === after.css && before.html === after.html,
+        `①轨道 ${gv.T} → 变异 ${gvMut.T}（判红=${gvMut.ok === false}；下界仍 ${gvMut.rowsUsed}）｜` +
+        `②仍生成盒子的页脚行 ${bvMut.fails.length} 个：${bvMut.fails.map(f => f.where).join('、') || '（无）'}` +
+        `（当前源码 ${bv.fails.length} 个）｜盘上未变 css=${before.css === after.css} html=${before.html === after.html}`);
+    }
+  }
+
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 ${skipped} 项`);
   if (failures.length) {
