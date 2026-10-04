@@ -40,7 +40,7 @@
    ========================================================================== */
 'use strict';
 
-const { startOfDay, startOfMonth, startOfYear, toDate } = require('../../platform/clock');
+const { startOfDay, startOfMonth, startOfYear, toDate, fmtDate } = require('../../platform/clock');
 
 const STATUS = {
   WAITING: '待测试',
@@ -240,7 +240,8 @@ function computeShiftStats(input) {
       `computeShiftStats: addRunSec 必须是 0～${addRunSecMax}（本周期增量；上界＝班次已进行时长 ` +
       `elapsedSec，ADR-0009 D3）的有限数，收到 ${JSON.stringify(rawAdd)}`);
   }
-  const accum = accumulateRunTime(input.accum, addRunSec, now);
+  const liveSplit = splitRunSecondsByDay(shift, runSec);
+  const accum = accumulateRunTime(input.accum, addRunSec, now, liveSplit);
 
   return {
     shift: {
@@ -252,6 +253,16 @@ function computeShiftStats(input) {
     runningQty: running, waitingQty: waiting, passQty: pass, failQty: fail, retestQty: retest,
     /* FR-4.10～4.15 */
     firstPassRate, runSec, idleSec, avgTestSec, capacityRate, oee,
+    /* `E83` 的**自然日投影**（FR-6.4／6.5／6.6 的当日/本月/年度累计运行；由本文件按零点切段）：
+       `runSecDay1` ＝ 本班运行秒数里落在**班次开始那一自然日**的部分、`runSecDay2` ＝ 落在**次日**的部分。
+       ⚠ 不跨自然日的班次恒为 `{runSecDay1: runSec, runSecDay2: 0}`；两者**恒有** `day1 + day2 === runSec`
+         （不许丢秒、不许重复计）。取数落盘与读口见 `repo/shiftStat.js` 的 `run_sec_day1/run_sec_day2`。 */
+    runSecDay1: liveSplit.day1,
+    runSecDay2: liveSplit.day2,
+    /* 切段结果**整体**也带上（含 `crossing` 与两段的日历归属 `day1Date`/`day2Date`）：
+       调用方（`stateSnapshot.statsOf()`）要把当班增量按段分配时必须拿到"是否跨零点"——
+       只搬运 day1/day2 两个数就会把这一位丢掉（`accumulateRunTime()` 于是走"整段算当日"）。 */
+    runSecSplit: liveSplit,
     /* DR-17 */
     accumulate: accum,
     /* 核对用 */
@@ -299,21 +310,158 @@ function rollAccum(prev, now) {
 }
 
 /**
+ * `E83` 甲·㈡ **自然日投影**：把"一个班次的运行秒数"按**零点**切成两段。
+ *
+ *   · 前段（`day1`）＝落在**班次开始那一自然日**（`shift.date`）的运行秒数 ⇒ 归 D；
+ *   · 后段（`day2`）＝落在**次日**（D+1）的运行秒数 ⇒ 归 D+1；
+ *   · **恒有 `day1 + day2 === runSec`**（不许丢秒、不许重复计）—— 这是本函数唯一的硬约束，
+ *     也是验收判据"日/月/年三档的切段之和 ＝ 总运行秒数"的落点。
+ *
+ * **两种口径在此分流（负责人 2026-10-04 裁定，不得混为一谈）**：
+ *   · **班次投影**＝整班归"班次开始的那一天"（`DR-06` 逐字／`FR-4.16`）—— 那是 `shift.date`
+ *     与 `shift_stat.shift_date` 的既有口径，**本函数不动它**（`repo/shiftStat.js` 的 `run_sec`）；
+ *   · **自然日投影**＝本函数（`FR-6.4/6.5/6.6` 的"当日/本月/年度累计运行"按**自然日**零点归零）。
+ *   两者**天然解耦**：一个按班次边界切、一个按自然日切，各自成立（不是需求冲突，是两件事）。
+ *
+ * 为什么**不**直接把 `measures` 按两段各自套一遍"条数 − 1"规则：那条规则（`E68`，见上文
+ * 「三、时长」段）是**在整班窗口上**定义 `runSec` 的算子，它对"稀疏/有缺口的采样"**不满足可加性**
+ * —— 两段各自 `min(elapsed_i, count_i − 1)` 相加**可能大于**整班 `min(elapsed, count − 1)`
+ * （实测构造：`[22:30, 23:30]` 与 `[01:00…06:00]` 六个点 ⇒ 分段和 1 ＋ 5 ＝ 6 s，而整班规则给 6 s
+ * 只在 count 恰好填满时相等；缺口一到就两边不等，甚至比整班多算）。**先切再套规则**于是会
+ * 凭空造出秒数 ⇒ 直接违反"不丢秒、不重复计"。故本函数以**整班 `runSec` 为总额**、
+ * 按**子窗口时长占比**分配（前段上限＝前段时长，余下全归后段）：
+ *   · 采样密集（`count ≈ elapsed + 1`，实采 1 s 口径）⇒ 与"先切再套规则"**逐秒相同**；
+ *   · 采样稀疏/有缺口 ⇒ 退化为"按已进行时长占比分摊整班总额"—— 这是**保守且可解释**的分配，
+ *     且**恒定保住总额**（唯一不能破的那条）。
+ *
+ * **无跨零点配置时逐字不变（最重要的回归面）**：`shift.end <= shift.start` 为假（现配置
+ * 0-8/8-16/16-24 全部如此）⇒ 直接返回 `{day1: runSec, day2: 0}` —— 不查半点、不做除法，
+ * 与改动前 `accumulateRunTime(prev, addSec, now)` 的行为**逐字相同**。
+ * 为什么要把它写成硬保证而不是"碰巧":自然日投影是新口径，旧口径是**在产**的读数
+ * （`/health.runAccum`、`GET /state` 的 `stats.accumulate`、`logic-check`／`db-check` 的既有期望值
+ * 都建立在它上面）；一旦现配置下两个投影不同值，说明改动**改变了在产行为**，
+ * 那是回归、不是新功能。故 `tests\._verify\e83-*.js` 对现配置做"改前 vs 改后"逐字比对。
+ *
+ * @param {{startAt:string, endAt:string, date:string, elapsedSec?:number}} shift 班次（真源＝
+ *        `services/shift.js` 的 `at()`；`elapsedSec` 是**已进行时长**）
+ * @param {number} runSec 整班有效运行秒数（`computeShiftStats()` 里那个 `runSec`）
+ * @returns {{day1:number, day2:number, crossing:boolean, day1Date:string|null, day2Date:string|null}}
+ *   两段秒数（非负整数；恒有 `day1 + day2 === runSec`）＋ `crossing`（这一次增量是否跨了自然日，
+ *   `accumulateRunTime()` 据此决定要不要按日历归属入日档）＋ 两段各自的日历归属（`yyyy-MM-dd`）。
+ */
+function splitRunSecondsByDay(shift, runSec) {
+  const total = Math.max(0, Math.round(Number(runSec) || 0));
+  /* 不跨自然日（含现配置的三段班与 `end = 24` 的 16→24）：整段归班次开始那天，**逐字不变**。
+     判不了（`shift.end` 不是数 / `startAt`·`endAt` 缺失或不可解析）也走这一支 —— 退化为
+     "整段归当日"，与改动前逐字同值；**不抛错**，因为切段是派生的增强、不该让旧调用方爆掉。 */
+  const bounds = (() => {
+    try {
+      const s = toDate(shift && shift.startAt);
+      const e = toDate(shift && shift.endAt);
+      return (s && e && Number.isFinite(s.getTime()) && Number.isFinite(e.getTime())) ? { s, e } : null;
+    } catch { return null; }
+  })();
+  if (!(Number(shift && shift.end) <= Number(shift && shift.start)) || !bounds) {
+    /* 非跨自然日：两段的"日期"其实都是班次开始那天（day2 恒 0）—— 一并给出，读方不用分支 */
+    const only = shift && typeof shift.date === 'string' ? shift.date : null;
+    return { day1: total, day2: 0, crossing: false, day1Date: only, day2Date: only };
+  }
+  const startAt = bounds.s;
+  const endAt = bounds.e;
+  const span = Math.max(0, Math.round((endAt.getTime() - startAt.getTime()) / 1000));
+  /* ⚠ 分配的分母是**已进行时长**（`shift.elapsedSec`），不是整班跨度 `span`：
+     运行中（如 22:00 的夜班在次日 00:30 被读）时已进行的只有 9000 s，而整班跨度是 28800 s ——
+     用 span 当分母会把 1800 s 的"后段时长"当成 6 h 的占比（实测：会把 800 : 200 算成 250 : 749）。
+     `elapsedSec` 缺失/非法（旧调用方）时退化为 `span`（＝"整班已跑完"的常见情形，
+     与 `server/index.js` 的 `completedShiftOf()` 同口径）。 */
+  const liveElapsed = Number.isFinite(Number(shift && shift.elapsedSec)) && Number(shift.elapsedSec) > 0
+    ? Math.min(span, Math.round(Number(shift.elapsedSec)))
+    : span;
+  /* 零点（**班次开始日的次日 0 点** ＝ 零点切段的那一刀）：⚠ 这一行必须从 `startAt` 推，
+     不能从 `endAt` 推 —— 跨零点规则的 `endAt` **本身**就在次日，"拿 endAt 的日历日当零点"
+     会把两段**算反**（实测：22→6 的 00:30 会切成 250 : 749，而正确的 2 h : 0.5 h 是 800 : 200）。
+     算式：开始日的 00:00 ＋ 24 h。 */
+  const dayStart = new Date(startAt.getFullYear(), startAt.getMonth(), startAt.getDate(), 0, 0, 0, 0);
+  const midnight = new Date(dayStart.getTime() + 24 * 3600 * 1000);
+  const day1Sec = Math.max(0, Math.min(span, Math.round((midnight.getTime() - startAt.getTime()) / 1000)));
+  /* 分配（整数、总额恒定）：前段＝总额 × 前段占比（四舍五入后夹在 [0, total]），后段＝总额 − 前段。
+     ⚠ 前段占比的分母必须是**已进行时长** `liveElapsed`（运行中 ≠ 整班跨度，见上）；
+     并且 `day1Sec` 还要被 `liveElapsed` 夹一次 —— 运行中尚未走完"开始日那一整段"时
+     （如 22:00 的班在 23:00 被读）前段占比不可能超过 1。 */
+  const day1Span = Math.min(day1Sec, liveElapsed);
+  const day1 = liveElapsed > 0 ? Math.max(0, Math.min(total, Math.round(total * (day1Span / liveElapsed)))) : 0;
+  /* 段 → 日历归属（`yyyy-MM-dd`）随切段一起给出：`day1` 归**班次开始那天**、`day2` 归次日。
+     为什么把归属**绑在切段结果上**（而不是让调用方另传一个参数）：两段与它们的日历归属是同一件事，
+     分开传就会出现"传了切段、忘了归属"的形态 —— 而那时 `day1`/`day2` 只能靠猜塞进某一天，
+     猜错正是 `E83` 要消掉的当日累计错位（实测踩到：次日的日档被多算进开始日那一段）。 */
+  return { day1, day2: total - day1, crossing: true, day1Date: shift.date, day2Date: fmtDate(midnight) };
+}
+
+/**
  * 把本周期新增的运行秒数并入累计值。
  * @param {{daySec:number, monthSec:number, yearSec:number, at:string|Date}} prev 上次落库值（DR-17 持久化）
  * @param {number} addSec 本周期新增（通常为该班次的有效运行秒数）
  * @param {string|Date} now
+ * @param {{day1:number, day2:number, crossing?:boolean, day1Date?:string, day2Date?:string}} [addSplit]
+ *   `E83` 的**自然日切段**（`splitRunSecondsByDay()` 的产物）。
+ *   · **缺省**（未传）或 `crossing !== true` ⇒ 行为与 `E83` 之前**逐字相同**：
+ *     整段增量加进日/月/年三档（**不**按日期归属改日档）；月/年档之间的滚动仍由 `rollAccum` 负责；
+ *   · `crossing === true` ⇒ 只有**跨零点**这一次增量才按日历归属入档（见下）。
+ * @param {{shiftStartDate?:string, shiftNextDate?:string}} [alloc] 兜底的日历归属（`yyyy-MM-dd`）。
+ *   ⚠ 为什么**只在 `crossing === true`** 时才动日档（本包实测踩到的两个坑，逐条登记）：
+ *    ① **次日的日档会凭空多出开始日那一段**：22:00 的夜班在**次日** 00:30 被读时，"今天"是 D+1，
+ *       读者要的是 `day2`；若把 `day1` 也加进日档，实测 `daySec` 由 192 变成 767 —— 正是 `E83`
+ *       要消掉的那种错位，只是换了个方向；
+ *    ② **不跨零点时按日期归属会改写既有读数**：`accumulateRunTime(prev, add, now)` 的 `prev`
+ *       是调用方给的"上次落库值"，`rollAccum` 会在跨日时把旧 `daySec` 滚进月/年 —— 这是**既有**
+ *       且**被测**的行为（`tests/logic-check.js` 的「五、累计运行」段与 `A1/D3-2`）。若对不跨零点的
+ *       增量也做"按日期归属"，日档就会被改成"整班的 run_sec"，实测把 7 200 变成 28 800
+ *       （3 条断言当场变红）。⇒ **不跨零点：一个字都不改**。
+ *   本月/本年两档不受归属影响：跨零点只可能跨"日"（一个班次最长 24 h，且月/年边界与零点同刻）
+ *   ⇒ 两段**都**落在同一个月/年，故两段都计入。
+ * @returns {{daySec:number, monthSec:number, yearSec:number, at:Date, reset:object}}
  */
-function accumulateRunTime(prev, addSec, now) {
+function accumulateRunTime(prev, addSec, now, addSplit, alloc) {
   const rolled = rollAccum(prev, toDate(now));
   const add = Math.max(0, Number(addSec) || 0);
+  /* 切段口径：缺省 / 不跨零点 ⇒ "整段算当日"（与改动前逐字相同）；只有 `crossing === true`
+     才按两段各自的日历归属入档。两段都做非负整数化，且**不**对 `day1 + day2` 做二次缩放
+     （`splitRunSecondsByDay()` 已保证恒等式；这里只负责不造出负数/NaN）。 */
+  const hasSplit = addSplit && addSplit.crossing === true &&
+    Number.isFinite(Number(addSplit.day1)) && Number.isFinite(Number(addSplit.day2));
+  const day1 = hasSplit ? Math.max(0, Math.round(Number(addSplit.day1))) : add;
+  const day2 = hasSplit ? Math.max(0, Math.round(Number(addSplit.day2))) : 0;
+  let toDay = add;
+  if (hasSplit) {
+    /* 两段的日历归属：优先取**切段结果自带**的（同源），否则退到调用方给的 `alloc` */
+    const start = (addSplit && typeof addSplit.day1Date === 'string' && addSplit.day1Date)
+      || (alloc && typeof alloc.shiftStartDate === 'string' ? alloc.shiftStartDate : null);
+    if (!start) {
+      throw new TypeError(
+        'accumulateRunTime: 传入**跨零点**切段时必须能确定两段的日历归属（addSplit.day1Date/day2Date 或 ' +
+        'alloc.shiftStartDate）—— 否则 day1 只能靠猜塞进某一天，而猜错就是 E83 要消掉的当日累计错位');
+    }
+    const next = (addSplit && typeof addSplit.day2Date === 'string' && addSplit.day2Date)
+      || (alloc && typeof alloc.shiftNextDate === 'string' ? alloc.shiftNextDate : fmtDate(nextDay(start)));
+    const nowDay = fmtDate(toDate(now));
+    if (start === nowDay) toDay = day1;          // 班次开始于今天 ⇒ 前段进今天的日档
+    else if (next === nowDay) toDay = day2;      // 今天＝次日 ⇒ 只有后段进今天的日档
+    else toDay = day1 + day2;                    // 都不匹配（异常形态）⇒ 不丢秒，整段进日档
+  }
   return {
-    daySec: Math.max(0, rolled.daySec + add),
-    monthSec: Math.max(0, rolled.monthSec + add),
-    yearSec: Math.max(0, rolled.yearSec + add),
+    daySec: Math.max(0, rolled.daySec + toDay),
+    monthSec: Math.max(0, rolled.monthSec + day1 + day2),
+    yearSec: Math.max(0, rolled.yearSec + day1 + day2),
     at: rolled.at,
     reset: rolled.reset
   };
+}
+
+/** 日期文本 +1 天（`yyyy-MM-dd`；**纯日期运算，不读系统时间**，D17） */
+function nextDay(dateText) {
+  const d = new Date(`${dateText}T00:00:00`);
+  d.setDate(d.getDate() + 1);
+  return d;
 }
 
 module.exports = {
@@ -321,6 +469,7 @@ module.exports = {
   DONE_STATUS,
   computeShiftStats,
   accumulateRunTime,
+  splitRunSecondsByDay,
   safeDiv,
   pct
 };

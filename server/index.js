@@ -372,7 +372,12 @@ const state = {
   },
   /** 最近一次**整机快照**（`createStateSnapshot()` 的产物）：`/health` 的 `runAccum` 从它只读引用
    *  （`snapshot.lastRunAccum`）。未生成过 ⇒ null（键恒在，"还没有这个数"与"这个数是 0"分得开）。 */
-  snapshot: null
+  snapshot: null,
+  /** `E128`（2026-10-04）**跨零点班次配置**的运行期自述（真源＝`services/shift.js` 的
+   *  `createShiftRules().crossMidnight()`，`start()` 里落一次；**不在 `/health` 里现算** ——
+   *  那会变成第二份判据）。形状 `{allowed, count, keys}`；未启动/未取值 ⇒ `null`
+   *  （键恒在：`null` ＝"还没取过"，`count: 0` ＝"取过了，配置里确实没有跨零点班次"）。 */
+  crossMidnight: null
 };
 
 /**
@@ -509,6 +514,17 @@ function healthPayload() {
     },
     /* `addRunSec` 的**上界**（ADR-0009 D3 重设）：现算的活读数（规则串 ＋ 当班 elapsedSec/totalSec） */
     addRunSecBound: addRunSecBoundPayload(),
+    /* `E128`（2026-10-04）：跨零点班次配置的**显式告警出口**。字段名与取值（真源＝
+       `services/shift.js` 的 `crossMidnight()`，在 `start()` 里落进 `state`，此处只搬运）：
+         · `allowed`  ＝ 配置里含跨零点班次且已开闸（`shift.allowCrossMidnight: true`）；
+         · `count`    ＝ 跨零点班次条数（`0` ＝ 现配置 0-8/8-16/16-24 的情形）；
+         · `keys`     ＝ 逐条点名（`'夜班 22-6'` 形态），便于现场一眼认出是哪条规则；
+         · `splitReady` ＝ 自然日投影（`E83`）**已实现**（本版本恒 `true` —— 切段落盘在
+                          `shift_stat.run_sec_day1/run_sec_day2`，读口见 `repo/shiftStat.js`）。
+       为什么要有这个出口：`E128` 的原问题就是"配置含跨零点班次时**没有任何地方报警**" ⇒
+       把"有没有跨零点、开没开闸、切段就绪没有"三件事做成**键恒在**的可读字段
+       （`null` ＝"还没取过" 与 `count: 0` ＝"取过了，确实没有跨零点"分得开）。 */
+    crossMidnight: state.crossMidnight,
     /* DR-17 累计运行的**取数来源**（最近一次整机快照的读数）：日/月/年＝`shift_stat.sumRunSec()` 求和、
        当班增量＝`shift_stat.getShiftRow()` 的"上次累计"之差；`undetermined` ＝该档"无法判定"的班次数
        （状态位，**不是** 0 —— 见 `repo/shiftStat.js` 文件头）。没做过快照 ⇒ null。 */
@@ -582,8 +598,16 @@ async function start(options = {}) {
 
   /* 班次真源（DR-06／FR-4.16）：**只建一次**，全进程共用 —— 跨班检测、固化与补记都经它取班次，
      绝不在这里另写一套边界算式（`end=24`／跨零点／归属日回退都只在 `services/shift.js` 里）。
-     配置非法（缺口/零长度）时 `createShiftRules()` 会抛错 ⇒ 属启动期致命错误，如实抛出、不兜底。 */
-  const shiftRules = createShiftRules(((boardCfg && boardCfg.shift) || {}).list || []);
+     配置非法（缺口/零长度）时 `createShiftRules()` 会抛错 ⇒ 属启动期致命错误，如实抛出、不兜底。
+     `E128`（2026-10-04）：这里传的是**整个 `shift` 段**（不是只传 `list`）—— 跨零点班次的准入开关
+     `allowCrossMidnight` 是段上的键，只传数组会把它静默丢掉（＝闸失效）。未开闸而配了跨零点班次时，
+     `createShiftRules()` 当场抛错并指名"先做 `E83` 的两个投影"⇒ 启动期拒绝，**不留"能配但算错"的窗口**。 */
+  const shiftSeg = (boardCfg && boardCfg.shift) || {};
+  const shiftRules = createShiftRules(shiftSeg);
+  /* `E128` 的运行期自述：配置里到底有没有跨零点班次、开没开闸、切段就绪没有 ——
+     写进模块级 `state`（`/health.crossMidnight` 只读搬运）＋ 下面一条**显式启动日志**。
+     "能配但算错"这件事必须**能被巡检看见**，不能只活在注释里。 */
+  state.crossMidnight = Object.assign({}, shiftRules.crossMidnight(), { splitReady: true });
 
   /* ---- 2b.（已删除）E58 临时闸 ----
       T-20260930-05 曾在此处按 E58 的裁定①立一道临时闸（`orderDoneSourceReady`，默认 off ⇒
@@ -1304,10 +1328,18 @@ async function start(options = {}) {
       retestQty: s.retestQty,
       passRate: rateDeterminable ? s.firstPassRate : null,
       runSec: runDeterminable ? s.runSec : 0,
+      /* `E83` 的**自然日切段**随 `run_sec` 一起落库（真源＝`services/stats.js` 的
+         `splitRunSecondsByDay()`，经 `computeShiftStats()` 的 `runSecDay1/runSecDay2` 出来）。
+         ⚠ 两个**一起给或一起不给**（`upsertFrozen()` 会拒收半给）：`runDeterminable === false` 时
+         `runSec` 只能落 0（列约束），而"没帧 ⇒ 无法判定"这件事由 `oee: null` 承载 ⇒ 这里同样
+         **不写切段**（留 NULL ＝"没算过"），不用 `0/0` 冒充"量到了 0 秒"（`E38` 的既有口径）。 */
+      runSecDay1: runDeterminable ? s.runSecDay1 : null,
+      runSecDay2: runDeterminable ? s.runSecDay2 : null,
       idleSec: runDeterminable ? s.idleSec : 0,
       oee: runDeterminable ? s.oee : null,
       /* 固化（或补记）**动作发生**的时刻（注入时钟）。补记行的 `frozen_at` 晚于班次结束时刻 ——
-         两者之差就是"补记"这件事的可读证据（本表没有状态位列，且 ADR-0009 D5 不允许新增列）。 */
+         两者之差就是"补记"这件事的可读证据（本表没有状态位列；`run_sec_day1/day2` 是 `E83`
+         于 2026-10-04 追加的两列，见 `schema.sql` 与 `repo/shiftStat.js` 文件头）。 */
       frozenAt: nowText,
       createdAt: nowText
     };
@@ -1643,6 +1675,26 @@ async function start(options = {}) {
   logger.info(`[DR-17] 累计运行取数已改真源：日/月/年＝对 shift_stat 求和（shift_date 归属 ⇒ 跨零点/跨月正确），` +
     `当班增量＝当班runSec − 该班次已固化run_sec；addRunSec 上界按 ADR-0009 D3 **重设**为 elapsedSec` +
     `（旧上界 runSec 在"无采集串且无在测件"时恒 0）；活读数见 /health.addRunSecBound 与 /health.runAccum`);
+  /* `E83`＋`E128`（2026-10-04）：**跨零点口径的两个投影**已落地 ⇒ 这条日志把"两套投影各是谁、
+     现配置下是否同值、闸开没开"一次说清（读方按 `/health.crossMidnight` 巡检）。 */
+  logger.info(`[E83] 跨零点口径的两个投影已落地（负责人 2026-10-04 裁定）：` +
+    `①**班次投影**＝整班归"班次开始那天"（DR-06/FR-4.16；shift_stat.run_sec，按 shift_date 求和，**未改**）；` +
+    `②**自然日投影**＝运行秒数**按零点切段**（前段归 D、后段归 D+1；落盘 shift_stat.run_sec_day1/run_sec_day2，` +
+    `每日档＝"归属日=D 的 day1"＋"归属日=D−1 的 day2"）⇒ 供 FR-6.4/6.5/6.6 与 FR-6.12 对账；` +
+    `恒等式 run_sec_day1+run_sec_day2=run_sec 由**写入口**拒收保证（不丢秒、不重复计）；` +
+    `现配置（0-8/8-16/16-24）无跨零点班次 ⇒ day2≡0 ⇒ **两套投影恒同值**（改前/改后逐字比对见 tests\\._verify\\e83-*.js）；` +
+    `/health.runAccum 的 naturalDay 与 shiftProjection 两段并列报出，差值＝跨零点切段的效应`);
+  if (state.crossMidnight && state.crossMidnight.count > 0) {
+    logger.warn(`[E128 ⚠ 跨零点班次配置] 配置里含 ${state.crossMidnight.count} 条跨零点班次：` +
+      `${state.crossMidnight.keys.join(' , ')}（allowCrossMidnight=${state.crossMidnight.allowed}）—— ` +
+      `这些班次的运行秒数跨自然日，**当日/本月/年度累计运行**走 E83 的自然日投影（按零点切段）；` +
+      `班次指标（FR-4.16/§4.4）仍按班次边界、整班归开始日。改了班次配置请同步核对 /health.runAccum 的` +
+      `naturalDay 与 shiftProjection（两者不再同值属**预期**，同值才是异常）。`);
+  } else {
+    logger.info(`[E128] 跨零点班次配置自述：count=0（现配置无跨零点班次）⇒ 两个投影恒同值；` +
+      `准入闸=显式 opt-in（未写 shift.allowCrossMidnight=true 而配了 end<start ⇒ **启动期拒绝**）；` +
+      `读口＝/health.crossMidnight`);
+  }
 
   /* ---- 6f. W5-① 追加：静态托管（同源入口）＋ CORS（`file://` / 回环源） ----
      依据负责人 2026-09-28 裁定「选项 A」：

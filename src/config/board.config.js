@@ -52,13 +52,29 @@ const BOARD_CONFIG = (function () {
 
     /* ---------------- 班次定义（Q-10 答复后修改此处） ----------------
        规则：start/end 为 24 小时制整点；end=24 表示次日 0 点。
-       跨零点归属、节假日与计划停线是否计入，见下方两个开关。 */
+       跨零点归属、节假日与计划停线是否计入，见下方两个开关。
+       ⚠⚠ **配跨零点班次（end < start，如 {name:'夜班',start:22,end:6}）之前先看 `E83`**：
+         跨零点班次的**运行秒数跨自然日** ⇒ "当日累计"必须走 **`E83` 的自然日投影**（按零点切段：
+         前段归 D、后段归 D+1；落盘 `shift_stat.run_sec_day1/day2`，读口见 `server/repo/shiftStat.js`），
+         而**班次指标**（FR-4.16／§4.4）仍按班次边界、整班归"班次开始那天"（DR-06）—— 两套口径并存。
+         **未做切段而配上跨零点班次 ⇒ 当日累计会静默错位**（症状像数据问题、不像配置问题）。
+         ⇒ 本仓的准入闸（`E128`）：**跨零点规则必须显式开闸**，否则 `createShiftRules()` 在**启动期拒绝**：
+             allowCrossMidnight: true,        // ← 与下面的 list 同级（就在本段里）
+           开闸前请确认 `E83` 的两个投影已落地（本版本已落地）＋ 改配置后核对 `GET /health` 的
+           `crossMidnight`（`count`/`keys`/`allowed`/`splitReady`）与 `runAccum` 的
+           `naturalDay` 与 `shiftProjection` 两段读数。 */
     shift: {
       list: [
         { name: '晚班', start: 0,  end: 8  },
         { name: '早班', start: 8,  end: 16 },
         { name: '中班', start: 16, end: 24 }
       ],
+      /* 跨零点班次的**显式准入开关**（`E128`，2026-10-04）：缺省（本行被注释＝未设置）即
+         "不含跨零点班次"；一旦 `list` 里出现 `end <= start` 的规则而本键不是 `true`，
+         `createShiftRules()` 会**当场抛错**并指名"先做 `E83` 的两个投影"⇒ 服务启动失败
+         （**拒绝优于静默算错**：现场看到的会是启动日志里的一句话，不是"当日累计少了几个小时"）。
+         ⚠ 本键**只是准入**，它不改变任何算式；`0-8／8-16／16-24` 三段班不跨零点，无需开启。 */
+      // allowCrossMidnight: true,
       countHoliday: true,       // 节假日是否计入当班时长（Q-10）
       countPlannedStop: false,  // 计划停线是否计入当班时长（Q-10）
       roster: {                 // 当班人员（Q-10；联调后由 MES 人员班组资质接口提供）

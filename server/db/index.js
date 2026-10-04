@@ -44,7 +44,7 @@ const path = require('node:path');
  *         `CREATE TABLE IF NOT EXISTS` 对旧表是**空操作**，SQLite 又写不出 `ADD COLUMN IF NOT EXISTS`。
  *    升版同样是必须的（正文一变指纹即变），且"库内版本 5 ≠ 当前 6"会命中 `planMigration()`
  *    ⇒ 旧库启动前**强制备份**（E18 不可跳过）。 */
-const SCHEMA_VERSION = '6';
+const SCHEMA_VERSION = '7';
 
 /** 建表脚本位置（与本文件同目录） */
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
@@ -190,7 +190,25 @@ const STRUCTURE_UPGRADES = [
         而 `initSchema()` 是**无条件**逐条执行本清单的（见其注释与实现），所以"老库补列"这件事
         不依赖版本号变化也能落地。 */
   'ALTER TABLE upload_log ADD COLUMN fail_reason TEXT',
-  'ALTER TABLE upload_log ADD COLUMN updated_at TEXT'
+  'ALTER TABLE upload_log ADD COLUMN updated_at TEXT',
+  /* `E83`（2026-10-04，跨零点口径的两个投影）：`shift_stat` 增列 `run_sec_day1`/`run_sec_day2`
+     —— **自然日投影**（FR-6.4／6.5／6.6 的"当日/本月/年度累计运行"按**自然日**零点切段）。
+     旧库（SCHEMA_VERSION < '7'）需要这两步补上；`CREATE TABLE IF NOT EXISTS` 对旧表是空操作。
+     ① 两列**可空**（`schema.sql` 就是可空）⇒ 既有行天然合法、**无需数据回填**：
+        NULL 的读法只有一条 —— **"本行按旧口径写入、未做自然日切段"** ⇒ 读口
+        （`repo/shiftStat.js` 的 `runDaysOf()`）按"整段归班次开始日"兜底，与 `E83` 之前的读数逐字相同。
+        **刻意不用 DEFAULT 0 回填**：0 只能表达"这一段确实是 0 秒"，而老行的真相是"我们没算过"
+        —— 用 0 顶替就是把"拿不到"写成"量到了"（技术债 `E38` 的既有口径），而 `run_sec_day2 = 0`
+        与 `run_sec_day2 IS NULL` 在"跨零点班次有没有被切段"上是**两个相反的事实**。
+     ② 恒等式 `run_sec_day1 + run_sec_day2 = run_sec` 由**写入口**（`repo/shiftStat.js` 的
+        `upsertFrozen()`）校验后落库 —— 不在库里加 CHECK 约束（那属"改约束"，在 SQLite 下对老库
+        是静默空操作，见 `E74` 的白名单口径），故恒等式由代码侧拒收保证；
+     ③ 重复执行时报 `duplicate column name`，被下面的容错吞掉 —— 天然幂等；
+     ④ **本包改了 `schema.sql`** ⇒ 按 9.5 第 6 条**同批升版**（上面 `SCHEMA_VERSION` 6 → 7）
+        ＋ 同批同步 `tests/db-check.js` 的 `REQUIRED_COLUMNS`（需求锚，新列**不进**
+        `LEGACY_BASELINE_COLUMNS`）；本文件只负责①升版与②补列两步，③归测试侧（座位 4b）。 */
+  'ALTER TABLE shift_stat ADD COLUMN run_sec_day1 INTEGER',
+  'ALTER TABLE shift_stat ADD COLUMN run_sec_day2 INTEGER'
 ];
 
 /**

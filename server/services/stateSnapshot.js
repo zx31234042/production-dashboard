@@ -68,12 +68,21 @@
        `stats.shift.elapsedSec` 等当班进度**随秒前进**（跨秒两次读取可能差 1 s），这是当班
        进度的应有语义；`link` 与 `frame` 在同一次状态变化之间是稳定的。
      · 缺什么给什么：无工单/无帧/无上报器 ⇒ 对应键为 null 或按上文缺省，**绝不编造**数值。
-     · DR-17 累计运行（**ADR-0009 D4 落地**）：`stats.accumulate` 的日/月/年三档不再是恒 0 ——
+     · DR-17 累计运行（**ADR-0009 D4 落地**；**`E83` 起一次给两套投影**）：`stats.accumulate` 的
+       日/月/年三档不再是恒 0 ——
        · **已固化部分**＝对 `shift_stat` 求和（读口 `repo/shiftStat.js` 的 `sumRunSec()`；
-         归属键＝DR-06 的 `shift_date`，故**跨零点/跨月/跨年归属**由它承载；周期键由本文件按注入时钟取）；
+         周期键由本文件按注入时钟取）；
        · **当班增量**（`addRunSec`）＝当班实时 `runSec` − **该班次已固化的 `run_sec`**（读口
          `repo/shiftStat.js` 的 `getShiftRow()`）⇒ 已固化部分不会被重复相加，且新读数**不回退**；
        · 三档求和的结果与增量一起交给 `services/stats.js` 的 `accumulateRunTime()`（算式仍只此一处）。
+       **`E83` 的两个投影（负责人 2026-10-04 裁定）** —— "当日/本月/年度累计"按**自然日**切，
+       而班次指标按**班次边界**切；同一行 `shift_stat` 同时承载两套读数：
+       · **自然日投影**（`FR-6.4/6.5/6.6` 的真源）＝`sumRunSec()` 按**零点切段**求和
+         （`shift_date = D` 的 `run_sec_day1` ＋ `shift_date = D−1` 的 `run_sec_day2`）＋ 当班增量按段分配
+         ⇒ 这就是 `stats.accumulate` 的日/月/年三档；
+       · **班次投影**（`DR-06`／`FR-4.16`，`E83` 之前的读数逐字保留）＝同一读口给的
+         `shiftDaySec/shiftMonthSec/shiftYearSec`（按 `shift_date` 对 `run_sec` 求和＝整班归开始日）；
+       · 两者一并挂在 `snapshot.lastRunAccum`（`naturalDay` 与 `shiftProjection` 两段）供 `/health` 对账。
        实现细节与已知边界（跨零点班次配置下"当班增量"的归属）见 `statsOf()` 内注释与回执。
      · `snapshot.lastRunAccum`：本文件把上面那次 DR-17 读数**另挂在快照函数对象上**（**不进** `snapshot()`
        的返回体 —— 那是 hello/`GET /state` 的契约，不动它），供 `GET /health` 的 `runAccum` 字段只读引用
@@ -132,6 +141,10 @@ const EMPTY_RUN_SUMS = Object.freeze({
   daySec: 0,
   monthSec: 0,
   yearSec: 0,
+  /* `E83` 的两套投影都要在"没有库"时同形（否则下游为"没库"还得再写一套分支） */
+  shiftDaySec: 0,
+  shiftMonthSec: 0,
+  shiftYearSec: 0,
   undetermined: Object.freeze({ day: 0, month: 0, year: 0 }),
   rows: 0
 });
@@ -280,7 +293,15 @@ function createStateSnapshot(options = {}) {
     ? options.now
     : platformClock.createClock({ mode: 'real' }).source();
   const config = options.config || boardConfig;
-  const shiftRules = createShiftRules((segOf(config, 'shift').list) || []);
+  /* 班次段：**两种入参形态都认**（向后兼容，且与 `server/index.js` 的 `start()` 同 ABI）：
+     · 整个业务配置（含 `shift` 段，`config.shift` 为对象或数组）—— 常规用法；
+     · 或**直接给 `shift` 段本身**（对象含 `list`）—— `contract-check` 等既有调用方就是这么传的。
+     为什么要把整个 `shift` 段交给班次真源（而不是只给 `list`）：`E128` 的准入开关
+     `allowCrossMidnight` 是**段上的键**，只传数组会把它静默丢掉（＝闸失效）。 */
+  const shiftSeg = Array.isArray(config.shift) ? { list: config.shift }
+    : (config.shift && typeof config.shift === 'object' ? config.shift
+      : (Array.isArray(config.list) ? config : segOf(config, 'shift')));
+  const shiftRules = createShiftRules(shiftSeg);
   /** 最近一次 DR-17 读数（日/月/年求和 ＋ 当班增量 ＋ 状态位）—— 挂在返回的 `snapshot` 函数对象上
    *  供 `GET /health` 的 `runAccum` 只读引用；**不进** `snapshot()` 的返回体（那是 hello/`GET /state`
    *  的契约，本次不动）。初值 `null` ＝"还没做过一次快照"。 */
@@ -350,12 +371,24 @@ function createStateSnapshot(options = {}) {
    *      （再滚一次会把"按周期已算好的和"当成上一天的累计、重复滚入月/年）。
    *      `accumulate.reset` 因此恒为 `{day:false, month:false, year:false}`：**归零靠周期过滤、不靠
    *      `rollAccum`**（口径只有一处：周期过滤）。
-   *   ⚠ **已知边界（如实登记）**：`addRunSec`（当班**未固化**增量）是**一个数**，而
-   *      `accumulateRunTime()` 会把它同时加到日/月/年三档 ⇒ 当"当班班次跨越自然日"时
-   *      （配置 `end < start`，如 22→6），该增量会被整段计入**新的一天**，而它的一部分实际发生在
-   *      前一天。现配置（0-8/8-16/16-24）**没有跨零点班次** ⇒ 该偏差当前不可达；若日后把班次配成
-   *      跨零点，必须改为"按自然日切分当班增量"（登记为待办）。已固化部分**不受影响**：它按 DR-06 的
-   *      `shift_date` 归属，跨零点也是对的。
+   *   ⚠ **`E83`（2026-10-04）之后本函数报的是"两套投影"**（负责人裁定的跨零点口径）：
+   *   · **自然日投影**（`FR-6.4/6.5/6.6` 的真源）＝`sums.daySec/monthSec/yearSec`（按零点切段求和，
+   *     `repo/shiftStat.js` 的 `segmentsOf()`）＋ **当班未固化增量的切段**（`addRunSecSplit`）；
+   *   · **班次投影**（`DR-06`／`FR-4.16` 的口径，`E83` 之前读数逐字保留）＝`sums.shiftDaySec/…`
+   *     与 `runSec` 整段；两者一并挂在 `snapshot.lastRunAccum` 上供对账（`/health.runAccum`）。
+   *     现配置（0-8/8-16/16-24）无跨零点班次 ⇒ 两套投影**恒同值**（这是硬保证，不是巧合：
+   *     见 `services/stats.js` 的 `splitRunSecondsByDay()` 与 `tests\._verify\e83-*.js` 的逐字比对）。
+   *   ⚠ **为什么切段结果必须落库（而不是只放内存累加器）**：本函数是"**每次快照从 DB 现算**"
+   *     （对 `shift_stat` 求和，不是"上次结果 + 增量"）—— 这条设计换来的是**幂等**（同一时刻连读两次
+   *     同值，`DR-17`）与**重启后一致**（进程内没有任何"必须记住"的状态）。若把切段只放在内存累加器里，
+   *     这两条会同时破：重启后/第二条读路径（`GET /health`、固化点、探针）拿到的日/月/年读数就会
+   *     与 `GET /state` 不同 —— 而它们本该是同一个数。⇒ 切段值随 `run_sec` 一起落 `shift_stat`
+   *     （`run_sec_day1`/`run_sec_day2`），"现算"才仍然成立。
+   *   ⚠ **为什么无跨零点配置时必须逐字不变**：自然日投影是**新**口径，旧读数是在产读数
+   *     （`/health.runAccum`、`GET /state` 的 `stats.accumulate`、`db-check`／`logic-check` 的既有期望值
+   *     都建立在它上面）。现配置不是跨零点 ⇒ 两套投影**必须**同值；一旦不同，说明改动**改变了在产行为**，
+   *     那是回归而不是新功能。故 `splitRunSecondsByDay()` 在不跨自然日时**直接返回整段**（不查半点、不做除法），
+   *     `accumulateRunTime()` 的第四入参缺省时也走**与改动前逐字相同**的那一支。
    *   ⚠ 三档求和的读数与增量**一并**挂到 `snapshot.lastRunAccum`（本文件导出的函数对象上的属性），
    *      供 `GET /health` 的 `runAccum` 字段只读引用 —— 读方要能看见"`addRunSec` 到底从哪儿来"。 */
   function statsOf(now) {
@@ -370,10 +403,39 @@ function createStateSnapshot(options = {}) {
        补上 —— 取数 SQL 只有 `statsForShift()` 一份，不存在第二个口径。 */
     const base = statsForShift(db, shift, { config, now, addRunSec: 0, accum: null });
     const addRunSec = Math.max(0, base.stats.runSec - frozenRunSec);
-    const accumPrev = { daySec: sums.daySec, monthSec: sums.monthSec, yearSec: sums.yearSec, at: now };
+    /* `E83` 的自然日投影（**当班未固化增量**的切段）：与 `addRunSec` **同源同形** ——
+       把"实时读数 − 已固化读数"这条增量算式**按段各算一遍**，而不是把整段增量塞进某一天。
+       · 不跨自然日（现配置）⇒ `runSecDay2 ≡ 0` ⇒ `split.day2 = 0`、`split.day1 = addRunSec`
+         ⇒ 下面 `accumulateRunTime()` 拿到 `{day1: add, day2: 0}`，与改动前逐字同值；
+       · 跨零点且有**部分固化**时，两段各自减自己的已固化值（互不代偿）——
+         已固化段的绝对值更大，故 `max(0, …)` 只会夹掉"库内比实时还大"这种不可能的分支。 */
+    const frozenDay = shiftStatRepo.segmentsOf({
+      fromDate: shift.date,
+      runSec: frozenRunSec,
+      runSecDay1: frozen ? frozen.run_sec_day1 : null,
+      runSecDay2: frozen ? frozen.run_sec_day2 : null
+    });
+    const day1Frozen = frozenDay.reduce((s, x) => (x.day === shift.date ? s + x.sec : s), 0);
+    const day2Frozen = frozenDay.reduce((s, x) => (x.day !== shift.date ? s + x.sec : s), 0);
+    /* ⚠ 用展开保留切段结果自带的 `crossing` 与两段的**日历归属**（`day1Date`/`day2Date`）——
+       只取 day1/day2 会把"这一次增量是否跨零点"丢掉，`accumulateRunTime()` 于是走"整段算当日"
+       那一支（实测：次日 00:30 的日档由 192 变成 959）。 */
+    const split = Object.assign({}, base.stats.runSecSplit, {
+      day1: Math.max(0, base.stats.runSecDay1 - day1Frozen),
+      day2: Math.max(0, base.stats.runSecDay2 - day2Frozen)
+    });
+    const accumPrev = {
+      daySec: sums.daySec, monthSec: sums.monthSec, yearSec: sums.yearSec, at: now,
+      /* `E83` 的第二套投影（班次投影）**不进** accum 的算式，只作为对账读数随读数一起报出去 */
+      shiftDaySec: sums.shiftDaySec, shiftMonthSec: sums.shiftMonthSec, shiftYearSec: sums.shiftYearSec
+    };
     /* 算式仍只此一处：`services/stats.js` 导出的 `accumulateRunTime()`（`computeShiftStats()` 内部用的
-       就是它）—— 这里显式再调一次，是为了不必为"读一个 runSec"把整套取数跑第二遍。 */
-    base.stats.accumulate = statsSvc.accumulateRunTime(accumPrev, addRunSec, now);
+       就是它）—— 这里显式再调一次，是为了不必为"读一个 runSec"把整套取数跑第二遍。
+       第 4 个入参＝`E83` 的自然日切段、第 5 个＝两段的**日历归属**（day1 归 `shift.date`、
+       day2 归次日）：缺省时行为与改动前逐字相同；见 `splitRunSecondsByDay()`／`accumulateRunTime()`。 */
+    base.stats.accumulate = statsSvc.accumulateRunTime(accumPrev, addRunSec, now, split, {
+      shiftStartDate: shift.date
+    });
     lastRunAccum = {
       at: platformClock.fmt(now),
       source: { sum: 'shift_stat.sumRunSec', current: 'shift_stat.getShiftRow' },
@@ -381,10 +443,27 @@ function createStateSnapshot(options = {}) {
       daySec: base.stats.accumulate.daySec,
       monthSec: base.stats.accumulate.monthSec,
       yearSec: base.stats.accumulate.yearSec,
+      /* `E83`：日/月/年三档的**自然日投影**与**班次投影**并列报出（读方按需取；对账靠两者之差） */
+      naturalDay: {
+        daySec: base.stats.accumulate.daySec,
+        monthSec: base.stats.accumulate.monthSec,
+        yearSec: base.stats.accumulate.yearSec
+      },
+      shiftProjection: {
+        daySec: sums.shiftDaySec === undefined ? null : sums.shiftDaySec,
+        monthSec: sums.shiftMonthSec === undefined ? null : sums.shiftMonthSec,
+        yearSec: sums.shiftYearSec === undefined ? null : sums.shiftYearSec
+      },
       undetermined: sums.undetermined,
       frozenShifts: sums.rows,
-      currentShift: { date: shift.date, name: shift.name, frozenRunSec },
+      currentShift: {
+        date: shift.date, name: shift.name, frozenRunSec,
+        frozenDay1: day1Frozen, frozenDay2: day2Frozen,
+        liveDay1: base.stats.runSecDay1, liveDay2: base.stats.runSecDay2,
+        crossing: Number(shift.end) <= Number(shift.start)
+      },
       addRunSec,
+      addRunSecSplit: split,
       liveRunSec: base.stats.runSec
     };
     return base.stats;

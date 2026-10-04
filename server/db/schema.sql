@@ -6,6 +6,13 @@
 --   * 时间统一为文本 'yyyy-MM-dd HH:mm:ss'（DR-16，本机 NTP 时间基准）
 --   * 表名与字段名一律小写下划线；与需求/上报的字段映射仍以 src/config/fieldMap.js 为准
 --   * 幂等：全部 IF NOT EXISTS，初始化脚本可重复执行
+--   ⚠ 改本文件（增/删/改列或表）必须**同批**做三件事（规范 9.5 第 6 条；`db-check` 六之九 有静态门禁）：
+--       ① 升 `server/db/index.js` 的 `SCHEMA_VERSION`（指纹由本文件正文算出，正文一变即需升版）；
+--       ② 在 `STRUCTURE_UPGRADES` 加同表同列的幂等 `ALTER TABLE … ADD COLUMN …`（老库的
+--          `CREATE TABLE IF NOT EXISTS` 是空操作，列不会凭空出现）；
+--       ③ 同步 `tests/db-check.js` 的 `REQUIRED_COLUMNS`／`LEGACY_BASELINE_COLUMNS` 需求锚
+--          （新增列**不要**写进老库基线 —— 写进去等于声明"老库不缺它"，那条门禁对该列立刻失明）。
+--       先例：`E83`（2026-10-04）给 `shift_stat` 加 `run_sec_day1`/`run_sec_day2`（自然日投影）。
 -- ==========================================================================
 
 /* ---------------- 结构版本（供后续迁移判断） ---------------- */
@@ -161,7 +168,11 @@ CREATE TABLE IF NOT EXISTS shift_stat (
   failed_qty    INTEGER NOT NULL DEFAULT 0,
   retest_qty    INTEGER NOT NULL DEFAULT 0,
   pass_rate     REAL,                            -- 一次性测试合格率
-  run_sec       INTEGER NOT NULL DEFAULT 0,      -- 有效运行时长
+  run_sec       INTEGER NOT NULL DEFAULT 0,      -- 有效运行时长（**班次投影**：整班归"班次开始那天"，DR-06/FR-4.16）
+  run_sec_day1  INTEGER,                         -- `E83` 自然日投影：本班运行秒数里落在**班次开始那一自然日**的部分
+                                                 --   可空：NULL ＝"本行按旧口径写入、未做自然日切段"⇒ 读口按整段归当日兜底
+  run_sec_day2  INTEGER,                         -- `E83` 自然日投影：落在**次日**的那部分（不跨零点班次恒为 0）
+                                                 --   恒有 run_sec_day1 + run_sec_day2 = run_sec（写入口校验，见 repo/shiftStat.js）
   idle_sec      INTEGER NOT NULL DEFAULT 0,      -- 待机时长
   oee           REAL,                            -- 稼动率
   frozen_at     TEXT NOT NULL,
