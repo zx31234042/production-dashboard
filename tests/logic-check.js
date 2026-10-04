@@ -2678,16 +2678,20 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
       const o = Object.assign({}, full139); o[field] = undefined; return o;
     };
     const cases139 = [
-      ['完整形态（`at()` 产物）', full139, []],
-      ['缺 `startAt`', missOne139('startAt'), ['startAt']],
-      ['缺 `endAt`', missOne139('endAt'), ['endAt']],
-      ['缺 `date`', missOne139('date'), ['date']],
-      ['缺 `start`/`end`（连判定都做不了）', { name: '夜班', startAt: full139.startAt, endAt: full139.endAt, date: '2026-10-31', elapsedSec: 9000 }, ['start', 'end']],
-      ['缺四个（只留 `date`）', { name: '夜班', date: '2026-10-31' }, ['start', 'end', 'startAt', 'endAt']],
-      ['`{}`', {}, ['start', 'end', 'startAt', 'endAt', 'date']]
-    ].map(([label, obj, wantMissing]) => {
+      ['完整形态（`at()` 产物）', full139, [], true],
+      ['缺 `startAt`', missOne139('startAt'), ['startAt'], false],
+      ['缺 `endAt`', missOne139('endAt'), ['endAt'], false],
+      /* ⚠ `E154`（2026-10-04，据 `C·23` 第 7 组）：**"只缺 `date`"这一支必须仍走"按零点切段"**
+         （`crossing:true`）—— 这是 `E139` 的**口径裁定**（"两段的时刻在场、已按零点切了段，
+         但入参形态不予背书"），不是"当前实现的快照"；旧谓词对它**两支都放行**
+         （`crossing === false ? day2 === 0 : …`）⇒ 把它退回"整段归开始日"照样绿。 */
+      ['缺 `date`', missOne139('date'), ['date'], true],
+      ['缺 `start`/`end`（连判定都做不了）', { name: '夜班', startAt: full139.startAt, endAt: full139.endAt, date: '2026-10-31', elapsedSec: 9000 }, ['start', 'end'], false],
+      ['缺四个（只留 `date`）', { name: '夜班', date: '2026-10-31' }, ['start', 'end', 'startAt', 'endAt'], false],
+      ['`{}`', {}, ['start', 'end', 'startAt', 'endAt', 'date'], false]
+    ].map(([label, obj, wantMissing, wantCross]) => {
       const out = stats.splitRunSecondsByDay(obj, 9000);
-      return { label, obj, out, wantMissing, hasDeg: 'degraded' in out, deg: out.degraded,
+      return { label, obj, out, wantMissing, wantCross, hasDeg: 'degraded' in out, deg: out.degraded,
         keys: Object.keys(out), fiveSame: FIVE139.every(k => out[k] === fullOut139[k]),
         gotMissing: Array.isArray(out.degradedMissing) ? out.degradedMissing.join(',') : '(无数组)',
         wantMissingStr: wantMissing.join(','), reason: out.degradedReason || '' };
@@ -2700,24 +2704,90 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
        就把它当成 `fiveSame` 的比较对象，实测六种形态全报 false，理由写在这里）。 */
     const noCross139 = stats.splitRunSecondsByDay(
       { name: '夜班', start: 0, end: 8, startAt: '2026-10-31T00:00:00', endAt: '2026-10-31T08:00:00', date: '2026-10-31' }, 9000);
-    t.check('E139-1 **形态完整 ⇒ 一个键都不加**：`createShiftRules().at(...)` 的完整对象 ⇒ 返回体键集**恰为** ' +
-      '`{day1,day2,crossing,day1Date,day2Date}`（**连 `degradedReason`/`degradedMissing` 都没有**）；' +
-      '且这五个键与"同一份实现里不跨零点那一支"的无故障读数逐值相同（`D21`：不写死期望值）',
-      !full139Row.hasDeg && full139Row.keys.length === 5
-        && FIVE139.every(k => full139Row.keys.includes(k))
-        && FIVE139.every(k => Object.prototype.hasOwnProperty.call(full139Row.out, k)),
+    const noCrossCfg139 = { start: 0, end: 8, date: '2026-10-31' };
+    /** `E154` 的**次一日**（用于把"跨零点支的 `day2Date`"钉住；从 `day1Date` 现推，不写死 '2026-11-01'）。 */
+    const ymdNext139 = (ymd) => {
+      const d = new Date(String(ymd) + 'T00:00:00');
+      d.setDate(d.getDate() + 1);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    /** **`E154`（2026-10-04，据 `C·23` 第 7 组）：标题强于谓词 —— 把标题里的承诺搬进谓词。** 两处各一句：
+     *   · `E139-1`：旧谓词**只比键集**（`!hasDeg && keys.length === 5 && 五键在场`），而标题写的是
+     *     "这五个键与'不跨零点那一支'的无故障读数**逐值相同**" ⇒ 读标题的人以为守住了、读谓词的人知道没守住
+     *     （`D23`：**台账/回执里抄的往往是标题**）。本判据把"逐值"落成三条**由入参推出**的比较（不写死期望值）：
+     *       ⓐ 两支**共享语义**的三键（`day1`／`day2`／`day1Date`）**逐值相同**；
+     *       ⓑ `crossing` 与"由 `start`/`end` 推出的跨零点判定"**逐值一致**（跨零点支 true、非跨零点支 false）；
+     *       ⓒ `day2Date`：跨零点支 ＝ `day1Date` 的**次日**；非跨零点支 ＝ `day1Date`；且两段之和恒 ＝ `runSec`。
+     *     ⚠ **为什么不是"五键全同"**（如实登记）：`full139` 是**跨零点配置**（夜班 22-6）⇒ `crossing` 与
+     *     `day2Date` 按定义**不可能**与"不跨零点那一支"相同 ⇒ 标题原来那句逐字读是错的；本件把标题改成与
+     *     谓词相符的写法（**不是**把承诺删掉，而是把它拆成"共享三键逐值 ＋ 两个跨零点键各自钉死"）。
+     *   · `E139-2`：旧谓词写 `crossing === false ? day2 === 0 : day2 === 9000 − day1` ⇒ "把'只缺 `date`'
+     *     退回整段归开始日"的形态（`{crossing:false, day2:0}`，**保留** `degraded`／`degradedMissing`）
+     *     **两支都放行** ⇒ 标题承诺的"**仍按零点切段**"没有任何断言在守。本判据改成**逐形态给期望**
+     *     （`wantCross` 在用例表里，来源＝`E139` 的口径裁定，不是实现快照）。
+     *  **主断言与 D22 共用本函数**（否则"变异后必红"只是人读谓词推出来的 —— 与 `E153` 同一个教训）。
+     *  @returns {string[]} 违规说明（空＝合规） */
+    const e139_1_problems = (row, ctrl, cfgCrossing, ctrlCfgCrossing) => {
+      const p = [];
+      if (row.hasDeg) p.push('完整形态**不该**带 `degraded`（"判定有效 ⇒ 原样返回、一个键都不加"）');
+      if (row.keys.length !== 5) p.push(`键集应恰为 5 个（实测 ${row.keys.length} 个：[${row.keys.join(', ')}]）`);
+      if (!FIVE139.every(k => Object.prototype.hasOwnProperty.call(row.out, k))) p.push('五键有缺');
+      for (const k of ['day1', 'day2', 'day1Date']) {
+        if (row.out[k] !== ctrl[k]) {
+          p.push(`\`${k}\` 与"不跨零点那一支"的无故障读数应**逐值相同**（完整形态 ${JSON.stringify(row.out[k])} ≠ 对照 ${JSON.stringify(ctrl[k])}）`);
+        }
+      }
+      if (row.out.crossing !== cfgCrossing) {
+        p.push(`\`crossing\` 应与"由 \`start\`/\`end\` 推出的跨零点判定"一致（实测 ${row.out.crossing}，应为 ${cfgCrossing}）`);
+      }
+      if (ctrl.crossing !== ctrlCfgCrossing) p.push(`对照支的 \`crossing\` 应为 ${ctrlCfgCrossing}（实测 ${ctrl.crossing}）`);
+      if (cfgCrossing) {
+        if (row.out.day2Date !== ymdNext139(row.out.day1Date)) {
+          p.push(`跨零点支的 \`day2Date\` 应为 \`day1Date\` 的次日（实测 ${JSON.stringify(row.out.day2Date)}，期望 ${JSON.stringify(ymdNext139(row.out.day1Date))}）`);
+        }
+      } else if (row.out.day2Date !== row.out.day1Date) p.push('非跨零点支的 `day2Date` 应等于 `day1Date`');
+      if (row.out.day1 + row.out.day2 !== 9000) p.push(`两段之和应恒 ＝ runSec 9000（实测 ${row.out.day1 + row.out.day2}）`);
+      return p;
+    };
+    const e139_2_problems = (list) => list.flatMap(c => {
+      const p = [];
+      if (c.deg !== true) p.push(`${c.label}：\`degraded\` 应为 \`true\`（实测 ${JSON.stringify(c.deg)}）`);
+      if (c.gotMissing !== c.wantMissingStr) p.push(`${c.label}：\`degradedMissing\` 应为 [${c.wantMissingStr}]（实测 [${c.gotMissing}]）`);
+      if (c.out.crossing !== c.wantCross) {
+        p.push(`${c.label}：\`crossing\` 应为 **${c.wantCross}**（实测 ${c.out.crossing}）`
+          + (c.wantCross ? '—— 这一支**必须仍按零点切段**（`E154`）' : ''));
+      }
+      if (c.wantCross) {
+        if (c.out.day2 !== 9000 - c.out.day1) p.push(`${c.label}：按零点切段时应有 \`day2 === runSec − day1\`（实测 day1=${c.out.day1}／day2=${c.out.day2}）`);
+        if (c.wantMissing.indexOf('date') >= 0 && c.out.day1Date !== undefined) {
+          p.push(`${c.label}：缺 \`date\` ⇒ \`day1Date\` 必须**不背书**（应为 undefined，实测 ${JSON.stringify(c.out.day1Date)}）`);
+        }
+      } else if (c.out.day2 !== 0) p.push(`${c.label}：整段归开始日那一支应恒有 \`day2 === 0\`（实测 ${c.out.day2}）`);
+      if (!FIVE139.every(k => typeof c.out[k] !== 'undefined' || k === 'day1Date' || k === 'day2Date')) {
+        p.push(`${c.label}：\`day1\`/\`day2\`/\`crossing\` 不得为 undefined（实测 ${JSON.stringify(c.out)}）`);
+      }
+      return p;
+    });
+    const full139Problems = e139_1_problems(full139Row, noCross139,
+      Number(full139.end) <= Number(full139.start), Number(noCrossCfg139.end) <= Number(noCrossCfg139.start));
+    t.check('E139-1 **形态完整 ⇒ 一个键都不加；且五键逐个被"同一份实现 ＋ 入参"钉住**：`createShiftRules().at(...)` ' +
+      '的完整对象 ⇒ 返回体键集**恰为** `{day1,day2,crossing,day1Date,day2Date}`（**连 `degradedReason`/`degradedMissing` 都没有**）；' +
+      '且 `day1`／`day2`／`day1Date` 与"同一份实现里不跨零点那一支"的无故障读数**逐值相同**、`crossing` 与"由 `start`/`end` ' +
+      '推出的跨零点判定"逐值一致、`day2Date` ＝ `day1Date` 的**次日**、两段之和恒 ＝ `runSec`（`E154`：标题的承诺已搬进谓词；' +
+      '`D21`：值全部由入参推出，不写死期望值）',
+      full139Problems.length === 0,
       `键集＝[${full139Row.keys.join(', ')}]；\`degraded\` 在场=${full139Row.hasDeg}（应 false）；` +
-      `读数＝${JSON.stringify(full139Row.out)}；不跨零点对照＝${JSON.stringify(noCross139)}`);
+      `读数＝${JSON.stringify(full139Row.out)}；不跨零点对照＝${JSON.stringify(noCross139)}；` +
+      (full139Problems.length ? `**逐值违规 ${full139Problems.length} 条**：${full139Problems.join('；')}` : '逐值比对：零违规'));
 
     t.check('E139-2 **缺字段 ⇒ `degraded:true` ＋ `degradedMissing` 指名缺哪个**（六种形态）；' +
-      '数值上不得凭空多出时段（`crossing:false` ⇒ `day2` 恒 0；`day1` 只由 `runSec` 与形态中**在场**的时刻决定）、' +
-      '且两种出口都可降级：`startAt`/`endAt` 缺失时整段归开始日；**只缺 `date`** 时仍按零点切段' +
-      '（`crossing:true`）但**明确不背书归属**（`degradedReason` 会说明 `day1Date` 不可核）',
-      bad139.every(c => c.deg === true && c.gotMissing === c.wantMissingStr
-        && (c.out.crossing === false ? c.out.day2 === 0 : c.out.day2 === 9000 - c.out.day1)
-        && FIVE139.every(k => typeof c.out[k] !== 'undefined' || k === 'day1Date' || k === 'day2Date')),
-      bad139.map(c => `${c.label}：degraded=${c.deg}、missing=[${c.gotMissing}]（应 [${c.wantMissingStr}]）、`
-        + `crossing=${c.out.crossing}/day1=${c.out.day1}/day2=${c.out.day2}`).join('；'));
+      '数值上不得凭空多出时段（**逐形态给期望**：整段归开始日那一支 `day2` 恒 0；**只缺 `date`** 那一支仍按零点切段' +
+      '（`crossing:true`、`day2 === runSec − day1`、`day1Date` 不背书）、且两种出口都可降级' +
+      '（`E154`：旧谓词的"两支都放行"已改掉 —— 谓词与 D22 **共用** `e139_2_problems()`）',
+      e139_2_problems(bad139).length === 0,
+      (e139_2_problems(bad139).length ? `**违规 ${e139_2_problems(bad139).length} 条**：${e139_2_problems(bad139).join('；')}｜` : '零违规｜')
+      + bad139.map(c => `${c.label}：degraded=${c.deg}、missing=[${c.gotMissing}]（应 [${c.wantMissingStr}]）、`
+        + `crossing=${c.out.crossing}（应 ${c.wantCross}）/day1=${c.out.day1}/day2=${c.out.day2}`).join('；'));
 
     t.check('E139-3 **语义可分**：`start`/`end` 不在场时理由串**不得说"判定有效"**（必须承认"连是否跨零点都判不了"）；' +
       '`start`/`end` 在场但两个时刻缺失/不可解析（真跨零点那一支）时理由串必须点明' +
@@ -2793,16 +2863,60 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
          ① 完整形态本该**没有** `degraded`，变异后却有了；② 五键本该逐值相同，变异后"判不了"那一支
          反而返回了 `day1/day2/crossing:true` 的切段读数 ⇒ 期望的 `sevenKeys`／missing 两个细节都对不上。 */
       const mutMissing = (anchorOk && mutFn) ? mutFn(missOne139('startAt'), 9000).degradedMissing : null;
+      /* ——— `E154`（2026-10-04，据 `C·23` 第 7 组）的两支**受控变异读数**（都喂**共用谓词**）———
+         ㈠ `E139-1` 的"只比键集"旧谓词 vs "逐值"新谓词：把完整形态读数的 `day1`／`day2` 改坏
+            （`{day1:1000, day2:8000}`，键集与 `degraded` 一字不动）⇒ **旧谓词照样 true（放行）**、
+            新谓词必红并**指名 `day1`／`day2`**；
+         ㈡ `E139-2` 的"只缺 `date`"退回**整段归开始日**（`{crossing:false, day1:9000, day2:0}`，
+            **保留** `degraded:true`／`degradedMissing:['date']`）⇒ 旧谓词照样 true、新谓词必红并指名
+            "`crossing` 应为 true —— 这一支必须仍按零点切段"。
+         ⚠ 旧谓词是**照抄**（只为给"改动前"读数；判据本体一律走共用纯函数）。 */
+      const mutRow139 = Object.assign({}, full139Row, { out: Object.assign({}, full139Row.out, { day1: 1000, day2: 8000 }) });
+      const oldPredicate139_1 = (row) => !row.hasDeg && row.keys.length === 5
+        && FIVE139.every(k => row.keys.includes(k))
+        && FIVE139.every(k => Object.prototype.hasOwnProperty.call(row.out, k));
+      const newProblems139_1 = e139_1_problems(mutRow139, noCross139,
+        Number(full139.end) <= Number(full139.start), Number(noCrossCfg139.end) <= Number(noCrossCfg139.start));
+      const dateCase139 = cases139.find(c => c.wantMissing.indexOf('date') >= 0);
+      const pushBack139 = Object.assign({}, dateCase139, {
+        out: Object.assign({}, dateCase139.out, { crossing: false, day1: 9000, day2: 0 })
+      });
+      const oldPredicate139_2 = (c) => c.deg === true && c.gotMissing === c.wantMissingStr
+        && (c.out.crossing === false ? c.out.day2 === 0 : c.out.day2 === 9000 - c.out.day1)
+        && FIVE139.every(k => typeof c.out[k] !== 'undefined' || k === 'day1Date' || k === 'day2Date');
+      const oldPushBackVerdict139 = oldPredicate139_2(pushBack139);
+      const newPushBackProblems139 = e139_2_problems([pushBack139]);
       t.check('E139-5 D22（可证伪）：把"**判定有效 ⇒ 原样返回**"与"**降级 ⇒ 加三键**"两条路径**互换**' +
         '（`server\\services\\stats.js` 的**内存字节副本**：把"整段归当日那一支"的入口判据反相、并清空 `faults`）' +
         '⇒ `E139-1`／`E139-2` 的期望**当场被违反**（完整形态在本该"判定有效"时拿不到 `degraded`、' +
-        '缺字段的形态反倒拿不到 `degradedMissing`）；而**原件**同两条期望都成立；盘上文件逐字节未变',
+        '缺字段的形态反倒拿不到 `degradedMissing`）；而**原件**同两条期望都成立；盘上文件逐字节未变。' +
+        '**`E154` 追加两支受控变异**：①完整形态的 `day1`／`day2` 改坏 ⇒ **只比键集的旧谓词放行**、' +
+        '**逐值的新谓词必红并指名**；②"只缺 `date`"退回整段归开始日 ⇒ **旧谓词放行**、' +
+        '**新谓词必红并指名"这一支必须仍按零点切段"**',
         Boolean(fullSrc) && anchorOk && mutDeg === false && mutFive === false
-          && !Array.isArray(mutMissing),
-        anchorOk
+          && !Array.isArray(mutMissing)
+          && oldPredicate139_1(mutRow139) === true && newProblems139_1.length > 0
+          && newProblems139_1.some(x => x.indexOf('`day1`') >= 0) && newProblems139_1.some(x => x.indexOf('`day2`') >= 0)
+          && oldPushBackVerdict139 === true && newPushBackProblems139.length > 0
+          && newPushBackProblems139.some(x => x.indexOf('`crossing`') >= 0 && x.indexOf('**true**') >= 0),
+        (anchorOk
           ? `变异体：完整形态 ` + '`degraded`' + ` 在场=${mutDeg}（应 false ＝**违反** E139-1）、五键同值=${mutFive}`
             + `（应 false）、缺 startAt 时 degradedMissing=${JSON.stringify(mutMissing)}（应 **undefined** ＝违反 E139-2）；盘上未变=true`
-          : '**锚点未命中**（stats.js 的 `const faults = shiftShapeFaults(shift);` 形状变了）⇒ 判红，不许静默放过');
+          : '**锚点未命中**（stats.js 的 `const faults = shiftShapeFaults(shift);` 形状变了）⇒ 判红，不许静默放过')
+        + `｜【\`E154\` ㈠】把完整形态读数改成 \`day1=1000/day2=8000\`（键集与 \`degraded\` 不动）⇒ `
+        + `**旧谓词（只比键集）判决=${oldPredicate139_1(mutRow139)}（＝放行）**、新谓词违规 ${newProblems139_1.length} 条＝`
+        + `${newProblems139_1.join('；') || '（无，异常）'}`
+        + `｜【\`E154\` ㈡】"只缺 \`date\`"退回整段归开始日 ⇒ **旧谓词判决=${oldPushBackVerdict139}（＝放行）**、`
+        + `新谓词违规 ${newPushBackProblems139.length} 条＝${newPushBackProblems139.join('；') || '（无，异常）'}`);
+      t.info(`\`E154\` 读数（` + '`PASS`' + ` 详情不打印 ⇒ 这里留痕）：`
+        + `\`E139-1\` 谓词从"只比键集"改成**逐值**（共享三键逐值 ＋ \`crossing\` 由入参推出 ＋ \`day2Date\` ＝ 次日 ＋ 两段和恒等）；`
+        + `\`E139-2\` 改成**逐形态给期望**（\`wantCross\`：完整／缺 date ⇒ true，其余 ⇒ false），`
+        + `两处都抽成纯函数并与 D22 **共用**。`
+        + `【㈠ "day1/day2 改坏"】旧谓词（只比键集）判决=${oldPredicate139_1(mutRow139)}（**放行**）、`
+        + `新谓词违规 ${newProblems139_1.length} 条＝${newProblems139_1.join('；') || '（无）'}；`
+        + `【㈡ "只缺 date 退回整段归开始日"】旧谓词判决=${oldPushBackVerdict139}（**放行**）、`
+        + `新谓词违规 ${newPushBackProblems139.length} 条＝${newPushBackProblems139.join('；') || '（无）'}；`
+        + `两处**指名**都能从违规串里读到（㈠指名 \`day1\`/\`day2\`、㈡指名"这一支必须仍按零点切段"）。`);
     }
   }
 

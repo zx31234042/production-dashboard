@@ -1363,9 +1363,25 @@ function main() {
    *      `run-all.__serialTail` 里排在 `docs-cross-check` **之后** ⇒ 本轮账本**天然不含**它们；
    *      而且 `--only` 子集轮**根本不跑**它们 ⇒ 那时账本里"没有这几条"是**预期**。
    *      `D20` 的边界正是为它立的：**不可比、点名、不判 FAIL**。
-   *    · **"上一轮有、这一轮没了"**（异常）：账本是**增量落盘、不清空**的，`ranSuites` 记着上一轮
-   *      **真的跑过**它、账里也**真的有过**它的条目 ⇒ 这一轮它不见了，只可能是**条目被删/被改写**
-   *      （座位 5 实测：只删 `browser-check` 一条 ⇒ 失配 0、`已核对 2／不可比 1`、主断言**仍 PASS**）。
+   *    · **"上一轮有、这一轮没了"**（异常）：⚠ **`E155`（2026-10-04，据 `C·23` 第 2 组）更正了本段上一版的措辞** ——
+   *      上一版写"账本是**增量落盘、不清空**的"，据此推出"`ranSuites` 记着上一轮真跑过、账里也真有过"。
+   *      **与实现不符**：`run-all.js:1275` 起手 `const results = []`，`:604`／`:608` 每轮把 `ranSuites`／`suites`
+   *      **重写成本轮结果**（主代理亲验：两处都是 `results.map(...)`）⇒ 正确的口径是
+   *      "**轮内增量写、轮间重置**"。⇒ 下面这条"消失"判据**只在"单跑本脚本、读到上一轮完整账本"那条路径上活着**；
+   *      在 `run-all` 轮里（浏览器/长跑脚本排在 `docs-cross-check` 之后）它们**本来就不在账**里。
+   *      这正是 `E142` 的守护窗口：**跑过一次 `--fast`**（把这三条条目合法清掉）之后，
+   *      `browser-check 33`／`overlap-check 27`／`stress-check 11` 这三个**已登记的权威数字**
+   *      **在门禁里没有任何逐脚本判据**（本节只报"本轮不可比 3 个"、不判红）。
+   *      ⇒ **`E155` 的补法**：给这三条一个**不随轮次重置的持久真源**（`._verify\browser-authority-trail.json`，
+   *      见下面 `trailDriftE155()`）：账本里有它 ⇒ 照旧逐值比对**并把读数写进留痕**；
+   *      账本里没有它（`--fast` 轮／子集轮／`run-all` 轮的中途）⇒ 退回留痕比"**上一次全量轮的真读数** vs
+   *      **现在的权威区声明**" ⇒ **不一致即判红并指名**（这正是 `--fast` 之后无人守的那件事）；
+   *      连留痕都没有 ⇒ **显式报"不可比：无持久留痕"**（**不判红、但绝不静默**）。
+   *      ⚠ 为什么不改 `run-all.js` 让它别覆盖这三条（候选方案之一）：那要动 `run-all.js`（本件权限外，
+   *      且会把"账本＝本轮结果"这个已被多处依赖的口径改掉）；留痕方案的代价只是**一个新文件 ＋ 一次写盘**。
+   *    · **"上一轮有、这一轮没了"**（异常，单跑本脚本时的判据）：这一轮它不见了，只可能是**条目被删/被改写**
+   *      （座位 5 实测：只删 `browser-check` 一条 ⇒ 失配 0、`已核对 2／不可比 1`、主断言**仍 PASS**，
+   *      这正是 `E142` 立案时的那次读数）。
    *      这一条**必须判红并指名是哪只脚本消失了** —— 否则一个已登记的权威数字（33／27／11）
    *      可以"没人守"，而报告上完全看不出来。
    *    ⇒ 判据：`planned = (ranRound 若有 ⇒ 本轮实跑集合) 否则 (账本自述的 ranSuites)`；
@@ -1416,20 +1432,97 @@ function main() {
        本轮若经 `run-all` 启动，这个字段就是**本轮**写的）都喂给判据，用来分辨两种"缺"。 */
     const ranInfoE136 = { ranLedger: totals.ranSuites, ranRound: totals.ranSuites };
     const brAudit = browserLedgerAuditE136(browserDeclOfE136, nm => ledgerSummary[nm], ranInfoE136);
+    /* ==================== `E155`（2026-10-04）：三只浏览器/长跑脚本的**持久留痕** ====================
+       立案（`C·23` 第 2 组报出、主代理亲验）：`run-all.js:1275` 起手 `const results = []`、`:604`／`:608`
+       每轮把 `ranSuites`／`suites` **重写成本轮结果**（正确口径＝"**轮内增量写、轮间重置**"）⇒ 跑过一次
+       `--fast` 之后，这三条的条目被**合法清掉**，而它们的权威数字（33／27／11）在本节**只剩"本轮不可比"**、
+       **没有任何逐脚本判据** ⇒ 声明漂移可以悄悄溜过去（本节**只报不可比、不判红**）。
+       **候选方案与代价（`E155` 要求"先给方案（两个以上候选 ＋ 代价）再动手"）**：
+        ㈠ **持久留痕文件**（**本件采用**）：`tests\._verify\browser-authority-trail.json` —— 每当**账本里有**
+           这条时，把 `passed/failed/skipped ＋ 当时的声明 ＋ 账本 sha12 ＋ 时间` 写进去；账本里**没有**时，
+           拿留痕的 `passed` 与**现在的声明**比 ⇒ 不一致即**判红并指名**。
+           代价：本节多一次写盘（落在被 gitignore 的 scratch 面）＋ 多一个文件；**不动** `run-all.js`。
+        ㈡ 让 `--fast` **不覆盖**带浏览器脚本的条目：须改 `run-all.js:604`／`:608`（**本件权限外，需先回执申请**），
+           且会改掉"账本＝本轮结果"这个已被 `E50`／`E112`／`E136` 多处依赖的口径。
+        ㈢ 只靠 `run-all` 收尾按全量 SUITES 判（现状）：**单跑本节**这条路径仍然无人守 ⇒ 不解决本次立案的形态。
+       ⇒ 采用 ㈠（最小、可复算、不越权）。⚠ 留痕**不是**"第二个账本"：它只记**上一次全量轮的通过数**，
+         用来回答"**声明有没有漂**"；"这一次真的跑出多少"永远以**实跑/账本**为准。 */
+    const TRAIL_E155 = path.join(env.paths.verify, 'browser-authority-trail.json');
+    const readTrailE155 = () => {
+      try {
+        if (!fs.existsSync(TRAIL_E155)) return { ok: false, why: '留痕文件不存在（本节第一次跑／刚被清理）', entries: {} };
+        const j = JSON.parse(fs.readFileSync(TRAIL_E155, 'utf8'));
+        return { ok: true, why: '', entries: (j && j.entries) || {}, at: j && j.at };
+      } catch (e) { return { ok: false, why: `留痕读不出：${e.message}`, entries: {} }; }
+    };
+    /** 判据本体（**纯函数**：D22 复用 ⇒ "留痕比声明"这件事能被合成输入证伪）。
+     *  @returns {{findings:string[], viaTrail:string[], noTrail:string[], guardedByLedger:string[]}} */
+    const trailDriftE155 = (declOf, gates, sumOfName, trail) => {
+      const findings = []; const viaTrail = []; const noTrail = []; const guardedByLedger = [];
+      for (const nm of gates) {
+        const d = declOf(nm);
+        if (!d) { findings.push(`${nm}：权威区里解析不出 \`通过/失败\` 声明`); continue; }
+        if (sumOfName(nm)) { guardedByLedger.push(nm); continue; }        /* 账本里有 ⇒ 由 `E136` 逐值守 */
+        const rec = trail.entries[nm];
+        if (!rec || !Number.isFinite(rec.passed)) { noTrail.push(nm); continue; }
+        if (d.declared !== rec.passed) {
+          findings.push(`${nm}：**本轮账本不含它**（按 \`D20\` 不可比），而**持久留痕**记着上一次全量轮它是 `
+            + `**${rec.passed} 通过**（${rec.at || '时间未记'}、账本 sha12=${rec.ledgerSha12 || '-'}），`
+            + `权威区现在写 **${d.declared} 通过** ⇒ **声明漂移，而别的判据不会报它**（\`E155\` 立案的正是这一形态）`);
+        } else viaTrail.push(nm);
+      }
+      return { findings, viaTrail, noTrail, guardedByLedger };
+    };
+    const trailBeforeE155 = readTrailE155();
+    const trailAuditE155 = trailDriftE155(browserDeclOfE136, browserGatesE136, nm => ledgerSummary[nm], trailBeforeE155);
+    /** 留痕的**唯一写入点**：账本里有这条 ⇒ 记下"这一次全量轮的真读数"；写失败**显式报出来**（不静默）。 */
+    const trailWriteE155 = (() => {
+      const ledgerShaE155 = totals.ok ? require('node:crypto').createHash('sha256')
+        .update(fs.readFileSync(totals.file)).digest('hex').slice(0, 12) : null;
+      const entries = Object.assign({}, trailBeforeE155.entries);
+      let written = 0;
+      for (const nm of browserGatesE136) {
+        const s = ledgerSummary[nm]; const d = browserDeclOfE136(nm);
+        if (!s || !d) continue;
+        entries[nm] = { passed: s.passed, failed: s.failed, skipped: s.skipped, declared: d.declared,
+          ledgerSha12: ledgerShaE155, at: new Date().toISOString().slice(0, 19) + 'Z' };
+        written++;
+      }
+      if (!written) return { ok: true, written: 0, why: '账本里没有这三条 ⇒ 本轮**不写**（留痕保持原样，供下次不可比时用）' };
+      try {
+        fs.writeFileSync(TRAIL_E155, JSON.stringify({
+          note: 'E155 持久留痕：三只浏览器/长跑脚本"上一次全量轮"的通过数（判据与写入点都在 tests/docs-cross-check.js 的 §11 E136/E155 段）',
+          at: new Date().toISOString().slice(0, 19) + 'Z',
+          ledger: path.relative(env.paths.root, totals.file),
+          entries
+        }, null, 2) + '\n');
+        return { ok: true, written, why: '' };
+      } catch (e) { return { ok: false, written: 0, why: `留痕**写失败**：${e.message}` }; }
+    })();
     t.check('E136 三只**浏览器/长跑**脚本的**通过数**逐脚本对账（**只读账本**，不实跑）：权威区声明的通过数 = ' +
       '`run-totals.json` 里该脚本的 `passed`；**账本覆盖不到 ⇒ 按 `D20` 报"本轮不可比"并点名**' +
       '（不判 FAIL、也不计入已核对）；`已核对 ＋ 不可比 ＋ **上轮有这轮没了** === 应有值`（**一只都不许消失**）；' +
-      '**`E142`：账本自述"上一轮跑过"而本轮条目消失 ⇒ 判红并指名**（"本轮没轮到"与"上轮有这轮没了"必须分得开）',
-      browserGatesE136.length > 0 && brAudit.findings.length === 0
+      '**`E142`：账本自述"上一轮跑过"而本轮条目消失 ⇒ 判红并指名**（"本轮没轮到"与"上轮有这轮没了"必须分得开）；' +
+      '**`E155`：账本不含它时退回持久留痕 —— 留痕的通过数 ≠ 现在的权威区声明 ⇒ 判红并指名**（`--fast` 之后无人守的那件事）',
+      browserGatesE136.length > 0 && brAudit.findings.length === 0 && trailAuditE155.findings.length === 0
         && brAudit.covered.length + brAudit.unmet.length + brAudit.disappeared.length === browserGatesE136.length,
       (brAudit.findings.length ? `**失配 ${brAudit.findings.length} 条**：${brAudit.findings.join('；')}`
         : `逐脚本一致（${brAudit.covered.map(n => `${n}=${ledgerSummary[n].passed}/${ledgerSummary[n].failed}/${ledgerSummary[n].skipped}`).join('、') || '（无可比项）'}）`) +
+      (trailAuditE155.findings.length ? `｜**\`E155\` 留痕失配 ${trailAuditE155.findings.length} 条**：${trailAuditE155.findings.join('；')}` : '') +
       `｜**已核对 ${brAudit.covered.length}／${browserGatesE136.length} 个**` +
       `｜**本轮不可比 ${brAudit.unmet.length} 个**：${brAudit.unmet.join('、') || '（无）'}` +
+      `｜**\`E155\` 由留痕守住 ${trailAuditE155.viaTrail.length} 个**：${trailAuditE155.viaTrail.join('、') || '（无）'}` +
+      `｜**\`E155\` 无留痕（显式不可比，不判红）${trailAuditE155.noTrail.length} 个**：${trailAuditE155.noTrail.join('、') || '（无）'}` +
       `｜**\`E142\` 上轮有这轮没了 ${brAudit.disappeared.length} 个**：${brAudit.disappeared.join('、') || '（无）'}` +
       `｜\`E142\` 计划集合来源＝${brAudit.plannedSrc}（${brAudit.planned.length} 个）` +
       `｜声明：${browserGatesE136.map(n => { const d = browserDeclOfE136(n); return `${n}=${d ? d.declared : '（解析不到）'}`; }).join('、')}` +
       `｜账本 ${totals.ok ? `可读（${path.relative(env.paths.root, totals.file)}）` : '不可用：' + totals.why}`);
+    t.info(`\`E155\` 持久留痕：文件＝${path.relative(env.paths.root, TRAIL_E155)}`
+      + `（${trailBeforeE155.ok ? `可读，条目 ${Object.keys(trailBeforeE155.entries).length} 条` : `**不可读**：${trailBeforeE155.why}`}）；`
+      + `本轮写入＝${trailWriteE155.written} 条${trailWriteE155.why ? `（${trailWriteE155.why}）` : ''}${trailWriteE155.ok ? '' : ' ⚠ **写失败**'}` +
+      `｜判据分工：账本有 ⇒ \`E136\` 逐值守（${trailAuditE155.guardedByLedger.length} 个）＋ 记入留痕；`
+      + `账本没有 ⇒ 留痕比声明（守住 ${trailAuditE155.viaTrail.length} 个、失配 ${trailAuditE155.findings.length} 个、`
+      + `无留痕 ${trailAuditE155.noTrail.length} 个**显式不可比、不静默**）`);
     if (brAudit.unmet.length) {
       t.info(`§11「E136 浏览器/长跑脚本通过数」**本轮不可比 ${brAudit.unmet.length} 个**（账本不含该脚本条目 ⇒ ` +
         '不判 FAIL、**也不计入已核对**）：' + brAudit.unmet.join('、') +
@@ -1482,10 +1575,24 @@ function main() {
     };
     const diskLedgerShaE136 = require('node:crypto').createHash('sha256')
       .update(totals.ok ? fs.readFileSync(totals.file) : Buffer.from('')).digest('hex').slice(0, 12);
+    /* `E155` 的 **D22**（`PASS` 详情不打印 ⇒ 读数下面用 `t.info` 留痕）：四支**受控合成**读数 ——
+       ㈠ 账本里没有它 ＋ 留痕 33 vs 声明 33 ⇒ **由留痕守住**（不判红、也不装绿）；
+       ㈡ 账本里没有它 ＋ 留痕 33 vs 声明 **34** ⇒ **必红并指名**（＝"跑过 `--fast` 之后无人守"的那件事）；
+       ㈢ 账本里没有它 ＋ **没有留痕** ⇒ 显式"不可比：无持久留痕"（不判红、**但绝不静默**）；
+       ㈣ 账本里有它 ⇒ 交回 `E136` 逐值守（留痕不抢判据的活）。 */
+    const noLedgerE155 = () => undefined;
+    const synthTrailE155 = { ok: true, entries: { [targetE136]: { passed: 33, declared: 33, at: '2026-10-04T00:00:00Z', ledgerSha12: 'deadbeef0000' } } };
+    const trail155 = {
+      held: trailDriftE155(synthDeclE136, browserGatesE136, noLedgerE155, synthTrailE155),
+      drifted: trailDriftE155((nm) => (nm === targetE136 ? { declared: 34 } : synthDeclE136(nm)), browserGatesE136, noLedgerE155, synthTrailE155),
+      noTrail: trailDriftE155(synthDeclE136, browserGatesE136, noLedgerE155, { ok: false, why: '（合成：没有留痕）', entries: {} }),
+      ledgerWins: trailDriftE155(synthDeclE136, browserGatesE136, synthSumE136, synthTrailE155)
+    };
     t.check('E136 D22（可证伪）：用**受控合成三元组**（不依赖盘上账本的当前状态）把某只浏览器/长跑脚本的' +
       '通过数改错（`33 ⇒ 99`）⇒ 本判据**必红并指名它**（恰 1 条）；把它置空 ⇒ 该项**从"已核对"移到"不可比"**' +
       '（`已核对＋不可比` 总数不变）⇒ `D20` 边界两边都不装绿；判据复用的是**同一个纯函数**；' +
-      '盘上账本**逐字节未变**（全程只读它，不写它）',
+      '**`E155`：账本不含它时退回持久留痕 —— 留痕 33 vs 声明 34 ⇒ 必红并指名；留痕 33 vs 声明 33 ⇒ 由留痕守住；' +
+      '连留痕都没有 ⇒ 显式"不可比"（不判红、但绝不静默）**；盘上账本**逐字节未变**（全程只读它，不写它）',
       synthBaseE136.findings.length === 0 && synthBaseE136.covered.length === browserGatesE136.length
         && synthMutE136.findings.length === 1
         && synthMutE136.findings[0].includes(targetE136) && synthMutE136.findings[0].includes('通过数逐脚本漂移')
@@ -1507,7 +1614,14 @@ function main() {
         && audit142.neverPlanned.disappeared.length === 0
         && audit142.allRemoved.findings.length === browserGatesE136.length
         && audit142.allRemoved.disappeared.length === browserGatesE136.length
-        && browserGatesE136.every(nm => audit142.allRemoved.findings.some(f => f.includes(nm))),
+        && browserGatesE136.every(nm => audit142.allRemoved.findings.some(f => f.includes(nm)))
+        /* `E155` 的四支合成读数 */
+        && trail155.held.findings.length === 0 && trail155.held.viaTrail.includes(targetE136)
+        && trail155.held.noTrail.length === browserGatesE136.length - 1
+        && trail155.drifted.findings.length === 1 && trail155.drifted.findings[0].includes(targetE136)
+        && trail155.drifted.findings[0].includes('声明漂移')
+        && trail155.noTrail.findings.length === 0 && trail155.noTrail.noTrail.length === browserGatesE136.length
+        && trail155.ledgerWins.guardedByLedger.length === browserGatesE136.length,
       `合成基线：失配 ${synthBaseE136.findings.length} 条／已核对 ${synthBaseE136.covered.length}（应 0／${browserGatesE136.length}）；` +
       `合成变异（33 ⇒ 99）：失配 ${synthMutE136.findings.length} 条 ⇒ ${synthMutE136.findings.join('；') || '（无，异常）'}；` +
       `合成置空：已核对 ${synthHideE136.covered.length}／不可比 ${synthHideE136.unmet.length}（总数 ${browserGatesE136.length} 不变）、` +
@@ -1515,10 +1629,19 @@ function main() {
       `【\`E142\` 三支】**上轮跑过/这轮消失**：失配 ${audit142.removed.findings.length} 条 ⇒ ${audit142.removed.findings.join('；') || '（无，异常）'}；` +
       `**从来自述没跑过**：失配 ${audit142.neverPlanned.findings.length} 条（应 0）／不可比 ${audit142.neverPlanned.unmet.length}；` +
       `**三条全删**：失配 ${audit142.allRemoved.findings.length} 条（应 ${browserGatesE136.length}）；` +
+      `【\`E155\` 四支】㈠留痕 33 vs 声明 33（账本无它）⇒ 失配 ${trail155.held.findings.length} 条（应 0）、由留痕守住 ${trail155.held.viaTrail.length} 个；` +
+      `㈡留痕 33 vs 声明 **34** ⇒ 失配 ${trail155.drifted.findings.length} 条 ⇒ ${trail155.drifted.findings.join('；') || '（无，异常）'}；` +
+      `㈢无留痕 ⇒ 失配 ${trail155.noTrail.findings.length} 条（应 0）、**显式不可比** ${trail155.noTrail.noTrail.length} 个；` +
+      `㈣账本有它 ⇒ 交回 \`E136\` 逐值守 ${trail155.ledgerWins.guardedByLedger.length} 个；` +
       `【真实账本读数（只留痕、不判红）】基线失配 ${brAudit.findings.length} 条（正常 = 0，由上面那条主断言判）；` +
       `内存改「${targetE136} 的 passed ⇒ ${(baseE136 ? baseE136.passed : 0) + 66}」后失配 ${mutAuditE136.findings.length} 条、` +
       `置空后已核对 ${hideAuditE136.covered.length}／不可比 ${hideAuditE136.unmet.length}；` +
       `盘上账本 sha256=${diskLedgerShaE136}…（D22 的变异只作用于内存访问器，不落盘）`);
+    t.info(`\`E155\` D22 合成读数：㈠账本无它＋留痕 33 vs 声明 33 ⇒ 失配 ${trail155.held.findings.length}／留痕守住 ${trail155.held.viaTrail.length}`
+      + `（${trail155.held.viaTrail.join('、') || '无'}）；㈡留痕 33 vs 声明 34 ⇒ 失配 ${trail155.drifted.findings.length}`
+      + `（${trail155.drifted.findings[0] ? trail155.drifted.findings[0].slice(0, 200) + '…' : '（无）'}）；`
+      + `㈢无留痕 ⇒ 显式不可比 ${trail155.noTrail.noTrail.length} 个（失配 ${trail155.noTrail.findings.length}）；`
+      + `㈣账本有它 ⇒ 交回 E136（${trail155.ledgerWins.guardedByLedger.length} 个）`);
   }
 
   /* ---- 自指排除的如实交代：docs-cross-check 自身的声明值不在本节比对范围内 ---- */
@@ -1697,10 +1820,17 @@ function main() {
      *     "**本轮不可比**"＋原因，**绝不出现"≠ 真源"话术**。
      *
      * **§16 里还有没有别的取数路径会回落滞后账本**（要求：自己 grep 一遍 `actualOf(`／账本读取点，
-     * 逐处判定并写进注释）——本座位逐处核过，结论如下（§16 共 3 处取数）：
-     *   ① `scriptTruth16()`（原 `:1532`）＝ 家庭 ③b／③c 的真源 ⇒ **已接前提**（本件）；
-     *   ② `sumMissing16`（原 `:1533`）⇒ **已接前提**（用的就是 ①）；
-     *   ③ `sumTruth16`（原 `:1534`）＝ 家庭 ④ 的真源 ⇒ **已接前提**（本件）。
+     * 逐处判定并写进注释）——**`E152`（2026-10-04，据 `C·23` 第 1 组）把上一版的结论更正如下**：
+     * 上一版写的是"§16 共 3 处取数，②③ 都**已接前提** ⇒ **没有第二处**未接前提的账本回落"，
+     * **那句话不成立**：`E141` 只把前提加在**使用点**，而 `sumMissing16`（原 `:1533`）／`sumTruth16`
+     * （原 `:1534`）的**定义**仍走 `actualOf()` ⇒ **定义了**一个"回落滞后账本"的值（只是当时没人绕过守卫用它）。
+     * `repair16()`（D22 基线"按真源更正"那一步）**就是**那个绕过者（本批实测：超时轮里基线被改成 **1483**、
+     * 真值 **1490**）⇒ 完整结论是：
+     *   ① `scriptTruth16()`＝ 家庭 ③b／③c 的真源 ⇒ **定义层已接前提** ✓；
+     *   ② `sumMissing16`／③ `sumTruth16` ⇒ **本件改成定义层接前提**（`sumEval16`，见下）；
+     *   ④ `repair16()` 的和值更正口 ⇒ **本件补前提**（前提不成立 ⇒ **一个字都不改**，并如实报"跳过"）；
+     *   ⑤ `audit16()` 的 `!sumTruthReady16` 守卫（使用点）⇒ **保留**：**定义层 ＋ 使用点两层都要有** ——
+     *      定义层保证"漏不掉"（错值根本不会生成）、使用点保证"报的话对"（报"本轮不可比"而不是"文档漂移"）。
      *   其余"数字"要么来自**文件系统**（`compCount16`＝`src\components\*.js` 文件数、`jsTop16`＝
      *   `tests\*.js` 顶层数、`offlineCount16`＝`SUITES` 过滤结果）—— 它们**不经账本、不受探针影响**；
      *   要么来自 `declaredOf()`（**声明侧**，不是真源）。⇒ §16 **没有第二处**未接前提的账本回落。
@@ -1724,15 +1854,42 @@ function main() {
       }
       return { value: actualOf(name), data: true, reason: '' };
     };
-    /** 家庭 ④ 的**可比性**：和值＝Σ(非自指门禁实跑值) ＋ 自指声明 ⇒ 任一非自指门禁不可比，和值也不可比 */
-    const sumProbeFailed16 = offlineGates.filter(n => n !== SELF_REF && Boolean(probeFailed[n]));
-    const sumTruthReady16 = sumProbeFailed16.length === 0;
+    /** 家庭 ④ 的**可比性**：和值＝Σ(非自指门禁实跑值) ＋ 权威区对自指脚本的声明 ⇒ **任一项取不到 ⇒ 和值不可比**。
+     *  ⚠ **`E152`（2026-10-04，据 `C·23` 第 1 组）：前提必须接在"定义层"，不能只接在"使用点"。**
+     *  为什么（本件要求写进注释并在回执复述）：`E141` 只把前提加在**使用点**（下面 `audit16()` 里的
+     *  `!sumTruthReady16` 守卫），而 `sumMissing16`／`sumTruth16` 的**定义**仍走 `actualOf()` ——
+     *  `actualOf()` 在探针失败/取不到汇总行时**回落滞后账本** ⇒ **任何绕过使用点守卫的读者**拿到的都是
+     *  "**账本拼出来的假和值**"（它看起来跟真值一模一样，没有任何标记）。本批实测到的那一处正是这样生效的：
+     *  `repair16()`（D22 基线"按真源更正"那一步）**没有前提判断** ⇒ 同一次 1 ms 超时轮里 **D22 基线被改成
+     *  1483**（＝滞后账本的和值；真值 **1490**），并让 `§16 D22` 变红、文案把读者引向"D22 定点变异／基线失配"。
+     *  ⇒ **只在使用点加闸 = 给每一个未来的读者留一条"必须记得加闸"的义务**；把前提做进**定义**
+     *  （返回值自带"前提是否成立"）才是"漏不掉"的形态 —— 本件据此把 `sumMissing16`／`sumTruth16`
+     *  改成 `sumEval16` 的**派生值**：`data=false` 时 `value` 是 `undefined`（**不是**一个恰好等于
+     *  滞后账本的数字），于是"忘了判前提"的读者会拿到 `undefined`，**当场显形**而不是悄悄算错。
+     *  @returns {{value:(number|undefined), data:boolean, missing:string[], reason:string}}
+     *           `data=true` ⇒ 和值可用；`data=false` ⇒ **本轮不可比**（`missing` 逐个列名、`reason` 可读） */
+    const sumEval16 = (() => {
+      const missing = offlineGates.filter(n => n !== SELF_REF && truthReason16(n).data === false);
+      const selfDecl = declaredOf(SELF_REF);
+      const selfOk = selfDecl !== null;
+      const data = missing.length === 0 && selfOk;
+      return {
+        value: data
+          ? offlineGates.filter(n => n !== SELF_REF).reduce((a, n) => a + truthReason16(n).value, 0) + selfDecl
+          : undefined,
+        data,
+        missing,
+        reason: data ? ''
+          : (missing.length
+            ? `和值真源里这些脚本本轮取不到实跑值（探针超时／无账本条目）：${missing.join('、')}`
+            : `自指脚本 \`${SELF_REF}\` 的权威区声明解析不到`)
+      };
+    })();
+    const sumTruthReady16 = sumEval16.data;
+    const sumMissing16 = sumEval16.missing;   /* **定义层**就带前提：取不到的项逐个列名（不再只在使用点判） */
+    const sumTruth16 = sumEval16.value;       /* `undefined` ⇒ 本轮不可比：读者必须显式处理（见 `E152`） */
     /** `<脚本名>`（N 项）族的期望值：实跑通过数（与第十一节同源）；自指脚本 ⇒ 权威区声明。 */
     const scriptTruth16 = (name) => truthReason16(name).value;
-    const sumMissing16 = offlineGates.filter(n => n !== SELF_REF && actualOf(n) === undefined);
-    const sumTruth16 = offlineGates.filter(n => n !== SELF_REF)
-      .reduce((a, n) => a + (actualOf(n) === undefined ? 0 : actualOf(n)), 0)
-      + (declaredOf(SELF_REF) === null ? 0 : declaredOf(SELF_REF));
 
     /* —— 范围与形态表（**唯一**的命中口径；改口径必须同步这段注释） —— */
     /** dated 历史记录的排除口径（三条，取并集；都是"按小节/行前缀/显式锚点限定"，不按数字大小猜）：
@@ -1799,9 +1956,10 @@ function main() {
                 if (n2 !== offlineCount16) {
                   findings.push({ key, msg: `${where} ${fam.id}："${raw}" 的"${n2} 个"≠ 离线门禁实数 ${offlineCount16}` });
                 } else if (!sumTruthReady16) {
-                  /* `E141`：和值的真源依赖"每个非自指门禁的实跑值都在" ⇒ 有探针失败即**不可比** */
+                  /* `E141`＋`E152`：和值的真源依赖"每个非自指门禁的实跑值都在" ⇒ 任一项取不到即**不可比**
+                     （`sumEval16.missing` 是**定义层**给出的逐个列名结果，不再只在使用点重算一遍）。 */
                   findings.push({ key, incomparable: true, msg: `${where} ${fam.id}："${raw}" **本轮不可比**`
-                    + `（和值真源里的 ${sumProbeFailed16.length} 个脚本取不到实跑值：${sumProbeFailed16.join('、')}）` });
+                    + `（${sumEval16.reason}）` });
                 } else if (got !== sumTruth16) {
                   findings.push({ key, msg: `${where} ${fam.id}："${raw}" 写 ${got} ≠ 真源 ${sumTruth16}` +
                     `（＝离线门禁实数中的 ${n2 - 1} 个**非自指**脚本实跑值之和 ＋ 权威区对自指脚本 \`${SELF_REF}\` 的声明）` });
@@ -1824,7 +1982,8 @@ function main() {
       `${A16.checked} 处命中｜${famCounts16}｜范围：${SRC16.map(s => `${s.file}（${s.rows.length} 行）`).join('、')}` +
       `｜dated 历史记录**已排除** ${archExcluded16} 行（口径：日期行前缀 ／ 变更记录小节之后 ／ dated 引文标记）` +
       (A16.lost.length ? `｜**锚点丢失**：${A16.lost.join('；')}` : '') +
-      `｜真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／和值 ${sumTruth16}` +
+      `｜真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／和值 `
+      + (sumTruthReady16 ? sumTruth16 : `（**本轮不可比**：${sumEval16.reason}）`) +
       (sumMissing16.length ? `（**和的取数不完整**：${sumMissing16.join('、')} 无实跑值）` : ''));
 
     const badNum16 = A16.findings.filter(f => f.key !== 'sum' && !f.incomparable);
@@ -1871,29 +2030,50 @@ function main() {
     const readmeFile16 = path.join(ROOT, 'tests', 'README.md');
     const archSha0 = sha16(fs.readFileSync(archFile16, 'utf8'));
     const readmeSha0 = sha16(fs.readFileSync(readmeFile16, 'utf8'));
-    /** 把**每一处**被识别到的引数按真源就地改写（只作用于传入的字符串副本） */
-    const repair16 = (srcs) => srcs.map(src => ({
-      ...src,
-      rows: src.rows.map(row => {
-        let text = row.text;
-        for (const key of src.fams) {
-          const fam = FAM16[key];
-          let out = ''; let last = 0; let m;
-          fam.re.lastIndex = 0;
-          while ((m = fam.re.exec(text)) !== null) {
-            let rep = m[0];
-            if (fam.kind === 'count') rep = rep.replace(/\d+/, String(fam.truth()));
-            else if (fam.kind === 'script') {
-              const exp = scriptTruth16(m[1]);
-              if (exp !== undefined && exp !== null) rep = rep.replace(/(\d+)(\s*项)/, exp + '$2');
-            } else if (Number(m[1]) === offlineCount16) rep = rep.replace(/(的和是\s*\*{0,2}\s*)\d+/, '$1' + sumTruth16);
-            out += text.slice(last, m.index) + rep; last = m.index + m[0].length;
+    /** 把**每一处**被识别到的引数按真源就地改写（只作用于传入的字符串副本）。
+     *  **`E152`（2026-10-04）：前提不成立时，和值族一个字都不许改。** 立案实测：旧写法在这一步
+     *  **没有前提判断** ⇒ `DSH_DC_PROBE_TIMEOUT_MS=1` 那一轮把 D22 基线从 **1490** 改成 **1483**
+     *  （＝滞后账本的和值）⇒ 基线随环境漂，且 `§16 D22` 变红、文案指向"D22 定点变异／基线失配"。
+     *  修法＝在每个"按真源更正"的入口**逐族判前提**（`sum` 族要求 `sumEval16.data === true` —— 与主断言
+     *  **同一个** `sumEval16`；`script` 族要求该脚本 `truthReason16(name).data === true`；`count` 族的真源
+     *  来自**文件系统**、不经账本 ⇒ 前提恒成立、照改）。**拒绝更正时如实报"跳过"**（不静默）。
+     *  @returns {{srcs:Array, skipped:Array<string>, sumRowsBefore:string, sumRowsAfter:string}} */
+    const repair16 = (srcs) => {
+      const skipped = [];
+      const repaired = srcs.map(src => ({
+        ...src,
+        rows: src.rows.map(row => {
+          let text = row.text;
+          for (const key of src.fams) {
+            const fam = FAM16[key];
+            let out = ''; let last = 0; let m;
+            fam.re.lastIndex = 0;
+            while ((m = fam.re.exec(text)) !== null) {
+              let rep = m[0];
+              if (fam.kind === 'count') rep = rep.replace(/\d+/, String(fam.truth()));
+              else if (fam.kind === 'script') {
+                const exp = scriptTruth16(m[1]);
+                if (exp !== undefined && exp !== null) rep = rep.replace(/(\d+)(\s*项)/, exp + '$2');
+                else skipped.push(`${key}（\`${m[1]}\` 本轮不可比 ⇒ **拒绝按真源更正**）`);
+              } else if (Number(m[1]) === offlineCount16) {
+                if (!sumEval16.data) {
+                  /* ← `E152`：**前提不成立 ⇒ 不改基线**（旧写法在这里会写进滞后账本的和值） */
+                  skipped.push(`${key}（和值本轮不可比 ⇒ **拒绝按真源更正**：${sumEval16.reason}）`);
+                } else {
+                  rep = rep.replace(/(的和是\s*\*{0,2}\s*)\d+/, '$1' + sumTruth16);
+                }
+              }
+              out += text.slice(last, m.index) + rep; last = m.index + m[0].length;
+            }
+            text = out + text.slice(last);
           }
-          text = out + text.slice(last);
-        }
-        return { ...row, text };
-      })
-    }));
+          return { ...row, text };
+        })
+      }));
+      /* "基线有没有被改"的读数：只取**和值族所在的行**（这一族是 `E152` 的主角） */
+      const sumRowsOf16 = (list) => list.flatMap(s => (s.fams.includes('sum') ? s.rows.map(r => r.text) : [])).join('\n');
+      return { srcs: repaired, skipped, sumRowsBefore: sumRowsOf16(srcs), sumRowsAfter: sumRowsOf16(repaired) };
+    };
     /** 把**第一个**命中该族的引数的**最后一个数字** +1（＝"改错一处"的最小形态） */
     const bump16 = (srcs, key) => {
       const fam = FAM16[key];
@@ -1909,24 +2089,60 @@ function main() {
       }
       return null;
     };
-    const base16 = repair16(SRC16);
+    const base16R = repair16(SRC16);
+    const base16 = base16R.srcs;
     const A16base = audit16(base16);
+    /* `E152`：**基线里"不可比"的项单列一桶**（`E141` 的 `incomparable` 标记）——
+       它们**既不算失配、也不算通过**（"通过"由 §16 的前两条断言在**前提成立**时给出）。
+       ⚠ 为什么必须排除，而不是把主断言放宽：不排除时"超时轮"会让本条 D22 **必红**
+       （`C·23` 实测：`基线失配 3 处` ⇒ 文案把读者引向"D22 定点变异／基线失配"，而四个变异体全打 `true`）。
+       排除之后"取不到"仍**不许静默放过**：它由上面那条 `E141 §16 与 §11 同口径` 断言**判红并指名**
+       （报的话是"**本轮不可比**"）⇒ 两条各司其职：**一条管"不可比要有人说"，一条管"可比时必须可证伪"**。 */
+    const baseIncomp16 = A16base.findings.filter(f => f.incomparable);
+    const baseBad16 = A16base.findings.filter(f => !f.incomparable);
+    /* `E152` 的**"改动前"读数**（只作留痕，不参与判据）：把**旧定义**（照抄：`actualOf()` 直接求和、
+       无前提 —— 探针失败时它会静默回落到**滞后账本**）算一遍 ⇒ 看它在**同一轮**会给出什么数。
+       本批实测：`DSH_DC_PROBE_TIMEOUT_MS=1` ＋ 账本 `harness-check 413→406` 时它给 **1483**，
+       而真值 **1490** ⇒ 旧写法会把 D22 基线写成 1483。 */
+    const laggedSumOld16 = offlineGates.filter(n => n !== SELF_REF)
+      .reduce((a, n) => a + (actualOf(n) === undefined ? 0 : actualOf(n)), 0)
+      + (declaredOf(SELF_REF) === null ? 0 : declaredOf(SELF_REF));
+    /* "基线（和值族）有没有被改"：前提成立 ⇒ 基线里和值＝真源；前提不成立 ⇒ **逐字未改**
+       （⚠ 这一条**就是 `E152` 的可证伪点**：把 `repair16()` 里那层前提闸去掉，超时轮就会把 1483 写进基线
+       ⇒ `sumBaselineUntouched16` 变 false ⇒ 本条 D22 **必红**） */
+    const sumBaselineUntouched16 = base16R.sumRowsBefore === base16R.sumRowsAfter;
+    const sumRepairHeld16 = sumEval16.data
+      ? base16R.sumRowsAfter.includes(String(sumTruth16))
+      : sumBaselineUntouched16;
     const mutants = ['comp', 'gates', 'scriptC', 'sum'].map(k => ({ k, m: bump16(base16, k) }))
       .map(x => ({ ...x, a: x.m ? audit16(x.m.srcs) : null }));
     const directed = mutants.every(x => x.m && x.a
       && x.a.findings.some(f => f.key === x.k && f.msg.startsWith(x.m.where)));
     t.check('E112 §16 D22 定点变异（**内存文本变异**，同一次变异改坏四个族各一处）：' +
       '①「N 个组件」改错、②「N 个（离线）门禁」改错、③一处「`<脚本>`（N 项）」改错、④「N 个的和是 M」改错 ⇒ ' +
-      '四条判据必须各自**红并逐处指名 `文件:行号`**；按真源更正后的基线必绿；盘上两个文件逐字节未变',
-      A16base.findings.length === 0 && A16base.lost.length === 0 && directed
+      '四条判据必须各自**红并逐处指名 `文件:行号`**；按真源更正后的基线必绿（**`E152`：`incomparable` 项单列一桶、不算失配**，' +
+      '它们由 §16 的"本轮不可比"那条断言判红）；**前提不成立时和值族一个字都不许改**（基线不被污染）；盘上两个文件逐字节未变',
+      baseBad16.length === 0 && A16base.lost.length === 0 && directed
+        && sumRepairHeld16
         && sha16(fs.readFileSync(archFile16, 'utf8')) === archSha0
         && sha16(fs.readFileSync(readmeFile16, 'utf8')) === readmeSha0,
-      `基线失配 ${A16base.findings.length} 处（锚点丢失 ${A16base.lost.length} 处）；` +
+      `基线失配 ${baseBad16.length} 处（**应 0**）、另有**本轮不可比** ${baseIncomp16.length} 处（单列，不计入失配；锚点丢失 ${A16base.lost.length} 处）；` +
+      `和值族基线：前提${sumEval16.data ? '**成立**（已按真源更正 ⇒ 基线和值 ' + sumTruth16 + '）' : '**不成立**（拒绝更正 ⇒ 和值行逐字未改=' + sumBaselineUntouched16 + '、旧定义照抄会给 ' + laggedSumOld16 + '）'}` +
+      `${base16R.skipped.length ? '；**拒绝更正的族**：' + [...new Set(base16R.skipped)].join('；') : ''}；` +
       mutants.map(x => x.m
         ? `${FAM16[x.k].id}：变异 ${x.m.where} 的「${x.m.from}」⇒ 命中该族且指名该行=${Boolean(x.a && x.a.findings.some(f => f.key === x.k && f.msg.startsWith(x.m.where)))}`
         : `${FAM16[x.k].id}：**锚点未命中，无法变异**`).join('；') +
       `｜盘上未变 arch=${sha16(fs.readFileSync(archFile16, 'utf8')) === archSha0}` +
       ` readme=${sha16(fs.readFileSync(readmeFile16, 'utf8')) === readmeSha0}`);
+    /* `E152` 的读数**每轮可见**（`PASS` 详情不打印 ⇒ 用 `t.info` 留痕；这是丙/乙两件回执的原始读数）。 */
+    t.info(`\`E152\` 读数（§16 D22 基线）：和值前提 ${sumEval16.data ? '**成立**' : '**不成立**'}`
+      + `${sumEval16.data ? '' : `（${sumEval16.reason}）`}；`
+      + `按真源更正后的基线和值＝${sumEval16.data ? sumTruth16 : '（未更正）'}；`
+      + `**旧定义照抄**（` + '`actualOf()` 直接求和、无前提' + `）在同一轮会给出＝${laggedSumOld16}` +
+      `${sumEval16.data ? '' : '（**这就是改动前会写进基线的那个数** ⇒ 基线随环境漂）'}；`
+      + `和值族行 sha 前后相同=${sumBaselineUntouched16}；`
+      + `拒绝更正的族＝${base16R.skipped.length ? [...new Set(base16R.skipped)].join('；') : '（无）'}；`
+      + `基线失配 ${baseBad16.length} 处／本轮不可比 ${baseIncomp16.length} 处`);
     if (badNum16.length || badSum16.length) {
       t.info('§16 的失配**逐处**照录（`E118`：失败明细一律留全）：\n      ' +
         [...badNum16, ...badSum16].map(f => f.msg).join('\n      '));

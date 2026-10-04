@@ -3096,8 +3096,7 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     };
     const sswTmp = env.ensureDir(path.join(env.paths.tempRoot, 'e148-upsert-' + process.pid));
     let sswOut = null;
-    try {
-      /* ⚠ `openDb()` 返回的是**包装对象** `{db, path, journalMode}`（不是句柄本身）⇒ 仓储要的是 `.db`。
+    try {      /* ⚠ `openDb()` 返回的是**包装对象** `{db, path, journalMode}`（不是句柄本身）⇒ 仓储要的是 `.db`。
          本座位第一版直接把它当句柄传 ⇒ `upsertFrozen` 报"需要已打开的库句柄"（实测踩过，写在这里）。 */
       const dbApi = require(path.join(env.paths.root, 'server', 'db'));
       const sswDb = dbApi.openDb(path.join(sswTmp, 'board.db')).db;
@@ -3124,6 +3123,8 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
       const sswAnchor = 'const input = row && typeof row === \'object\' ? row : {};';
       const sswMutOk = sswSrc0.includes(sswAnchor);
       let mutThrew = null; let mutRet = null;
+      let mutCleanRet = null; let mutRowSame = null; let mutAllSame = null;
+      let mutLeaked = null; let mutCleanUpdatedOk = null;
       if (sswMutOk) {
         const mutSrc = sswSrc0.replace(sswAnchor,
           sswAnchor + '\n  { const KNOWN = ["shiftDate","shiftName","planQty","startedQty","finishedQty","qualifiedQty",'
@@ -3133,15 +3134,27 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
         const mutRepo = sswLoadVariant(mutSrc, 'e148-reject');
         const mutDb = dbApi.openDb(path.join(sswTmp, 'board-mut.db')).db;
         dbApi.initSchema(mutDb);
-        mutRepo.upsertFrozen(mutDb, Object.assign({}, sswBase));           /* 干净行：变异体也必须能写 */
+        /* `E153`：**把变异体的库侧读数也实测出来**（而不是"假定它除了抛错之外都干净"）——
+           干净行照写（`mutCleanRet.updated === false`）、带未知键那次抛错后**该行/全表一个字都没变**、
+           未知键没泄漏。这三条由 D22 的读数直接引用。 */
+        mutCleanRet = mutRepo.upsertFrozen(mutDb, Object.assign({}, sswBase));
+        const mutRowAfterClean = sswRowText(mutDb, sswBase.shiftDate, sswBase.shiftName);
+        const mutAllAfterClean = sswAllText(mutDb);
         mutRet = true;
         try { mutRepo.upsertFrozen(mutDb, dirtyRow); } catch (e) { mutThrew = String(e && e.message); }
+        const mutRowAfterDirty = sswRowText(mutDb, sswBase.shiftDate, sswBase.shiftName);
+        const mutAllAfterDirty = sswAllText(mutDb);
+        mutRowSame = mutRowAfterClean === mutRowAfterDirty;
+        mutAllSame = mutAllAfterClean === mutAllAfterDirty;
+        mutLeaked = /zzUnknownFlag|splitDegradedReason|unknownNumeric|degraded/.test(mutAllAfterDirty);
+        mutCleanUpdatedOk = Boolean(mutCleanRet) && mutCleanRet.updated === false;
         try { mutDb.close(); } catch { /* 忽略 */ }
       }
       const diskSameSsw = sswSha12(fs.readFileSync(SSW_FILE)) === sswSha0;
       try { sswDb.close(); } catch { /* 忽略 */ }
       sswOut = {
         cleanRet, dirtyRet, dirtyThrew, mutThrew, mutRet, sswMutOk, diskSameSsw,
+        mutCleanUpdatedOk, mutRowSame, mutAllSame, mutLeaked,
         /* ⚠ 只比"与未知键无关"的键：`updated` 是**行是否已存在**的读数（第一次 INSERT ⇒ false、
            第二次同 (date,name) UPDATE ⇒ true），**本来就该不同** —— 把它算进去会把"正常语义"
            误判成"未知键改了返回值"（本座位第一版就这么读了，留在这里）。 */
@@ -3155,27 +3168,82 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     } catch (err) {
       sswOut = { error: String(err && err.stack ? err.stack : err) };
     }
+    /** `E148` 的**契约谓词（纯函数）**：主断言与 D22 **都喂它** ⇒ "变异后必红"是**执行出来的**、
+     *  不是靠人读谓词推出来的（`E153`，据 `C·23` 第 7 组）。
+     *  ⚠ **为什么必须共用同一个谓词**（本件要求写进注释并在回执复述）：旧写法把契约**内联**在主断言里，
+     *  而 D22 走的是**另一条**独立路径（另一份 `Module._compile` 副本 ＋ 另一个库），两者只在"同一个
+     *  `sswOut` 对象"这一层相遇 ⇒ 合取项 `dirtyThrew === null` **只在契约谓词里**（全仓 5 处全在契约侧），
+     *  D22 的谓词只读 `mutThrew` ⇒ **若有人把 `dirtyThrew === null` 从契约里删掉（`D21` 禁的动作），
+     *  两条断言都会照样绿** —— 这就是 `D19` 的"看起来验过了"。抽成纯函数后：D22 把**变异体的读数**代回
+     *  **同一个谓词**，删掉那一项 ⇒ 本条 D22 **当场红**。
+     *  @param {object|null} o 取值对象；`null` ⇒ 用例未执行
+     *  @returns {{pass:boolean, problems:string[]}} */
+    const sswContractE148 = (o) => {
+      if (!o) return { pass: false, problems: ['取值对象缺失（用例未执行）'] };
+      if (o.error) return { pass: false, problems: [`用例自身异常：${o.error}`] };
+      const problems = [];
+      if (!o.retSame) problems.push('带未知键/不带未知键的**返回值**（除 `updated` 位）不相同');
+      if (!o.updatedFlagOk) problems.push('`updated` 位不符合语义（首写 false／改写 true）');
+      if (!o.rowSame) problems.push('库内该行文本变了（未知键落库）');
+      if (!o.allSame) problems.push('全表文本变了');
+      if (o.leaked) problems.push('未知键出现在行文本里（泄漏进 SQL）');
+      if (o.dirtyThrew !== null) problems.push(`**带未知键的调用抛错**（契约要求"容忍未知键"）：${o.dirtyThrew}`);
+      return { pass: problems.length === 0, problems };
+    };
+    const sswConvE148 = sswContractE148(sswOut);            /* 主断言的判决（同一个谓词） */
     t.check('`E148` `upsertFrozen()` **容忍未知键**（显式契约）：喂同一行 ＋ 四个未知键' +
       '（`zzUnknownFlag`／`splitDegradedReason`／`degraded`／`unknownNumeric`）⇒ ' +
-      '**返回值逐键与不带未知键那次相同**、**库内该行逐字节不变**、**未知键不出现在任何行里**（不进 SQL）',
-      Boolean(sswOut) && !sswOut.error && sswOut.retSame && sswOut.updatedFlagOk && sswOut.rowSame && sswOut.allSame && !sswOut.leaked
-        && sswOut.dirtyThrew === null,
+      '**返回值逐键与不带未知键那次相同**、**库内该行逐字节不变**、**未知键不出现在任何行里**（不进 SQL）' +
+      '（判据＝纯函数 `sswContractE148()`，与 D22 **共用**）',
+      sswConvE148.pass,
       sswOut && sswOut.error ? `**用例自身异常**：${sswOut.error}`
-        : `带未知键/不带未知键的返回（**除 \`updated\` 位**）逐键相同=${sswOut.retSame}（\`${JSON.stringify(sswOut.cleanRet)}\`）；`
+        : `契约谓词（**纯函数** \`sswContractE148()\`）判决=${sswConvE148.pass}；违反项 ${sswConvE148.problems.length} 条＝`
+          + `${sswConvE148.problems.join('；') || '（无）'}；`
+          + `带未知键/不带未知键的返回（**除 \`updated\` 位**）逐键相同=${sswOut.retSame}（\`${JSON.stringify(sswOut.cleanRet)}\`）；`
           + `\`updated\` 位符合语义=${sswOut.updatedFlagOk}（首写 false／改写 true，与未知键无关）；`
           + `库内该行文本不变=${sswOut.rowSame}；全表文本不变=${sswOut.allSame}；`
           + `未知键泄漏到行文本=${sswOut.leaked}（应 false）；调用未抛错=${sswOut.dirtyThrew === null}`);
+    /* `E153`：把**变异体的读数喂回同一个谓词** —— 构造法是**单点替换**（只换契约要守的那一位
+       `dirtyThrew`），其余位沿用原件读数（原件已被上面那条判定为真）⇒ 判决的红**只可能**归因于这一项。
+       为什么可以这样构造（如实交代）：变异体的"带未知键那次"**抛了错、没有返回值** ⇒ `retSame`／
+       `updatedFlagOk` 这些"以返回值为前提"的位在变异体上**不可评**；本件另外**实测**了变异体的库侧读数
+       （`mutCleanUpdatedOk`／`mutRowSame`／`mutAllSame`／`mutLeaked`）来证明"除了这一位，其余都干净"。 */
+    const sswMutViewE148 = (sswOut && !sswOut.error)
+      ? Object.assign({}, sswOut, { dirtyThrew: sswOut.mutThrew }) : null;
+    const sswMutConvE148 = sswContractE148(sswMutViewE148);
+    const sswMutViewDiffKeysE148 = (sswOut && !sswOut.error)
+      ? Object.keys(sswOut).filter(k => k !== 'dirtyThrew'
+        && JSON.stringify(sswOut[k]) !== JSON.stringify(sswMutViewE148[k])) : ['（用例未执行）'];
     t.check('`E148` D22（可证伪）：把"容忍未知键"改成"**拒绝**未知键"（`server\\repo\\shiftStat.js` 的' +
-      '**内存字节副本**变异体：入口处对清单外的键抛 `TypeError`）⇒ 同一用例**必红并指名**（带未知键那次抛错）；' +
-      '而变异体对**干净行**照写不误（⇒ 不是"把一切都拦掉"）；盘上文件全程逐字节未变',
+      '**内存字节副本**变异体：入口处对清单外的键抛 `TypeError`）⇒ 把**变异体的读数**代回**同一个契约谓词**' +
+      '（`sswContractE148()`）**必红、且只因为 `dirtyThrew` 那一个合取项**（删掉契约里那一项 ⇒ 本条当场红）；' +
+      '而变异体对**干净行**照写不误、库侧读数全干净（⇒ 不是"把一切都拦掉"）；盘上文件全程逐字节未变',
       Boolean(sswOut) && !sswOut.error && sswOut.sswMutOk
+        && sswMutConvE148.pass === false
+        && sswMutConvE148.problems.length === 1
+        && /带未知键的调用抛错/.test(sswMutConvE148.problems[0])
+        && sswMutViewDiffKeysE148.length === 0
+        && sswMutViewE148.dirtyThrew === sswOut.mutThrew
         && sswOut.mutThrew !== null && /拒绝未知键/.test(String(sswOut.mutThrew))
-        && sswOut.mutRet === true && sswOut.diskSameSsw,
+        && sswOut.mutRet === true && sswOut.mutCleanUpdatedOk === true
+        && sswOut.mutRowSame === true && sswOut.mutAllSame === true && sswOut.mutLeaked === false
+        && sswOut.diskSameSsw,
       sswOut && sswOut.error ? `**用例自身异常**：${sswOut.error}`
         : `变异锚点命中=${sswOut.sswMutOk}；变异体带未知键 ⇒ ${sswOut.mutThrew === null ? '**没抛错（异常）**' : `抛「${sswOut.mutThrew}」`}；`
-          + `变异体干净行写入成功=${sswOut.mutRet === true}；盘上文件未变=${sswOut.diskSameSsw}`);
+          + `**喂回同一谓词** ⇒ 判决=${sswMutConvE148.pass}（应 **false ＝必红**）、违反项 ${sswMutConvE148.problems.length} 条＝`
+          + `${sswMutConvE148.problems.join('；') || '（无）'}；`
+          + `变异体读数与原件**差异键**＝[${sswMutViewDiffKeysE148.join('、') || '（无）'}]`
+          + `（**只有 \`dirtyThrew\` 这一位** ⇒ 若把契约里那一项删掉，判决就会变 true、本条当场红）；`
+          + `变异体干净行写入成功=${sswOut.mutRet === true}（\`updated\` 位符语义=${sswOut.mutCleanUpdatedOk}）；`
+          + `变异体库侧：该行未变=${sswOut.mutRowSame}、全表未变=${sswOut.mutAllSame}、未泄漏=${sswOut.mutLeaked === false}；`
+          + `盘上文件未变=${sswOut.diskSameSsw}`);
     /* 收尾（**必须做**）：本用例建在 `env.paths.tempRoot` 下 ⇒ 不删干净会污染后面的 E90 临时区清理断言
        （本座位第一版实测：`E90②/④` 与 `cleanup(true)` 三条因此判红）。走 `env.removeLinkSafe()`（E46 纪律）。 */
+    t.info(`\`E148\`／\`E153\` 读数（**同一个纯函数** \`sswContractE148()\` 的两侧判决）：`
+      + `原件 ⇒ ${sswConvE148.pass}（违反项 ${sswConvE148.problems.length} 条：${sswConvE148.problems.join('；') || '（无）'}）；`
+      + `变异体读数代回同一谓词 ⇒ ${sswMutConvE148.pass}（违反项 ${sswMutConvE148.problems.length} 条：${sswMutConvE148.problems.join('；') || '（无）'}）；`
+      + `两者差异键＝[${sswMutViewDiffKeysE148.join('、') || '（无）'}]（**只有 \`dirtyThrew\`** ⇒ 删掉契约里那一项，D22 就会变绿为红不成立）；`
+      + `\`dirtyThrew\` 侧的合取项在**全仓只此一处**（旧写法下 D22 的谓词一次都没读它 ⇒ \`D19\` 的"看起来验过了"）。`);
     try { env.removeLinkSafe(sswTmp, { recursive: true, force: true }); } catch { /* 收尾失败不影响判据读数 */ }
   }
 
@@ -9380,6 +9448,13 @@ t.finish();
       裸递归删 **42** 条＝`E46` 取证实物 11 ＋ 旧版本字节副本 31（**一次性探针 64 已全部改走
       `env.removeLinkSafe()`** ⇒ 该族归零，见 `E140`）；迁移**之前**的普查基线是 **106** 条
       ＝ 11 ＋ 31 ＋ 64（`T-20261004-14` 甲组）。外部工具调用形态 **13** 条＝`E46` 真调用 3 ＋ 词形撞车 10。
+      ⚠ **`E151`（2026-10-04）更正这条普查的一个盲区**：旧判据**先查守护、后查在册** ⇒ 凡"文件里有同 id 的
+      `lstatSync`/`isLink`"的 `(文件,id)` **整条**被豁免 ⇒ 它们**连普查都看不见**（上列的 106／42 都**不含**它们）。
+      实测：`._verify\` 面另有 **5 条**这类 `(文件,id)`（`e46\probe-danger.js:link`（3 处）、`probe-raw.js:link`、
+      `probe-raw2.js:dirlink`、`probe-twoside.js:link`、`review\s5t20-junction.js:link`）、受管面另有 **2 条**
+      （`tests\env.js:target`／`p`）⇒ 本批**逐条登记**（清单 42 → **47**＝e46 16 ＋ oldcopy 31，锚点同步更新），
+      **不把判据放宽回"未在册也豁免"**。**存量"出现次数"的现算读数**见 B⑥ 的 `E156` 口径行
+      （口径写在那里：数的是什么、在哪个面、什么时刻）。
       **两处数口径不同、必须写清**（`C·22` 靶子① 的提醒）：`A⑥` 打印的"**原始命中行**"数的是**行**，
       而"已登记 **13** 条"数的是 `(文件,形态)` **去重后的登记条目** ⇒ 同一 `(文件,形态)` 出现多行时，
       行数会**大于**条目数（实测差 5 行，全是**同一批文件里的重复行**），**不是"有 5 条没登记"**。
@@ -9491,9 +9566,17 @@ function e103LinkSafetyChecks(t) {
   /** 判据（纯函数，供 B③ 的 D22 复用）：剥字面量后，逐 `(文件, 标识符)` 数"裸递归删"的**出现次数**，
    *  与清单的 `max` 比对。`max` 缺省 = 1（**不隐式放宽**）。
    *  ⚠ "有没有守护"的**判别式子**（`guardedReE144`）抽出来共用：B③／B⑦／B⑧／E144 的 D22 与判据本体
-   *    必须是**同一把尺子**。这条式子的结尾必须是 `[,)]`（不能只写 `\b`）：`\b` 会让
-   *    `lstatSync(p).isSymbolicLink()` 这种**不是守护**的写法也命中（`\b` 在 `p` 后成立）——
-   *    本座位第一版 D22 就是被这一点骗过（新旧两支都判绿，读数看起来"一致"）。
+   *    必须是**同一把尺子**。这条式子的结尾必须是 `[,)]`（不能只写 `\b`）：`\b` **旧式子的**结尾会在
+   *    `p.foo`／`p && x` 的 `p` 后同样成立 ⇒ 把 `lstatSync(p.foo)`／`lstatSync(p && x)` 这类"提了一句、
+   *    **并没有拿 `p` 的判别结果去控制删/不删**"的写法也算成守护 ⇒ 本座位第一版 D22 就是被这一点骗过
+   *    （新旧两支都判绿，读数看起来"一致"）。
+   *  ⚠ **`E158`（2026-10-04，据 `C·23` 第 4 组）：本段上一版把反例举错了** —— 它写的是
+   *    "`lstatSync(p).isSymbolicLink()` 这种**不是守护**的写法也会命中"，而**新式子对它照样命中**
+   *    （`p` 后紧跟 `)` 正是 `[,)]` 允许的形态；复核方实测样本 G：该形态 ＋ 同 id 裸删 ⇒ 新判据命中
+   *    **0** 条＝被判"有守护"）。**该形态其实**算守护****（`lstatSync` 是**不跟随链接**的判别，与
+   *    `isLink()` 同类）⇒ 反例换成**真正被新式子排除**的两种：`lstatSync(p.foo)`／`lstatSync(p && x)`。
+   *    **判据强度本身没问题，坏的是这段注释给人的反例**（`D19` 家族：说错了比没有更坏 —— 后来者会
+   *    照着错的反例去推判据的强度）。
    *  @param {string} source 该文件源码
    *  @param {Array<{id:string,max:number}>} entries 该文件在清单里登记的条目（可含多条）
    *  @returns {Array<{id:string,count:number,lines:number[],max:number,registered:boolean}>} 违规清单（空＝合规） */
@@ -9506,7 +9589,22 @@ function e103LinkSafetyChecks(t) {
     let m;
     while ((m = re.exec(code))) {
       const id = m[1];
-      if (guardedReE144(id).test(code)) continue;  /* 这一处自带守护（同 id 的**任一**判别）⇒ 不是"裸"删 */
+      /* `E151`（2026-10-04，主代理裁定㈠）：**守护豁免只发给"在册的 `(文件,id)`"**。
+         ── 为什么必须这样切（本件要求写进注释并在回执复述）：**"为什么"看起来有守护" ≠ "守护真的在起作用"** ——
+            旧写法的**第一句**是 `if (guardedReE144(id).test(code)) continue;`：它是**文件级**判断
+            （"这个文件里出现过该 id 的判别"），而且对**从未在册的 `(文件,id)`** 同样豁免 ⇒
+            一支**全新**探针只要写一行 `if (fs.lstatSync(t).isSymbolicLink()) { console.log('note: link'); }`
+            （**不 return、结果不参与控制流**）＋ 裸 `fs.rmSync(t,{recursive:true})` 就能过关：
+            `C·23` 第 4 组与主代理亲验都读到 `harness-check` **413/0/2 全绿、该文件名 0 次被提及**
+            ⇒ `E130` 立案时承诺的"**新增即红**"被**一行装饰性写法**绕过（`max` 的计数维度对
+            "从未在册的 `(文件,id)`"完全不起作用）。
+         裁定：**未在册 ⇒ 一律不豁免**（`max` 视作 0，出现一处即红并指名 `文件:行号`）；
+            **在册 ⇒ 仍走"文件级守护"这条既有语义**（`E149` 的**调用点级**判定留作下一个债号，
+            这里**不假装已覆盖**：在册项上一行装饰性 `isLink` 仍能豁免它 —— 见 B⑥ 注释里的边界登记）。
+         ⚠ 这**不是**"只要有这个 id 就红"的恒红式：在册且"有守护"或"≤ 各自 `max`"的照旧判绿
+            （E144 D22 的形态②③④ 与 B③ 的真守护样本各自给读数）。 */
+      const regOf = entries.find(e => e.id === id);
+      if (regOf && guardedReE144(id).test(code)) continue;  /* **在册** + 该 id 有判别 ⇒ 不按"裸"删计 */
       if (!cnt.has(id)) cnt.set(id, { count: 0, lines: [] });
       const e = cnt.get(id); e.count++; e.lines.push(lineOf(m.index));
     }
@@ -9541,14 +9639,36 @@ function e103LinkSafetyChecks(t) {
   const rmHitsE103 = (list, residueList) => list.flatMap((f) => scanRmViolations(
     readOrEmpty(f), (residueList || []).filter(r => r.file === relOfE103(f))
   ).map(h => ({ file: relOfE103(f), ...h })));
-  const rmManaged = rmHitsE103(managedJsE103);
+  const rmManagedDisk = rmHitsE103(managedJsE103);
   /** 存量清单（`文件 ＋ 标识符`；**不含行号**）：语义＝"**零新增**"：清单外的任何一处 ⇒ 红。
    *  **`E117`（2026-10-04，本座位收口）：原先那 6 处已全部改走 `env.removeLinkSafe()` ⇒ 清单清空。**
    *  为什么不"保留豁免"：留着清单就等于"这几处再退回裸 `fs.rmSync(recursive)` 也照样绿"，
    *  正是本仓反复吃亏的"看起来在守、实际守不住"（`D23`）。清空后**任一处回潮都会被 B① 当"新增"点名**，
    *  而"判据不许为了变绿而放宽"这条（`D21`／`D23`）**没有被动过**：B① 的式子一字未改，
-   *  变的只是"清单里有几条"这个**事实**（6 → 0，因为缺陷真的被修掉了）。 */
-  const RM_LEGACY_E103 = [];
+   *  变的只是"清单里有几条"这个**事实**（6 → 0，因为缺陷真的被修掉了）。
+   *
+   *  ⚠ **`E151`（2026-10-04）之后本清单不再为空：新增 1 条**（＝`tests\env.js` 的 `target`）。
+   *  **它是怎么冒出来的（如实登记，这是本批的"发现"而不是"放宽"）**：`E151` 的裁定㈠把守护豁免
+   *  从"任何 `(文件,id)`"收窄到"**只在册的** `(文件,id)`"（见 `scanRmViolations()` 的注释）⇒
+   *  这处**从未进过清单**的调用点**第一次被普查看见**（旧判据**先查守护、后查在册** ⇒ 它被
+   *  "文件里有同 id 的 `lstatSync`"整个吃掉，连 `E140` 的 106 条普查里都没有它）。
+   *  ⇒ 按裁定**在同一批里登记**（登记本身即留痕），**不把判据放宽回"未在册也豁免"**；
+   *  同时 `rmManaged` 改成**把本清单喂进判据**（在册 ⇒ 按各自 `max` 判；未在册 ⇒ 一律不豁免）
+   *  —— 这一步是 `E144` 抬头早就写着、而真扫里一直没有的那一维（`D19`：措辞强于判据）。
+   *  ⚠ **`target` 是"真守护"**（也是受管面**唯一**的登记）：`removeLinkSafe()` 内部
+   *  `st = fs.lstatSync(target)` 之后才分支，链接那一支**先 return** ⇒ 走到
+   *  `fs.rmSync(target, {recursive:true})` 时已证明"不是链接" ⇒ 判据口径＝"**零未守护裸递归删**"。
+   *  ⚠ **同日撤掉的那一条（主代理裁定㈡，留痕）**：`tests\env.js` 的 **`p`** 曾是第 2 条 ——
+   *  它是 `makeRealSweepIo().removeDir` 这个**接缝**，安全性原先**只靠调用方**（`cleanupStaleTemp()`
+   *  先 `fsi.isLink(full)`），而文件里 `isLink: p => isLink(p)` 是**转发定义、不是判定**
+   *  （文件级正则的**误命中**）⇒ 登记它等于"**文件级命中一次 ⇒ 该 id 的裸删永久豁免、`max` 不生效**"，
+   *  正是 `E151` 要消灭的形态。⇒ 已把该接缝改成走 **`removeLinkSafe`**（`tests\env.js`，主代理批准；
+   *  对非链接**逐字等价**、对链接**只拆链不跟随**）⇒ **撤掉这条登记**，受管面回到"零未守护"。
+   *  两条都**不是**"为了变绿而放宽"：判据式子一字未改，且"未在册 ⇒ 不豁免"这条**比改动前更严**。 */
+  const RM_LEGACY_E103 = [
+    { file: 'tests\\env.js', id: 'target', max: 1,
+      why: '**真守护**：`removeLinkSafe()` 自己的实现（`lstatSync(target)` ⇒ 链接支先 return ⇒ 才递归删真实目录）' }
+  ];
   /** **`E117` 的已修复留档**（只作说明 ＋ 定向回归的靶子；**不参与 B① 的豁免**）：
    *  逐处给"为什么它结构上不可能是链接、以及为什么仍然改走安全删除"。
    *  这 6 处的共同点＝**删自建的一次性临时目录/文件**（`mkdtempSync`／`mkdirSync`／`makeTempDir` 刚建出来的），
@@ -9562,20 +9682,32 @@ function e103LinkSafetyChecks(t) {
     { file: 'tests\\offline-check.js', id: 'root', line0: 771, why: '夹具自建的临时包根（`输出文件` 交付包形态）的收尾' },
     { file: 'tests\\platform-check.js', id: 'logDir', line0: 273, why: '本节自建的日志目录收尾（本脚本不加载 `lib/harness.js`，故用 `env` 已导出的同名函数）' }
   ];
-  const rmNew = rmManaged.filter(h => !RM_LEGACY_E103.some(r => r.file === h.file && r.id === h.id));
-  const rmStale = RM_LEGACY_E103.filter(r => !rmManaged.some(h => h.file === r.file && h.id === r.id));
-  const ownFace = rmManaged.filter(h => h.file === 'tests\\harness-check.js' || h.file.startsWith('tests\\lib\\'));
-  t.check('E103-B① 组合判据（**零新增**）：受管面里凡 `fs.rmSync(<标识符>, … recursive:true)`，同文件必须有 `lstatSync(<同一标识符>)`／`isLink(<同一标识符>)`（或已改走 `removeLinkSafe(`）—— 存量按 `文件＋标识符` **逐条登记**，清单外的任何一处 ⇒ 红并指名',
-    rmNew.length === 0,
-    rmNew.length
-      ? `判红：**新增未防护调用点 ${rmNew.length} 处** —— ` + rmNew.map(h => `${h.file}:${h.line}（id=${h.id}）`).join('；')
+  /** **判据视图**（在册 ⇒ 按各自 `max` 判；未在册 ⇒ 一律不豁免 —— `E151` 的裁定㈠）。
+   *  ⚠ 与 `rmManagedDisk`（原样扫描、不施加任何豁免）**不是一回事**，两者都要留痕：
+   *  `rmManagedDisk` 用来回答"清单还准不准"（`rmStale`／B②），`rmManaged` 用来判"有没有新增/超限"。 */
+  const rmManaged = rmHitsE103(managedJsE103, RM_LEGACY_E103);
+  const rmOverMaxManaged = rmManaged.filter(h => h.registered);      /* 在册但**超过各自 max** ⇒ 必红并指名 */
+  const rmNewManaged = rmManaged.filter(h => !h.registered);         /* **未在册**（`E151`：一律不豁免）⇒ 必红并指名 */
+  const rmStale = RM_LEGACY_E103.filter(r => !rmManagedDisk.some(h => h.file === r.file && h.id === r.id));
+  const ownFace = rmManagedDisk.filter(h => h.file === 'tests\\harness-check.js' || h.file.startsWith('tests\\lib\\'));
+  const rmLegacyWhyText = RM_LEGACY_E103.length
+    ? RM_LEGACY_E103.map(r => `${r.file}:${r.id}（在册 \`max: ${r.max}\`）—— ${r.why}`).join('；')
+    : '（空）';
+  t.check('E103-B① 组合判据（**零新增 ＋ 零超限**）：受管面里凡 `fs.rmSync(<标识符>, … recursive:true)`，同文件必须有 `lstatSync(<同一标识符>)`／`isLink(<同一标识符>)`（或已改走 `removeLinkSafe(`）—— 存量按 **`文件＋标识符＋max`** 逐条登记：**清单外的任何一处（`E151`：未在册 ⇒ 连"有判别"也不豁免）或在册超 `max` ⇒ 红并指名**',
+    rmManaged.length === 0,
+    (rmOverMaxManaged.length || rmNewManaged.length)
+      ? `判红：**新增/超限未防护调用点 ${rmManaged.length} 处** —— `
+        + rmOverMaxManaged.map(h => `\`${h.file}\`:${h.lines.join('、')}（id=${h.id}：**在册但数到 ${h.count} 处 > \`max: ${h.max}\`**）`).join('；')
+        + (rmOverMaxManaged.length && rmNewManaged.length ? '；' : '')
+        + rmNewManaged.map(h => `${h.file}:${h.lines.join('、')}（id=${h.id}：判据数到 ${h.count} 处，**清单里没有这个 (文件,id)**）`).join('；')
         + `；已登记存量 ${RM_LEGACY_E103.length} 条 = ` + (RM_LEGACY_E103.map(r => `${r.file}:${r.id}`).join('、') || '（空）')
-      : `零新增（受管面共 ${rmManaged.length} 处未防护${rmManaged.length ? '：'
-        + RM_LEGACY_E103.map(r => `${r.file}:${r.id}`).join('、') : ' ⇒ \`E117\` 之后**存量清零**'}；`
+      : `零新增 ＋ 零超限（受管面**原样扫描**（不施加任何豁免）命中 ${rmManagedDisk.length} 条 \`(文件,id)\`；`
+        + `**在册 ${RM_LEGACY_E103.length} 条**全部满足各自 \`max\` ⇒ 判据视图 0 处命中；未在册 0 处）；`
         + `清单里已消失的条目 ${rmStale.length} 条＝` + (rmStale.map(r => `${r.file}:${r.id}`).join('、') || '无')
-        + ` ⇒ 存量只减不增、任一处被修好都会在这里显形（但**不判红**：修好不是缺陷））`);
+        + ` ⇒ 存量只减不增、任一处被修好都会在这里显形（但**不判红**：修好不是缺陷））`
+        + `｜在册条目与理由（**每次跑都印出来**，豁免不许是隐形的）：${rmLegacyWhyText}`);
   t.check('E103-B④ `E117` 显式清单（**不是靠"没扫到"**）：登记在案的 6 处**逐处**都已改走 `removeLinkSafe('
-    + '（`文件:标识符` 逐个核对），且受管面**已无**裸递归删形态 —— 其中任一处回潮都会被 B① 当"新增"点名',
+    + '（`文件:标识符` 逐个核对），且受管面**零新增/零超限**（在册条目逐条给 why）—— 其中任一处回潮都会被 B① 当"新增"点名',
     (() => {
       const miss = [];
       for (const r of RM_FIXED_E117) {
@@ -9586,7 +9718,9 @@ function e103LinkSafetyChecks(t) {
     })(),
     `显式登记 ${RM_FIXED_E117.length} 处（应 6）：`
       + RM_FIXED_E117.map(r => `${r.file}:${r.id}`).join('、')
-      + `；受管面仍未防护 ${rmManaged.length} 处（应 0）`);
+      + `；受管面**新增/超限** ${rmManaged.length} 处（应 0）`
+      + `；原样扫描命中 ${rmManagedDisk.length} 条 \`(文件,id)\` ＝ 在册 ${RM_LEGACY_E103.length} 条（逐条 why：${rmLegacyWhyText}）`
+      + `（⚠ 由 ` + '`E151`' + ` 的裁定㈠**照出来的历史存量**：旧判据先查守护、后查在册 ⇒ 它们被"文件里有同 id 的判别"吃掉、连普查都看不见；本批**登记**而不是放宽判据）`);
   /* `E117` 的 D22：**内存副本**把其中一处换回裸递归删 ⇒ B① 的同一判据必须红并**指名 `lockDir`**。 */
   {
     const dbPath117 = path.join(env.paths.root, 'tests', 'db-check.js');
@@ -9614,13 +9748,35 @@ function e103LinkSafetyChecks(t) {
   const sampleNewEnvShape = 'if (isLink(full)) { removeLinkSafe(full, { recursive: true, force: true }); continue; }\n'
     + 'const st = fs.statSync(full);\n'
     + 'if (now - st.mtimeMs > maxAgeMs) { fs.rmSync(full, { recursive: true, force: true }); }\n';
+  /* ⚠ `E151`（2026-10-04）**同批复核本条的样本**（主代理裁定的必做项；**两条路都给读数**，不许默认跳过）：
+     本条的 `sampleNewEnvShape` 是**真守护**：`isLink(full)` 的判别结果**控制**了控制流 ——
+     是链接 ⇒ 走 `removeLinkSafe()` 并 `continue`（**永远到不了**下面那处裸 `fs.rmSync(full,…)`）；
+     不是链接 ⇒ 才落到那处裸删。⇒ 它**在结构上**就是 `tests\env.js` 的现行形态
+     （`cleanupStaleTemp()` 的 `isLink(full)` ＋ 过期才递归删），属"**真守护不该被判红**"那一类。
+     `E151` 的裁定㈠（未在册 ⇒ 不豁免）下，这种形态**必须按"已登记形态"喂**：给它一份
+     `[{ id: 'full', max: 1 }]`（＝"这个 `(文件,id)` 在册、允许 1 处"）⇒ "在册 ＋ 有守护"照旧判绿。
+     两条路（**同一次运行里都现算**）：
+       · **路 A（本判据采用）**：真守护 ＋ **在册** ⇒ 命中 **0** 条 ⇒ 判绿；
+       · **路 B（对照）**：同一段样本**当作未在册**（不给登记）⇒ 命中 **1** 条（`max 0`）⇒ **判红并指名 `full`**。
+         这不是"真守护被误判"的缺陷，而是裁定㈠**换来的代价与边界**：判据此刻**不知道**这个 `(文件,id)`
+         是谁 ⇒ 宁可判红（"新增即红"是 `E130` 唯一的承诺），由人把它**登记进清单**（登记动作本身即留痕）。
+     装饰性形态与真守护在**文本上分不开**（`if (fs.lstatSync(t).isSymbolicLink()) { console.log('note: link'); }`）
+     ⇒ 要分得开只能靠**调用点级**判据（`E149`，先给方案）⇒ 这里**不写**"装饰性也必红"的假断言。 */
+  const envShapeRegE151 = [{ id: 'full', max: 1 }];
   const oldShapeHits = scanUnprotectedRm(sampleOldEnvShape);
-  const newShapeHits = scanUnprotectedRm(sampleNewEnvShape);
-  t.check('E103-B③ D22（可证伪）：把 `tests\\env.js` 的 `cleanupStaleTemp()` 变回**旧形态**（`statSync` 判过期 ＋ 递归删、无 `lstat`）⇒ 同一判据**必红并指名 `full`**；而**现行形态**（`isLink(full)` 在场）判绿 —— 两条读数给出"能证伪"',
-    oldShapeHits.length === 1 && oldShapeHits[0].id === 'full' && newShapeHits.length === 0,
+  const newShapeHits = scanRmViolations(sampleNewEnvShape, envShapeRegE151);        /* 路 A：真守护 ＋ 在册 ⇒ 绿 */
+  const newShapeUnregHits = scanRmViolations(sampleNewEnvShape);                     /* 路 B：同一段但未在册 ⇒ 红 */
+  t.check('E103-B③ D22（可证伪）：把 `tests\\env.js` 的 `cleanupStaleTemp()` 变回**旧形态**（`statSync` 判过期 ＋ 递归删、无 `lstat`）⇒ 同一判据**必红并指名 `full`**；而**现行形态**（`isLink(full)` **真守护** ＋ `(文件,id)` **在册**）判绿 —— 两条读数给出"能证伪"（`E151` 的对照见详情）',
+    oldShapeHits.length === 1 && oldShapeHits[0].id === 'full' && newShapeHits.length === 0
+      && newShapeUnregHits.length === 1 && newShapeUnregHits[0].id === 'full' && newShapeUnregHits[0].max === 0,
     `旧形态命中 ${oldShapeHits.length} 处（${oldShapeHits.map(h => `id=${h.id}`).join('、')}，应 1）；`
-      + `现行形态命中 ${newShapeHits.length} 处（应 0）；盘上 tests\\env.js 当前命中 `
-      + `${rmManaged.filter(h => h.file === 'tests\\env.js').length} 处（应 0，与 B① 同源）`);
+      + `现行形态（真守护＋在册）命中 ${newShapeHits.length} 处（应 0）；`
+      + `⚠ 同一段样本当作**未在册**的对照 ⇒ 命中 ${newShapeUnregHits.length} 处`
+      + `（${newShapeUnregHits.map(h => `id=${h.id} max=${h.max}`).join('、') || '无'}，应 1 ＝ \`E151\` 裁定㈠的代价）；`
+      + `盘上 tests\\env.js 判据视图命中 `
+      + `${rmManaged.filter(h => h.file === 'tests\\env.js').length} 处（应 0，与 B① 同源）；`
+      + `\`tests\\env.js\` **原样扫描**（不施加任何豁免）命中 `
+      + `${rmManagedDisk.filter(h => h.file === 'tests\\env.js').length} 条 \`(文件,id)\`（＝ \`E151\` 照出来的 2 条在册项，逐条 why 见 B①／B④）`);
 
   /* ==================== 甲-B⑥：`tests\._verify\**` 面的裸递归删守护（`E130`，2026-10-04） ====================
      **为什么这一面必须守（不是"顺手扩大扫描面"）** —— 回执里也复述了这一段：
@@ -9642,11 +9798,21 @@ function e103LinkSafetyChecks(t) {
          **静默放行**（去重把它吃掉了，命中数不涨）；而抬头写的是"**多一处就红**" ⇒ 措辞与判据不一致
          （`D19` 的"看起来验过了"）。修法＝**数次数**：清单每条带 `max`（缺省 1，**不隐式放宽**），
          超过 `max` 即红并**逐行指名 `文件:行号`**。
-         ⚠ **已知边界（如实登记，不假装已覆盖）**：`E144` 报告里的第二种触发 ——"同文件本来就有
-         `lstatSync(X)`／`isLink(X)` 时**别处**再加一处裸 `fs.rmSync(X,…)` 也过"—— **本件改不掉**：
-         新旧两支都把"有没有守护"判成**文件级**（先看"这个文件里有没有该 id 的判别"，再看该 id 的每一处
-         `rmSync`）⇒ 那个形态下两支读数相同。要真堵它，得把守护判到**调用点**上（下一个债号）。
-         `max>1` 的 8 条逐条注明"盘上 × N"（它们是**字节冻结**的取证实物／历史副本，逐处如实登记）。
+         ⚠ **`E151`（2026-10-04，主代理裁定㈠）：把"守护豁免"从"任何 `(文件,id)`"收窄到"**只在册的** `(文件,id)`"**
+         —— 这是本节式子本轮**第二处**强度变化（第一处是 `E144` 的 `max` 计数）。理由（`C·23` 第 4 组报出、
+         主代理**独立复现且结果更严重**）：旧写法**第一句**就是 `if (guardedReE144(id).test(code)) continue;`
+         ⇒ 守护是**文件级**判断，且对**从未在册的 `(文件,id)`** 同样豁免 ⇒ 一支**全新**探针里只要写一行
+         `if (fs.lstatSync(t).isSymbolicLink()) { console.log('note: link'); }`（**装饰性：不 return、结果不
+         参与控制流**）＋ 裸 `fs.rmSync(t,{recursive:true})`，`harness-check` 就 **413/0/2 全绿、该文件名
+         0 次被提及** ⇒ `E130` 立案时唯一承诺的"**新增即红**"被绕过（`max` 的计数维度对未在册项不起作用）。
+         修法＝**先查在册、再谈守护**：未在册 ⇒ **不豁免**（`max` 视作 0，出现一处即红并指名）；
+         在册 ⇒ 保持"文件级守护"（`E144` 的 `max` 继续守"同 id 多一处"）。
+         ⚠ **仍然存在的边界（如实登记，不假装已覆盖，归 `E149`）**：把守护判到**调用点级**
+         （"这一次裸删的同一目标/同一作用域上有没有先做 `lstat`/`isLink` 判定"）**本件没有做** ⇒
+         对**在册的** `(文件,id)`，一行**装饰性** `isLink` 仍能让该 id 的裸删豁免（真守护与装饰性写法
+         在**文本上**分不开）。⇒ `E151` 只堵住了"未在册"这一侧；在册那一侧的调用点级判定见 `E149`。
+         `max>1` 的**条数不写死**：由清单现算（`E156` 的教训 —— 台账里手写的 `8` 与实测的 **11** 不符；
+         这条现算读数打进 B⑥ 详情与 `E156` 口径行）。
       ④ **`E140` 的存量迁移已落地（本座位，2026-10-04）**：普查基线＝裸递归删 **106** 处（`E46` 取证实物
          **11** ＋ 旧字节副本 **31** ＋ **一次性探针 64**，分布在 57 个文件）。本轮把 **64 条 probe 类**
          全部改走 `env.removeLinkSafe()`（机械迁移器与逐文件 diff／语法预检见 `tests\._verify\t16-e141\`）；
@@ -9678,6 +9844,19 @@ function e103LinkSafetyChecks(t) {
     { file: 'tests\\._verify\\e46\\probe-raw2.js', id: 'through', kind: 'e46' },
     { file: 'tests\\._verify\\e46\\probe-twoside.js', id: 'l', kind: 'e46', max: 5 },
     { file: 'tests\\._verify\\e46\\probe-twoside.js', id: 'SIDE', kind: 'e46', max: 2 },
+    /* —— `E151` 暴露的 5 条（2026-10-04，本批次**同一批登记**）：它们的 `(文件,id)` **从来没进过清单**，
+       因为旧判据**先查守护、后查在册**，而它们的文件里都有一处同 id 的 `lstatSync`/`isLink`（有的是
+       **测量**、有的是**别处的判定**）⇒ 整个 `(文件,id)` 被"文件级豁免"吃掉、**连普查都看不见**
+       （`E140` 的 106 条里也没有它们 ⇒ "普查"当时对"文件里有守护"的那一类是**盲的**）。
+       ⇒ `E151` 的裁定㈠（未在册 ⇒ 不豁免）把它们照出来了 ⇒ 按裁定**同批登记**（登记本身即留痕），
+       而不是把判据放宽回"未在册也豁免"。它们是 `E46` 家族的**取证探针：故意调用被禁 API**，
+       与上面 11 条同类 ⇒ `kind: 'e46'`，`max` ＝ 盘上**实测**出现次数（逐条见括号）。 */
+    { file: 'tests\\._verify\\e46\\probe-danger.js', id: 'link', kind: 'e46', max: 3 },   /* 68／84／97：三种持链形态下故意 `rmSync(link,{recursive})` */
+    { file: 'tests\\._verify\\e46\\probe-raw.js', id: 'link', kind: 'e46' },               /* 115：D1 案（裸递归删 junction） */
+    { file: 'tests\\._verify\\e46\\probe-raw2.js', id: 'dirlink', kind: 'e46' },           /* 119：T6 目录符号链接那一支 */
+    { file: 'tests\\._verify\\e46\\probe-twoside.js', id: 'link', kind: 'e46' },           /* 68：danger 侧对照 */
+    { file: 'tests\\._verify\\review\\s5t20-junction.js', id: 'link', kind: 'e46',         /* 54：`E46` 家族的两侧对照（`removeLinkSafe` vs 裸 `rmSync`），座位 5 取证件 */
+      why: '故意用裸递归删复现"会不会顺着 junction 出圈"、并与 `env.removeLinkSafe()` 两侧对照 ⇒ 与 `E46` 的取证实物同族' },
     /* —— oldcopy（31 条）—— */
     { file: 'tests\\._verify\\e90\\harness.head2.js', id: 'dir', kind: 'oldcopy', max: 3 },
     { file: 'tests\\._verify\\e90\\harness.head2.js', id: 'env', kind: 'oldcopy' },
@@ -9712,7 +9891,18 @@ function e103LinkSafetyChecks(t) {
     { file: 'tests\\._verify\\w4\\bak\\tests__db-check.js', id: 'lockDir', kind: 'oldcopy', max: 2 },
   ];
   const rmVerify = rmHitsE103(verifyJsE103);
-  const rmNewVerify = rmVerify.filter(h => !RM_RESIDUE_VERIFY_E103.some(r => r.file === h.file && r.id === h.id));
+  /** `E144` 承诺的另一半（**"同一 `(文件,id)` 超过 `max` 一处 ⇒ 红并指名"**）在**盘上真扫**这一侧的落点。
+   *  ⚠ **本件新补（2026-10-04，随 `E151` 同批）**：`rmVerify` 走的是 `rmHitsE103(verifyJsE103)`
+   *  ——**没把登记清单喂进判据** ⇒ 它只能回答"盘上这个 `(文件,id)` 在不在册"，**回答不了"它超没超 `max`"**：
+   *  一个在册的 `(文件,id)` 在盘上出现 `max + 5` 次，`rmNewVerify` 那一条照样绿（`h.registered` 恒 false）
+   *  ⇒ B⑥ 的**抬头**写着"超过 `max` 一处 ⇒ 红并指名"，而**真扫**里没有这一维（`D19`：措辞强于判据 ——
+   *  与 `E144` 立案的病灶**同型**，只是这次在"真扫 vs D22"之间）。故这里**再算一遍**"喂了清单"的读数：
+   *  在册项按各自 `max` 判定 ⇒ 超限即命中并指名（未在册项也照旧命中，见 `E151`）。
+   *  ⚠ 与 `rmVerify` **不是一回事**（口径不同，两者都留痕）：`rmVerify`＝"盘上未防护 `(文件,id)`"
+   *  （用于与清单对账 ⇒ `E145` 留痕行）；`rmVerifyRegE144`＝"**按登记 + max 判定后的违规**"。 */
+  const rmVerifyRegE144 = rmHitsE103(verifyJsE103, RM_RESIDUE_VERIFY_E103);
+  const rmOverMaxVerify = rmVerifyRegE144.filter(h => h.registered);
+  const rmNewVerify = rmVerifyRegE144.filter(h => !h.registered);
   const rmStaleVerify = RM_RESIDUE_VERIFY_E103.filter(r => !rmVerify.some(h => h.file === r.file && h.id === r.id));
   const rmKindCountVerify = ['e46', 'oldcopy', 'probe']
     .map(k => `${k} ${RM_RESIDUE_VERIFY_E103.filter(r => r.kind === k).length} 条`).join('、');
@@ -9725,18 +9915,55 @@ function e103LinkSafetyChecks(t) {
     missing: residueList.filter(r => !diskHits.some(h => h.file === r.file && h.id === r.id)),
     extra: diskHits.filter(h => !residueList.some(r => r.file === h.file && r.id === h.id))
   });
-  t.check('E103-B⑥ 组合判据（**`tests\\._verify\\**` 面，`E130`／`E144`**）：这一面里凡 ' +
+  /** `E156`（2026-10-04，`C·23` 第 6 组）**口径自证**：把"出现次数"这类**统计数**做成**现算**、
+   *  并把**口径**（数的是什么、在哪个面、什么时刻）打进输出 —— 立案事实：台账里"裸删出现次数
+   *  `128 → 54`"在**四处**各不相同（快照 54／`probe-counts-after.log` 55／`census-before.log` 123、101／
+   *  复核方 66、71），根因是**没有一处写清口径**；而"显式带 `max` 的条目"台账写 **8**、实测 **11**（手写数）。
+   *  ⇒ 本件只做两件事：①这两条读数**现算**（不再手写）②把口径印在读数旁边。
+   *  **口径（逐字，复算请照此数）**：
+   *   · **面**＝`verifyJsE103`（`tests\**\*.js` ＋ `tools\**\*.js` 里**相对仓库根路径含 `._verify\`** 的
+   *     那些文件；**本轮扫描时刻**的盘上状态，**不看 git 跟踪状态**）；
+   *   · **数的对象**＝`fs.rmSync(<标识符>, …, recursive:true)` 的**原始出现次数**（`re.exec` 命中数求和）；
+   *     ⚠ **不是** `(文件,id)` 对数、**不是**"命中行数"、**不是**"清单条数"；
+   *   · **两个口径各给一个数**：`raw`＝**不施加任何豁免**（连"同文件有 `lstatSync`/`isLink`"也算）；
+   *     `bare`＝按**本门禁现行豁免规则**（`E151` 之后：**在册** `(文件,id)` ＋ 该 id 有判别 ⇒ 不计；未在册 ⇒ 一律计）；
+   *   · **时刻**＝本轮 `harness-check` 跑本节的那一刻（探针生灭会改这个数 ⇒ 它只是**当轮读数**，
+   *     **不是**"存量真值"；防退化靠 `E145` 的逐条 `sha12` 锚点，那一层已被证明可复算）。
+   *  ⇒ 与旧数（128／106／54／55／123／101／66／71）**不可能逐个对上**：它们分别数在**不同的面**（迁移前的
+   *    历史面／含/不含 `review\`）、**不同的豁免口径**（含已获豁免的在册项）、**不同的时刻**，或干脆是手写。
+   *     本行给出的两个数**任何时候都能用同一条命令复算**（见回执里的命令）。 */
+  const e156Count = (withGuardExemption) => verifyJsE103.reduce((acc, f) => {
+    const code = stripLiterals(readOrEmpty(f));
+    const re = /fs\.rmSync\((\w+)[^)]*recursive:\s*true/g;
+    let m; let n = 0;
+    while ((m = re.exec(code))) { if (withGuardExemption && guardedReE144(m[1]).test(code)) continue; n++; }
+    return acc + n;
+  }, 0);
+  const e156Raw = e156Count(false);
+  const e156Bare = e156Count(true);
+  const e156MaxGt1 = RM_RESIDUE_VERIFY_E103.filter(r => (Number.isFinite(r.max) ? r.max : 1) > 1).length;
+  const e156MaxExplicit = RM_RESIDUE_VERIFY_E103.filter(r => Number.isFinite(r.max)).length;
+  t.info(`\`E156\` 口径自证（**现算**，不手写）：\`._verify\` 面（${verifyJsE103.length} 个 .js）**本轮扫描时刻**的`
+    + `裸递归删**出现次数** —— 口径 \`raw\`（不施加任何豁免）＝**${e156Raw}** 次；`
+    + `口径 \`bare\`（按现行豁免：在册 + 有判别 ⇒ 不计）＝**${e156Bare}** 次。`
+    + `清单侧现算：条目 **${RM_RESIDUE_VERIFY_E103.length}** 条、**显式带 \`max\`** 的 **${e156MaxExplicit}** 条、`
+    + `**\`max>1\`** 的 **${e156MaxGt1}** 条（台账里手写的 \`8\` 与实测 **${e156MaxGt1}** 不符 ⇒ 本行是它的真源）。`
+    + `⚠ 这两个数**只在"面＝\`._verify\\\`、时刻＝本轮、豁免＝上述两条"下成立** ⇒ 与历史台账里的`
+    + `128／106／54／55／123／101／66／71 **不是同一个量**（口径未写明）；防退化以 \`E145\` 的逐条摘要 \`sha12\` 为准。`);
+  t.check('E103-B⑥ 组合判据（**`tests\\._verify\\**` 面，`E130`／`E144`／`E151`**）：这一面里凡 ' +
     '`fs.rmSync(<标识符>, … recursive:true)`，同文件必须有 `lstatSync(<同一标识符>)`／`isLink(<同一标识符>)`' +
     '（或已改走 `removeLinkSafe(`）—— 存量按 **`文件＋标识符＋允许出现次数 max`** 逐条登记：' +
-    '**同一 `(文件,id)` 超过 `max` 一处、或出现清单外的新调用点 ⇒ 红并指名 `文件:行号`**',
-    rmNewVerify.length === 0,
-    rmNewVerify.length
-      ? `判红：**超限/新增未防护调用点 ${rmNewVerify.length} 处** —— `
-        + rmNewVerify.map(h => (h.registered
-          ? `${h.file}:${h.lines.join('、')}（id=${h.id}：判据数到 **${h.count}** 处 > 已登记 \`max: ${h.max}\`）`
-          : `${h.file}:${h.lines.join('、')}（id=${h.id}：判据数到 ${h.count} 处，**清单里没有这个 (文件,id)**）`)).join('；')
+    '**同一 `(文件,id)` 超过 `max` 一处、或出现清单外的新调用点（`E151`：未在册 ⇒ 连"有判别"也不豁免）⇒ 红并指名 `文件:行号`**',
+    rmVerifyRegE144.length === 0,
+    (rmNewVerify.length || rmOverMaxVerify.length)
+      ? `判红：**超限/新增未防护调用点 ${rmNewVerify.length + rmOverMaxVerify.length} 处** —— `
+        + rmOverMaxVerify.map(h => `\`${h.file}\`:${h.lines.join('、')}（id=${h.id}：**在册但数到 ${h.count} 处 > \`max: ${h.max}\`**）`).join('；')
+        + (rmOverMaxVerify.length && rmNewVerify.length ? '；' : '')
+        + rmNewVerify.map(h => `${h.file}:${h.lines.join('、')}（id=${h.id}：判据数到 ${h.count} 处，**清单里没有这个 (文件,id)**）`).join('；')
         + `；已登记存量 ${RM_RESIDUE_VERIFY_E103.length} 条（${rmKindCountVerify}）`
-      : `零超限（\`._verify\\\` 面共 ${rmVerify.length} 条未防护 \`(文件,id)\` 命中，全部 ⊆ 已登记存量并满足各自 \`max\`：${rmKindCountVerify}；`
+      : `零超限（\`._verify\\\` 面**原样扫描**（不施加任何豁免）命中 ${rmVerify.length} 条 \`(文件,id)\`，全部 ⊆ 已登记存量；`
+        + `**按登记 + \`max\` 判定**（\`E144\` 那一半 ＋ \`E151\` 的未在册不豁免）：未在册 **${rmNewVerify.length}** 处（应 0）、在册超限 **${rmOverMaxVerify.length}** 处（应 0）；`
+        + `清单侧现算：共 ${RM_RESIDUE_VERIFY_E103.length} 条（${rmKindCountVerify}）、显式带 \`max\` 的 ${e156MaxExplicit} 条、\`max>1\` 的 **${e156MaxGt1}** 条；`
         + `清单里已消失的条目 ${rmStaleVerify.length} 条＝` + (rmStaleVerify.map(r => `${r.file}:${r.id}`).join('、') || '无')
         + ` ⇒ 存量只减不增，谁把它改走 \`removeLinkSafe()\` 都会在这里显形（**本判据不判红**：修好不是缺陷 ——`
         + `"清单变短"这件事由 B⑥-口径自证按**双向一致**强制守住，见 \`E145\`））`);
@@ -9769,17 +9996,55 @@ function e103LinkSafetyChecks(t) {
     const cleanSrc = 'const p = mkOneShot();\n'
       + 'fs.' + 'rmSync(p, { recursive: ' + 'true, force: true });\n';
     const cleanHits = scanRmViolations(cleanSrc, [{ id: 'p', max: 1 }]);
+    /* `E151`（2026-10-04，主代理裁定㈠）的**五形态读数**（同一判据、同一次运行里现算）：
+       ① 全新文件（`(文件,id)` **从未在册**）＋ **装饰性**守护 ⇒ **必红并指名**（这正是被绕过的那一处）；
+       ② 全新文件（未在册）＋ **纯裸删** ⇒ 必红（对照：裁定㈠没有把"新增即红"弄丢）；
+       ③ **在册** ＋ **真守护**（`isLink` 的判别结果**控制**了控制流）⇒ **必绿**（真守护不该被判红）；
+       ④ **在册** ＋ 同 id 多一处（超 `max`）⇒ 必红（下面那条"内存追加第 3 处"就是它，`max` 仍生效）；
+       ⑤ **在册** ＋ **装饰性**守护 ⇒ **仍绿** —— 这是 `E149` 的边界（真守护与装饰性写法**文本上分不开**），
+          **只作留痕、不当"已覆盖"**（`E149` 要做调用点级判定才分得开；这里不写"它必红"的假断言）。
+       ⚠ 形态③要**有判别力**：样本里放**两处**裸删 ＋ `max:1` ⇒ 若"文件级守护豁免"不起作用就会是 `2 > 1` ⇒ 红；
+       正因为豁免真在起作用才绿 ⇒ 这条读数测到的是**豁免本身**，不只是"单处 ≤ max"。 */
+    const decorGuardE151 = 'if (fs.lstatSync(t).isSymbolicLink()) { console.log(' + Q_E103 + 'note: link' + Q_E103 + '); }\n';
+    const e151UnregDecor = 'const t = mkOneShot();\n' + decorGuardE151
+      + 'fs.' + 'rmSync(t, { recursive: ' + 'true, force: true });\n';
+    const e151UnregPlain = 'const t = mkOneShot();\n'
+      + 'fs.' + 'rmSync(t, { recursive: ' + 'true, force: true });\n';
+    const e151RegTrueGuard = 'if (isLink(t)) { removeLinkSafe(t, { recursive: ' + 'true, force: true }); continue; }\n'
+      + 'fs.' + 'rmSync(t, { recursive: ' + 'true, force: true });\n'
+      + 'fs.' + 'rmSync(t, { recursive: ' + 'true, force: true });\n';
+    const e151RegDecor = 'const t = mkOneShot();\n' + decorGuardE151
+      + 'fs.' + 'rmSync(t, { recursive: ' + 'true, force: true });\n';
+    const e151Hits = {
+      unregDecor: scanRmViolations(e151UnregDecor),                        /* 未在册 ⇒ 无登记 ⇒ max 0 ⇒ 必红 */
+      unregPlain: scanRmViolations(e151UnregPlain),
+      regTrueGuard: scanRmViolations(e151RegTrueGuard, [{ id: 't', max: 1 }]),
+      regDecor: scanRmViolations(e151RegDecor, [{ id: 't', max: 1 }])
+    };
     t.check('E144 D22（可证伪）：**同文件同标识符多一处**（旧式子按 id 去重 ⇒ 命中数不涨）' +
       ' ⇒ 新判据**必红并指名行号**；而"同 id 在两支文件里各一处（各自 `max:1`）"与' +
-      '"只有一处裸删＋`max:1`"都必须**绿**（⇒ 不是恒红式）',
+      '"只有一处裸删＋`max:1`"都必须**绿**（⇒ 不是恒红式）；**`E151`：未在册的 `(文件,id)` 一律不豁免**' +
+      '（新文件 ＋ 装饰性 `lstatSync` 守护 ＋ 裸删 ⇒ **必红并指名**；新文件 ＋ 纯裸删 ⇒ 必红；' +
+      '**在册 ＋ 真守护 ⇒ 仍绿**）',
       dupHits.length === 1 && dupHits[0].id === 'p' && dupHits[0].count === 2 && dupHits[0].lines.length === 2
         && dupHitsOld.length === 1
         && aNew.length === 0 && bNew.length === 0
-        && cleanHits.length === 0,
+        && cleanHits.length === 0
+        && e151Hits.unregDecor.length === 1 && e151Hits.unregDecor[0].id === 't' && e151Hits.unregDecor[0].max === 0
+        && e151Hits.unregPlain.length === 1 && e151Hits.unregPlain[0].id === 't' && e151Hits.unregPlain[0].max === 0
+        && e151Hits.regTrueGuard.length === 0,
       `形态①（同 id × 2、max:1）⇒ 新判据命中 ${dupHits.length} 条（${dupHits.map(h => `id=${h.id} 数到 ${h.count} 处、行 ${h.lines.join('、')}`).join('；') || '（无，异常）'}），`
         + `旧式子命中 ${dupHitsOld.length} 条（**去重 ⇒ 看不出"多了一处"**）；`
         + `形态②（同 id 分处两支文件、各 1 处、各在册 max:1）⇒ 新判据 文件A ${aNew.length} 条／文件B ${bNew.length} 条（都应 0）；`
-        + `反例（单处裸删＋max:1）⇒ ${cleanHits.length} 条（应 0）`);
+        + `反例（单处裸删＋max:1）⇒ ${cleanHits.length} 条（应 0）；`
+        + `【\`E151\` 五形态】㈠未在册＋**装饰性**守护＋裸删 ⇒ ${e151Hits.unregDecor.length} 条`
+        + `（${e151Hits.unregDecor.map(h => `id=${h.id} max=${h.max}`).join('、') || '无'}，**应 1 ＝ 必红并指名**）；`
+        + `㈡未在册＋纯裸删 ⇒ ${e151Hits.unregPlain.length} 条（应 1，对照）；`
+        + `㈢在册＋**真守护**（` + '`isLink(t)`' + ` 控制控制流、样本里两处裸删、max:1）⇒ ${e151Hits.regTrueGuard.length} 条`
+        + `（**应 0 ＝ 真守护仍绿**；若文件级豁免失效就会是 2 > 1）；`
+        + `㈣在册＋同 id 多一处（超 max）⇒ 见下一条 D22；`
+        + `㈤在册＋**装饰性**守护 ⇒ ${e151Hits.regDecor.length} 条（**留痕：这是 \`E149\` 的边界**，`
+        + `真守护与装饰性在文本上分不开 ⇒ 本件**不**声称它已覆盖）`);
     /* 更强的一条：在**已登记文件**（`e46\probe-raw2.js`）的**内存副本**里，对**已登记的那个 id**（`link`）
        再加一处裸删 —— `link` 在该文件的 `max` 是 2，故**必须红**（旧式子：同 id 去重 ⇒ 绿）。
        盘上文件全程只读（`Buffer.compare` 复核）。 */
@@ -9802,6 +10067,17 @@ function e103LinkSafetyChecks(t) {
         : `原件违规 ${beforeE144.length} 条（应 0，\`link\` 登记 max:2、盘上恰好 2 处）⇒ 内存追加第 3 处后 `
           + `违规 ${afterE144.length} 条、其中 \`link\`：数到 ${linkRowE144 ? linkRowE144.count : '-'} 处 > max ${linkRowE144 ? linkRowE144.max : '-'}`
           + `（行 ${linkRowE144 ? linkRowE144.lines.join('、') : '-'}）；盘上文件逐字节未变=${diskSameE144}`);
+    /* `E151` 的**五形态读数**（`PASS` 详情不打印 ⇒ 这里用 `t.info` 让它**每轮都可见**；
+       立案要求的"必红/必绿"四条 ＋ 一条如实留痕的边界，一条都不许省）。 */
+    t.info(`\`E151\` 五形态读数（判据：\`scanRmViolations()\`；同一次运行里现算）：`
+      + `㈠**未在册** ＋ 装饰性守护（\`if (fs.lstatSync(t).isSymbolicLink()) { console.log('note: link'); }\`，**不 return**）＋ 裸递归删 `
+      + `⇒ **命中 ${e151Hits.unregDecor.length} 条**（id=${e151Hits.unregDecor.map(h => h.id).join('、') || '无'}、\`max\`=${e151Hits.unregDecor.map(h => h.max).join('、') || '-'}）`
+      + `＝**必红并指名**（改动前这一形态判绿、文件名 0 次被提及）；`
+      + `㈡**未在册** ＋ 纯裸删 ⇒ **命中 ${e151Hits.unregPlain.length} 条**（对照，必红）；`
+      + `㈢**在册** ＋ **真守护**（样本里两处裸递归删、\`max:1\` ⇒ 若文件级豁免失效就是 2 > 1）⇒ **命中 ${e151Hits.regTrueGuard.length} 条**（必绿）；`
+      + `㈣**在册** ＋ 同 id 多一处（超 \`max\`）⇒ **必红并指名**（见上面那条内存变异：\`link\` 数到 3 处 > \`max: 2\`）；`
+      + `㈤**在册** ＋ 装饰性守护 ⇒ 命中 ${e151Hits.regDecor.length} 条（**如实留痕：这是 \`E149\` 的边界** —— 文本上分不开真守护与装饰性，`
+      + `本件**不**声称已覆盖，留作调用点级判据）。`);
   }
   /* `E145` 的**口径自证（本座位改写，2026-10-04）**：原口径只要求"三类各自非零条数" ⇒ 把清单一类
      删到 1 条也照样绿（座位 5 在 `C·22` 靶子⑧指出：清单会从"普查台账"退化成"象征性留几条"）。
@@ -9816,7 +10092,7 @@ function e103LinkSafetyChecks(t) {
           **自觉的、留痕的**改动，而不是"悄悄少几条"）—— 这正是原口径缺的那一层。
      ⚠ 与"盘上实存"的对账**不在这里判红**：新增未登记命中由 B⑥ 逐处指名判红（那是它的职责）；
        本判据只把它**留痕**（`t.info`），供人对照"清单还在不在盘上"。 */
-  const REGISTRY_ANCHOR_E145 = { total: 42, e46: 11, oldcopy: 31, probe: 0, sha12: '8ba5d7fd7281' };  const anchorCountsE145 = (() => {
+  const REGISTRY_ANCHOR_E145 = { total: 47, e46: 16, oldcopy: 31, probe: 0, sha12: 'd8e4411aa8b1' };  const anchorCountsE145 = (() => {
     const m = {};
     for (const r of RM_RESIDUE_VERIFY_E103) { const k = `${r.file}|${r.id}`; m[k] = (m[k] || 0) + 1; }
     return m;
@@ -10329,8 +10605,10 @@ function e103LinkSafetyChecks(t) {
     + `探针纪律形态 ${GIT_RESTORE_PATTERNS_E103.length} 类（剥注释、保留字符串）`);
   /* `E130`（2026-10-04）：把 `._verify\` 面的存量读数**打进日志**（PASS 时不打印 check 的 detail，
      故这里必须有可见证据 —— "守了多少、还剩多少存量"要能一眼读到，不许只在红的时候才看得见）。 */
-  t.info(`E103/E130 \`._verify\\\` 面存量（普查 ＋ 清单）：裸递归删 ${rmVerify.length} 处`
-    + `（已登记 ${RM_RESIDUE_VERIFY_E103.length} 条＝${rmKindCountVerify}；新增 ${rmNewVerify.length}、已消失 ${rmStaleVerify.length}）；`
+  t.info(`E103/E130 \`._verify\\\` 面存量（普查 ＋ 清单）：**原样扫描**（不施加任何豁免）命中 ${rmVerify.length} 条 \`(文件,id)\``
+    + `（⚠ 口径：这条数的是**"盘上有这个 \`(文件,id)\`"的条数**、**不是**"出现次数"、**不是**"未防护条数"；`
+    + `按登记 + \`max\` 判定后的违规 ${rmVerifyRegE144.length} 条。**"出现次数"的现算读数**见上面的 \`E156\` 口径行）`
+    + `（已登记 ${RM_RESIDUE_VERIFY_E103.length} 条＝${rmKindCountVerify}；未在册 ${rmNewVerify.length}、在册超限 ${rmOverMaxVerify.length}、已消失 ${rmStaleVerify.length}）；`
     + `外部工具调用形态 **${toolCallVerify.length} 行命中**（已登记 ${TOOL_RESIDUE_VERIFY_E103.length} 条`
     + `＝取证实物 ${TOOL_RESIDUE_VERIFY_E103.filter(r => r.kind === 'real').length} ＋ 词形撞车 ${TOOL_RESIDUE_VERIFY_E103.filter(r => r.kind === 'artifact').length}；`
     + `新增 ${toolNewVerify.length}、已消失 ${toolStaleVerify.length}）`
