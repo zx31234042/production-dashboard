@@ -2297,6 +2297,160 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
     }
   }
 
+  /* ================= 乙⑧ `E132`：跨零点班次在**月末/年末**的月/年归属 =================
+     立案（`E132`；座位 5 在 `C·21` 靶子⑥ 报出、主代理登记，2026-10-04）：`splitRunSecondsByDay()`
+     早就给出两段各自的**日历归属**（`day1Date`/`day2Date`），但旧 `accumulateRunTime()` 把
+     `day1 + day2` **一起**加进 `now` 所在月/年 —— 而它注释里那句"跨零点只可能跨日（两段都落在
+     同一个月/年）"**是假的**：零点既是日界、也是**月/年界**。
+     危害（实测）：`FR-6.5`（本月累计运行）/`FR-6.6`（本年累计运行）在月末/年末那一班**多算 `day1`**，
+     而上月/上年那一段（`rollAccum()` 已把旧档清零）**永久丢失** ⇒ 症状是"月/年累计少了几个小时"。
+     现口径（座位 3 的 `E132` 实现，本座实测复核）：**月/年档按各段自己的日历归属聚合**，
+     不属于本周期的那几段**不进**本周期档，但**也不静默消失** —— 它们的秒数随只读字段
+     **`outOfPeriod{month,year,note}`** 一并报出（"扣掉的秒去哪儿了"可核）。
+     本次期望值的来源＝我自己跑 `tests\._verify\t14-e130\e132-expected.js` 的实测读数（不是推导值）：
+     夜班 22-6、`10-31 22:00→11-01 06:00`、`now=11-01 00:30` ⇒ 切段 `7200/1800`；**旧实现 `monthSec=9000`、
+     现实现 `1800` ＋ `outOfPeriod.month=7200`**。 */
+  {
+    const nightSeg132 = {
+      list: [
+        { name: '夜班', start: 22, end: 6 },
+        { name: '白班', start: 6, end: 14 },
+        { name: '中班', start: 14, end: 22 }
+      ],
+      allowCrossMidnight: true
+    };
+    const nRules132 = createShiftRules(nightSeg132);
+    /** 一次"跨周期"读数：按真源算切段，再把切段交给记账口（`prev` 带**上一个周期**的已固化档） */
+    const readAt132 = (now, prev) => {
+      const sh = nRules132.at(now);
+      const split = stats.splitRunSecondsByDay(sh, sh.elapsedSec);
+      const acc = stats.accumulateRunTime(prev, sh.elapsedSec, now, split);
+      return { sh, split, acc, total: sh.elapsedSec };
+    };
+    const prevOct = { daySec: 33, monthSec: 77777, yearSec: 888888, at: '2026-10-31T23:00:00' };
+    const M132 = readAt132('2026-11-01T00:30:00', prevOct);
+    t.check('E132-1 **跨月**（夜班 `10-31 22:00 → 11-01 06:00` 在 `11-01 00:30` 被读）：切段 `7200/1800`、' +
+      '两段日历归属 `2026-10-31`/`2026-11-01`；**月档只收 1800**（＝11 月那一段；**旧实现给 9000**），' +
+      '被扣掉的 7200 记进 `outOfPeriod.month`，且 `月档 ＋ outOfPeriod.month === 本次切段总额`（不多算、也不丢秒）',
+      M132.sh.date === '2026-10-31' && M132.split.crossing === true &&
+      M132.split.day1 === 7200 && M132.split.day2 === 1800 &&
+      M132.split.day1Date === '2026-10-31' && M132.split.day2Date === '2026-11-01' &&
+      M132.acc.monthSec === 1800 && M132.acc.monthSec !== 9000 &&
+      M132.acc.outOfPeriod !== null && M132.acc.outOfPeriod.month === 7200 &&
+      M132.acc.monthSec + M132.acc.outOfPeriod.month === M132.total &&
+      M132.acc.daySec === 1800,
+      `切段=${JSON.stringify(M132.split)}；monthSec=${M132.acc.monthSec}（旧实现会是 9000）、daySec=${M132.acc.daySec}；` +
+      `outOfPeriod.month=${M132.acc.outOfPeriod ? M132.acc.outOfPeriod.month : '（null）'}；` +
+      `月档＋outOfPeriod.month=${M132.acc.monthSec + (M132.acc.outOfPeriod ? M132.acc.outOfPeriod.month : 0)}（应=${M132.total}）`);
+
+    const prevDec = { daySec: 44, monthSec: 777, yearSec: 888888, at: '2026-12-31T23:00:00' };
+    const Y132 = readAt132('2027-01-01T00:30:00', prevDec);
+    t.check('E132-2 **跨年**（夜班 `12-31 22:00 → 次年 01-01 06:00` 在 `2027-01-01 00:30` 被读）：切段 `7200/1800`、' +
+      '日历归属 `2026-12-31`/`2027-01-01`；**年档只收 1800**（**旧实现给 9000**），被扣掉的 7200 记进 ' +
+      '`outOfPeriod.year`，且 `年档 ＋ outOfPeriod.year === 本次切段总额`',
+      Y132.sh.date === '2026-12-31' && Y132.split.day1 === 7200 && Y132.split.day2 === 1800 &&
+      Y132.split.day1Date === '2026-12-31' && Y132.split.day2Date === '2027-01-01' &&
+      Y132.acc.yearSec === 1800 && Y132.acc.yearSec !== 9000 &&
+      Y132.acc.outOfPeriod !== null && Y132.acc.outOfPeriod.year === 7200 &&
+      Y132.acc.yearSec + Y132.acc.outOfPeriod.year === Y132.total,
+      `切段=${JSON.stringify(Y132.split)}；yearSec=${Y132.acc.yearSec}（旧实现会是 9000）；` +
+      `outOfPeriod.year=${Y132.acc.outOfPeriod ? Y132.acc.outOfPeriod.year : '（null）'}；` +
+      `年档＋outOfPeriod.year=${Y132.acc.yearSec + (Y132.acc.outOfPeriod ? Y132.acc.outOfPeriod.year : 0)}（应=${Y132.total}）`);
+
+    /* 边界两端（**期望值同样是实测值**）：
+       · 月末**最后一秒**（`10-31 23:59:59`）：还没跨月 ⇒ 月/年档**整段计入**、`outOfPeriod = null`；
+       · **恰好在零点**（`11-01 00:00:00`）：已跨月 ⇒ `day2 = 0`（切段口径）、月档**只收 0**
+         （该段全归 10 月）、`outOfPeriod.month = 7200`。
+       这一条把"边界两侧各自算对"钉住 —— 只测中间时刻会漏掉"零点那一刻算给谁"这个最容易错的地方。 */
+    const E132 = readAt132('2026-10-31T23:59:59', { daySec: 55, monthSec: 77777, yearSec: 888888, at: '2026-10-31T23:00:00' });
+    const Z132 = readAt132('2026-11-01T00:00:00', { daySec: 66, monthSec: 77777, yearSec: 888888, at: '2026-10-31T23:00:00' });
+    t.check('E132-3 **月末最后一秒 vs 恰好零点**（边界两端各自算对）：`10-31 23:59:59` ⇒ 整段 7199 全进 10 月的月/年档、' +
+      '`outOfPeriod = null`；`11-01 00:00:00` ⇒ 切段 `7200/0`、`daySec` 只收后段（0）、**月档只收 0**、' +
+      '`outOfPeriod.month = 7200`（那 7200 归 10 月，一分不少地报出来）',
+      E132.sh.date === '2026-10-31' && E132.total === 7199 &&
+      E132.split.day1 === 7199 && E132.split.day2 === 0 && E132.split.crossing === true &&
+      E132.acc.monthSec === 77777 + 7199 && E132.acc.yearSec === 888888 + 7199 &&
+      E132.acc.outOfPeriod === null &&
+      Z132.sh.date === '2026-10-31' && Z132.total === 7200 &&
+      Z132.split.day1 === 7200 && Z132.split.day2 === 0 && Z132.split.crossing === true &&
+      Z132.acc.daySec === 0 && Z132.acc.monthSec === 0 &&
+      Z132.acc.outOfPeriod !== null && Z132.acc.outOfPeriod.month === 7200,
+      `23:59:59：切段=${JSON.stringify(E132.split)}、月/年=${E132.acc.monthSec}/${E132.acc.yearSec}` +
+      `（应 ${77777 + 7199}/${888888 + 7199}）、outOfPeriod=${JSON.stringify(E132.acc.outOfPeriod)}；` +
+      `00:00:00：切段=${JSON.stringify(Z132.split)}、daySec=${Z132.acc.daySec}、monthSec=${Z132.acc.monthSec}、` +
+      `outOfPeriod.month=${Z132.acc.outOfPeriod ? Z132.acc.outOfPeriod.month : '（null）'}`);
+
+    /* `outOfPeriod` 的**契约面**（本座判断：算读数字段，但既然实现把它写进返回值，就该被守 —— 理由：
+       它是"扣掉的秒去哪儿了"的**唯一可核证据**；若哪天它被删掉/改成静默，本条的其余读数**照样全绿**
+       （数值判定只看 `monthSec`/`yearSec`）⇒ 必须有独立断言把它钉住。零值语义＝`null`（**没有**跨周期段），
+       不是 `{month:0,year:0}` —— 两种写法读起来一个是"没有"、一个是"有但为 0"，不许混。） */
+    const legacy132 = stats.accumulateRunTime({ daySec: 1, monthSec: 2, yearSec: 3, at: '2026-09-30T23:00:00' },
+      60, '2026-10-01T00:30:00');
+    const sameMonth132 = readAt132('2026-10-05T00:30:00', { daySec: 0, monthSec: 77777, yearSec: 888888, at: '2026-10-04T23:00:00' });
+    t.check('E132-4 `outOfPeriod` **在场且语义明确**（读数字段，本座按契约面守）：三种形态都能读到该键 —— ' +
+      '①旧调用形态（不传切段）⇒ `null`；②跨零点但两段同月/同年（`10-04→10-05`）⇒ `null`；' +
+      '③真跨周期 ⇒ `{month,year,note}` 且 `month`/`year` 为**数值**、`note` 非空（"不是丢失"的口径写在里面）',
+      'outOfPeriod' in legacy132 && legacy132.outOfPeriod === null &&
+      'outOfPeriod' in sameMonth132.acc && sameMonth132.acc.outOfPeriod === null &&
+      sameMonth132.acc.monthSec === 77777 + 9000 &&
+      M132.acc.outOfPeriod !== null && typeof M132.acc.outOfPeriod.month === 'number' &&
+      typeof M132.acc.outOfPeriod.year === 'number' && M132.acc.outOfPeriod.note.length > 20 &&
+      M132.acc.outOfPeriod.month === 7200 && M132.acc.outOfPeriod.year === 0,
+      `旧形态（不传切段）=${JSON.stringify(legacy132.outOfPeriod)}；同月跨零点（10-04→10-05）=${JSON.stringify(sameMonth132.acc.outOfPeriod)}` +
+      `（其 monthSec=${sameMonth132.acc.monthSec}，应=${77777 + 9000}）；跨月形态=${JSON.stringify(M132.acc.outOfPeriod && { month: M132.acc.outOfPeriod.month, year: M132.acc.outOfPeriod.year, noteLen: M132.acc.outOfPeriod.note.length })}`);
+
+    /* `E132` 的 D22（可证伪）：把月/年档的两条"按归属聚合"式子**改回旧实现**（`monthAdd = day1 + day2`、
+       `yearAdd = day1 + day2`）—— **内存副本** `Module._compile`，盘上一个字节都不落 ⇒
+       `E132-1`／`E132-2` 的期望**必被违反**（月档 9000、年档 9000）；盘上 `server\services\stats.js` 逐字节未变。
+       ⚠ 只变异**加数**那一处（不碰返回值形状）—— 否则"红"可能来自别的改动，证明不了这条判据的判别力。 */
+    {
+      const Module132 = require('node:module');
+      const crypto132 = require('node:crypto');
+      const sha132 = (b) => crypto132.createHash('sha256').update(b).digest('hex');
+      const stPath = require.resolve('../server/services/stats');
+      const stBytes0 = fs.readFileSync(stPath);
+      const sha0 = sha132(stBytes0);
+      let mutSrc = stBytes0.toString('utf8');
+      const reMonth = /monthAdd = \(d1MonthKey[\s\S]*?;\r?\n/;
+      const reYear = /yearAdd = \(d1YearKey[\s\S]*?;\r?\n/;
+      const hitMonth = reMonth.test(mutSrc) && reYear.test(mutSrc);
+      mutSrc = mutSrc.replace(reMonth, 'monthAdd = day1 + day2;\r\n').replace(reYear, 'yearAdd = day1 + day2;\r\n');
+      const load132 = (src) => {
+        const m = new Module132(stPath, null);
+        m.filename = stPath;
+        m.paths = Module132._nodeModulePaths(path.dirname(stPath));
+        m._compile(src, stPath);
+        return m.exports;
+      };
+      let mutM = null;
+      let mutY = null;
+      let mutErr = '';
+      try {
+        const mutStats = load132(mutSrc);
+        const shM = nRules132.at('2026-11-01T00:30:00');
+        const spM = mutStats.splitRunSecondsByDay(shM, shM.elapsedSec);
+        mutM = mutStats.accumulateRunTime(prevOct, shM.elapsedSec, '2026-11-01T00:30:00', spM);
+        const shY = nRules132.at('2027-01-01T00:30:00');
+        const spY = mutStats.splitRunSecondsByDay(shY, shY.elapsedSec);
+        mutY = mutStats.accumulateRunTime(prevDec, shY.elapsedSec, '2027-01-01T00:30:00', spY);
+      } catch (err) { mutErr = String((err && err.message) || err); }
+      const stBytes1 = fs.readFileSync(stPath);
+      const diskSame132 = Buffer.compare(stBytes0, stBytes1) === 0 && sha132(stBytes1) === sha0;
+      t.check('E132-5 D22（可证伪）：把月/年档的两条"按归属聚合"式子**改回旧实现**（`monthAdd = day1 + day2`／' +
+        '`yearAdd = day1 + day2`，`Module._compile` 的**内存副本**、盘上文件全程只读）⇒ `E132-1`／`E132-2` 的期望' +
+        '**必被违反**（月档 9000、年档 9000）；而**原件**给 1800／1800；`server\\services\\stats.js` 盘上字节逐字节未变',
+        hitMonth && mutErr === '' && mutSrc !== stBytes0.toString('utf8') &&
+        mutM !== null && mutM.monthSec === 9000 && mutY !== null && mutY.yearSec === 9000 &&
+        M132.acc.monthSec === 1800 && Y132.acc.yearSec === 1800 && diskSame132,
+        `变异命中两处锚点=${hitMonth}、变异体 sha256=${sha132(Buffer.from(mutSrc, 'utf8')).slice(0, 12)}…（原件 ${sha0.slice(0, 12)}…）；` +
+        `变异体读数：跨月 monthSec=${mutM ? mutM.monthSec : '（未执行）'}（应 9000＝旧实现）、` +
+        `跨年 yearSec=${mutY ? mutY.yearSec : '（未执行）'}（应 9000）；` +
+        `原件读数：monthSec=${M132.acc.monthSec}／yearSec=${Y132.acc.yearSec}（应 1800／1800）；` +
+        (mutErr ? `⚠ 变异体载入/执行失败：${mutErr}；` : '') +
+        `盘上 stats.js 逐字节未变=${diskSame132}`);
+    }
+  }
+
   /* ================= 乙⑦ `E128`：跨零点配置的准入闸 ================= */
   {
     const throwOf = (fn) => { try { return { ok: true, out: fn() }; } catch (err) { return { ok: false, err }; } };
@@ -2343,6 +2497,118 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
       '这种自相矛盾、读方无法据此报警的读数）',
       curCm.count === 0 && curCm.allowed === false && JSON.stringify(curCm.keys) === JSON.stringify([]),
       `现配置 crossMidnight()=${JSON.stringify(curCm)}`);
+
+    /* ================= 乙⑦-b `E131`：`allowCrossMidnight` **只认布尔字面量** =================
+       立案（`E131`；座位 5 在 `C·21` 靶子⑦ 实测 13 组、主代理登记，2026-10-04）：段级判据原是
+       `Boolean(options && options.allowCrossMidnight)`，而**规则级**同名字段是 `=== true`
+       ⇒ **同一个键名两种严格度**：`allowCrossMidnight: 'false'`（**人读作"关"**）会**静默开闸**
+       （`Boolean('false') === true`），`/health.crossMidnight.allowed` 还报 `true`。
+       现口径（座位 3 的实现，本座逐值复核）：**取值域只有三段** —— `undefined`（键不在场）／
+       `true`／`false`；**其余一律 `TypeError` 当场拒绝**，消息里**指名实际值与类型**。
+       为什么"打错字"必须吵（而不是静默当关）：`'true'`（带引号）若静默当关，改配置的人**以为开了**
+       却什么也没发生；而 `'false'` 若静默当真，则"以为关了其实开了" —— 两种误读都**无法从读数上**
+       与正确配置区分（`E38` 同族）。⇒ **含糊即拒绝**（拒绝优于替调用方猜）。
+       本条的期望值＝我自己跑 `tests\._verify\t14-e130\e131-expected.js` 的实测读数（逐值 13 组＋规则级同款）。 */
+    {
+      /** 值 → 报错文本里必须出现的那段"实际值（类型）"（**实测**，`assertBoolSwitch()` 的 `shown`） */
+      const NONBOOL = [
+        ['\'true\'', 'true', '\'true\'（字符串）'],
+        ['\'false\'', 'false', '\'false\'（字符串）'],
+        ['\'0\'', '0', '\'0\'（字符串）'],
+        ['\'no\'', 'no', '\'no\'（字符串）'],
+        ['\'\'', '', '\'\'（字符串）'],
+        ['1', 1, '1（number）'],
+        ['0', 0, '0（number）'],
+        ['[]', [], '[]（数组）'],
+        ['{}', {}, '{}（对象）'],
+        ['null', null, 'null（null）'],
+        ['NaN', NaN, 'NaN（number）']
+      ];
+      const segBad = NONBOOL.map(([label, v, shown]) => {
+        const r = throwOf(() => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }], allowCrossMidnight: v }));
+        const msg = r.ok ? '' : String(r.err.message);
+        return { label, ok: r.ok, type: r.ok ? '' : r.err.constructor.name, named: msg.includes('收到 ' + shown), msg };
+      });
+      t.check('E131-1 **段级非布尔值一律拒绝**（真值表 11 组：`\'true\'`／`\'false\'`／`\'0\'`／`\'no\'`／`\'\'`／' +
+        '`1`／`0`／`[]`／`{}`／`null`／`NaN`）⇒ 逐个 `TypeError`，且消息**指名实际值与类型**' +
+        '（`收到 <值>（<类型>）`）—— 这一条正是 `E131` 的病灶：`Boolean(\'false\') === true` 会静默开闸',
+        segBad.every(x => x.ok === false && x.type === 'TypeError' && x.named),
+        segBad.every(x => x.ok === false && x.type === 'TypeError' && x.named)
+          ? `11/11 全部 TypeError 且逐值指名（例：${segBad[1].msg.slice(0, 74)}…）`
+          : '**未拒绝/未指名**的取值：' + segBad.filter(x => x.ok || x.type !== 'TypeError' || !x.named)
+            .map(x => `${x.label}（ok=${x.ok}、异常=${x.type || '（无）'}、指名=${x.named}）`).join('；'));
+
+      const ruleBad = NONBOOL.map(([label, v, shown]) => {
+        const r = throwOf(() => createShiftRules([{ name: '夜班', start: 22, end: 6, allowCrossMidnight: v }]));
+        const msg = r.ok ? '' : String(r.err.message);
+        return { label, ok: r.ok, type: r.ok ? '' : r.err.constructor.name, named: msg.includes('收到 ' + shown),
+          where: msg.includes('规则「夜班 22-6」') };
+      });
+      t.check('E131-2 **规则级非布尔值同款**（裸数组 ＋ 规则自带键，真值表 11 组）：同样逐个 `TypeError`、' +
+        '同样指名实际值与类型，且消息里点明是**规则那一处**（`规则「夜班 22-6」`）—— ' +
+        '两处严格度必须**同一把尺子**（`E131` 的原始病灶就是"同一个键名两种严格度"）',
+        ruleBad.every(x => x.ok === false && x.type === 'TypeError' && x.named && x.where),
+        ruleBad.every(x => x.ok === false && x.type === 'TypeError' && x.named && x.where)
+          ? `11/11 全部 TypeError ＋ 逐值指名 ＋ 点明"规则那一处"（例：${ruleBad[1].label}）`
+          : '**未达标**的取值：' + ruleBad.filter(x => x.ok || x.type !== 'TypeError' || !x.named || !x.where)
+            .map(x => `${x.label}（ok=${x.ok}、异常=${x.type || '（无）'}、指名=${x.named}、点明规则处=${x.where}）`).join('；'));
+
+      /* ③ **判据与"这次用没用到"无关**：配置里**没有**跨零点班次时打错字，也必须拒 ——
+         否则"今天恰好没跨零点"就成了一张通行证，改一行班次它就生效（`board.config.js` 的配置校验同一取舍）。 */
+      const dayList = [{ name: '晚班', start: 0, end: 8 }];
+      const typos = [['\'false\'', 'false'], ['1', 1], ['{}', {}]];
+      const noCrossBad = typos.map(([label, v]) => {
+        const seg = throwOf(() => createShiftRules({ list: dayList, allowCrossMidnight: v }));
+        const rule = throwOf(() => createShiftRules([{ name: '晚班', start: 0, end: 8, allowCrossMidnight: v }]));
+        return { label, seg: !seg.ok && seg.err.constructor.name === 'TypeError', rule: !rule.ok && rule.err.constructor.name === 'TypeError' };
+      });
+      t.check('E131-3 **不跨零点的班次配置上打错字也必须拒**（真值表 3 组 × 段级/规则级）：' +
+        '判据与"这次用没用到这个键"**无关** —— 非法的配置不该因为"今天恰好没跨零点"被放过' +
+        '（现场改一行班次就可能让它生效；与 `board.config.js` 的"配置校验不等它出事"同一取舍）',
+        noCrossBad.every(x => x.seg && x.rule),
+        noCrossBad.every(x => x.seg && x.rule)
+          ? `${noCrossBad.map(x => x.label).join('、')} 三组 × 段级/规则级 全部 TypeError`
+          : '**被放过**的：' + noCrossBad.filter(x => !x.seg || !x.rule)
+            .map(x => `${x.label}（段级拒=${x.seg}、规则级拒=${x.rule}）`).join('；'));
+
+      /* ④ `undefined`／`false` ⇒ **关闸**，且 `E128` 的原判据**不许放宽**：
+         `undefined`（键不在场）与 `false`（显式关）在**配置段形态**下都走**既有 fail-closed 拒绝**
+         （`RangeError`，消息指名"先做 `E83` 的两个投影"），**不是** `TypeError` ——
+         "关闸"是**已声明**的一个取值，不是"看不懂"的兜底去处（两者必须能被分辨）。 */
+      const offGate = [['undefined（键不在场）', undefined], ['false（显式关）', false]].map(([label, v]) => {
+        const seg = { list: [{ name: '夜班', start: 22, end: 6 }] };
+        if (v !== undefined) seg.allowCrossMidnight = v;
+        const r = throwOf(() => createShiftRules(seg));
+        const msg = r.ok ? '' : String(r.err.message);
+        return { label, ok: r.ok, type: r.ok ? '' : r.err.constructor.name,
+          e83: /E83/.test(msg) && /两个投影/.test(msg), isType: r.ok ? false : r.err.constructor.name === 'TypeError' };
+      });
+      t.check('E131-4 `undefined`／`false` ⇒ **关闸**（配置段形态下都走**既有 fail-closed 拒绝**）：' +
+        '两者都抛 `RangeError` 且消息指名"先做 `E83` 的两个投影"（`E128` 的原判据**一个字都没放宽**）；' +
+        '而且它们**不是** `TypeError` —— "已声明为关"与"打错字"必须能在读数上分辨',
+        offGate.every(x => x.ok === false && x.type === 'RangeError' && x.e83 && !x.isType),
+        offGate.map(x => `${x.label}：ok=${x.ok}、异常=${x.type}、含"E83 两个投影"=${x.e83}、是 TypeError=${x.isType}`).join('；'));
+
+      /* ⑤ `true` 是**唯一**能开闸的取值：段级 `true` 与规则级 `true` 都放行，且 `crossMidnight()`
+         如实自述 `{allowed:true,count:1,keys:['夜班 22-6']}`；而**非布尔真值**（`'true'`／`1`／`[]`／`{}`）
+         一律在①/②里被拒 —— 两端合起来＝"取值域闭合"（`open(v) === (v === true)`）。 */
+      const openTrue = [['段级', () => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }], allowCrossMidnight: true })],
+        ['规则级', () => createShiftRules([{ name: '夜班', start: 22, end: 6, allowCrossMidnight: true }])]]
+        .map(([label, mk]) => { const r = throwOf(mk); return { label, ok: r.ok, cm: r.ok ? r.out.crossMidnight() : null }; });
+      const truthy = ['true', 1, []].map((v, i) => {
+        const val = i === 0 ? 'true' : v;
+        const r = throwOf(() => createShiftRules({ list: [{ name: '夜班', start: 22, end: 6 }], allowCrossMidnight: val }));
+        return { label: i === 0 ? '\'true\'' : JSON.stringify(v), rejected: !r.ok && r.err.constructor.name === 'TypeError' };
+      });
+      t.check('E131-5 取值域**闭合**：`true` 是**唯一**能开闸的取值 —— 段级/规则级 `true` 都放行且 ' +
+        '`crossMidnight() = {allowed:true,count:1,keys:[\'夜班 22-6\']}`；而**非布尔真值**' +
+        '（`\'true\'`／`1`／`[]`）一律被拒（与①/②同一把尺子）⇒ `开闸(v) === (v === true)`',
+        openTrue.every(x => x.ok && x.cm.allowed === true && x.cm.count === 1 &&
+          JSON.stringify(x.cm.keys) === JSON.stringify(['夜班 22-6'])) &&
+        truthy.every(x => x.rejected),
+        `开闸读数：${openTrue.map(x => `${x.label}=${JSON.stringify(x.cm)}`).join('；')}；` +
+        `非布尔真值被拒：${truthy.map(x => `${x.label}=${x.rejected}`).join('、')}`);
+    }
   }
 }
 

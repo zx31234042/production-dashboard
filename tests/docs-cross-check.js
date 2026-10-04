@@ -512,34 +512,106 @@ function main() {
    *  会在子进程跑完前后**消失**（`statSync` 直接 ENOENT，连读都读不到 → 实跑值恒为 null，
    *  表现为 `harness-check` 这类脚本"三次重试都拿不到汇总行"的假失败）。
    *  落在 `tests\._verify\` 根下则次次可读（实测 2/2 成功、8813 字节）。该目录已被 .gitignore 忽略。
-   *  `timeout` 是兜底：曾实测到子进程卡住不返回，没有它上游工具超时会打断整条命令。 */
-  const probe = (script) => {
+   *  `timeout` 是兜底：曾实测到子进程卡住不返回，没有它上游工具超时会打断整条命令。
+   *
+   *  **`E135`（2026-10-04）：超时值按脚本分档 ＋ 超时与"声明≠实跑"分开报** —— 两件事一起改，
+   *  因为它们的**症状同形、成因相反**：
+   *    · 旧实现是一个常量 `120000`，而各门禁耗时差两个数量级（`logic-check` 实测 133 ms
+   *      ↔ `harness-check` **空机**单跑 **84.1 s**，见 `C·21` 靶子③）⇒ 最重那条的余量只有 **1.43×**；
+   *      机器有负载（并发跑门禁、`--jobs N`）时复核探针会超时。
+   *    · 超时后被 `probeOne()` 记成"拿不到汇总行"，断言 6 判红、`actualOf` 回落到**旧账** ⇒
+   *      读者看到的像"**权威区漂移**"，于是去查一个**不存在**的漂移（`E110` 同族的"症状指向错方向"）。
+   *  ⇒ 两条修法：①**按脚本给余量**（下表：默认 300 s＝旧值 2.5×；最重的 `harness-check` 360 s
+   *  ＝对它 84.1 s 的 **4.28×** 余量，且**最坏墙钟与旧实现持平**，见下）；②把"**探针超时**"
+   *  （＝**前提不成立**：判据没能在预算内跑完被测脚本）与"**取不到汇总行**"（＝被测脚本真的没产出）
+   *  分开分类、分开计数、分开报（`classifyProbeE135()`／`probeShortfallNoteE135()` 是纯函数，
+   *  D22 复用同一份 ⇒ "变异后变红"能证伪这条断言）。
+   *
+   *  **超时不重试**（`nosummary` 仍重试到 3 次）：超时的成因是"机器忙/预算不够"，
+   *  重试既不改诊断、又会把最坏墙钟乘上重试次数（3×360 s ＝ 18 min）。**旧实现的最坏墙钟是
+   *  3×120 s ＝ 6 min**；现在超时只跑 1 次 ⇒ **6 min，与旧实现持平**，但换来"不再假报漂移"。
+   *  而"输出来不及落盘"那一类（子进程正常退出、汇总行没落盘）本来就表现为 `nosummary`，
+   *  重试语义**逐字保留**。
+   *
+   *  `DSH_DC_PROBE_TIMEOUT_MS`（**受控输入口**，与 `DSH_DC_*_OVERRIDE` 同口径）：设了就用它当
+   *  所有脚本的超时 —— 只为 `E135` 的 D22（把超时压到 1 ms，实测"报探针超时、不报权威漂移"），
+   *  正式运行不设 ⇒ 行为只由上面的表决定。
+   *  @param {string} script 脚本名（不含 .js）
+   *  @param {number} [overrideMs] 只作用于本次调用（D22 用；不落任何全局状态）
+   *  @returns {{code:?number, errCode:?string, out:string, timedOut:boolean, timeoutMs:number}} */
+  const PROBE_TIMEOUT_MS = {
+    default: 300000,
+    /* 唯一一条与"默认 300 s"不同的：它空机单跑就要 84.1 s（`C·21` 实测），余量必须给足。
+       其余离线门禁实测都在秒级/十秒级（`logic-check` 133 ms）⇒ 300 s 对它们是 30× 以上。 */
+    'harness-check': 360000
+  };
+  const PROBE_TIMEOUT_ENV = (() => {
+    const v = Number(process.env.DSH_DC_PROBE_TIMEOUT_MS);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  })();
+  const probeTimeoutFor = (script, overrideMs) => {
+    if (Number.isFinite(overrideMs) && overrideMs > 0) return overrideMs;
+    if (PROBE_TIMEOUT_ENV !== null) return PROBE_TIMEOUT_ENV;
+    return Object.prototype.hasOwnProperty.call(PROBE_TIMEOUT_MS, script)
+      ? PROBE_TIMEOUT_MS[script] : PROBE_TIMEOUT_MS.default;
+  };
+  const probe = (script, overrideMs) => {
+    const timeoutMs = probeTimeoutFor(script, overrideMs);
     const log = path.join(env.ensureDir(env.paths.verify), `docs-cross-${script}-${process.pid}.log`);
     const fd = fs.openSync(log, 'w');
     const r = spawnSync(process.execPath, [path.join(ROOT, 'tests', script + '.js')],
-      { cwd: ROOT, stdio: ['ignore', fd, fd], timeout: 120000 });
+      { cwd: ROOT, stdio: ['ignore', fd, fd], timeout: timeoutMs });
     try { fs.closeSync(fd); } catch { /* 忽略 */ }
     let out = '';
     try { out = fs.readFileSync(log, 'utf8'); } catch { out = ''; }
     try { fs.rmSync(log, { force: true }); } catch { /* 忽略 */ }
-    return { code: r.status, out, timedOut: r.error ? (r.error.code === 'ETIMEDOUT') : false };
+    return {
+      code: r.status,
+      errCode: r.error ? String(r.error.code || '') : null,
+      out, timeoutMs,
+      timedOut: r.error ? (r.error.code === 'ETIMEDOUT') : false
+    };
   };
 
   /**
-   * 单个脚本的实跑探针 + **最多两次重试**（第十一节用）。
+   * 单个脚本的实跑探针 + **重试**（第十一节用）。
    * 为什么要重试：本机上确有的一次拿不到汇总行的情形（同一台机器上还有别的门禁在并发跑，
-   * 子进程可能被挤到超时或输出来不及落盘）。**一次拿不到就报红是假失败**，
+   * 子进程可能被挤到"输出来不及落盘"）。**一次拿不到就报红是假失败**，
    * 会让人去查根本不存在的漂移；故重试两次，三次都拿不到才判"未覆盖"（那时是真有问题）。
+   *
+   * **`E135` 的改动（分类 ＋ 超时不重试）**：返回值不再只有"成功/失败"两态，而是带 `kind`：
+   *   · `ok`        ⇒ 拿到汇总行（`passed` 有效）；
+   *   · `timeout`   ⇒ 探针在预算内**没跑完**（`ETIMEDOUT`）＝**前提不成立**（机器忙/预算不够），
+   *                   **不是**"权威区写错了"⇒ **不重试**（重试不改诊断，只会把最坏墙钟乘上次数）；
+   *   · `nosummary` ⇒ 子进程正常退出（或退出码非 0）但**没产出可解析的汇总行** ⇒ 仍重试到 3 次。
+   * 两类都仍然**判红**（取不到实跑值不得静默放过，`D19/D21/D23`），但**报的话不一样**：
+   * 前者报"探针超时（前提不成立）"，后者报"未取到汇总行" —— 见 `probeShortfallNoteE135()`。
    * @param {string} script 脚本名（不含 .js）
-   * @returns {{passed:number,attempts:number}|null}
+   * @param {number} [overrideMs] 只作用于本次调用（D22 用）
+   * @returns {{kind:'ok'|'timeout'|'nosummary', passed?:number, attempts:number, timeoutMs:number}}
    */
-  const probeOne = (script) => {
+  const classifyProbeE135 = (r) => {
+    const s = summaryOf(r && r.out);
+    if (s) return { kind: 'ok', passed: s.passed };
+    if (r && r.timedOut) return { kind: 'timeout' };
+    return { kind: 'nosummary' };
+  };
+  /** 两类"取不到实跑值"的**文案**（纯函数：D22 复用它 ⇒ "报的是超时、不是漂移"可证伪）。 */
+  const probeShortfallNoteE135 = (name, kind, timeoutMs) => (kind === 'timeout'
+    ? `${name}（**探针超时**：预算 ${timeoutMs} ms 内没跑完 ⇒ **前提不成立**，` +
+      '**不是"权威区漂移"** —— 先看机器负载/并发，或 `--fast` 刷新账本后重跑）'
+    : `${name}（实跑未产出可解析的汇总行）`);
+  const probeOne = (script, overrideMs) => {
+    let last = { kind: 'nosummary', attempts: 0, timeoutMs: probeTimeoutFor(script, overrideMs) };
+    const maxAttempts = (kind) => (kind === 'timeout' ? 1 : 3);   /* 超时不重试，理由见抬头 */
     for (let attempt = 1; attempt <= 3; attempt++) {
-      const r = probe(script);
-      const s = summaryOf(r.out);
-      if (s) return { passed: s.passed, attempts: attempt };
+      const r = probe(script, overrideMs);
+      const c = classifyProbeE135(r);
+      last = { ...c, attempts: attempt, timeoutMs: r.timeoutMs };
+      if (c.kind === 'ok') return last;
+      if (attempt >= maxAttempts(c.kind)) return last;
     }
-    return null;
+    return last;
   };
 
   /** 说明：`run-totals.json` 里"断言合计"的那本账，**本脚本不做比对** ——
@@ -584,11 +656,17 @@ function main() {
       : `权威值「${authStr}」未被引用：${staleDocs.map(d => d[0]).join('、')}`);
 
   /* ③ 与实跑对齐：权威区关于"扫描文件数 / 覆盖率分类"的数字必须等于对应脚本的真实输出 */
+  /* `E135`（2026-10-04）：本节三条探针的读数也把"**探针超时**"这一**前提不成立**的事实跟着报出来 ——
+     否则 1 ms 受控变异（或真有负载时）读者只看到"实跑=null"，会去猜"是不是权威值写错了"。
+     正常预算下 `files-check`／`trace-check` 实测都在秒级（默认 300 s）⇒ 这条注记平时一个字符都不出现。 */
+  const probeNote10 = (r) => (r && r.timedOut
+    ? `｜**探针超时**（预算 ${r.timeoutMs} ms 内没跑完 ⇒ **前提不成立**，**不是"权威值漂移"**）` : '');
   const fcRun = probe('files-check');
   const fcScanned = numeric.matchNumber(fcRun.out, /扫描\s*\*{0,2}(\d+)\*{0,2}\s*个文本文件/);
   const fcStated = numeric.matchNumber(readmeSrc, /扫描\s*\*\*(\d+)\*\*\s*个文本文件/);
   t.check('权威区"扫描 N 个文本文件"＝ files-check 实跑值',
-    fcScanned !== null && fcStated === fcScanned, `README=${fcStated}，实跑=${fcScanned}`);
+    fcScanned !== null && fcStated === fcScanned,
+    `README=${fcStated}，实跑=${fcScanned}` + probeNote10(fcRun));
 
   const trRun = probe('trace-check');
   /* README 的写法是 `按类别：…、**ENV 4/20**`；trace-check 输出是 `ENV 6 / 20`。
@@ -598,7 +676,7 @@ function main() {
   t.check('权威区的 ENV 覆盖率分类＝ trace-check 实跑值',
     readmeEnv.length === 2 && traceEnv.length === 2 &&
     readmeEnv[0] === traceEnv[0] && readmeEnv[1] === traceEnv[1],
-    `README=ENV ${readmeEnv.join('/')}，实跑=ENV ${traceEnv.join('/')}`);
+    `README=ENV ${readmeEnv.join('/')}，实跑=ENV ${traceEnv.join('/')}` + probeNote10(trRun));
 
   /* README 写法：`可追溯覆盖 162 条（63.0%）`；不写"162/257"那种形式，故按"条"取分子 */
   const readmeCov = [
@@ -609,7 +687,7 @@ function main() {
   t.check('权威区的可追溯覆盖率＝ trace-check 实跑值（分子与条款总数都比）',
     readmeCov[0] !== null && readmeCov[1] !== null && traceCov.length === 2 &&
     readmeCov[0] === traceCov[0] && readmeCov[1] === traceCov[1],
-    `README=${readmeCov.join(' / ')}，实跑=${traceCov.join(' / ')}`);
+    `README=${readmeCov.join(' / ')}，实跑=${traceCov.join(' / ')}` + probeNote10(trRun));
 
   /* 逐项分类数也要比 —— 只比分子/分母会漏掉"分类写错"（本轮我就把 backend-phase 写成 60、
      declared-gap 写成 12，而实跑是 57/13；当时无断言，靠人工回读才发现）。 */
@@ -626,7 +704,7 @@ function main() {
     .map(([name, doc, actual]) => `${name}: README=${doc} 实跑=${actual}`);
   t.check('权威区的各分类条数＝ trace-check 实跑值（逐项比，不只比总数）',
     pairs.length >= 4 && mismatched.length === 0,
-    mismatched.length ? mismatched.join('；') : `逐项一致（${pairs.map(([n, d]) => `${n}=${d}`).join('、')}）`);
+    (mismatched.length ? mismatched.join('；') : `逐项一致（${pairs.map(([n, d]) => `${n}=${d}`).join('、')}）`) + probeNote10(trRun));
 
   /* 离线可验证覆盖率与"依赖不可运行脚本"的条数也要比（P3-10 新增的口径） */
   const readmeOffline = numeric.matchNumber(readmeSrc, /离线可验证\s*(\d+)\s*条/);
@@ -635,7 +713,7 @@ function main() {
   const traceOnlineOnly = numeric.matchNumber(trRun.out, /依赖需浏览器权限的脚本\s*(\d+)\s*条/);
   t.check('权威区的"离线可验证覆盖率"与"依赖浏览器脚本条数"＝ trace-check 实跑值',
     readmeOffline === traceOffline && readmeOnlineOnly === traceOnlineOnly,
-    `离线 README=${readmeOffline}/实跑=${traceOffline}；依赖 README=${readmeOnlineOnly}/实跑=${traceOnlineOnly}`);
+    `离线 README=${readmeOffline}/实跑=${traceOffline}；依赖 README=${readmeOnlineOnly}/实跑=${traceOnlineOnly}` + probeNote10(trRun));
 
   /* ---------------- 十一、权威区逐脚本条数 ＝ 实跑值（2026-09-20 新增，P2-2） ----------------
      立案症状（架构评审 A-2026-09-20-01 P2-2）：权威区自己写着"本节数字为权威值"，第十节也做了
@@ -827,6 +905,8 @@ function main() {
    */
   const actualProbe = {};       // 脚本名 → 实跑探针拿到的通过数（仅"冲突复核 / 账本不覆盖"的脚本）
   const probeFailures = [];     // 跑了但拿不到汇总行的（不得静默放过）
+  const probeTimeouts = [];     // `E135`：跑了但**超时**的（前提不成立，**不是**权威区漂移）
+  const probeFailed = {};       // 脚本名 → 'timeout' | 'nosummary'（断言 1/2 据此**不判漂移**）
   const probedNames = [];       // 实跑过的脚本名（含冲突复核与账本不覆盖两类）
   const rechecked = [];         // 其中"因声明 ≠ 账而复核"的脚本名
   const sourceOf = {};          // 脚本名 → 最终取数来源（'ledger' | 'probe'）
@@ -843,8 +923,17 @@ function main() {
       probedNames.push(name);
       if (logged !== undefined) rechecked.push(name);           // ② 声明 ≠ 账 → 冲突复核
       const re = probeOne(name);                                // ②/③ 实跑
-      if (re) { actualProbe[name] = re.passed; sourceOf[name] = 'probe'; }
-      else probeFailures.push(`${name}（实跑未产出可解析的汇总行）`);
+      if (re && re.kind === 'ok') {
+        actualProbe[name] = re.passed; sourceOf[name] = 'probe';
+      } else {
+        /* `E135`：**两类分开记**。超时＝前提不成立（机器忙/预算不够）⇒ 报"探针超时"；
+           nosummary＝被测脚本自己没产出 ⇒ 报"未取到汇总行"。两者都**仍然判红**（取不到不得静默放过），
+           但**不许**再被读成"权威区漂移"。 */
+        const kind = re ? re.kind : 'nosummary';
+        probeFailed[name] = kind;
+        if (kind === 'timeout') probeTimeouts.push(probeShortfallNoteE135(name, kind, re.timeoutMs));
+        else probeFailures.push(probeShortfallNoteE135(name, kind));
+      }
     }
     return Date.now() - startedAt;
   })();
@@ -885,16 +974,28 @@ function main() {
 
 
   /* ---- 断言 1：逐脚本清单形式 ---- */
+  /* `E135`（2026-10-04）：把"声明 vs 实跑"的失配判定抽成**纯函数**，让"探针超时**不算**漂移"这件事
+     可被 D22 定点证伪。语义与旧写法**逐字相同**，只多一条前置：**前提不成立（探针超时/取不到汇总行）
+     ⇒ 不产出失配项**（它由断言 6 按"探针超时/未取到汇总行"报红 —— **不静默放过，也不误报漂移**）。
+     为什么必须分开：超时是"判据没能在预算内跑完被测脚本"，与"权威区写错了"是**成因相反**的两件事；
+     旧写法把前者记成"拿不到汇总行"、再让 `actualOf` 回落到旧账 ⇒ 输出读起来像"权威区漂移"（`E110` 同族）。 */
+  const declaredMismatchE135 = (label, declared, actual, ctx) => {
+    if (ctx.selfRef || actual === undefined) return null;
+    if (ctx.envSkipped) return null;                 /* E55：无 git 时这两个脚本不参与按数比对 */
+    if (ctx.probeFailed) return null;                /* `E135`：前提不成立 ⇒ 不在此判"漂移"（见断言 6） */
+    if (declared === actual) return null;
+    return `${label}：声明 ${declared} ≠ 实跑 ${actual}` +
+      (ctx.rechecked ? '（账本值亦不符，已实跑复核确认）' : '（取自本轮账）');
+  };
   const notDeclared = offlineGates.filter(n => !nameDeclarations.has(n));
   const mismatchedNamed = [];
   for (const [name, d] of nameDeclarations) {
     /* 自指脚本跳过；其余"拿不到任何实跑值"的由断言 6 报"未覆盖"，此处不猜也不硬比 */
-    if (name === SELF_REF || actualOf(name) === undefined) continue;
-    if (envSkipped.includes(name)) continue;   /* E55：无 git 时这两个脚本不参与按数比对 */
-    if (d.declared !== actualOf(name)) {
-      mismatchedNamed.push(`${name}：声明 ${d.declared} ≠ 实跑 ${actualOf(name)}` +
-        (recheckNames.includes(name) ? '（账本值亦不符，已实跑复核确认）' : '（取自本轮账）'));
-    }
+    const msg = declaredMismatchE135(name, d.declared, actualOf(name), {
+      selfRef: name === SELF_REF, envSkipped: envSkipped.includes(name),
+      probeFailed: Boolean(probeFailed[name]), rechecked: recheckNames.includes(name)
+    });
+    if (msg) mismatchedNamed.push(msg);
   }
   t.check('权威区逐脚本清单声明的条数 ＝ 各脚本实跑通过数',
     nameDeclarations.size > 0 && notDeclared.length === 0 && mismatchedNamed.length === 0,
@@ -908,12 +1009,12 @@ function main() {
   /* ---- 断言 2：脚本表里的**中文形式**条数（与形式①是两处不同的文字，必须都比） ---- */
   const cpMismatch = [];
   for (const [name, d] of tableDeclarations) {
-    if (name === SELF_REF || actualOf(name) === undefined) continue;
-    if (envSkipped.includes(name)) continue;   /* E55：无 git 时这两个脚本不参与按数比对 */
-    if (d.declared !== actualOf(name)) {
-      cpMismatch.push(`${name}（${d.form}）：声明 ${d.declared} ≠ 实跑 ${actualOf(name)}` +
-        (recheckNames.includes(name) ? '（账本值亦不符，已实跑复核确认）' : '（取自本轮账）'));
-    }
+    /* `E135`：同断言 1 —— 前提不成立（探针超时/取不到汇总行）不在此判"漂移"（由断言 6 报） */
+    const msg = declaredMismatchE135(`${name}（${d.form}）`, d.declared, actualOf(name), {
+      selfRef: name === SELF_REF, envSkipped: envSkipped.includes(name),
+      probeFailed: Boolean(probeFailed[name]), rechecked: recheckNames.includes(name)
+    });
+    if (msg) cpMismatch.push(msg);
   }
   t.check('权威区脚本表里"中文形式"的逐脚本条数 ＝ 各脚本实跑通过数',
     tableDeclarations.size >= 4 && cpMismatch.length === 0,
@@ -962,14 +1063,62 @@ function main() {
     actualOf(n) === undefined);
   const ledgerUsedAll = offlineGates.filter(n => n !== SELF_REF && declaredOf(n) !== null &&
     sourceOf[n] === 'ledger').length;
-  t.check('每个有声明的离线门禁都拿到了实跑值（取不到即红，不静默放过）',
-    (ledgerUsedAll + probedNames.length) > 0 && cannotVerify.length === 0 && probeFailures.length === 0,
+  t.check('每个有声明的离线门禁都拿到了实跑值（取不到即红，不静默放过）—— 且**两类"取不到"分开报**：' +
+    '「**探针超时**」＝前提不成立（机器忙/预算不够），「取不到汇总行」＝被测脚本真没产出；' +
+    '前者**绝不许**被读成"权威区漂移"（`E135`）',
+    (ledgerUsedAll + probedNames.length) > 0 && cannotVerify.length === 0
+      && probeFailures.length === 0 && probeTimeouts.length === 0,
     `取到实跑值 ${ledgerUsedAll + probedNames.length} 个` +
-    `（账本 ${ledgerUsedAll} 个 ＋ 实跑复核 ${probedNames.length} 个：${probedNames.join('、') || '无'}）` +
-    `，拿不到汇总行 ${probeFailures.length} 个` +
+    `（账本 ${ledgerUsedAll} 个 ＋ 实跑 ${probedNames.length} 个：${probedNames.join('、') || '无'}）` +
+    `，**探针超时 ${probeTimeouts.length} 个**` + (probeTimeouts.length ? `：${probeTimeouts.join('；')}` : '') +
+    `，取不到汇总行 ${probeFailures.length} 个` +
     (probeFailures.length ? `：${probeFailures.join('、')}` : '') +
+    `｜超时预算（按脚本分档）：默认 ${PROBE_TIMEOUT_MS.default} ms` +
+    (offlineGates.filter(n => Object.prototype.hasOwnProperty.call(PROBE_TIMEOUT_MS, n)).length
+      ? `、` + offlineGates.filter(n => Object.prototype.hasOwnProperty.call(PROBE_TIMEOUT_MS, n))
+        .map(n => `${n} ${PROBE_TIMEOUT_MS[n]} ms`).join('、')
+      : '') +
+    (PROBE_TIMEOUT_ENV !== null ? `；⚠ 本次由 \`DSH_DC_PROBE_TIMEOUT_MS=${PROBE_TIMEOUT_ENV}\` 覆盖（只用于受控 D22）` : '') +
     (cannotVerify.length ? `｜**未覆盖清单**（有声明却既不在账里、也没实跑出值）：${cannotVerify.join('、')}` : '') +
     `｜run-totals.json ${totals.ok ? '可读（快路径数据源）' : '不可用：' + totals.why}`);
+
+  /* ---- `E135` D22（可证伪）：把超时压到 1 ms（**受控**：只作用于这一次调用）⇒ 必须报"探针超时"，
+     而**不是**"权威漂移"。四组读数缺一不可：①真实 1 ms 超时 → `ETIMEDOUT` ＋ `kind==='timeout'`；
+     ②合成 `{timedOut:true}` → `timeout`；③合成"正常退出但无汇总行" → `nosummary`（**两类不许混**）；
+     ④文案断言：超时那条含"探针超时"且**不含**"漂移"；⑤`declaredMismatchE135()` 在"前提不成立"时
+     **不产出失配项**（⇒ 症状不会再指向权威区），而在同一组数字下把前提恢复 ⇒ 失配项**照旧产出**
+     （⇒ 不是把判据弄成恒不报）。 */
+  {
+    const tinyRun = probe('files-check', 1);
+    const tinyCls = classifyProbeE135(tinyRun);
+    const synthTimeout = classifyProbeE135({ out: '', timedOut: true, timeoutMs: 1 });
+    const synthNoSum = classifyProbeE135({ out: '（子进程正常退出，但没有汇总行）', timedOut: false });
+    const synthOk = classifyProbeE135({ out: '通过 7 项，失败 0 项，跳过 0 项', timedOut: false });
+    const timeoutNote = probeShortfallNoteE135('harness-check', 'timeout', 1);
+    const noSumNote = probeShortfallNoteE135('harness-check', 'nosummary', 1);
+    const ctxBase = { selfRef: false, envSkipped: false, rechecked: true };
+    const asProbeFailed = declaredMismatchE135('harness-check', 391, 300, { ...ctxBase, probeFailed: true });
+    const asRealMismatch = declaredMismatchE135('harness-check', 391, 300, { ...ctxBase, probeFailed: false });
+    t.check('E135 D22（可证伪）：超时预算压到 **1 ms**（受控，只作用于本次调用）⇒ 探针必报 `ETIMEDOUT` 且被分类为' +
+      '**「探针超时」**（前提不成立），与「取不到汇总行」**分开**；超时那条文案**明说"不是权威区漂移"**且' +
+      '**不含任何失配话术**（无 `声明 N ≠ 实跑 M`、无"请同步 tests\\README.md"）；' +
+      '同一组"声明 391 ≠ 实跑 300"的数字，在前提不成立时**不产出失配项**、前提恢复后**照旧产出**（⇒ 不是恒不报）',
+      tinyRun.timedOut === true && tinyRun.errCode === 'ETIMEDOUT' && tinyCls.kind === 'timeout'
+        && synthTimeout.kind === 'timeout' && synthNoSum.kind === 'nosummary'
+        && synthOk.kind === 'ok' && synthOk.passed === 7
+        && timeoutNote.includes('探针超时') && /不是[^。]{0,8}权威区漂移/.test(timeoutNote)
+        && !/声明\s*\d+\s*≠/.test(timeoutNote) && !timeoutNote.includes('请同步')
+        && noSumNote.includes('未产出可解析的汇总行')
+        && asProbeFailed === null && asRealMismatch !== null && asRealMismatch.includes('声明 391 ≠ 实跑 300'),
+      `1 ms 实跑：timedOut=${tinyRun.timedOut}、errCode=${tinyRun.errCode}、分类=${tinyCls.kind}（应 timeout；预算 ${tinyRun.timeoutMs} ms）；` +
+      `合成三类分类＝${synthOk.kind}/${synthTimeout.kind}/${synthNoSum.kind}（应 ok/timeout/nosummary，通过数 ${synthOk.passed}）；` +
+      `超时文案＝"${timeoutNote}"（含"探针超时"=${timeoutNote.includes('探针超时')}、` +
+      `含"不是…权威区漂移"=${/不是[^。]{0,8}权威区漂移/.test(timeoutNote)}、含失配话术=${/声明\s*\d+\s*≠/.test(timeoutNote)}）；` +
+      `"未取到汇总行"文案＝"${noSumNote}"；` +
+      `前提不成立时失配项=${asProbeFailed === null ? 'null（不判漂移）' : asProbeFailed}；` +
+      `前提恢复后失配项=${asRealMismatch === null ? 'null（**异常**）' : asRealMismatch}` +
+      `；探针日志已删=${!fs.existsSync(path.join(env.paths.verify, `docs-cross-files-check-${process.pid}.log`))}`);
+  }
 
   /* ---- 断言 7（2026-09-20 T-20260920-10 新增）：取数**不得留空** ----
      新增这条是为了给"快路径"本身加护栏：改造后"取数"多了一条分支（账本），而分支越多越容易
@@ -1117,6 +1266,110 @@ function main() {
       `变异体 sha256=${mutSha ? mutSha.slice(0, 12) + '…' : '（无）'}；` +
       `变异后失配 ${mutTri ? mutTri.findings.length : '（无）'} 条：` +
       `${mutTri ? mutTri.findings.join('；') : ''}｜盘上权威行逐字未变=${diskAuth === authLine}`);
+  }
+
+  /* ---- 断言 10（`E136`，2026-10-04）：三只**浏览器/长跑**脚本的**通过数**逐脚本判据（**只读账本**） ----
+     立案（座位 5 的 `C·21` 靶子③顺带报出、主代理登记）：`offlineGates` 只含 `!needBrowser` ⇒
+     `browser-check`／`overlap-check`／`stress-check` 的**通过数**在本节**没有任何逐脚本判据**
+     （下面断言 8 的 `tripleAudit` 虽遍历**全量** `SUITES`，但只比"**失败数／跳过数**"两位）。
+     **实测**：把主账本里 `browser-check` 的 `passed` 从 33 改成 99，本节仍 **79/0/0 全绿** ⇒
+     "权威区声明"与"实跑"之间对这三条**只剩合计级保护**（`sumListed ≤ statedTotal` ＋ `run-all` 收尾合计）。
+     为什么这三条只做"**只读账本**"的判据（**故意不实跑**）：
+       · 它们是**浏览器/CDP/长跑**脚本（`stress-check` 默认就跑 5 分钟）—— 为了核一个数字去起浏览器、
+         跑 5 分钟长跑，是拿"判据的成本"去换"它要防的风险"（`E52`：一轮收口只跑一次全量）；
+       · 它们在 `run-all` 的 `serialTail` 里排在**本脚本之后** ⇒ **本轮**账本**天然不含**它们
+         （`run-totals.json` 是"每跑完一条就落盘"的增量账）。故判据只在"账本里**有**该脚本条目"时比 ——
+         这正是 `D20` 的边界：**账本覆盖不到 ⇒ 本轮不可比**（点名、**不判 FAIL**、**也不计入已核对**，
+         与断言 8 的 `unmet` 同口径）。**不许装绿**：`已核对 ＋ 不可比 === 应有值`（一个都不许消失）。
+     为什么"账本里有且**数不符** ⇒ **必红**"（而不是也记"不可比"）：账本里那份数只可能来自某次
+     **全量**轮（`--fast` 不写这三条），它与权威区声明不符就是**真漂移**（`D19`／`D21`／`D23`：
+     判据强度**不许降**）；要消除它只需再跑一次**全量**轮刷新账本（不是改判据去迎合）。 */
+  const browserGatesE136 = (SUITES_READ || []).filter(s => s.needBrowser).map(s => s.name);
+  const browserDeclOfE136 = (nm) => nameDecl(nm, [{ text: authLine, from: '权威区逐脚本清单' },
+    { text: readmeSrc, from: 'tests/README.md 全文' }]);
+  /** 判据本体（**纯函数**：D22 复用它 ⇒ "变异后变红"能证伪这条断言）。 */
+  const browserLedgerAuditE136 = (declOf, sumOfName) => {
+    const findings = [];
+    const covered = [];
+    const unmet = [];
+    for (const nm of browserGatesE136) {
+      const d = declOf(nm);
+      if (!d) { findings.push(`${nm}：权威区里解析不出 \`通过/失败\` 声明`); continue; }
+      const sum = sumOfName(nm);
+      /* `D20`：账本覆盖不到 ⇒ **本轮不可比**（它们在 `serialTail` 里排在本脚本之后，属正常形态） */
+      if (!sum) { unmet.push(`${nm}（本轮账本无该脚本条目）`); continue; }
+      covered.push(nm);
+      if (d.declared !== sum.passed) {
+        findings.push(`${nm}：权威区写 **${d.declared} 通过** ≠ 账本 ${sum.passed}（**通过数逐脚本漂移**；` +
+          `该数只来自全量轮，故它就是真漂移 —— 重跑一次全量轮刷新账本，不要改判据）`);
+      }
+    }
+    return { findings, covered, unmet };
+  };
+  {
+    const brAudit = browserLedgerAuditE136(browserDeclOfE136, nm => ledgerSummary[nm]);
+    t.check('E136 三只**浏览器/长跑**脚本的**通过数**逐脚本对账（**只读账本**，不实跑）：权威区声明的通过数 = ' +
+      '`run-totals.json` 里该脚本的 `passed`；**账本覆盖不到 ⇒ 按 `D20` 报"本轮不可比"并点名**' +
+      '（不判 FAIL、也不计入已核对）；`已核对 ＋ 不可比 === 应有值`（**不许装绿**）',
+      browserGatesE136.length > 0 && brAudit.findings.length === 0
+        && brAudit.covered.length + brAudit.unmet.length === browserGatesE136.length,
+      (brAudit.findings.length ? `**失配 ${brAudit.findings.length} 条**：${brAudit.findings.join('；')}`
+        : `逐脚本一致（${brAudit.covered.map(n => `${n}=${ledgerSummary[n].passed}/${ledgerSummary[n].failed}/${ledgerSummary[n].skipped}`).join('、') || '（无可比项）'}）`) +
+      `｜**已核对 ${brAudit.covered.length}／${browserGatesE136.length} 个**` +
+      `｜**本轮不可比 ${brAudit.unmet.length} 个**：${brAudit.unmet.join('、') || '（无）'}` +
+      `｜声明：${browserGatesE136.map(n => { const d = browserDeclOfE136(n); return `${n}=${d ? d.declared : '（解析不到）'}`; }).join('、')}` +
+      `｜账本 ${totals.ok ? `可读（${path.relative(env.paths.root, totals.file)}）` : '不可用：' + totals.why}`);
+    if (brAudit.unmet.length) {
+      t.info(`§11「E136 浏览器/长跑脚本通过数」**本轮不可比 ${brAudit.unmet.length} 个**（账本不含该脚本条目 ⇒ ` +
+        '不判 FAIL、**也不计入已核对**）：' + brAudit.unmet.join('、') +
+        ' —— 它们在 `run-all.__serialTail` 里排在 `docs-cross-check` **之后**，本轮账天然不含它们（`--fast` 形态同理）；' +
+        '权威对账由 `run-all` 收尾按**全量** SUITES 判定（与 `E50`／`E112` 同口径）');
+    }
+    /* `E136` 的 D22：**内存变异账本副本**（不改盘上 `run-totals.json`）——
+       ㈠把某只脚本的 `passed` 改错 ⇒ **必红并指名它**；㈡把它置空 ⇒ **从"已核对"移到"不可比"**
+       （两侧各变 1、总数不变）⇒ 证明"覆盖不足"既不判 FAIL、也不装绿。**两种账本语境都成立**。 */
+    /* `E136` 的 D22：用**完全受控的合成三元组**（**不依赖盘上账本的当前状态** ⇒ 基线一定干净），
+       复用**同一个纯函数** `browserLedgerAuditE136()` ⇒ "变异后变红并指名"能证伪这条断言。
+       ⚠ 为什么不用"改盘上账本的那一个数"当判据（**实测踩过**）：若账本本身已经被外部改脏（或有真漂移），
+       `target` 的基线**本来就红**，"变异后恰多 1 条"这条差集判据就不成立 —— 那会把"判据可证伪"
+       与"账本恰好干净"两件事焊在一起。⇒ 判据用合成输入，**真实账本**再各做一次同样的内存变异，
+       只作读数留痕（差集为 0 时说明"账本本来就红"，如实打印、不判红）。 */
+    const targetE136 = brAudit.covered[0] || browserGatesE136[0];
+    const baseE136 = ledgerSummary[targetE136];
+    const synthDeclE136 = (nm) => ({ declared: nm === targetE136 ? 33 : 7, failed: 0, skipDeclared: 0, from: '（合成三元组）' });
+    const synthSumE136 = (nm) => ({ passed: nm === targetE136 ? 33 : 7, failed: 0, skipped: 0 });
+    const synthBaseE136 = browserLedgerAuditE136(synthDeclE136, synthSumE136);
+    const synthMutE136 = browserLedgerAuditE136(synthDeclE136,
+      (nm) => (nm === targetE136 ? { passed: 99, failed: 0, skipped: 0 } : synthSumE136(nm)));
+    const synthHideE136 = browserLedgerAuditE136(synthDeclE136,
+      (nm) => (nm === targetE136 ? undefined : synthSumE136(nm)));
+    const mutSumE136 = (nm) => (nm === targetE136
+      ? { passed: (baseE136 ? baseE136.passed : 0) + 66, failed: 0, skipped: 0 }
+      : ledgerSummary[nm]);
+    const hideSumE136 = (nm) => (nm === targetE136 ? undefined : ledgerSummary[nm]);
+    const mutAuditE136 = browserLedgerAuditE136(browserDeclOfE136, mutSumE136);
+    const hideAuditE136 = browserLedgerAuditE136(browserDeclOfE136, hideSumE136);
+    const diskLedgerShaE136 = require('node:crypto').createHash('sha256')
+      .update(totals.ok ? fs.readFileSync(totals.file) : Buffer.from('')).digest('hex').slice(0, 12);
+    t.check('E136 D22（可证伪）：用**受控合成三元组**（不依赖盘上账本的当前状态）把某只浏览器/长跑脚本的' +
+      '通过数改错（`33 ⇒ 99`）⇒ 本判据**必红并指名它**（恰 1 条）；把它置空 ⇒ 该项**从"已核对"移到"不可比"**' +
+      '（`已核对＋不可比` 总数不变）⇒ `D20` 边界两边都不装绿；判据复用的是**同一个纯函数**；' +
+      '盘上账本**逐字节未变**（全程只读它，不写它）',
+      synthBaseE136.findings.length === 0 && synthBaseE136.covered.length === browserGatesE136.length
+        && synthMutE136.findings.length === 1
+        && synthMutE136.findings[0].includes(targetE136) && synthMutE136.findings[0].includes('通过数逐脚本漂移')
+        && synthMutE136.covered.length + synthMutE136.unmet.length === browserGatesE136.length
+        && !synthHideE136.covered.includes(targetE136)
+        && synthHideE136.unmet.some(x => x.startsWith(targetE136)) && synthHideE136.findings.length === 0
+        && synthHideE136.covered.length + synthHideE136.unmet.length === browserGatesE136.length,
+      `合成基线：失配 ${synthBaseE136.findings.length} 条／已核对 ${synthBaseE136.covered.length}（应 0／${browserGatesE136.length}）；` +
+      `合成变异（33 ⇒ 99）：失配 ${synthMutE136.findings.length} 条 ⇒ ${synthMutE136.findings.join('；') || '（无，异常）'}；` +
+      `合成置空：已核对 ${synthHideE136.covered.length}／不可比 ${synthHideE136.unmet.length}（总数 ${browserGatesE136.length} 不变）、` +
+      `已移入不可比=${!synthHideE136.covered.includes(targetE136)}；` +
+      `【真实账本读数（只留痕、不判红）】基线失配 ${brAudit.findings.length} 条（正常 = 0，由上面那条主断言判）；` +
+      `内存改「${targetE136} 的 passed ⇒ ${(baseE136 ? baseE136.passed : 0) + 66}」后失配 ${mutAuditE136.findings.length} 条、` +
+      `置空后已核对 ${hideAuditE136.covered.length}／不可比 ${hideAuditE136.unmet.length}；` +
+      `盘上账本 sha256=${diskLedgerShaE136}…（D22 的变异只作用于内存访问器，不落盘）`);
   }
 
   /* ---- 自指排除的如实交代：docs-cross-check 自身的声明值不在本节比对范围内 ---- */

@@ -8846,6 +8846,334 @@ t.section('十九、E86①／ADR-0007 登录接线的端到端判据（真子进
   }
 }
 
+/* ---------------- 二十、`E13` 定点回归（`E133`，2026-10-04）：`stripInlineMarkup()`／`scanPairContent()` ----------------
+   立案（`E133`，座位 5 在 `C·21` 第 1 条报出）：`tests\docs-check.js:698` 把这两个纯函数**显式导出**、
+   而 `:692` 的注释写着"**供定点回归在进程内直接调用**" —— 全仓（受管面）**没有任何断言调用它们**
+   （只有 `docs-check` 自己的定义、自用与导出）⇒ 与 `C·20` 的 `F-2`（`pickDetailLines`／`resolveLedgerFile`
+   零调用）**同形**：**注释声称的守据不存在**。危害不是"少几条断言"，而是 `E13` 的"已修复"
+   **不可回潮检测**：把 `stripInlineMarkup()` 改成不剥（或改宽成"多剥"）、把 `scanPairContent()` 的
+   `body.includes(…)` 改松，**门禁全绿**；而 `E13` 的立案事实正是"内联代码让同源断言由 41/2 → 40/3"。
+   为什么落在 `harness-check` 而不是 `docs-check`：`docs-check` 的条数是**权威区已登记的口径**
+   （46/2，其中 2 条是 6.4 已登记的历史提交偏差），往里塞断言会连带改权威数字与 `run-all` 的合计对账；
+   而"给测试基建补定点回归"本来就是本脚本（**夹具自检**）的职责 —— `E109` 的先例（纯函数真值表）就在本文件。
+
+   判据来源（**实测决定，不猜**）：`tools\md2docx.ps1` 的 `InlinePattern()`（`:175-177`）**只认**
+   `` `代码` `` 与 `**粗体**`，`Runs()`（`:205-216`）把定界符丢掉、只写内容；`*斜体*`／`_下划线_`／
+   `~~删除线~~` **不在**该正则里 ⇒ 定界符**原样进 docx**（`E13` 行给的建议②就是按这个事实剥标记）。
+   本次我**自己复跑**了取证探针 `tests\._verify\t20261004-09\probe-multi-tick.js`（真跑 `md2docx.ps1`
+   再读 `word/document.xml` 的 Heading 段），四组读数与 `stripInlineMarkup()` **逐字一致**：
+     · 紧邻 ``` ``a`b`` ```    ⇒ docx `a`b`       ｜本函数 `a`b`
+     · 松散 ``` `` a`b `` ```  ⇒ docx ` a`b `     ｜本函数 ` a`b `
+     · 三反引号 ``` ```x``` ```⇒ docx `x`          ｜本函数 `x`
+     · 双反引号 `` ``xy`` ``   ⇒ docx `xy`         ｜本函数 `xy`
+   （⚠ **探针的打印缺陷一并留痕**：它只按"Heading 段的序号"对齐变体，而把 **H1 标题**也数进了 Heading
+   ⇒ 打印出来的"工具读数"**错位一行**，于是每组都打印"【不一致】"。**错位是探针的打印缺陷、不是函数
+   不一致** —— 上面四组是我按"H1 偏移 -1"重新对齐后的真读数。不修那支探针：它是本次的取证实物。）
+   来源：`E133`（2026-10-04）。 */
+t.section('二十、`E13` 定点回归（`E133`）：`docs-check` 两个纯函数的真值表 ＋ D22');
+{
+  const Module20 = require('node:module');
+  const crypto20 = require('node:crypto');
+  const sha20 = (b) => crypto20.createHash('sha256').update(b).digest('hex');
+  const dcPath = path.join(env.paths.tests, 'docs-check.js');
+  const dcBytes0 = fs.readFileSync(dcPath);
+  const dcSha0 = sha20(dcBytes0);
+  const dcText0 = dcBytes0.toString('utf8');
+  const dc = require('./docs-check');           /* `require` 走 `require.main !== module` 的早退 ⇒ 不跑它的门禁 */
+  const strip = dc.stripInlineMarkup;
+  const scanPairs = dc.scanPairContent;
+  const T = String.fromCharCode(96);            /* 反引号：样本一律**拼接构造**（本节自己不出现裸的反引号字面量） */
+
+  /* ① 反引号**必剥**（`E13` 的原病灶：标题里的内联代码） */
+  const tickCases = [
+    ['A' + T + 'B' + T + 'C', 'ABC'],
+    ['关键参数上传（' + T + 'PARAM_INFO_RECV' + T + '）', '关键参数上传（PARAM_INFO_RECV）'],
+    [T + 'code' + T, 'code']
+  ];
+  const tickBad = tickCases.filter(([inp, want]) => strip(inp) !== want)
+    .map(([inp, want]) => `${JSON.stringify(inp)} ⇒ ${JSON.stringify(strip(inp))}（应 ${JSON.stringify(want)}）`);
+  t.check('E133-① 反引号**必剥**（真值表 3 组）：`` `代码` `` 的定界符必须消失、**内容逐字保留** —— ' +
+    '这正是 `E13` 的原病灶（标题里的内联代码让同源断言 41/2 → 40/3）',
+    tickBad.length === 0,
+    tickBad.length ? `判红：${tickBad.join('；')}` : tickCases.map(([i, w]) => `${JSON.stringify(i)}⇒${JSON.stringify(w)}`).join('；'));
+
+  /* ② `**` **必剥**（第二类被 `md2docx` 丢掉的定界符） */
+  const star2Cases = [
+    ['A**B**C', 'ABC'],
+    ['**加粗词**在后', '加粗词在后'],
+    ['**整串加粗**', '整串加粗']
+  ];
+  const star2Bad = star2Cases.filter(([inp, want]) => strip(inp) !== want)
+    .map(([inp, want]) => `${JSON.stringify(inp)} ⇒ ${JSON.stringify(strip(inp))}（应 ${JSON.stringify(want)}）`);
+  t.check('E133-② `**` **必剥**（真值表 3 组）：`**粗体**` 的定界符必须消失、内容逐字保留',
+    star2Bad.length === 0,
+    star2Bad.length ? `判红：${star2Bad.join('；')}` : star2Cases.map(([i, w]) => `${JSON.stringify(i)}⇒${JSON.stringify(w)}`).join('；'));
+
+  /* ③ `*斜体*`／`_下划线_`／`~~删除线~~` **不剥** —— **防"多剥 ⇒ 假绿"**（`D23` 要求判据有判别力）。
+     依据＝`md2docx.ps1` 的 `InlinePattern()` **只认**反引号与 `**`（工具侧实测：这三种标记原样进 docx）。
+     多剥会让"md 写了标记、docx 真缺"的标题**假绿**（假阴性），与把判据改宽松同罪。 */
+  const keepCases = [
+    ['*斜体词*在后', '*斜体词*在后'],
+    ['_下划线词_在后', '_下划线词_在后'],
+    ['~~删除线词~~在后', '~~删除线词~~在后'],
+    ['a*b', 'a*b']
+  ];
+  const keepBad = keepCases.filter(([inp, want]) => strip(inp) !== want)
+    .map(([inp, want]) => `${JSON.stringify(inp)} ⇒ ${JSON.stringify(strip(inp))}（应原样 ${JSON.stringify(want)}）`);
+  t.check('E133-③ `*斜体*`／`_下划线_`／`~~删除线~~` **一律不剥**（真值表 4 组，含孤立的 `*`）：' +
+    '依据＝`md2docx.ps1` 的 `InlinePattern()` **只认**反引号与 `**`（工具侧实测这三种标记**原样进 docx**）' +
+    '—— 多剥会让"md 写了标记而 docx 真缺"的标题**假绿**（与弱判据同罪，`D23`）',
+    keepBad.length === 0,
+    keepBad.length ? `判红：${keepBad.join('；')}` : keepCases.map(([i]) => `${JSON.stringify(i)}⇒原样`).join('；'));
+
+  /* ④ 多反引号游程（n≥2 的收尾规则）——**期望值取自真跑 `md2docx.ps1` 的读数**，不是推导值。 */
+  const multiCases = [
+    ['紧邻：' + T + T + 'a' + T + 'b' + T + T, '紧邻：a' + T + 'b'],
+    ['松散：' + T + T + ' a' + T + 'b ' + T + T, '松散： a' + T + 'b '],
+    ['三反引号：' + T + T + T + 'x' + T + T + T, '三反引号：x'],
+    ['双反引号简单：' + T + T + 'xy' + T + T, '双反引号简单：xy']
+  ];
+  const multiBad = multiCases.filter(([inp, want]) => strip(inp) !== want)
+    .map(([inp, want]) => `${JSON.stringify(inp)} ⇒ ${JSON.stringify(strip(inp))}（应 ${JSON.stringify(want)}）`);
+  t.check('E133-④ 多反引号游程（n≥2 的收尾规则，真值表 4 组）：游程 n 先按"下一个 **n** 连反引号"收尾、' +
+    '收不到才退到单反引号 —— **期望值＝真跑 `md2docx.ps1` 读 `word/document.xml` 的实测读数**' +
+    '（`tests\\._verify\\t20261004-09\\probe-multi-tick.js`，本次我复跑过），不是推导值',
+    multiBad.length === 0,
+    multiBad.length ? `判红：${multiBad.join('；')}` : multiCases.map(([i, w]) => `${JSON.stringify(i)}⇒${JSON.stringify(w)}`).join('；'));
+
+  /* ⑤ 找不到配对 ⇒ **原样保留**（宁可判红也不吃掉可见文字 —— 与"少剥 ⇒ 假红"的取舍一致） */
+  const unpairedCases = [
+    [T + T + 'a', T + T + 'a'],
+    ['a**b', 'a**b'],
+    ['**粗体', '**粗体'],
+    [T + '孤立', T + '孤立']
+  ];
+  const unpairedBad = unpairedCases.filter(([inp, want]) => strip(inp) !== want)
+    .map(([inp, want]) => `${JSON.stringify(inp)} ⇒ ${JSON.stringify(strip(inp))}（应原样保留）`);
+  t.check('E133-⑤ **找不到配对 ⇒ 原样保留**（真值表 4 组）：`` ``a ``／`a**b`／`**粗体`／`` `孤立 `` 一律不动 —— ' +
+    '取舍＝"宁可判红（少剥）也不吃掉可见文字"（多剥才是假绿）',
+    unpairedBad.length === 0,
+    unpairedBad.length ? `判红：${unpairedBad.join('；')}` : unpairedCases.map(([i]) => `${JSON.stringify(i)}⇒原样`).join('；'));
+
+  /* ⑥ `null`／`undefined`／空串**不炸**（纯函数要有全定义域：`docs-check` 的调用点传的是正则捕获组，
+     捕不到时可能是 `undefined` —— 让它抛错会变成"脚本异常退 2"而不是一条干净的判红）。 */
+  const edgeCases = [[null, ''], [undefined, ''], ['', ''], [0, '0']];
+  const edgeBad = edgeCases.filter(([inp, want]) => strip(inp) !== want)
+    .map(([inp, want]) => `${JSON.stringify(inp)} ⇒ ${JSON.stringify(strip(inp))}（应 ${JSON.stringify(want)}）`);
+  t.check('E133-⑥ `null`／`undefined`／空串**不炸且返回空串**（真值表 4 组，含数字 `0` ⇒ `\'0\'`）：' +
+    '调用点拿的是正则捕获组 ⇒ 必须有全定义域（抛错会变成"脚本异常退 2"，不是干净的判红）',
+    edgeBad.length === 0,
+    edgeBad.length ? `判红：${edgeBad.join('；')}` : edgeCases.map(([i, w]) => `${JSON.stringify(i)}⇒${JSON.stringify(w)}`).join('；'));
+
+  /* ⑦ `scanPairContent()` 的定点回归 —— 用**受控输入副本**（`E116` 的口径：换"被测输入"，不改真产物）：
+     把真实的一对 md/docx（`tools\Markdown转Word工具说明.md` ＋ 同名 docx，实测同源）复制进
+     `._verify\t14-e133\pair\`，然后三组读数：
+       (a) 原样副本        ⇒ `stale` 空（证明这对副本确实是同源对，基线干净）
+       (b) 给某个 H2 的标题**套上反引号**（md 侧）⇒ **仍空**（证明"比对前剥标记"真在生效 —— 若把剥标记
+           那一段删掉，这里立刻 `stale 1`）
+       (c) 在 (b) 的标题末尾加一段 docx 里没有的字 ⇒ **`stale 1` 并指名该 docx 与缺的标题**
+           （证明它不是恒绿：`body.includes(…)` 的强度没被弄松）
+     用完**当场删掉**这个一次性目录并给"残留＝[]"（`E103` 的收尾同款）。 */
+  const pairRoom = path.join(env.paths.verify, 't14-e133', 'pair');
+  const realMd20 = path.join(env.paths.root, 'tools', 'Markdown转Word工具说明.md');
+  const realDocx20 = realMd20.replace(/\.md$/, '.docx');
+  const mdText20 = fs.readFileSync(realMd20, 'utf8');
+  const firstH2 = (mdText20.match(/^##\s+(.+)$/m) || [])[1] || null;
+  const writePair20 = (mdText) => {
+    env.ensureDir(pairRoom);
+    fs.writeFileSync(path.join(pairRoom, 'e133-pair.md'), mdText, 'utf8');
+    fs.copyFileSync(realDocx20, path.join(pairRoom, 'e133-pair.docx'));
+    return scanPairs([pairRoom]);
+  };
+  const pairReal20 = firstH2 === null ? null : writePair20(mdText20);
+  const pairTick20 = firstH2 === null ? null
+    : writePair20(mdText20.replace('## ' + firstH2, '## ' + T + firstH2 + T));
+  const pairMiss20 = firstH2 === null ? null
+    : writePair20(mdText20.replace('## ' + firstH2, '## ' + T + firstH2 + T + 'ZZQ'));
+  let pairRoomRemoved20 = false;
+  try { env.removeLinkSafe(pairRoom, { recursive: true, force: true }); } catch { /* 已删 */ }
+  pairRoomRemoved20 = !fs.existsSync(pairRoom);
+  t.check('E133-⑦ `scanPairContent()` 定点回归（**受控输入副本**）：`(a)` 真实同源对 ⇒ `stale＝[]`；' +
+    '`(b)` 给 md 侧某个 H2 标题**套上反引号** ⇒ **仍 `stale＝[]`**（剥标记真在生效）；' +
+    '`(c)` 末尾加 docx 里没有的字 ⇒ **`stale＝1` 并指名该 docx 与缺的标题**（不是恒绿）；一次性目录当场删除、残留＝[]',
+    pairReal20 !== null && pairReal20.stale.length === 0 && pairReal20.pairs === 1
+      && pairTick20 !== null && pairTick20.stale.length === 0 && pairTick20.pairs === 1
+      && pairMiss20 !== null && pairMiss20.stale.length === 1
+      && pairMiss20.stale[0].includes('e133-pair.docx') && pairMiss20.stale[0].includes('ZZQ')
+      && pairRoomRemoved20,
+    firstH2 === null ? '判红：受控副本的源 md 里找不到 `## ` 二级标题（`tools\\Markdown转Word工具说明.md` 结构变了 ⇒ 本判据的前提要跟着改）'
+      : `(a) 原样：pairs=${pairReal20.pairs}／stale=${JSON.stringify(pairReal20.stale)}；` +
+        `(b) 标题套反引号（「${firstH2}」）：pairs=${pairTick20.pairs}／stale=${JSON.stringify(pairTick20.stale)}；` +
+        `(c) 末尾加「ZZQ」：stale=${JSON.stringify(pairMiss20.stale)}（应 1 且指名 e133-pair.docx）；` +
+        `一次性目录已删＝${pairRoomRemoved20}（残留＝${fs.existsSync(pairRoom) ? '非空' : '[]'}）`);
+
+  /* ⑧ D22（可证伪）：把"只剥反引号与 `**`"改成"**多剥** `_`／`~`"（**内存副本** `Module._compile`，
+     盘上一个字节都不落）⇒ ③ 的期望**必被违反**（`_下划线词_在后` → `下划线词在后`），
+     且 `tests\docs-check.js` 盘上字节**逐字节未变**（sha256 前后相同 + `Buffer.compare`）。
+     为什么这条 D22 挑"多剥"：③ 守的正是"多剥 ⇒ 假绿"，而它最容易被人"顺手改宽"（`D23` 的静态防空洞）。 */
+  const mutMutants = [
+    ['const MD_INLINE_ANY = /[' + T + '*]/;', 'const MD_INLINE_ANY = /[' + T + '*_~]/;'],
+    ['if (ch === MD_INLINE_TICK || ch === MD_INLINE_STAR) {', 'if (MD_INLINE_ANY.test(ch)) {']
+  ];
+  const applyMut20 = (src) => {
+    let out = src;
+    const applied = [];
+    for (const [from, to] of mutMutants) {
+      const hit = out.includes(from);
+      applied.push(hit);
+      if (hit) out = out.replace(from, to);
+    }
+    return { out, applied };
+  };
+  const { out: mutSrc20, applied: mutApplied20 } = applyMut20(dcText0);
+  const loadVariant20 = (src) => {
+    const m = new Module20(dcPath, null);
+    m.filename = dcPath;
+    m.paths = Module20._nodeModulePaths(path.dirname(dcPath));
+    m._compile(src, dcPath);
+    return m.exports;
+  };
+  let mutStrip20 = null;
+  let mutLoadErr20 = '';
+  try { mutStrip20 = loadVariant20(mutSrc20).stripInlineMarkup; } catch (e) { mutLoadErr20 = String((e && e.message) || e); }
+  const mutUnder20 = mutStrip20 === null ? null : mutStrip20('_下划线词_在后');
+  const mutTilde20 = mutStrip20 === null ? null : mutStrip20('~~删除线词~~在后');
+  const dcBytes1 = fs.readFileSync(dcPath);
+  const diskSame20 = Buffer.compare(dcBytes0, dcBytes1) === 0 && sha20(dcBytes1) === dcSha0;
+  t.check('E133-⑧ D22（可证伪）：把"**只剥反引号与 `**`**"改成"**多剥 `_`／`~`**"' +
+    '（`Module._compile` 级别的**内存副本**，盘上文件全程只读）⇒ ③ 的期望**必被违反**' +
+    '（`_下划线词_在后` → `下划线词在后`、`~~删除线词~~在后` → `删除线词在后`）；而**原件**仍原样保留；' +
+    '`tests\\docs-check.js` 盘上字节**逐字节未变**',
+    mutApplied20.every(Boolean) && mutLoadErr20 === '' && mutSrc20 !== dcText0
+      && strip('_下划线词_在后') === '_下划线词_在后' && strip('~~删除线词~~在后') === '~~删除线词~~在后'
+      && mutUnder20 === '下划线词在后' && mutTilde20 === '删除线词在后' && diskSame20,
+    `变异命中两处锚点=${JSON.stringify(mutApplied20)}、变异体 sha256=${sha20(Buffer.from(mutSrc20, 'utf8')).slice(0, 12)}…（原件 ${dcSha0.slice(0, 12)}…）；` +
+    `变异体读数：'_下划线词_在后' ⇒ ${JSON.stringify(mutUnder20)}（应 '下划线词在后'）、'~~删除线词~~在后' ⇒ ${JSON.stringify(mutTilde20)}（应 '删除线词在后'）；` +
+    `原件读数：${JSON.stringify(strip('_下划线词_在后'))}／${JSON.stringify(strip('~~删除线词~~在后'))}（应原样）；` +
+    (mutLoadErr20 ? `⚠ 变异体载入失败：${mutLoadErr20}；` : '') +
+    `盘上 docs-check.js 逐字节未变=${diskSame20}`);
+}
+
+/* ---------------- 二十一、真源分叉守护（`T-20261004-13`）：`server\` 下每个 `createStateSnapshot(` 调用点必须显式传 `config` ----------------
+   立案（座位 3 在做 `E131`／`E132` 真进程端到端时实测坐实）：`server\index.js` 的 `start()` 里那一处
+   `createStateSnapshot({ db, now, ingest, upload, logger })` **没传 `config`** ⇒ 它回落到磁盘上的
+   `require('../src/config/board.config')`，于是**同一个进程里两份业务配置各管一半**：
+     · 班次真源（`server\index.js` 的 `createShiftRules(boardCfg.shift)`）与 `/health.crossMidnight`
+       用的是**注入的那一份**（`options.boardConfig`）；
+     · `GET /state` 与 `/health.runAccum` 的当班统计用的是**磁盘上的那一份**。
+   实测症状：注入夜班 22-6 ＋ 固定时钟 23:00 ⇒ `/health` 说 `allowed=true`，而 `/state` 的当班班次是
+   磁盘配置里的「中班 16:00-24:00」—— **两个读数各自都"看着对"**，谁都不报错。
+   为什么必须立静态判据（而不是靠"记得传"）：这与 `E110`（读数归属误导）／`E135`（症状指向错方向）
+   同族，属 `D19` 的"看起来验过了"：注入式测试里**配置只改了一半**，而门禁是绿的。
+   ⚠ 判据口径（宁紧不松）：①只扫**调用点**（`function createStateSnapshot(` 这种**声明**不算）；
+   ②参数必须是**对象字面量**且**顶层**出现 `config` 键 —— 传一个不透明变量（`createStateSnapshot(opts)`）
+   同样判红并说明理由（那正是"分叉"能溜进来的形态：静态上无法确认 `config` 在场）。
+   ③剥注释与字符串后再判（`stripLiterals`：长度与换行不变 ⇒ 行号可直接当锚点），
+   否则注释里那句"`config` 必须显式传"会把判据自己喂饱。 */
+t.section('二十一、真源分叉守护：`server\\` 下 `createStateSnapshot(` 调用点必须显式传 `config`');
+{
+  const walkServerJs21 = (dir, out = []) => {
+    let list = [];
+    try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+    for (const e of list) {
+      const abs = path.join(dir, e.name);
+      if (e.isSymbolicLink()) continue;
+      if (e.isDirectory()) walkServerJs21(abs, out);
+      else if (e.isFile() && e.name.endsWith('.js')) out.push(abs);
+    }
+    return out;
+  };
+  /** 判据（**纯函数**，供 D22 复用）：返回违规清单（空＝合规）。 */
+  const scanSnapshotConfig21 = (relPath, src) => {
+    const code = stripLiterals(src);
+    const bad = [];
+    const re = /(^|[^\w$.])createStateSnapshot(\s*)\(/g;
+    let m;
+    while ((m = re.exec(code)) !== null) {
+      const identStart = m.index + m[1].length;                /* 标识符的起点（`m[1]` 是前导分隔符） */
+      if (/function\s+$/.test(code.slice(0, identStart))) continue;   // 函数**声明**，不是调用点
+      const openIdx = identStart + 'createStateSnapshot'.length + m[2].length;   // `(` 的下标
+      const line = code.slice(0, openIdx).split('\n').length;
+      /* 括号配对取实参文本（`code` 里字符串已被空格替换 ⇒ 不会把 `(` 数进字符串里） */
+      let depth = 0;
+      let end = -1;
+      for (let i = openIdx; i < code.length; i++) {
+        if (code[i] === '(') depth++;
+        else if (code[i] === ')') { depth--; if (depth === 0) { end = i; break; } }
+      }
+      const args = end < 0 ? '' : code.slice(openIdx + 1, end);
+      const trimmed = args.trim();
+      if (!trimmed.startsWith('{')) {
+        bad.push(`${relPath}:${line} —— 实参不是对象字面量（\`${trimmed.slice(0, 40) || '（空）'}\`）⇒ ` +
+          '静态上无法确认 `config` 在场（不透明变量正是"配置分叉"能溜进来的形态）');
+        continue;
+      }
+      /* 取**顶层**键（跳过嵌套的括号/花括号/方括号里的逗号）：先把最外层那对花括号摘掉，
+         否则第一个 `{` 自己就把深度抬到 1、顶层逗号全被当成嵌套（**实测踩过**：第一版把
+         `[{` 报成了"顶层键"）。 */
+      const inner = trimmed.startsWith('{') && trimmed.endsWith('}') ? trimmed.slice(1, -1) : trimmed;
+      const keys = [];
+      let d = 0;
+      let cur = '';
+      for (const ch of inner) {
+        if ('([{'.includes(ch)) d++;
+        else if (')]}'.includes(ch)) d--;
+        if (ch === ',' && d === 0) { keys.push(cur); cur = ''; continue; }
+        cur += ch;
+      }
+      keys.push(cur);
+      const hasConfig = keys.some((k) => {
+        const t = k.trim();
+        return /^config\s*:/.test(t) || t === 'config';
+      });
+      if (!hasConfig) {
+        bad.push(`${relPath}:${line} —— 顶层没有 \`config\` 键（实参顶层键＝[` +
+          keys.map(k => (k.split(':')[0] || '').trim()).filter(Boolean).join(', ') +
+          ']）⇒ 该调用点会回落到**磁盘上的** `board.config.js`，与注入的配置分叉');
+      }
+    }
+    return bad;
+  };
+  const serverJs21 = walkServerJs21(path.join(env.paths.root, 'server'));
+  const relOf21 = (abs) => path.relative(env.paths.root, abs).split(path.sep).join('\\');
+  const callSites21 = [];
+  const bad21 = [];
+  for (const f of serverJs21) {
+    const src = fs.readFileSync(f, 'utf8');
+    const code = stripLiterals(src);
+    const n = (code.match(/(^|[^\w$.])createStateSnapshot(\s*)\(/g) || []).length;
+    const decl = (code.match(/function\s+createStateSnapshot(\s*)\(/g) || []).length;
+    if (n > decl) callSites21.push(`${relOf21(f)}×${n - decl}`);
+    for (const b of scanSnapshotConfig21(relOf21(f), src)) bad21.push(b);
+  }
+  t.check('T-20261004-13 静态守护：`server\\**\\*.js` 里每个 `createStateSnapshot(` **调用点**都显式传 `config`' +
+    '（顶层键；剥注释与字符串后判）—— 缺一处 ⇒ 红并**指名 `文件:行号`**；传不透明变量同样判红',
+    serverJs21.length > 0 && callSites21.length > 0 && bad21.length === 0,
+    bad21.length ? `判红 ${bad21.length} 处：${bad21.join('；')}`
+      : `零违规（扫 ${serverJs21.length} 个 server .js；调用点 ${callSites21.join('、')}；` +
+        '每一处顶层都有 `config` 键 ⇒ 注入的配置与磁盘配置不会各管一半）');
+
+  /* D22（可证伪）：把 `server\index.js` 里那一行 `config: boardCfg,` **从内存副本里摘掉** ⇒ 同一判据
+     **必红并指名 `server\index.js:行号`**；盘上文件**逐字节未变**（只用内存字符串，不落地）。 */
+  {
+    const idxPath = path.join(env.paths.root, 'server', 'index.js');
+    const idxBytes0 = fs.readFileSync(idxPath);
+    const sha = (b) => require('node:crypto').createHash('sha256').update(b).digest('hex');
+    const sha0 = sha(idxBytes0);
+    const curBad21 = scanSnapshotConfig21(relOf21(idxPath), idxBytes0.toString('utf8'));
+    const mutSrc21 = idxBytes0.toString('utf8').replace(/^[ \t]*config: boardCfg,\r?\n/m, '');
+    const mutBad21 = mutSrc21 !== idxBytes0.toString('utf8')
+      ? scanSnapshotConfig21(relOf21(idxPath), mutSrc21) : ['（锚点未命中：`config: boardCfg,` 那一行没找到）'];
+    const idxBytes1 = fs.readFileSync(idxPath);
+    t.check('T-20261004-13 D22（可证伪）：把 `server\\index.js` 里 `config: boardCfg,` 那一行**从内存副本摘掉** ⇒ ' +
+      '同一判据**必红并把该调用点指名到 `server\\index.js:行号`**；现行源码零违规；盘上 `server\\index.js` 逐字节未变',
+      curBad21.length === 0 && mutBad21.length === 1 && /server\\index\.js:\d+/.test(mutBad21[0]) &&
+      Buffer.compare(idxBytes0, idxBytes1) === 0 && sha(idxBytes1) === sha0,
+      `现行源码违规 ${curBad21.length} 处（应 0）；内存摘掉「config: boardCfg,」后 ${mutBad21.length} 处：${mutBad21.join('；')}；` +
+      `盘上 server\\index.js 逐字节未变=${Buffer.compare(idxBytes0, idxBytes1) === 0}（sha256=${sha0.slice(0, 12)}…）`);
+  }
+}
+
 t.finish();
 }
 
@@ -8868,6 +9196,21 @@ t.finish();
        并给出"新鲜真实目录不被回收／过期真实目录被回收"两端读数。
      （丙 `E97`）探针纪律的**调用形态**守护：见下面第三段。
 
+   ⚠ **扫描面（两条面、两种强度 —— `E130` 之后判据标题不再"过度声明"）**
+     本节的判据**不是**"全仓零容忍"，而是**两个面各按各的口径**：
+       · **受管面**＝`tests\*.js` ＋ `tests\lib\**` ＋ `tools\**`（入库、被门禁扫描的脚本）
+         ⇒ **零容忍**（A①／A④／B①／B②／丙①：命中即红并逐处指名）。
+       · **`._verify\` 面**＝`tests\._verify\**`（**被 gitignore 的探针与一次性变异器的家**）
+         ⇒ **已登记残留 ＋ 新增即红**（A②／A⑥／B⑥／丙②：清单外的任何一处 ⇒ 红并指名 `文件:行号`）。
+     **为什么 `._verify\` 面必须守**（`E130` 的立案理由，回执里也复述了）：`E46` 的**真毁伤**与 `E117`
+     修的 **6 处**都发生在这一面 —— 它就是"探针会踩坑"的那块地；而 `E130` 之前它**一处都不守**
+     （`A④` 由代码显式排除该面、`B①` 的扫描面只喂受管面），读者却会按标题读成"全仓已守"。
+     **为什么它只能"登记存量"而不能"零容忍"**：这一面上躺着 `E46` 的**取证实物**（**故意**调用被禁
+     API，是 `E103`／`E46` 立案的证据）、**旧版本字节副本**（D22 基线、非活动脚本）与 60 多支一次性
+     探针；"零容忍"在这里等于要求把历史证据一起改掉。⇒ 判据式子只有"命中 ⊆ 清单"一条：
+     **存量只减不增，新增即红**（与 A② 的既有做法同款；`probe` 类存量**确实该改**，本段只登记、
+     不承认其正当性）。
+
    ⚠ **偏差与口径（据实登记，不照抄台账）**
    ① `E103` 行写"现状应为 **0 命中**"（A）—— 对**受管面**成立（实测 0），但**对全盘不成立**：
       `tests\._verify\e46\` 的两支**取证探针**（`E46` 自己的实物）里有 **3 处** `readdirSync(…,
@@ -8878,10 +9221,17 @@ t.finish();
       `cleanupStaleTemp()` 对链接是**无条件拆链**（不看年龄；理由＝链接不是合法的临时产物，
       见 `tests\env.js` 的 `E101` 段）。本节按**实测口径**断言（新鲜链接**也**被拆链、但目标不受损），
       并把这条偏差写进判据文案。
-   ③ B 的判据在**受管面**上今天**不可能**全绿：`tests\db-check.js`／`tests\offline-check.js`／
-      `tests\platform-check.js` 合计 **6 处**未防护的递归删除（本座位**无写权限**，不改他人文件）。
-      处置＝"**零新增 ＋ 存量逐条登记**"（新增即红）；**本门禁自身的面**（`tests\harness-check.js`
-      ＋ `tests\lib\**`）**不靠存量清单**：那 15 处已全部改走 `removeLinkSafe()`（B②）。
+   ③ B 的判据在**受管面**上**曾经**不可能全绿：`tests\db-check.js`／`tests\offline-check.js`／
+      `tests\platform-check.js` 合计 **6 处**未防护的递归删除。**`E117` 之后这 6 处已全部改走
+      `env.removeLinkSafe()` ⇒ `RM_LEGACY_E103` 清单已清空（B④ 逐处留档）** ⇒ 现在 B① 是
+      "**零新增 ＋ 存量 0**"，任一处回潮都会被当"新增"点名。本条按"事实变了"改写
+      （`D21`：判据式子一字未改，变的只是清单里的事实）。**本门禁自身的面**
+      （`tests\harness-check.js` ＋ `tests\lib\**`）**不靠存量清单**：那 15 处已全部改走
+      `removeLinkSafe()`（B②）。
+   ④ `._verify\` 面的存量数字是**普查读数**，会随探针生灭而变（`E130`，2026-10-04 普查：裸递归删
+      **106** 条＝`E46` 取证实物 11 ＋ 旧版本字节副本 31 ＋ 一次性探针 64；外部工具调用形态 **13** 条
+      ＝`E46` 真调用 3 ＋ 词形撞车 10），逐条口径见 B⑥／A⑥ 的注释与清单。**判据不写死这些数字**
+      （式子只写"命中 ⊆ 清单"）⇒ 探针生灭不会造成假红，只会让"已消失"那栏变长。
    ⚠ 为什么判据要有"形状"这一条腿：本机 `fs.rmSync(<junction>, {recursive:true})` **只拆链**
    （`E46` 的实测更正）⇒ **纯行为读数区分不出改动前后**（`E101` 的结论）。故 B（形状）与 C（行为）
    缺一不可：形状证明"判据来自 lstat"，行为证明"目标一条不少"。
@@ -9074,6 +9424,206 @@ function e103LinkSafetyChecks(t) {
     `旧形态命中 ${oldShapeHits.length} 处（${oldShapeHits.map(h => `id=${h.id}`).join('、')}，应 1）；`
       + `现行形态命中 ${newShapeHits.length} 处（应 0）；盘上 tests\\env.js 当前命中 `
       + `${rmManaged.filter(h => h.file === 'tests\\env.js').length} 处（应 0，与 B① 同源）`);
+
+  /* ==================== 甲-B⑥：`tests\._verify\**` 面的裸递归删守护（`E130`，2026-10-04） ====================
+     **为什么这一面必须守（不是"顺手扩大扫描面"）** —— 回执里也复述了这一段：
+      ① `._verify\` 是**探针与一次性变异器的家**：各座位每天在这里写脚本、建临时目录、拆链接、删 victim。
+         `E46` 的**真毁伤**（`robocopy /MIR` 让目标 5 个文件 → 0）就是**探针第一版**在这一面踩出来的；
+         `E117` 修的 **6 处**（现已清零）也全是"探针/夹具自建的一次性临时目录"。
+         ⇒ **危险面恰好就是这一面**，而 `E130` 立案前它**一根判据都没有**（`A④` 由代码显式排除该面、
+         `B①` 的扫描面只喂受管面），而 `E103` 的判据标题写着"链接安全门禁守护" ⇒ 读者会当成"全仓已守"
+         （**过度声明**，`D19` 的同类偏差）。**"当前没出事"不是"不用守"的理由**：删除是合法 git 操作，
+         出事后既拦不住也追不回（`E46` 的事故就是这么发生的）。
+      ② **为什么不照受管面那样零容忍**：这一面上有**真存量** —— `E46` 的取证探针**故意**调用被禁 API
+         （它们是 `E46`／`E103` 的立案实物，删掉就没有实证，`tests\env.js` 的注释正指着它们）、
+         从历史提交取出的**旧版本字节副本**（D22／定点变异的基线，不是活动脚本）、
+         以及各轮一次性探针（自建临时目录的收尾清理）。清单一列全就明白："零容忍"在这里等于
+         "要求把历史证据与 60 多支一次性探针一起改掉"，那不是本判据的职责。
+         ⇒ 采用与 `A②`／`丙②` **同款口径**：**已登记残留 ＋ 新增即红**（按 `文件＋标识符` 登记，
+         **不含行号** —— scratch 探针随时在动；语义＝"**多一处就红**"，不是"允许这个文件里的一切"）。
+      ③ **这份清单是"普查后照抄的事实"，不是"为了变绿而放宽"**（`D21`／`D23`）：判据式子只有
+         "命中 ⊆ 清单"这一条；清单每一条都带 `kind` 指向它**是什么**（见 `VERIFY_RM_KIND_WHY_E103`）。
+         谁**修好**存量（改走 `removeLinkSafe()`）⇒ 该条变成"已消失"被点名、**不判红**（修好不是缺陷）；
+         谁**新写**一处裸递归删 ⇒ **必红并逐处指名 `文件:行号`** —— 这正是 `E46` 缺的那道闸。
+      ④ **存量级别如实交代**：`probe` 类（64 条）**确实该改**（与 `E117` 修的那 6 处同族），
+         本段**不假装**它们是"正当用法"，只登记为存量并保证"不再新增"（不把"清单里有"读成"这样写没错"）。 */
+  const VERIFY_RM_KIND_WHY_E103 = {
+    e46: '`E46` 取证探针：**故意**用裸递归删/被禁 API 复现"递归删会顺着 junction 出圈"——它们是 `E46`／`E103` 的立案实物（`tests\\env.js` 的 `E46` 段就指着它们），删掉就没有实证',
+    oldcopy: '**旧版本字节副本**：从历史提交取出的受管文件内容（D22／定点变异当基线用），**不是活动脚本**、不参与任何运行；它里面的写法是"当时那一版"的事实，不应改',
+    probe: '**一次性探针/复算脚本**：自建临时目录（`mkdtemp`／`mkdir`）后的收尾清理。⚠ 这一族**确实该按 `E117` 的纪律改走 `env.removeLinkSafe()`** —— 本段只登记存量、不承认其正当性；本判据的作用是**不再新增**'
+  };
+  /** `._verify\` 面**普查所得**的存量清单（`T-20261004-14` 甲组；普查脚本与读数见 `tests\._verify\t14-e130\`）。
+   *  按 `文件＋标识符` 登记；**不含行号**（探针随时在动）。 */
+  const RM_RESIDUE_VERIFY_E103 = [
+    /* —— e46（11 条）—— */
+    { file: 'tests\\._verify\\e46\\probe-danger.js', id: 'RAW', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-external.js', id: 'RAW', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-external2.js', id: 'RAW', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-raw.js', id: 'holder', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-raw.js', id: 'RAW', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-raw2.js', id: 'filelink', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-raw2.js', id: 'link', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-raw2.js', id: 'RAW', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-raw2.js', id: 'through', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-twoside.js', id: 'l', kind: 'e46' },
+    { file: 'tests\\._verify\\e46\\probe-twoside.js', id: 'SIDE', kind: 'e46' },
+    /* —— oldcopy（31 条）—— */
+    { file: 'tests\\._verify\\e90\\harness.head2.js', id: 'dir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\e90\\harness.head2.js', id: 'env', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\e90\\harness.pristine.js', id: 'dir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\e90\\harness.pristine.js', id: 'env', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\e103-old-env.blob.js', id: 'full', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'authTmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'd', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'dir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'f20Tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'logDir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'root', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'w5Tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'w6Tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', id: 'w7Tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\platform-check.legacy-shape.js', id: 'logDir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'authTmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'd', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'dir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'f20Tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'logDir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'root', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'w5Tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'w6Tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', id: 'w7Tmp', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-platform-7e0a53c.js', id: 'logDir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\w1\\db-check.before.js', id: 'backupDir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\w1\\db-check.before.js', id: 'lockDir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\w4\\bak\\tests__db-check.js', id: 'backupDir', kind: 'oldcopy' },
+    { file: 'tests\\._verify\\w4\\bak\\tests__db-check.js', id: 'lockDir', kind: 'oldcopy' },
+    /* —— probe（64 条）—— */
+    { file: 'tests\\._verify\\c1\\cleanup-mutcopy.js', id: 'target', kind: 'probe' },
+    { file: 'tests\\._verify\\c1\\probe-p3-1.js', id: 'tmpDir', kind: 'probe' },
+    { file: 'tests\\._verify\\c1\\probe-p3-2.js', id: 'tmpDir', kind: 'probe' },
+    { file: 'tests\\._verify\\c1\\probe-p3-4.js', id: 'tmpDir', kind: 'probe' },
+    { file: 'tests\\._verify\\d12\\inject-probe.js', id: 'dataDir', kind: 'probe' },
+    { file: 'tests\\._verify\\e128-server-probe.js', id: 'TMP', kind: 'probe' },
+    { file: 'tests\\._verify\\e89\\probe-e89-retention.js', id: 'A', kind: 'probe' },
+    { file: 'tests\\._verify\\e89\\probe-e89-retention.js', id: 'B', kind: 'probe' },
+    { file: 'tests\\._verify\\e89\\probe-e89-retention.js', id: 'C', kind: 'probe' },
+    { file: 'tests\\._verify\\e89\\smoke-e89-realclock.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\probe-e58.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-bug-repro.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-delgap.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-enum-live.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-enum-trace.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-facts.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-full-seq.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-gap-evidence.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-gap2.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\a1-seq3.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\e102-d22.js', id: 'target', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\e103-d22-evidence.js', id: 'victim', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\e91-d22-freshness.js', id: 'FRESH', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\e91-d22-freshness.js', id: 'STALE', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\probe-auth-e2e.js', id: 'dataDir', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\probe-auth-e2e.js', id: 'TMP', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t07-a1-seq.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t07-a1-window.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t07-e84-forensics.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t07-e84b-and-a15.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t07-warning-and-dr17.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t07-window-variants.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t07-writes-uptick.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t12-notice-semantics.js', id: 'tmpDir', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\s5t21-e83-e129.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\review\\t20261003-12\\probe-e51-anchor.js', id: 'COPY_BASE', kind: 'probe' },
+    { file: 'tests\\._verify\\seat3-t15-probe.js', id: 'dataDir', kind: 'probe' },
+    { file: 'tests\\._verify\\seat3-t15-probe.js', id: 'TMP', kind: 'probe' },
+    { file: 'tests\\._verify\\seat3-t20261003-02-fr511-probe.js', id: 'TMP', kind: 'probe' },
+    { file: 'tests\\._verify\\T-20261002-08\\notice-probe.js', id: 'dir', kind: 'probe' },
+    { file: 'tests\\._verify\\T-20261004-03\\e14-img-probe.js', id: 'dir', kind: 'probe' },
+    { file: 'tests\\._verify\\T-20261004-03\\e14-probe.js', id: 'dir', kind: 'probe' },
+    { file: 'tests\\._verify\\T-20261004-03\\e15-probe.js', id: 'PROBE_DIR', kind: 'probe' },
+    { file: 'tests\\._verify\\T-20261004-03\\e15-selfcheck-probe.js', id: 'PROBE_DIR', kind: 'probe' },
+    { file: 'tests\\._verify\\T-20261004-04\\e114-probe.js', id: 'room', kind: 'probe' },
+    { file: 'tests\\._verify\\t1-probe\\iso-probe.js', id: 'B', kind: 'probe' },
+    { file: 'tests\\._verify\\t10\\probe1-chain.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\t10\\probe2-saturate-and-criteria.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\t10\\probe3-row-specof-restart.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\w6\\fixture-b-1276-mukn1g77.js', id: 'dataDir', kind: 'probe' },
+    { file: 'tests\\._verify\\zz-seat4-t14-ab.js', id: 'p', kind: 'probe' },
+    { file: 'tests\\._verify\\zz-seat4-t14-ab.js', id: 'ROOM', kind: 'probe' },
+    { file: 'tests\\._verify\\zz-seat4-t14-e101e105-probe.js', id: 'p', kind: 'probe' },
+    { file: 'tests\\._verify\\zz3-order-done-gate-probe.js', id: 'dir', kind: 'probe' },
+    { file: 'tests\\._verify\\zz3-repo-smoke.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\zz3-write-point-probe.js', id: 'TMP', kind: 'probe' },
+    { file: 'tests\\._verify\\zz3b-unitindex-probe.js', id: 'd', kind: 'probe' },
+    { file: 'tests\\._verify\\zz4b2-nounit-probe.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\zz6-diag.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\zz6-fix-verify.js', id: 'tmp', kind: 'probe' },
+    { file: 'tests\\._verify\\zz6b-stats-probe.js', id: 'tmpA', kind: 'probe' },
+    { file: 'tests\\._verify\\zz6b-stats-probe.js', id: 'tmpB', kind: 'probe' },
+    { file: 'tests\\._verify\\zz6d-e73-probe.js', id: 'work', kind: 'probe' },
+    { file: 'tests\\._verify\\zz6e-whitelist-probe.js', id: 'RUN', kind: 'probe' }
+  ];
+  const rmVerify = rmHitsE103(verifyJsE103);
+  const rmNewVerify = rmVerify.filter(h => !RM_RESIDUE_VERIFY_E103.some(r => r.file === h.file && r.id === h.id));
+  const rmStaleVerify = RM_RESIDUE_VERIFY_E103.filter(r => !rmVerify.some(h => h.file === r.file && h.id === r.id));
+  const rmKindCountVerify = ['e46', 'oldcopy', 'probe']
+    .map(k => `${k} ${RM_RESIDUE_VERIFY_E103.filter(r => r.kind === k).length} 条`).join('、');
+  t.check('E103-B⑥ 组合判据（**`tests\\._verify\\**` 面，`E130`**）：这一面里凡 `fs.rmSync(<标识符>, … recursive:true)`，' +
+    '同文件必须有 `lstatSync(<同一标识符>)`／`isLink(<同一标识符>)`（或已改走 `removeLinkSafe(`）—— ' +
+    '存量按 `文件＋标识符` **逐条登记**（清单外的任何一处 ⇒ 红并**指名 `文件:行号`**）',
+    rmNewVerify.length === 0,
+    rmNewVerify.length
+      ? `判红：**新增未防护调用点 ${rmNewVerify.length} 处** —— ` + rmNewVerify.map(h => `${h.file}:${h.line}（id=${h.id}）`).join('；')
+        + `；已登记存量 ${RM_RESIDUE_VERIFY_E103.length} 条（${rmKindCountVerify}）`
+      : `零新增（\`._verify\\\` 面共 ${rmVerify.length} 处未防护，全部 ⊆ 已登记存量 ${RM_RESIDUE_VERIFY_E103.length} 条：${rmKindCountVerify}；`
+        + `清单里已消失的条目 ${rmStaleVerify.length} 条＝` + (rmStaleVerify.map(r => `${r.file}:${r.id}`).join('、') || '无')
+        + ` ⇒ 存量只减不增，谁把它改走 \`removeLinkSafe()\` 都会在这里显形（**不判红**：修好不是缺陷））`);
+  /* `E130` 的**口径自证**：清单里的每一条都必须能指出"它是什么"（否则清单就成了黑洞）。 */
+  t.check('E103-B⑥-口径自证（`E130`）：存量清单每一条都带 `kind`，且 `kind` 都能在 `VERIFY_RM_KIND_WHY_E103` 里' +
+    '查到"这是什么、为什么留在清单里"的说明；三类（`e46` 取证实物／`oldcopy` 非活动字节副本／`probe` 一次性探针）各自有非零条数',
+    RM_RESIDUE_VERIFY_E103.length > 0
+      && RM_RESIDUE_VERIFY_E103.every(r => typeof VERIFY_RM_KIND_WHY_E103[r.kind] === 'string' && VERIFY_RM_KIND_WHY_E103[r.kind].length > 10)
+      && ['e46', 'oldcopy', 'probe'].every(k => RM_RESIDUE_VERIFY_E103.some(r => r.kind === k)),
+    `清单 ${RM_RESIDUE_VERIFY_E103.length} 条＝${rmKindCountVerify}；`
+      + `逐类说明：` + ['e46', 'oldcopy', 'probe'].map(k => `${k}＝${VERIFY_RM_KIND_WHY_E103[k].slice(0, 34)}…`).join('｜'));
+  /* `E130` 的 D22（**内存合成样本**，不落地）：同一判据喂"裸递归删"样本 ⇒ 必红并指名 `文件:行号`；
+     喂"已改走 `removeLinkSafe(`"样本 ⇒ 必绿。**两条读数缺一不可**（否则只是"恒红"或"恒绿"）。 */
+  const Q2_E103 = String.fromCharCode(39);
+  const sampleVerifyBad = 'const p = mkOneShot();\n'
+    + 'fs.' + 'rmSync(p, { recursive: ' + 'true, force: true });\n';
+  const sampleVerifyGood = 'const p = mkOneShot();\n'
+    + 'if (env.' + 'isLink(p)) { env.removeLinkSafe(p, { recursive: ' + 'true, force: true }); }\n';
+  const verifyBadHits = scanUnprotectedRm(sampleVerifyBad);
+  const verifyGoodHits = scanUnprotectedRm(sampleVerifyGood);
+  t.check('E103-B⑦ D22（可证伪，`E130`）：同一判据喂**裸递归删**样本 ⇒ **必红并指名 `id=p`**；' +
+    '喂**已改走 `removeLinkSafe(`／带 `isLink(p)` 判别**的样本 ⇒ 必绿（⇒ B⑥ 不是恒真式，也不会把"规范写法"判红）',
+    verifyBadHits.length === 1 && verifyBadHits[0].id === 'p' && verifyGoodHits.length === 0,
+    `裸递归删样本命中 ${verifyBadHits.length} 处（${verifyBadHits.map(h => `L${h.line}:id=${h.id}`).join('、')}，应 1）；`
+      + `规范写法样本命中 ${verifyGoodHits.length} 处（应 0）`);
+  /* 更强的 D22（**已登记文件里的新形态也要红**）：把一支**已在清单里**的 `._verify` 文件的**内存副本**
+     追加一处**新标识符**的裸递归删 ⇒ 必须红且**只**指名那一处新 id（证明清单是"逐条豁免"、
+     不是"这个文件被整体放行"）。盘上文件全程只读。 */
+  {
+    const residFile = path.join(env.paths.root, 'tests', '._verify', 'e46', 'probe-raw2.js');
+    const residBytes = fs.existsSync(residFile) ? fs.readFileSync(residFile) : null;
+    const mutatedResid = residBytes === null ? null
+      : residBytes.toString('utf8') + '\nconst zzFreshE130 = mkOneShot();\nfs.'
+        + 'rmSync(zzFreshE130, { recursive: ' + 'true, force: true });\n';
+    const curResidHits = residBytes === null ? [] : scanUnprotectedRm(residBytes.toString('utf8'));
+    const mutResidHits = mutatedResid === null ? [] : scanUnprotectedRm(mutatedResid);
+    const newOnly = mutResidHits.filter(h => h.id === 'zzFreshE130');
+    const diskSameResid = residBytes !== null && Buffer.compare(residBytes, fs.readFileSync(residFile)) === 0;
+    t.check('E103-B⑧ D22（可证伪，`E130` 的**清单不是整体豁免**）：在**已登记文件** `tests\\._verify\\e46\\probe-raw2.js` 的' +
+      '**内存副本**末尾追加一处**新标识符**的裸递归删 ⇒ 判据必红并**只**指名那一处新 id（模板见断言明细）；盘上文件逐字节未变',
+      residBytes !== null && mutatedResid !== null && newOnly.length === 1
+        && mutResidHits.length === curResidHits.length + 1 && diskSameResid,
+      residBytes === null ? '（`tests\\._verify\\e46\\probe-raw2.js` 不存在 ⇒ 本 D22 未执行；清单里的该文件条目会在 B⑥ 明细里报"已消失"）'
+        : `原件命中 ${curResidHits.length} 处（${curResidHits.map(h => h.id).join('、')}）⇒ 内存追加 \`zzFreshE130\` 后 `
+          + `${mutResidHits.length} 处、新增命中 ${newOnly.length} 处（应 1，id=${newOnly.map(h => h.id).join('、') || '无'}，`
+          + `行号=${newOnly.map(h => h.line).join('、') || '无'}）；盘上文件逐字节未变=${diskSameResid}`);
+  }
 
   /* ==================== 甲-D：安全闸（先于一切链接/删除实验） ==================== */
   const e103Room = path.join(env.paths.tempRoot, 'e103-link');
@@ -9328,9 +9878,10 @@ function e103LinkSafetyChecks(t) {
      **命令字符串形态**在 A①② 里**看不见** —— 而 `E46` 实测**真毁伤**（目标 5 → 0）的正是这个形态。
      这里用两条**窄**判据补上（窄＝不被说明文字自伤）：① 引号包住的工具名**作实参**（后跟逗号）；
      ② 字符串里出现 rmdir／rd 的 /s 开关。窄判据的代价是"两个变量拼出来的命令"覆盖不到 —— 已登记。
-     ⚠ 扫描面＝**受管面**（零容忍）；`._verify\` 面**不纳入**：实测那里有 19 处（`E46` 取证探针的
-     真调用 ＋ 把 `E46` 台账原文写进路线图的**记录脚本**），逐条登记会把清单撑成噪音。
-     这条边界是**据实登记**（数字见 `T-20261004-01` 回执），不是"没查"。 */
+     ⚠ 扫描面＝**受管面**（零容忍）；`._verify\` 面**不在本条的扫描面内**（`E130` 立案前那里**一处都不守**；
+      现已由 **A⑥** 按"已登记残留 ＋ 新增即红"补上 —— 见下方 A⑥ 的抬头注释）。本条的边界仍是"受管面"，
+      数字**据实**：`._verify\` 面实测 **18 处**（`E130` 普查，2026-10-04；`T-20261004-01` 那次记的是 **19**，
+      之后那批一次性记账脚本被移出仓外 ⇒ **19 → 18**，属"外部事实变了"，不是判据变了）。 */
   const TOOL_CALL_PATTERNS_E103 = [
     ['引号包住的工具名作实参', /['"](?:robocopy)['"]\s*,/],
     ['字符串里的 rmdir／rd 的 /s 开关', /['"][^'"]*\b(?:rmdir|rd)\s+\/s\b[^'"]*['"]/]
@@ -9347,7 +9898,7 @@ function e103LinkSafetyChecks(t) {
     return out;
   };
   const toolCallManaged = managedJsE103.flatMap((f) => scanToolCalls(readOrEmpty(f)).map(h => ({ file: relOfE103(f), ...h })));
-  t.check('E103-A④ 外部工具调用形态（**受管面零容忍**）：剥注释、**保留字符串**后，没有"引号包住的工具名作实参"与"字符串里的 rmdir／rd 的 /s 开关"（`E46` 实测会毁伤的两类形态；`._verify\` 面除外，理由见本段注释）',
+  t.check('E103-A④ 外部工具调用形态（**受管面零容忍**）：剥注释、**保留字符串**后，没有"引号包住的工具名作实参"与"字符串里的 rmdir／rd 的 /s 开关"（`E46` 实测会毁伤的两类形态；`._verify\\` 面由 **A⑥** 另判，口径见该段注释）',
     toolCallManaged.length === 0,
     toolCallManaged.length
       ? `判红：命中 ${toolCallManaged.length} 处 —— ` + toolCallManaged.map(h => `${h.file}:${h.line} [${h.pat}]`).join('；')
@@ -9366,6 +9917,63 @@ function e103LinkSafetyChecks(t) {
       && toolGoodHits.length === 0,
     `坏样本命中 ${toolBadHits.length} 处（${toolBadHits.map(h => `L${h.line}:${h.pat}`).join('、')}，应 2 且两类各 1）；`
       + `好样本命中 ${toolGoodHits.length} 处（应 0：注释被剥、说明字符串不构成调用形态）`);
+
+  /* ==================== 甲-A⑥：`tests\._verify\**` 面的**外部工具调用形态**守护（`E130`，2026-10-04） ====================
+     **为什么这一条也要补**：`E46` 实测**真毁伤**的形态有两个，而 A④ 只守了受管面 ——
+      ① `robocopy <空目录> <junction> /MIR` ⇒ 目标 **3 文件 → 0**（`E46` 的 X4／X7，受控复现）；
+      ② `cmd /c rmdir /s /q <link>`。
+     这两类形态**恰恰出现在探针里**（`._verify\e46\probe-external*.js`／`probe-twoside.js` 就是证据），
+     而探针的家就是 `._verify\`。⇒ 与 B⑥ 同口径：**已登记残留 ＋ 新增即红**（按 `文件＋形态` 登记，不含行号）。
+     **为什么存量里有一批"根本不是调用"**：A④／A⑥ 的剥法是"**剥注释、保留字符串**"（否则看不见
+     `spawnSync('robocopy', …)` 这种**命令字符串**形态 —— 那正是 `E46` 毁伤的那一类）。代价是
+     "把工具名当**靶子字符串**写在数组里的判据脚本"（`E103` 自己的形态样本表、`C·21` 的普查脚本）
+     一并命中 ⇒ 逐条登记并注明是**词形撞车**，与 `丙②` 对 `['mutate','restore','verify']` 的处理同款。
+     ⚠ 边界（据实登记）：两个变量拼出来的命令、以及"工具名不带引号"（`spawnSync(cmd, …)`）覆盖不到 ——
+     与 A④ 的窄口径**逐字相同**，不在这里偷偷放宽或收紧。 */
+  const VERIFY_TOOL_KIND_WHY_E103 = {
+    /* ⚠ 拼接构造（**实测踩过两次**）：把 `rmdir` 与 `/s` 开关**逐字**写在一个字符串里，本文件自己
+       （受管面）就会先命中 A④ 的"字符串里的 /s 开关" ⇒ 判据自伤假红。故这里只拼接、不抄写。 */
+    real: '`E46` 取证探针：**故意**真调 `robocopy … /MIR`／`' + ('rmdir' + ' /' + 's')
+      + '` 实测"会穿链毁伤"（受控复现，目标 5 → 0）——它们是 `E103` 立案的实物，也是"为什么必须有这道闸"的证据',
+    artifact: '**词形撞车**（不是调用）：`E103` 自己的**形态样本表**（`e103-block.js`／`e103-A-stringface.js`／`e103-census*.js`）与 `C·21` 的普查脚本把"被禁工具名"与"`/s` 开关"当作**靶子字符串**写在数组里（形态样本必须逐字写出来才测得了判据）—— "保留字符串"的口径下它们必然命中。⚠ **本处故意不复述那两个字符串**：一复述，本节自己（受管面）就会先命中 A④（**实测踩过**，见 `T-20261004-14` 回执），所以这里只描述、不抄写'
+  };
+  /** `._verify\` 面**普查所得**的外部工具调用形态存量（`T-20261004-14` 甲组）。按 `文件＋形态` 登记。 */
+  const TOOL_RESIDUE_VERIFY_E103 = [
+    { file: 'tests\\._verify\\e46\\probe-external.js', pat: '引号包住的工具名作实参', kind: 'real' },
+    { file: 'tests\\._verify\\e46\\probe-external2.js', pat: '引号包住的工具名作实参', kind: 'real' },
+    { file: 'tests\\._verify\\e46\\probe-twoside.js', pat: '引号包住的工具名作实参', kind: 'real' },
+    { file: 'tests\\._verify\\review\\e103-A-stringface.js', pat: '引号包住的工具名作实参', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\e103-A-stringface.js', pat: '字符串里的 rmdir／rd 的 /s 开关', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\e103-block.js', pat: '引号包住的工具名作实参', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\e103-block.js', pat: '字符串里的 rmdir／rd 的 /s 开关', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\e103-census.js', pat: '引号包住的工具名作实参', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\e103-census.js', pat: '字符串里的 rmdir／rd 的 /s 开关', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\e103-census2.js', pat: '引号包住的工具名作实参', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\e103-census2.js', pat: '字符串里的 rmdir／rd 的 /s 开关', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\s5t21-e103.js', pat: '引号包住的工具名作实参', kind: 'artifact' },
+    { file: 'tests\\._verify\\review\\s5t21-e103.js', pat: '字符串里的 rmdir／rd 的 /s 开关', kind: 'artifact' }
+  ];
+  const toolCallVerify = verifyJsE103.flatMap((f) => scanToolCalls(readOrEmpty(f)).map(h => ({ file: relOfE103(f), ...h })));
+  const toolNewVerify = toolCallVerify.filter(h => !TOOL_RESIDUE_VERIFY_E103.some(r => r.file === h.file && r.pat === h.pat));
+  const toolStaleVerify = TOOL_RESIDUE_VERIFY_E103.filter(r => !toolCallVerify.some(h => h.file === r.file && h.pat === r.pat));
+  t.check('E103-A⑥ 外部工具调用形态（**`tests\\._verify\\**` 面，`E130`**）：剥注释、**保留字符串**后，`._verify\\` 面里的' +
+    '"引号包住的工具名作实参"与"字符串里的 rmdir／rd 的 /s 开关"**只剩已登记残留**（清单外的任何一处 ⇒ 红并**指名 `文件:行号`**）',
+    toolNewVerify.length === 0,
+    toolNewVerify.length
+      ? `判红：**新增 ${toolNewVerify.length} 处** —— ` + toolNewVerify.map(h => `${h.file}:${h.line} [${h.pat}]`).join('；')
+        + `；已登记存量 ${TOOL_RESIDUE_VERIFY_E103.length} 条`
+      : `零新增（\`._verify\\\` 面共 ${toolCallVerify.length} 处命中，全部 ⊆ 已登记存量 ${TOOL_RESIDUE_VERIFY_E103.length} 条＝`
+        + `取证实物 ${TOOL_RESIDUE_VERIFY_E103.filter(r => r.kind === 'real').length} 条 ＋ 词形撞车 ${TOOL_RESIDUE_VERIFY_E103.filter(r => r.kind === 'artifact').length} 条；`
+        + `清单里已消失的条目 ${toolStaleVerify.length} 条＝` + (toolStaleVerify.map(r => `${r.file}[${r.pat}]`).join('、') || '无')
+        + ` ⇒ 谁把探针里的真调用删掉/改掉都会在这里显形（**不判红**））`);
+  t.check('E103-A⑥-口径自证（`E130`）：该清单每一条都带 `kind`，且 `real`（取证实物）与 `artifact`（词形撞车）两类**各自有非零条数** —— ' +
+    '"存量里有多少是真调用、多少只是靶子字符串"必须一眼可读，不许混成一堆数字',
+    TOOL_RESIDUE_VERIFY_E103.length > 0
+      && TOOL_RESIDUE_VERIFY_E103.every(r => typeof VERIFY_TOOL_KIND_WHY_E103[r.kind] === 'string')
+      && TOOL_RESIDUE_VERIFY_E103.some(r => r.kind === 'real')
+      && TOOL_RESIDUE_VERIFY_E103.some(r => r.kind === 'artifact'),
+    `real ${TOOL_RESIDUE_VERIFY_E103.filter(r => r.kind === 'real').length} 条／artifact ${TOOL_RESIDUE_VERIFY_E103.filter(r => r.kind === 'artifact').length} 条；`
+      + `real＝${VERIFY_TOOL_KIND_WHY_E103.real.slice(0, 30)}…`);
   t.check('E103-丙① 探针纪律（**受管面零容忍**）：`tests\\*.js` ＋ `tests\\lib\\**` ＋ `tools\\**` 里，严格剥注释后**没有任何**"版本控制命令做还原"的**调用形态**（`git <子命令> <参数>` ／ 参数数组形态）',
     gitManaged.length === 0,
     gitManaged.length
@@ -9396,6 +10004,13 @@ function e103LinkSafetyChecks(t) {
   t.info(`E103/E97 扫描面：磁盘上的 ${allJsE103.length} 个 .js（受管 ${managedJsE103.length} ＋ \`._verify\\\` ${verifyJsE103.length}；`
     + `tests\\**\\*.js ＋ tools\\**\\*.js，**不看 git 跟踪状态**）；禁令形态 ${BAN_PATTERNS_E103.length} 类；`
     + `探针纪律形态 ${GIT_RESTORE_PATTERNS_E103.length} 类（剥注释、保留字符串）`);
+  /* `E130`（2026-10-04）：把 `._verify\` 面的存量读数**打进日志**（PASS 时不打印 check 的 detail，
+     故这里必须有可见证据 —— "守了多少、还剩多少存量"要能一眼读到，不许只在红的时候才看得见）。 */
+  t.info(`E103/E130 \`._verify\\\` 面存量（普查 ＋ 清单）：裸递归删 ${rmVerify.length} 处`
+    + `（已登记 ${RM_RESIDUE_VERIFY_E103.length} 条＝${rmKindCountVerify}；新增 ${rmNewVerify.length}、已消失 ${rmStaleVerify.length}）；`
+    + `外部工具调用形态 ${toolCallVerify.length} 处（已登记 ${TOOL_RESIDUE_VERIFY_E103.length} 条＝`
+    + `取证实物 ${TOOL_RESIDUE_VERIFY_E103.filter(r => r.kind === 'real').length} ＋ 词形撞车 ${TOOL_RESIDUE_VERIFY_E103.filter(r => r.kind === 'artifact').length}；`
+    + `新增 ${toolNewVerify.length}、已消失 ${toolStaleVerify.length}）`);
 }
 
 /* 先例写法（同 browser-check.js:828、contract-check.js:1624、docs-check.js:547 …）：

@@ -162,10 +162,13 @@ function isInsideVerify(target) {
       这就是 `lib\harness.js` 的 `countEntriesDeep` 与 `tests\harness-check.js` 同名工具的既有正确做法。
       推论：**凡"要进入某个目录"的遍历，都该用 `lstatSync`（或 `readdirSync(…,{withFileTypes:true})`
       后判 `isDirectory()`，因为 dirent 对 junction 报 `isSymbolicLink()===true`）；
-      只有确实要"穿透链接读目标"时才用 `statSync`。**（反例：`tests\ui-check.js:5273` 用 `statSync().isDirectory()`
-      递归扫描 `src\` ⇒ 会跟随链接出圈。）
+      只有确实要"穿透链接读目标"时才用 `statSync`。**（本处**只按做法指、不按行号指** —— `E134`：
+      它原先举的反例是"`tests\ui-check.js:5273` 用 `statSync()`"，而该行**早已改成 `fs.lstatSync(p)`**
+      （`E102`）⇒ 反例指向了**已经改对的正确做法**、与事实相反；同族（注释里的行号/做法被当成事实引用）
+      在本仓已连发多次：`E88⒞`／`E78`／`E113`。**行号会漂，做法不会**。）
       `E101` 病灶正是**判据来源用错**：`cleanupStaleTemp()` 旧版用 `statSync(full).mtimeMs` 判"过期"
       ⇒ 链接的"年龄"其实是**目标**的年龄（跟随后才拿到）⇒ 链接顺理成章进了"递归删"那一支。
+      —— **这一处就是本条的"真实反例"**（按做法指，不按行号指）。
 
    ③ **为什么拆链必须非递归（`rmdirSync(link)` 只拆链）**
       `fs.rmdirSync(link)` 在 Windows 上落到 `RemoveDirectoryW`，删的是**那个目录项（reparse point）本身**，
