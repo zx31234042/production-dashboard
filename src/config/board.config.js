@@ -62,7 +62,19 @@ const BOARD_CONFIG = (function () {
              allowCrossMidnight: true,        // ← 与下面的 list 同级（就在本段里）
            开闸前请确认 `E83` 的两个投影已落地（本版本已落地）＋ 改配置后核对 `GET /health` 的
            `crossMidnight`（`count`/`keys`/`allowed`/`splitReady`）与 `runAccum` 的
-           `naturalDay` 与 `shiftProjection` 两段读数。 */
+           `naturalDay` 与 `shiftProjection` 两段读数。
+         ⚠⚠ **本键只认布尔字面量（`E131`，2026-10-04）**：**只有 `true` 开闸**；`false`＝显式关；
+            **不写**（本行被注释掉）＝未声明 ⇒ 含跨零点规则时启动期拒绝。写成别的任何东西
+            （`'true'`／`'false'`／`'0'`／`1`／`0`／`[]`／`{}`／`null` …）都会在**启动期抛错**并打出
+            实际值与类型 —— 这不是刁难：JS 里 `Boolean('false') === true`，写 `allowCrossMidnight: 'false'`
+            （**人读作"关"**）过去会**静默开闸**（`E131` 的病灶，主代理亲验 13 组）；反过来"静默当关"
+            又会让写 `'true'` 的人以为开了。故**含糊即拒绝**（拒绝优于替调用方猜意图），
+            规则级同名字段 `{name,start,end,allowCrossMidnight}` 与段级**同一把尺子**（都只认 `true`、
+            都拒非布尔值）。写法就两种：段级 `allowCrossMidnight: true`，或规则级
+            `{ name:'夜班', start:22, end:6, allowCrossMidnight:true }`。
+         ⚠ `E132`（同批修正，解释"开闸后为什么月/年档也对"）：跨零点班次在**月末/年末**会**同时**
+            跨月/跨年 ⇒ 运行秒数按**段自己的日历归属**进月/年档（10-31 22:00→11-01 06:00 在 11-01 00:30
+            被读：10 月那段归 10 月、11 月那段归 11 月），**不是**把两段一起算进"读它的那一刻"所在的月/年。 */
     shift: {
       list: [
         { name: '晚班', start: 0,  end: 8  },
@@ -73,7 +85,11 @@ const BOARD_CONFIG = (function () {
          "不含跨零点班次"；一旦 `list` 里出现 `end <= start` 的规则而本键不是 `true`，
          `createShiftRules()` 会**当场抛错**并指名"先做 `E83` 的两个投影"⇒ 服务启动失败
          （**拒绝优于静默算错**：现场看到的会是启动日志里的一句话，不是"当日累计少了几个小时"）。
-         ⚠ 本键**只是准入**，它不改变任何算式；`0-8／8-16／16-24` 三段班不跨零点，无需开启。 */
+         ⚠ 取值域**只有三个**（`E131`）：`true`＝开闸、`false`＝显式关（等价于不写，但**写明意图**）、
+         **不写**＝未声明。**非布尔值一律启动期拒绝**（`'true'`／`'false'`／`'0'`／`1`／`0`／`[]`／`{}` …）——
+         理由见上方 shift 段的注记（`Boolean('false') === true` 会让"人读作关"的写法静默开闸）。
+         ⚠ 本键**只是准入**，它不改变任何算式；`0-8／8-16／16-24` 三段班不跨零点，无需开启。
+         （`allowCrossMidnight` 的取值域＝`true`／`false`／**不写**；写别的会启动期拒绝。） */
       // allowCrossMidnight: true,
       countHoliday: true,       // 节假日是否计入当班时长（Q-10）
       countPlannedStop: false,  // 计划停线是否计入当班时长（Q-10）

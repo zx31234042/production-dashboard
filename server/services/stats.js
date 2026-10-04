@@ -241,6 +241,9 @@ function computeShiftStats(input) {
       `elapsedSec，ADR-0009 D3）的有限数，收到 ${JSON.stringify(rawAdd)}`);
   }
   const liveSplit = splitRunSecondsByDay(shift, runSec);
+  /* 第 4 个入参＝`E83` 的自然日切段（含两段各自的**日历归属** `day1Date`/`day2Date`）：
+     日档按段归 D／D+1（`E83`），月/年档按段归各自的自然月/年（`E132` —— 段属于哪个周期由
+     **段的日期**决定，不由读它的时刻决定；见 `accumulateRunTime()` 的 docblock）。 */
   const accum = accumulateRunTime(input.accum, addRunSec, now, liveSplit);
 
   return {
@@ -312,10 +315,16 @@ function rollAccum(prev, now) {
 /**
  * `E83` 甲·㈡ **自然日投影**：把"一个班次的运行秒数"按**零点**切成两段。
  *
- *   · 前段（`day1`）＝落在**班次开始那一自然日**（`shift.date`）的运行秒数 ⇒ 归 D；
- *   · 后段（`day2`）＝落在**次日**（D+1）的运行秒数 ⇒ 归 D+1；
+ *   · **前段（`day1`）＝落在**班次开始那一自然日**（`shift.date`）的运行秒数 ⇒ 归 D；
+ *   · **后段（`day2`）＝落在**次日**（D+1）的运行秒数 ⇒ 归 D+1；
  *   · **恒有 `day1 + day2 === runSec`**（不许丢秒、不许重复计）—— 这是本函数唯一的硬约束，
  *     也是验收判据"日/月/年三档的切段之和 ＝ 总运行秒数"的落点。
+ *   ⚠ **"日/月/年各自按日历归属聚合"（`E132`，2026-10-04 修正）**：本函数只负责**切日**
+ *     （D 与 D+1）；月/年档由读方再按**同一份日历归属**聚合 —— `accumulateRunTime()` 用
+ *     `day1Date`/`day2Date` 把自己的加数分派到各自的自然月/年（月末/年末那一班会**同时**跨月/跨年，
+ *     两段**不**同月同年，上一版"两段都落在同月/年"的断言是假的 ⇒ 上一周期那段会永久丢失）；
+ *     `repo/shiftStat.js` 的 `segmentsOf()`/`projectRows()` 对**已固化**的行做同一件事。
+ *     即：**"哪个周期"永远由段的日期决定，不由读它的时刻决定**。
  *
  * **两种口径在此分流（负责人 2026-10-04 裁定，不得混为一谈）**：
  *   · **班次投影**＝整班归"班次开始的那一天"（`DR-06` 逐字／`FR-4.16`）—— 那是 `shift.date`
@@ -417,9 +426,20 @@ function splitRunSecondsByDay(shift, runSec) {
  *       且**被测**的行为（`tests/logic-check.js` 的「五、累计运行」段与 `A1/D3-2`）。若对不跨零点的
  *       增量也做"按日期归属"，日档就会被改成"整班的 run_sec"，实测把 7 200 变成 28 800
  *       （3 条断言当场变红）。⇒ **不跨零点：一个字都不改**。
- *   本月/本年两档不受归属影响：跨零点只可能跨"日"（一个班次最长 24 h，且月/年边界与零点同刻）
- *   ⇒ 两段**都**落在同一个月/年，故两段都计入。
- * @returns {{daySec:number, monthSec:number, yearSec:number, at:Date, reset:object}}
+ *   本月/本年两档**同样受归属影响**（`E132`，2026-10-04 修正；上一版这里的断言"两段都落在
+ *   同一个月/年"**是假的**）：跨零点只可能跨"日"这一句对**日**成立，对**月/年**不成立 ——
+ *   月末/年末那一班会同时跨日、跨月（跨年）：`2026-10-31 22:00 → 11-01 06:00`、`now = 11-01 00:30`
+ *   ⇒ `day1` 是**10 月**的 7200 s、`day2` 是**11 月**的 1800 s。上一版把两段**一起**加进
+ *   `now` 所在的 11 月 ⇒ 实测 `monthSec = 9000`（11 月凭空多拿 10 月那 7200），而 10 月真正的
+ *   读数被 `rollAccum()` 的跨月归零丢掉（10 月那段**永久丢失**）⇒ `FR-6.5`（本月）在月末必错；
+ *   跨年（12-31 → 次年 01-01）同理 ⇒ `FR-6.6`（年度）在年末必错。
+ *   ⇒ **月/年档按各段自己的日历归属聚合**（见下 `monthAdd`/`yearAdd`）：只有落在 `now` 所在
+ *     月/年的那几段才进本周期档；不属于本周期的段**不进**（它们归**上一个**周期，见 `outOfPeriod`）。
+ * @returns {{daySec:number, monthSec:number, yearSec:number, at:Date, reset:object,
+ *            outOfPeriod:null|{month:number,year:number,note:string}}}
+ *   `monthSec`/`yearSec` ＝ **本周期**（`now` 所在月/年）截至此刻的累计；
+ *   `outOfPeriod` ＝ 本次切段里**不属于 `now` 所在周期**的那些秒数与一句口径说明
+ *   （`null` ＝ 没有这种情况）—— 保留它是为了"扣掉的秒去哪儿了"能被看见，而不是静默消失。
  */
 function accumulateRunTime(prev, addSec, now, addSplit, alloc) {
   const rolled = rollAccum(prev, toDate(now));
@@ -431,6 +451,12 @@ function accumulateRunTime(prev, addSec, now, addSplit, alloc) {
     Number.isFinite(Number(addSplit.day1)) && Number.isFinite(Number(addSplit.day2));
   const day1 = hasSplit ? Math.max(0, Math.round(Number(addSplit.day1))) : add;
   const day2 = hasSplit ? Math.max(0, Math.round(Number(addSplit.day2))) : 0;
+  /* `E132`：月/年档的加数**先各归 0**，只有"落进 `now` 所在周期"的段才被加上（见上 docblock）。
+     默认值与上一版**逐字相同**：不跨零点（`hasSplit === false`）⇒ `monthAdd = yearAdd = day1 + day2
+     = add + 0 = add`（`day1` 在该支就等于 `add`、`day2` 恒 0）⇒ 三档一个数都不变。 */
+  let monthAdd = day1 + day2;
+  let yearAdd = day1 + day2;
+  let outOfPeriod = null;
   let toDay = add;
   if (hasSplit) {
     /* 两段的日历归属：优先取**切段结果自带**的（同源），否则退到调用方给的 `alloc` */
@@ -447,13 +473,65 @@ function accumulateRunTime(prev, addSec, now, addSplit, alloc) {
     if (start === nowDay) toDay = day1;          // 班次开始于今天 ⇒ 前段进今天的日档
     else if (next === nowDay) toDay = day2;      // 今天＝次日 ⇒ 只有后段进今天的日档
     else toDay = day1 + day2;                    // 都不匹配（异常形态）⇒ 不丢秒，整段进日档
+
+    /* ---- `E132`：月/年档按**日历归属**聚合（为什么必须这样，而不是加到 `now` 所属周期）----
+       日档"两段分属 D 与 D+1"是 `E83` 已解决的那一半；月/年档是**同一件事的上一层**：
+       自然月/自然年都是**日历区间**，而 `now` 只是这一次读数的时刻 —— 把两段一起塞进 `now`
+       所在周期，等于承认"一个增量属于哪个周期由**读它的时刻**决定"，那正是 `E132` 的病灶。
+       一个反例就够：10-31 22:00→11-01 06:00 在 11-01 00:30 被读 ⇒ 10 月那段会被算进 11 月，
+       而 10 月的档已经被 `rollAccum()` 按跨月归零（`rolled.monthSec = 0`）⇒ 那些秒**永久丢失**
+       （不是"晚一点才显示"，是不会再出现）。故：**按段自己的月/年归属分派，不属于本周期的不进**。
+       ⚠ "不进"不等于"丢"（这是本修正能成立的另一半，必须写清）：
+         · 该段的**持久真源**是 `shift_stat` 那一行（`shift_date = 班次开始日`），读口 `sumRunSec()`
+           的 `segmentsOf()` 会把 `run_sec_day1` 归到班次开始日、`run_sec_day2` 归到次日 ——
+           按**段自己的日历日**再归集到月/年档（`repo/shiftStat.js` 的 `projectRows()`）。
+           那一行里的秒数**在它自己的周期里**一定被算到，与本函数无关；
+         · 本函数只管"**当班未固化增量**"这一段读数：它属于 `prev`（`now` 所在周期的已固化求和）
+           之外的增量 ⇒ 只有落进本周期的段才能进本周期档，否则就会重犯 `E132`；
+         · 为了不把"扣掉的秒"做成静默行为，扣掉的部分随 `outOfPeriod` 一并报出（读数可核）。
+       ⚠ 边界的同一性（为什么 `=== nowYear` 是**对的**判据，尽管"今年"其实由 1/1 零点定义，
+         与"月"由 1 号零点定义不同）：`rolled.yearSec` 只在**跨年**时归零（`rollAccum()` 的
+         `yearChanged`），而跨年那一刻起"今年"自然等于 `now` 的年 ⇒ `day1` 若真属于上一年，
+         它就不该进 `rolled.yearSec + yearAdd`；若 `day1Date` 与 `now` 同年（哪怕跨了月），
+         `rolled.yearSec` 也没归零 ⇒ 相加仍然正确。两档用的是同一条"日历归属"判据。 */
+    if (typeof start === 'string' && start) {
+      const d1 = toDate(`${start}T00:00:00`);
+      const d2 = toDate(`${next}T00:00:00`);
+      const nowD = toDate(now);
+      const nowMonthKey = `${nowD.getFullYear()}-${String(nowD.getMonth() + 1).padStart(2, '0')}`;
+      const nowYearKey = String(nowD.getFullYear());
+      if (d1 && d2 && Number.isFinite(d1.getTime()) && Number.isFinite(d2.getTime())) {
+        const d1MonthKey = `${d1.getFullYear()}-${String(d1.getMonth() + 1).padStart(2, '0')}`;
+        const d2MonthKey = `${d2.getFullYear()}-${String(d2.getMonth() + 1).padStart(2, '0')}`;
+        const d1YearKey = String(d1.getFullYear());
+        const d2YearKey = String(d2.getFullYear());
+        /* "两段同属本周期"是**常见情形**（班次不跨月末/年末）⇒ 保持上一版的合计口径（一次判定） */
+        monthAdd = (d1MonthKey === nowMonthKey) ? day1 + (d2MonthKey === nowMonthKey ? day2 : 0)
+          : (d2MonthKey === nowMonthKey ? day2 : 0);
+        yearAdd = (d1YearKey === nowYearKey) ? day1 + (d2YearKey === nowYearKey ? day2 : 0)
+          : (d2YearKey === nowYearKey ? day2 : 0);
+        const outMonth = (day1 + day2) - monthAdd;
+        const outYear = (day1 + day2) - yearAdd;
+        if (outMonth > 0 || outYear > 0) {
+          outOfPeriod = {
+            month: outMonth,
+            year: outYear,
+            note: '这两段里有不属于 now 所在月/年的部分（跨月末/年末的跨零点班次）⇒ 本周期档**只收**' +
+              '属于本周期的段，其余的秒数归**上一个**周期：它们由 shift_stat 那一行按段自己的日历日' +
+              '（run_sec_day1 → 班次开始日、run_sec_day2 → 次日）计入各自周期（repo/shiftStat.js 的' +
+              'segmentsOf/projectRows），**不是丢失**；此处报出只为让"扣掉的秒去哪儿了"可核。'
+          };
+        }
+      }
+    }
   }
   return {
     daySec: Math.max(0, rolled.daySec + toDay),
-    monthSec: Math.max(0, rolled.monthSec + day1 + day2),
-    yearSec: Math.max(0, rolled.yearSec + day1 + day2),
+    monthSec: Math.max(0, rolled.monthSec + monthAdd),
+    yearSec: Math.max(0, rolled.yearSec + yearAdd),
     at: rolled.at,
-    reset: rolled.reset
+    reset: rolled.reset,
+    outOfPeriod
   };
 }
 

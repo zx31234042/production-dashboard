@@ -376,6 +376,11 @@ function createStateSnapshot(options = {}) {
    *     `repo/shiftStat.js` 的 `segmentsOf()`）＋ **当班未固化增量的切段**（`addRunSecSplit`）；
    *   · **班次投影**（`DR-06`／`FR-4.16` 的口径，`E83` 之前读数逐字保留）＝`sums.shiftDaySec/…`
    *     与 `runSec` 整段；两者一并挂在 `snapshot.lastRunAccum` 上供对账（`/health.runAccum`）。
+   *     `E132`（2026-10-04）：月/年两档**不是**"跨零点只可能跨日、两段同月同年"（那句曾写在
+   *     `stats.js` 里，是假的）—— 月末/年末那一班会同时跨月/跨年 ⇒ 本文件传下去的切段带**两段各自的
+   *     日历归属**（`day1Date`/`day2Date`），由 `accumulateRunTime()` 按段分派到各自的自然月/年
+   *     （不属于 `now` 所在周期的段不进本周期档，它们归上一个周期；读口 `sumRunSec()` 的分段归集
+   *     对**已固化**的行做同一件事）。
    *     现配置（0-8/8-16/16-24）无跨零点班次 ⇒ 两套投影**恒同值**（这是硬保证，不是巧合：
    *     见 `services/stats.js` 的 `splitRunSecondsByDay()` 与 `tests\._verify\e83-*.js` 的逐字比对）。
    *   ⚠ **为什么切段结果必须落库（而不是只放内存累加器）**：本函数是"**每次快照从 DB 现算**"

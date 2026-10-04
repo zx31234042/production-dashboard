@@ -884,6 +884,15 @@ async function start(options = {}) {
   const snapshot = createStateSnapshot({
     db: state.db,
     now: currentClock().source(),
+    /* ⚠ `config` 必须显式传**已解析的业务配置**（`options.boardConfig` 优先，否则配置文件）——
+       这一行是 `T-20261004-13` 顺手坐实的一个**静默分叉**：`createStateSnapshot()` 缺省回落到
+       `require('../src/config/board.config')`，于是"注入了别的业务配置"的进程里：
+       班次真源（`:606` 的 `createShiftRules(boardCfg.shift)`）与 `/health.crossMidnight` 用的是
+       **注入的那一份**，而 `GET /state`/`/health.runAccum` 的当班统计用的是**磁盘上的那一份**
+       （实测：注入夜班 22-6 ＋ 固定时钟 23:00 ⇒ `/health.crossMidnight.allowed=true` 但
+        `/state` 的当班班次是磁盘配置的"中班 16:00-24:00"）。刻意**不**在 `stateSnapshot.js` 里再取一次
+       配置（那会变成第二处真源）：真源仍由 `start()` 传入。 */
+    config: boardCfg,
     ingest: ifd.instance,
     upload: upload.instance,
     logger

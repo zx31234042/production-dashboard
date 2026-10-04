@@ -24,6 +24,19 @@
         且症状看上去像"数据问题"、不像"配置问题"。⇒ **先做掉 `E83` 的两个投影，再在这里开闸。**
         归属日那一半（DR-06 逐字"班次开始那天"）与这道闸**无关**：`at()` 的
         `startDayOffset = -1` 与 `date = fmtDate(startAt)`（下方 :83/:99 一带）一直是对的，不动。
+    ⚠ **`E131`（2026-10-04）：这道闸的判据是「显式布尔 `true`」，不是"真值"** ——
+         段级与规则级**同一把尺子**：只有 `=== true` 开闸；`undefined`／`false`／**任何非布尔值**
+         ⇒ 关闸；**且该键在场而不是布尔值（含字符串 `'true'`）⇒ 启动期拒绝**（见
+         `assertBoolSwitch()`／`assertCrossMidnightAllowed()`）。
+         为什么非布尔值必须**吵**（而不是静默关闸、更不是静默开闸）：JS 里 `Boolean('false') === true`
+         —— 现场把配置写成 `allowCrossMidnight: 'false'`（**人读作"关"**）会**静默开闸**，
+         于是 `E83` 的跨零点路径（含 `E132` 的跨月/跨年错）直接上生产 ⇒ 症状是"我以为关了"，
+         属 `E38`（"没算过"显示成 0）同族的**把"未声明"与"显式关"混为一谈**。
+         而"静默关闸"同样不可接受：写 `'true'`（带引号）的人**以为开了**，静默关会让他在
+         整班跨零点时拿到"闸没开"的读数，且没有任何地方告诉他。⇒ 两种意图都必须被识破并
+         **当场拒绝**：拒绝不是"猜他想要什么"，而是**拒绝替他猜**。
+         ⚠ 裸数组形态的取舍**不变**（见 `assertCrossMidnightAllowed()`）：那里只跳过"未声明"这一支，
+         **非布尔值仍一律拒绝** —— "拒绝含糊"与"放行未声明"是两件事，前者不存在"整脚本异常"的代价。
    依赖：platform/clock.js（时间一律注入，禁止 new Date()）。
     ========================================================================== */
 'use strict';
@@ -38,6 +51,48 @@ const { fmt, fmtDate, toDate } = require('../../platform/clock');
  *    否则会出现"归属日按跨零点回退、切段却按不跨零点算"这类两套口径。 */
 function isCrossMidnight(rule) {
   return Number(rule.end) <= Number(rule.start);
+}
+
+/**
+ * `E131` 的**布尔开关校验**：`allowCrossMidnight` 这一族键**只认布尔字面量**。
+ *
+ * 取值域（三段，无第四种）：
+ *   · `undefined`（**键不在场**）⇒ **合法**，语义＝"未声明"（由调用方按 fail-closed 处置）；
+ *   · `true`／`false`（布尔字面量）⇒ **合法**，语义＝显式开／显式关；
+ *   · **其余一切**（`'true'`／`'false'`／`'0'`／`'no'`／`1`／`0`／`[]`／`{}`／`null`／`''` …）
+ *     ⇒ **当场拒绝**（`TypeError`），消息里**指名实际值与类型**，并给出正确的写法。
+ *
+ * 为什么非布尔值必须**吵**（这是本函数存在的唯一理由，`E131` 的根因）：
+ *   `Boolean('false') === true` —— 配置里写 `allowCrossMidnight: 'false'`（**人读作"关"**）会被
+ *   当作"开"，于是跨零点路径静默上生产；反过来写 `'true'`（带引号）如果"静默当关"，
+ *   改配置的人**以为开了**却什么也没发生。两种误读都**无法从读数上区分**于正确配置，
+ *   属 `E38`（"没算过"显示成 0）同族的"把未声明／显式关／显式开混为一谈"。
+ *   ⇒ 判据不替调用方猜意图：**含糊即拒绝**（拒绝优于猜，也优于静默取真值）。
+ *   ⚠ 与"fail-closed"的分工：`undefined`／`false` 走 fail-closed（关闸）；**非布尔值走拒绝** ——
+ *     "关闸"是**已声明**的一个取值，不是"看不懂"的兜底去处。
+ * @param {*} value 待校验的键值
+ * @param {string} label 键的可读位置（报错用；例：`配置段（shift 段）`／`规则「夜班 22-6」`）
+ */
+function assertBoolSwitch(value, label) {
+  if (value === undefined || typeof value === 'boolean') return;
+  /* 实际值的可读呈现：⚠ `JSON.stringify(NaN)` 是 `null`（会被误读成"写了个 null"）；
+     `JSON.stringify(undefined)` 不会走到这里（上面已放行）；`[]`／`{}` 用 JSON 形态更像现场写法。 */
+  const type = value === null ? 'null'
+    : Array.isArray(value) ? '数组'
+      : typeof value === 'object' ? '对象' : typeof value;
+  const shown = typeof value === 'string' ? `'${value}'（字符串）`
+    : (typeof value === 'number' && Number.isNaN(value)) ? 'NaN（number）'
+      : `${JSON.stringify(value)}（${type}）`;
+  throw new TypeError(
+    `${label} 必须是布尔值 true/false（只有显式 true 才开闸），收到 ${shown} —— ` +
+    '若你是想**关闸**，请写 false（并删掉引号）；若你是想**开闸**，请写 true。' +
+    '（`E131`：非布尔值一律拒绝 —— `Boolean(\'false\') === true`，静默取真值会让你"以为关了其实开了"；' +
+    '静默关闸又会让写 `\'true\'` 的人"以为开了其实没开"。配置意图含糊时，拒绝优于替调用方猜。）');
+}
+
+/** `E131` 报错用的键位置（段级／规则级**同一个键名**，报错里必须能分辨是哪一处） */
+function crossMidnightSwitchLabel(where) {
+  return `${where}的 allowCrossMidnight`;
 }
 
 /**
@@ -61,17 +116,28 @@ function isCrossMidnight(rule) {
  *
  * 配置面（两选一，等价）：整个 shift 段写 `allowCrossMidnight: true`，或写在**规则自己**身上
  * `{ name:'夜班', start:22, end:6, allowCrossMidnight:true }`。
- * @param {Array} rules 已归一化的规则（含 name/start/end）
+ * **判据（`E131` 修正，段级/规则级同一把尺子）**：只有**显式布尔 `true`** 开闸。
+ *   `undefined`／`false` ⇒ 关闸；**任何非布尔值 ⇒ 启动期拒绝**（判据与理由写在 `assertBoolSwitch()`）。
+ *
+ * @param {Array} rules 已归一化的规则（含 name/start/end；规则级开关已归一为布尔）
  * @param {{allowCrossMidnight?:boolean}} [options]
- * @param {boolean} [strict] `true` ＝配置段形态（fail-closed）；`false` ＝裸数组形态（放行、只自述）
+ * @param {boolean} [strict] `true` ＝配置段形态（fail-closed）；`false` ＝裸数组形态（放行"未声明"、只自述）
  */
 function assertCrossMidnightAllowed(rules, options, strict) {
   const crossing = rules.filter(isCrossMidnight);
   if (!crossing.length) return;
-  const allowed = Boolean(options && options.allowCrossMidnight) ||
+  /* `E131`：**先判形态**（非布尔值一律拒绝，两种形态都拒），再判放行与否。顺序不可换 ——
+     否则"非布尔值而恰好被当假值"会落到下面的"未声明"分支，被裸数组形态静默放行。 */
+  assertBoolSwitch(options && options.allowCrossMidnight, crossMidnightSwitchLabel('配置段（shift 段）'));
+  for (const r of crossing) {
+    assertBoolSwitch(r.allowCrossMidnight, crossMidnightSwitchLabel(`规则「${r.name} ${r.start}-${r.end}」`));
+  }
+  /* 放行判据（`E131`：把原来的 `Boolean(...)` 换成 `=== true`）：段级给 `true`，或**每条**跨零点规则
+     自己给 `true`（规则级被 `createShiftRules()` 归一为布尔 ⇒ 非布尔值早在上面就被拒了）。 */
+  const allowed = (options && options.allowCrossMidnight === true) ||
     crossing.every(r => r.allowCrossMidnight === true);
   if (allowed) return;
-  if (!strict) return;   // 裸数组形态：见上方 docblock 的取舍说明
+  if (!strict) return;   // 裸数组形态的"未声明"：见上方 docblock 的取舍说明
   throw new RangeError(
     'shift: 配置里含**跨零点班次**（' +
     crossing.map(r => `${r.name} ${r.start}-${r.end}`).join(' , ') +
@@ -110,8 +176,12 @@ function createShiftRules(list, options) {
     name: s.name,
     start: Number(s.start),
     end: Number(s.end),
-    /* 规则级开关只在**显式 true** 时生效（缺省 undefined ⇒ 不放行），不参与任何算式 */
-    allowCrossMidnight: s.allowCrossMidnight === true
+    /* 规则级开关只在**显式 true** 时生效（缺省 undefined ⇒ 不放行），不参与任何算式。
+       ⚠ `E131`：`=== true` 的**归一**在这里，但**非布尔值的拒绝**在下面（`assertBoolSwitch()`）——
+         归一必须先看到**原值**，否则 `'false'` 被折成 `false` 之后就再也分不出"显式关"与"打错字"。 */
+    allowCrossMidnight: s.allowCrossMidnight === true,
+    /* **原值**（不参与任何算式，只为"键在场但不是布尔值"这条判据留证；见下） */
+    rawAllowCrossMidnight: s.allowCrossMidnight
   }));
   if (!rules.length) throw new Error('shift: 班次列表为空，请检查 board.config.shift.list');
 
@@ -132,9 +202,27 @@ function createShiftRules(list, options) {
     }
   }
 
+  /* `E131` 的**键值形态校验**（`E128` 的闸之前、形态校验之后）：`allowCrossMidnight` 这个键
+     无论出现在**规则自己**身上还是**配置段**上，只要在场就必须是布尔字面量；非布尔值一律当场拒绝。
+     为什么列在两个入口都做（而不是只在真跨零点的规则上做）：
+       · 键名相同 ⇒ 严格度必须相同（`E131` 的原始病灶就是"同一个键名两种严格度"）；
+       · 判据与该键是否**被用到**无关 —— 一台机器上"打错字"的配置不该因为"这次恰好没跨零点"
+         而被放过（现场改一行班次就可能让它生效）。这与 `board.config.js` 的配置校验同一取舍：
+         **非法配置一律拒绝，不等它出事**。
+     为什么规则级的原值要单独留一份：上面 `allowCrossMidnight` 已归一为布尔，`'false'` 与 `false`
+     在那里就**再也分不开**了 —— 而"键在场但不是布尔值"必须被识破（`rawAllowCrossMidnight`）。 */
+  for (const r of rules) {
+    assertBoolSwitch(r.rawAllowCrossMidnight, crossMidnightSwitchLabel(`规则「${r.name} ${r.start}-${r.end}」`));
+  }
+  assertBoolSwitch(seg ? seg.allowCrossMidnight : undefined,
+    crossMidnightSwitchLabel('配置段（shift 段）'));
+  assertBoolSwitch(opts.allowCrossMidnight, crossMidnightSwitchLabel('调用方传入的 options'));
+
   /* `E128`：跨零点准入（形态校验之后、建规则之前 —— 非法形态先报形态错，不被闸的消息盖住）。
-     `strict` 的判据＝**调用方是否给了配置上下文**（配置段形态 ⇒ fail-closed；裸数组 ⇒ 放行）。
-     判据本体与两种强度的理由写在 `assertCrossMidnightAllowed()` 的 docblock 里（不在此重复）。 */
+     `strict` 的判据＝**调用方是否给了配置上下文**（配置段形态 ⇒ fail-closed；裸数组 ⇒ 放行"未声明"）。
+     判据本体与两种强度的理由写在 `assertCrossMidnightAllowed()` 的 docblock 里（不在此重复）。
+     ⚠ `E131`：上面两道形态校验**与 `strict` 无关** —— 裸数组形态同样拒收非布尔值（不存在
+       "整脚本异常"的代价：那是"放行未声明"这一支的取舍，不是"放过打错字"的理由）。 */
   const strict = Boolean(seg) || (options && typeof options === 'object');
   assertCrossMidnightAllowed(rules, merged, strict);
 
@@ -214,11 +302,17 @@ function createShiftRules(list, options) {
    *  "这套配置里有没有跨零点班次、开没开闸"必须**能被巡检读到**，不能只活在注释里。
    *  ⚠ `allowed` 的语义＝"**跨零点被放行**"，它只在**真有跨零点班次**时才可能为 `true`：
    *    没有跨零点班次时恒为 `false` —— 否则 `/health` 上会出现 `count:0, allowed:true` 这种
-   *    自相矛盾的读数（"没有跨零点班次，但跨零点被放行了"），读方无法据此判断该不该报警。 */
+   *    自相矛盾的读数（"没有跨零点班次，但跨零点被放行了"），读方无法据此判断该不该报警。
+   *  ⚠ `E131`（2026-10-04）：判据与 `assertCrossMidnightAllowed()` **同一把尺子** ——
+   *    段级 `merged.allowCrossMidnight === true`（**不是** `Boolean(...)`）或**每条**跨零点规则
+   *    自己 `=== true`。于是 `/health.crossMidnight.allowed` 反映的是**修正后的**判定：
+   *    现场写 `allowCrossMidnight: 'false'` 时**不会**再出现 `allowed:true`
+   *    （该形态在 `createShiftRules()` 里已被 `assertBoolSwitch()` 当场拒绝 ⇒ 进程根本起不来，
+   *      巡检读到的是启动日志里的那句拒绝原因，而不是一个"看起来开了闸"的读数）。 */
   function crossMidnight() {
     const crossing = rules.filter(isCrossMidnight);
     return {
-      allowed: crossing.length > 0 && (Boolean(merged.allowCrossMidnight) ||
+      allowed: crossing.length > 0 && (merged.allowCrossMidnight === true ||
         crossing.every(r => r.allowCrossMidnight === true)),
       count: crossing.length,
       keys: crossing.map(r => `${r.name} ${r.start}-${r.end}`)
@@ -228,4 +322,4 @@ function createShiftRules(list, options) {
   return { rules, at, current, describe, names, crossMidnight };
 }
 
-module.exports = { createShiftRules, isCrossMidnight, assertCrossMidnightAllowed };
+module.exports = { createShiftRules, isCrossMidnight, assertCrossMidnightAllowed, assertBoolSwitch };
