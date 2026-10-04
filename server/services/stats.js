@@ -243,7 +243,12 @@ function computeShiftStats(input) {
   const liveSplit = splitRunSecondsByDay(shift, runSec);
   /* 第 4 个入参＝`E83` 的自然日切段（含两段各自的**日历归属** `day1Date`/`day2Date`）：
      日档按段归 D／D+1（`E83`），月/年档按段归各自的自然月/年（`E132` —— 段属于哪个周期由
-     **段的日期**决定，不由读它的时刻决定；见 `accumulateRunTime()` 的 docblock）。 */
+     **段的日期**决定，不由读它的时刻决定；见 `accumulateRunTime()` 的 docblock）。
+     ⚠ `E139`：`liveSplit` 可能带 `degraded: true`（入参不是 `createShiftRules().at()` 的完整形态）。
+     本函数**原样带上**（下面的 `runSecSplit` 整体返回）—— 于是"这次切段可不可信"随读数一起交给
+     读方，而不是被这一层吃掉；`accumulateRunTime()` 只在 `crossing === true` 时按日历归属入档 ⇒
+     降级时它走"整段算当日"，与 `E83` 之前的读数**逐字相同**（**仍不抛错**：理由见
+     `splitRunSecondsByDay()` 的 `E139` 段 —— 切段是派生增强，不该让旧调用方爆掉）。 */
   const accum = accumulateRunTime(input.accum, addRunSec, now, liveSplit);
 
   return {
@@ -313,6 +318,105 @@ function rollAccum(prev, now) {
 }
 
 /**
+ * `E139` 的**入参形态判据**（纯函数、只读）：返回"缺失/非法字段"的名字数组
+ * （**空数组＝影响"判定或归属"的字段齐**；⚠ 这**不**等价于"是 `at()` 的完整形态"，见下 `totalSec`）。
+ *
+ * 为什么要有这道判据（而不是"能算就算"）：`E139`（2026-10-04 登记、主代理亲验）的病灶是
+ * `splitRunSecondsByDay()` 对**手工构造的半个 shift 对象**（如 `{name:'夜班',start:22,end:6}`）
+ * **静默**退化为"不切段" —— 调用方会把"看不懂"当成一个合法取值（"这段不跨零点"），于是跨零点
+ * 那一班按旧口径整段归开始日（**正是 `E132` 的病理形态**），而没有任何地方提示"是入参不全"。
+ * 同族先例的处置一律是**把"看不懂"标出来**：`E38`（"没算过"显示成 0）、`E129`（截断不报）、
+ * `E131`（`'false'` 静默开闸）。
+ *
+ * 字段清单＝**只含"影响跨零点判定或日历归属"的字段**（2026-10-04 裁定收窄，理由见下 `totalSec`）：
+ *   · `start`／`end`   —— 判"是否跨零点"的既有判据（正文用 `Number(end) <= Number(start)`）。
+ *     `at()` 给的是**整数**（`shift.js:175-193` 先 `Number()` 归一、再 `Number.isInteger` 校验），
+ *     故这里用**严格数**判据：`null`／`''`／数字字符串一律算形态不全 —— `Number(null) === 0`、
+ *     `Number('') === 0` 这类隐式强转会**把"打错字"当成合法取值**，正是 `E139` 要消灭的东西；
+ *   · `startAt`／`endAt`—— 跨零点时"零点那一刀"要用的两个时刻。判据是"**能不能解析成时刻**"
+ *     （不限定字符串类型：`toDate()` 也吃 `Date`／时间戳），故 `'x'`／`undefined` ⇒ 形态不全；
+ *   · `date`           —— 前段的日历归属（`day1Date`）。要求 `yyyy-MM-dd`：`accumulateRunTime()`
+ *     拿到它后会拼 `${date}T00:00:00`，而**拼不动/拼歪了**正是当日累计错位（`E83`）的来源；
+ *   ⚠ `totalSec` **不在** fault 列表里（**主代理 2026-10-04 更正了自己上一票的口径**）：它**不参与**
+ *     本函数任何运算、也**不影响"能不能判跨零点/能不能定归属"**，而 `degraded` 的语义只是"**这次没能
+ *     判跨零点**"⇒ 缺它而置 `degraded` 是 **cry wolf**（数值与完整形态**逐值相同**却喊降级）⇒ 缺
+ *     `totalSec` ⇒ **`degraded` 缺席**、数值与完整形态逐值相同（它缺不缺，与本函数要报的"判定不成立"无关）。
+ *   ⚠ **不**列入：`name`（与本函数无关，缺了不影响任何取值）、`elapsedSec`（本函数 docblock
+ *     明写它**可缺**、缺了退化为整班跨度 `span` —— 那是**有意的**向后兼容，不是"看不懂"）。
+ * @param {object} shift `createShiftRules().at()` 的产物（或手工构造的同形对象）
+ * @returns {string[]} 缺失/非法字段名（`['shift']` ＝ 连对象都不是：`null`／`undefined`／非对象）
+ */
+function shiftShapeFaults(shift) {
+  if (!shift || typeof shift !== 'object') return ['shift'];
+  const faults = [];
+  const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+  const isTime = (v) => {
+    try {
+      const d = toDate(v);
+      return !!d && Number.isFinite(d.getTime());
+    } catch { return false; }
+  };
+  if (!isNum(shift.start)) faults.push('start');
+  if (!isNum(shift.end)) faults.push('end');
+  if (!isTime(shift.startAt)) faults.push('startAt');
+  if (!isTime(shift.endAt)) faults.push('endAt');
+  if (typeof shift.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(shift.date)) faults.push('date');
+  return faults;
+}
+
+/**
+ * `E139` 的降级说明：一句话说清"**缺什么**"＋"**后果是什么**"（与 `degradedMissing` 的字段名数组
+ * 一并给出，前者给人读、后者给机器核）。`facts` 是三个**已判明的事实位**（由调用处算好，
+ * 不在这里重算 —— 同一份判据只留一处）：
+ *   · `cut`            —— 真的按零点切了段（跨零点那一支）；此时缺的只是形态的其余部分，
+ *     后果是"**切段不予背书**"（如缺 `date` ⇒ `day1Date` 为 `undefined`），**不是**"数值算错了"；
+ *   · `startEndNumeric`—— `start`/`end` 是**有限数**（能判"是否跨零点"）；
+ *   · `cfgCrossing`    —— `Number(end) <= Number(start)`（**配置层面**说这个班跨零点）。
+ * ⚠ 三种情形必须**分开说**（否则就是拿"形态不全"冒充"判定无效"，与 `E139` 的病灶同型）：
+ *   ① `cut` ⇒ 切了段、但不背书；
+ *   ② `startEndNumeric && !cfgCrossing` ⇒ "**本次不跨零点**"这一判定**本身有效**（形态不全 ⇒
+ *      仍标 `degraded` 但不冒领"算错了"）；
+ *   ③ 其余（`start`/`end` 不是数，**或**判据说跨零点而两个时刻不可用）⇒ **真的判不了/切不了** ⇒
+ *      这才是 docblock 那句"**`crossing:false` 不代表"确实不跨零点"**"的适用面。
+ *      ⚠ 情形③的**后半**正是 `E139` 的原始踩法（`{name:'夜班',start:22,end:6}`：配置明写跨零点、
+ *      只是没有两个时刻）—— 把它归到"判定有效"会是**假话**（实测：本探针第一版就这样误报过）。
+ */
+function degradedSplitReason(faults, facts) {
+  const has = (f) => faults.indexOf(f) >= 0;
+  /* ⚠ 本函数的输入只有 `faults`（＝"影响判定/归属"的字段名）与三个事实位 ⇒ 理由串只谈这些：
+     `totalSec` 已移出 fault 列表（口径收窄）⇒ 这里**不再有**"缺 `totalSec` 不影响数值"那句（它不可能出现）。 */
+  const head = `班次入参**缺/非法**了影响"跨零点判定或日历归属"的字段（${faults.join('、')}）—— `;
+  if (facts.cut) {
+    return head + '两段的时刻在场、已按零点切了段，但**入参形态不予背书**' +
+      (has('date') ? '（缺/非法 `date` ⇒ `day1Date` 为 `undefined`，两段的日历归属不可核）' : '') +
+      '；读方不得把它当成"已核实的切段"。';
+  }
+  if (facts.startEndNumeric && !facts.cfgCrossing) {
+    return head + '`start`/`end` 在场且**判据说本次不跨零点** ⇒ 这一判定**有效**（`crossing: false` 可信），' +
+      '但入参不是契约形态 ⇒ 本函数对形态**不予背书**' +
+      (has('date') ? '（缺/非法 `date` ⇒ 两段的日历归属为 `null`）' : '') + '。';
+  }
+  return head + (facts.startEndNumeric
+    ? '`start`/`end` 在场且**判据说它跨零点**，但 `startAt`/`endAt` 缺失或不可解析 ⇒ **切不了段**'
+    : '`start`/`end` 不是数 ⇒ 连"是否跨零点"都**判不了**') +
+    ' ⇒ 本次返回的是"整段归班次开始日"的**兜底形态**：`crossing: false` **不代表"确实不跨零点"**' +
+    '（真跨零点的班次会被整段归进开始日，正是 `E132` 的病理形态）。';
+}
+
+/**
+ * `E139`：把降级标记挂到切段结果上（**只加键、不动既有五个键的名字与顺序**）。
+ * 形态完整（`faults` 为空）时**原样返回** —— 连一个多余的键都不加：这是"正常路径绝不带
+ * `degraded`"与"无跨零点配置逐字不变"两条保证的落点。
+ */
+function markSplitDegraded(out, faults, facts) {
+  if (faults.length === 0) return out;
+  out.degraded = true;
+  out.degradedReason = degradedSplitReason(faults, facts);
+  out.degradedMissing = faults.slice();
+  return out;
+}
+
+/**
  * `E83` 甲·㈡ **自然日投影**：把"一个班次的运行秒数"按**零点**切成两段。
  *
  *   · **前段（`day1`）＝落在**班次开始那一自然日**（`shift.date`）的运行秒数 ⇒ 归 D；
@@ -351,18 +455,49 @@ function rollAccum(prev, now) {
  * 都建立在它上面）；一旦现配置下两个投影不同值，说明改动**改变了在产行为**，
  * 那是回归、不是新功能。故 `tests\._verify\e83-*.js` 对现配置做"改前 vs 改后"逐字比对。
  *
- * @param {{startAt:string, endAt:string, date:string, elapsedSec?:number}} shift 班次（真源＝
- *        `services/shift.js` 的 `at()`；`elapsedSec` 是**已进行时长**）
+ * @param {{start:number, end:number, startAt:string, endAt:string, date:string, totalSec:number,
+ *          elapsedSec?:number, name?:string}} shift 班次（真源＝`services/shift.js` 的 `at()`：
+ *        `start`/`end` 判是否跨零点、`startAt`/`endAt` 是零点那一刀的两个时刻、`date` 是前段的
+ *        日历归属、`totalSec` 是整班跨度（**不参与**本函数运算、也**不在** fault 判据里）；`elapsedSec`
+ *        是**已进行时长**且**可缺** —— 缺了退化为整班跨度 `span`，那是有意的向后兼容（见 `shiftShapeFaults()`）
  * @param {number} runSec 整班有效运行秒数（`computeShiftStats()` 里那个 `runSec`）
- * @returns {{day1:number, day2:number, crossing:boolean, day1Date:string|null, day2Date:string|null}}
+ * @returns {{day1:number, day2:number, crossing:boolean, day1Date:string|null, day2Date:string|null,
+ *            degraded?:true, degradedReason?:string, degradedMissing?:string[]}}
  *   两段秒数（非负整数；恒有 `day1 + day2 === runSec`）＋ `crossing`（这一次增量是否跨了自然日，
  *   `accumulateRunTime()` 据此决定要不要按日历归属入日档）＋ 两段各自的日历归属（`yyyy-MM-dd`）。
+ *
+ *   ⚠⚠ **`E139`（2026-10-04）：判定不成立时必须**能看出来** —— `degraded` 的语义（**逐字**如下）**：
+ *     · **`degraded` 是真＝这次没能判跨零点（不是"确实不跨"）**：入参**缺/非法**了"影响判定或归属"
+ *       的字段（`start`/`end`/`startAt`/`endAt`/`date`）⇒ 返回的 `crossing: false` 只是"整段归
+ *       班次开始日"的**兜底形态**；`degradedReason` 写明"缺哪个字段／为什么判不了"、
+ *       `degradedMissing` 是**字段名数组**（机器可核、稳定顺序）。⚠ 判据**不收**"不影响判定/归属"
+ *       的字段（`totalSec`；口径收窄见 `shiftShapeFaults()`）：它既不参与运算、也不妨碍判跨零点/定归属，
+ *       把它算作 fault 只会得到"数值与完整形态逐值相同却喊降级"的 **cry wolf**。
+ *       `degradedReason` 仍**区分三种情形**、**不冒领**"算错了"：`start`/`end` 不在场＝**真的判不了**；
+ *       判据说跨零点而两个时刻不在场/不可解析＝**切不了段**（这才是"`crossing:false` 不代表确实不跨"
+ *       的适用面）；在场且判据说本次不跨零点＝这一判定**本身有效**，只是形态**不予背书**。
+ *     · **`degraded` 缺席或为 `false` ⇒ 判定有效**（**向后兼容**的定义）：老调用方**完全不看**
+ *       这个键，行为与 `E139` 之前**逐字相同** —— 标记是**加**在返回体上的第六～八个键，
+ *       既有五个键的名字、顺序、取值一个都没动；⇒ **不看它不会更糟，看它才拿得到新信息**。
+ *     · **正常路径（`createShiftRules().at()` 的完整对象）绝不带 `degraded`**：完整形态下
+ *       连这个键都**不存在**（缺 `totalSec`、但判定/归属字段齐的入参同样不带 —— 见 `shiftShapeFaults()`；
+ *       这是"无跨零点配置逐字不变"那条硬保证的一部分，`E83`／`E132` 的既有断言都建立在那五个键上）。
+ *   ⚠ **为什么不抛错**（这条取舍在本函数里**先于** `E139` 就写明了，本次**不推翻**它）：
+ *     见正文"判不了…也走这一支…**不抛错**，因为切段是**派生的增强**、不该让旧调用方爆掉"。
+ *     抛错会打断它要保护的那批调用方（不传 `startAt`/`endAt` 的旧形态）；而 `degraded` **既不打断**、
+ *     又让"我看不懂"变成**可读事实** —— 这正是 `E38`（"没算过"显示成 0）／`E129`（截断不报）／
+ *     `E131`（`'false'` 静默开闸）同族缺陷的一贯处置：把"看不懂"标出来，而不是当成正常读数。
+ *     命名沿用本仓既有的降级标记先例：`services/dispatch.js` 的 `auth.degraded`（＋ `warning`）。
  */
 function splitRunSecondsByDay(shift, runSec) {
   const total = Math.max(0, Math.round(Number(runSec) || 0));
   /* 不跨自然日（含现配置的三段班与 `end = 24` 的 16→24）：整段归班次开始那天，**逐字不变**。
      判不了（`shift.end` 不是数 / `startAt`·`endAt` 缺失或不可解析）也走这一支 —— 退化为
-     "整段归当日"，与改动前逐字同值；**不抛错**，因为切段是派生的增强、不该让旧调用方爆掉。 */
+     "整段归当日"，与改动前逐字同值；**不抛错**，因为切段是派生的增强、不该让旧调用方爆掉。
+     ⚠ `E139`（2026-10-04）**只把"判不了"从无信号改成有信号**，**不改这条取舍**：上面那句
+     "不抛错"是**有意**的向后兼容（`C·22` 靶子⑧ 复核确认），故本次的修法是"标注"而不是
+     "改成抛错" —— 抛错会打断它要保护的那批旧调用方，而标注既不打断、又让"我看不懂"可读
+     （`markSplitDegraded()`／`degradedSplitReason()`；语义与理由见本函数 docblock 的 `E139` 段）。 */
   const bounds = (() => {
     try {
       const s = toDate(shift && shift.startAt);
@@ -370,10 +505,27 @@ function splitRunSecondsByDay(shift, runSec) {
       return (s && e && Number.isFinite(s.getTime()) && Number.isFinite(e.getTime())) ? { s, e } : null;
     } catch { return null; }
   })();
-  if (!(Number(shift && shift.end) <= Number(shift && shift.start)) || !bounds) {
-    /* 非跨自然日：两段的"日期"其实都是班次开始那天（day2 恒 0）—— 一并给出，读方不用分支 */
+  /* `E139` 的形态判据（**与上面那支判断无关**、只读、不参与任何算式）：fault 只含**影响判定或归属**
+     的字段 ⇒ 完整形态（`start`/`end`/`startAt`/`endAt`/`date` 全在场）⇒ 空数组。放在这里只算一次，
+     两条出口都用它 —— 两个出口都可能拿到不完整入参：
+     ① 整段归当日那一支（判不了跨零点，或本来就非跨零点）；
+     ② 真跨零点那一支（时刻在场但 `date` 缺 ⇒ 例如 `day1Date` 会是 `undefined`）。
+     ⚠ 下面两个事实位是给 `degradedSplitReason()` 用的（**不参与任何算式**）：`start`/`end`
+     是不是有限数、以及**配置层面**说不说这个班跨零点 —— 后者是 `E139` 原始踩法的关键：
+     `{name:'夜班',start:22,end:6}` 的 `start`/`end` 明写跨零点，只是两个时刻不在场 ⇒
+     理由必须说"**切不了段**"，不许说成"判定有效"（本探针第一版就这样误报过）。 */
+  const startEndNumeric = !!shift && typeof shift === 'object' &&
+    typeof shift.start === 'number' && Number.isFinite(shift.start) &&
+    typeof shift.end === 'number' && Number.isFinite(shift.end);
+  const cfgCrossing = Number(shift && shift.end) <= Number(shift && shift.start);
+  const faults = shiftShapeFaults(shift);
+  if (!cfgCrossing || !bounds) {
+    /* 非跨自然日：两段的"日期"其实都是班次开始那天（day2 恒 0）—— 一并给出，读方不用分支。
+       ⚠ 完整形态下**原样返回这五个键**（`markSplitDegraded()` 一个键都不加）＝
+       "无跨零点配置逐字不变"这条硬保证（`E83`／`E132` 反复保过的回归面）。 */
     const only = shift && typeof shift.date === 'string' ? shift.date : null;
-    return { day1: total, day2: 0, crossing: false, day1Date: only, day2Date: only };
+    return markSplitDegraded({ day1: total, day2: 0, crossing: false, day1Date: only, day2Date: only },
+      faults, { cut: false, startEndNumeric, cfgCrossing });
   }
   const startAt = bounds.s;
   const endAt = bounds.e;
@@ -403,7 +555,9 @@ function splitRunSecondsByDay(shift, runSec) {
      为什么把归属**绑在切段结果上**（而不是让调用方另传一个参数）：两段与它们的日历归属是同一件事，
      分开传就会出现"传了切段、忘了归属"的形态 —— 而那时 `day1`/`day2` 只能靠猜塞进某一天，
      猜错正是 `E83` 要消掉的当日累计错位（实测踩到：次日的日档被多算进开始日那一段）。 */
-  return { day1, day2: total - day1, crossing: true, day1Date: shift.date, day2Date: fmtDate(midnight) };
+  return markSplitDegraded(
+    { day1, day2: total - day1, crossing: true, day1Date: shift.date, day2Date: fmtDate(midnight) },
+    faults, { cut: true, startEndNumeric, cfgCrossing });
 }
 
 /**
@@ -446,7 +600,13 @@ function accumulateRunTime(prev, addSec, now, addSplit, alloc) {
   const add = Math.max(0, Number(addSec) || 0);
   /* 切段口径：缺省 / 不跨零点 ⇒ "整段算当日"（与改动前逐字相同）；只有 `crossing === true`
      才按两段各自的日历归属入档。两段都做非负整数化，且**不**对 `day1 + day2` 做二次缩放
-     （`splitRunSecondsByDay()` 已保证恒等式；这里只负责不造出负数/NaN）。 */
+     （`splitRunSecondsByDay()` 已保证恒等式；这里只负责不造出负数/NaN）。
+     ⚠ `E139`：**降级**的切段（`E139` 的 `degraded: true`）恒带 `crossing: false` ⇒ 在这里就落进
+     "整段算当日"那一支（与 `E83` 之前逐字相同）—— 这正是"不抛错、不改变数值"的取舍。本函数
+     **不**把 `degraded` 再抄进自己的返回值（**单一真源**：标记只挂在 `addSplit` 上，调用方手上
+     已经有那个对象；多抄一处就会出现"两个地方都说降级、取值还可能不同"）。它在两条在产路径上
+     被**读**到：`computeShiftStats()` 的 `runSecSplit`（原样带出）与 `stateSnapshot.statsOf()`
+     的 `runAccum.currentShift.splitDegraded`（并记一条去重的 `console.warn`）。 */
   const hasSplit = addSplit && addSplit.crossing === true &&
     Number.isFinite(Number(addSplit.day1)) && Number.isFinite(Number(addSplit.day2));
   const day1 = hasSplit ? Math.max(0, Math.round(Number(addSplit.day1))) : add;

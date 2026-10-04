@@ -1314,6 +1314,12 @@ async function start(options = {}) {
     return { key: shiftKeyOf(s), date: s.date, name: s.name, startAt: s.startAt, endAt: s.endAt };
   }
 
+  /** `E146`（2026-10-04）**写路径**的降级告警闸：同一原因（同一 `degradedReason` 串）只告警一次。
+   *  本 `Set` 随 `start()` 一轮归零（与 `state.shiftStatWrite` 的计数同一处纪律：上一轮的告警不该
+   *  让新一轮静默）。判据真源只有一处 —— `services/stats.js` 的 `splitRunSecondsByDay()` 挂在切段
+   *  结果上的 `degraded` 标记（本文件与 `stateSnapshot.js` 都只**读**它，不另判一套）。 */
+  const warnedSplitDegraded = new Set();
+
   /** 把一个班次的**库内真源读数**装成 `shift_stat` 的一行（固化与补记共用；口径见 6e-4 段头）。
    *  ⚠ "无法判定"的两个**状态位**（`oee`/`pass_rate` 为 `null`）是本函数**刻意**给出的，别改成 0：
    *    · `frameCount === 0` ⇒ 该窗口没有采集数据 ⇒ **运行时长无法判定**（设备没跑 / 链路断了 /
@@ -1323,6 +1329,36 @@ async function start(options = {}) {
     const taken = statsForShift(state.db, shift, { config: boardCfg, now: shift.endAt, addRunSec: 0 });
     const s = taken.stats;
     const f = taken.fact;
+    /* `E146`（2026-10-04）：**写路径也要读出降级** —— 读的是与 `stateSnapshot.statsOf()` 同一个标记
+       （判据真源只有一处：`services/stats.js` 的 `splitRunSecondsByDay()`；语义＝"**这次没能判跨零点**"，
+       `crossing:false` 只是"整段归班次开始日"的兜底形态）。
+       为什么**写路径更要管**：读错看得见（下一次读还是错的、能被对账发现），而**写进库的错账**会被
+       `repo/shiftStat.js` 的 `segmentsOf()`/`sumRunSec()` 当成"已固化的真源"永久参与日/月/年档求和 ——
+       错一次、之后每次读都错，且库里没有任何一列再提示"这一行的切段其实是兜底形态"。
+       ⇒ 若降级真的发生在这一支，绝不能**静默**落一行"整段归 day1"的错账。
+       处置＝**标注 ＋ 告警**，一个数都不改（与 `stateSnapshot.statsOf()` 同一口径、同一先例；
+       出口沿用 `server/db/index.js` 的 F17-3：有 `logger` 走 `logger.warn`，否则 `console.warn`）：
+         · **不抛错** —— `stats.js` 的既有取舍是"切段是派生的增强、不该让旧调用方爆掉"（`E139` docblock），
+           写路径抛错会把整条固化链（乃至那一拍的判定链）带下来；
+         · **同一原因只告警一次**（`warnedSplitDegraded`）：本函数按班次被反复调用，不设闸会刷屏。
+       现况（真源可核）：本函数的 `shift` 来自 `completedShiftOf()` → `shiftRules.at()`，而 `at()`
+       （`services/shift.js:237-282`）必给 `start`/`end`/`startAt`/`endAt`/`date` —— 正是 `E139` 收窄后的
+       **全部** fault 判据（`totalSec` 不在其中）⇒ **生产路径上 `degraded` 不可达**（本条是"下一根探针/
+       下一个调用方"的防线，不是当下在冒烟）。 */
+    const split = s.runSecSplit;
+    if (split && split.degraded === true) {
+      const why = String(split.degradedReason || '（未给 degradedReason）');
+      if (!warnedSplitDegraded.has(why)) {
+        warnedSplitDegraded.add(why);
+        const line = '[DR-06] ⚠ 固化班次的**切段降级**（`E146`）—— ' +
+          `班次 ${shift.date} ${shift.name}：本次落库的 run_sec_day1/run_sec_day2 ＝ ` +
+          `${s.runSecDay1}/${s.runSecDay2}，是"整段归班次开始日"的**兜底形态**` +
+          '（跨零点班次会把次日那一段并进开始日的日档 —— **写进库的错账比读数错更难发现**，' +
+          `因为此后每次日/月/年档求和都把它当"已固化的真源"）；原因：${why}`;
+        if (logger && typeof logger.warn === 'function') logger.warn(line);
+        else console.warn(line);
+      }
+    }
     const runDeterminable = f.frameCount > 0;
     const rateDeterminable = f.pieceCount > 0;
     const nowText = platformClock.fmt(currentClock().now());

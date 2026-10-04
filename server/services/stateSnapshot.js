@@ -306,6 +306,9 @@ function createStateSnapshot(options = {}) {
    *  供 `GET /health` 的 `runAccum` 只读引用；**不进** `snapshot()` 的返回体（那是 hello/`GET /state`
    *  的契约，本次不动）。初值 `null` ＝"还没做过一次快照"。 */
   let lastRunAccum = null;
+  /** `E139`：已告警过的**切段降级原因**（每个实例一份）—— 本函数（`statsOf()`）每拍都被调用，
+   *  不设闸会把同一句 `console.warn` 刷成日志洪水；"同一原因只报一次"是告警，不是节流丢弃。 */
+  const warnedDegradedSplit = new Set();
 
   /** 当前工单行（最近更新的一条；无 ⇒ null） */
   function taskRow() {
@@ -381,6 +384,11 @@ function createStateSnapshot(options = {}) {
    *     日历归属**（`day1Date`/`day2Date`），由 `accumulateRunTime()` 按段分派到各自的自然月/年
    *     （不属于 `now` 所在周期的段不进本周期档，它们归上一个周期；读口 `sumRunSec()` 的分段归集
    *     对**已固化**的行做同一件事）。
+   *   ⚠ **`E139`（2026-10-04）：本函数读切段的 `degraded` 标记**（`splitRunSecondsByDay()` 在"入参缺/非法
+   *     了**影响跨零点判定或日历归属**的字段"时会给；**不影响**判定/归属的字段如 `totalSec` **不算**）
+   *     —— 判断与理由（为什么读、为什么**只告警不抛错**）写在下面 `statsOf()` 里那一行注释上（不在此
+   *     重复）；读数落在 `runAccum.currentShift.splitDegraded`/`splitDegradedReason`。⚠ 现况：本函数的
+   *     `shift` 来自 `shiftRules.at(now)` ⇒ 完整形态 ⇒ **生产路径上 `degraded` 不可达**（防线，不是冒烟）。
    *     现配置（0-8/8-16/16-24）无跨零点班次 ⇒ 两套投影**恒同值**（这是硬保证，不是巧合：
    *     见 `services/stats.js` 的 `splitRunSecondsByDay()` 与 `tests\._verify\e83-*.js` 的逐字比对）。
    *   ⚠ **为什么切段结果必须落库（而不是只放内存累加器）**：本函数是"**每次快照从 DB 现算**"
@@ -429,6 +437,32 @@ function createStateSnapshot(options = {}) {
       day1: Math.max(0, base.stats.runSecDay1 - day1Frozen),
       day2: Math.max(0, base.stats.runSecDay2 - day2Frozen)
     });
+    /* `E139`（2026-10-04）：**读**切段的降级标记 —— `splitRunSecondsByDay()` 在"入参不是
+       `createShiftRules().at()` 的完整形态"时会带 `degraded: true`（语义：**这次没能判跨零点**，
+       `crossing:false` 只是"整段归开始日"的兜底形态、**不表示"确实不跨"**；见 `services/stats.js`
+       的 `splitRunSecondsByDay()` docblock 的 `E139` 段）。
+       为什么这里**要读**（而不是"让它躺着，反正调用方会自己看"）：本函数是 `GET /state`／`/health`
+       那一份**在产读数**的组装处，降级一旦发生就会**静默错账**（跨零点那一班整段进开始日的日档，
+       正是 `E132` 的病理形态）—— 那正是 `E38`／`E131` 同族缺陷的形态。读它只做两件事，
+       **一个数都不改**：
+         ① 随 `runAccum.currentShift.splitDegraded`/`splitDegradedReason` 如实报出（`/health` 可核）；
+         ② **同一原因只告警一次**（`console.warn`）—— 本函数每拍都被调用，不设闸会把日志刷满。
+        ⚠ 为什么**只告警、不抛错**：`stats.js:364-365`（改动前原文）与 `E139` docblock 都写明
+          "切段是派生的增强、**不该让旧调用方爆掉**"是**有意**取舍 ⇒ 抛错会打断它要保护的那批
+          调用方，还会把 `GET /state` 整条读路径带下来。⇒ 处置是"**标注 ＋ 告警**"（与
+          `server/db/index.js` 的 F17-3 告警出口同款：有 `logger` 走 `logger.warn`，本模块没有
+          注入的 logger 出口，故退 `console.warn`，**绝不静默**）。
+       ⚠ 现况（真源可核）：本函数的 `shift` 来自 `shiftRules.at(now)`，而 `at()`（`services/shift.js`
+          `:237-282`）必给 `start`/`end`/`startAt`/`endAt`/`date` —— 正是 `E139` 收窄后的**全部** fault
+          判据（`totalSec` 不在其中）⇒ **生产路径上 `degraded` 不可达**（防线，不是当下在冒烟）。 */
+    const splitDegraded = split.degraded === true;
+    if (splitDegraded) {
+      const why = String(split.degradedReason || '（未给 degradedReason）');
+      if (!warnedDegradedSplit.has(why)) {
+        warnedDegradedSplit.add(why);
+        console.warn(`[stateSnapshot] 当班切段**降级**（E139）—— ${why}`);
+      }
+    }
     const accumPrev = {
       daySec: sums.daySec, monthSec: sums.monthSec, yearSec: sums.yearSec, at: now,
       /* `E83` 的第二套投影（班次投影）**不进** accum 的算式，只作为对账读数随读数一起报出去 */
@@ -465,7 +499,12 @@ function createStateSnapshot(options = {}) {
         date: shift.date, name: shift.name, frozenRunSec,
         frozenDay1: day1Frozen, frozenDay2: day2Frozen,
         liveDay1: base.stats.runSecDay1, liveDay2: base.stats.runSecDay2,
-        crossing: Number(shift.end) <= Number(shift.start)
+        crossing: Number(shift.end) <= Number(shift.start),
+        /* `E139`：**切段**那一支的判定是否成立 —— `splitDegraded === true` ⇒ `crossing`
+           （本键＝按 `start`/`end` 的配置判据）**与** `liveDay1`/`liveDay2` 都是"整段归开始日"的
+           **兜底形态**，读方不得把它们当成"确实不跨零点"（理由与后果见上一条注释）。 */
+        splitDegraded,
+        splitDegradedReason: splitDegraded ? String(split.degradedReason || '') : null
       },
       addRunSec,
       addRunSecSplit: split,
