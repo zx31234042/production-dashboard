@@ -677,6 +677,190 @@ async function main() {
       : dateRow === '' ? `找不到「| 编制日期 |」行（${reqListRel}）`
         : `最新登记 V${latestDated || '（无）'} ≠ 文件名 V${reqListVer}${curBold ? '' : `；且当前版本未写成「**V${reqListVer} 修订于 …**」`}（行内登记：${datedVers.join('、') || '无'}）`);
 
+  /* ===== D7 提交信息偏差登记名单（`E173`：偏差**计数**也是断言） =====
+     【为什么"容许失败"的机制必须有计数守据（本段立案句）】
+     D2 的两条断言判的是"**当前每一条提交都合规**"，于是它们对**已登记的历史偏差**永久失败。
+     "永久失败"的意思不是"红着"，而是：**通过/失败计数不会再动** —— 今天新增一笔不合规提交
+     （`2c4f594`「测试: …」就是实例，2026-10-05 主代理自己踩中），D2 的失败清单里会多一条，
+     但汇总行仍是"通过 46 项，失败 2 项" ⇒ **新增偏差没有任何独立信号**，不会有人因为"计数变了"去看一眼。
+     这正是本仓反复抓到的「**已登记的戳会盖住未登记的失败**」（`E156`／`E164`／`C·24`）
+     在**提交信息**这一层的形态：**容错机制自己把新错误吃掉了**。
+     ⇒ 修法：把"偏差**条数**"本身变成断言 —— **登记名单的条数 N**（硬编码常量）与 `git log` 实测的
+     **不合规提交条数 M** 比对：**M > N ⇒ 红并逐条指名新增的那几笔**（完整哈希 ＋ 主题）；
+     **M < N ⇒ 红并报"名单陈旧"**（登记了却实测不到 ⇒ 有人改写了历史，或名单写错/多写）。
+     名单本身**只增不改写**（`PROJECT_RULES` 6.4 纪律：已推送的不合规提交一律不改写，只登记）。
+     ⚠ 口径（`M` 数的是什么）：**逐提交、按完整哈希去重**（不是按主题去重）—— 否则"再写一笔 `review`"
+     这种新增**不会**让计数变化，信号又没了（今天的 `测试:` 那笔恰好是新主题，按主题去重它也看得见；
+     但按主题去重会给下一种形态留洞）。
+     ⚠ 与既有守据的关系（不重复、不冲突）：`tests\harness-check.js` 第十一节比对的是
+     `tests\run-all.js` 的 `REGISTERED_DEVIATIONS['docs-check'].listedItems`（**失败清单条数**）——
+     它既不指名具体是哪几笔、也不判"名单陈旧"；本段补的正是**逐笔登记 ＋ 双向 ＋ 冻结点**，
+     并把"`listedItems` 与本段名单是否同步"一并纳入判据（免得一处登记、另一处仍写旧数）。
+     ⚠ **本段刻意放在 D2 段之外**：`harness-check` 第十一节用**源码切片**（`section('D2 提交信息格式…')`
+     到 `/* ===== D3`）静态核对"D2 段断言名 ↔ 已登记偏差断言名"；新增断言若写进切片里，会被误算成
+     "D2 段又加了一条断言"（＝换了豁免口子）⇒ 本段的断言**不是**那两条已登记偏差，**不得**进切片。
+     ⚠ **如何登记新增（一句话操作说明）**：把新增的那一笔 `{ hash, subject, why }` **追加**到
+     `E173_REGISTRY` 末尾，并把 `E173_ANCHOR` 的 `total` 与 `sha12` 改成**本断言判红详情里直接给出的
+     新值**（照抄即可）；同时（**须负责人放行 —— 4b 无 `PROJECT_RULES.md`／`tests\run-all.js` 写权限**）
+     把 `PROJECT_RULES.md` 6.4 的两个数字与 `tests\run-all.js` 的 `listedItems` 一起 ＋1。名单**只增**，
+     历史**不改写**。 */
+  section('D7 提交信息偏差登记名单（`E173`：偏差计数也是断言）');
+  {
+    /** **登记名单**（硬编码常量；出处＝`PROJECT_RULES.md` 6.4 逐条登记的那 13 笔）。
+     *  字段：`hash`＝**完整**提交哈希（比对键，逐笔去重）；`subject`＝主题全文（留痕、可读）；
+     *  `why`＝6.4 里的登记类别（逐条登记／同类早期）。**只增不改写**。 */
+    const E173_REGISTRY = [
+      { hash: '01d7aede00bc76a4d61bc7abfb4e95207bcaa621', subject: '修改: 附录2增至13字段并按责任方重新归口待确认事项，需求清单升 V1.26', why: '6.4 同类早期（主题 35 字 > 30）' },
+      { hash: '0b2db3fffbb78d085729f59881a8ff736b877537', subject: 'review', why: '6.4 同类早期（缺前缀「review」）' },
+      { hash: '3feb163356f83d44af93350505133540474c5f95', subject: '新增：接口适配层与配置化、模拟上位机与模拟 MES 联调工具', why: '6.4 同类早期（缺前缀：用了全角冒号「新增：…」）' },
+      { hash: '41fa42d6b209a019352a1b726c086a775682db78', subject: 'review report', why: '6.4 同类早期（缺前缀「review report」）' },
+      { hash: '870e54ab18da5f7c1a07c6bd0c26cfbad481f82f', subject: 'review', why: '6.4 同类早期（缺前缀「review」）' },
+      { hash: '93f27a9f99ee9b07290f33f6c3f2933e80f69030', subject: '文档: 需求清单升 V1.28，正文附录 2 字段数统一为 13 构建: contract-check 新增字段数声明一致性断言', why: '6.4 逐条登记（主题 60 字 > 30；且 `文档:` 与 `构建:` 挤在同一行）' },
+      { hash: 'a5ff9c7be2c893f4997cfde75bfef4a79b10763f', subject: 'review', why: '6.4 同类早期（缺前缀「review」）' },
+      { hash: 'a6a6bd0001c613345174e4104421e9ad2dc2a288', subject: 'review', why: '6.4 同类早期（缺前缀「review」）' },
+      { hash: 'be63c3734903d3e958849cd1df92e7859cb40eb5', subject: '记录: 登记 FR-5.10 与 FR-5.11 缺口及 FR-5.11 口径待定', why: '6.4 同类早期（主题 37 字 > 30；2026-09-30 本机 AI 提交，推送前由门禁当场发现）' },
+      { hash: 'c269c4c07a5b048ab6171b2063fecb142201262e', subject: '代码审查', why: '6.4 逐条登记（类型不合规：无白名单类型前缀，主题为「代码审查」）' },
+      { hash: 'dcb8274f5f7a49103337f4947072c5f0e799cad2', subject: '修改: 设备运行阶段简化为准备/运行/判定/完成，需求清单升 V1.25', why: '6.4 同类早期（主题 32 字 > 30）' },
+      { hash: 'dffc2dc61f95fac9b6ad95c0ff71a14ac804dbbb', subject: 'test', why: '6.4 同类早期（缺前缀「test」）' },
+      { hash: 'f9152eecd7d5b0b901b9793f88253da80e255716', subject: 'review', why: '6.4 逐条登记（类型不合规：无白名单类型前缀「review」）' },
+      /* ⚠ `E173` 第 14 笔（2026-10-05 追加，**名单只增不改写**）：负责人当天"**批准登记**"
+         （`PROJECT_RULES` 6.4 已同批改为"本表逐条登记 **4** 条／D2 段实际列出 **14** 条"，规范升 v1.39）
+         ⇒ 本段名单同步 ＋1，`E173_ANCHOR` 改为 `total: 14`／`sha12: 'aa2200d1bd99'`；
+         `tests\run-all.js` 的 `listedItems` 同批 **13 → 14**（本批**临时授权**，只许动这一个常量）。
+         这一笔的"将来报警"能力由 `E173-②` 的 ㈠（把实测 M 改成 15 ⇒ 必红并指名）守着。 */
+      { hash: '2c4f5945ce697fa1227469d27a14266c9057e34b', subject: '测试: E160地面自证与E161禁API落地', why: '6.4 逐条登记（**类型不在 6.2 白名单**：用了 `测试:`，应为 `修改:`；主题 22 字合规）' },
+    ];
+    /** **冻结点锚点**（`E145` 的教训：锚点必须是**常量**，不能由清单现算 —— 现算＝自己对自己复读、零证伪能力）。
+     *  清单被悄悄改过（删一条／改一条主题／换顺序）⇒ `sha12` 不符 ⇒ 当场红。 */
+    const E173_ANCHOR = { total: 14, sha12: 'aa2200d1bd99' };
+    const sha12E173 = (s) => require('node:crypto').createHash('sha256').update(s).digest('hex').slice(0, 12);
+    /** **判据（纯函数；主断言与 D22 同一把尺子）**：`measured`＝实测不合规提交的**完整哈希**数组；
+     *  `registry`＝登记名单。返回双向读数（`E140`／`E145` 的"只增不减 ＋ 名单陈旧 ＋ 冻结点"机制）。 */
+    const auditE173 = (measured, registry, anchor) => {
+      const measuredSet = new Set(measured);
+      const hashes = registry.map(e => e.hash);
+      const regSet = new Set(hashes);
+      const unregistered = measured.filter(h => !regSet.has(h));       /* M > N：新增（必红并指名） */
+      const stale = hashes.filter(h => !measuredSet.has(h));           /* 名单陈旧（必红并报） */
+      const dupReg = hashes.filter((h, i) => hashes.indexOf(h) !== i);
+      const badField = registry.filter(e => !/^[0-9a-f]{40}$/.test(String(e.hash))
+        || !String(e.subject || '').trim() || !String(e.why || '').trim()).map(e => e.hash);
+      const sorted = registry.slice().sort((a, b) => String(a.hash).localeCompare(String(b.hash)));
+      const sha12 = sha12E173(sorted.map(e => `${e.hash}|${e.subject}`).join('\n'));
+      const anchorOk = anchor.total === registry.length && anchor.sha12 === sha12;
+      return { unregistered, stale, dupReg, badField, sha12, total: registry.length, anchorOk };
+    };
+    /* 规则参数**从 D2 段源码里读**（免得两处各写一份规则再次漂移；与 `harness-check` 第十一节同法）。 */
+    const selfSrcE173 = fs.readFileSync(__filename, 'utf8');
+    const d2AtE173 = selfSrcE173.indexOf("section('D2 提交信息格式");
+    const d2EndE173 = selfSrcE173.indexOf('/* ===== D3', d2AtE173);
+    const d2SrcE173 = d2AtE173 < 0 || d2EndE173 < 0 ? '' : selfSrcE173.slice(d2AtE173, d2EndE173);
+    const typesE173 = [...((d2SrcE173.match(/const TYPES = \[([^\]]*)\]/) || [])[1] || '')
+      .matchAll(/'([^']+)'/g)].map(m => m[1]);
+    const lenLimitE173 = Number((d2SrcE173.match(/\.length\s*>\s*(\d+)\)/) || [])[1]);
+    const rowsE173 = gitOutput(['log', '--pretty=format:%H%x09%s'], 'e173-subjects.txt')
+      .split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+      .map((l) => { const p = l.split('\t'); return { hash: p[0], subject: p.slice(1).join('\t') }; });
+    const ruleOkE173 = rowsE173.length > 0 && typesE173.length >= 5 && Number.isInteger(lenLimitE173);
+    const badTypeE173 = rowsE173.filter(r => !new RegExp(`^(${typesE173.join('|')}): \\S`).test(r.subject)).map(r => r.hash);
+    const tooLongE173 = rowsE173.filter(r => r.subject.replace(/^[^:]+:\s*/, '').length > lenLimitE173).map(r => r.hash);
+    const measuredE173 = [...new Set([...badTypeE173, ...tooLongE173])];
+    const subjectOfE173 = (h) => (rowsE173.find(x => x.hash === h) || { subject: '（主题未取到）' }).subject;
+    const measuredTxtE173 = measuredE173.map(h => `\`${h.slice(0, 7)}\`「${subjectOfE173(h)}」`);
+    const auditDiskE173 = ruleOkE173
+      ? auditE173(measuredE173, E173_REGISTRY, E173_ANCHOR)
+      : { unregistered: [], stale: [], dupReg: [], badField: [], total: E173_REGISTRY.length, anchorOk: false, sha12: '' };
+    const runAllE173 = require('./run-all');
+    const listedItemsE173 = runAllE173.REGISTERED_DEVIATIONS && runAllE173.REGISTERED_DEVIATIONS['docs-check']
+      ? runAllE173.REGISTERED_DEVIATIONS['docs-check'].listedItems : null;
+    const syncOkE173 = listedItemsE173 === E173_REGISTRY.length;
+    /** 待登记的几笔（＝实测有、名单无）——判红详情里给**照抄即用**的登记行与新锚点。 */
+    const pendingE173 = auditDiskE173.unregistered.map(h => ({
+      hash: h, subject: subjectOfE173(h), why: '（待登记：2026-10-05 由 4b 报出，须负责人放行）'
+    }));
+    const newAnchorE173 = (() => {
+      const all = E173_REGISTRY.concat(pendingE173)
+        .slice().sort((a, b) => String(a.hash).localeCompare(String(b.hash)));
+      return { total: all.length, sha12: sha12E173(all.map(e => `${e.hash}|${e.subject}`).join('\n')) };
+    })();
+    console.log(`  [E173] 登记名单 N=${E173_REGISTRY.length}（锚点 total=${E173_ANCHOR.total}／sha12=${E173_ANCHOR.sha12}；`
+      + `现算 sha12=${auditDiskE173.sha12}；锚点相符=${auditDiskE173.anchorOk}；\`run-all.listedItems\`=${listedItemsE173}）；`
+      + `git 实测不合规提交 M=${measuredE173.length}（类型不合规 ${badTypeE173.length} ＋ 超 ${lenLimitE173} 字 ${tooLongE173.length}，`
+      + `逐笔按完整哈希去重）${ruleOkE173 ? '' : '；⚠ git 或规则参数取不到 ⇒ 本段不作判定依据'}`);
+    check('E173-① **提交信息偏差计数断言**（`E173`）：登记名单条数 N 与 `git log` 实测不合规条数 M **双向比对**'
+      + '（逐笔按**完整哈希**去重）—— `M > N` ⇒ **红并逐条指名新增的那几笔（哈希 ＋ 主题）**；'
+      + '`M < N` ⇒ 红并报"**名单陈旧**"；名单只增不改写；并给**冻结点锚点**（条数 ＋ 逐条 `sha12`，常量、不由清单现算）；'
+      + '且 N 与 `tests\\run-all.js` 的 `listedItems`（另一处登记）**同步**',
+      ruleOkE173 && auditDiskE173.unregistered.length === 0 && auditDiskE173.stale.length === 0
+        && auditDiskE173.dupReg.length === 0 && auditDiskE173.badField.length === 0
+        && auditDiskE173.anchorOk && syncOkE173,
+      (ruleOkE173
+        ? `**M=${measuredE173.length}／N=${E173_REGISTRY.length} ⇒ 判红**：新增（未登记）${auditDiskE173.unregistered.length} 笔`
+          + `${auditDiskE173.unregistered.length ? '＝' + auditDiskE173.unregistered.map(h => measuredTxtE173[measuredE173.indexOf(h)]).join('、') : ''}；`
+          + `名单陈旧 ${auditDiskE173.stale.length} 笔${auditDiskE173.stale.length ? '＝' + auditDiskE173.stale.join('、') : ''}；`
+          + `重复登记 ${auditDiskE173.dupReg.length}／字段不合形 ${auditDiskE173.badField.length}；`
+          + `锚点相符=${auditDiskE173.anchorOk}（冻结 total ${E173_ANCHOR.total}／sha12 ${E173_ANCHOR.sha12}，现算 ${auditDiskE173.sha12}）；`
+          + `与 \`run-all.listedItems\` 同步=${syncOkE173}（实测 ${listedItemsE173}）`
+        : '⚠ git／规则参数取不到 ⇒ 本段**不作判定依据**（不等于通过）')
+        + `。**要清掉这条红**（二选一，两条路都须**负责人放行** —— 4b 无 \`PROJECT_RULES.md\`／`
+        + '`tests\\run-all.js` 写权限）：①按 6.4 纪律**登记**上面那几笔（把下面"待追加的登记行"追加进 '
+        + `\`E173_REGISTRY\`，并把 \`E173_ANCHOR\` 改成 total: ${newAnchorE173.total}／sha12: '${newAnchorE173.sha12}'，`
+        + `同时把 \`tests\\run-all.js\` 的 \`listedItems\` 与 \`PROJECT_RULES.md\` 6.4 的两个数字一起 `
+        + `＋${pendingE173.length}）；②若负责人**不许登记**，那也是一种决定，须**显式写出**`
+        + `（本条就永久红 —— 这正是"偏差有独立信号"的代价，` + '`E173`' + ` 立案要的就是这个信号）。`
+        + ` 待追加的登记行（照抄）：`
+        + (pendingE173.length
+          ? pendingE173.map(e => `\n        { hash: '${e.hash}', subject: '${e.subject}', why: '${e.why}' },`).join('')
+          : '（无）'));
+    check('E173-② D22（可证伪，**四支内存变异 ＋ 负对照**）：同一 `auditE173()` 喂 —— '
+      + '㈠**实测 M 比名单多 1 笔**（登记 14 笔之后即 **M=15**）⇒ 进 `unregistered`（**红并指名**）；'
+      + '㈡登记名单**删**一条（`measured` 不变）⇒ 该笔进 `unregistered`（红）；'
+      + '㈢登记名单**加**一笔历史里没有的哈希 ⇒ 进 `stale`（**报"名单陈旧"** ⇒ 红）；'
+      + '㈣只改一条的**主题**（哈希不变）⇒ 冻结点 `sha12` **必不符**（⇒ 锚点不是清单对自己的复读）；'
+      + '**负对照**＝盘上名单 ＋ "实测＝名单"的合成读数 ⇒ 四项全 0、锚点相符（**必绿**）',
+      (() => {
+        const reg = E173_REGISTRY;
+        const hashes = reg.map(e => e.hash);
+        const zz = 'a'.repeat(40);
+        const yy = 'b'.repeat(40);
+        const clean = auditE173(hashes, reg, E173_ANCHOR);
+        const m1 = auditE173(hashes.concat([zz]), reg, E173_ANCHOR);
+        const dropped = reg.slice(1);
+        const m2 = auditE173(hashes, dropped,
+          { total: dropped.length, sha12: auditE173(hashes, dropped, { total: dropped.length, sha12: '' }).sha12 });
+        const added = reg.concat([{ hash: yy, subject: '（合成）', why: '（合成）' }]);
+        const m3 = auditE173(hashes, added,
+          { total: added.length, sha12: auditE173(hashes, added, { total: added.length, sha12: '' }).sha12 });
+        const edited = reg.map((e, i) => (i === 0 ? { hash: e.hash, subject: e.subject + '（改过）', why: e.why } : e));
+        const m4 = auditE173(hashes, edited, E173_ANCHOR);
+        return clean.unregistered.length === 0 && clean.stale.length === 0 && clean.anchorOk === true
+          && m1.unregistered.length === 1 && m1.unregistered[0] === zz
+          && m2.unregistered.length === 1 && m2.unregistered[0] === reg[0].hash
+          && m3.stale.length === 1 && m3.stale[0] === yy
+          && m4.anchorOk === false && m4.sha12 !== E173_ANCHOR.sha12;
+      })(),
+      (() => {
+        const reg = E173_REGISTRY;
+        const hashes = reg.map(e => e.hash);
+        const zz = 'a'.repeat(40);
+        const yy = 'b'.repeat(40);
+        const clean = auditE173(hashes, reg, E173_ANCHOR);
+        const m1 = auditE173(hashes.concat([zz]), reg, E173_ANCHOR);
+        const dropped = reg.slice(1);
+        const m2 = auditE173(hashes, dropped,
+          { total: dropped.length, sha12: auditE173(hashes, dropped, { total: dropped.length, sha12: '' }).sha12 });
+        const added = reg.concat([{ hash: yy, subject: '（合成）', why: '（合成）' }]);
+        const m3 = auditE173(hashes, added,
+          { total: added.length, sha12: auditE173(hashes, added, { total: added.length, sha12: '' }).sha12 });
+        const edited = reg.map((e, i) => (i === 0 ? { hash: e.hash, subject: e.subject + '（改过）', why: e.why } : e));
+        const m4 = auditE173(hashes, edited, E173_ANCHOR);
+        return `负对照（实测＝名单）⇒ unregistered ${clean.unregistered.length}／stale ${clean.stale.length}／锚点相符 ${clean.anchorOk}（都应绿）；`
+          + `㈠` + '`measured`' + ` 多一笔未登记哈希 ⇒ unregistered ${m1.unregistered.length} 笔（指名 \`${m1.unregistered[0]}\`）；`
+          + `㈡名单删一条 ⇒ unregistered ${m2.unregistered.length} 笔（指名 \`${m2.unregistered[0]}\`）；`
+          + `㈢名单加一笔历史里没有的 ⇒ stale ${m3.stale.length} 笔（报"名单陈旧"，指名 \`${m3.stale[0]}\`）；`
+          + `㈣只改一条主题 ⇒ 锚点现算 sha12 ${m4.sha12} ≠ 冻结 ${E173_ANCHOR.sha12}（必不符）`;
+      })());
+  }
   /* ---------------- 汇总 ---------------- */
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 ${skipped} 项`);

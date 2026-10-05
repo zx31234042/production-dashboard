@@ -24,11 +24,21 @@
    状态码：200（正常，含"跳过"与"本次仍失败"—— 失败已作为业务结果如实回在响应体里）；
            400（入参非法：`ids`/`limit` 形态不对）；**403（非回环来源，E87）**；
            405/404 由路由器给；500 内部故障（路由器留痕）。
-   装配语义（**E48**，2026-10-05）：上报器实例池的键是 `db` 句柄，**值里带"行为指纹"** ——
-     同一个库上第二次 `mountUpload()` 若行为配置与第一次不同 ⇒ **显式抛错并逐项指名差异**
-     （绝不复用第一个实例的配置快照：那正是"上报静默发到旧地址"的成因）；配置相同 ⇒ 复用并
-     **打一条日志**；`deps.config` 进**必填**（缺失即抛；装配点 `server/index.js` 与这里同批传
-     `boardCfg`，**不读全局配置兜底**）。详见下方 `resolveReporterDetail()` 的注释。
+   装配语义（**E48**，2026-10-05；同日**补修②**＝独立复核 `C·26②` 判"指纹覆盖面不够"）：上报器
+     实例池的键是 `db` 句柄，**值里带"行为指纹"** —— 同一个库上第二次 `mountUpload()` 若行为配置
+     与第一次不同 ⇒ **显式抛错并逐项指名差异**（绝不复用第一个实例的配置快照：那正是"上报静默发到
+     旧地址"的成因）；配置相同 ⇒ 复用并**打一条日志**；`deps.config` 进**必填**（缺失即抛；装配点
+     `server/index.js` 与这里同批传 `boardCfg`，**不读全局配置兜底**）。
+     补修②把复核实测出来的三个洞一并补上：
+       ① 配置覆盖面：由"只挑几个"改为**显式白名单**（含 `config.dataSource`／
+          `config.device.equipCode`／`config.mes.*`，逐项附代码出处）—— 见 `CONFIG_KEY_PATHS`；
+       ② 标量选项**按类型严格校验与比较**（`timeoutMs: 2000` ≠ `'2000'`；后者过去会静默回落
+          `mes.timeoutMs`/3000）—— 见 `assertOptionTypes()`／`canonScalar()`；
+       ③ `logger`/`now`/`fetch`/`queue`/`bus`/`idGenerator` 这类**无法按值比较的注入**，本次与创建时
+          不是同一实例 ⇒ **默认抛错**（复核实测：沿用旧时钟 ⇒ 发报时间戳落旧时刻；沿用旧 bus ⇒
+          本次挂载的订阅者 **0** 条事件），只有显式 `allowReuseWithDifferentDeps: true` 才降级为
+          "逐项点名 ＋ 告警"。**默认路径里不再有"不同注入、静默复用、只在日志里说一句"**。
+     详见下方 `resolveReporterDetail()` 及其上方的白名单注释。
    ⚠ 本包**不做**：定时上报/自动重试（W5 接线后才会有周期触发；即使那时也只调 `report()` 一次）、
       SSE 业务推送（W5）、前端切真实源（W5）、登录与口令（后续包）。
    依赖：`server/services/uploadReporter.js`、`server/http/router.js`（复用 json/readJson）、
@@ -52,26 +62,89 @@ const { remoteOf } = require('./auth');
  *  每请求各建一份会让 `/upload/status` 永远显示"还没发过"（等于没有状态可观测）。
  *  键＝`db` 句柄本身（`WeakMap`，不把句柄转字符串），与 `routes/ifA.js` 的池同款。
  *
- *  ⚠ **E48（2026-10-05）**：原来"命中 `db` 键就 `return cached`"——**不再看本次的 config／logger／
- *  now／fetch／bus**，于是"同一个库上再挂一份指向别的 MES 的上报器"会**静默复用第一个实例
- *  （连同它的配置快照）**：上报打到旧地址、阈值用旧值，而且**不报错**（现场只能看到"上报发去了
- *  旧地址"）。现在池里的值带**行为指纹**（见 `behaviorOf()`）：
- *    ①指纹相同 ⇒ 复用（`E48②`），并**打一条日志**说明复用了哪个实例、本次哪些注入项未被采纳；
+ *  ⚠ **E48（2026-10-05；补修②同日，复核 `C·26②`）**：原来"命中 `db` 键就 `return cached`"——
+ *  **不再看本次的 config／logger／now／fetch／bus**，于是"同一个库上再挂一份指向别的 MES 的
+ *  上报器"会**静默复用第一个实例（连同它的配置快照）**：上报打到旧地址、阈值用旧值，而且**不报错**
+ *  （现场只能看到"上报发去了旧地址"）。现在池里的值带**行为指纹**（见 `behaviorOf()`）：
+ *    ①指纹相同 ⇒ 复用（`E48②`），并**打一条日志**说明复用了哪个实例；
  *    ②指纹不同 ⇒ **显式抛错并逐项指名差异**（`E48②`），绝不静默换用旧配置；
  *    ③`config` 进**必填**（`E48③`）：创建路径缺 `config` 直接抛，**不读全局配置兜底** ——
- *      装配点 `server/index.js` 与本文件同批传 `boardCfg`。 */
+ *      装配点 `server/index.js` 与本文件同批传 `boardCfg`；
+ *    ④**注入项**（`logger`/`now`/`fetch`/`queue`/`bus`/`idGenerator`）与创建时**不是同一实例**
+ *      ⇒ **默认也抛错**（补修②：复核实测"沿用旧时钟 ⇒ 发报时间戳落旧时刻""沿用旧 bus ⇒ 本次
+ *      挂载的订阅者 **0** 条事件"都是**真的发错**，不是"只是日志不好看"）；只有显式
+ *      `allowReuseWithDifferentDeps: true` 才降级为"逐项点名 ＋ `logger.warn` 告警"；
+ *    ⑤标量选项**按类型严格校验与比较**（`timeoutMs: 2000` ≠ `'2000'`，见 `E48①-b`）。 */
 const pool = { byDb: new WeakMap(), nullDb: null };
 
+/* ---------------------------------------------------------------------------
+   `E48①`（补修②）：**"创建实例时读了哪些 config 键"＝显式白名单**（复核 `C·26②` 判"覆盖面不够"）
+   ---------------------------------------------------------------------------
+   **推导依据＝代码里实际读过的键**（`server/services/uploadReporter.js`，逐处指行）：
+     · `config.mes.baseUrl`            :219 `configured()`、:221 `baseUrl()`
+     · `config.mes.pathTemplate`       :222 `pathTemplate()`
+     · `config.mes.responseStyle`      :223 `responseStyle()`
+     · `config.mes.token`              :224 `token()`
+     · `config.mes.timeoutMs`          :196（`timeoutMs` 的缺省来源）
+     · `config.mes.reportPlaceholder`  :197（`paramDataList` 的占位哨兵）
+     · `config.mes.queueCap`           :548（`status().queueCap` 的读数；只影响状态输出，仍属"读到过"）
+     · `config.mes.queueWarnThreshold` `services/uploadQueue.js:48-49`（模块级快照）／
+       `:52-55`（运行期 `configWarnThreshold()`）—— **保守纳入**：它读的是**磁盘那份**
+       `board.config.js`（不是本入口注入的 `config`），故"只改注入配置里的这一项"其实不改行为
+       ⇒ 会制造一次**假冲突**；但假冲突是**吵闹**的（现场立刻看见，按提示传同一份配置即可），
+       而漏项是**静默**的（正是 `E48` 要防的形态）。⇒ **宁可吵闹，不可静默**。
+       （"队列阈值仍读磁盘真源"本身另行登记，不属本包可改面。）
+     · `config.device.equipCode`       :272（报文 `equipCode` 的本机兜底，FR-8.6）
+     · `config.dataSource`             :277（`'mock'` ⇒ 无帧时 `testStatus=0` **照发**；否则**拒发**
+                                        `NO_TEST_STATUS`）—— 复核实测的两处漏项之一
+   为什么用**枚举白名单**，而不是"整段 `config` 归一化"（复核给的另一条路）：
+     · 枚举的**强项＝点名**：报错直接说 `config.dataSource（首次 … ⇒ 本次 …）`，现场不必自己 diff
+       两份配置对象；整段归一只能回显一大坨 JSON，且会把 `shift`/`server`/`upper` 等**上报器一行都
+       没读过**的段算进来 ⇒ "改了班次表却拒绝复用上报器"这类**假冲突**（吵闹且与上报行为无关）；
+     · 枚举的**弱项＝会漏**（`uploadReporter.js` 以后多读一个键而这里不跟手 ⇒ 又回到静默）——这条
+       弱项**不靠"整段归一"补偿**，而靠**机械对账**：`tests\._verify\T-20261005-18\
+       p-e48-config-coverage.js` 扫描 `uploadReporter.js` 里所有 `config.`／`q().` 读点并与本表逐项
+       对账（本批已跑，读数见回执）。⚠ 该探针**不是受管门禁**（`tests\*` 受管面不属本包可改）⇒
+       **改了 `uploadReporter.js` 的人必须重跑它**；这条已登记为残留。
+   **不可序列化字段怎么处理**（"归一化"必然要回答的问题）：本表是**纯数据路径 ＋ 按值比较**，不引入
+     对象身份；若读段内出现**函数／`symbol`／`RegExp`／`Map`／`Set`／类实例**（`JSON.stringify` 下会
+     **坍缩**成同一形态 ⇒ 两个不同实例会给出**同一指纹** ＝"假同"），`lossyConfigPaths()` 会**列出来
+     并默认抛错**（要求配置是纯数据，或显式注入 `deps.reporter`）；只有
+     `allowReuseWithDifferentDeps: true` 才降级为告警。`Date` 不在此列（`toISOString()` 可按值比较）。
+   --------------------------------------------------------------------------- */
+/** 上报器**会读**的顶层配置段（其余顶层段与上报行为无关 ⇒ 不进指纹，避免假冲突） */
+const CONFIG_READ_TOP = Object.freeze(['dataSource', 'device', 'mes']);
+
+/** 扁平白名单：每条＝代码里**确实读过**的配置路径（推导逐处见上方注释）。
+ *  ⚠ **新增读取点必须同步本表**（否则指纹漏项 ⇒ 又回到"改了配置却复用"）；同步后重跑上面那条对账探针。 */
+const CONFIG_KEY_PATHS = Object.freeze([
+  'dataSource',
+  'device.equipCode',
+  'mes.baseUrl',
+  'mes.pathTemplate',
+  'mes.responseStyle',
+  'mes.token',
+  'mes.timeoutMs',
+  'mes.reportPlaceholder',
+  'mes.queueCap',
+  'mes.queueWarnThreshold'
+]);
+
 /** 键名排序的稳定序列化（**只用于指纹**：同一份内容的不同对象实例必须给出同一个字符串；
- *  函数与循环引用都要有**稳定表示**，不能被 `JSON.stringify` 悄悄丢掉）。 */
+ *  函数／symbol／`Date`／循环引用都要有**稳定表示**，不能被 `JSON.stringify` 悄悄丢掉）。
+ *  `undefined` 与 `null` 同形（"没有这个键"与"显式 null"对上报器行为一致）。 */
 function stableJson(value) {
   const seen = new WeakSet();
   const norm = v => {
-    if (v === undefined) return null;
-    if (v === null || typeof v !== 'object') return typeof v === 'function' ? '[function]' : v;
+    if (v === undefined || v === null) return null;
+    const t = typeof v;
+    if (t === 'function') return '[function]';
+    if (t === 'symbol') return '[symbol]';
+    if (t !== 'object') return v;
     if (seen.has(v)) return '[circular]';
     seen.add(v);
     if (Array.isArray(v)) return v.map(norm);
+    if (v instanceof Date) return '[date:' + v.toISOString() + ']';
     const out = {};
     for (const k of Object.keys(v).sort()) out[k] = norm(v[k]);
     return out;
@@ -79,18 +152,77 @@ function stableJson(value) {
   return JSON.stringify(norm(value));
 }
 
-/** 上报器**行为**的逐项读数（`E48①`：缓存键＝`db` ＋ 这份指纹）。
- *  范围＝"创建实例时真正被读进去的东西"：`config.mes` **整段**（地址／路径模板／回执风格／
- *  令牌／超时／占位哨兵／阈值……）＋ 显式标量选项。
- *  `logger`／`now`／`fetch`／`queue`／`bus` 是**不可按值比较**的注入（函数／句柄），不放进指纹
- *  （否则"同一时钟的两个闭包"会被误判成"配置不同"而制造假冲突），改为在复用时**如实点名**
- *  （见 `ignoredInjections()`）。 */
-const TRACKED_OPTIONS = ['serviceName', 'methodName', 'capacity', 'warnThreshold', 'timeoutMs'];
-function behaviorOf(deps) {
-  const parts = { 'config.mes': stableJson((deps.config && deps.config.mes) || null) };
-  for (const k of TRACKED_OPTIONS) {
-    parts['options.' + k] = deps[k] === undefined ? null : String(deps[k]);
+/** 标量指纹：**带上类型**（`2000` ≠ `'2000'`、`true` ≠ `'true'`）—— `E48①-b`。
+ *  复核实测：旧实现用 `String()` 归一 ⇒ `timeoutMs: 2000` 与 `'2000'` **同指纹**，而后者本会
+ *  回落 `mes.timeoutMs`/3000（"被当成同一份配置复用、实例却仍是 2000"）。 */
+function canonScalar(v) {
+  if (v === undefined) return 'absent';
+  if (v === null) return 'null';
+  return typeof v + ':' + stableJson(v);
+}
+
+/** 按路径读值（白名单是扁平路径串；读不到＝`undefined`） */
+function readPath(root, path) {
+  let cur = root;
+  for (const seg of path.split('.')) {
+    if (cur === null || typeof cur !== 'object') return undefined;
+    cur = cur[seg];
   }
+  return cur;
+}
+
+/** 读段内**不可按值比较**的配置值（函数／`symbol`／`RegExp`／`Map`／`Set`／类实例…）。
+ *  这类值经 `stableJson` 会**坍缩**（`'[function]'`／`'{}'`）⇒ 两个不同实例给出同一指纹 ＝**假同**
+ *  （"改了配置却复用"的另一条路）。故**不静默**：默认抛错点名（见 `resolveReporterDetail()`）。 */
+function isLossyConfigValue(v) {
+  if (typeof v === 'function' || typeof v === 'symbol') return true;
+  if (v === null || typeof v !== 'object') return false;
+  if (Array.isArray(v) || v instanceof Date) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto !== Object.prototype && proto !== null;
+}
+
+/** 遍历读段（`CONFIG_READ_TOP`）收集 lossy 值的路径（深度上限 8：配置是数据，不是深树） */
+function lossyConfigPaths(config) {
+  const out = [];
+  const walk = (node, prefix, depth) => {
+    if (depth > 8) return;
+    if (isLossyConfigValue(node)) {
+      const ctor = (node.constructor && node.constructor.name) || typeof node;
+      out.push(prefix + '（' + ctor + '）');
+      return;
+    }
+    if (node === null || typeof node !== 'object') return;
+    if (Array.isArray(node)) { node.forEach((v, i) => walk(v, prefix + '[' + i + ']', depth + 1)); return; }
+    for (const k of Object.keys(node).sort()) walk(node[k], prefix ? prefix + '.' + k : k, depth + 1);
+  };
+  if (config && typeof config === 'object') {
+    for (const top of CONFIG_READ_TOP) {
+      if (!Object.prototype.hasOwnProperty.call(config, top)) continue;
+      walk(config[top], 'config.' + top, 1);
+    }
+  }
+  return out;
+}
+
+/** 值的可读描述（**带类型**）—— 报错文案不许把 `NaN`/`Infinity` 说成 "null"（`E135` 同族：
+ *  `JSON.stringify(NaN) === 'null'` 会把症状指向错方向，故一律 `String(v) ＋ 类型`；
+ *  长度截到 40 字符：函数体的 `String(fn)` 可能很长，报错文案不该被它淹没）。 */
+function describeValue(v) {
+  const s = String(v);
+  return (s.length > 40 ? s.slice(0, 40) + '…' : s) + '（类型 ' + typeof v + '）';
+}
+
+/** 上报器**行为**的逐项读数（`E48①`：缓存键＝`db` ＋ 这份指纹）。
+ *  范围＝**白名单**（`CONFIG_KEY_PATHS`，推导见上方注释）＋ 显式标量选项（按类型严格比较）。
+ *  `logger`／`now`／`fetch`／`queue`／`bus`／`idGenerator` 是**不可按值比较**的注入（函数／句柄），
+ *  不放进指纹（否则"同一时钟的两个闭包"会被误判成"配置不同"而制造假冲突），改为在复用时
+ *  **按引用比较**：不同 ⇒ **默认抛错**（见 `resolveReporterDetail()` 的第④条取舍）。 */
+const TRACKED_OPTIONS = ['serviceName', 'methodName', 'capacity', 'warnThreshold', 'timeoutMs', 'strict'];
+function behaviorOf(deps) {
+  const parts = {};
+  for (const path of CONFIG_KEY_PATHS) parts['config.' + path] = stableJson(readPath(deps.config, path));
+  for (const k of TRACKED_OPTIONS) parts['options.' + k] = canonScalar(deps[k]);
   return parts;
 }
 
@@ -105,39 +237,126 @@ function fingerprintTag(fp) {
   return h.toString(16).padStart(8, '0');
 }
 
-/** 复用时**未被采纳**的注入项（实例已建好，本次传的是**另一些实例**）—— 必须说清楚，不能静默。
- *  判据＝"本次显式传了（非 undefined/null）∧ 与创建时的引用不同"。 */
-const INJECTED_KEYS = ['logger', 'now', 'fetch', 'queue', 'bus'];
-function ignoredInjections(createdDeps, deps) {
-  return INJECTED_KEYS.filter(k => deps[k] !== undefined && deps[k] !== null && deps[k] !== createdDeps[k]);
+/** 可注入的**不可按值比较**项（函数／句柄）。
+ *  `idGenerator` 由**补修②**加入：它原来经 `mountUpload` 被**静默丢弃**（`createUploadReporter()`
+ *  支持它，但本文件没转发，复核 `C·26②` 顺带实测到）—— 现在**转发**，于是"换一个序号域"也必须
+ *  显式（不许悄悄沿用旧实例的生成器）。 */
+const INJECTED_KEYS = ['logger', 'now', 'fetch', 'queue', 'bus', 'idGenerator'];
+
+/** 创建时**实际用到的引用**快照（`undefined`/`null` 一律记 `null` ＝"没有这一项注入"） */
+function depsSnapshot(deps) {
+  const out = {};
+  for (const k of INJECTED_KEYS) out[k] = (deps[k] === undefined || deps[k] === null) ? null : deps[k];
+  return out;
+}
+
+/** 本次挂载**传了、但与创建时不是同一个实例**的注入项（＝本次的注入不会被采纳，必须显式处置）。
+ *  判据＝"本次显式传了（非 undefined/null）∧ 与创建时的引用不同"——与实例自身"没传就用缺省"
+ *  的语义一致：**没传**不算冲突（本次没提出相反要求），**传了不同的**才算。 */
+function injectedConflicts(createdDeps, deps) {
+  const cur = depsSnapshot(deps);
+  return INJECTED_KEYS.filter(k => cur[k] !== null && cur[k] !== createdDeps[k]);
+}
+
+/** 入口类型校验（补修②）：**不许**"传了字符串／`null` 却被静默忽略或回落"。
+ *  · 数值项必须是有限数（`timeoutMs` 还要 `> 0`：否则 `createUploadReporter` 会**回落**
+ *    `mes.timeoutMs`/3000 —— 那正是"传了值但没生效"的静默形态）；
+ *  · `strict` 只认布尔（`strict: 'yes'` 会被 `options.strict === true` 静默吃掉）；
+ *  · `serviceName`/`methodName` 只认非空字符串（否则会被 `join('/')` 隐式转字符串）；
+ *  · `idGenerator` 必须带 `next()`（否则在更深处才炸，症状指向错方向）；
+ *  · **`null` 一律拒绝**：要表示"不传"请**省略该键** —— 与 `E131` 同一条纪律"含糊即拒绝，
+ *    拒绝优于替调用方猜意图"（`E33①` 的残留正是"`null` 被 `Number()` 收下 ⇒ 恒告警"）。 */
+const NUMBER_OPTIONS = ['capacity', 'warnThreshold', 'timeoutMs'];
+const STRING_OPTIONS = ['serviceName', 'methodName'];
+function assertOptionTypes(deps) {
+  for (const k of NUMBER_OPTIONS) {
+    const v = deps[k];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new TypeError('mountUpload/resolveReporter: `' + k + '` 必须是**有限数值**，收到 ' +
+        describeValue(v) + '；要表示"不传"请**省略该键**（不认 `null`／数字字符串 —— ' +
+        "`timeoutMs: '2000'` 过去会静默回落到 `mes.timeoutMs`/3000，见 E48①-b）");
+    }
+    if (k === 'timeoutMs' && !(v > 0)) {
+      throw new TypeError('mountUpload/resolveReporter: `timeoutMs` 必须 **> 0**，收到 ' + describeValue(v) +
+        '（否则 `createUploadReporter` 会静默回落到 `mes.timeoutMs`/3000）');
+    }
+  }
+  for (const k of STRING_OPTIONS) {
+    const v = deps[k];
+    if (v === undefined) continue;
+    if (typeof v !== 'string' || v === '') {
+      throw new TypeError('mountUpload/resolveReporter: `' + k + '` 必须是**非空字符串**，收到 ' + describeValue(v));
+    }
+  }
+  if (deps.strict !== undefined && typeof deps.strict !== 'boolean') {
+    throw new TypeError('mountUpload/resolveReporter: `strict` 只认布尔值（`true` ＝"同一帧重复上报即抛错"），' +
+      '收到 ' + describeValue(deps.strict));
+  }
+  if (deps.idGenerator !== undefined &&
+      (!deps.idGenerator || typeof deps.idGenerator.next !== 'function')) {
+    throw new TypeError('mountUpload/resolveReporter: `idGenerator` 必须带 `next()`（见 platform/id.js），收到 ' +
+      describeValue(deps.idGenerator));
+  }
+  if (deps.allowReuseWithDifferentDeps !== undefined && typeof deps.allowReuseWithDifferentDeps !== 'boolean') {
+    throw new TypeError('mountUpload/resolveReporter: `allowReuseWithDifferentDeps` 只认布尔值，收到 ' +
+      describeValue(deps.allowReuseWithDifferentDeps));
+  }
 }
 
 /**
  * 取（或惰性创建）上报器实例，并**如实报告来源**（`E48` 的装配显式性）。
  * 显式注入（`deps.reporter`）优先 —— 自检据此注入 mock 发送／固定时钟；此时**不查池、不要求
  * `config`**（实例由调用方自建自持，"配置"在这条路径上不存在）。
+ *
+ * **同库多实例的正解**（写在这里，别只在返回值的注释里）：本入口的池是"一个库一份实例"，
+ * 想在同一库上同时挂**两份行为不同**的上报器（多网卡／多 MES／测试并行）⇒ **显式注入
+ * `deps.reporter`（自建实例，装配方自持）** 或**另建一个库句柄**；本入口**不会**替调用方
+ * "悄悄换用旧实例"，也**不会**替调用方"悄悄新建第二个实例"（那会让 `/upload/status` 的状态分叉）。
+ *
  * @param {object} [deps] 同 `mountUpload`
  * @returns {{reporter:object|null, source:'injected'|'created'|'reused'|'none',
- *            fingerprint:string|null, ignored:string[]}}
- * @throws {TypeError} 创建路径缺 `deps.config`（`E48③`）
- * @throws {Error} 同库第二次挂载且行为指纹不同（`E48②`；消息里逐项指名差异）
+ *            fingerprint:string|null, ignored:string[],
+ *            depsConflict:'n/a'|'none'|'allowed-by-opt-in'}}
+ *          `ignored` ＝ 本次传入但**不会被采纳**的注入项（默认路径下必然为空：不同就抛错）。
+ * @throws {TypeError} 创建路径缺 `deps.config`（`E48③`）／标量选项类型非法（补修②）／
+ *                     读段内出现不可按值比较的配置值（补修②）
+ * @throws {Error} 同库第二次挂载且**行为指纹不同**（`E48②`；消息里逐项指名差异）
+ * @throws {Error} 同库第二次挂载且**注入项与创建时不是同一实例**（补修②：默认拒绝复用；
+ *                 消息里逐项指名"本次传入的 X 与创建时不是同一个实例 ⇒ 拒绝复用"）
  */
 function resolveReporterDetail(deps = {}) {
   if (deps.reporter) {
-    return { reporter: deps.reporter, source: 'injected', fingerprint: null, ignored: [] };
+    return { reporter: deps.reporter, source: 'injected', fingerprint: null, ignored: [], depsConflict: 'n/a' };
   }
   /* `E48③`：`config` **必填**。刻意**不**回落到 `require(board.config)` —— 那正是把"忘了传"
-     掩盖成"配置正确"的形态（与 `server/index.js:907` 记录的同类静默分叉同一机理）。 */
+     掩盖成"配置正确"的形态（与 `server/index.js` 里 `createStateSnapshot({…})` 那处记录过的
+     同类静默分叉同一机理；**不写行号**：注释里的行号会先烂）。 */
   if (deps.config === undefined || deps.config === null) {
     throw new TypeError('mountUpload/resolveReporter: deps.config 是**必填项**（E48③）：' +
       '必须显式传**已解析的业务配置**（装配点 server/index.js 传 boardCfg）；' +
       '本模块刻意**不读全局配置兜底**（那会把"忘了传"掩盖成"配置正确"，与 E48 要防的静默错误同类）');
+  }
+  if (typeof deps.config !== 'object' || Array.isArray(deps.config)) {
+    throw new TypeError('mountUpload/resolveReporter: deps.config 必须是**对象**，收到 ' + describeValue(deps.config));
+  }
+  assertOptionTypes(deps);
+  /* 读段内出现**无法按值比较**的配置值 ⇒ **默认抛错**（否则 `Map`／类实例会"假同"，见白名单注释末段） */
+  const allowDiffDeps = deps.allowReuseWithDifferentDeps === true;
+  const lossy = lossyConfigPaths(deps.config);
+  if (lossy.length && !allowDiffDeps) {
+    throw new TypeError('mountUpload/resolveReporter: 读段（' + CONFIG_READ_TOP.join(' / ') + '）里出现了' +
+      '**无法按值比较**的配置值 ⇒ 拒绝用它做"行为指纹"（`JSON.stringify` 下会坍缩成同一形态 ⇒ ' +
+      '被判成同一指纹 ⇒ 静默复用，正是 E48 要防的形态）：' + lossy.join('；') +
+      '。配置必须是**纯数据**（对象／数组／原始值／Date）；若确需如此，请显式注入 deps.reporter' +
+      '（自建实例），或显式 `allowReuseWithDifferentDeps: true`（接受这几项上指纹不保真）。');
   }
   const db = deps.db || null;
   const parts = behaviorOf(deps);
   const fingerprint = fingerprintOf(parts);
   const cached = db ? pool.byDb.get(db) : pool.nullDb;
   if (cached) {
+    /* ---- ①行为配置不同 ⇒ 抛错并逐项指名（`E48②`） ---- */
     if (cached.fingerprint !== fingerprint) {
       const diff = Object.keys(parts)
         .filter(k => cached.parts[k] !== parts[k])
@@ -148,17 +367,47 @@ function resolveReporterDetail(deps = {}) {
         '。三种正当做法：①传**同一份**配置（内容相同即可）；②显式注入 deps.reporter（自建实例）；' +
         '③另建一个库句柄。');
     }
-    const ignored = ignoredInjections(cached.deps, deps);
-    /* `E48②`：配置相同 ⇒ **带日志复用**。日志走**本次**传入的 logger；若本次没传 logger，
-       同一事实仍可从 `mountUpload()` 的返回值 `reporterSource:'reused'` 读到（不静默）。 */
-    if (deps.logger && typeof deps.logger.info === 'function') {
-      deps.logger.info('[上报] 复用同一 db 句柄上已建的上报器实例（E48②：行为指纹相同 ' +
-        fingerprintTag(fingerprint) + '）' +
-        (ignored.length
-          ? '；本次传入的 ' + ignored.join('/') + ' 与创建时不是同一个实例，**不会被采纳**（实例已建好）'
-          : ''));
+    /* ---- ②注入项与创建时不是同一实例 ⇒ **默认也抛错**（补修②，复核 `C·26②` 的实测） ----
+       为什么默认抛错而不是"点名 ＋ 日志"：这几项**无法按值比较**，而"沿用旧实例"会**真的发错**
+       （旧 `now` ⇒ 发报时间戳落旧时刻；旧 `bus` ⇒ 本次挂载的订阅者 0 条事件；旧 `fetch` ⇒ 本次的
+       发送实现不被采纳）；只打一条日志时，错误行为**照旧发生**，只是多了一行不一定被读的日志 ⇒
+       这不是"不静默"，而是"静默 + 一行字"。默认拒绝、把选择权交给调用方（opt-in 降级），
+       才能保证"现场看到的失败 = 调用方**显式接受**的失败"。 */
+    const conflicts = injectedConflicts(cached.deps, deps);
+    if (conflicts.length && !allowDiffDeps) {
+      throw new Error('mountUpload: 同一个 db 句柄上**第二次挂载传了与创建时不同的注入项** —— ' +
+        '拒绝复用已经建好的上报器（E48②·补修②，复核 C·26②）：' +
+        conflicts.map(k => '本次传入的 ' + k + ' 与创建时不是同一个实例 ⇒ 拒绝复用').join('；') +
+        '。这六项注入**无法按值比较**（函数／句柄），「沿用旧实例」会真的发错：旧 `now` ⇒ 本次的' +
+        '时间戳／留痕落在**旧时钟**的时刻；旧 `bus` ⇒ 本次挂载的订阅者**一条 `upload` 事件都收不到**；' +
+        '旧 `fetch` ⇒ 本次的发送实现不被采纳。三种正当做法：①传**同一个**实例（引用相同）；' +
+        '②显式注入 deps.reporter（自建实例，本入口只看注入项、不查池）；③确实要沿用旧实例并接受' +
+        '「本次注入不生效」：显式 `allowReuseWithDifferentDeps: true`（此时降级为**逐项点名 ＋ ' +
+        'logger.warn 告警**，并且该降级事实会回在 `reporterDepsConflict` 上）。');
     }
-    return { reporter: cached.reporter, source: 'reused', fingerprint, ignored };
+    const ignored = conflicts;
+    /* ---- ③配置相同、注入项相同（或已显式 opt-in）⇒ 带日志复用（`E48②`） ---- */
+    const logLine = '[上报] 复用同一 db 句柄上已建的上报器实例（E48②：行为指纹相同 ' +
+      fingerprintTag(fingerprint) + '）' +
+      (ignored.length
+        ? '；**allowReuseWithDifferentDeps 已显式开启**：本次传入的 ' + ignored.join('/') +
+          ' 与创建时不是同一个实例，**不会被采纳**（实例已建好）—— 这是被**显式允许**的降级，不是默认路径'
+        : '');
+    if (ignored.length) {
+      /* 降级路径的告警打到**两边**：本次调用方的 logger（它看得见）＋ 实例实际用的 logger（它写日志）。
+         一个 logger 都没有时也不静默：事实仍在返回值 `reporterIgnoredDeps`／`reporterDepsConflict` 上。 */
+      const sinks = [deps.logger, cached.deps.logger].filter((l, i, arr) =>
+        l && typeof l.warn === 'function' && arr.indexOf(l) === i);
+      for (const l of sinks) l.warn(logLine);
+    } else if (deps.logger && typeof deps.logger.info === 'function') {
+      /* 配置与注入项都相同 ⇒ 普通复用：日志走**本次**传入的 logger；若本次没传 logger，
+         同一事实仍可从 `mountUpload()` 的返回值 `reporterSource:'reused'` 读到（不静默）。 */
+      deps.logger.info(logLine);
+    }
+    return {
+      reporter: cached.reporter, source: 'reused', fingerprint, ignored,
+      depsConflict: ignored.length ? 'allowed-by-opt-in' : 'none'
+    };
   }
   const created = createUploadReporter({
     db,
@@ -172,6 +421,10 @@ function resolveReporterDetail(deps = {}) {
     capacity: deps.capacity,
     warnThreshold: deps.warnThreshold,
     timeoutMs: deps.timeoutMs,
+    /* 补修②：`strict` 与 `idGenerator` 原来经本函数**被静默丢弃**（复核 `C·26②` 顺带实测到）
+       —— 现在**转发**（要"不支持"就明说，不许丢）：`strict` 进了指纹，`idGenerator` 进了注入判据。 */
+    strict: deps.strict,
+    idGenerator: deps.idGenerator,
     /* W5-①：事件总线透传（`upload` 事件在待补传队列的真实状态迁移点发布） */
     bus: deps.bus
   });
@@ -179,11 +432,11 @@ function resolveReporterDetail(deps = {}) {
     reporter: created,
     fingerprint,
     parts,
-    /* 创建时**实际用到的引用**（供复用时点名"本次哪些注入项不会被采纳"） */
-    deps: { logger: deps.logger || null, now: deps.now, fetch: deps.fetch, queue: deps.queue, bus: deps.bus }
+    /* 创建时**实际用到的引用**（供复用时逐项判"本次注入项是否与创建时同一实例"） */
+    deps: depsSnapshot(deps)
   };
   if (db) pool.byDb.set(db, entry); else pool.nullDb = entry;
-  return { reporter: created, source: 'created', fingerprint, ignored: [] };
+  return { reporter: created, source: 'created', fingerprint, ignored: [], depsConflict: 'none' };
 }
 
 /** 取（或惰性创建）上报器实例 —— `E48` 之前的**公开形状保持不变**（只返回实例本身）。 */
@@ -297,13 +550,21 @@ function forbiddenBody(path, method, remote, at) {
  *          路径才允许不传（实例由调用方自建自持）。装配点见 `server/index.js` 的 `boardCfg`。
  * @param {{db?:object, reporter?:object, logger?:object, now?:Function, config:object,
  *          fetch?:Function, queue?:object, serviceName?:string, methodName?:string,
- *          capacity?:number, warnThreshold?:number, timeoutMs?:number, bus?:object,
+ *          capacity?:number, warnThreshold?:number, timeoutMs?:number, strict?:boolean,
+ *          idGenerator?:object, bus?:object, allowReuseWithDifferentDeps?:boolean,
  *          isLoopback?:Function, remoteOf?:Function}} [deps]
  *          `isLoopback`/`remoteOf` 是**判据注入口**（缺省＝上面的真源）：只为自检能把来源伪造为
- *          非回环地址而设，**不给生产接线用**（`server/index.js` 不传这两项）。
+ *          非回环地址而设，**不给生产接线用**（`server/index.js` 不传这两项）。这两项是**每次挂载
+ *          各自生效**的（本函数内取用），故第二次挂载传不同的判据**不会**触发下面的注入冲突。
+ *          `strict`/`idGenerator`（补修②）：过去经本入口会**被静默丢弃**，现在**转发**并纳入
+ *          指纹／注入判据（`strict` 布尔进指纹；`idGenerator` 是句柄 ⇒ 换了必须显式 opt-in）。
+ *          `allowReuseWithDifferentDeps`（补修②）：**默认 false** ⇒ 同库第二次挂载若传了与创建时
+ *          不同的 `logger`/`now`/`fetch`/`queue`/`bus`/`idGenerator`，**直接抛错并逐项指名**；
+ *          显式置 `true` 才降级为"逐项点名 ＋ `logger.warn` 告警"（`reporterDepsConflict` 上可见）。
  * @returns {{mount:'upload', mounted:boolean, by:'W4', routes:string[], instance:object|null,
  *          reporterSource:'injected'|'created'|'reused'|'none', reporterFingerprint:string|null,
- *          reporterIgnoredDeps:string[], counters:object, status:Function}}
+ *          reporterIgnoredDeps:string[], reporterDepsConflict:'n/a'|'none'|'allowed-by-opt-in',
+ *          counters:object, status:Function}}
  *          `mounted:true` 才是"已接线"的**显式**状态（与 W6 空壳 `router.mountUpload()` 的
  *          `mounted:false` 形成可核查对照，D23 反静默空转）。
  */
@@ -318,7 +579,7 @@ function mountUpload(router, deps = {}) {
      风格）静默套到第二次挂载上，现场表现为"上报打到旧地址"且**不报错**。 */
   const resolved = (deps.reporter || deps.db)
     ? resolveReporterDetail(deps)
-    : { reporter: null, source: 'none', fingerprint: null, ignored: [] };
+    : { reporter: null, source: 'none', fingerprint: null, ignored: [], depsConflict: 'n/a' };
   const reporter = resolved.reporter;
   /* 判据注入口（自检用）：缺省一律走**真源**，不另造判定 */
   const isLoopbackOf = typeof deps.isLoopback === 'function' ? deps.isLoopback : isLoopback;
@@ -424,10 +685,14 @@ function mountUpload(router, deps = {}) {
     routes,
     instance: reporter,
     /* `E48`：实例来源显式化 —— `injected`（显式注入，装配方自持）／`created`（本次新建）／
-       `reused`（复用同库已建实例：**行为指纹相同**，日志里已如实说明）／`none`（未装配）。 */
+       `reused`（复用同库已建实例：**行为指纹相同** ＋ 注入项相同；日志里已如实说明）／`none`（未装配）。
+       补修②：`allowReuseWithDifferentDeps: true` 下复用可以"注入项不同"，这一降级事实不在日志里
+       藏着 —— `reporterIgnoredDeps`（哪些注入项没被采纳）＋ `reporterDepsConflict`
+       （`n/a` 未装配／`none` 无冲突／`allowed-by-opt-in` 显式放行）两处都能读到。 */
     reporterSource: resolved.source,
     reporterFingerprint: resolved.fingerprint,
     reporterIgnoredDeps: resolved.ignored,
+    reporterDepsConflict: resolved.depsConflict,
     /** 来源校验的计数（E87；供自检/巡检读取，**不进 HTTP 响应体**） */
     counters,
     status: () => (reporter ? reporter.status() : { mounted: false, by: 'W4', routes })

@@ -652,14 +652,15 @@ function runGroundChecksE160(t, files) {
        ⇒ 钉住的是**结构与规模**（哪个文件、多少行、含 A 档删除 API），行号**每轮现算并打印**；
          真正要抓的"**新出现一处盲区**"由"清单外的文件／条数超出"这一维负责（它对新增最敏感）。 */
   const GROUND_BLIND_LEDGER_E160 = [
-    {
-      file: 'tests\\harness-check.js', lines: 858,
-      why: '`const W5_FIXTURE_SSE = String.raw\\`…\\`` 这个内联夹具（**生成本文件自己的子进程脚本**）：'
-        + '它是**字面量内容**、不是被门禁执行的代码 ⇒ 剥离器把它 blank 是正确行为；'
-        + '但 `E103-B①②` 在这段里读的是**空气** ⇒ 必须登记 ＋ 锁住 ＋ 由第二路覆盖（`E160-⑥`）。'
-        + '段内含 A 档删除 API（夹具自己的收尾清理：一处非递归单文件删 ＋ 一处 '
-        + '`fs.rmSync(tmpRoot,{recursive:true,force:true})` ＝ realpath 探针的收尾）'
-    },
+    /* ⚠ **退役记录（`T-20261005-17` 4b，主代理裁定 ㈠）**：这里原本登记着
+       `{ file: 'tests\\harness-check.js', lines: 858 }` 那条。本波把该夹具的收尾清理从
+       `fs.rmSync(tmpRoot,{recursive:true,force:true})` 改成走安全出口 `env.removeLinkSafe(...)`
+       （理由：那份生成物一旦被中断留在 `._verify\` 里，下一轮 `E103-B⑥` 就会把它当"未登记的新调用点"，
+       而文件名带 per-run tag ⇒ 永远不在册 ⇒ 每轮随机复发）。
+       于是该段**不再含 A 档删除 API** ⇒ 按 `E160-②` 自己的口径（"长度 ＋ API **两维同时成立**才算盲区"）
+       它退化为**合法长字面量** ⇒ 本条按主代理裁定**退役**（不是把行内容改写成"现在没有 API"）。
+       它的新归属＝下面 `GROUND_CLEAN_LONG_LEDGER_E160` 里那条"同段、同长 858"的登记。
+       ⚠ 段长仍是 858 ⇒ `E160-④` 的长度锚点**不动**（它量的就是**长度**这一维）。 */
     {
       file: 'tests\\._verify\\review\\old-harness-0996ed0.js', lines: 858,
       why: '**旧版本字节副本**（从历史提交取出的 `harness-check.js`，D22／定点变异的基线，不是活动脚本）—— '
@@ -687,10 +688,15 @@ function runGroundChecksE160(t, files) {
         + '剥离器把它 blank 完全无害（这正是"长度维度不能单独判红"的盘上实证）' },
     { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', lines: 251, why: '同上（历史字节副本里的同一份夹具）' },
     { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', lines: 251, why: '同上（另一份历史字节副本）' },
-    { file: 'tests\\._verify\\T-20261005-09\\harness-check.seat4b-inflight.js', lines: 251, why: '同上（在飞快照里的同一份夹具）' }
+    { file: 'tests\\._verify\\T-20261005-09\\harness-check.seat4b-inflight.js', lines: 251, why: '同上（在飞快照里的同一份夹具）' },
+    { file: 'tests\\harness-check.js', lines: 858,
+      why: '**从盲区台账退役过来的那一段**（`T-20261005-17` 4b，主代理裁定 ㈠）：同一条 858 行的 '
+        + '`const W5_FIXTURE_SSE = String.raw\\`…\\`` 夹具段 —— 本波把它的收尾清理改成走安全出口 '
+        + '`env.removeLinkSafe(...)` 之后，段内**零** A 档删除 API ⇒ 按 `E160-②` 的口径它只算'
+        + '"**长但干净**"（不是盲区），故在这里登记，盲区台账里对应那条同时退役' }
   ];
   const GROUND_BLIND_ANCHOR_E160 = {
-    total: 4,
+    total: 3,                     /* 退役 `tests\harness-check.js` 那条（见上"退役记录"）⇒ 4 → 3 */
     sha12: require('node:crypto').createHash('sha256')
       .update(GROUND_BLIND_LEDGER_E160.map(e => `${e.file}|${e.lines}`).join('\n')).digest('hex').slice(0, 12)
   };
@@ -702,15 +708,20 @@ function runGroundChecksE160(t, files) {
    *  @returns {{missing:Array,extra:Array,mismatch:Array}} */
   const blindAuditE160 = (ledger, disk) => {
     const missing = ledger.filter(e => !disk.some(d => d.file === e.file));
-    const extra = disk.filter(d => !ledger.some(e => e.file === d.file));
-    const mismatch = [];
-    for (const e of ledger) {
-      const d = disk.find(x => x.file === e.file);
-      if (!d) continue;
-      if (d.lines !== e.lines) mismatch.push(`\`${e.file}\`：段行数 盘上 ${d.lines} vs 台账 ${e.lines}`);
-    }
+    /* `extra`／`mismatch` 按 **(文件, 段长) 对**比，而不是只按文件比（`T-20261005-17b` 修，理由实测）：
+       同一个文件**可以合法地有多段**长段 —— 实测 `tests\harness-check.js` 现在就有两段：
+       `W7_DOD_FIXTURE`（251 行）＋ 退役过来的 `W5_FIXTURE_SSE`（858 行）。
+       只按文件比的话，第二段要么被当成"已在册"而**隐形**，要么把台账行与"第一段"错配成"行数不符"（本轮实测踩到）。
+       按对比**更严**：某文件新冒出一段没登记的段长 ⇒ `extra` 照样红（正是本台账要抓的"新冒出一段长字面量"）。 */
+    const keyOf160 = (o) => `${o.file}|${o.lines}`;
+    const extra = disk.filter(d => !ledger.some(e => keyOf160(e) === keyOf160(d)));
+    const mismatch = ledger
+      .filter(e => disk.some(d => d.file === e.file) && !disk.some(d => keyOf160(d) === keyOf160(e)))
+      .map(e => `\`${e.file}\`：台账 ${e.lines} 行 —— 盘上同文件**没有**这个段长的段（实测 `
+        + `${disk.filter(d => d.file === e.file).map(d => d.lines).join('／')} 行）`);
     return { missing, extra, mismatch };
   };
+
   const diskBlind = attribution.flatMap(a => a.redRuns.map(p => ({
     file: a.file, start: p.start, end: p.end, lines: p.lines,
     apiLines: [...new Set(p.hits.flatMap(h => h.lines))].sort((x, y) => x - y),
@@ -741,17 +752,36 @@ function runGroundChecksE160(t, files) {
         + `实测 ${blindTxtE160}；锚点 \`sha12\` ${GROUND_BLIND_ANCHOR_E160.sha12}。`
         + `另：**"长但干净"的段**（超阈值、段内零删除 API）台账 ${GROUND_CLEAN_LONG_LEDGER_E160.length} 处 ↔ 盘上 ${diskCleanLong.length} 处`
         + `（新增/行数不符都会红 —— 免得"新冒出一段长字面量"无人看见）`);
+  /* `E160-ⓑ` **退役后的非恒绿自证**（**只报数、不加断言条数** —— 本波主代理明确要求条数不变）：
+     把**同一个** `blindAuditE160()` 喂两种内存变异（绝不落盘）：①台账里多一条"与盘上段长不符"的登记；
+     ②盘上多一段"台账里没有的盲区" ⇒ 两支都必须**逐条指名**报出来。若"退役"把判据掏空成恒绿，这两支会报空。 */
+  const mut160a = blindAuditE160(
+    [...GROUND_BLIND_LEDGER_E160, { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', lines: 999 }], diskBlind);
+
+  const mut160b = blindAuditE160(GROUND_BLIND_LEDGER_E160,
+    [...diskBlind, { file: 'tests\\._verify\\新盲区-x.js', start: 1, end: 300, lines: 300, apiLines: [7], rules: ['rmSync(...,{recursive:true})'] }]);
+  const mut160c = blindAuditE160(GROUND_BLIND_LEDGER_E160, diskBlind);      // 负对照＝盘上现测（应全空）
   t.info(`\`E160-ⓑ\` **已知盲区台账（每轮可见，绝不隐形；行号现算）**：`
     + diskBlind.map(d => `\`${d.file}\`:${d.start}-:${d.end}（${d.lines} 行；段内 A 档 API ${d.apiLines.map(n => ':' + n).join('、') || '无'}）`).join(' ｜ ')
-    + `。⚠ **` + '`tests\\harness-check.js`' + ` 那一段就是 ` + '`E160`' + ` 立案的 858 行**：`
-    + GROUND_BLIND_LEDGER_E160[0].why
-    + `。⇒ 处置是 **第二路覆盖 ＋ 台账锁住 ＋ 新盲区即红**，**不是**"已消除"；`
-    + `任何**清单外**的超阈值段只要段内含 A 档删除 API，` + '`E160-ⓑ`' + ` 当场红并指名 ` + '`文件:行号区间`' + `。`
+    + `。⚠ 【**本波退役**】\`tests\\harness-check.js\` 那一段（858 行的 \`W5_FIXTURE_SSE\`）**已从本台账退役**`
+    + `（\`T-20261005-17\`，主代理裁定 ㈠）：夹具收尾改走安全出口 \`env.removeLinkSafe()\` ⇒ 段内**零** A 档删除 API `
+    + `⇒ 按 \`E160-②\` 自己的口径（长度＋API **两维同时成立**才算盲区）它只算"长但干净"，`
+    + `新归属见 \`GROUND_CLEAN_LONG_LEDGER_E160\`：`
+    + ((GROUND_CLEAN_LONG_LEDGER_E160.find(e => e.file === 'tests\\harness-check.js' && e.lines === 858) || {}).why || '（登记缺失）')
+    + `。⚠ 段长仍是 **858** ⇒ \`E160-④\` 的长度锚点**不动**（它量的就是长度这一维）。`
+    + `⇒ 处置仍是 **第二路覆盖 ＋ 台账锁住 ＋ 新盲区即红**，**不是**"已消除"；`
+    + `任何**清单外**的超阈值段只要段内含 A 档删除 API，\`E160-ⓑ\` 当场红并指名 \`文件:行号区间\`。`
     + ` ｜ **长但干净**的在册 ${GROUND_CLEAN_LONG_LEDGER_E160.length} 处 ↔ 盘上 ${diskCleanLong.length} 处：`
     + diskCleanLong.map(d => `\`${d.file}\`:${d.start}-:${d.end}（${d.lines} 行）`).join('、')
     + ` ｜ 另有**真正合法的长字面量样本**（本件负对照在盘上的实证，段内零删除 API）：`
     + attribution.flatMap(a => a.runs.filter(pp => pp.hits.length === 0 && pp.lines > 100)
       .map(pp => `\`${a.file}\`:${pp.start}-:${pp.end}（${pp.lines} 行）`)).slice(0, 8).join('、'));
+  t.info(`\`E160-ⓑ\` **退役后的非恒绿自证（内存变异，只报数、不加条数）**：`
+    + `①台账多一条"段长不符"（\`tests\\harness-check.js\` 记 999 行、盘上 858）⇒ mismatch ${mut160a.mismatch.length} 项：`
+    + `${mut160a.mismatch.join('；') || '（空 ⇒ 判据被掏空）'}；`
+    + `②盘上多一段"清单外盲区"（\`tests\\._verify\\新盲区-x.js\` 300 行、段内 API :7）⇒ extra ${mut160b.extra.length} 处：`
+    + `${mut160b.extra.map(d => d.file + ':' + d.start + '-:' + d.end).join('；') || '（空 ⇒ 判据被掏空）'}；`
+    + `③负对照＝盘上现测（**同一次调用**）⇒ extra ${mut160c.extra.length}／mismatch ${mut160c.mismatch.length}（都应 0）。`);
 
   /* ---------- 6. 双路复核（同一纯函数喂两路）：合成读数 ＋ 盘上读数 ---------- */
   const dualExample = dualScanE160(synBad, scanRmApiStrippedE161);
@@ -1515,12 +1545,12 @@ t.section('四、服务启停与端口（后端 HTTP/SSE 用例的底座）');
       "/* 启动自检②：backupDir 被同名**文件**占位（写探针必然失败 ENOTDIR）⇒ 自检必须挡住 ⇒ 退非零。 */",
       "const fs = require('node:fs');",
       "const path = require('node:path');",
-      "const ROOT = path.resolve(__dirname, '..', '..', '..');",
+      "const ROOT = path.resolve(__dirname, '..', '..', '..'); const env = require(path.join(ROOT, 'tests', 'env.js'));   // E103／E161 纪律：删除走安全出口",
       "process.env.DSH_ENV = 'test';",
       "const entry = require(path.join(ROOT, 'server', 'index.js'));",
       "const dataDir = process.env.DSH_W6_DATA;",
       "const blocker = path.join(dataDir, 'backup');          // 备份目录路径上放一个**同名普通文件**",
-      "fs.rmSync(dataDir, { recursive: true, force: true });",
+      "env.removeLinkSafe(dataDir, { recursive: true, force: true });",
       "fs.mkdirSync(dataDir, { recursive: true });",
       "fs.writeFileSync(blocker, 'W6 夹具②：本文件占住“备份目录”这个路径（它本该是个目录）', 'utf8');",
       "/* 反向自检：确认这个占位真的让“写探针文件”失败（否则夹具没造出目标场景，不许假绿） */",
@@ -1619,7 +1649,7 @@ t.section('四之②、W5-① 服务端 SSE 业务推送（快照同源／断线
        导致 12:00:xx 的帧仍按 P-W5 判定）。 */
 const fs = require('node:fs');
 const path = require('node:path');
-const ROOT = path.resolve(__dirname, '..', '..', '..');
+const ROOT = path.resolve(__dirname, '..', '..', '..'); const env = require(path.join(ROOT, 'tests', 'env.js'));   /* E103／E161：删除走安全出口 */
 process.env.DSH_ENV = 'test';
 const entry = require(path.join(ROOT, 'server', 'index.js'));
 const { createUploadReporter } = require(path.join(ROOT, 'server', 'services', 'uploadReporter.js'));
@@ -2095,7 +2125,7 @@ const streams = [];
       outsideStillThere: fs.existsSync(path.join(outside, 'secret.js')),
       inRepoStillThere: fs.existsSync(path.join(inRoot, 'tests-like.js'))
     };
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    env.removeLinkSafe(tmpRoot, { recursive: true, force: true });   /* E103／E161：删除走安全出口 —— 本夹具不得留裸递归删形态，否则它一旦被中断留在 _verify 下，下一轮 E103-B⑥ 会把它当"未登记的新调用点"判红（实测 fixture-sse-tag.js:497 就是这么红的） */
   } catch (err) {
     OUT.realpathProbe.note = 'junction/符号链接实验不可用：' + ((err && err.code) || (err && err.message) || String(err)) +
       '（本机 EPERM：Windows 建链接需开发者模式或管理员）—— realpath 防护为**代码级**，此路未做实验';
@@ -5944,7 +5974,13 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       t.check('已登记偏差的**失败断言数** = git 历史实算（D2 两条断言各失败一条 → 2）',
         failedRules === reg.failedAssertions,
         `实算 ${failedRules} 条失败断言（缺前缀 ${badPrefix.length} 条 / 超 ${lenLimit} 字 ${tooLong.length} 条），常量写 ${reg.failedAssertions}`);
-      t.check('已登记偏差的**失败清单条数** = git 历史实算（9 条缺前缀 + 4 条超字数 → 13）',
+      /* ⚠ `E173`（2026-10-05，4b `T-20261005-12`）：本条的**标题里原本手写着三个数字**
+         （"9 条缺前缀 + 4 条超字数 → 13"）—— 那是**没人核的常量**：`2c4f594` 那笔一出现，标题就与实算（14）不符，
+         而它**不影响判据**（判据比的是 `listed === reg.listedItems`）⇒ 正是 `E156`／`E158` 同族
+         "手写前提/数字会一直错下去"。改成**现算**后，标题永远等于它自己那条判据的读数；
+         与本条同口径的**逐笔**守据见 `tests\docs-check.js` D7（`E173-①`：逐笔哈希双向 ＋ 冻结点 ＋ 与 `listedItems` 同步）。 */
+      t.check('已登记偏差的**失败清单条数** = git 历史实算（' + badPrefix.length + ' 条缺前缀 + '
+        + tooLong.length + ' 条超字数 → ' + listed + '）',
         listed === reg.listedItems,
         `实算 ${listed} 条 = 缺前缀 ${badPrefix.length} + 超字数 ${tooLong.length}，常量写 ${reg.listedItems}`);
     }
@@ -9944,10 +9980,17 @@ t.section('二十一、真源分叉守护：`server\\` 下 `createStateSnapshot(
     }
     return out;
   };
-  /** 判据（**纯函数**，供 D22 复用）：返回违规清单（空＝合规）。 */
-  const scanSnapshotConfig21 = (relPath, src) => {
+  /** **调用点解析（纯函数，单一真源）**：源码 ⇒ 每个 `createStateSnapshot(` **调用点**的
+   *  `{line, argsStart, argsEnd, argsText, opaque, keys, configKeySpan, hasConfig}`。
+   *  ⚠ `T-20261005-15`（主代理批准的重钉）：把**解析**与**判定**拆开 —— 这样 D22 就能按**符号/内容**
+   *  定位"某调用点自己的 `config` 键"再从内存副本里摘掉，而**不再**按"第一条 `config: boardCfg,` 文本行"
+   *  （那条同形行可能属于**别的**对象字面量 ⇒ 实测踩过：座位 3 给 `mountUpload({...})` 补了 `config` 之后，
+   *  旧写法摘掉的是**别处**那一行 ⇒ 期望的"1 处"变成 0 处 ⇒ **假红**）。
+   *  坐标口径：`argsStart`＝`(` 的下标、`argsEnd`＝配对 `)` 的下标；`stripLiterals` **长度守恒**
+   *  ⇒ 同一坐标可直接用于**原样字节**。 */
+  const snapshotCallSites21 = (relPath, src) => {
     const code = stripLiterals(src);
-    const bad = [];
+    const out = [];
     const re = /(^|[^\w$.])createStateSnapshot(\s*)\(/g;
     let m;
     while ((m = re.exec(code)) !== null) {
@@ -9955,46 +9998,69 @@ t.section('二十一、真源分叉守护：`server\\` 下 `createStateSnapshot(
       if (/function\s+$/.test(code.slice(0, identStart))) continue;   // 函数**声明**，不是调用点
       const openIdx = identStart + 'createStateSnapshot'.length + m[2].length;   // `(` 的下标
       const line = code.slice(0, openIdx).split('\n').length;
-      /* 括号配对取实参文本（`code` 里字符串已被空格替换 ⇒ 不会把 `(` 数进字符串里） */
       let depth = 0;
       let end = -1;
       for (let i = openIdx; i < code.length; i++) {
         if (code[i] === '(') depth++;
         else if (code[i] === ')') { depth--; if (depth === 0) { end = i; break; } }
       }
-      const args = end < 0 ? '' : code.slice(openIdx + 1, end);
-      const trimmed = args.trim();
-      if (!trimmed.startsWith('{')) {
-        bad.push(`${relPath}:${line} —— 实参不是对象字面量（\`${trimmed.slice(0, 40) || '（空）'}\`）⇒ ` +
-          '静态上无法确认 `config` 在场（不透明变量正是"配置分叉"能溜进来的形态）');
-        continue;
+      const argsEnd = end < 0 ? code.length - 1 : end;
+      const argsText = code.slice(openIdx + 1, argsEnd);
+      const trimmed = argsText.trim();
+      const site = {
+        relPath, line, argsStart: openIdx, argsEnd, argsText,
+        opaque: !trimmed.startsWith('{'), keys: [], configKeySpan: null, hasConfig: false
+      };
+      if (!site.opaque) {
+        /* 取**顶层**键（跳过嵌套的括号/花括号/方括号里的逗号）：先把最外层那对花括号摘掉，
+           否则第一个 `{` 自己就把深度抬到 1、顶层逗号全被当成嵌套（**实测踩过**：第一版把
+           `[{` 报成了"顶层键"）。顺带把每个键在**原文**里的区间算出来（供 D22 精确摘除）。 */
+        const trimmedAt = argsText.indexOf(trimmed);
+        const braceAt = trimmed.startsWith('{') ? 1 : 0;
+        const inner = trimmed.startsWith('{') && trimmed.endsWith('}') ? trimmed.slice(1, -1) : trimmed;
+        const innerBase = openIdx + 1 + trimmedAt + braceAt;   /* `inner` 在 src 里的起点 */
+        const spans = [];
+        let d = 0;
+        let start = 0;
+        for (let i = 0; i < inner.length; i++) {
+          const ch = inner[i];
+          if ('([{'.includes(ch)) d++;
+          else if (')]}'.includes(ch)) d--;
+          if (ch === ',' && d === 0) { spans.push([start, i]); start = i + 1; }
+        }
+        spans.push([start, inner.length]);
+        site.keys = spans.map(([a, b]) => inner.slice(a, b));
+        const ci = spans.findIndex(([a, b]) => {
+          const t = inner.slice(a, b).trim();
+          return /^config\s*:/.test(t) || t === 'config';
+        });
+        if (ci >= 0) {
+          site.hasConfig = true;
+          const [a, b] = spans[ci];
+          const seg = inner.slice(a, b);
+          const leadWs = seg.length - seg.trimStart().length;
+          const startAt = innerBase + a + leadWs;
+          /* 末键 ⇒ 摘到键尾；否则摘到**下一个顶层键的起点**（连它后面那个逗号一起去掉） */
+          const endAt = ci < spans.length - 1 ? innerBase + spans[ci + 1][0] : innerBase + b;
+          site.configKeySpan = [startAt, endAt];
+        }
       }
-      /* 取**顶层**键（跳过嵌套的括号/花括号/方括号里的逗号）：先把最外层那对花括号摘掉，
-         否则第一个 `{` 自己就把深度抬到 1、顶层逗号全被当成嵌套（**实测踩过**：第一版把
-         `[{` 报成了"顶层键"）。 */
-      const inner = trimmed.startsWith('{') && trimmed.endsWith('}') ? trimmed.slice(1, -1) : trimmed;
-      const keys = [];
-      let d = 0;
-      let cur = '';
-      for (const ch of inner) {
-        if ('([{'.includes(ch)) d++;
-        else if (')]}'.includes(ch)) d--;
-        if (ch === ',' && d === 0) { keys.push(cur); cur = ''; continue; }
-        cur += ch;
-      }
-      keys.push(cur);
-      const hasConfig = keys.some((k) => {
-        const t = k.trim();
-        return /^config\s*:/.test(t) || t === 'config';
-      });
-      if (!hasConfig) {
-        bad.push(`${relPath}:${line} —— 顶层没有 \`config\` 键（实参顶层键＝[` +
-          keys.map(k => (k.split(':')[0] || '').trim()).filter(Boolean).join(', ') +
-          ']）⇒ 该调用点会回落到**磁盘上的** `board.config.js`，与注入的配置分叉');
-      }
+      out.push(site);
     }
-    return bad;
+    return out;
   };
+  /** 判据（**纯函数**，供 D22 复用）：返回违规清单（空＝合规）。**文案与拆分前逐字相同**。 */
+  const scanSnapshotConfig21 = (relPath, src) => snapshotCallSites21(relPath, src).flatMap((s) => {
+    if (s.opaque) {
+      const trimmed = s.argsText.trim();
+      return [`${relPath}:${s.line} —— 实参不是对象字面量（\`${trimmed.slice(0, 40) || '（空）'}\`）⇒ ` +
+        '静态上无法确认 `config` 在场（不透明变量正是"配置分叉"能溜进来的形态）'];
+    }
+    if (s.hasConfig) return [];
+    return [`${relPath}:${s.line} —— 顶层没有 \`config\` 键（实参顶层键＝[` +
+      s.keys.map(k => (k.split(':')[0] || '').trim()).filter(Boolean).join(', ') +
+      ']）⇒ 该调用点会回落到**磁盘上的** `board.config.js`，与注入的配置分叉'];
+  });
   const serverJs21 = walkServerJs21(path.join(env.paths.root, 'server'));
   const relOf21 = (abs) => path.relative(env.paths.root, abs).split(path.sep).join('\\');
   const callSites21 = [];
@@ -10014,27 +10080,650 @@ t.section('二十一、真源分叉守护：`server\\` 下 `createStateSnapshot(
       : `零违规（扫 ${serverJs21.length} 个 server .js；调用点 ${callSites21.join('、')}；` +
         '每一处顶层都有 `config` 键 ⇒ 注入的配置与磁盘配置不会各管一半）');
 
-  /* D22（可证伪）：把 `server\index.js` 里那一行 `config: boardCfg,` **从内存副本里摘掉** ⇒ 同一判据
-     **必红并指名 `server\index.js:行号`**；盘上文件**逐字节未变**（只用内存字符串，不落地）。 */
+  /* D22（可证伪，`T-20261005-15` **按符号/内容重钉**）：从**第一个带 `config` 键的调用点**的实参里，
+     把这个**顶层 `config` 键的区间**（含其后那个逗号）从**内存副本**摘掉 ⇒ 同一判据**必红并把该调用点
+     指名到 `server\index.js:行号`**；盘上文件**逐字节未变**。
+     ⚠ 为什么不能按"第一条 `config: boardCfg,` 文本行"摘（旧写法）：那条同形行可能属于**别的**对象字面量
+     ⇒ 实测踩过一次**假红**（座位 3 给别的调用点补了 `config` 之后，摘掉的是别处那一行 ⇒ 期望的 1 处变 0 处）。
+     ⇒ 现在先按**同一个解析器**定位调用点与它自己的键，再摘 —— **不写死行号、也不写死值**。
+     ⚠ 前提（不许静默通过）：盘上**至少有一处**调用点带 `config` 键；一处都没有 ⇒ 判红（本 D22 无从谈起）。 */
   {
     const idxPath = path.join(env.paths.root, 'server', 'index.js');
     const idxBytes0 = fs.readFileSync(idxPath);
     const sha = (b) => require('node:crypto').createHash('sha256').update(b).digest('hex');
     const sha0 = sha(idxBytes0);
-    const curBad21 = scanSnapshotConfig21(relOf21(idxPath), idxBytes0.toString('utf8'));
-    const mutSrc21 = idxBytes0.toString('utf8').replace(/^[ \t]*config: boardCfg,\r?\n/m, '');
-    const mutBad21 = mutSrc21 !== idxBytes0.toString('utf8')
-      ? scanSnapshotConfig21(relOf21(idxPath), mutSrc21) : ['（锚点未命中：`config: boardCfg,` 那一行没找到）'];
+    const src0 = idxBytes0.toString('utf8');
+    const sites21 = snapshotCallSites21(relOf21(idxPath), src0);
+    const withCfg21 = sites21.filter(s => s.hasConfig && s.configKeySpan);
+    const curBad21 = scanSnapshotConfig21(relOf21(idxPath), src0);
+    const target21 = withCfg21[0] || null;
+    const mutSrc21 = target21
+      ? src0.slice(0, target21.configKeySpan[0]) + src0.slice(target21.configKeySpan[1])
+      : src0;
+    const mutBad21 = target21
+      ? scanSnapshotConfig21(relOf21(idxPath), mutSrc21)
+      : ['（前提不成立：`server\\index.js` 里找不到带顶层 `config` 键的调用点）'];
     const idxBytes1 = fs.readFileSync(idxPath);
-    t.check('T-20261004-13 D22（可证伪）：把 `server\\index.js` 里 `config: boardCfg,` 那一行**从内存副本摘掉** ⇒ ' +
-      '同一判据**必红并把该调用点指名到 `server\\index.js:行号`**；现行源码零违规；盘上 `server\\index.js` 逐字节未变',
-      curBad21.length === 0 && mutBad21.length === 1 && /server\\index\.js:\d+/.test(mutBad21[0]) &&
-      Buffer.compare(idxBytes0, idxBytes1) === 0 && sha(idxBytes1) === sha0,
-      `现行源码违规 ${curBad21.length} 处（应 0）；内存摘掉「config: boardCfg,」后 ${mutBad21.length} 处：${mutBad21.join('；')}；` +
-      `盘上 server\\index.js 逐字节未变=${Buffer.compare(idxBytes0, idxBytes1) === 0}（sha256=${sha0.slice(0, 12)}…）`);
+    t.check('T-20261004-13 D22（可证伪，`T-20261005-15` **按符号/内容重钉**）：从**第一个带 `config` 键的 '
+      + '`createStateSnapshot(` 调用点**的实参里，把这个**顶层 `config` 键的区间**从**内存副本**摘掉 ⇒ '
+      + '同一判据**必红并把该调用点指名到 `server\\index.js:行号`**（**不写死行号、也不写死值**）；'
+      + '现行源码零违规；盘上 `server\\index.js` 逐字节未变',
+      withCfg21.length > 0 && curBad21.length === 0 && mutBad21.length === 1
+        && mutBad21[0].includes('server\\index.js:' + (target21 ? target21.line : ''))
+        && Buffer.compare(idxBytes0, idxBytes1) === 0 && sha(idxBytes1) === sha0,
+      `调用点 ${sites21.length} 处（带顶层 \`config\` 键 ${withCfg21.length} 处`
+        + `${target21 ? `，目标＝server\\index.js:${target21.line}` : ''}）；`
+        + `现行源码违规 ${curBad21.length} 处（应 0）；内存摘掉**目标调用点自己的** \`config\` 键后 `
+        + `${mutBad21.length} 处：${mutBad21.join('；')}；`
+        + `盘上 server\\index.js 逐字节未变=${Buffer.compare(idxBytes0, idxBytes1) === 0}（sha256=${sha0.slice(0, 12)}…）`);
   }
 }
 
+/* ---------------- 二十二、`E129` 取数上限／`E166`／`E167`／`E170`（4b 的 `T-20261005-12`） ----------------
+   【本节四件事与"为什么"（逐条对应 `项目记录\后续路线图.md` 的债行）】
+    ① `E129` 门禁断言：`statsForShift()` 的窗口取数**不得含行数上限**。旧实现
+       `ORDER BY id DESC LIMIT 1000`（`C·25` 复核实测：改前 `runSec` 钉在 999、改后 1999）
+       会让"**算不全**"与"**真的只有 1000 帧**"读数**完全一样** ⇒ `FR-4.11`（当班有效运行时长）
+       与 `FR-4.15`（设备稼动率）两个 **P0** 静默偏低（`E38` 同族：没算全却显示成一个数）。
+       候选＝**SQL 字面量**里同时含 `FROM measure_rt` 与 `collect_time` 比较谓词的 **SELECT**
+       （`C·25` 第②面给的口径）。
+       ⚠ **必须排除"邻接单行"**（`C·25` 明确点名的坑）：`SELECT collect_time AS collectTime FROM
+       measure_rt WHERE collect_time < ? ORDER BY collect_time DESC LIMIT 1` 是"**早于本帧的最近一条**"
+       的**语义**（`server\index.js` 的 `previousFrameShiftOf()`，重启后回读"上次所见班次"用）——
+       ⚠ **别把行号写进判据**（`E134`／`E147`：行号会漂）：`C·25` 立此例时那条语句在 `:1329`，
+       盘上实测已因别的改动漂到 `:1336` ⇒ 本判据只按**形态**判，**现算行号**一律打进读数。
+       那里的 `LIMIT 1` 是**语义**、不是截断。⇒ 判据把"**单边谓词 ＋ ORDER BY ＋ LIMIT 1**"整类排除，并把被排除的每一处
+       **逐条打出来**（`E161` 的教训：**排除必须看得见**，否则"排除"会退化成"看不见"）。
+    ② `E170` 的 D22：`E166` 的首选修法（给 `measure_rt(collect_time)` 加索引）**必须可证伪** ——
+       判据读 `EXPLAIN QUERY PLAN`（**内存** `:memory:` 库 ＋ 盘上 `server\db\schema.sql` 的 DDL 现读），
+       要求窗口查询的计划**用上** `ix_measure_rt_collect_time` 且**不是** `SCAN measure_rt`；
+       D22 在**内存里**把索引去掉（`DROP INDEX` ＋ 从 schema 文本摘掉那一行）⇒ 同一判据**必红并指名
+       `SCAN measure_rt`**；负对照＝现行盘上 schema ⇒ **必绿**。另复核**老库路径**：
+       `server\db\index.js` 的 `STRUCTURE_UPGRADES` 必须带**幂等**建索引步骤（同批三件之一）。
+    ③ `E167` 的断言：**探针调用不消耗生产告警名额** ＋ **计数不去重**（`E146`／`T-20261004-19` 的既有分工）。
+       判据与生产**同一个纯函数**（`measureWindowDensity()`）；"这一窗报过没有"按**快照实例**记账
+       （`SNAPSHOT_WARN_SETS`）。对照＝**真旧字节**（`git show 030f76e^:server/services/stateSnapshot.js`，
+       模块顶层 `Set` ＋ 导出函数里告警）**在内存里编译**后跑**同一场景** ⇒ 探针先调则生产**一条都不响**
+       （改前会红）；现行 ⇒ 生产照响（改后绿）。
+    ④ 残留与盘上字节：本节所有变异**一律只在内存**；每个 D22 都给"盘上逐字节未变（`Buffer.compare`
+       ＋ sha256）"与"判据在盘上原件上的残留"读数。
+   【扫描面与口径（显式声明，不是顺手扩大）】
+    · `E129-①` 的面＝`server\**\*.js` —— 生产**取数面**：`E129` 的病灶（`services/stateSnapshot.js`）
+      与 `C·25` 给的反例（`server/index.js` 的 `previousFrameShiftOf()`）都在这一面；前端 `src\` 无 SQL，`._verify\` 面是探针家。
+    · `E161-D①` 的 shell 形态判据在第五节自己的块里（面＝受管面，含生产），本节只复述其读数。
+   【不改判据迎合】：本节**只新增**断言，一个既有断言的式子都没动；
+    若权威区（`tests\README.md` 第三节）的声明数字与本节实跑不一致，按 `9.5-5` 报"声明≠实跑"，
+    由权威区同步，**不**改判据去凑。 */
+t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警名额与计数（`T-20261005-12`）');
+{
+  const crypto22 = require('node:crypto');
+  const Module22 = require('node:module');
+  const { DatabaseSync } = require('node:sqlite');
+  const dbApi22 = require('../server/db');
+  const snapSvc22 = require('../server/services/stateSnapshot');
+  const sha256hex22 = (b) => crypto22.createHash('sha256').update(b).digest('hex');
+  const Q22 = String.fromCharCode(39);
+  const relOf22 = (abs) => path.relative(env.paths.root, abs).split(path.sep).join('\\');
+  const read22 = (abs) => fs.readFileSync(abs, 'utf8');
+  const lineOf22 = (src, idx) => src.slice(0, idx).split('\n').length;
+  const attempt22 = (fn) => { try { return { ok: true, value: fn() }; } catch (e) { return { ok: false, err: String((e && e.message) || e) }; } };
+  const clock22 = createClock({ mode: 'fixed', at: '2026-09-19T12:00:00' });
+  const shiftRules22 = createShiftRules(boardConfig.shift.list);
+  const SRC_SNAPSHOT_REL22 = 'server\\services\\stateSnapshot.js';
+  const SRC_SNAPSHOT_ABS22 = path.join(env.paths.root, 'server', 'services', 'stateSnapshot.js');
+  const SCHEMA_REL22 = 'server\\db\\schema.sql';
+  const SCHEMA_ABS22 = path.join(env.paths.root, 'server', 'db', 'schema.sql');
+
+  /* ==================== 共用 1：字面量跨度扫描（判据的"地面"） ====================
+     为什么要自己扫一遍"哪些字符在字面量里"：SQL 一律写在引号/模板串里，而 `stripLiterals()`
+     把**内容**blank 掉（连引号一起）⇒ 从剥后文本里读不到 SQL。故这里只做**边界**：
+     与 `tests\lib\assert.js` 的 `stripLiterals()` **同一套状态机**（含 `isRegexStart` 那一步，
+     为的是不把正则里的引号当成字符串起点），并**交叉自证**：凡进入判据的字面量，其区间内
+     "非空白的原样字符"必须都被 `stripLiterals()` blank 掉（否则本判据的"边界"就错了 ⇒ 只报不判）。
+     ⚠ 判据本体（`scanWindowQueryCap22`）与 D22 **共用这一个函数**（`E153` 的教训）。 */
+  const isRegexStart22 = (out, i) => {
+    let k = i - 1;
+    while (k >= 0 && /\s/.test(out[k])) k--;
+    if (k < 0) return true;
+    if ('([{,;:=!&|?+-*%~^<>'.includes(out[k])) return true;
+    let w = k;
+    while (w >= 0 && /[A-Za-z_$]/.test(out[w])) w--;
+    return /^(return|typeof|instanceof|in|of|new|delete|void|case|do|else|yield|await)$/
+      .test(out.slice(w + 1, k + 1));
+  };
+  /** 返回 `[{start,end,quote}]`（**含引号本身**；`end` 是闭合引号的下标）。
+   *  未闭合的字面量止于行尾（与 `stripLiterals` 的容错同一口径）；正则只用来"跳过"，不产出跨度。 */
+  const literalSpans22 = (src, stripped) => {
+    const spans = [];
+    const stack = [];
+    let mode = 'code';
+    let start = -1;
+    let quote = '';
+    const close = (end) => { if (start >= 0) spans.push({ start, end, quote }); start = -1; quote = ''; };
+    const n = src.length;
+    let i = 0;
+    while (i < n) {
+      const c = src[i];
+      const c2 = src[i + 1];
+      if (mode === 'code') {
+        if (c === '/' && c2 === '/') { mode = 'line'; i += 2; continue; }
+        if (c === '/' && c2 === '*') { mode = 'block'; i += 2; continue; }
+        if (c === Q22 || c === '"' || c === '`') {
+          start = i; quote = c; mode = c === '`' ? 'tpl' : (c === Q22 ? 'sq' : 'dq'); i++; continue;
+        }
+        if (c === '/' && isRegexStart22(stripped, i)) { mode = 're'; i++; continue; }
+        if (stack.length) {
+          if (c === '{') stack[stack.length - 1].braces++;
+          else if (c === '}') {
+            if (stack[stack.length - 1].braces === 0) { stack.pop(); mode = 'tpl'; }
+            else stack[stack.length - 1].braces--;
+          }
+        }
+        i++; continue;
+      }
+      if (mode === 'line') { if (c === '\n') mode = 'code'; i++; continue; }
+      if (mode === 'block') { if (c === '*' && c2 === '/') { mode = 'code'; i += 2; continue; } i++; continue; }
+      if (mode === 'sq' || mode === 'dq') {
+        const q = mode === 'sq' ? Q22 : '"';
+        if (c === '\\') { i += 2; continue; }
+        if (c === q) { close(i); mode = 'code'; i++; continue; }
+        if (c === '\n') { close(i - 1); mode = 'code'; i++; continue; }     /* 未闭合：止于行尾 */
+        i++; continue;
+      }
+      if (mode === 'tpl') {
+        if (c === '\\') { i += 2; continue; }
+        if (c === '`') { close(i); mode = 'code'; i++; continue; }
+        if (c === '$' && c2 === '{') { stack.push({ braces: 0 }); mode = 'code'; i += 2; continue; }
+        i++; continue;
+      }
+      if (mode === 're') {
+        if (c === '\\') { i += 2; continue; }
+        if (c === '[') { mode = 'reclass'; i++; continue; }
+        if (c === '/') { mode = 'code'; i++; continue; }
+        if (c === '\n') { mode = 'code'; i++; continue; }
+        i++; continue;
+      }
+      /* mode === 'reclass' */
+      if (c === '\\') { i += 2; continue; }
+      if (c === ']') { mode = 're'; i++; continue; }
+      i++; continue;
+    }
+    if (start >= 0) close(n - 1);
+    return spans;
+  };
+
+  /* ==================== 共用 2：`E129` 的判据（纯函数；主断言与 D22 同一把尺子） ====================
+     · 候选＝以 `SELECT` 起头、含 `FROM measure_rt`、且含 `collect_time` **比较谓词**的字面量；
+     · 上限＝候选里任何 `LIMIT <数字|?|插值>` 子句；
+     · 排除＝"单边 `collect_time` 谓词 ＋ `ORDER BY` ＋ `LIMIT 1`"＝**邻接单行**（`server\index.js` 的 `previousFrameShiftOf()` 的语义）；
+     · 含模板插值的字面量**不判红**（静态判据看不见内容）⇒ 归入 `undecided` **并逐条报出**。 */
+  const CT_CMP22 = /collect_time\s*(?:>=|<=|<>|!=|>|<|=|BETWEEN)/i;
+  const scanWindowQueryCap22 = (rel, src) => {
+    const stripped = stripLiterals(src);
+    const spans = literalSpans22(src, stripped);
+    const candidates = [];
+    const violations = [];
+    const adjacency = [];
+    const undecided = [];
+    for (const sp of spans) {
+      const text = src.slice(sp.start + 1, sp.end);
+      if (!/\bFROM\s+measure_rt\b/i.test(text)) continue;
+      const line = lineOf22(src, sp.start);
+      if (text.includes('${')) {
+        undecided.push({ rel, line, why: '含模板插值（动态 SQL ⇒ 静态判据看不见内容）', sql: text.trim().slice(0, 120) });
+        continue;
+      }
+      if (!/^\s*SELECT\b/i.test(text)) continue;                      /* 只判取数（SELECT），不判 DELETE 之类 */
+      if (!CT_CMP22.test(text)) continue;                             /* 不按 collect_time 取数 ⇒ 不是候选 */
+      /* 地面自证：区间内的非空白原样字符必须都被 `stripLiterals()` blank（否则边界错了 ⇒ 不判红） */
+      const rawSeg = src.slice(sp.start, sp.end + 1);
+      const strSeg = stripped.slice(sp.start, sp.end + 1);
+      let ground = true;
+      for (let k = 0; k < rawSeg.length; k++) {
+        if (!/\s/.test(rawSeg[k]) && !/\s/.test(strSeg[k])) { ground = false; break; }
+      }
+      if (!ground) {
+        undecided.push({ rel, line, why: '字面量边界与 `stripLiterals()` 的地面不符（本判据不判这一处）', sql: text.trim().slice(0, 120) });
+        continue;
+      }
+      const caps = [];
+      const capRe = /\bLIMIT\s+(\d+|\?|\$\{[^}]*\})/gi;
+      let mc;
+      while ((mc = capRe.exec(text))) {
+        caps.push({ txt: mc[0].replace(/\s+/g, ' '), n: mc[1], line: lineOf22(src, sp.start + 1 + mc.index) });
+      }
+      const hasLower = /collect_time\s*(?:>=|>)/i.test(text) || /collect_time\s*BETWEEN/i.test(text);
+      const hasUpper = /collect_time\s*(?:<=|<)/i.test(text) || /collect_time\s*BETWEEN/i.test(text);
+      const singleSided = !(hasLower && hasUpper);
+      const hasOrder = /\bORDER\s+BY\b/i.test(text);
+      candidates.push({ rel, line, caps: caps.map(c => c.txt), singleSided, hasOrder, sql: text.trim() });
+      for (const cap of caps) {
+        if (cap.n === '1' && hasOrder && singleSided) {
+          adjacency.push({ rel, line, capLine: cap.line, cap: cap.txt, sql: text.trim() });
+        } else {
+          violations.push({
+            rel, line, capLine: cap.line, cap: cap.txt, sql: text.trim(),
+            why: cap.n === '1' ? '`LIMIT 1` 但**不是**"邻接单行"形态（有上下界／缺 `ORDER BY`）'
+              : `行数上限 \`${cap.txt}\``
+          });
+        }
+      }
+    }
+    return { candidates, violations, adjacency, undecided };
+  };
+  const serverJs22 = walkJsTopE160(path.join(env.paths.root, 'server'));
+  const e129PerFile22 = serverJs22.map(f => ({ rel: relOf22(f), ...scanWindowQueryCap22(relOf22(f), read22(f)) }));
+  const e129Candidates22 = e129PerFile22.flatMap(r => r.candidates.map(c => ({ rel: r.rel, ...c })));
+  const e129Violations22 = e129PerFile22.flatMap(r => r.violations.map(v => ({ rel: r.rel, ...v })));
+  const e129Adjacency22 = e129PerFile22.flatMap(r => r.adjacency.map(v => ({ rel: r.rel, ...v })));
+  const e129Undecided22 = e129PerFile22.flatMap(r => r.undecided.map(v => ({ rel: r.rel, ...v })));
+  const e129AdjTxt22 = e129Adjacency22.length
+    ? e129Adjacency22.map(v => `\`${v.rel}\`:${v.capLine} \`${v.cap}\`（${v.sql.replace(/\s+/g, ' ').slice(0, 96)}…）`).join('；')
+    : '（无）';
+  t.check('E129-① **静态判据：窗口取数不得含行数上限**（面＝`server\\**\\*.js`）：候选＝SQL 字面量里同时含 '
+    + '`FROM measure_rt` 与 `collect_time` 比较谓词的 `SELECT`；候选内任何 `LIMIT` 子句 ⇒ **红并指名 `文件:行号`**；'
+    + '唯一例外＝"**单边谓词 ＋ ORDER BY ＋ LIMIT 1**"＝**邻接单行**（`server\\index.js` 的 `previousFrameShiftOf()` 的语义），'
+    + '该例外**逐条打出来**（排除不许隐形）',
+    e129Violations22.length === 0 && e129Candidates22.length > 0
+      && e129Adjacency22.some(v => v.rel === 'server\\index.js'),
+    e129Violations22.length
+      ? `判红 ${e129Violations22.length} 处：`
+        + e129Violations22.map(v => `\`${v.rel}\`:${v.capLine}（${v.why}；SQL 起于 :${v.line}）`).join('；')
+      : `零违规（扫 ${serverJs22.length} 个 server .js；候选 ${e129Candidates22.length} 条：`
+        + e129Candidates22.map(c => `\`${c.rel}\`:${c.line}[${c.caps.join(',') || '无上限'}]`).join('、')
+        + `；**邻接单行（例外、判绿）** ${e129Adjacency22.length} 条：${e129AdjTxt22}`
+        + `；未判定 ${e129Undecided22.length} 条：`
+        + (e129Undecided22.map(v => `\`${v.rel}\`:${v.line} ${v.why}`).join('；') || '（无）'));
+  t.info(`\`E129-①\` 口径：候选＝"按 \`collect_time\` 取数"的 SELECT 字面量；例外＝邻接单行（单边谓词 ＋ ORDER BY ＋ LIMIT 1）。`
+    + `**反例读数**（必须不被误判）：\`server\\index.js\` 的 \`previousFrameShiftOf()\` 里 \`WHERE collect_time < ? ORDER BY collect_time DESC LIMIT 1\` `
+    + `是"早于本帧的最近一条"的**语义** ⇒ 实测${e129Adjacency22.some(v => v.rel === 'server\\index.js') ? '**已列入除外**（判绿 ✓）' : '**未被列入 ⇒ 判据有问题**'}`);
+
+  /* ---------------- `E129-②` D22（可证伪）：把窗口查询改回 `LIMIT 1000`（**内存**） ---------------- */
+  {
+    const b0 = fs.readFileSync(SRC_SNAPSHOT_ABS22);
+    const src0 = b0.toString('utf8');
+    const sha0 = sha256hex22(b0);
+    const live22 = scanWindowQueryCap22(SRC_SNAPSHOT_REL22, src0);
+    const anchor22 = 'ORDER BY id DESC`';
+    const mutSrc22 = src0.replace(anchor22, 'ORDER BY id DESC LIMIT 1000`');
+    const hit22 = mutSrc22 !== src0;
+    const mut22 = hit22 ? scanWindowQueryCap22(SRC_SNAPSHOT_REL22, mutSrc22) : { violations: [] };
+    const b1 = fs.readFileSync(SRC_SNAPSHOT_ABS22);
+    const residual22 = scanWindowQueryCap22(SRC_SNAPSHOT_REL22, b1.toString('utf8')).violations;
+    t.check('E129-② D22（可证伪）：把盘上窗口查询的 `ORDER BY id DESC`（**内存副本**）改成 '
+      + '`ORDER BY id DESC LIMIT 1000` ⇒ **同一判据必红并指名 `server\\services\\stateSnapshot.js` 的行号**；'
+      + '现行源码零违规（**负对照必绿**）；盘上文件**逐字节未变**；变异实验后盘上判据的残留 `[]`',
+      live22.violations.length === 0 && hit22 && mut22.violations.length === 1
+        && mut22.violations[0].cap === 'LIMIT 1000' && Buffer.compare(b0, b1) === 0 && residual22.length === 0,
+      `现行违规 ${live22.violations.length} 处（应 0）；锚点 \`${anchor22}\` 命中=${hit22}；`
+        + `内存变异后违规 ${mut22.violations.length} 处（应 1）：`
+        + (mut22.violations.map(v => `\`${v.rel}\`:${v.capLine}（${v.why}）`).join('；') || '（**红没出现 ⇒ 本条判据不可证伪**）')
+        + `；盘上 \`server\\services\\stateSnapshot.js\` 逐字节未变=${Buffer.compare(b0, b1) === 0}（sha256=${sha0.slice(0, 12)}…）；`
+        + `残留 ${JSON.stringify(residual22.map(v => `${v.rel}:${v.capLine}`))}`);
+  }
+
+  /* ==================== `E170`：索引与查询计划（`EXPLAIN QUERY PLAN` 判据） ====================
+     · 建库：**内存** `:memory:` ＋ 盘上 `schema.sql` 的 DDL 现读（不落盘、不碰真库）；
+     · 待判 SQL：**就从盘上 `stateSnapshot.js` 现抠**（与 `E129-①` 同一个扫描器 ⇒ 两件判据同一份取数口）；
+     · 负对照＝盘上现行（期望 `SEARCH … USING COVERING INDEX ix_measure_rt_collect_time`）；
+     · D22＝内存 `DROP INDEX` ＋ 从 schema 文本摘掉那一行（`E170` 的"打回 `SCAN`"）。 */
+  const windowSql22 = (() => {
+    const r = scanWindowQueryCap22(SRC_SNAPSHOT_REL22, read22(SRC_SNAPSHOT_ABS22));
+    const c = r.candidates.find(x => /SELECT\s+collect_time\s+AS\s+collectTime/i.test(x.sql));
+    return c ? c.sql : null;
+  })();
+  const schemaSql22 = read22(SCHEMA_ABS22);
+  const INDEX_LINE_RE22 = /^CREATE INDEX IF NOT EXISTS ix_measure_rt_collect_time ON measure_rt\(collect_time\);\r?\n/m;
+  const planOf22 = (db, sql) => db.prepare('EXPLAIN QUERY PLAN ' + sql).all('0', '9')
+    .map(r => String(r.detail)).join(' | ');
+  const planJudge22 = (plan) => ({
+    ok: /ix_measure_rt_collect_time/.test(plan) && !/\bSCAN measure_rt\b/i.test(plan), plan
+  });
+  const stepJudge22 = (steps) => {
+    const hit = steps.filter(s => /ix_measure_rt_collect_time/.test(String(s)));
+    const cls = hit.length === 1 ? dbApi22.classifyUpgradeStep(hit[0]) : null;
+    return { ok: hit.length === 1 && Boolean(cls && cls.ok === true && cls.kind === 'create-index'), n: hit.length, kind: cls ? cls.kind : '（未命中）' };
+  };
+  const withDb22 = (schemaText, fn) => {
+    const db = new DatabaseSync(':memory:');
+    try { db.exec(schemaText); return fn(db); } finally { try { db.close(); } catch { /* 已关 */ } }
+  };
+  const planDisk22 = windowSql22
+    ? withDb22(schemaSql22, db => planOf22(db, windowSql22)) : '（窗口 SQL 未抠到 ⇒ 计划不可读）';
+  const planDiskVerdict22 = planJudge22(planDisk22);
+  const stepDisk22 = stepJudge22(dbApi22.STRUCTURE_UPGRADES);
+  t.check('E170-① **索引与查询计划**（`E166` 的首选修法、`E170` 的验收面）：`EXPLAIN QUERY PLAN`（内存 '
+    + '`:memory:` ＋ 盘上 `schema.sql`）对**从盘上抠出的窗口查询**必须给出 '
+    + '`ix_measure_rt_collect_time`（`SEARCH`）而**不是** `SCAN measure_rt`；且老库路径 '
+    + '`server\\db\\index.js` 的 `STRUCTURE_UPGRADES` 必须带**幂等**建索引步骤（`classifyUpgradeStep` 归 '
+    + '`create-index`）；`schema.sql`（新建库路径）与它同源',
+    Boolean(windowSql22) && planDiskVerdict22.ok && INDEX_LINE_RE22.test(schemaSql22) && stepDisk22.ok,
+    `窗口 SQL＝${windowSql22 ? '`' + windowSql22.replace(/\s+/g, ' ').slice(0, 90) + '…`' : '**未抠到**'}；`
+      + `盘上计划＝\`${planDisk22}\`；用上索引且非 SCAN=${planDiskVerdict22.ok}；`
+      + `\`schema.sql\` 含幂等建索引行=${INDEX_LINE_RE22.test(schemaSql22)}；`
+      + `\`STRUCTURE_UPGRADES\` 命中 ${stepDisk22.n} 条（应 1）、归类＝\`${stepDisk22.kind}\`（应 \`create-index\`）；`
+      + `\`SCHEMA_VERSION\`=${JSON.stringify(dbApi22.SCHEMA_VERSION)}`);
+  /* ---------------- `E170-②` D22：内存"打回 SCAN" ----------------
+     三支变异（都在内存）：㈠建好的内存库上 `DROP INDEX` ㈡schema 文本摘掉那一行再建库
+     ㈢`STRUCTURE_UPGRADES` 的内存副本去掉那一步。负对照＝盘上原件（三支都应绿）。 */
+  {
+    const schemaBytes0_22 = fs.readFileSync(SCHEMA_ABS22);
+    const dropPlan22 = windowSql22 ? withDb22(schemaSql22, (db) => {
+      db.exec('DROP INDEX ix_measure_rt_collect_time');
+      return planOf22(db, windowSql22);
+    }) : '（窗口 SQL 未抠到）';
+    const minusSchema22 = schemaSql22.replace(INDEX_LINE_RE22, '');
+    const minusHit22 = minusSchema22 !== schemaSql22;
+    const minusPlan22 = windowSql22 ? withDb22(minusSchema22, db => planOf22(db, windowSql22)) : '（窗口 SQL 未抠到）';
+    const minusSteps22 = dbApi22.STRUCTURE_UPGRADES.filter(s => !/ix_measure_rt_collect_time/.test(String(s)));
+    const minusStepVerdict22 = stepJudge22(minusSteps22);
+    const schemaBytes1_22 = fs.readFileSync(SCHEMA_ABS22);
+    const residualSteps22 = stepJudge22(dbApi22.STRUCTURE_UPGRADES);
+    const dropRed22 = planJudge22(dropPlan22).ok === false && /\bSCAN measure_rt\b/i.test(dropPlan22);
+    const minusRed22 = minusHit22 && planJudge22(minusPlan22).ok === false && /\bSCAN measure_rt\b/i.test(minusPlan22);
+    t.check('E170-② D22（可证伪，**三支内存变异 ＋ 负对照**）：㈠`DROP INDEX ix_measure_rt_collect_time` '
+      + '㈡从 `schema.sql` 文本摘掉那一行 ⇒ 同一判据**必红并指名 `SCAN measure_rt`**；'
+      + '㈢`STRUCTURE_UPGRADES` 的内存副本去掉那一步 ⇒ 老库路径判据**必红并指名"未命中"**；'
+      + '而**盘上原件**两支判据**全部为绿**；`schema.sql` 逐字节未变',
+      dropRed22 && minusRed22 && minusStepVerdict22.ok === false && minusStepVerdict22.n === 0
+        && planDiskVerdict22.ok === true && stepDisk22.ok === true
+        && Buffer.compare(schemaBytes0_22, schemaBytes1_22) === 0 && residualSteps22.ok === true,
+      `㈠内存 DROP INDEX ⇒ \`${dropPlan22}\`（判红并指名 SCAN=${dropRed22}）；`
+        + `㈡schema 摘行锚点命中=${minusHit22} ⇒ \`${minusPlan22}\`（判红并指名 SCAN=${minusRed22}）；`
+        + `㈢STRUCTURE_UPGRADES 去掉那一步 ⇒ 命中 ${minusStepVerdict22.n} 条／归类 \`${minusStepVerdict22.kind}\`（应红）；`
+        + `**负对照**（盘上原件）：计划判据绿=${planDiskVerdict22.ok}、老库路径判据绿=${stepDisk22.ok}；`
+        + `盘上 \`schema.sql\` 逐字节未变=${Buffer.compare(schemaBytes0_22, schemaBytes1_22) === 0}；`
+        + `残留（老库路径判据）＝${residualSteps22.ok ? '[]' : JSON.stringify(residualSteps22)}`);
+  }
+
+  /* ==================== `E167`：告警名额与计数 ====================
+     · 生产调用点＝`statsForShift(db, shift, {snapshot})`（与 `statsOf()` 同一条路径，`stateSnapshot.js:712`）；
+     · 桩库＝只按 SQL 文本分派 `all()/get()`，**不建库、不落盘**；
+     · 告警捕获＝临时替换 `console.warn`（`finally` 还原；绝不吞掉别的输出）。 */
+  const stubDb22 = (rows) => ({
+    prepare(sql) {
+      const s = String(sql);
+      return {
+        all: () => (/FROM\s+measure_rt/i.test(s) ? rows : []),
+        get: () => (/COUNT\(\*\)/i.test(s) ? { c: 0 } : null)
+      };
+    }
+  });
+  const denseRows22 = (n) => {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const mm = Math.floor(i / 60);
+      out.push({
+        collectTime: `2026-09-19 ${String(8 + (Math.floor(mm / 60) % 8)).padStart(2, '0')}:`
+          + `${String(mm % 60).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}`
+      });
+    }
+    return out;
+  };
+  const captureWarn22 = (fn) => {
+    const got = [];
+    const real = console.warn;
+    console.warn = (...a) => { got.push(a.map(String).join(' ')); };
+    try { return { warns: got, result: fn() }; } finally { console.warn = real; }
+  };
+  const shift22 = shiftRules22.at(clock22.now());
+  const cap22 = snapSvc22.measureWindowDensity(shift22, 0).cap;
+  const rowsDense22 = denseRows22(cap22 + 1);
+  const dbStub22 = stubDb22(rowsDense22);
+  const pureJudgeTrue22 = snapSvc22.measureWindowDensity(shift22, cap22 + 1).dense;
+  const pureJudgeFalse22 = snapSvc22.measureWindowDensity(shift22, cap22).dense;
+  /* ① 纯判据**零副作用**：连调两次，计数必须纹丝不动 */
+  snapSvc22.resetMeasureWindowDenseCounts();
+  const countsBeforePure22 = snapSvc22.measureWindowDenseCounts();
+  const pureReads22 = [snapSvc22.measureWindowDensity(shift22, cap22 + 1), snapSvc22.measureWindowDensity(shift22, cap22 + 1)];
+  const countsAfterPure22 = snapSvc22.measureWindowDenseCounts();
+  /* ② 探针先调 ⇒ 生产**照响**（名额不被消耗）；探针自己的去重只作用于它自己 */
+  const inst22 = snapSvc22.createStateSnapshot({ db: dbStub22, now: clock22.source(), config: boardConfig });
+  const probeCap22 = captureWarn22(() => snapSvc22.warnIfMeasureWindowDense(shift22, cap22 + 1));
+  const probeCapAgain22 = captureWarn22(() => snapSvc22.warnIfMeasureWindowDense(shift22, cap22 + 1));
+  const prodCap22 = captureWarn22(() => snapSvc22.statsForShift(dbStub22, shift22, {
+    snapshot: inst22, config: boardConfig, now: clock22.now(), addRunSec: 0, accum: null
+  }));
+  const countsAfterProd22 = snapSvc22.measureWindowDenseCounts();
+  t.check('E167-① **探针调用不消耗生产告警名额**（`E167` 的验收面）：`measureWindowDensity()` 是**纯判据**'
+    + '（连调两次，`MEASURE_WINDOW_DENSE_COUNTER` 纹丝不动 ⇒ 不记账）；模块导出的 '
+    + '`warnIfMeasureWindowDense()` **先调一次**（探针形态）之后，生产路径 '
+    + '`statsForShift(db, shift, {snapshot})` **仍然告警**（名额按快照实例记账，与"谁先问过"无关）',
+    pureJudgeTrue22 === true && pureJudgeFalse22 === false
+      && JSON.stringify(countsBeforePure22) === JSON.stringify(countsAfterPure22)
+      && countsBeforePure22.called === 0 && pureReads22.length === 2
+      && probeCap22.warns.length === 1 && probeCapAgain22.warns.length === 0
+      && prodCap22.warns.length === 1
+      && countsAfterProd22.bySource.probe === 2 && countsAfterProd22.bySource.prod === 1,
+    `判据真值表：帧数 ${cap22 + 1}（> cap ${cap22}）⇒ dense=${pureJudgeTrue22}；帧数 ${cap22}（＝cap）⇒ dense=${pureJudgeFalse22}；`
+      + `**纯判据不记账**：调用前 ${JSON.stringify(countsBeforePure22)}、调用两次后 ${JSON.stringify(countsAfterPure22)}；`
+      + `**探针先调**（同窗两次）⇒ 探针自己告警 ${probeCap22.warns.length} 条／再调 ${probeCapAgain22.warns.length} 条（它自己的去重）；`
+      + `**生产路径**（同一窗口、探针已"问过"）⇒ 告警 **${prodCap22.warns.length} 条**（应 1）；`
+      + `计数 bySource＝${JSON.stringify(countsAfterProd22.bySource)}（探针 2 ＋ 生产 1）；`
+      + `生产事实 frameCount=${prodCap22.result && prodCap22.result.fact ? prodCap22.result.fact.frameCount : '（无）'}`);
+  /* ③ 计数**不去重**：同一窗口连问三次 ⇒ 告警 1 条（去重）、计数 3 次（不去重） */
+  const smallShift22 = { name: '小窗', date: '2026-09-19', startAt: '2026-09-19 08:00:00', endAt: '2026-09-19 08:00:10' };
+  const smallCap22 = snapSvc22.measureWindowDensity(smallShift22, 0).cap;
+  snapSvc22.resetMeasureWindowDenseCounts();
+  const smallCap3x22 = captureWarn22(() => {
+    snapSvc22.warnIfMeasureWindowDense(smallShift22, smallCap22 + 1);
+    snapSvc22.warnIfMeasureWindowDense(smallShift22, smallCap22 + 1);
+    snapSvc22.warnIfMeasureWindowDense(smallShift22, smallCap22 + 1);
+  });
+  const counts3x22 = snapSvc22.measureWindowDenseCounts();
+  t.check('E167-② **同窗连问三次 ⇒ 告警去重（1 条）／计数不去重（3 次）**（`E146`／`T-20261004-19` 的分工，'
+    + '`E167` 补的机器可读计数）：`MEASURE_WINDOW_DENSE_COUNTER` 的 `called`／`dense`／`bySource.probe` 各 ＋3，'
+    + '而 `warned` 只 ＋1 —— 于是门禁能读到"这一窗到底告警过没有"，而人不会被刷屏',
+    smallCap22 === 20 && smallCap3x22.warns.length === 1
+      && counts3x22.called === 3 && counts3x22.dense === 3 && counts3x22.warned === 1
+      && counts3x22.bySource.probe === 3 && counts3x22.bySource.prod === 0,
+    `小窗 ${smallShift22.startAt}→${smallShift22.endAt}（10 s ⇒ cap ${smallCap22}）连问三次：`
+      + `告警 ${smallCap3x22.warns.length} 条（应 1＝**去重**）；计数 ${JSON.stringify(counts3x22)}（called／dense 应 3、warned 应 1＝**不去重**）`);
+  /* ④ D22：**真旧字节**（`030f76e^`＝`E167` 修前的模块顶层 `Set`）在内存里编译，跑**同一场景** ⇒ 生产 0 条 */
+  {
+    const OLD_REV22 = '030f76e^';
+    const oldBytes22 = (() => {
+      const r = spawnSync('git', ['show', OLD_REV22 + ':' + SRC_SNAPSHOT_REL22.split('\\').join('/')],
+        { cwd: env.paths.root, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+      return r.status === 0 && r.stdout ? r.stdout : null;
+    })();
+    const oldSvc22 = (() => {
+      if (!oldBytes22) return null;
+      return attempt22(() => {
+        const m = new Module22(SRC_SNAPSHOT_ABS22, null);
+        m.filename = SRC_SNAPSHOT_ABS22;
+        m.paths = Module22._nodeModulePaths(path.dirname(SRC_SNAPSHOT_ABS22));
+        m._compile(oldBytes22, SRC_SNAPSHOT_ABS22);
+        return m.exports;
+      });
+    })();
+    const oldSvcOk22 = Boolean(oldSvc22 && oldSvc22.ok && oldSvc22.value
+      && typeof oldSvc22.value.warnIfMeasureWindowDense === 'function'
+      && typeof oldSvc22.value.statsForShift === 'function');
+    const svc22 = oldSvcOk22 ? oldSvc22.value : null;
+    const oldProbeRes22 = svc22
+      ? attempt22(() => captureWarn22(() => svc22.warnIfMeasureWindowDense(shift22, cap22 + 1)))
+      : { ok: false, err: oldSvc22 && oldSvc22.err ? oldSvc22.err : '旧模块不可用' };
+    const oldProdRes22 = svc22
+      ? attempt22(() => captureWarn22(() => svc22.statsForShift(dbStub22, shift22, {
+        config: boardConfig, now: clock22.now(), addRunSec: 0, accum: null
+      })))
+      : { ok: false, err: oldProbeRes22.err };
+    const oldProbe22 = oldProbeRes22.ok ? oldProbeRes22.value : { warns: [] };
+    const oldProd22 = oldProdRes22.ok ? oldProdRes22.value : { warns: [] };
+    const b0 = fs.readFileSync(SRC_SNAPSHOT_ABS22);
+    const b1 = fs.readFileSync(SRC_SNAPSHOT_ABS22);
+    /* 现行实现的"残留"读数：换一个**新实例**再跑一次生产路径 ⇒ 仍告警（名额只属于它自己） */
+    const inst2nd22 = snapSvc22.createStateSnapshot({ db: dbStub22, now: clock22.source(), config: boardConfig });
+    const prodResidual22 = captureWarn22(() => snapSvc22.statsForShift(dbStub22, shift22, {
+      snapshot: inst2nd22, config: boardConfig, now: clock22.now(), addRunSec: 0, accum: null
+    }));
+    t.check('E167-③ D22（可证伪，**真旧字节**）：把 `' + OLD_REV22 + '` 版 `stateSnapshot.js`（修前：模块顶层 '
+      + '`Set` ＋ 导出函数里告警）**在内存里编译**后跑**同一场景**（探针先调、生产随后）⇒ 生产告警 **0 条** '
+      + '（＝`E167` 的病灶：名额被"先问过的人"占掉）⇒ "生产必须告警"这条判据在旧实现上**必红**；'
+      + '现行实现同一场景 **1 条**（**负对照必绿**）；盘上文件逐字节未变；残留（新实例再跑一次生产路径）'
+      + '**仍告警 1 条**',
+      oldSvcOk22 && oldProbeRes22.ok && oldProdRes22.ok
+        && oldProbe22.warns.length === 1 && oldProd22.warns.length === 0
+        && prodCap22.warns.length === 1 && prodResidual22.warns.length === 1
+        && Buffer.compare(b0, b1) === 0,
+      `旧字节来源 \`git show ${OLD_REV22}:server/services/stateSnapshot.js\` ⇒ ${oldBytes22 ? oldBytes22.length + ' B' : '**取不到**'}`
+        + `（内存编译成功=${oldSvcOk22}${oldSvcOk22 ? '' : '；err=' + String(oldSvc22 && oldSvc22.err)}）；`
+        + `同一场景：旧实现探针告警 ${oldProbe22.warns.length} 条、**生产 ${oldProd22.warns.length} 条**`
+        + `（应 0 ⇒ "生产必须告警"在旧实现上不成立＝可证伪）；现行实现生产 ${prodCap22.warns.length} 条（负对照，应 1）；`
+        + `盘上逐字节未变=${Buffer.compare(b0, b1) === 0}；残留（新实例重跑生产路径）告警 ${prodResidual22.warns.length} 条（应 1）`);
+  }
+  t.info(`\`E129\`／\`E170\`／\`E167\` 的面与读数（现算）：\`E129-①\` 扫 ${serverJs22.length} 个 server .js ⇒ 候选 `
+    + `${e129Candidates22.length} 条、违规 ${e129Violations22.length} 条、邻接单行例外 ${e129Adjacency22.length} 条、未判定 ${e129Undecided22.length} 条；`
+    + `\`E170-①\` 窗口计划＝\`${planDisk22}\`；\`E167\` 判据口＝\`measureWindowDensity()\`（纯）＋ `
+    + `\`measureWindowDenseCounts()\`（机器可读、不去重）`);
+}
+  /* ---------------- 二十三、`E164` 受管侧"台账结构不变量"（4b 的 `T-20261005-15`） ----------------
+     【立案】`E164`：主代理仓外的台账写入器（`ledger.js`）曾把 **469 行台账用 `join(/\r?\n/)` 粘成 1 行** ——
+     那次事故**仓内一条判据都没有**（`E164` 立案句："台账行结构无守据"）。本节把**结构不变量**做成仓内断言。
+     【面】四份台账（主代理点名）：`项目记录\后续路线图.md`／`当前状态快照.md`／`工作日志.md`／`tests\README.md`。
+     【维度】与主代理 `ledger.js` 同口径的五项：
+       ① **行数**（`≥` 冻结点下界 ⇒ 抓"整体塌缩"；**不是变更预算** —— 台账是增量文件，只会涨）
+       ② **最长行**（`≤` 冻结点上界 ⇒ 抓"整份被写成一行"与"单行失控"）
+       ③ **可按 `|` 分列的行占比**（`≥` 冻结点下界 ⇒ 抓"表格被压平"）
+       ④ **首行逐字**（sha12 冻结）＋ **末行（最后一个非空行）**：`首行 ≠ 末行`（**整份只剩一行 ＝ 粘连特征**）；
+         末行 sha12 只作**读数**、**不冻结**
+          （实测：快照/日志/README 的末行是**当轮会话文字**，每轮都在长）
+       ⑤ **无 BOM** ＋ **行尾不混用** ＋ **末行尾存在**
+     【阈值来源】**实测**（2026-10-05 四份台账现读；完整分布见 `E164-①` 的详情）——
+       ⚠ 主代理要求"**先报实测、确认后再写死**"⇒ 下面的 `E164_BASELINE` 是**暂用值**（已如实标注），
+       与仓外 `ledger.js` 口径核对后**只需改这一个常量块**，并同步 `E164_ANCHOR` 的 `sha12`（`E164-③` 会当场拦）。
+     【为什么是"下界/上界"而不是"写死数字"】正常追加**不会假红**（行数与表格占比只涨、最长行留 3 倍余量），
+       而"粘成一行／被压平／被换编码"必红并**逐条指名 `文件：维度 实测/阈值`**。 */
+  t.section('二十三、`E164` 受管侧"台账结构不变量"（四份台账 × 五维）');
+  {
+    const crypto23 = require('node:crypto');
+    const sha12_23 = (s) => crypto23.createHash('sha256').update(s).digest('hex').slice(0, 12);
+    const E164_FILES = [
+      { rel: '项目记录\\后续路线图.md', label: '后续路线图' },
+      { rel: '项目记录\\当前状态快照.md', label: '当前状态快照' },
+      { rel: '项目记录\\工作日志.md', label: '工作日志' },
+      { rel: 'tests\\README.md', label: 'tests/README（权威区）' }
+    ];
+    /** **冻结点基线**（**暂用值 ＝ 2026-10-05 实测**；主代理与仓外 `ledger.js` 口径核对后确认/调整）。
+     *  推导规则（写清以便复核）：`linesMin` ＝ 实测行数的**一半**（取整到 10）；
+     *  `maxLineMax` ＝ `max(10000, 实测最长行 × 3)`；`tableRatioMin` ＝ 实测表格行占比的**一半**（向下取整到 1%）；
+     *  `firstLineSha12` ＝ 首行**逐字** sha12（标题，稳定）。
+     *  实测：行数 486／543／2032／323；最长行 7906／4694／2314／9156；表格行占比 65.2%／38.0%／5.2%／19.8%。 */
+    const E164_BASELINE = [
+      { rel: '项目记录\\后续路线图.md', linesMin: 240, maxLineMax: 24000, tableRatioMin: 0.30, firstLineSha12: '006422e11a43' },
+      { rel: '项目记录\\当前状态快照.md', linesMin: 270, maxLineMax: 15000, tableRatioMin: 0.18, firstLineSha12: '25683d1ff613' },
+      { rel: '项目记录\\工作日志.md', linesMin: 1000, maxLineMax: 10000, tableRatioMin: 0.02, firstLineSha12: '0fb0692b692e' },
+      { rel: 'tests\\README.md', linesMin: 160, maxLineMax: 28000, tableRatioMin: 0.09, firstLineSha12: 'a7dacae51339' }
+    ];
+    /** **冻结点锚点**（`E145` 的教训：锚点必须是**常量**，不能由基线现算 —— 现算＝自己对自己复读、零证伪能力）。
+     *  有人**悄悄放宽**某一个阈值（E164 最容易被"顺手改松"）⇒ `sha12` 不符 ⇒ `E164-③` 当场红。 */
+    const E164_ANCHOR = { total: 4, sha12: '00edc52014a5' };
+    /** 结构读数（**纯函数**；主判据与 D22 共用同一把尺子） */
+    const e164Stats = (text) => {
+      const raw = text.split(/\r\n|\n/);
+      const body = raw[raw.length - 1] === '' ? raw.slice(0, -1) : raw;      /* 末行尾的那一"空行"不算行 */
+      const lens = body.map(l => l.length);
+      const tableRows = body.filter((l) => {
+        const cells = l.split('|').map(c => c.trim()).filter(Boolean);
+        return l.trim().startsWith('|') && cells.length >= 3;
+      }).length;
+      const nonEmpty = body.filter(l => l.trim());
+      return {
+        lines: body.length,
+        maxLen: lens.length ? Math.max(...lens) : 0,
+        tableRows,
+        tableRatio: body.length ? tableRows / body.length : 0,
+        firstLine: body[0] || '',
+        lastLine: nonEmpty.length ? nonEmpty[nonEmpty.length - 1] : '',
+        bom: text.charCodeAt(0) === 0xFEFF,
+        crlf: (text.match(/\r\n/g) || []).length,
+        bareLf: (text.match(/(?<!\r)\n/g) || []).length,
+        endsWithNewline: /\n$/.test(text)
+      };
+    };
+    /** **判据（纯函数）**：逐维比对 ⇒ 违规串**一律带文件名**（⇒ "逐条指名"是结构性的，不是靠调用方拼串） */
+    const e164Audit = (rel, stats, b) => {
+      const bad = [];
+      if (stats.lines < b.linesMin) bad.push(`行数 ${stats.lines} < 下界 ${b.linesMin}`);
+      if (stats.maxLen > b.maxLineMax) bad.push(`最长行 ${stats.maxLen} > 上界 ${b.maxLineMax}`);
+      if (stats.tableRatio < b.tableRatioMin) {
+        bad.push(`表格行占比 ${(stats.tableRatio * 100).toFixed(1)}% < 下界 ${(b.tableRatioMin * 100).toFixed(0)}%`);
+      }
+      if (sha12_23(stats.firstLine) !== b.firstLineSha12) {
+        bad.push(`首行 sha12 ${sha12_23(stats.firstLine)} ≠ 冻结 ${b.firstLineSha12}（首行＝「${stats.firstLine.slice(0, 40)}」）`);
+      }
+      if (stats.lines <= 1 || stats.firstLine === stats.lastLine) {
+        bad.push('首行 ＝ 末行（或整份只有一行）—— `join(\'\')` 式"整份粘成一行"的特征');
+      }
+      if (stats.bom) bad.push('带 BOM');
+      if (stats.crlf > 0 && stats.bareLf > 0) bad.push(`行尾混用（CRLF ${stats.crlf}／裸 LF ${stats.bareLf}）`);
+      if (!stats.endsWithNewline) bad.push('缺末行尾');
+      return bad.map(x => `${rel}：${x}`);
+    };
+    const e164Disk = E164_FILES.map((f) => {
+      const text = fs.readFileSync(path.join(env.paths.root, f.rel), 'utf8');
+      const b = E164_BASELINE.find(x => x.rel === f.rel);
+      const stats = e164Stats(text);
+      return { ...f, b, stats, bad: e164Audit(f.rel, stats, b) };
+    });
+    const e164Bad = e164Disk.flatMap(r => r.bad);
+    t.check('E164-① **四份台账的结构不变量**（行数下界／最长行上界／表格行占比下界／首行逐字／首末行不同行／无 BOM／'
+      + '行尾不混用／末行尾存在）：任一份任一项违规 ⇒ **红并逐条指名「文件：维度 实测/阈值」**；'
+      + '正常追加不改判据（下界/上界，不是写死数字）',
+      e164Disk.length === E164_FILES.length && e164Disk.every(r => r.b && r.stats.lines > 0) && e164Bad.length === 0,
+      `盘上现测（**五量全读数**，供主代理与仓外那一份口径对照）：`
+        + e164Disk.map(r => `${r.label}［${r.rel}］行数 ${r.stats.lines}／最长行 ${r.stats.maxLen}／表格行 ${r.stats.tableRows}`
+          + `（${(r.stats.tableRatio * 100).toFixed(1)}%）／首行 sha12 ${sha12_23(r.stats.firstLine)}／`
+          + `末行(最后非空) sha12 ${sha12_23(r.stats.lastLine)}／BOM ${r.stats.bom}／CRLF ${r.stats.crlf}·裸 LF ${r.stats.bareLf}／末行尾 ${r.stats.endsWithNewline}`).join('；')
+        + `。阈值（**暂用值，待确认**）：${E164_BASELINE.map(b => `${b.rel}[行数≥${b.linesMin}／最长行≤${b.maxLineMax}／表格≥${(b.tableRatioMin * 100).toFixed(0)}%]`).join('；')}`
+        + `。违规 ${e164Bad.length} 条${e164Bad.length ? '：' + e164Bad.join('；') : '（无）'}`);
+    /* `E164-②` D22（可证伪，**内存变异 ＋ 负对照**）：
+       ㈠把**行数最多**的那份台账按 `join('')` **粘成一行**（`E164` 的事故形态）⇒ 同一判据必红，
+          且**维度名**必须出现在违规串里（"行数"＋"最长行"＋"首行＝末行"至少各中一条）并带文件名；
+       ㈡把**后续路线图**里的 `|` 全部去掉（表格被压平）⇒ "表格行占比"这一维必红；
+       ㈢**负对照**＝盘上现测 ⇒ 全绿。全程只在内存里改字符串，盘上文件逐字节未变。 */
+    {
+      const target = e164Disk.slice().sort((a, b) => b.stats.lines - a.stats.lines)[0];
+      const tgtText = fs.readFileSync(path.join(env.paths.root, target.rel), 'utf8');
+      const glued = tgtText.replace(/\r\n|\n/g, '');
+      const gluedBad = e164Audit(target.rel, e164Stats(glued), target.b);
+      const road = E164_BASELINE.find(b => b.rel === '项目记录\\后续路线图.md');
+      const roadText = fs.readFileSync(path.join(env.paths.root, road.rel), 'utf8');
+      const flat = roadText.replace(/\|/g, '');
+      const flatBad = e164Audit(road.rel, e164Stats(flat), road);
+      const bytes0 = fs.readFileSync(path.join(env.paths.root, target.rel));
+      const bytes1 = fs.readFileSync(path.join(env.paths.root, target.rel));
+      t.check('E164-② D22（可证伪，**两支内存变异 ＋ 负对照**）：㈠把行数最多的台账 `join(\'\')` **粘成一行** ⇒ '
+        + '同一判据**必红**且违规串里必须出现「行数」「最长行」「首行 ＝ 末行」这些**维度名**并带文件名；'
+        + '㈡把后续路线图的 `|` 全去掉（表格压平）⇒「表格行占比」维度必红；㈢**负对照**＝盘上现测 ⇒ 全绿；'
+        + '盘上文件逐字节未变',
+        gluedBad.length >= 3 && gluedBad.some(x => x.includes('行数')) && gluedBad.some(x => x.includes('最长行'))
+          && gluedBad.some(x => x.includes('首行 ＝ 末行')) && gluedBad.every(x => x.startsWith(target.rel))
+          && flatBad.length >= 1 && flatBad.some(x => x.includes('表格行占比'))
+          && e164Bad.length === 0 && Buffer.compare(bytes0, bytes1) === 0,
+        `㈠「${target.label}」粘成一行（行数 ${target.stats.lines} → ${e164Stats(glued).lines}、最长行 ${target.stats.maxLen} → ${e164Stats(glued).maxLen}）`
+          + `⇒ 违规 ${gluedBad.length} 条：${gluedBad.join('；')}；`
+          + `㈡「后续路线图」去掉全部 \`|\` ⇒ 违规 ${flatBad.length} 条：${flatBad.join('；')}；`
+          + `㈢负对照（盘上现测）⇒ 违规 ${e164Bad.length} 条（应 0）；盘上逐字节未变=${Buffer.compare(bytes0, bytes1) === 0}`);
+    }
+    /* `E164-③` 冻结点自证：基线块被**悄悄改松**（某个阈值改小/改大）⇒ 锚点 `sha12` 必不符并指名。
+       ⚠ 锚点是**常量**、不由基线现算（`E145` 的教训）—— 这里刻意"现算一个值去比常量"。 */
+    {
+      const anchorOf = (list) => sha12_23(list.slice().sort((a, b) => a.rel.localeCompare(b.rel))
+        .map(b => `${b.rel}|${b.linesMin}|${b.maxLineMax}|${b.tableRatioMin}|${b.firstLineSha12}`).join('\n'));
+      const nowSha = anchorOf(E164_BASELINE);
+      const loosened = E164_BASELINE.map((b, i) => (i === 0 ? { ...b, linesMin: b.linesMin - 10 } : b));
+      const tightened = E164_BASELINE.map((b, i) => (i === 1 ? { ...b, maxLineMax: b.maxLineMax + 1000 } : b));
+      t.check('E164-③ **冻结点的自证**（`E145` 机制）：基线块条数 ＝ 台账份数、锚点 `total` ＝ 条数、'
+        + '逐条 `sha12`（常量，**不由基线现算**）＝ 现算值；**把任一阈值改松/改紧**（内存副本）⇒ `sha12` **必不符**',
+        E164_BASELINE.length === E164_FILES.length && E164_ANCHOR.total === E164_BASELINE.length
+          && nowSha === E164_ANCHOR.sha12
+          && anchorOf(loosened) !== E164_ANCHOR.sha12 && anchorOf(tightened) !== E164_ANCHOR.sha12,
+        `基线 ${E164_BASELINE.length} 条／锚点 total ${E164_ANCHOR.total}；现算 sha12 ${nowSha}／冻结 ${E164_ANCHOR.sha12}；`
+          + `改松一处（首个 \`linesMin\` −10）⇒ ${anchorOf(loosened)}（必不符）；改紧一处（第二个 \`maxLineMax\` +1000）⇒ ${anchorOf(tightened)}（必不符）`);
+    }
+  }
 t.finish();
 }
 
@@ -10447,6 +11136,96 @@ function e103LinkSafetyChecks(t) {
           : `原件 B 档命中 ${before.length} 处（应 1：${before.map(h => 'L' + h.line).join('、')}）⇒ `
             + `内存副本改成 \`${guardCall}\` 后命中 ${after.length} 处（应 0）；`
             + `盘上 \`tests\\preflight.js\` 逐字节未变=${diskSame}`);
+    }
+    /* ---------------- 甲-A2（`E161` **步 2**，主代理裁定㈠）：shell／child_process 递归删形态**独立成条并判红** ----------------
+       裁定㈠（`项目记录\工作日志.md` 第 8 轮⑤，2026-10-05）："同意把 shell/child_process 形态
+       **独立成条并判红**（现在它们只在原样路被报出）"。
+       为什么必须独立成条（`E161-C①` 的㈥㈧ 读数就是证据）：`rmdir /s`／`rd /s`／robocopy 的镜像开关
+       这类"外调 shell 的递归删"**只存在于字符串实参里**，而 A 档的**剥离路**故意剥掉字符串
+       ⇒ 它们**只在原样路上被报出**（`E160-⑦` 的"只在原样路"那一栏，`E161` 立案时实测 2 处）
+       ⇒ **"被报出"不等于"被判红"**：一行 info 没人读，等于没守（`D19` 家族）。
+       本条的判据**就是** `scanToolShellE161()`（与 `E160-⑦`／`E161-C①` **同一个纯函数** ——
+       `E153` 的教训：D22 与主判据不许各写一份），本件新增的是"**命中即红**"的判定 ＋ 面的声明。
+       ⚠ **判据自身的形态表**（本文件 `TOOL_SHELL_PATTERNS_E161` 那几行）会被自己的正则扫到 ——
+       那是**靶子形态**（写出来的字符串），不是调用 ⇒ 按**动态定位的区间**整段排除，并把排除条数与
+       区间**逐条打出来**；区间宽度设上限（> 800 B 或 > 12 行即判红）⇒ **不能拿它当藏身处**。
+       ⚠ 裁定㈡：`._verify\` 面**仍然只报不判**（本件只把**受管面**的读数独立判红，不扩大判红面）。 */
+    {
+      const SELF_ABS_E161D = path.join(env.paths.root, 'tests', 'harness-check.js');
+      const SELF_SRC_E161D = readE161(SELF_ABS_E161D);
+      const selfRegionE161D = (() => {
+        const at = SELF_SRC_E161D.indexOf('const TOOL_SHELL_PATTERNS_E161 = [');
+        if (at < 0) return null;
+        const end = SELF_SRC_E161D.indexOf('\n];', at);
+        if (end < 0) return null;
+        const stop = end + 3;
+        return {
+          at, stop,
+          fromLine: lineOfE161(SELF_SRC_E161D, at),
+          toLine: lineOfE161(SELF_SRC_E161D, stop),
+          bytes: stop - at
+        };
+      })();
+      /** **判据（纯函数；主断言与 D22 同一把尺子）**：输入 `{rel, src}` 列表 ⇒ 违规清单。
+       *  唯一例外＝判据自身的形态表区间（只对 `tests\harness-check.js` 生效，且区间必须已定位到）。 */
+      const shellJudgeE161D = (items) => items.flatMap(it => scanToolShellE161(it.src)
+        .filter(h => !(selfRegionE161D && it.rel === 'tests\\harness-check.js'
+          && h.line >= selfRegionE161D.fromLine && h.line <= selfRegionE161D.toLine))
+        .map(h => ({ file: it.rel, line: h.line, rule: h.rule })));
+      const managedItemsE161D = managedJsE161.map(f => ({ rel: relOfE103(f), src: readE161(f) }));
+      const shellManagedE161D = shellJudgeE161D(managedItemsE161D);
+      const shellSelfE161D = selfRegionE161D
+        ? scanToolShellE161(SELF_SRC_E161D)
+          .filter(h => h.line >= selfRegionE161D.fromLine && h.line <= selfRegionE161D.toLine)
+          .map(h => ({ file: 'tests\\harness-check.js', line: h.line, rule: h.rule }))
+        : [];
+      const shellVerifyE161D = shellJudgeE161D(verifyJsE103.map(f => ({ rel: relOfE103(f), src: readE161(f) })));
+      t.check('E161-D① **shell／child_process 递归删形态独立判红**（`E161` 步 2，主代理裁定㈠）：受管面'
+        + '（`server\\`／`src\\`／`platform\\`／`tests\\**\\*.js`／`tools\\`）里**原样路**（保留字符串）'
+        + '不得出现 `rmdir` 的递归开关、' + RD_S + ' 开关、以及 ' + ROBOC + ' 的镜像开关 —— '
+        + '命中 ⇒ **红并逐处指名 `文件:行号`**；唯一例外＝**判据自身的形态表**（动态定位的区间，逐条报出且设宽度上限）；'
+        + '`._verify\\` 面**只报不判**（裁定㈡：不计作违规，读数照给）',
+        shellManagedE161D.length === 0 && Boolean(selfRegionE161D)
+          && selfRegionE161D.bytes < 800 && (selfRegionE161D.toLine - selfRegionE161D.fromLine) < 12,
+        shellManagedE161D.length
+          ? `判红：受管面 shell 递归删形态 ${shellManagedE161D.length} 处 —— `
+            + shellManagedE161D.map(h => `\`${h.file}\`:${h.line}（${h.rule}）`).join('；')
+          : `零违规（受管面扫 ${managedItemsE161D.length} 个 .js）；判据自身形态表区间＝`
+            + (selfRegionE161D
+              ? `\`tests\\harness-check.js\`:${selfRegionE161D.fromLine}-:${selfRegionE161D.toLine}（${selfRegionE161D.bytes} B）`
+              : '**未定位到**')
+            + `；该区间内的"自伤"命中 ${shellSelfE161D.length} 处（已按区间排除，逐条报出：`
+            + (shellSelfE161D.map(h => `:${h.line}（${h.rule}）`).join('、') || '无') + `）；`
+            + `**\`._verify\\\` 面（只报不判）** ${shellVerifyE161D.length} 处／`
+            + `${new Set(shellVerifyE161D.map(h => h.file)).size} 个文件`);
+      /* D22（可证伪）：合成样本喂**同一把尺子** ⇒ 两支 shell 形态各命中 1 处并指名行号；
+         负对照（走唯一出口 `env.removeLinkSafe`）必须 0 命中。靶子形态一律**拼接构造**（防自伤）。 */
+      {
+        const bad1E161D = 'const link = one();\n'
+          + 'execSync(' + Q3_E161 + 'cmd /c ' + RD_S + ' /q ' + Q3_E161 + ' + link);\n';
+        const bad2E161D = 'spawnSync(' + Q3_E161 + ROBOC + Q3_E161 + ', [empty, link, ' + Q3_E161 + MIR + Q3_E161 + ']);\n';
+        const goodE161D = 'if (env.isLink(t)) { env.removeLinkSafe(t, { recursive: true, force: true }); }\n';
+        const bad1Hits = shellJudgeE161D([{ rel: 'tests\\zz-e161d-synth-1.js', src: bad1E161D }]);
+        const bad2Hits = shellJudgeE161D([{ rel: 'tests\\zz-e161d-synth-2.js', src: bad2E161D }]);
+        const goodHits = shellJudgeE161D([{ rel: 'tests\\zz-e161d-synth-3.js', src: goodE161D }]);
+        t.check('E161-D② D22（可证伪）：同一判据 `shellJudgeE161D()` 喂**合成样本** ⇒ '
+          + '㈠外调 shell 版递归删 ㈡' + ROBOC + ' 的镜像开关 '
+          + '**每一支必命中并指名 `文件:行号`**；**负对照**（走唯一出口 `env.removeLinkSafe`）**必须 0 命中**'
+          + '（防"恒红式"）；而盘上受管面实测 0 违规（由 `E161-D①` 给出）',
+          bad1Hits.length === 1 && bad1Hits[0].line === 2 && bad1Hits[0].file === 'tests\\zz-e161d-synth-1.js'
+            && bad2Hits.length === 1 && bad2Hits[0].line === 1 && bad2Hits[0].file === 'tests\\zz-e161d-synth-2.js'
+            && goodHits.length === 0,
+          `㈠命中 ${bad1Hits.length} 处（${bad1Hits.map(h => `${h.file}:${h.line} ${h.rule}`).join('；') || '无'}，应 1 且行号 2）；`
+            + `㈡命中 ${bad2Hits.length} 处（${bad2Hits.map(h => `${h.file}:${h.line} ${h.rule}`).join('；') || '无'}，应 1 且行号 1）；`
+            + `负对照命中 ${goodHits.length} 处（应 0，样本＝\`${goodE161D.trim()}\`）`);
+      t.info(`\`E161-D①\` 面与读数（现算）：受管面 ${managedItemsE161D.length} 个 .js ⇒ **shell 递归删违规 ${shellManagedE161D.length} 处**；`
+        + `判据自身形态表区间＝\`tests\\harness-check.js\`:${selfRegionE161D ? selfRegionE161D.fromLine : '?'}-:`
+        + `${selfRegionE161D ? selfRegionE161D.toLine : '?'}（${selfRegionE161D ? selfRegionE161D.bytes : '?'} B）、`
+        + `区间内自伤命中 ${shellSelfE161D.length} 处（已排除，逐条见断言详情）；`
+        + `**\`._verify\\\` 面（只报不判，裁定㈡）** ${shellVerifyE161D.length} 处／${new Set(shellVerifyE161D.map(h => h.file)).size} 个文件 —— `
+        + `这一面被 gitignore 但**不是法外之地**（\`E46\` 的真毁伤就发生在这里）；本批**没有**为它迁移或判红，`
+        + `故**不得**把"受管面 shell 递归删 ＝ 0"读成"全仓 ＝ 0"。`);
+      }
     }
   }
 

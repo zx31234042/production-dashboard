@@ -143,25 +143,147 @@ function main() {
 
   /* ---------------- 四、目录描述 与 实际仓库 ---------------- */
   t.section('四、目录描述 与 实际仓库');
-  const dirs = fs.readdirSync(ROOT, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name);
   const files = fs.readdirSync(ROOT, { withFileTypes: true }).filter(e => e.isFile()).map(e => e.name);
-  /* server/ 与 platform/ 都已真实存在（2026-09-19 起）；断言只要求"文档描述与实际一致" */
-  const serverExists = dirs.includes('server');
-  const serverDeclaredPending = /server\/\s*#\s*【后端，⬜ 待建】/.test(arch);
-  t.check('server/ 的存在状态与架构文档描述一致',
-    serverExists ? !serverDeclaredPending : serverDeclaredPending,
-    serverExists ? 'server/ 已存在且文档未再标"待建"' : `实际：${dirs.join(', ')}`);
-  const platformExists = dirs.includes('platform');
-  const platformDeclaredPending = /platform\/\s*#\s*【平台适配层，⬜ 待建】/.test(arch);
-  t.check('platform/ 的存在状态与架构文档描述一致',
-    platformExists ? !platformDeclaredPending : platformDeclaredPending,
-    platformExists ? 'platform/ 已存在且文档未再标"待建"' : 'platform/ 尚未创建，文档须标"待建"');
+  /* ---- `E174`（★★，2026-10-05 主代理登记）：**"守规划项假现状"的判据已退化为恒真** ----
+     立案：本节原来那两条（`server/ 的存在状态与架构文档描述一致`／`platform/ …`）以
+     `项目架构与技术栈.md` 里的 `【后端，⬜ 待建】`／`【平台适配层，⬜ 待建】` 为锚；而该文档自
+     `server\`／`platform\` 落地起**就不再写这两个标记** ⇒ `xxxDeclaredPending` 恒 `false`
+     ⇒ 条件恒为 `!false === true` ⇒ **两条断言恒真、判别力为零**（`D23`：恒真断言＝没有断言）；
+     第三条（本节 `PROJECT_RULES 把 server/platform 列入"后期再创建"`，`msg` 为空）同样恒真。
+     ⇒ 改成**以规范 9.1「后期再创建」表为真源**的判据：**表 → 项集 → 每项的可判定路径 → 存在性 ⇔ 登记**。
+     ⚠ **主代理给的两条路我选㈡「显式登记」**（依据＝盘上实测）：该表眼下**确有 4 项已在盘**
+       （`server\services\`／`server\http\`／`server\index.js`／`platform\`），而它们**早已登记在
+       9.1 目录树里** ⇒ 那是**规范表该行的措辞待一次放行**，不是"盘上偷偷多建"。若写成"表内每一项都必须
+       不存在"，这 4 项会**恒红**；若只判未建项，就丢掉"新落地的东西必须登记"这一半 ⇒ 故把这 4 项
+       **显式登记**（附放行待办）＋ **双向机制**（未登记即红／登记陈旧即红／划掉项必须在盘上不存在）。
+     ⚠ **不许恒真也不许恒红**：`E174-③` 用**内存变异**证明这条判据可证伪（全程不碰盘）。 */
+  /** 规范 9.1「后期再创建」表 → 项集（**纯函数**；主判据与 D22 共用同一把尺子） */
+  const e174Parse = (rulesText) => {
+    const at = rulesText.search(/^\*\*后期再创建（现在不需要）\*\*\s*$/m);
+    if (at < 0) return { ok: false, why: '规范里找不到「**后期再创建（现在不需要）**」标题', items: [] };
+    const items = [];
+    for (const line0 of rulesText.slice(at).split(/\r?\n/)) {
+      const line = line0.trim();
+      if (!line.startsWith('|')) { if (items.length) break; continue; }
+      if (/^\|\s*-{2,}/.test(line) || /^\|\s*文件\s*\|/.test(line)) continue;
+      const first = (line.split('|')[1] || '').trim();
+      if (!first) continue;
+      for (const raw0 of first.split('、')) {
+        const raw = raw0.trim();
+        if (!raw) continue;
+        items.push({ raw, struck: /^~~[\s\S]*~~$/.test(raw), name: raw.replace(/~~/g, '').replace(/`/g, '').trim() });
+      }
+    }
+    return { ok: items.length > 0, why: items.length ? '' : '表里解析不到任何项（结构被改？）', items };
+  };
+  /** 项 → **可判定路径**（解释规则只此一份；`E174-①` 与规范表**双向**比对，多／少都红） */
+  const E174_PATHS = [
+    { name: 'package.json', rel: 'package.json', kind: 'file' },
+    { name: 'server\\services\\', rel: 'server/services', kind: 'dir' },
+    { name: 'transport\\', rel: 'server/transport', kind: 'dir' },
+    { name: 'http\\', rel: 'server/http', kind: 'dir' },
+    { name: 'index.js', rel: 'server/index.js', kind: 'file' },
+    { name: 'server\\util\\', rel: 'server/util', kind: 'dir' },
+    { name: 'platform\\', rel: 'platform', kind: 'dir' },
+    { name: 'docs/', rel: 'docs', kind: 'dir' }
+  ];
+  /** **已在盘、而规范表仍列「后期再创建」**的显式登记（＝待一次规范放行；`E174` 立案句） */
+  const E174_BUILT_REGISTRY = [
+    { rel: 'server/services', why: '服务层实现时落地，**9.1 目录树已登记** ⇒ 本表该行措辞待放行' },
+    { rel: 'server/http', why: '同上（`server\\http\\` 已落地并登记）' },
+    { rel: 'server/index.js', why: '同上（`server\\index.js` 已落地并登记）' },
+    { rel: 'platform', why: '平台适配层落地，**9.1 目录树已登记** ⇒ 本表该行措辞待放行' }
+  ];
+  /** 存在性读数（盘上现测；D22 用**内存变异**替换它，绝不写真盘） */
+  const e174ExistsOf = (p) => {
+    const abs = path.join(ROOT, p.rel);
+    if (!fs.existsSync(abs)) return false;
+    try { const st = fs.lstatSync(abs); return p.kind === 'dir' ? st.isDirectory() : st.isFile(); } catch { return false; }
+  };
+  /** **判据（纯函数；主断言与 D22 同一把尺子）**：`existsOf` 由调用方喂 ⇒ 变异只在内存里做 */
+  const e174Audit = (parsed, paths, registry, existsOf) => {
+    const names = parsed.items.map(i => i.name);
+    const unknownInSpec = names.filter(n => !paths.some(p => p.name === n));
+    const unknownInCode = paths.map(p => p.name).filter(n => !names.includes(n));
+    const regSet = new Set(registry.map(r => r.rel));
+    const builtUnregistered = [];
+    const registryStale = [];
+    const struckOnDisk = [];
+    const rows = [];
+    for (const p of paths) {
+      const item = parsed.items.find(i => i.name === p.name);
+      if (!item) continue;
+      const ex = Boolean(existsOf(p));
+      const registered = regSet.has(p.rel);
+      rows.push({ name: p.name, rel: p.rel, kind: p.kind, struck: item.struck, exists: ex, registered });
+      if (item.struck) { if (ex) struckOnDisk.push(p); continue; }
+      if (ex && !registered) builtUnregistered.push(p);
+      if (!ex && registered) registryStale.push({ rel: p.rel, kind: p.kind, orphan: false });
+    }
+    for (const r of registry) if (!paths.some(p => p.rel === r.rel)) registryStale.push({ rel: r.rel, kind: '?', orphan: true });
+    return { unknownInSpec, unknownInCode, builtUnregistered, registryStale, struckOnDisk, rows };
+  };
+  const e174Parsed = e174Parse(rules);
+  const e174Disk = e174Audit(e174Parsed, E174_PATHS, E174_BUILT_REGISTRY, e174ExistsOf);
+  const e174RowTxt = (p) => `${p.name}→${p.rel}（${p.kind}${p.struck ? '，**已划掉＝不另建**' : ''}）`;
+  t.check('E174-① **规范 9.1「后期再创建」表 ↔ 判据的"可判定路径"表双向对齐**（`E174` 的地面自证）：'
+    + '规范表里解析出的**每一项**都必须在判据里有唯一一条可判定路径（多一项 ⇒ 判据未覆盖 ⇒ 红并指名）；'
+    + '判据里的每一条路径也必须在规范表里有对应项（规范删了项而判据没删 ⇒ 红并指名）；'
+    + '并逐项打出"项 → 路径 → 类型"',
+    e174Parsed.ok && e174Disk.unknownInSpec.length === 0 && e174Disk.unknownInCode.length === 0
+      && e174Parsed.items.length === E174_PATHS.length,
+    !e174Parsed.ok
+      ? `前提不成立：${e174Parsed.why}`
+      : `规范表解析出 ${e174Parsed.items.length} 项（其中划掉的 ${e174Parsed.items.filter(i => i.struck).length} 项）；`
+        + `判据路径 ${E174_PATHS.length} 条；**规范有而判据不认** ${e174Disk.unknownInSpec.length} 项`
+        + `${e174Disk.unknownInSpec.length ? '：' + e174Disk.unknownInSpec.join('、') : ''}；`
+        + `**判据有而规范无** ${e174Disk.unknownInCode.length} 项`
+        + `${e174Disk.unknownInCode.length ? '：' + e174Disk.unknownInCode.join('、') : ''}；`
+        + `逐项：${E174_PATHS.map(e174RowTxt).join('；')}`);
+  t.check('E174-② **表内每一项的盘上存在性 ⇔ 登记**（`E174` 主判据）：**盘上已存在而未登记 ⇒ 逐项指名红**；'
+    + '**登记了却盘上不存在 ⇒ 红并报"登记陈旧"**；**被划掉的项**（`~~…~~`＝不另建）必须在盘上**不存在**'
+    + '（否则 `v1.38` 的裁定被违反）',
+    e174Disk.builtUnregistered.length === 0 && e174Disk.registryStale.length === 0
+      && e174Disk.struckOnDisk.length === 0,
+    `盘上现测 ${e174Disk.rows.length} 项：`
+      + e174Disk.rows.map(r => `${r.name}存在=${r.exists}／登记=${r.registered}`).join('、')
+      + `；**盘上有而未登记** ${e174Disk.builtUnregistered.length} 项`
+      + `${e174Disk.builtUnregistered.length ? '：' + e174Disk.builtUnregistered.map(p => p.rel).join('、') + '（⇒ 请登记到 E174_BUILT_REGISTRY 或把它从规范表移出）' : ''}；`
+      + `**登记陈旧** ${e174Disk.registryStale.length} 项`
+      + `${e174Disk.registryStale.length ? '：' + e174Disk.registryStale.map(r => r.rel).join('、') : ''}；`
+      + `**划掉项却在盘上** ${e174Disk.struckOnDisk.length} 项`
+      + `${e174Disk.struckOnDisk.length ? '：' + e174Disk.struckOnDisk.map(p => p.rel).join('、') : ''}；`
+      + `**已登记待放行**（表仍列"待建"但 9.1 树已登记其落地）${E174_BUILT_REGISTRY.length} 项：`
+      + E174_BUILT_REGISTRY.map(r => `${r.rel}（${r.why}）`).join('；'));
   t.check('架构文档存在于根目录', files.includes('项目架构与技术栈.md'));
   t.check('README 目录树登记了架构文档', readme.includes('项目架构与技术栈.md'));
   t.check('PROJECT_RULES 9.1 登记了架构文档', rules.includes('项目架构与技术栈.md'));
   t.check('PROJECT_RULES 9.6 登记了"架构现状说明"归档去向', /架构现状说明/.test(rules));
-  t.check('PROJECT_RULES 把 server/platform 列入"后期再创建"',
-    rules.includes('`server\\`') || /server\\/.test(rules), '');
+  /* `E174-③` D22（可证伪，**内存变异 ＋ 负对照**，全程不碰盘）：
+     ①把**未建项** `transport\` 的存在性翻成 true ⇒ 同一 `e174Audit()` 必让它进 `builtUnregistered`
+       并**指名 `server/transport`**（＝"盘上已存在而未登记"这一维真的在挡）；
+     ②把 `platform` 从登记里摘掉（内存副本）⇒ 同一判据也必红并**指名 `platform`**
+       （证明"登记"这一维不是装饰）；
+     ③**负对照**＝盘上现测 ⇒ 三项全 0（绿）。 */
+  {
+    const t1 = e174Audit(e174Parsed, E174_PATHS, E174_BUILT_REGISTRY,
+      (p) => (p.rel === 'server/transport' ? true : e174ExistsOf(p)));
+    const regMinus = E174_BUILT_REGISTRY.filter(r => r.rel !== 'platform');
+    const t2 = e174Audit(e174Parsed, E174_PATHS, regMinus, e174ExistsOf);
+    const t3 = e174Disk;
+    t.check('E174-③ D22（可证伪，**内存变异 ＋ 负对照**）：①内存把未建项 `transport\\` 翻成"存在" ⇒ 同一判据'
+      + '**必红并指名 `server/transport`**；②内存把 `platform` 从登记里摘掉 ⇒ **必红并指名 `platform`**'
+      + '（证明"登记"这一维在挡，不是装饰）；③**负对照**＝盘上现测 ⇒ 三项全 0（绿）',
+      t1.builtUnregistered.length === 1 && t1.builtUnregistered[0].rel === 'server/transport'
+        && t2.builtUnregistered.length === 1 && t2.builtUnregistered[0].rel === 'platform'
+        && t3.builtUnregistered.length === 0 && t3.registryStale.length === 0 && t3.struckOnDisk.length === 0,
+      `①把 server/transport 翻成存在 ⇒ builtUnregistered ${t1.builtUnregistered.length} 项（应 1，指名 `
+        + `${t1.builtUnregistered.map(p => p.rel).join('、') || '（无）'}）；`
+        + `②摘掉 platform 的登记 ⇒ builtUnregistered ${t2.builtUnregistered.length} 项（应 1，指名 `
+        + `${t2.builtUnregistered.map(p => p.rel).join('、') || '（无）'}）；`
+        + `③负对照（盘上现测）⇒ builtUnregistered ${t3.builtUnregistered.length}／registryStale ${t3.registryStale.length}／`
+        + `struckOnDisk ${t3.struckOnDisk.length}（都应 0）；盘上文件全程只读（变异只在内存）`);
+  }
   t.check('ADR 目录索引含 ADR-0001/0002/0003',
     adrReadme.includes('ADR-0001') && adrReadme.includes('ADR-0002') && adrReadme.includes('ADR-0003'));
 

@@ -5442,6 +5442,34 @@ async function main() {
     return { hiddenKids, fails };
   }
 
+  /** 取某 id 元素的**自身**结构摘要（`directChildrenOf` 只给子元素 ⇒ 这里另给"元素自己"）。
+   *  `E127②` 用：`#upCard` 是**顶层卡片**（不是任何容器的子元素），要判的是它自己带 `hidden` 时的盒子。 */
+  function selfInfoOf(htmlText, id) {
+    const m = new RegExp('<([a-zA-Z][\\w-]*)\\b([^>]*\\bid\\s*=\\s*"' + id + '"[^>]*)>').exec(htmlText);
+    return m ? childInfo({ tag: m[1].toLowerCase(), attrs: m[2] }) : null;
+  }
+
+  /** 纯函数判据本体③（`E127②`）：**元素自身**带 `hidden` 时，必须有一条作者规则把它 `display:none`。
+   *  与 `hiddenRowBoxVerdict` 同一把尺子，但**收紧两处**（`E160` 的纪律：宁可判红，不许假绿）：
+   *   ① `display` 取值允许 `none` **或** `none !important` —— 只认 `=== 'none'` 的话，会把 `E127①`
+   *      补的 `[hidden]{display:none !important}` **排除在外**，反而让一条**祖先约束**的规则顶上来当"命中"
+   *      （实测：收紧前命中 1 条，是 `#board-status > div[hidden]` —— 它**并不作用在 `#upCard` 上** ⇒ 假绿）；
+   *   ② 只认**无祖先约束**的选择器（单个复合选择器，不含空格／`>`／`+`／`~`）—— 本仓没有 DOM 树，
+   *      "末段复合命中 `div`"不足以证明该规则作用在 `#upCard` 上；带祖先约束的规则**单独列出来当读数**
+   *      （`ancestorScoped`），不参与判定。 */
+  function hiddenSelfBoxVerdict(rulesMap, el) {
+    const info = !el ? null : (el.classes === undefined ? childInfo(el) : el);
+    if (!info) return { info: null, ok: false, hits: [], ancestorScoped: [] };
+    const displayNone = (v) => /^none(\s*!\s*important)?$/i.test(String(v || '').trim());
+    const ancestorFree = (sel) => !/[\s>+~]/.test(String(sel).trim());
+    const rows = [...rulesMap.entries()]
+      .filter(([sel, decls]) => displayNone(decls.display) && /\[hidden\]/.test(String(sel))
+        && compoundMatches(lastCompound(sel), info))
+      .map(([sel, decls]) => ({ sel, important: /!important/i.test(String(decls.display)), strict: ancestorFree(sel) }));
+    const hits = rows.filter(r => r.strict);
+    return { info, ok: info.hidden === true && hits.length > 0, hits, ancestorScoped: rows.filter(r => !r.strict) };
+  }
+
   section('U10 `E92` 残项：版面**结构性不变量**（幽灵网格轨道 / `hidden` 行仍占位；**禁写死像素**）');
   {
     const settingEl = directChildrenOf(html, 'panel-setting');
@@ -5475,7 +5503,73 @@ async function main() {
       '`#board-status > div{display:flex}` 是作者样式，恒胜 UA 的 `[hidden]{display:none}`',
       bv.hiddenKids.length > 0 && bv.fails.length === 0,
       `带 hidden 的页脚行 ${bv.hiddenKids.length} 个（${bv.hiddenKids.map(k => k.where).join('、') || '（无）'}）；` +
-      (bv.fails.length ? `**仍会生成盒子**：${bv.fails.map(k => k.where).join('、')}` : '全部被作者样式压成 display:none'));
+        + (bv.fails.length ? `**仍会生成盒子**：${bv.fails.map(k => k.where).join('、')}` : '全部被作者样式压成 display:none'));
+
+    /* ---- `E127②`（★，`T-20261005-17`）：把 `U10-b` 的口径**扩到 `#upCard`** ----
+       `E127` 立案：`#upCard`（`.card`）**静态首帧**带 `hidden`，而作者样式 `.card{display:flex}`
+       **恒胜** UA 样式表的 `[hidden]{display:none}`（作者样式胜 UA，**与特异度无关**）⇒ 仍生成盒子，
+       当时靠 JS 内联样式兜住；修复是在 `global.css` 尾部补一条全局 `[hidden]{display:none !important}`。
+       本条把它**钉成断言**（与 `U10-b` 同一把尺子，但按 `E160` 收紧两处 —— 见 `hiddenSelfBoxVerdict`：
+       ①`display` 认 `none`／`none !important`；②只认**无祖先约束**的选择器，否则会被
+       `#board-status > div[hidden]` 这种"末段命中 `div`"的规则顶上来 ⇒ 假绿；那是本波**实测踩到**的坑）。
+       并**沿用 `E160`／`E161` 的地面纪律**：读数建立在"剥注释后的 CSS 规则表"上 ⇒ 先自证地面。
+       ⚠ 判据是**静态的**（"作者样式有没有压住 `[hidden]`"），与 `U10-b` 同口径 ——
+         本仓在无浏览器环境也要能跑；真渲染那一层由 `browser-check` 的 `[hidden]` 断言覆盖。 */
+    const cssGround = (() => {
+      const raw = readText('src/styles/global.css');
+      const norm = String(raw).replace(/\r\n?/g, '\n');
+      const spans = [...norm.matchAll(/\/\*[\s\S]*?\*\//g)];
+      const removed = spans.reduce((a, m) => a + m[0].length, 0);
+      const spansOk = spans.length > 0 && spans.every(m => m[0].startsWith('/*') && m[0].endsWith('*/'));
+      const stripped = norm.replace(/\/\*[\s\S]*?\*\//g, '');
+      const noMarkers = !/\/\*/.test(stripped) && !/\*\//.test(stripped);
+      const ruleCount = parseCss(raw).size;
+      return {
+        ok: spansOk && noMarkers && ruleCount > 0,
+        txt: `剥注释 ${spans.length} 段／${removed} 字符（原文 ${norm.length} 字符，剥除率 ${((removed / norm.length) * 100).toFixed(2)}%）；`
+          + `跨度首尾自查=${spansOk}；剥后无注释符=${noMarkers}；规则数=${ruleCount}`
+      };
+    })();
+    const upCardInfo = selfInfoOf(html, 'upCard');
+    const cv = hiddenSelfBoxVerdict(rules, upCardInfo);
+    console.log(`  [读数] #upCard ${cv.info ? cv.info.where : '（未解析到）'} hidden=${cv.info ? cv.info.hidden : '—'}；`
+      + `**无祖先约束**且 display:none 的 [hidden] 规则 ${cv.hits.length} 条`
+      + `（${cv.hits.map(h => h.sel + (h.important ? '（带 !important）' : '（**不带** !important）')).join('、') || '（无）'}）；`
+      + `带祖先约束、**不计入判定**的 ${cv.ancestorScoped.length} 条（${cv.ancestorScoped.map(h => h.sel).join('、') || '（无）'}）；`
+      + `地面：${cssGround.txt}`);
+    check('U10-c（`E127②`：`#upCard` 带 `hidden` 时不得生成盒子）`index.html` 的 `#upCard` **自身**带 `hidden` ⇒ '
+      + '`global.css` 里必须有一条作者规则把它 `display:none`（与 `U10-b` 同一把尺子：`display:none`［含 `!important` 形态］'
+      + '∧ 选择器含 `[hidden]` ∧ 命中该元素 ∧ **无祖先约束**）—— 否则 `.card{display:flex}` 这类作者样式会**恒胜** '
+      + 'UA 的 `[hidden]{display:none}`；并给**地面自证**（剥注释只删 `/* … */` 跨度、剥后不再含注释符、规则数 > 0）',
+      cssGround.ok && Boolean(cv.info) && cv.info.hidden === true && cv.ok === true,
+      `地面：${cssGround.txt}；判据：${cv.info ? cv.info.where : '（未解析到 #upCard）'}、hidden=${cv.info ? cv.info.hidden : '—'}、`
+        + `无祖先约束的命中规则 ${cv.hits.length} 条`
+        + `${cv.hits.length
+          ? '：' + cv.hits.map(h => `${h.sel}${h.important ? '（带 !important ⇒ 压得住任何作者 display）' : '（**不带** !important ⇒ 仍可能被更高优先级的作者 display 盖掉）'}`).join('、')
+          : '（**无** ⇒ 会生成盒子）'}`
+        + `；带祖先约束、不计入的 ${cv.ancestorScoped.length} 条：${cv.ancestorScoped.map(h => h.sel).join('、') || '（无）'}`);
+    {
+      /* `U10-c-D22`：三支内存变异（**绝不落地**）——
+         ① 摘掉**全部**含 `[hidden]` 的规则 ⇒ 必红；
+         ② 只摘掉**无祖先约束**的那条（＝`E127①` 补的全局规则），保留祖先约束的那些 ⇒ **仍必红**
+            ——这一支专治"被 `#board-status > div[hidden]` 顶上来"的假绿（本波实测踩到）；
+         ③ 负对照＝盘上现测 ⇒ 必绿。 */
+      const rulesNoHiddenC = new Map([...rules].filter(([sel]) => !/\[hidden\]/.test(String(sel))));
+      const cvMutAll = hiddenSelfBoxVerdict(rulesNoHiddenC, upCardInfo);
+      const ancestorFreeSel = new Set(cv.hits.map(h => h.sel));
+      const rulesKeepAncestor = new Map([...rules].filter(([sel]) => !ancestorFreeSel.has(sel)));
+      const cvMutStrict = hiddenSelfBoxVerdict(rulesKeepAncestor, upCardInfo);
+      check('U10-c-D22 定点变异（**内存副本**，不碰 `src\\*`）：①摘掉 `global.css` 里**所有**含 `[hidden]` 的规则 ⇒ '
+        + '`U10-c` **必红**；②**只**摘掉那条**无祖先约束**的（`E127①` 补的全局规则）、保留祖先约束的那些 ⇒ **仍必红**'
+        + '（证明判据没被"末段命中 `div`"的祖先约束规则顶成假绿）；③负对照＝盘上现测 ⇒ 必绿',
+        cv.ok === true && cvMutAll.ok === false && cvMutAll.hits.length === 0
+          && cvMutStrict.ok === false && cvMutStrict.hits.length === 0
+          && cvMutStrict.ancestorScoped.length === cv.ancestorScoped.length,
+        `①摘全部 [hidden] 规则 ⇒ 命中 ${cvMutAll.hits.length} 条（应 0 ⇒ 红）；`
+          + `②只摘无祖先约束的 ${cv.hits.length} 条（${cv.hits.map(h => h.sel).join('、') || '（无）'}）⇒ 命中 ${cvMutStrict.hits.length} 条（应 0 ⇒ 红），`
+          + `同时保留的祖先约束规则仍 ${cvMutStrict.ancestorScoped.length} 条（应 ${cv.ancestorScoped.length} ⇒ 证明它不是判定依据）；`
+          + `③盘上现测命中 ${cv.hits.length} 条 ⇒ 绿；盘上 src\\styles\\global.css 未被改写（变异只发生在内存 Map 上）`);
+    }
 
     /* ---- `D22` 定点变异（**内存**，绝不落地；不碰 `src\*`／`index.html`）----
        ① 给 `#panel-setting` 的**内存副本**加回第三条显式 `auto` 轨道（＝`05bcf7b` 的真实形态）

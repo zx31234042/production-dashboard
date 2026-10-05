@@ -651,6 +651,18 @@ async function main() {
       up3.ok === false && afterPending === beforePending + 1,
       `ok=${up3.ok}，pending ${beforePending} → ${afterPending}`
     );
+    /* `E33②`（★，`T-20261005-17`）：下面"告警位当场重算"那一臂**必须与真源阈值同量级** ——
+       原写法把容量写死成 `1`、再期望 `capacity === 1` 且 `queueAlert === true`，只在
+       "**真源阈值恰好是 1**"时成立（`src\config\board.config.js` 的 `mes.queueWarnThreshold`
+       一旦长期改成 ≥2，这条会**静默失配** —— `E156` 同族：手写的数会一直错下去）。
+       ⇒ 待补传条数**按真源阈值配足**（此刻链路仍指向 `portFail` ⇒ 每次上报都失败入队；
+         用**不同 uploadId** 免得前端按 id 去重把条数吃掉），后面所有期望值一律由 `thrD` 推导、
+         **不再出现字面量 1**。⚠ 配足必须发生在上面那条"`pending + 1`"的对账**之后**（否则会改掉它的入参）。 */
+    const thrD = CFG.mes.queueWarnThreshold;      // 真源（浏览器侧；与 board.config.js 的同源由 R26-P3-4 ① 对账）
+    const pendAtInject = Api.getStatus().pendingCount;
+    for (let i = pendAtInject; i < thrD; i++) {
+      await Api.uploadReport(Object.assign({}, report, { uploadId: 'UP' + String(20260918151027000 + i) }));
+    }
 
     /* 6.10 后半（V1.31 语义，C-58～C-62）：上报失败**不做任何自动重发**（IF-B.9 / NFR-10 / NFR-13）。
        失败只做两件事：①告警/暴露待补传条数；②报文本地持久化留存（浏览器侧为内存队列，
@@ -662,9 +674,10 @@ async function main() {
        不再依赖已按 ADR-0005 删除的 CFG.mes.retry 键（见 src/config/board.config.js）。 */
     CFG.mes.baseUrl = `http://127.0.0.1:${portStatus}`;   // 链路"恢复"：若还在自动重发，这里就会把队列发空
     const queueCapSaved = CFG.mes.queueCap;
-    /* 临时把容量收窄到 1：待补传已有 1 条，告警位必须**当场重算**为 true。
-       否则"状态/告警字段确实被刷新"就无从证明（写死的 false 也会通过）。 */
-    CFG.mes.queueCap = 1;
+    /* 临时把容量收窄到**真源阈值 `thrD`**（不再写死 `1`）：待补传已配足到 `≥ thrD` 条 ⇒
+       告警位必须**当场重算**为 true。否则"状态/告警字段确实被刷新"就无从证明（写死的 false 也会通过）。
+       `E33②`：收窄值与下面那条断言的期望值**全部由 `thrD` 推导** ⇒ 真源改成 ≥2 时照样成立。 */
+    CFG.mes.queueCap = thrD;
     const flushLogBefore = (await (await fetch(`http://127.0.0.1:${portStatus}/log`)).json()).items.length;
     const pendBeforeFlush = Api.getStatus().pendingCount;
     const flushed = await Api.flushPending();
@@ -679,7 +692,7 @@ async function main() {
       flushLogAfter === flushLogBefore &&
       flushed.pendingCount === pendAfterFlush && flushed.left === pendAfterFlush &&
       flushed.remaining === pendAfterFlush &&
-      flushed.capacity === statusAfterFlush.pendingCapacity && flushed.capacity === 1 &&
+      flushed.capacity === statusAfterFlush.pendingCapacity && flushed.capacity === thrD &&
       flushed.queueAlert === true && flushed.queueAlert === statusAfterFlush.queueAlert &&
       flushed.queueFull === true && flushed.queueFull === statusAfterFlush.queueFull,
       `sent=${flushed.sent} failed=${flushed.failed}；待补传 ${pendBeforeFlush} → ${pendAfterFlush}；` +
@@ -708,6 +721,43 @@ async function main() {
       `tries ${beforeRetry && beforeRetry.tries} → ${keptItem && keptItem.tries}，队列仍 ${pendAfterRetryFail} 条；` +
       `人工重报（链路恢复）sent=${retryThenOk.sent}，队列 ${pendAfterRetryFail} → ${pendAfterRetryOk} 条`
     );
+    /* `E33②-D22`（**真源内存变异 ＋ 负对照**，不落盘任何文件）：把真源阈值在内存里改成 `thrD + 1` ⇒
+       同一条"容量收窄到阈值 ⇒ `flushPending` 把告警位重算为 true"**仍然成立**（＝"期望值从真源推导"的可证伪面）；
+       再给**负对照**：阈值抬到 `thrD + 2`（待补传只有 `thrD + 1` 条）⇒ 告警位**必须为 false**
+       —— 这一臂证明判据**真的在读阈值**，不是恒真（`D23`）。
+       ⚠ 位置：放在"人工入口才发送"那条**之后** —— 它要往队列里补件，若插在前面会改掉那条的入参
+         （实测：插在前面时 `retryStillFail.remaining === pendAfterFlush` 立刻变红）；末尾再把队列**排空**，
+         让本段结束态与改动前一致。 */
+    const thrSavedD = CFG.mes.queueWarnThreshold;
+    const capSavedD = CFG.mes.queueCap;
+    CFG.mes.queueWarnThreshold = thrD + 1;
+    CFG.mes.baseUrl = `http://127.0.0.1:${portFail}`;
+    const pendNowD = Api.getStatus().pendingCount;
+    for (let i = pendNowD; i < thrD + 1; i++) {
+      await Api.uploadReport(Object.assign({}, report, { uploadId: 'UP' + String(20260918151028000 + i) }));
+    }
+    CFG.mes.queueCap = thrD + 1;
+    const flushAltD = await Api.flushPending();
+    CFG.mes.baseUrl = `http://127.0.0.1:${portStatus}`;
+    CFG.mes.queueWarnThreshold = thrD + 2;        // 负对照：阈值高于待补传条数 ⇒ 不得告警
+    const alertLowD = Api.getStatus().queueAlert;
+    const pendAltD = Api.getStatus().pendingCount;
+    const capAltD = Api.getStatus().pendingCapacity;
+    CFG.mes.queueWarnThreshold = thrSavedD;       // 立即还原（后续段仍按真源跑）
+    CFG.mes.queueCap = capSavedD;
+    const drainD = await Api.retryPending();      // 收尾：把 D22 造的补传件发走，队列回到"空"（与改动前本段结束态一致）
+    check('E33②-D22（**真源内存变异 ＋ 负对照**）：把真源阈值在内存里改成 `thrD + 1` 后，同一条'
+      + '「容量收窄到阈值 ⇒ `flushPending` 当场把告警位重算为 true」**仍然成立**；'
+      + '再把阈值抬到 `thrD + 2` ⇒ 同一 `pending` 下告警位**必须为 false**（证明判据真在读阈值、不是恒真）',
+      flushAltD.sent === 0 && flushAltD.failed === 0 && flushAltD.capacity === thrD + 1
+        && flushAltD.queueAlert === true && flushAltD.pendingCount >= thrD + 1
+        && alertLowD === false && pendAltD >= thrD + 1 && capAltD === thrD + 1
+        && CFG.mes.queueWarnThreshold === thrSavedD && CFG.mes.queueCap === capSavedD
+        && Api.getStatus().pendingCount === 0,
+      `变异后（真源 ${thrD + 1}）flushPending：capacity=${flushAltD.capacity}（应 ${thrD + 1}）、`
+        + `queueAlert=${flushAltD.queueAlert}（应 true）、pending=${flushAltD.pendingCount}、sent=${flushAltD.sent}；`
+        + `负对照（阈值抬到 ${thrD + 2}、pending ${pendAltD}）⇒ queueAlert=${alertLowD}（应 **false**）、capacity=${capAltD}；`
+        + `真源／容量已还原=${CFG.mes.queueWarnThreshold}/${CFG.mes.queueCap}；收尾排空 sent=${drainD.sent}、队列剩 ${Api.getStatus().pendingCount} 条`);
   }
 
   /* ===== E. ?source=upper 链路：内置模拟上位机的取帧顺序（6.2） ===== */

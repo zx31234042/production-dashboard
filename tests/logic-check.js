@@ -2101,8 +2101,8 @@ t.section('十二、A1：DR-17 三档改真源（对 `shift_stat` 求和）、�
    可证伪性（D22）：M-Y1 把 `assertCrossMidnightAllowed()` 的构成条件改成恒真 ⇒ `E128-1` 必红并指名
    （靶子见 `tests\._verify\t20261004-11-d22-mutation.js`，**字节副本**还原）。
    边界（如实登记，不冒领）：本节只断言"**读数的两个投影**"与"**配置准入**"，**不**动
-   `E129`（`statsForShift()` 的 `LIMIT 1000` 采样上限）—— 该上限不在本票范围（本包未改它、
-   也**不**为它加断言）；本节所有夹具的帧数都远小于 1000，故与它无交互。 */
+   `E129`（`statsForShift()` 的采样窗口上限）：**2026-10-05 已修复**（`T-20261005-09`）—— 窗口取数改为
+   **按时间范围取全量**（无 `LIMIT`），并由 `harness-check` 第二十二节 `E129-①`／`E129-②` 守着；本节夹具帧数很小，故与它无交互。 */
 t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128` 跨零点准入闸');
 {
   const { DatabaseSync } = require('node:sqlite');
@@ -2209,7 +2209,7 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
       });
       /* 10 帧采样（22:00:01～22:00:10，全落在夜班窗口 [22:00, 次日 06:00) 内）
          ⇒ 运行中 `runSec = min(elapsedSec, 帧数 − 1) = 9`（`E68` 的无条件截断口径）。
-         ⚠ 帧数远小于 `statsForShift()` 的 `LIMIT 1000`（技术债 `E129`，**不在本票范围**）⇒ 无交互。 */
+         ⚠ 帧数很小（10 帧）：`statsForShift()` 的采样窗口上限已由 `E129` 修复为**按时间范围取全量**（无 `LIMIT`；`harness-check` 第二十二节 `E129-①②` 守着）⇒ 无交互。 */
       const insN = N_DB.prepare(
         `INSERT INTO measure_rt(equip_code, proc_order_no, unit_index, collect_time, created_at)
          VALUES(?, ?, ?, ?, ?)`);
