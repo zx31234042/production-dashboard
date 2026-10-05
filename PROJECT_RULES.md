@@ -432,7 +432,7 @@ production-dashboard/
 │   ├── files-check.js            # 编码与文件卫生（乱码/BOM/Tab/临时文件 + 全部 .js 可解析 + 静态防空洞断言 + assertRuntime 全覆盖）
 │   ├── harness-check.js          # 夹具自检（时钟/样本/错误注入/服务启停/临时区/断言器/runner 规则/定点变异/权威比对前置条件与可达性）
 │   ├── logic-check.js            # 当班统计与班次边界（FR-4 全组 + DR-17，时钟全部注入）
-│   ├── db-check.js               # 本地库结构与仓储层（13 张表/去重键/事务/曲线固化/备份与保留）
+│   ├── db-check.js               # 本地库结构与仓储层（13 张业务表/去重键/事务/曲线固化/备份与保留）
 │   ├── platform-check.js         # 平台适配层（路径三套隔离 / uploadId 形状 / 日志分级滚动与保留）
 │   ├── env.js                    # 测试环境常量 + Node 版本下限校验（<24 直接退出）+ 退出码契约
 │   ├── lib/                      # 测试夹具层（供所有后端自检复用）
@@ -446,7 +446,7 @@ production-dashboard/
 │   ├── run-all.js                # 统一 runner：顺序跑全部门禁并汇总，任一失败即非零退出
 │   └── ._verify/                 # 自检产物（截图/捕获/日志/长跑 CSV/临时数据库），已被 .gitignore 忽略
 ├── server/                       # 看板服务端（Node 24 LTS；ADR-0001/0002）
-│   ├── db/                       #   schema.sql（DR-01～DR-19 的 13 张表）+ index.js（连接/初始化）+ maintain.js（备份/保留）
+│   ├── db/                       #   schema.sql（DR-01～DR-19 的 13 张业务表）+ index.js（连接/初始化）+ maintain.js（备份/保留）
 │   ├── repo/                     #   仓储层：只写 SQL，不做业务判断（measure.js 实测数据 / curve.js 任务曲线）
 │   └── services/                 #   业务层（shift.js 班次边界 / stats.js 当班统计 FR-4；判定/MES/推送待补）
 ├── platform/                     # 平台适配层（ADR-0002 D11：业务代码禁出现平台字样）
