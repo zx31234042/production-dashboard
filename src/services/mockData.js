@@ -26,6 +26,8 @@
      深度 47/19/34、速度 32/14/55 ⇒「参数超范围预警」在 70% 的帧上常亮（现场会被读成"总在报警"）。
    - 测试标准来源（FR-3.18）：`state.task.standard`（FR-3.19 现场录入）优先，未建立时回退
      `config/board.config.js` 的 `standards.default`（仅演示）
+     **"给了对象但该指标缺项"一律判"标准未设定"（不回退演示值）** —— 与 `server/services/judge.js`
+     的 `specOf()` 逐条同口径（`E45` 余项①，负责人裁定以服务端为单一真源），见下方 `standardSpecOf()`
    - 19 台相机的取值/整合由 PC 上位机完成，本看板按给定值直接展示，不做二次聚合 — C-30/IF-D.13
    - 统计口径与班次时间严格一致：班次进度、运行时长、产量均由当前时钟推导，跨班次自动清零（FR-4.16）
    后期接入真实接口时：本文件由 services/api.js 替代（见 PROJECT_RULES 9.2）
@@ -373,7 +375,9 @@ window.MockData = (function () {
      故下方判据里**不出现任何相机参数**。
      标准来源（FR-3.18）：运行时真源 state.task.standard（FR-3.19 现场录入）优先，
      未建立时回退 config/board.config.js 的 standards.default（仅演示）；
-     必要项＝典型值＋上偏差＋下偏差，缺一即"标准未设定"（不判定、也不产生预警）。 */
+     必要项＝典型值＋上偏差＋下偏差，缺一即"标准未设定"（不判定、也不产生预警）。
+     ⚠ **"传了对象但该指标缺项"不回退演示值**（`E45` 余项①）：该分支的口径真源＝服务端
+     `server/services/judge.js` 的 `specOf()`，本文件只做**镜像**，见下方 `standardSpecOf()` 的长注释。 */
   const BCstd = BC.standards || {};
   const STD_DIGITS = typeof BCstd.digits === 'number' ? BCstd.digits : 2;
   const PARAM_CN = { depth: '深度', speed: '速度' };
@@ -390,11 +394,28 @@ window.MockData = (function () {
     return typeof r === 'number' ? r : 0.15;
   }
 
-  /** 取某参数（depth / speed）当前生效的标准规格；口径与 components/TaskPanel.js 的 ensureRow() 一致 */
+  /** 取某参数（depth / speed）当前生效的标准规格。
+   *  **单一真源＝服务端判定引擎** `server/services/judge.js` 的 `specOf(standardLike, kind)`
+   *  （`E45` 余项①：负责人裁定"以服务端 `specOf()` 为准"）—— 分支逐条对齐，前端**不留第二种判断**：
+   *    ① **传了对象**（哪怕 `{}`、哪怕只带 `productCode`）⇒ 该对象就是本次的**标准真源**：
+   *       只从里面取；该指标缺项（或不是对象）⇒ **`null` ＝"标准未设定"**，**绝不**回退演示值；
+   *    ② **没给标准对象**（`undefined` / `null` / 非对象）⇒ 才轮到演示缺省段；而"**本模式下许不许回退**"
+   *       这一判定**不在这里重写**：唯一真源＝`config/fieldMap.js` 的 `standardLimits()`
+   *       （`F15-3`：`dataSource === 'server'` 一律不许回退演示默认，依据 `ADR-0008 D3`）。
+   *  ⚠ 为什么是"逐条对齐"而不是"直接调用服务端那份代码"：浏览器侧不能 `require` `server/` 下的模块，
+   *     而本包**不得新增受管文件** ⇒ 无法把 `specOf()` 抽成双端共享模块。故本函数是它的**镜像**，
+   *     由 `tests\._verify\T-20261005-20\p-e45-specof-parity.js` 对同一输入矩阵逐字对账两侧输出。 */
   function standardSpecOf(kind) {
     const task = state.task || {};
-    const live = (task.standard && task.standard[kind]) || null;
-    if (live) return live;
+    const std = task.standard;
+    if (std && typeof std === 'object') {
+      const live = std[kind];
+      return (live && typeof live === 'object') ? live : null;
+    }
+    const FM = window.FieldMap;
+    if (FM && typeof FM.standardLimits === 'function' && !FM.standardLimits(state)[kind]) {
+      return null;
+    }
     const dft = stdCfg().default || {};
     return dft[kind] || null;
   }

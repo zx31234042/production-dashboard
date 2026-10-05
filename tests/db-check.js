@@ -3406,9 +3406,26 @@ async function main() {
     getHealth: () => ({ ok: true }),
     onError: err => { w4HttpErrors.push(String(err && err.message)); }
   });
-  const uploadStruct = mountUpload(w4Router, {
-    db: w4Db.db, logger: w4Logger, now: w4Now, config: w4Config, fetch: w4Fetch, timeoutMs: 2000
+  /* ⚠ **同批（`T-20261005-21`，负责人 2026-10-05 授权）**：`/upload/retry` 现在要求
+     "**回环 ＋ 登录态**"（与 `POST /notice` 同口径，`E87` 的"同口径完整版"）⇒ 本段的**端到端 HTTP**
+     请求必须带会话令牌，且挂载必须注入 `auth`。判据真源＝`server/services/auth.js`（**不另造第二套令牌**）：
+     本节**自造**一个实例（`initCode()` → `init()` → `login()`，全走真源函数），不使用任何后门。
+     ⚠ 期望值一行未改：本段判的仍是 200／`sent=1`／幂等／`limit:0 ⇒ 400`。 */
+  const w4Auth = authSvc.createAuth({
+    db: w4Db.db, now: w4Now, silent: true, teamCode: '检验一班', username: 'admin'
   });
+  const W4_AUTH_PW = 'DbCheck#W4-2026';
+  const w4AuthInit = w4Auth.init({ code: w4Auth.initCode(), password: W4_AUTH_PW, remote: '127.0.0.1' });
+  const w4AuthLogin = w4Auth.login({ password: W4_AUTH_PW, remote: '127.0.0.1' });
+  const W4_TOKEN = (w4AuthLogin && w4AuthLogin.token) || '';
+  const uploadStruct = mountUpload(w4Router, {
+    db: w4Db.db, logger: w4Logger, now: w4Now, config: w4Config, fetch: w4Fetch, timeoutMs: 2000,
+    auth: w4Auth
+  });
+  t.requires('§⑧ 前提（同批夹具）：进程内鉴权可初始化并取到会话令牌（`/upload/retry` 的登录态闸才有归因对象）',
+    w4AuthInit && w4AuthInit.ok === true && w4AuthLogin && w4AuthLogin.ok === true && /^[0-9a-f]{64}$/.test(W4_TOKEN),
+    `init.ok=${w4AuthInit && w4AuthInit.ok}；login.ok=${w4AuthLogin && w4AuthLogin.ok}；令牌长度=${W4_TOKEN.length}`);
+
   const w4Server = http.createServer((req, res) => {
     Promise.resolve(w4Router.handle(req, res)).catch(() => { try { res.destroy(); } catch { /* 已断 */ } });
   });
@@ -3422,8 +3439,11 @@ async function main() {
     return { status: res.status, body: await res.json() };
   };
   const w4Post = async (pathname, body) => {
+    /* ⚠ **同批**：写入口要登录态 ⇒ 带 `Authorization: Bearer <令牌>`（令牌来自上面那个真源实例） */
+    const headers = { 'Content-Type': 'application/json' };
+    if (W4_TOKEN) headers.Authorization = 'Bearer ' + W4_TOKEN;
     const res = await fetch(`http://127.0.0.1:${w4Port}${pathname}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      method: 'POST', headers, body: JSON.stringify(body)
     });
     return { status: res.status, body: await res.json() };
   };

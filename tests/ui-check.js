@@ -1604,7 +1604,7 @@ async function main() {
            ⇒ 上下限 4.02～4.04 m，仍落在量程 [4, 6] 内、是合法可录入的行），而演示深度游走区间是
            [4.77, 5.33]（mockData 头部口径）⇒ **深度几乎每帧都判超范围（err）**；
          · 速度不写标准行 ⇒ 按 mockData 的回退口径取 `standards.default.speed`（4.80～5.20），
-           其态随游走变化；循环 tick（上限 2000 帧）直到同一帧里**同时**出现 err 与 warn 两条参数类
+           其态随游走变化（**`E45` 注记：下面已改为把速度标准行也显式写出来** —— 原先"不写 ⇒ 靠 `mockData` 的回退口径取 `standards.default.speed`"正是 `E45` 余项①裁定要**删掉**的那条分支，**构造前提不得建立在待删口径上**）；循环 tick（上限 2000 帧）直到同一帧里**同时**出现 err 与 warn 两条参数类
            预警（实测 200 次独立试验的命中帧 ≤ 82，故上限留了 20 倍余量；真到不了即判红，不静默放过）。
        判据四条，全部落在**该帧的真实实算产物**上：
          ① 确实存在 err 级参数类预警（否则本条形同虚设 —— 这正是旧判据漏掉变异 A 的原因）；
@@ -1627,7 +1627,10 @@ async function main() {
       try {
         M.state.task.standard = {
           depth: { unit: 'm', digits: STD.digits,
-                   typical: RANGE_DEPTH.min + 3 * grid, upperDev: grid, lowerDev: -grid }
+                   typical: RANGE_DEPTH.min + 3 * grid, upperDev: grid, lowerDev: -grid },
+          speed: { unit: 'm/s', digits: STD.digits,
+                   typical: STD.default.speed.typical,
+                   upperDev: STD.default.speed.upperDev, lowerDev: STD.default.speed.lowerDev }
         };
         const base = new Date('2026-09-18T15:30:00').getTime();
         for (let i = 0; i < 2000 && obs.hit === null; i++) {

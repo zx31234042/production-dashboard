@@ -812,6 +812,18 @@ async function start(options = {}) {
     `幂等口径=task 按 proc_order_no 幂等（不覆盖）/ device 按 equip_code 后到覆盖 / 物料·工艺按报文签名幂等；` +
     `留痕=op_log（成功与失败都留，幂等命中不追加）；访问控制=${ifa.status().auth.enabled ? '已启用' : '未配置（放行+告警）'}`);
 
+  /* ---- 6d-0（`E87` 登录态那一半，2026-10-05）. 鉴权**实例**：必须先于 IF-B 挂载建好 ----
+     为什么单列一步、而不是留在 6d-2 里跟 `mountAuth()` 一起：`POST /upload/retry`
+     （6d 的**人工重报**，全仓唯一会再次向 MES 发报文的口径）按裁定要与 `POST /notice`
+     **同口径**（回环 ＋ 登录态）⇒ `mountUpload()` 需要 `auth.verify()`，而它**只能**拿到
+     本处建好的**同一个**实例（同一份会话表；`ADR-0007` 明令不新造第二套令牌）。
+     **不做的事**：不在这里读全局、不给 `mountUpload` 任何"没有 auth 就放行"的兜底 ——
+     它缺 `auth` 时的行为是**拒绝**（503 `no_auth`，fail-closed），见 `routes/upload.js` 的 `noAuthBody()`。
+     调用顺序的**硬约束**：本行 ⇒ 6d（`mountUpload` 注入 `auth`）⇒ 6d-2（`mountAuth` 登记 `/auth/*`）
+     ⇒ 6d-3（`mountNotice` 注入**同一个** `auth`）。路由清单与挂载顺序无关（`router.list()` 排序输出）。 */
+  const auth = createAuth({ db: state.db, logger, now: currentClock().source() });
+  state.auth = auth;
+
   /* ---- 6d. W4 业务挂载：IF-B 上报的**人工重报/待补传状态**接口（UI-20 的消费口） ----
      依据 `server/http/router.js` 挂载位的指引（"实现这些包时，请把注册写进对应函数体"），
      注册动作在 `server/http/routes/upload.js` 的 `mountUpload()` 里完成，本处**只接一次线**
@@ -823,12 +835,19 @@ async function start(options = {}) {
      上报器（`services/uploadReporter.js`）的 `report()` 一次调用只发一次，失败即落 `upload_log`
      等人工补传，**不起任何定时器/退避**。`mes.baseUrl` 未配置（Q-23 未答）时所有端点都会
      如实返回"未配置"，不当作成功（见回执"未决"）。 */
+  /* `E87` 接线语义（登录态那一半，2026-10-05 按负责人"同口径完整版"）：本挂载注入**上方 6d-0
+     建好的同一个 `auth` 实例** ⇒ `POST /upload/retry` 与 `POST /notice` 同口径（回环 ＋ 登录态）、
+     同一份会话表；`auth` 缺失时该端点**拒绝**（503 `no_auth`），**不静默放行**。 */
   const upload = mountUpload(router, {
     db: state.db,
     logger,
     now: currentClock().source(),
     /* W5-①：`upload` 事件在待补传队列（upload_log 的唯一写路径）的状态迁移点发布 */
     bus,
+    /* `E87`（2026-10-05）：登录态闸的**唯一真源** —— 与 `/auth/*`、`/notice` **同一个** `auth`
+       实例（`ADR-0007` D3：会话令牌只有一套）。本处**不**新建第二套、**不**读全局、
+       **不**给"没有 auth 就放行"的兜底（缺它 ⇒ 503 `no_auth` 拒绝，见 routes/upload.js）。 */
+    auth,
     /* `E48③`（2026-10-05；补修②改注释）：`config` 是**必填**，此处必须传**已解析的业务配置**
        `boardCfg`（`options.boardConfig` 优先、否则读配置文件；见 `:617`）。
        **为什么必填**：上报器（`services/uploadReporter.js:193-197`／`:219-224`／`:272`／`:277`／
@@ -857,9 +876,9 @@ async function start(options = {}) {
        · **与 IF-A 静态令牌严格分开**：`server.ifAuth.token` 只给对外接口，本挂载的会话令牌只给看板解锁，
          两套互不复用（`server/services/auth.js` 里没有任何一处读 `ifAuth.token`）；
        · 时钟仍走**同一个注入出口** `currentClock().source()`（ADR-0003 D17），**不新造第二套时钟**。
-     位置：数据面挂载（IF-D/IF-A/IF-B）之后、SSE 之前 —— 路由必须在监听前全部注册完。 */
-  const auth = createAuth({ db: state.db, logger, now: currentClock().source() });
-  state.auth = auth;
+     位置：数据面挂载（IF-D/IF-A/IF-B）之后、SSE 之前 —— 路由必须在监听前全部注册完。
+     ⚠ `auth` **实例**建在**上方 6d-0**（不是这里）：6d 的 `mountUpload()` 要用它做登录态闸，
+     而 6d 在本段**之前**；这里只做 `/auth/*` 的**路由登记**与启动日志（同一实例，不新造）。 */
   const authMount = mountAuth(router, { auth, logger, now: currentClock().source() });
   logger.info(`[路由] 鉴权已接线（${authMount.by}）：${authMount.routes.join(' , ')}；` +
     `口令哈希=${auth.algorithm}（${auth.params}）；失败阈值=${auth.limits.maxFailures} 次 ⇒ 锁定 ` +

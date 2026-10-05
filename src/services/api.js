@@ -565,6 +565,14 @@ window.Api = (function () {
    * `uploadReporter.retryPending()`（`upload_log` 单源、按 `created_at, id` 顺序、幂等），
    * 前端**不组装报文、不直接向 MES 上报**（ADR-0008 D3）。
    * **只在被调用时发一次请求**：无定时器、无指数退避、不自动重试（NFR-10 / NFR-13）。
+   *
+   * **E87（2026-10-05）—— 必须带会话令牌**：`POST /upload/retry` 与 `POST /notice` 同口径
+   * （回环 ＋ 登录态，`ADR-0007` D3）：服务端缺令牌一律 **401 `unauthorized`**。
+   * 令牌**只从唯一出口取** —— `services/auth.js` 的 `BoardSession.authHeaders()`（它把令牌装成
+   * `{Authorization:'Bearer <token>'}`；未登录时返回 `{}`）。本文件**不自己拼 `Bearer`**：
+   * 拼第二份必然与那一份漂移，而"请求头里到底带没带令牌"是安全口径，不能有两处判断。
+   * 未登录时 `headers` 为 `{}` ⇒ 这一次请求与改动前的请求头**逐字节相同**，服务端如实 401、
+   * 前端按 D5 的统一 401 处理当帧降级（**不假装已重报**）。
    * @param {{ids?:string[], limit?:number}} [options] 空体＝重报全部待补传；`limit:1`＝只补最旧 1 条
    * @returns {Promise<object>} 服务端响应体（含 `ok/sent/failed/remaining/skipped/reason`）或本机失败结论
    */
@@ -573,7 +581,9 @@ window.Api = (function () {
     const opt = options || {};
     if (Array.isArray(opt.ids) && opt.ids.length) body.ids = opt.ids.slice();
     if (Number.isInteger(opt.limit) && opt.limit > 0) body.limit = opt.limit;
-    return httpJson('/upload/retry', { method: 'POST', body: body }).then(r => {
+    const bs = window.BoardSession;
+    const headers = (bs && typeof bs.authHeaders === 'function') ? bs.authHeaders() : {};
+    return httpJson('/upload/retry', { method: 'POST', body: body, headers: headers }).then(r => {
       if (!r.ok) {
         return {
           ok: false, url: r.url, error: r.error, reason: r.failReason,

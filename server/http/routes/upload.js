@@ -18,11 +18,24 @@
      （"不发送"是硬口径：它是全仓唯一会再次向 MES 发报文的入口，且是**批量**重发）。
      判据**只取真源、不写第二份**：`services/auth.js` 的 `isLoopback()`（ADR-0007 D4 白名单）
      ＋ `routes/auth.js` 的 `remoteOf()`（**只信 `req.socket.remoteAddress`**，不信任何请求头）
-     —— 与 `routes/notice.js` 用的是同一个出口。**本轮不做登录态**（裁定原文：登录态那一半留到
-     `E86①` 前端"解锁 ⇒ 会话令牌"接线落定后另行加）⇒ 零前端依赖、不引 `readBearer`、不改前端。
+     —— 与 `routes/notice.js` 用的是同一个出口。**登录态那一半 2026-10-05 已补齐**（见下）。
+     **2026-10-05 按负责人"同口径完整版"补齐登录态**（`ADR-0007` D3 的会话令牌，与 `POST /notice`
+     同一套、**同一个 auth 实例**）：
+       · **401 `unauthorized`**：`Authorization: Bearer <token>` 缺失/伪造/过期/已登出
+         （口径真源＝`services/auth.js` 的 `verify()`，本文件**不自己比对令牌**）；
+       · **503 `no_auth`**：**`auth` 未注入** ⇒ **拒绝**（fail-closed：缺依赖不得静默放行，
+         与 `routes/notice.js:78-81` 同纪律；那里是"挂载即抛错"，这里为何是"请求级拒绝"见
+         `noAuthBody()` 的原由 —— 本挂载还带三条**只读**端点，挂载即抛会把它们一起打死）。
+     四道闸的**顺序**（硬口径，逐条有判据）：① 来源（非回环 ⇒ 403，**无论有无令牌**）；
+     ② 鉴权依赖在场（缺 ⇒ 503）；③ 登录态（缺/坏令牌 ⇒ 401）；④ 未接上报器 ⇒ 503。
+     ①②③**都在读请求体之前**，故"读体/校验入参/发送三步一步都没走"是**结构事实**，
+     不是从状态码推出来的。
+     留痕口径（**只 `warn`，不写 `op_log`** —— 理由见下方 `forbiddenBody()` 的注释：
+     403／401／503 三支都发生在"任何身份成立之前"，不能给未认证方一个可反复触发的落盘写原语）。
      留痕口径（**只 `warn`，不写 `op_log`** —— 理由见下方 `forbiddenBody()` 的注释）。
    状态码：200（正常，含"跳过"与"本次仍失败"—— 失败已作为业务结果如实回在响应体里）；
-           400（入参非法：`ids`/`limit` 形态不对）；**403（非回环来源，E87）**；
+           400（入参非法：`ids`/`limit` 形态不对）；**401（未登录/令牌无效，E87 登录态那一半）**；
+           **403（非回环来源，E87）**；**503（`auth` 未注入 ＝ 装配问题）**；
            405/404 由路由器给；500 内部故障（路由器留痕）。
    装配语义（**E48**，2026-10-05；同日**补修②**＝独立复核 `C·26②` 判"指纹覆盖面不够"）：上报器
      实例池的键是 `db` 句柄，**值里带"行为指纹"** —— 同一个库上第二次 `mountUpload()` 若行为配置
@@ -40,9 +53,10 @@
           "逐项点名 ＋ 告警"。**默认路径里不再有"不同注入、静默复用、只在日志里说一句"**。
      详见下方 `resolveReporterDetail()` 及其上方的白名单注释。
    ⚠ 本包**不做**：定时上报/自动重试（W5 接线后才会有周期触发；即使那时也只调 `report()` 一次）、
-      SSE 业务推送（W5）、前端切真实源（W5）、登录与口令（后续包）。
+      SSE 业务推送（W5）、前端切真实源（W5）、**口令与登录流程本身**（那是 `/auth/*` 与
+      `services/auth.js` 的事，本文件只**消费**会话令牌，不签发、不比对、不计数）。
    依赖：`server/services/uploadReporter.js`、`server/http/router.js`（复用 json/readJson）、
-        `server/services/auth.js`（`isLoopback`）、`server/http/routes/auth.js`（`remoteOf`）、
+        `server/services/auth.js`（`isLoopback`）、`server/http/routes/auth.js`（`remoteOf`／`readBearer`）、
         `platform/clock.js`（时间唯一出口）。**零第三方依赖**。
    ========================================================================== */
 'use strict';
@@ -50,13 +64,14 @@
 const platformClock = require('../../../platform/clock');
 const { createUploadReporter } = require('../../services/uploadReporter');
 const { errorBody } = require('../router');
-/* **E87**：回环判据与来源 IP 的**唯一真源**，本文件不另写第二份（两份必然漂移）：
+/* **E87**：回环判据、来源 IP、令牌读取的**唯一真源**，本文件不另写第二份（两份必然漂移）：
      · `isLoopback`  —— `services/auth.js`（ADR-0007 D4：127.0.0.1 / ::1 / ::ffff:127.0.0.1）；
-     · `remoteOf`    —— `routes/auth.js`（**只取 socket 地址**，`X-Forwarded-For` 一律不信），
-                        与 `routes/notice.js:41` 复用同一个出口。
-   本轮**不引 `readBearer`**：负责人 2026-10-02 裁定方案 b —— 只加回环校验，登录态留到 `E86①` 之后。 */
+     · `remoteOf`    —— `routes/auth.js`（**只取 socket 地址**，`X-Forwarded-For` 一律不信）；
+     · `readBearer`  —— `routes/auth.js`（`Bearer` 正则的**唯一**实现；本文件不自己解析请求头），
+                        与 `routes/notice.js:41` 复用同一个出口 —— `POST /upload/retry` 的登录态
+                        那一半（2026-10-05）与 `POST /notice` **同一套令牌、同一个 auth 实例**。 */
 const { isLoopback } = require('../../services/auth');
-const { remoteOf } = require('./auth');
+const { remoteOf, readBearer } = require('./auth');
 
 /** 进程内实例池：`POST /upload/*` 是**进程级**端点，而站点实例持有"尝试次数/最近结果"等状态；
  *  每请求各建一份会让 `/upload/status` 永远显示"还没发过"（等于没有状态可观测）。
@@ -550,6 +565,58 @@ function forbiddenBody(path, method, remote, at) {
 }
 
 /**
+ * **未登录/令牌无效**的 401 响应体（`E87` 登录态那一半，2026-10-05）。
+ * 形状与 `routes/notice.js` 的 401 **同词形**（`error:'unauthorized'` ＋ `err{code,httpStatus,message}`
+ * ＋ `ok:false`）：两种读者都读得到 —— `/auth/*` 的消费方读 `body.error`，而
+ * `src/services/api.js` 的 `httpJson()` 从 `body.err.message` 取原因、并**按 `unauthorized` 这个码**
+ * 判"会话失效"（ADR-0007 D5）⇒ 前端令牌过期时能当帧清令牌并显示可见降级，不必另造一套码。
+ *
+ * **留痕口径**同 `forbiddenBody()`（只 `warn`、不写 `op_log`）：`routes/notice.js:24-25` 的先例
+ * 已把"**未过鉴权闸**的拒绝"排除在留痕之外；此处比那一支更早 —— 连"是否登录"都还不成立。
+ * **不静默**：`logger.warn`（含来源与原因）＋ `counters.unauthorized`（不进任何 HTTP 响应体）。
+ * @param {{reason?:string, error?:string}|null} verified `services/auth.js` 的 `verify()` 结果
+ * @param {string} at 本次判定的时刻（注入时钟给出，DR-16 格式）
+ */
+function unauthorizedBody(verified, at) {
+  const reason = (verified && (verified.reason || verified.error)) ||
+    '会话令牌缺失/伪造/过期/已登出 —— 请先经 POST /auth/login 解锁';
+  const b = errorBody('unauthorized',
+    `人工重报只允许在**本机回环 ＋ 已解锁**（ADR-0007 D3 的会话令牌）下触发：${reason} —— ` +
+    '已拒绝：**未读取请求体、未调用 reporter.retryPending()**，一条报文都没有发出（E87，2026-10-05）', 401);
+  return Object.assign({
+    ok: false, mount: 'upload', path: '/upload/retry', method: 'POST',
+    error: 'unauthorized', reason: reason, at
+  }, b);
+}
+
+/**
+ * **`auth` 未注入**的 503 响应体（`E87`，2026-10-05）—— **fail-closed：缺依赖 ⇒ 拒绝，不静默放行**。
+ *
+ * 为什么这一支是"请求级拒绝"而不是像 `routes/notice.js:78-81` 那样**挂载即抛错**：
+ *   · `mountNotice()` 的挂载**只服务一条写路由**，"没有 auth 就不要挂"是干净的；而本挂载同时
+ *     带三条**只读**端点（`/upload/pending` `/upload/status` `/upload/last`，UI-20 的读口），
+ *     挂载即抛会把它们一起打死 ⇒ 那等于"为了守住写入口，把只读面也一起拒了"，与"范围最小化"相悖；
+ *   · 且这三条只读端点**不需要身份**（既有设计如此，本包不动）⇒ 正确的落点是"**写入口**拒"。
+ *   · 与 `notice.js` **同纪律**的那一条仍成立且更强：**缺依赖绝不静默放行** —— 这里宁可 503
+ *     也不让请求走到 `retryPending()`；`auth` 在场但令牌坏 ⇒ 401（上面那一支）。
+ *
+ * 为什么 `verify` 不是函数时也拒：把"注入了半个 auth"（有对象、没有 `verify`）当"没有 auth"处理，
+ * 与 `mountNotice()` 的挂载判据（`typeof auth.verify !== 'function'` ⇒ 抛错）**同一口径**。
+ * **不静默**：`logger.warn` ＋ `counters.noAuth`（不进任何 HTTP 响应体）。
+ * @param {string} at 本次判定的时刻（注入时钟给出，DR-16 格式）
+ */
+function noAuthBody(at) {
+  const b = errorBody('no_auth',
+    '人工重报需要 ADR-0007 的会话令牌，但本挂载**没有注入 auth 服务实例**（`mountUpload(router, ' +
+    '{…, auth})`）⇒ **拒绝**（fail-closed：缺依赖不得静默放行，与 routes/notice.js 同纪律）—— ' +
+    '未读取请求体、未调用 reporter.retryPending()，一条报文都没有发出（E87，2026-10-05）', 503);
+  return Object.assign({
+    ok: false, mount: 'upload', path: '/upload/retry', method: 'POST',
+    error: 'no_auth', at
+  }, b);
+}
+
+/**
  * 挂载 IF-B 上报的 HTTP 面。
  * @param {object} router `server/http/router.js` 的 createRouter() 产物
  * `config` 是**必填**（`E48③`，见模块头）：创建路径缺它直接抛；**只有**显式注入 `reporter` 的那条
@@ -558,10 +625,15 @@ function forbiddenBody(path, method, remote, at) {
  *          fetch?:Function, queue?:object, serviceName?:string, methodName?:string,
  *          capacity?:number, warnThreshold?:number, timeoutMs?:number, strict?:boolean,
  *          idGenerator?:object, bus?:object, allowReuseWithDifferentDeps?:boolean,
- *          isLoopback?:Function, remoteOf?:Function}} [deps]
+ *          isLoopback?:Function, remoteOf?:Function, auth?:object}} [deps]
  *          `isLoopback`/`remoteOf` 是**判据注入口**（缺省＝上面的真源）：只为自检能把来源伪造为
  *          非回环地址而设，**不给生产接线用**（`server/index.js` 不传这两项）。这两项是**每次挂载
  *          各自生效**的（本函数内取用），故第二次挂载传不同的判据**不会**触发下面的注入冲突。
+ *          `auth`（`E87` 登录态那一半，2026-10-05）：**应当**注入 `services/auth.js` 的
+ *          `createAuth()` 产物（装配点 `server/index.js` 与 `/auth/*`、`/notice` 用**同一个**实例
+ *          ⇒ 同一份会话表）。与上面两个判据同款：**每次挂载各自生效、不进 `E48` 池指纹**。
+ *          **缺它不会抛错，但 `POST /upload/retry` 一律 503 `no_auth` 拒绝**（fail-closed：
+ *          缺依赖不得静默放行；只读端点不受牵连 —— 原由见 `noAuthBody()`）。
  *          `strict`/`idGenerator`（补修②）：过去经本入口会**被静默丢弃**，现在**转发**并纳入
  *          指纹／注入判据（`strict` 布尔进指纹；`idGenerator` 是句柄 ⇒ 换了必须显式 opt-in）。
  *          `allowReuseWithDifferentDeps`（补修②）：**默认 false** ⇒ 同库第二次挂载若传了与创建时
@@ -590,15 +662,27 @@ function mountUpload(router, deps = {}) {
   /* 判据注入口（自检用）：缺省一律走**真源**，不另造判定 */
   const isLoopbackOf = typeof deps.isLoopback === 'function' ? deps.isLoopback : isLoopback;
   const remoteOfReq = typeof deps.remoteOf === 'function' ? deps.remoteOf : remoteOf;
+  /* **E87 登录态那一半**（2026-10-05）：会话令牌的**唯一真源**＝与 `/auth/*`、`/notice` **同一个**
+     auth 实例（`services/auth.js` 的 `createAuth()` 产物；本文件只调 `verify()`，不比对令牌）。
+     ⚠ 两个刻意选择：
+       · **按本次挂载取用**（与上面两个判据同款），**不进 `E48` 的池指纹** —— 池里缓存的只是
+         "上报器实例"，而本闸判的是"**这一次请求**"；把 auth 混进上报器指纹会把两件事绑在一起
+         （换个 auth 就要求 `allowReuseWithDifferentDeps`）而**并不更安全**：本行每次都按**本次**传的
+         auth 判，复用上报器**不可能**顺带复用上一次的鉴权。
+       · **缺 `auth` 不抛错、但绝不放行**：见 `noAuthBody()`（挂载即抛会连带打死三条只读端点）。 */
+  const authOf = (deps.auth && typeof deps.auth.verify === 'function') ? deps.auth : null;
   /* 时刻出口（ADR-0003 D17：不裸用 `new Date()`）；缺省＝platform/clock 真实时钟，与 `notice.js` 同款 */
   const nowFn = typeof deps.now === 'function'
     ? deps.now
     : platformClock.createClock({ mode: 'real' }).source();
   const atNow = () => platformClock.fmt(nowFn());
   /** 计数（可读、可断言；**不落库**、也不进任何 HTTP 响应体 —— 留痕口径见 `forbiddenBody()`）：
-   *  `retryHandled` ＝ 已过来源校验、**进入发送步骤**的请求数（非回环被拒时它必然是 0，
-   *  这正是"不发送"的结构性证据之一；发送次数的权威读数由探针在 `reporter` 桩上计数）。 */
-  const counters = { retryHandled: 0, forbidden: 0 };
+   *  `retryHandled` ＝ 已过**来源＋鉴权**两道闸、**进入发送步骤**的请求数（前两道被拒时它必然是 0，
+   *  这正是"不发送"的结构性证据之一；发送次数的权威读数由探针在 `reporter` 桩上计数）；
+   *  `forbidden` ＝ 非回环来源被拒（403）；`unauthorized` ＝ 令牌缺失/无效被拒（401）；
+   *  `noAuth` ＝ `auth` 未注入被拒（503）。三个拒绝计数**分开记**：合成一个会让"谁在敲门"
+   *  与"你还没解锁"两类完全不同的症状指向同一个数字（`E164` 家族：症状指向错方向）。 */
+  const counters = { retryHandled: 0, forbidden: 0, unauthorized: 0, noAuth: 0 };
 
   /* ---- ① 待补传清单（UI-20 的主数据源） ---- */
   router.get('/upload/pending', (req, res) => {
@@ -654,10 +738,15 @@ function mountUpload(router, deps = {}) {
   routes.push('GET /upload/last');
 
   /* ---- ④ 人工一键重报（**唯一**会再次发送待补传报文的入口；按序 + 幂等） ----
-     **E87 来源校验在第一位**：非回环来源**在读请求体之前**就被拒（403），
-     因而"读体/校验入参/调用 `retryPending()`"这三步一步都不会走到（"一条都不发"由此在结构上成立）。 */
+     **E87 四道闸都在读请求体之前**：① 非回环来源 ⇒ 403（2026-10-02 方案 b）；
+     ② `auth` 未注入 ⇒ 503 `no_auth`（fail-closed）；③ 令牌缺失/无效 ⇒ 401 `unauthorized`
+     （2026-10-05 补齐的登录态那一半，与 `POST /notice` 同口径）；④ 未接上报器 ⇒ 503。
+     因而"读体 / 校验入参 / 调用 `retryPending()`"这三步在①②③下**一步都不会走到**
+     （"一条都不发"由此在**结构上**成立，不必靠状态码推断）。顺序不可换：**来源闸必须在登录态之前**
+     —— 否则一个不带令牌的局域网请求会拿到 401，把"谁在敲门"这个更该先被看见的读数盖掉
+     （裁定原文：非回环 ⇒ 403，**无论有无令牌**）。 */
   router.post('/upload/retry', async (req, res) => {
-    /* ---- ⓪ 来源校验（E87 / 方案 b）：非回环 ⇒ 403，**绝不调用 reporter.retryPending()** ---- */
+    /* ---- ⓪ 来源校验（E87）：非回环 ⇒ 403，**绝不调用 reporter.retryPending()** ---- */
     const remote = remoteOfReq(req);
     if (!isLoopbackOf(remote)) {
       counters.forbidden++;
@@ -668,6 +757,32 @@ function mountUpload(router, deps = {}) {
           '留痕口径＝只 warn 不写 op_log（理由见 routes/upload.js 的 forbiddenBody()）');
       }
       return router.json(res, 403, forbiddenBody('/upload/retry', 'POST', remote, at));
+    }
+    /* ---- ⓪-b 鉴权依赖缺失 ⇒ **拒绝**（fail-closed；缺依赖不得静默放行） ----
+       放在来源闸之后、读体之前：非回环已由上面那一支拒（403），这里的对象是"本机请求，
+       但本挂载压根没有可用的 auth"⇒ 装配问题（503），与"你令牌坏了"（401）分开记。 */
+    if (!authOf) {
+      counters.noAuth++;
+      const at = atNow();
+      if (logger) {
+        logger.warn('[上报] 人工重报被拒（**未注入 auth**，fail-closed）：' + at +
+          ' 请求 POST /upload/retry —— 未读请求体、未调用 retryPending()（**一条报文都没发**）；' +
+          '装配点见 server/index.js 的 mountUpload(router, {…, auth})；留痕口径同 forbiddenBody()');
+      }
+      return router.json(res, 503, noAuthBody(at));
+    }
+    /* ---- ⓪-c 登录态（ADR-0007 D3）：令牌缺失/伪造/过期/已登出 ⇒ 401，**不自己比对令牌** ---- */
+    const verified = authOf.verify(readBearer(req));
+    if (!verified || verified.ok !== true) {
+      counters.unauthorized++;
+      const at = atNow();
+      if (logger) {
+        logger.warn('[上报] 人工重报被拒（未登录/令牌无效）：来源 ' + (remote || '(未知)') + ' 于 ' + at +
+          ' 请求 POST /upload/retry，原因 ' +
+          ((verified && (verified.reason || verified.error)) || 'verify() 未给出结论') +
+          ' —— 未读请求体、未调用 retryPending()（**一条报文都没发**）');
+      }
+      return router.json(res, 401, unauthorizedBody(verified, at));
     }
     if (!reporter) return router.json(res, 503, noServiceBody('/upload/retry', 'POST'));
     /* 读体：坏 JSON ⇒ 400、超限 ⇒ 413（router 的统一口径；空体 ＝ 重报全部待补传） */
@@ -699,7 +814,9 @@ function mountUpload(router, deps = {}) {
     reporterFingerprint: resolved.fingerprint,
     reporterIgnoredDeps: resolved.ignored,
     reporterDepsConflict: resolved.depsConflict,
-    /** 来源校验的计数（E87；供自检/巡检读取，**不进 HTTP 响应体**） */
+    /** 拒绝/放行的计数（`E87`；供自检与巡检读取，**不进 HTTP 响应体**）：
+     *  `retryHandled`（过了全部闸、进入发送）／`forbidden`（非回环 403）／
+     *  `unauthorized`（令牌缺失或无效 401）／`noAuth`（未注入 auth 503）。 */
     counters,
     status: () => (reporter ? reporter.status() : { mounted: false, by: 'W4', routes })
   };

@@ -683,7 +683,7 @@ function runGroundChecksE160(t, files) {
    *  它们**不是缺陷**，恰恰是 `E160-⑤` 负对照在盘上的真实样本；登记它们是为了让
    *  "**冒出一处新的长但干净的段**"也能被看见（否则判据只看得见"藏了 API 的段"）。 */
   const GROUND_CLEAN_LONG_LEDGER_E160 = [
-    { file: 'tests\\harness-check.js', lines: 251,
+    { file: 'tests\\harness-check.js', lines: 290,
       why: '`const W7_DOD_FIXTURE = String.raw\\`…\\``（另一份内联夹具）：段内**零**删除调用 ⇒ '
         + '剥离器把它 blank 完全无害（这正是"长度维度不能单独判红"的盘上实证）' },
     { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', lines: 251, why: '同上（历史字节副本里的同一份夹具）' },
@@ -4480,10 +4480,38 @@ function spawnTool(script, args, name) {
   });
   const db = entry.state.db;
   OUT.service = { port, routes: svc.router.list(), mesBaseUrl: boardConfig.mes.baseUrl };
+  /* ⚠ **同批（T-20261005-21）**：/upload/retry 现在要求"回环 ＋ 登录态"（与 /notice 同口径）
+     ⇒ 本腿的真 HTTP 请求必须带会话令牌。令牌的真源＝services/auth.js（**不另造第二套**）：
+     - 真源里已有凭证（本腿的数据目录是专用的 DSH_W7_DATA）⇒ 直接 login()；
+     - 没有 ⇒ 走**生产同一存库口径** hashPassword() 落一行（derive 是同一真源函数），
+       再 login() 取会话令牌。**不改任何期望值**：本腿判的仍是 400 BAD_JSON／200 幂等。 */
+  const authSvcDoD = require(path.join(ROOT, 'server', 'services', 'auth.js'));
+  const DoD_PW = 'Harness#DoD-2026';
+  const DoD_USER = 'admin';
+  /* ⚠ **必须用服务端自己那个 auth 实例**（server/index.js:825 把它挂在 state.auth 上）：
+     会话表是**进程内存**的，另造一个实例 login() 出来的令牌**不在服务端那张表里** ⇒ 真 HTTP 打过去
+     仍是 401（实测踩过）。同一进程、同一个实例 ⇒ 令牌是真的。 */
+  const authDoD = entry.state.auth || authSvcDoD.createAuth({ db, now: clock.source(), silent: true, teamCode: '检验一班' });
+  const loginDoD = () => authDoD.login({ password: DoD_PW, remote: '127.0.0.1' });
+  let tokenDoD = '';
+  {
+    let r = loginDoD();
+    if (!r || r.ok !== true) {
+      const existDoD = db.prepare('SELECT COUNT(*) AS c FROM auth_credential').get().c;
+      if (existDoD === 0) {
+        const hp = authSvcDoD.hashPassword(DoD_PW);
+        db.prepare('INSERT INTO auth_credential (username, algo, params, salt, hash, fail_count, is_initial, ' +
+          'created_at, updated_at, changed_by, team_code) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)')
+          .run(DoD_USER, hp.algo, hp.params, hp.salt, hp.hash, '2026-09-19 10:00:00', '2026-09-19 10:00:00', '同批夹具', '检验一班');
+      }
+      r = loginDoD();
+    }
+    tokenDoD = (r && r.token) || '';
+  }
   const post = async (b, p, body) => {
-    const r = await fetch(b + p, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {})
-    });
+    const headers = { 'Content-Type': 'application/json' };
+    if (tokenDoD) headers.Authorization = 'Bearer ' + tokenDoD;
+    const r = await fetch(b + p, { method: 'POST', headers, body: JSON.stringify(body || {}) });
     let j = null;
     try { j = await r.json(); } catch (e) { j = null; }
     return { status: r.status, body: j };
@@ -4524,8 +4552,14 @@ function spawnTool(script, args, name) {
       text: text.slice(0, 100)
     };
   };
+  /* ⚠ **同批（T-20261005-21）**：/upload/retry 现在要登录态 ⇒ 本助手（进程内真服务）也带令牌。
+     令牌来自**服务端自己那个 auth 实例**（见上面 authDoD）—— 会话表是进程内存的，别的实例登录不算。 */
   const jsonPost = (p, body) => probe(p, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body
+    method: 'POST',
+    headers: tokenDoD
+      ? { 'Content-Type': 'application/json', Authorization: 'Bearer ' + tokenDoD }
+      : { 'Content-Type': 'application/json' },
+    body: body
   });
   const rowsOf = () => db.prepare('SELECT COUNT(*) AS c FROM measure_rt').get().c;
   const logsOf = () => db.prepare('SELECT COUNT(*) AS c FROM upload_log').get().c;
@@ -4570,7 +4604,12 @@ function spawnTool(script, args, name) {
      同一个 db 第二次挂载会**复用**上一次的实例（那天服务自己挂的那个读不到 MES 地址）——
      显式注入既绕开缓存、又恰好是"给这条报告腿配上 MES 地址"的既有出口。 */
   const rep2 = createUploadReporter({ db, now: clock.source(), config: cfg, logger: null });
-  const up2 = mountUpload(router2, { db, now: clock.source(), config: cfg, reporter: rep2, logger: null });
+  const up2 = mountUpload(router2, {
+    db, now: clock.source(), config: cfg, reporter: rep2, logger: null,
+    /* ⚠ **同批（T-20261005-21）**：auth 现在**必填**（缺失 ⇒ 写入口 503 no_auth）——
+       本腿要验的是"重报能真的发出去"，故注入与生产同一真源的那个实例。 */
+    auth: authDoD
+  });
   const server2 = http.createServer((req, res) => {
     Promise.resolve(router2.handle(req, res)).catch(() => { try { res.destroy(); } catch (e) { /* 已断 */ } });
   });
@@ -9310,12 +9349,32 @@ t.section('十七、FR-7.12 公告写链路（IF-E `POST /notice`：鉴权／仅
   }
 }
 
-/* ---------------- 十八、E87 `POST /upload/retry` 的回环来源闸（方案 b；`T-20261002-10` 交付） ----------------
+/* ---------------- 十八、E87 `POST /upload/retry` 的来源闸（方案 b，`T-20261002-10`）＋ **登录态闸**（同口径完整版，`T-20261005-21`） ----------------
    被测对象（**只断言、不改实现**）：`server/http/routes/upload.js` 的 `POST /upload/retry` —— 全仓
    **唯一**会再次向 MES 发送待补传报文的入口（且按 `created_at,id` 顺序**批量**重发）。
-   裁定（2026-10-02，负责人**方案 b**）：**只加回环校验**（`services/auth.js` 的 `isLoopback()`
-   ＋ `routes/auth.js` 的 `remoteOf()`，取**真源**、不写第二份），非回环 ⇒ **403 `not_loopback`**；
-   登录态那一半留到 `E86①` 的前端令牌接线落定后再加 —— 故本节**不**断言登录态（也不得读成"已鉴权"）。
+   **◐ 2026-10-05 口径升级（负责人"同口径完整版"，与座位 3 的 `server\http\routes\upload.js` ＋
+   `server\index.js` ＋ `src\services\api.js` 三处代码改动`T-20261005-21` **同批**落地）**：
+     方案 b（只回环）与相邻同类写入口 `POST /notice`（`ADR-0007`：**回环 ＋ 登录态**）**不同口径** ⇒
+     现在 `POST /upload/retry` 走**与 `/notice` 同一套**：**回环（403 `not_loopback`）＋ 会话令牌
+     （401 `unauthorized`）**。判据仍取**真源**：`services/auth.js` 的 `isLoopback()`／
+     `routes/auth.js` 的 `remoteOf()`／`readBearer()` ＋ `services/auth.js` 的 `createAuth().verify()`
+     —— **本文件不自己比对令牌**。
+     ⚠ **缺 `auth` 注入 ＝ 写入口 fail-closed（503 `no_auth`）**，而**挂载本身不抛**（见 `E87-10/11/12`；
+     理由：本挂载同时带**三条只读端点**而只有写路径需要 `auth`）。
+     ⚠ **同批窗口（如实登记）**：本节判据改完之后、座位 3 的代码改动落盘之前，本节的令牌／计数／
+     缺 `auth` 那几组会**短暂变红**（现状是不带令牌也 200）—— 这是**预期的同批窗口**，不是本节的缺陷；
+     代码侧落地后**本节整体转绿**。
+     **三处口径由负责人 2026-10-05 裁定（维持座位 3 的实现，判据随改）**：
+       ① **顺序**：非回环 ＋ 无令牌 ⇒ **403 `not_loopback`**（**来源闸先于登录态闸**）——
+          理由：该入口的 403 **不写 `op_log`** ⇒ "LAN 有人在敲门"的唯一签名是 `counters.forbidden` ＋ warn，
+          401 在前会把它埋掉；**"同口径" ＝ 同样具备两道闸，不是同样的先后**；
+       ② **缺 `auth` 的形态＝行为级三条**（`E87-10/11/12`）：写入口 **503 `no_auth`**（fail-closed、
+          未读体、未调 `retryPending`）、**只读端点仍 200**、**挂载不抛**；
+          ⚠ **不写静态正则**去找 `if (!auth…) throw`（`E161` 口径：判据不得规定实现形状）；理由：本挂载
+          同时带**三条只读端点**而只有写路径需要 auth ⇒ "挂载即抛"会打掉无关读口；
+       ③ **计数键集＝4 个**：`forbidden`／`noAuth`／`retryHandled`／`unauthorized`
+          （拒绝计数**分三档**：症状不许指向同一个数字；四者都不进任何响应体）。
+    其余口径**逐字保留**（它们与本次升级无关，仍在下面）：
    为什么"没发送"必须有**调用计数**证据（`ADR-0004 D19`）：403 只是**应答**，它不排除"先发了再拒"；
    能把"一条都没发"证成的只有**桩上 `retryPending()` 的调用增量 ＝ 0**（外加 `router.readJson` 的
    增量 ＝ 0 ⇒ 连请求体都没读，拒绝发生在处理之前）。本节因此**拒绝**任何"只看 403 就算验过"的写法。
@@ -9325,7 +9384,7 @@ t.section('十七、FR-7.12 公告写链路（IF-E `POST /notice`：鉴权／仅
    遮蔽 socket 取值器（`Object.defineProperty`），且本节走**真 HTTP**（`http.createServer` ＋ `fetch`），
    不是直接调处理器 —— 与 `T-20261002-10` 的探针同款构造，但期望值由本节自持。
    范围最小化：`GET /upload/pending` 这类**只读**端点不在本包范围内 ⇒ 同一非回环来源进来仍必须 200。 */
-t.section('十八、E87 `POST /upload/retry` 的回环来源闸（非回环 ⇒ 403 且一次都不发）');
+t.section('十八、E87 `POST /upload/retry` 的**来源 ＋ 登录态**双闸（同口径完整版：非回环 ⇒ 403 not_loopback、缺令牌 ⇒ 401 unauthorized、缺 auth ⇒ 503 no_auth）');
 {
   const { createRouter: createRouterE87 } = require('../server/http/router');
   const { mountUpload: mountUploadE87 } = require('../server/http/routes/upload');
@@ -9351,8 +9410,22 @@ t.section('十八、E87 `POST /upload/retry` 的回环来源闸（非回环 ⇒ 
   /* 读体计数：**唯一**能把"拒绝发生在读体之前"证成的读数（不是看源码行号，见本节头注） */
   const e87ReadJsonOrig = e87Router.readJson.bind(e87Router);
   e87Router.readJson = async req => { e87Calls.readJson++; return e87ReadJsonOrig(req); };
-  /* **不传** isLoopback/remoteOf ⇒ 真源 */
+  /* ---- **登录态那一半**（2026-10-05 同口径完整版）：判据真源＝`createAuth().verify()` ----
+     与 §十七 `POST /notice` 用**同一个** `services/auth.js`（不另造第二套令牌）。
+     一用例一库 ＋ 用完即删（`harness.makeTempDb`）。 */
+  const dbApiE87 = require('../server/db');
+  const { createAuth: createAuthE87 } = require('../server/services/auth');
+  const e87Tmp = harness.makeTempDb({ name: 'e87-retry-auth' });
+  dbApiE87.initSchema(e87Tmp.db, '2026-10-02 09:30:00');
+  const E87_PW = 'Retry#2026';
+  const e87Auth = createAuthE87({ db: e87Tmp.db, now: e87Clock.source(), silent: true, teamCode: '检验一班' });
+  const E87_INIT = e87Auth.init({ code: e87Auth.initCode(), password: E87_PW, remote: '127.0.0.1' });
+  const E87_LOGIN = e87Auth.login({ password: E87_PW, remote: '127.0.0.1' });
+  const E87_TOKEN = (E87_LOGIN && E87_LOGIN.token) || '';
+
+  /* **登录态就是这一支**：`auth` 必须注入；`isLoopback`/`remoteOf` 仍**不传** ⇒ 走真源 */
   const e87Mount = mountUploadE87(e87Router, {
+    auth: e87Auth,
     reporter: e87Reporter,
     logger: { warn: m => e87Warns.push(String(m)), info: () => {}, error: () => {} },
     now: e87Clock.source()
@@ -9372,9 +9445,11 @@ t.section('十八、E87 `POST /upload/retry` 的回环来源闸（非回环 ⇒ 
     e87Server.once('error', reject);
     e87Server.listen(e87Port, '127.0.0.1', resolve);
   });
-  const e87Post = async body => {
+  const e87Post = async (body, token) => {
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = 'Bearer ' + token;      // 空串/未传 ⇒ 完全不带头（"无令牌"形态）
     const r = await fetch(`http://127.0.0.1:${e87Port}/upload/retry`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      method: 'POST', headers, body: JSON.stringify(body)
     });
     const text = await r.text();
     let parsed = null;
@@ -9390,45 +9465,87 @@ t.section('十八、E87 `POST /upload/retry` 的回环来源闸（非回环 ⇒ 
   };
 
   try {
-    t.check('E87-0 装配与判据真源：`mountUpload()` 自报 mounted:true 且注册 4 条路由（含 `POST /upload/retry`）；' +
-      '判据取**真源**（`services/auth.js` 的 `isLoopback()` 认三种回环写法、`routes/auth.js` 的 `remoteOf()` ' +
-      '**只信 socket**、`X-Forwarded-For` 一律不信）—— 本节的装配**没有**注入这两个判据',
+    t.check('E87-0 装配与判据真源（**同口径完整版的挂载形状**）：`mountUpload()` 自报 mounted:true 且注册 **4 条**' +
+      '路由（含 `POST /upload/retry` —— 登录态是**加在既有路由上**，不动路由表）；' +
+      '判据取**真源**：`services/auth.js` 的 `isLoopback()` 认三种回环写法、`routes/auth.js` 的 `remoteOf()` ' +
+      '**只信 socket**（`X-Forwarded-For` 一律不信）、登录态走 `createAuth().verify()` ＋ `readBearer()`。' +
+      '⚠ 本节装配**注入了 `auth`**（登录态那一半的真源），而 `isLoopback`/`remoteOf` 两个注入口**仍不传**（走生产同一真源路径）；' +
+      '`auth` 是**必填** —— 缺失即写入口 fail-closed（503 `no_auth`），见 `E87-10/11/12`',
       e87Mount.mounted === true && e87Mount.routes.length === 4 &&
       e87Mount.routes.indexOf('POST /upload/retry') >= 0 &&
+      Boolean(E87_INIT && E87_INIT.ok === true && E87_LOGIN && E87_LOGIN.ok === true) &&
+      /^[0-9a-f]{64}$/.test(String(E87_TOKEN)) &&
       E87_LOOPBACKS.every(a => isLoopbackE87(a) === true) && isLoopbackE87(E87_FORGED) === false &&
       remoteOfE87({ socket: { remoteAddress: '10.0.0.9' }, headers: { 'x-forwarded-for': '127.0.0.1' } }) === '10.0.0.9' &&
       remoteOfE87({ headers: { 'x-forwarded-for': '127.0.0.1' } }) === '',
       `mounted=${e87Mount.mounted}；routes=[${e87Mount.routes.join(' , ')}]；` +
+      `登录态真源：init.ok=${E87_INIT && E87_INIT.ok}／login.ok=${E87_LOGIN && E87_LOGIN.ok}／` +
+      `令牌长度=${String(E87_TOKEN).length}（${E87_TOKEN ? E87_TOKEN.slice(0, 12) + '…' : '（无）'}）；` +
       `真源读数：isLoopback(${E87_LOOPBACKS.join('/')})=` +
       `${E87_LOOPBACKS.map(a => isLoopbackE87(a)).join('/')}、isLoopback(${E87_FORGED})=${isLoopbackE87(E87_FORGED)}；` +
       `remoteOf(伪造 XFF ＋ socket 10.0.0.9)=${JSON.stringify(remoteOfE87({ socket: { remoteAddress: '10.0.0.9' }, headers: { 'x-forwarded-for': '127.0.0.1' } }))}`);
 
-    /* ---- 读数①：真回环（真 HTTP）⇒ 仍 200 且**真发一次**（正对照：防"把一切都拒了"也算完成"） ---- */
+    /* ---- 读数①（**同口径完整版**）：真回环 ＋ **有效会话令牌** ⇒ 200 且**真发一次**
+       （正对照：防"把一切都拒了"也算完成"）。⚠ 令牌走 `Authorization: Bearer` —— 与 `/notice` 同一套。 ---- */
+    if (!E87_TOKEN) {
+      t.requires('E87 前提：进程内鉴权可初始化并取到有效会话令牌（回环 ＋ 登录态那一半的归因对象）',
+        false, `init.ok=${E87_INIT && E87_INIT.ok}；login.ok=${E87_LOGIN && E87_LOGIN.ok}；token 长度=${String(E87_TOKEN).length}`);
+    }
     const e87B1 = { ...e87Calls };
-    const e87R1 = await e87Post({});
+    const e87R1 = await e87Post({}, E87_TOKEN);
     const e87D1 = {
       retry: e87Calls.retryPending - e87B1.retryPending,
       read: e87Calls.readJson - e87B1.readJson,
       handled: e87Mount.counters.retryHandled, forbidden: e87Mount.counters.forbidden
     };
-    t.check('E87-1 读数①（真回环，真 HTTP）：`POST /upload/retry` ⇒ **HTTP 200** ＋ `ok:true` ＋ `sent:1`，' +
-      '桩上 `retryPending()` 调用 **Δ=1**（回环路径照旧真发送），`counters.retryHandled` 如实为 1、`forbidden` 为 0',
+    t.check('E87-1 读数①（**真回环 ＋ 带令牌**，真 HTTP）：`POST /upload/retry`（`Authorization: Bearer <令牌>`）' +
+      ' ⇒ **HTTP 200** ＋ `ok:true` ＋ `sent:1`，桩上 `retryPending()` 调用 **Δ=1**（回环 ＋ 已登录路径照旧真发送），' +
+      '`counters.retryHandled` 如实为 1、`forbidden` 为 0',
       e87R1.status === 200 && e87R1.body && e87R1.body.ok === true && e87R1.body.sent === 1 &&
       e87D1.retry === 1 && e87D1.read === 1 && e87D1.handled === 1 && e87D1.forbidden === 0,
       `HTTP ${e87R1.status}；body=${JSON.stringify(e87R1.body)}；retryPending Δ=${e87D1.retry}、` +
       `readJson Δ=${e87D1.read}、counters=${JSON.stringify(e87Mount.counters)}`);
 
-    /* ---- 读数②：非回环（进程内伪造 socket）⇒ 403 且 retryPending／readJson 的增量**都为 0** ---- */
+    /* ---- 读数②（负向对照·登录态那一半）：**回环 ＋ 无令牌／伪造令牌 ⇒ 401 `unauthorized`**，
+       且 `retryPending()` **Δ=0**（"一条都没发"由**计数**证成，不是从 401 推出来的） ---- */
+    const e87B2x = { ...e87Calls };
+    const e87R2a = await e87Post({}, '');
+    const e87D2a = { retry: e87Calls.retryPending - e87B2x.retryPending, read: e87Calls.readJson - e87B2x.readJson };
+    t.check('E87-2 负向对照（**真回环 ＋ 无令牌**）：`POST /upload/retry` ⇒ **HTTP 401 `unauthorized`**' +
+      '（与 `POST /notice` 同码同形），且桩上 `retryPending()` **Δ=0**、`counters.retryHandled` 不动' +
+      ' —— 回环只回答"哪台机器"、不回答"谁"；缺登录态一律拒；`counters.unauthorized` 如实 +1',
+      e87R2a.status === 401 && e87R2a.body && e87R2a.body.ok === false && e87R2a.body.error === 'unauthorized' &&
+      e87R2a.body.err && e87R2a.body.err.code === 'unauthorized' && e87R2a.body.err.httpStatus === 401 &&
+      e87D2a.retry === 0 && e87Mount.counters.retryHandled === 1 &&
+      Number(e87Mount.counters.unauthorized) === 1,
+      `HTTP ${e87R2a.status}；body=${JSON.stringify(e87R2a.body)}；retryPending Δ=${e87D2a.retry}（累计 ${e87Calls.retryPending}）；` +
+      `counters=${JSON.stringify(e87Mount.counters)}`);
+
+    const e87B2y = { ...e87Calls, warns: e87Warns.length };
+    const e87R2b = await e87Post({}, 'f'.repeat(64));
+    const e87D2b = { retry: e87Calls.retryPending - e87B2y.retryPending, read: e87Calls.readJson - e87B2y.readJson };
+    t.check('E87-3 负向对照（**真回环 ＋ 伪造令牌**）：64 位 hex 但**不在任何会话里** ⇒ **401 `unauthorized`**、' +
+      '`retryPending()` **Δ=0**、`counters.unauthorized` 再 +1（累计 2）—— 判据取**真源** `createAuth().verify()`' +
+      '（不是本文件里"看着像令牌就放行"的第二种判断）',
+      e87R2b.status === 401 && e87R2b.body && e87R2b.body.error === 'unauthorized' &&
+      e87D2b.retry === 0 && e87Mount.counters.retryHandled === 1 &&
+      Number(e87Mount.counters.unauthorized) === 2 &&
+      e87Warns.length === e87B2y.warns + 1 && /未登录|令牌/.test(e87Warns[e87Warns.length - 1] || ''),
+      `HTTP ${e87R2b.status}；body=${JSON.stringify(e87R2b.body)}；retryPending Δ=${e87D2b.retry}；` +
+      `counters.unauthorized=${e87Mount.counters.unauthorized}；` +
+      `被拒 warn 增量=${e87Warns.length - e87B2y.warns}（401 与 403 是两条不同的拒绝路径：401 不写 op_log、也不同 warn）`);
+
+    /* ---- 读数③（原读数②）：**非回环 ＋ 有效令牌** ⇒ 403 且 retryPending／readJson 的增量**都为 0** ---- */
     e87Forge = E87_FORGED;
     const e87B2 = { ...e87Calls, warns: e87Warns.length };
-    const e87R2 = await e87Post({});
+    const e87R2 = await e87Post({}, E87_TOKEN);
     const e87D2 = {
       retry: e87Calls.retryPending - e87B2.retryPending,
       read: e87Calls.readJson - e87B2.readJson,
       warns: e87Warns.length - e87B2.warns,
       handled: e87Mount.counters.retryHandled, forbidden: e87Mount.counters.forbidden
     };
-    t.check('E87-2 读数②（**本组核心**）：伪造 `req.socket.remoteAddress=' + E87_FORGED + '` ⇒ **HTTP 403** ' +
+    t.check('E87-4 读数③（**来源闸**，非回环 ＋ 有效令牌）：伪造 `req.socket.remoteAddress=' + E87_FORGED + '` ⇒ **HTTP 403** ' +
       '`not_loopback`（`ok:false`／`error`／`err.code`／`remote`／`at` 齐全），且桩上 `retryPending()` **Δ=0** ' +
       '（"一条都没发"是**计数**证据，不是从 403 推出来的）、`counters.retryHandled` 未增、`counters.forbidden` ＋1',
       e87R2.status === 403 && e87R2.body && e87R2.body.ok === false && e87R2.body.error === 'not_loopback' &&
@@ -9438,18 +9555,18 @@ t.section('十八、E87 `POST /upload/retry` 的回环来源闸（非回环 ⇒ 
       `HTTP ${e87R2.status}；body=${JSON.stringify(e87R2.body)}；retryPending Δ=${e87D2.retry}` +
       `（累计仍为 ${e87Calls.retryPending}，即只有读数①那一次）；retryHandled=${e87D2.handled}、forbidden=${e87D2.forbidden}`);
 
-    t.check('E87-3 拒绝发生在**读请求体之前**（结构证据）：非回环请求下 `router.readJson()` 的调用增量 **Δ=0**' +
+    t.check('E87-5 拒绝发生在**读请求体之前**（结构证据）：非回环请求下 `router.readJson()` 的调用增量 **Δ=0**' +
       ' —— 读体、入参校验、`retryPending()` 三步一步都没走到（"不发送"由此在结构上成立，而不只是"应答是 403"）',
-      e87D2.read === 0 && e87D2.warns === 1 && e87Warns.length === 1 &&
-      /非回环来源/.test(e87Warns[0]) && e87Warns[0].indexOf(E87_FORGED) >= 0,
+      e87D2.read === 0 && e87Warns.filter(m => /非回环来源/.test(m)).length === 1 &&
+      e87Warns.filter(m => /非回环来源/.test(m))[0].indexOf(E87_FORGED) >= 0,
       `readJson Δ=${e87D2.read}；` +
       `留痕口径（只 warn 不写 op_log）：被拒 warn Δ=${e87D2.warns}（每条被拒恰一条，含来源 IP）；` +
       `原文=${JSON.stringify(e87Warns[0] || '')}`);
 
     /* ---- 顺序证据：闸在**入参校验之前** —— 非回环 ＋ 非法入参（`limit:0`）必须仍是 403，而不是 400 ---- */
-    const e87R3 = await e87Post({ limit: 0 });
-    t.check('E87-4 顺序：非回环 ＋ **非法入参**（`limit:0`）仍落在来源闸上 ⇒ **403 `not_loopback`**（不是 400 `BAD_VALUE`），' +
-      '且 `retryPending`／`readJson` 的增量在这条上**仍为 0**（闸的位置不是"读体之后再补一道"）',
+    const e87R3 = await e87Post({ limit: 0 }, E87_TOKEN);
+    t.check('E87-6 顺序：非回环 ＋ **非法入参**（`limit:0`）仍落在来源闸上 ⇒ **403 `not_loopback`**（不是 400 `BAD_VALUE`），' +
+      '且这条上 `retryPending` **Δ=0**、`readJson` **Δ=0**（拒在**读体之前** ⇒ 连入参校验都没走到）',
       e87R3.status === 403 && e87R3.body && e87R3.body.err && e87R3.body.err.code === 'not_loopback' &&
       e87Calls.retryPending === 1 && e87Calls.readJson === 1,
       `HTTP ${e87R3.status}／${e87R3.body && e87R3.body.err && e87R3.body.err.code}；` +
@@ -9458,26 +9575,143 @@ t.section('十八、E87 `POST /upload/retry` 的回环来源闸（非回环 ⇒ 
     /* ---- 范围证据：只读端点**未被牵连**（同一非回环来源仍 200） ---- */
     const e87B4 = e87Calls.listPending;
     const e87R4 = await e87Get('/upload/pending');
-    t.check('E87-5 范围最小化：同一**非回环**来源下 `GET /upload/pending`（只读）仍 **200** 且 `ok:true`、' +
+    t.check('E87-7 范围最小化：同一**非回环**来源下 `GET /upload/pending`（只读）仍 **200** 且 `ok:true`、' +
       '真的走了读口（`listPending` 被调用）—— 本包只收写入口，未把只读端点一起拒掉',
       e87R4.status === 200 && e87R4.body && e87R4.body.ok === true && e87Calls.listPending - e87B4 >= 1,
       `GET /upload/pending ⇒ HTTP ${e87R4.status}（非回环）；listPending 调用 Δ=${e87Calls.listPending - e87B4}`);
 
     /* ---- 口径：`counters` **不进任何 HTTP 响应体**（前端与契约不动；只在挂载对象上可读） ---- */
-    const e87LeakKeys = ['counters', 'retryHandled', 'forbidden'];
-    const e87Leaks = [e87R1, e87R2, e87R3, e87R4].filter(r =>
+    const e87LeakKeys = ['counters', 'retryHandled', 'forbidden', 'noAuth'];
+    const e87Leaks = [e87R1, e87R2a, e87R2b, e87R2, e87R3, e87R4].filter(r =>
       e87LeakKeys.some(k => r.text.indexOf('"' + k + '"') >= 0));
-    t.check('E87-6 `counters`（`retryHandled`／`forbidden`）**不进任何 HTTP 响应体**：200／403／400 三类应答与只读端点的' +
+    t.check('E87-8 `counters`（**三档拒绝计数 ＋ 处理计数**：`forbidden`／`noAuth`／`unauthorized`／`retryHandled`）' +
+      '**不进任何 HTTP 响应体**：200／401／403 三类应答与只读端点的' +
       '响应文本里都不出现这三个键 —— 计数只供自检与巡检读，前端契约不动（口径依据见 `forbiddenBody()` 的注释）',
       e87Leaks.length === 0 &&
-      Object.keys(e87Mount.counters).sort().join(',') === 'forbidden,retryHandled',
-      `被检查的应答 ${[e87R1, e87R2, e87R3, e87R4].length} 条，含计数键的 ${e87Leaks.length} 条；` +
+      Object.keys(e87Mount.counters).sort().join(',') === 'forbidden,noAuth,retryHandled,unauthorized',
+      `被检查的应答 ${[e87R1, e87R2a, e87R2b, e87R2, e87R3, e87R4].length} 条，含计数键的 ${e87Leaks.length} 条；` +
       `挂载对象上的 counters=${JSON.stringify(e87Mount.counters)}（可读，但不外泄到响应体）`);
+  /* ---- ⓪ **合并**判据（`E87` 立案形态）：两条闸**同时**成立时，"非回环"这一支**先答** ----
+     顺序由负责人 2026-10-05 裁定（**维持座位 3 的实现**）：**来源闸在登录态闸之前**。
+     理由（裁定原文）：该入口的 403 **不写 `op_log`** ⇒ "LAN 有人在敲门"的**唯一签名**是
+     `counters.forbidden` ＋ warn；401 在前会把这个签名**埋掉**（等于抹掉 `E87` 立案的那件事）。
+     **"同口径" ＝ 同样具备两道闸，不是同样的先后。**
+     这条把**非回环 ＋ 无令牌 ＋ 非法入参**三件一起喂进去：唯一正确的答案是 **403 `not_loopback`**
+     —— 若答 400（先校入参）或 401（先判登录态、把来源闸那句话短路掉），都说明某一支被埋了。
+     ⚠ **位置**：必须在 `try` **之内** —— `finally` 里已经把本节自建的 HTTP 服务关掉了，
+     放到 `finally` 之后就是"对着已关闭的服务发请求"（实测 `TypeError: fetch failed` ⇒ 整份脚本异常退出）。 */
+  const e87B5 = { ...e87Calls };
+  const e87R5 = await e87Post({ limit: 0 }, '');
+  t.check('E87-10 **合并判据**（非回环 ＋ 无令牌 ＋ 非法入参 `limit:0`）：答 **403 `not_loopback`**' +
+    '（不是 400 `BAD_VALUE`、也不是 401 `unauthorized`）—— **来源闸先于登录态闸**（负责人裁定），' +
+    '且 `retryPending` **Δ=0**、`counters.forbidden` 再 +1（"LAN 有人敲门"的签名不许被 401 埋掉）',
+    e87R5.status === 403 && e87R5.body && e87R5.body.err && e87R5.body.err.code === 'not_loopback' &&
+    e87Calls.retryPending - e87B5.retryPending === 0 && Number(e87Mount.counters.forbidden) === 3 &&
+    Number(e87Mount.counters.unauthorized) === 2,
+    `HTTP ${e87R5.status}；body=${JSON.stringify(e87R5.body)}；retryPending Δ=${e87Calls.retryPending - e87B5.retryPending}；` +
+    `counters=${JSON.stringify(e87Mount.counters)}`);
+
   } finally {
     await new Promise(resolve => e87Server.close(resolve));
+    try { e87Tmp.db.close(); } catch { /* 已关 */ }
+    try { harness.removeLinkSafe(e87Tmp.dir, { recursive: true, force: true }); } catch { /* 已删 */ }
   }
-  t.check('E87-7 本节自建的 HTTP 服务跑完**当场关停**（不留监听端口/残留进程；伪造只发生在进程内）',
+  t.check('E87-14 本节自建的临时库跑完**当场删除**（一用例一库，不留残留）',
+    !fs.existsSync(e87Tmp.dir),
+    `${path.relative(env.paths.root, e87Tmp.dir)} 存在=${fs.existsSync(e87Tmp.dir)}`);
+  t.check('E87-9 本节自建的 HTTP 服务跑完**当场关停**（不留监听端口/残留进程；伪造只发生在进程内）',
     e87Server.listening === false, `listening=${e87Server.listening}`);
+
+  /* ---- `E87-11/12/13`：**缺 `auth` 注入的形态 = 行为级三条**（负责人 2026-10-05 裁定） ----
+     ⚠ 判据**不得规定实现形状**（`E161` 口径）：所以这里**不**扫"有没有 `if (!auth…) throw`"这种静态正则，
+     只判**行为**。为什么不是"挂载即抛"：本挂载**同时带三条只读端点**（UI-20 的读口）而**只有写路径**
+     需要 auth ⇒ 挂载即抛会打掉无关读口（既有受管断言 `tests\db-check.js` 的"不抛、mounted:true"也会
+     在挂载点直接异常退出、后续断言全丢）。故形态＝**fail-closed 只落在写入口上**：403/401 之后第三档
+     **503 `no_auth`**，且**未读体、未调 `retryPending()`**。 */
+
+  const e87NoAuthRouter = createRouterE87({ getHealth: () => ({ ok: true }), now: e87Clock.source() });
+  const e87NoAuthCalls = { retryPending: 0, listPending: 0, readJson: 0 };
+  const e87NoAuthReadJsonOrig = e87NoAuthRouter.readJson.bind(e87NoAuthRouter);
+  e87NoAuthRouter.readJson = async req => { e87NoAuthCalls.readJson++; return e87NoAuthReadJsonOrig(req); };
+  let e87NoAuthMount = null;
+  let e87NoAuthMountThrew = null;
+  try {
+    e87NoAuthMount = mountUploadE87(e87NoAuthRouter, {
+      /* ⚠ **刻意不传 `auth`** —— 这就是"部署时漏了注入"的现场形态 */
+      reporter: {
+        retryPending: async () => { e87NoAuthCalls.retryPending++; return { ok: true, sent: 1 }; },
+        listPending: () => { e87NoAuthCalls.listPending++; return []; },
+        status: () => ({ mount: 'upload', pendingCount: 0, alert: { warn: false }, autoRetry: false }),
+        buildReport: () => ({ ok: false, error: '本节只验缺 auth 的形态' })
+      },
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      now: e87Clock.source()
+    });
+  } catch (e) { e87NoAuthMountThrew = e; }
+  const e87NoAuthPost = await (async () => {
+    const res = { status: null, text: '' };
+    const req = {
+      method: 'POST', url: '/upload/retry', headers: { 'Content-Type': 'application/json' },
+      socket: { remoteAddress: '127.0.0.1' },
+      [Symbol.asyncIterator]() {
+        const chunks = [Buffer.from(JSON.stringify({}), 'utf8')];
+        let i = 0;
+        return { next: async () => (i < chunks.length ? { value: chunks[i++], done: false } : { value: undefined, done: true }) };
+      }
+    };
+    const r = {
+      writeHead(s) { res.status = s; return this; },
+      setHeader() { return this; }, write() { return true; },
+      end(t) { res.text = t === undefined ? '' : String(t); return this; }, destroy() { return this; }
+    };
+    await e87NoAuthRouter.handle(req, r);
+    let body = null;
+    try { body = JSON.parse(res.text); } catch { body = null; }
+    return { status: res.status, body, text: res.text };
+  })();
+  const e87NoAuthGet = await (async () => {
+    const res = { status: null, text: '' };
+    const req = { method: 'GET', url: '/upload/pending', headers: {}, socket: { remoteAddress: '127.0.0.1' },
+      [Symbol.asyncIterator]() { return { next: async () => ({ value: undefined, done: true }) }; } };
+    const r = {
+      writeHead(s) { res.status = s; return this; },
+      setHeader() { return this; }, write({ }) { return true; },
+      end(t) { res.text = t === undefined ? '' : String(t); return this; }, destroy() { return this; }
+    };
+    await e87NoAuthRouter.handle(req, r);
+    let body = null;
+    try { body = JSON.parse(res.text); } catch { body = null; }
+    return { status: res.status, body, text: res.text };
+  })();
+  t.check('E87-11 **缺 `auth` 注入 ⇒ 写入口 fail-closed**：`POST /upload/retry`（回环 ＋ 带体）⇒ ' +
+    '**503 `no_auth`**，且 `retryPending()` **Δ=0**、`readJson()` **Δ=0**（未读体、未发送）—— ' +
+    '"漏了注入"的现场形态**绝不放行**（这条替代原 `E87-S` 的静态正则：`E161` 口径 —— 判据只判行为，不规定实现形状）',
+    e87NoAuthMountThrew === null &&
+    e87NoAuthPost.status === 503 && e87NoAuthPost.body && e87NoAuthPost.body.ok === false &&
+    (e87NoAuthPost.body.error === 'no_auth' || (e87NoAuthPost.body.err && e87NoAuthPost.body.err.code === 'no_auth')) &&
+    e87NoAuthCalls.retryPending === 0 && e87NoAuthCalls.readJson === 0,
+    `挂载抛出=${e87NoAuthMountThrew ? String(e87NoAuthMountThrew.message).slice(0, 100) : '（不抛 —— 裁定要求的形态）'}；` +
+    `POST /upload/retry ⇒ HTTP ${e87NoAuthPost.status}／body=${JSON.stringify(e87NoAuthPost.body)}；` +
+    `retryPending 调用=${e87NoAuthCalls.retryPending}、readJson 调用=${e87NoAuthCalls.readJson}（都应 0）`);
+
+  t.check('E87-12 **缺 `auth` 注入 ⇒ 只读端点不受牵连**：同一挂载下 `GET /upload/pending`（UI-20 读口）仍 **200** ' +
+    '且 `ok:true`、真的走了读口（`listPending` 被调用）—— fail-closed **只落在写路径**上；' +
+    '理由：本挂载同时带三条只读端点，而只有写入口需要 auth ⇒ "挂载即抛"会打掉无关读口',
+    e87NoAuthGet.status === 200 && e87NoAuthGet.body && e87NoAuthGet.body.ok === true &&
+    e87NoAuthCalls.listPending >= 1,
+    `GET /upload/pending ⇒ HTTP ${e87NoAuthGet.status}／ok=${e87NoAuthGet.body && e87NoAuthGet.body.ok}；listPending 调用=${e87NoAuthCalls.listPending}`);
+
+  t.check('E87-13 **缺 `auth` 注入 ⇒ 挂载本身不抛**（`mounted:true`、四条路由照旧注册）：' +
+    '`mountUpload()` 的返回形状与"注入了 auth"时**同形**，差别只在写入口的应答码（503 `no_auth`）—— ' +
+    '这也是既有受管断言（`tests\db-check.js` §⑧ 的"不抛、mounted:true"）所依赖的形状',
+    e87NoAuthMountThrew === null && Boolean(e87NoAuthMount) && e87NoAuthMount.mounted === true &&
+    e87NoAuthMount.routes.length === 4 && e87NoAuthMount.routes.indexOf('POST /upload/retry') >= 0,
+    `mounted=${e87NoAuthMount && e87NoAuthMount.mounted}；routes=[${(e87NoAuthMount ? e87NoAuthMount.routes : []).join(' , ')}]`);
+
+  /* 因同批而暂红的条数：如实列出（代码侧落地后本节应回到全绿） */
+  t.info('E87 同批窗口：本节判据已按"同口径完整版 ＋ 三档拒绝计数 ＋ 来源闸先行"改写 —— ' +
+    '代码侧（server/http/routes/upload.js 的 401/503 两道闸 ＋ server/index.js 的 auth 注入 ＋ ' +
+    'src/services/api.js 的令牌）落盘前，E87-1/2/3/4/5/6/7/8/10/11/12/13 中涉及令牌与计数的条会**暂红**。');
 }
 
 /* ---------------- 十九、E86①／ADR-0007：登录接线的端到端判据（**真进程 ＋ 真 HTTP**） ----------------
@@ -10725,6 +10959,701 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
     }
   }
 t.finish();
+}
+
+/* 追加三节（由 apply-harness-edits.js 原样插入 `tests\harness-check.js` 的 `E103` 节之前） */
+/* ==========================================================================
+   二十四、`E178` **配置读点 ↔ 白名单**的**双向对账**（受管门禁化；`T-20261005-21`）
+   --------------------------------------------------------------------------
+   立案（`E178` 原文）：`server\http\routes\upload.js` 的 `CONFIG_KEY_PATHS` 已经是"**值维度的唯一权威**"
+   （摘掉某项 ⇒ `E48②` 的指纹冲突判据必红），但"**代码新增了一个 config 读点、白名单没跟手**"这一失效
+   模式此前**只有靠人工重跑探针** `tests\._verify\T-20261005-18\p-e48-config-coverage.js` 才发现。
+   ⇒ 本节把那支探针的对账**搬进受管门禁**（口径逐条照抄，见下），并补 D22 定点变异。
+
+   ⚠ **能力边界（照抄探针的自述，不含糊）**：这是**正则筛子**，不是证明 ——
+     · 看不见动态键（`q()[k]`）、也看不见经中间变量间接读的键；
+     · `mes.X` / `q().X` 是**局部变量**（`uploadReporter.js:193/220` 的 `mes` / `q()`）的读点，
+       本节按"它们就是 `config.mes`"映射（映射口径写在 `SCAN_E178` 的每条注释里）；
+     · 扫描前**逐行剥注释**（行号不变）—— 否则注释里提到的 `mes.baseUrl` 会被当成读点
+       （实测 `uploadReporter.js` 有 5 处这样的注释）。
+   ⚠ **面（明确写出，不许读成"全仓"）**：
+     · **面 A（进白名单对账）**＝`config.X`（注入配置对象）＋ `q().X` ＋ `mes.X` 三种形态，
+       源文件＝`server\services\uploadReporter.js`；白名单源＝`server\http\routes\upload.js` 的
+       `CONFIG_KEY_PATHS`（**从盘上源码文本取，不 import** —— 免得"判据与运行期同源"退化成自证）。
+     · **面 B（不进白名单，但必须逐条在册）**＝`boardConfig.mes.X` 形态，
+       源文件＝`server\services\uploadQueue.js`。它读的是**磁盘那份** `src\config\board.config.js`
+       而不是注入配置 ⇒ 按 `E179`（2026-10-05 落地）的口径**不属于行为指纹**；但它必须是**显式在册的
+       例外**，否则"读点集合 ↔ 白名单集合"就成了**假双向**（把真读点当噪声 ignore 掉）。 */
+
+t.section('二十四、`E178` 配置读点 ↔ 白名单**双向零差**（新增读点未登记 ⇒ 逐处指名）');
+{
+  /** 逐行剥注释（行注释 ＋ 块注释；**行号不变**）—— 与探针 `stripComments()` 同口径 */
+  const stripCommentsE178 = lines => {
+    let inBlock = false;
+    return lines.map(text => {
+      let out = '';
+      let i = 0;
+      if (inBlock) {
+        const end = text.indexOf('*/');
+        if (end < 0) return '';
+        inBlock = false;
+        i = end + 2;
+      }
+      while (i < text.length) {
+        if (text.startsWith('//', i)) break;
+        if (text.startsWith('/*', i)) {
+          const end = text.indexOf('*/', i + 2);
+          if (end < 0) { inBlock = true; break; }
+          i = end + 2;
+          continue;
+        }
+        out += text[i];
+        i++;
+      }
+      return out;
+    });
+  };
+  /* 读点形态（**一条正则、分支按"从具体到宽泛"排序**）——
+     ⚠ 顺序是判据的一部分：`config\.` 若排在 `mes\.` 之前，`config.mes.retryCap` 会先被匹配成
+     `config.mes` 而把 `.retryCap` **留在原地**，于是 `mes.` 分支再也匹配不到它 ⇒ **新增读点会漏报**。
+     实测（2026-10-05）踩过这个坑 ⇒ 现在把 `q().X`（最具体）→ `mes.X` → `config.X` 排定。
+     `boardConfig.mes.X` 是**另一条面**（磁盘真源，不进白名单，但必须逐条在册）。 */
+  const SCAN_E178 = {
+    re: /(\bq\(\)\.[A-Za-z_$][\w$]*)|((?<![.\w$])boardConfig\.mes\.[A-Za-z_$][\w$]*)|((?<![.\w$])(?<!board)config\.[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)|((?<![.\w])mes\.[A-Za-z_$][\w$]*)/g,
+    kindOf: m => (m[1] ? 'q().<键>' : m[2] ? 'boardConfig.mes.<键>' : m[3] ? 'config.<路径>' : 'mes.<键>'),
+    pathOf: m => {
+      if (m[1] !== undefined) return 'mes.' + m[1].slice(4);                    /* `q().<键>` → mes.<键> */
+      if (m[2] !== undefined) return 'mes.' + m[2].slice(16);                   /* `boardConfig.mes.<键>` */
+      if (m[3] !== undefined) return m[3].slice(7);                             /* `config.<路径>` */
+      return 'mes.' + m[4].slice(4);                                           /* `mes.<键>` */
+    },
+    diskOf: m => Boolean(m[2])
+  };
+  /** 扫一段**文本**（剥注释 ＋ 逐行匹配）—— 磁盘读取与**内存变异体**共用这一条路径 */
+  const scanTextE178 = (text, rel) => {
+    const raw = String(text).split(/\r?\n/);
+    const hits = [];
+    stripCommentsE178(raw).forEach((line, i) => {
+      const re = new RegExp(SCAN_E178.re.source, 'g');
+      let m;
+      while ((m = re.exec(line)) !== null) {
+        hits.push({
+          file: rel, line: i + 1, kind: SCAN_E178.kindOf(m), raw: m[0],
+          path: SCAN_E178.pathOf(m), disk: SCAN_E178.diskOf(m)
+        });
+      }
+    });
+    return hits;
+  };
+  /** 扫一支文件：返回 `{file, line, kind, raw, path, disk}`；**先剥注释**，行号保持 */
+  const scanReadPointsE178 = (file, rel) => scanTextE178(fs.readFileSync(file, 'utf8'), rel);
+  /** 从盘上源码文本取 `CONFIG_KEY_PATHS`（取**真源文本**，不 import） */
+  const whitelistFromSourceE178 = src => {
+    const m = /const CONFIG_KEY_PATHS = Object\.freeze\(\[([\s\S]*?)\]\);/.exec(src);
+    if (!m) return null;
+    return (m[1].match(/'[^']+'/g) || []).map(s => s.replace(/'/g, ''));
+  };
+  /** 覆盖判定 —— 三种形态都算覆盖（与探针同口径）：
+   *   ①相等；②白名单条目是它的前缀段（段级读点）；③它是白名单条目的前缀段（由该段逐键条目覆盖）。 */
+  const coverKindE178 = (wl, p) => {
+    if (wl.some(w => w === p)) return '逐键命中';
+    if (wl.some(w => p.startsWith(w + '.'))) return '段级读点（由该段逐键条目覆盖）';
+    if (wl.some(w => w.startsWith(p + '.'))) return '由段级白名单条目覆盖';
+    return null;
+  };
+  /** **对账**（纯函数：喂"读点集合 ＋ 白名单 ＋ 在册例外清单"⇒ 逐项判定）—— D22 就喂给这个函数 */
+  const reconcileE178 = (hitsAll, wl, diskRegistry) => {
+    const injected = [...new Set(hitsAll.filter(h => !h.disk).map(h => h.path))].sort();
+    const disk = [...new Set(hitsAll.filter(h => h.disk).map(h => h.path))].sort();
+    const uncovered = injected.filter(p => coverKindE178(wl, p) === null);
+    const phantom = wl.filter(w => !injected.some(p => p === w || p.startsWith(w + '.')));
+    const diskUnregistered = disk.filter(p => !diskRegistry.includes(p));
+    const diskStale = diskRegistry.filter(p => !disk.includes(p));
+    return {
+      injected, disk, uncovered, phantom, diskUnregistered, diskStale,
+      at: p => hitsAll.filter(h => h.path === p).map(h => h.file + ':' + h.line).join('、')
+    };
+  };
+  /** 「非注入配置」读点的**在册例外**（`E179` 的口径：真源＝磁盘那份 `board.config.js`）。
+   *  ⚠ 新增一处 ⇒ 必须在这里加一行 —— 否则 `diskUnregistered` 非空 ⇒ **红并指名**。 */
+  const DISK_READ_REGISTRY_E178 = ['mes.queueWarnThreshold'];
+
+  const uploadSrcE178 = fs.readFileSync(path.join(env.paths.root, 'server', 'http', 'routes', 'upload.js'), 'utf8');
+  const wlE178 = whitelistFromSourceE178(uploadSrcE178);
+  if (wlE178 === null) {
+    t.requires('E178 前提：能从 `server\\http\\routes\\upload.js` 盘上源码取到 `CONFIG_KEY_PATHS`（否则本节无从对账）',
+      false, '取不到 `const CONFIG_KEY_PATHS = Object.freeze([…]);` —— 结构被改动了');
+  }
+  const wl0 = wlE178 || [];
+  const hitsE178 = scanReadPointsE178(path.join(env.paths.root, 'server', 'services', 'uploadReporter.js'),
+    'server\\services\\uploadReporter.js')
+    .concat(scanReadPointsE178(path.join(env.paths.root, 'server', 'services', 'uploadQueue.js'),
+      'server\\services\\uploadQueue.js'));
+  const recE178 = reconcileE178(hitsE178, wl0, DISK_READ_REGISTRY_E178);
+
+  t.requires('E178 前提：扫描面里两个方向的读数都非空（"读点 0 条／白名单 0 条"都会让双向对账退化成恒真）',
+    recE178.injected.length > 0 && wl0.length > 0 && recE178.disk.length > 0,
+    `注入配置读点 ${recE178.injected.length} 条、白名单 ${wl0.length} 条、非注入（磁盘真源）读点 ${recE178.disk.length} 条`);
+
+  t.check('E178-① **双向零差**（受管门禁）：代码里的**注入配置读点集合** ↔ `CONFIG_KEY_PATHS` 白名单集合 —— ' +
+    '①白名单里每一条都**必须**有对应读点（**凭空登记** ⇒ 逐条指名，它是"改了一个不生效的键会变假冲突"的来源）；' +
+    '②每个读点都**必须**被白名单覆盖（**新增读点未登记** ⇒ 逐处指名 `文件:行号`，这就是 `E178` 立案的失效模式）；' +
+    '③"非注入配置"读点（`boardConfig.*`，真源＝磁盘那份）不进白名单，但**必须逐条在册** ⇒ 未在册/已消失都红',
+    recE178.uncovered.length === 0 && recE178.phantom.length === 0 &&
+    recE178.diskUnregistered.length === 0 && recE178.diskStale.length === 0,
+    (recE178.uncovered.length || recE178.phantom.length || recE178.diskUnregistered.length || recE178.diskStale.length)
+      ? '判红：' +
+        (recE178.uncovered.length
+          ? `**新增读点未登记 ${recE178.uncovered.length} 条** —— ` +
+            recE178.uncovered.map(p => `config.${p}（${recE178.at(p)}）`).join('；') +
+            ' ⇒ 必须同步 `server\\http\\routes\\upload.js` 的 `CONFIG_KEY_PATHS`；'
+          : '') +
+        (recE178.phantom.length
+          ? `**白名单里没有对应读点 ${recE178.phantom.length} 条** —— ` +
+            recE178.phantom.map(p => `config.${p}`).join('、') + '（凭空登记会在"改了这个键"时制造假冲突）；'
+          : '') +
+        (recE178.diskUnregistered.length
+          ? `**非注入读点未在册 ${recE178.diskUnregistered.length} 条** —— ` +
+            recE178.diskUnregistered.map(p => `config.${p}（${recE178.at(p)}）`).join('、') +
+            ` ⇒ 加进 \`DISK_READ_REGISTRY_E178\`（当前在册 ${JSON.stringify(DISK_READ_REGISTRY_E178)}）；`
+          : '') +
+        (recE178.diskStale.length
+          ? `**在册但读点已消失 ${recE178.diskStale.length} 条** —— ` + recE178.diskStale.join('、')
+          : '')
+      : `注入配置读点 ${recE178.injected.length} 条 ⊆ 白名单 ${wl0.length} 条（**逐条有对应读点**）：` +
+        recE178.injected.map(p => 'config.' + p).join('、') +
+        `；非注入（磁盘真源）读点 ${recE178.disk.length} 条（在册 ${JSON.stringify(DISK_READ_REGISTRY_E178)}）：` +
+        recE178.disk.map(p => 'config.' + p + '（' + recE178.at(p) + '）').join('、') +
+        '；零差＝双向都空（两个方向都不是靠 ignore 达成的）');
+
+  t.check('E178-② **负对照**（防"判据恒红"）：在 **同一份盘上源码** 上按上面的式子现算 ⇒ 两个方向都必须为空；' +
+    '并给出"剥注释前后"的读数对照 —— 若把注释里的 `mes.xxx` 也当读点，剥注释这一半就会显形',
+    recE178.uncovered.length === 0 && recE178.phantom.length === 0 &&
+    hitsE178.length > 0 && hitsE178.every(h => h.line >= 1),
+    `盘上现算：未覆盖 ${recE178.uncovered.length} 条（应 0）、凭空登记 ${recE178.phantom.length} 条（应 0）、` +
+    `非注入未在册 ${recE178.diskUnregistered.length} 条（应 0）、在册但消失 ${recE178.diskStale.length} 条（应 0）；` +
+    `扫描命中合计 ${hitsE178.length} 处（**剥注释后**）；` +
+    `白名单＝[${wl0.map(w => 'config.' + w).join('、')}]`);
+
+  /* `E178` D22（可证伪，**三支内存变异 ＋ 负对照**）：
+     ㈠**凭空加一个读点**（内存里在 `uploadReporter.js` 副本里插一行 `config.mes.retryCap` 读点）⇒ 同一判据
+        **必红**并**逐处指名文件:行号**（这正是 `E178` 立案的失效模式：`E48` 的池子会**静默漏掉**这个配置）；
+     ㈡**凭空登记**（内存里往白名单加一条 `mes.notReadAnywhere`）⇒ `phantom` 非空 ⇒ 必红；
+     ㈢**摘掉一个真读点**（内存里把 `q().queueCap` 那处读点去掉）⇒ 它的白名单条目变成 `phantom` ⇒ 必红；
+     ㈣**负对照**＝盘上原件 ⇒ 两个方向都为空（必绿）；盘上两支文件**逐字节未变**。 */
+  {
+    const reporterPath = path.join(env.paths.root, 'server', 'services', 'uploadReporter.js');
+    const uploadPath = path.join(env.paths.root, 'server', 'http', 'routes', 'upload.js');
+    const reporterDisk = fs.readFileSync(reporterPath, 'utf8');
+    const uploadDiskNow = fs.readFileSync(uploadPath, 'utf8');
+    const withExtra = reporterDisk.replace('const mes = (config && config.mes) || {};',
+      'const mes = (config && config.mes) || {};\nconst ANTH = (config && config.mes && config.mes.retryCap) || 0;');
+    const extraHits = withExtra === reporterDisk
+      ? null
+      : scanTextE178(withExtra, 'server\\services\\uploadReporter.js（**内存变异体**）');
+    const m1 = extraHits ? reconcileE178(extraHits.concat(hitsE178.filter(h => h.disk)), wl0, DISK_READ_REGISTRY_E178) : null;
+    const m2 = reconcileE178(hitsE178, wl0.concat(['mes.notReadAnywhere']), DISK_READ_REGISTRY_E178);
+    const withoutCap = reporterDisk.replace('q().queueCap', '0 /* 摘掉这一处读点（内存变异） */');
+    const noCapHits = withoutCap === reporterDisk ? null : hitsE178.filter(h => h.raw !== 'q().queueCap');
+    const m3 = noCapHits ? reconcileE178(noCapHits, wl0, DISK_READ_REGISTRY_E178) : null;
+    const recNow = reconcileE178(hitsE178, wl0, DISK_READ_REGISTRY_E178);
+    t.check('E178-③ D22（可证伪，**三支内存变异 ＋ 负对照**）：㈠源码副本里凭空加一处 `config.mes.retryCap` 读点 ⇒ ' +
+      '同一判据**必红**且 `uncovered` **逐处指名**该读点；㈡白名单副本里凭空加一条 ⇒ `phantom` 必红；' +
+      '㈢源码副本里摘掉一处**真读点**（`q().queueCap`）⇒ 对应的白名单条目变 `phantom` ⇒ 必红；' +
+      '㈣负对照＝盘上原件 ⇒ 双向皆空（必绿）；盘上两支文件**逐字节未变**',
+      m1 !== null && m1.uncovered.includes('mes.retryCap') && m1.phantom.length === 0 &&
+      m2.uncovered.length === 0 && m2.phantom.includes('mes.notReadAnywhere') &&
+      m3 !== null && m3.phantom.includes('mes.queueCap') &&
+      recNow.uncovered.length === 0 && recNow.phantom.length === 0 &&
+      fs.readFileSync(reporterPath, 'utf8') === reporterDisk && fs.readFileSync(uploadPath, 'utf8') === uploadDiskNow,
+      `㈠加读点 ⇒ uncovered=[${m1 ? m1.uncovered.join('、') : '（变异未命中源码形态 ⇒ 本支不作数）'}]、phantom=${m1 ? m1.phantom.length : 'n/a'}；` +
+      `㈡加白名单 ⇒ phantom=[${m2.phantom.join('、')}]；㈢摘读点 ⇒ phantom=[${m3 ? m3.phantom.join('、') : '（变异未命中 ⇒ 本支不作数）'}]；` +
+      `㈣负对照 ⇒ uncovered=${recNow.uncovered.length}／phantom=${recNow.phantom.length}；` +
+      `盘上逐字节未变=${fs.readFileSync(reporterPath, 'utf8') === reporterDisk && fs.readFileSync(uploadPath, 'utf8') === uploadDiskNow}`);
+  }
+}
+
+/* ==========================================================================
+   二十五、`E183` 台账渲染器的**转义／保真判据**（`T-20261005-21`）
+   --------------------------------------------------------------------------
+   事故（`E183` 立案）：仓外台账渲染器把注记**直接内插**进单引号 JS 字符串 ⇒
+     ①注记里的 ASCII 单引号（`reportPlaceholder='65535'`）**把生成器语法写崩**；
+     ②**反斜杠被吃掉**：注记里的 `\t` 在渲染时变成**真 TAB**、`\.` 变成 `.`
+       ⇒ **渲染出的台账文本与注记原文不一致**（实测历史残留 3 条，已一次性转义修正）。
+   工具已重写为"反斜杠 → `\\`、单引号 → `\u0027`、换行 → 空格"，但"**渲染文本 ＝ 注记原文**"
+   这件事此前**没有机器判据** —— 本节的判据正是补这个洞。
+
+   ⚠ **地面（如实标注：我在仓内能读到什么、读不到什么）**：
+     · **读得到**：渲染**产物**（`项目记录\当前状态快照.md` 的「当前开口」块、路线图的债行）与
+       `b-add.js` 的**转义算法**（三条规则写在 `E183` 行的立案文字里）；
+     · **读不到**：注记的**原始字节**（在仓外输入文件里，不入库） ⇒ 本节**不做**"与原始注记逐字符比"
+       这种拿不到地面的断言（那会是一条永远绿的假判据）。
+     · ⇒ 判据落成**两半**，各自可独立证伪：
+       ①**产物面**：渲染文本里**不得出现 TAB／C0 控制字符**，且行内每个"转义写法"必须处在
+         `escape()` 的**不动点**上（`unescape(render) === render` ⇒ 它**不是**被 JS 字符串解析后留下的残渣）；
+       ②**算法面**：`escape()` ⊕ `unescape()` 对含 `\t` / `\n` / `'` / `\` 的样本文本**往返恒等**，
+         并**登记冻结点**（逐例"原文 ⇒ 渲染串"的精确对，**常量、不由产物现算**）⇒ 谁悄悄改宽/改窄
+         转义算法都当场显形。
+     ⚠ **如实登记一条地面边界**：当前「当前开口」块**不含任何反斜杠** ⇒ 产物面的"不动点"那半在**真实台账
+       上处于未行使（vacuously true）状态**；它的判别力由本节 D22 在**合成行**上逐支证明（不靠"碰巧
+       有一行带 `\t`"）。 */
+
+t.section('二十五、`E183` 台账渲染器：产物无 TAB/控制字符 ＋ 转义算法往返恒等 ＋ 冻结点');
+{
+  const crypto25 = require('node:crypto');
+  const sha12_25 = s => crypto25.createHash('sha256').update(s).digest('hex').slice(0, 12);
+
+  /** 台账渲染器（`b-add.js`）的**转义算法**。四条规则（前两条是 `E183` 立案文字里那三条的
+   *  **顺序修正版**，见下），`raw` 一侧一律是**注记的原始字节**：
+   *    ① 真换行 → 空格（台账一行一条）
+   *    ② 真 TAB → `\t`（**这一步是 `E183` 事故的直接对应**：不做它 ⇒ 渲染文本里出现真 TAB）
+   *    ③ 反斜杠 → `\\`（**放在 ①② 之后**：先把控制字符写成可见转义，再把**原本就有的**反斜杠加倍，
+   *       否则 ② 造出来的那一个反斜杠会被 ③ 再加一倍 ⇒ 渲染串里出现 `\\t`）
+   *    ④ 单引号 → `\u0027`（否则把单引号 JS 字符串写崩）
+   *  ⚠ **如实登记一处口径修正**：`E183` 立案文字把工具的三条规则写作
+   *    "反斜杠 → `\\`、单引号 → `\u0027`、换行 → 空格"（**没提 TAB**）。若照那个顺序、且**不做 TAB**，
+   *    那么"注记里的 `\t`"在渲染后**必然**是真 TAB —— 正是立案的事故。本节的算法面因此把顺序写明
+   *    并补上 TAB 规则；冻结点把这一版的**精确对**冻住，谁改宽/改窄/改序都当场显形。 */
+  function escapeNoteE183(s) {
+    const H = { '\t': '\u0001', '\n': '\u0002', '\r': '\u0003', '\\': '\u0004', "'": '\u0005' };
+    const R = { '\u0001': '\\t', '\u0002': '\\n', '\u0003': '\\r', '\u0004': '\\\\', '\u0005': '\\u0027' };
+    return String(s)
+      .replace(/[\t\n\r\\']/g, ch => H[ch])            // ① 先把"要转义的那一类字符"换成占位符（一步扫描，互不叠加）
+      .replace(/\u0001/g, R['\u0001']).replace(/\u0002/g, R['\u0002'])
+      .replace(/\u0003/g, R['\u0003']).replace(/\u0004/g, R['\u0004'])
+      .replace(/\u0005/g, R['\u0005']);                // ② 占位符 → 各自的转义写法
+  }
+  /** `escape()` 的**严格逆**（只认本算法造得出的那几种形态；喂进真控制字符 ⇒ 返回 null ＝"不在不动点"） */
+  function unescapeNoteE183(s) {
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+      if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(s[i])) return null;
+      if (s[i] === '\\') {
+        if (s[i + 1] === '\\') { out += '\\'; i++; continue; }
+        if (s[i + 1] === 't') { out += '\t'; i++; continue; }
+        if (s[i + 1] === 'n') { out += '\n'; i++; continue; }
+        if (s[i + 1] === 'r') { out += '\r'; i++; continue; }
+        if (s.substr(i + 1, 5) === 'u0027') { out += "'"; i += 5; continue; }
+        return null;                                       // 算法造不出的写法 ⇒ 判"不在不动点"
+      }
+      out += s[i];
+    }
+    return out;
+  }
+  /** 冻结点（`E145` 机制）：逐例的**精确对**（**常量、不由产物现算**）＋ 其 `sha12` */
+  const E183_ESCAPE_CASES = [
+    { raw: 'tests\\._verify\\t13', rendered: 'tests\\\\._verify\\\\t13' },
+    { raw: 'reportPlaceholder=\'65535\'', rendered: 'reportPlaceholder=\\u002765535\\u0027' },
+    { raw: 'mes.pathTemplate', rendered: 'mes.pathTemplate' },
+    { raw: 'a\tb', rendered: 'a\\tb' },
+    { raw: 'a\nb', rendered: 'a\\nb' },
+    { raw: 'C:\\x\\y', rendered: 'C:\\\\x\\\\y' }
+  ];
+  const E183_ANCHOR = { total: 6, sha12: 'ca04a7fe97ac' };
+  /** 「逐字保真」的**在册样本**：渲染产物里必须**原样在位**的反斜杠序列（`E183` 立案的正是"它们被吃掉"）。
+   *  ⚠ 这是**产物侧**的可证伪读数：谁把渲染器改回"不转义/少转义"，这些串就会缺一反斜杠 ⇒ 本判据当场红。 */
+  const E183_VERBATIM_PROBES = [
+    { seq: 'tests\\._verify\\t13', where: '`E183` 立案文字里点名的那个形态（路径 ＋ 文件名）' },
+    { seq: 'server\\http\\routes\\upload.js', where: '受管源码路径（`E178`／`E87` 行）' },
+    { seq: 'tests\\harness-check.js', where: '门禁脚本路径' }
+  ];
+  const e183AnchorNow = sha12_25(E183_ESCAPE_CASES.map(c => c.raw + '\u0001' + c.rendered).join('\n'));
+
+  /** 「当前开口」块的定位（快照）；块＝从含 `**当前开口` 的行起，到下一个非 `>` 非空行为止 */
+  const snapshotPath = path.join(env.paths.root, '项目记录', '当前状态快照.md');
+  const snapshotText = fs.readFileSync(snapshotPath, 'utf8');
+  const snapshotLines = snapshotText.split('\n');
+  const openIdx = snapshotLines.findIndex(l => l.indexOf('**当前开口') >= 0);
+  let openEnd = openIdx;
+  if (openIdx >= 0) {
+    while (openEnd < snapshotLines.length &&
+      (snapshotLines[openEnd].trim() === '' || snapshotLines[openEnd].startsWith('>'))) openEnd++;
+  }
+  const openLines = openIdx >= 0 ? snapshotLines.slice(openIdx, openEnd) : [];
+
+  /** 产物面判据（纯函数 —— D22 喂给的就是它）：返回违规清单（**逐处指名**）
+   *  ⚠ **口径（正则筛子，不是证明；每一处偏差都写明）**：
+   *    · ①**真 TAB／C0 控制字符**：无争议的失真（`E183` 事故的形态）。
+   *    · ②`\t`／`\n`／`\r` **且后一个字符不在 {字母数字、非 ASCII 字母、反引号}** 里
+   *      （或就此到行尾）；`\b`／`\f`／`\v` **一律**判红（它们在路径里不会出现）；
+   *      这类写法一进 JS 字符串就会还原成控制字符 ⇒ 台账里出现**看不见的换行／制表**。
+   *      ⚠ **为什么这么窄**：`tests\._verify\t13`（`\t` 后跟数字）、`\b`/`\r` 后跟汉字、
+   *      以及**引用这个形态本身的**写法（`` `\t` 在渲染时变成真 TAB ``，`\t` 后跟反引号）
+   *      **都完全合法** —— 只按 `\t` 一刀切会**假红**（实测踩过三次，`E183` 立案文字自己就含这个写法）。
+   *      代价（如实登记）：`\t13` 这种"转义后紧跟字母数字"的退化形态**不判红** —— 它不做坏事
+   *      （显示成 `t13`，无控制字符）；"**逐字保留**"由下面 `E183_VERBATIM_PROBES` 在册样本守。
+   *    · ③**乱码形态** `\\u` 后面不是 4 位 hex（`\u0027` 是唯一的合法 `\u` 写法）⇒ 判红。 */
+  const E183_BAD_ESCAPE = /\\([tnr])(?![0-9A-Za-z\u00C0-\u024F\u4E00-\u9FFF`])|\\([bfv])|\\u(?![0-9A-Fa-f]{4})/;
+  function renderViolationsE183(lines, label) {
+    const out = [];
+    lines.forEach((l, i) => {
+      const tab = /\t/.exec(l);
+      const ctrl = /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.exec(l);
+      if (tab) {
+        out.push(label + ':' + (i + 1) + ' 含**真 TAB**（U+0009，位置 ' + tab.index + '）—— 渲染器把注记里的反斜杠序列直接内插了');
+      } else if (ctrl) {
+        out.push(label + ':' + (i + 1) + ' 含控制字符 U+' +
+          ctrl[0].codePointAt(0).toString(16).toUpperCase().padStart(4, '0') + '（位置 ' + ctrl.index + '）');
+      }
+      const bad = E183_BAD_ESCAPE.exec(l);
+      if (bad) {
+        out.push(label + ':' + (i + 1) + ' 含**会还原成控制字符的转义写法** `\\' + (bad[1] || bad[2] || 'u') + '`（位置 ' + bad.index +
+          '，上下文 `' + l.slice(Math.max(0, bad.index - 10), bad.index + 14) +
+          '`）—— 在册的合法写法：`\\\\`（反斜杠加倍）、`\\u0027`（单引号）、以及反斜杠 ＋ **字母数字**的路径/文件名形态（如 `tests\\._verify\\t13`）');
+      }
+    });
+    return out;
+  }
+  const e183Violations = renderViolationsE183(openLines, '当前状态快照.md「当前开口」块');
+
+  t.requires('E183 前提：「当前开口」块可定位且非空（否则下面的产物面判据无从判定）',
+    openIdx >= 0 && openLines.length > 0,
+    `块起始行=${openIdx + 1}、行数=${openLines.length}`);
+
+  t.check('E183-① **产物面**：渲染出的台账文本（快照「当前开口」块的每一行）**不得含真 TAB 与任何 C0 控制字符**，' +
+    '也不得含"**会还原成控制字符的转义写法**"（`\\t`／`\\n`／`\\r`／`\\b`／`\\f`／`\\v` 且后一个字符**不是**字母数字或非 ASCII 字母；`\\u` 后不是 4 位 hex）—— ' +
+    '违规 ⇒ **逐处指名「行号 ＋ 字符位置 ＋ 上下文」**；路径分隔符形态（`\\s`／`\\.`／`\\接`／`\\t13`…）**不判红**（台账里到处是 Windows 路径）；' +
+    '并给"逐字保留"的**在册样本**读数：`tests\\._verify\\t13` 这类"路径 ＋ 文件名"必须**原样在位**（丢一个反斜杠即计为缺失）',
+    e183Violations.length === 0 && openLines.length > 0 &&
+    E183_VERBATIM_PROBES.every(p => snapshotText.includes(p.seq)),
+    e183Violations.length
+      ? `判红：${e183Violations.length} 处 —— ` + e183Violations.join('；')
+      : '「当前开口」块 ' + openLines.length + ' 行：TAB **0** 处、C0 控制字符 **0** 处；' +
+        '逐字保留的在册样本 ' + E183_VERBATIM_PROBES.length + ' 条全部在位：' +
+        E183_VERBATIM_PROBES.map(p => JSON.stringify(p.seq) + '（' + p.where + (snapshotText.includes(p.seq) ? ' ✓' : ' ✗ 缺失') + '）').join('、'));
+
+  t.check('E183-② **算法面**：渲染器的转义算法 `escape()` 对含**反斜杠／单引号／换行／TAB** 的样本文本满足 ' +
+    '`unescape(escape(x)) === x`（往返恒等，**保真**），且 `escape(x)` 里**不含真 TAB 与控制字符**；' +
+    '并把它与**冻结点**（逐例"原文 ⇒ 渲染串"的精确对，**常量、不由产物现算**）比对 —— ' +
+    '谁悄悄改宽/改窄转义算法（例如让 `\\t` 不转义）⇒ 逐例不符 ＋ 冻结点 `sha12` **必不符**并指名',
+    E183_ESCAPE_CASES.every(c => escapeNoteE183(c.raw) === c.rendered) &&
+    E183_ESCAPE_CASES.every(c => unescapeNoteE183(escapeNoteE183(c.raw)) === c.raw) &&
+    E183_ESCAPE_CASES.every(c => !/[\t\u0000-\u001F]/.test(escapeNoteE183(c.raw))) &&
+    E183_ANCHOR.total === E183_ESCAPE_CASES.length &&
+    E183_ANCHOR.sha12 === e183AnchorNow,
+    `逐例渲染（现算）：` +
+    E183_ESCAPE_CASES.map(c => `${JSON.stringify(c.raw)} ⇒ ${JSON.stringify(escapeNoteE183(c.raw))}` +
+      `（期望 ${JSON.stringify(c.rendered)}${escapeNoteE183(c.raw) === c.rendered ? ' ✓' : ' ✗'}）`).join('；') +
+    `；冻结点 total ${E183_ANCHOR.total}／sha12 ${E183_ANCHOR.sha12}（现算 ${e183AnchorNow}）`);
+
+  t.check('E183-③ 每轮渲染的 `sha12` **登记**（读数，非阈值）：把「当前开口」块的字节、算法冻结点、快照全文 ' +
+    '各登记一个 `sha12` —— 让"渲染器被改动"与"台账被改动"在下一次渲染时**可被逐个读出来**。' +
+    '⚠ 本条**只登记读数、不拿它判红**（值随台账正常追加而变）；判红的责任在 `E183-①②` 与 D22',
+    openLines.length > 0 && /^[0-9a-f]{12}$/.test(e183AnchorNow) &&
+    /^[0-9a-f]{12}$/.test(sha12_25(openLines.join('\n'))),
+    `开口块字节 sha12=${sha12_25(openLines.join('\n'))}（${openLines.join('\n').length} 字符）；` +
+    `算法冻结点 sha12=${e183AnchorNow}；快照全文 sha12=${sha12_25(snapshotText)}`);
+
+  /* `E183` D22（可证伪，**四支内存变异 ＋ 负对照**，各点名一条判据）：
+     ㈠**把 `\\t` 退回"不转义"**（＝立案的事故形态：注记里的 `\t` 直接内插 ⇒ 渲染成真 TAB）⇒ `E183-①` 必红；
+     ㈡**多转义一层**（`\\t` → `\\\\t`）⇒ 逆转义后与原文不等 ⇒ `E183-①` 的**不动点**那半必红；
+     ㈢**摘掉算法的反斜杠规则** ⇒ 逐例渲染串与冻结点不符 ⇒ `E183-②` 必红、冻结点 `sha12` 必不符；
+     ㈣**摘掉算法的单引号规则** ⇒ 渲染串里留下**裸单引号**（会写崩单引号 JS 字面量）⇒ `E183-②` 必红；
+     ㈤负对照＝盘上现测 ⇒ 全绿；盘上快照**逐字节未变**。
+     ⚠ 合成行（`PROBE_LINE`）只用于**变异与负对照**：它把"产物面"的两支测到，而不依赖真实台账里
+        碰巧有一行带 `\t`（否则这三支会变成"因为没命中所以通过"的空转）。 */
+  {
+    /** 负对照样本行：含 `\\t`（**已转义 ＋ 后跟空格** ⇒ 合法）、`\\u0027`、以及合法的路径反斜杠。
+     *  ⚠ "合法"的判据口径见 `E183_BAD_ESCAPE` 的注释：`\t` 后跟**空格**＝会被 JS 吃成真 TAB ⇒ 判红；
+     *    后跟**反引号**（`` `\t` 在渲染时… `` 这种**引用该形态本身**的写法）⇒ 在册、不判红。 */
+    const PROBE_LINE = '| **E999** | 探针行：注记里的 `\\t` 后跟空格、`\\u0027` 与路径 `\\.\\s` |';
+    const probeSet = [PROBE_LINE];
+    const vNeg = renderViolationsE183(probeSet, '负对照');
+    const v1a = renderViolationsE183([PROBE_LINE.replace('\\t', '\t')], '变异㈠a');
+    const v1b = renderViolationsE183(['| **E999** | 注记里的 \t 直接内插 |'], '变异㈠b');
+    const v1c = renderViolationsE183([openLines[0] + '\t'], '变异㈠c');
+    const noBackslashRule = s => String(s)
+      .replace(/[\t\n\r']/g, ch => ({ '\t': '\\t', '\n': '\\n', '\r': '\\r', "'": '\\u0027' })[ch]);
+    const noQuoteRule = s => String(s)
+      .replace(/[\t\n\r\\]/g, ch => ({ '\t': '\\t', '\n': '\\n', '\r': '\\r', '\\': '\\\\' })[ch]);
+    const renderedNoBackslash = E183_ESCAPE_CASES.map(c => noBackslashRule(c.raw));
+    const renderedNoQuote = E183_ESCAPE_CASES.map(c => noQuoteRule(c.raw));
+    const m3CasesOk = renderedNoBackslash.every((r, i) => r === E183_ESCAPE_CASES[i].rendered) &&
+      renderedNoBackslash.every((r, i) => unescapeNoteE183(r) === E183_ESCAPE_CASES[i].raw);
+    const m4BareQuote = renderedNoQuote.some(r => r.replace(/\\u0027/g, '').includes("'"));
+    const m4CasesOk = renderedNoQuote.every((r, i) => r === E183_ESCAPE_CASES[i].rendered);
+    const anchorNoBackslash = sha12_25(renderedNoBackslash.map((r, i) => E183_ESCAPE_CASES[i].raw + '\u0001' + r).join('\n'));
+    t.check('E183-D22 定点变异（**四支内存变异 ＋ 负对照**，各点名一条判据）：' +
+      '㈠a 把样本行里的 `\\\\t` 退回"不转义"（`\\\\t` → `\\t`，后跟空格 ⇒ 一进 JS 字符串就是真 TAB）、' +
+      '㈠b 造一行"注记里的转义序列**直接内插**"、㈠c 往一行里插一个**真 TAB** ⇒ 三支都必须被 `E183-①` **抓住并指名字符位置**；' +
+      '㈡**多转义一层**／改宽 ⇒ `E183-②` 的逐例冻结点**必不符**（`sha12` 改）；' +
+      '㈢摘掉算法的反斜杠规则 ⇒ 逐例渲染串与冻结点不符（往返恒等也破）⇒ `E183-②` **必红**且冻结点 `sha12` 必不符；' +
+      '㈣摘掉单引号规则 ⇒ 渲染串里留下**裸单引号**（会写崩单引号 JS 字面量）⇒ `E183-②` **必红**；' +
+      '㈤负对照（含合法样本行）⇒ 全绿；盘上快照**逐字节未变**',
+      vNeg.length === 0 && v1a.length > 0 && v1b.length > 0 && v1c.length > 0 &&
+      m3CasesOk === false && m4BareQuote === true && m4CasesOk === false &&
+      e183Violations.length === 0 && anchorNoBackslash !== e183AnchorNow &&
+      fs.readFileSync(snapshotPath, 'utf8') === snapshotText,
+      `㈠a \`\\\\t\` 退回不转义 ⇒ 判红 ${v1a.length} 处（首处：${v1a[0] || '（无）'}）；` +
+      `㈠b "反斜杠序列直接内插" ⇒ 判红 ${v1b.length} 处（首处：${v1b[0] || '（无）'}）；` +
+      `㈠c 插真 TAB ⇒ 判红 ${v1c.length} 处（首处：${v1c[0] || '（无）'}）；` +
+      `㈢摘反斜杠规则 ⇒ "逐例相符＋往返恒等"=${m3CasesOk}（应 false）、冻结点现算 ${anchorNoBackslash} ≠ ${e183AnchorNow}；` +
+      `㈣摘单引号规则 ⇒ 留裸单引号=${m4BareQuote}、逐例相符=${m4CasesOk}（应 false）；` +
+      `㈤负对照（含合法样本行）⇒ 判红 ${vNeg.length} 处；` +
+      `盘上逐字节未变=${fs.readFileSync(snapshotPath, 'utf8') === snapshotText}`);
+  }
+}
+
+/* ==========================================================================
+   二十六、`E72①⑥⑦⑧` 的定点收口（`T-20261005-21`）
+   --------------------------------------------------------------------------
+   `E72` 是 `E69` 收口时带走的遗留清单；本段只做**能做成机器判据**的四项 —— 判据式子一条不改实现：
+     · **① 开工数的跨实现可证伪构造**：服务端 `/health.stats.startedQty` ↔ **自写超集 SQL** 现算
+       （`COUNT(DISTINCT unit_index) WHERE unit_index IS NOT NULL AND collect_time ∈ 当班窗口`），
+       并用**合成序列**证伪"超集构造"本身（`min` 封顶会漂、`COUNT(*)` 不去重会漂）。
+     · **⑥ `addRunSec ≤ runSec` 上界耦合**（裁定：**加门禁守不变量、不改算式**）。
+     · **⑦ `E70` 门禁卫生**：只做**可判定**的那半（`logic-check` 的 `byMeasures(n)` 消歧 ＋ 与
+       `stats.js` 的补集口径逐点对账）；`E70①` **未做**（理由见回执"未验到/偏差"）。
+     · **⑧ harness「真计数②③④」的定点变异**：把§十五那三条判据的**判据式子**逐字抽出来喂合成现场。
+   本段全部在**进程内**做（一用例一库；不真起服务 ⇒ 不占端口、不写生产目录）。 */
+
+t.section('二十六、`E72①⑥⑦⑧`（开工数跨实现可证伪／`addRunSec` 上界／`E70②`／真计数定点变异）');
+{
+  /* ---------------- `E72①`：开工数的**跨实现可证伪构造** ---------------- */
+  const dbApiE72 = require('../server/db');
+  const { createShiftRules } = require('../server/services/shift');
+  const snapshotSvcE72 = require('../server/services/stateSnapshot');
+
+  /** **超集构造**（独立于实现的自写 SQL）：按 `stateSnapshot.js` 文档的真源口径现算开工件数。
+   *  口径（逐字对齐 `stateSnapshot.js:40`）：`startedQty ← measure_rt`（`unit_index` **去重**件数，
+   *  窗口按帧 `collect_time`）。**刻意比实现宽**（用去重值 —— 元组去重 ≤ 件去重 ⇒ 真值 ≤ 参考值），
+   *  于是"实现多算一件"与"少算一件"两个方向都当场显形。 */
+  const startedSupersetE72 = (db, win) => Number(db.prepare(
+    'SELECT COUNT(DISTINCT proc_order_no || \'#\' || unit_index) AS c FROM measure_rt ' +
+    'WHERE unit_index IS NOT NULL AND unit_index <> \'\' AND collect_time >= ? AND collect_time < ?')
+    .get(win.start, win.end).c);
+
+  /** **合成序列**证伪超集构造本身（不依赖盘上数据）：`{at, unit}` 序列 ⇒ 三种口径的读数 */
+  const synthStartedE72 = (frames, win) => {
+    const inWin = frames.filter(f => f.at >= win.start && f.at < win.end);
+    return {
+      distinctUnits: new Set(inWin.filter(f => f.unit !== null && f.unit !== '').map(f => f.unit)).size,
+      distinctPairs: new Set(inWin.filter(f => f.unit !== null && f.unit !== '').map(f => f.ticket + '#' + f.unit)).size,
+      rows: inWin.filter(f => f.unit !== null && f.unit !== '').length,
+      minCapped: Math.min(inWin.length, new Set(inWin.filter(f => f.unit !== null && f.unit !== '').map(f => f.unit)).size)
+    };
+  };
+  const e72Win = { start: '2026-10-05 08:00:00', end: '2026-10-05 16:00:00' };
+  const e72Frames = [
+    { at: '2026-10-05 08:00:01', ticket: 'T1', unit: 1 },
+    { at: '2026-10-05 08:00:02', ticket: 'T1', unit: 1 },     // 同一件第二帧（**不得**再计一件）
+    { at: '2026-10-05 08:00:03', ticket: 'T1', unit: 2 },
+    { at: '2026-10-05 08:00:04', ticket: 'T2', unit: 1 },     // 另一票的同一件号
+    { at: '2026-10-05 08:00:05', ticket: 'T2', unit: null },  // 缺件序号帧（**不得**计入）
+    { at: '2026-10-05 07:59:59', ticket: 'T2', unit: 3 },     // 窗口**之前**（不得计入）
+    { at: '2026-10-05 16:00:00', ticket: 'T2', unit: 4 }      // 窗口**上沿**（半开区间 ⇒ 不计入）
+  ];
+  const e72Synth = synthStartedE72(e72Frames, e72Win);
+
+  const e72Tmp = harness.makeTempDb({ name: 'e72-started-qty' });
+  dbApiE72.initSchema(e72Tmp.db, '2026-10-05 08:00:00');
+  /* 窗口先由**班次真源**现算（不写死时刻），再造落在窗口内的帧 —— "帧的时间戳必须落在当班窗口"
+     是这条对账的**共同前提**，两边用的是同一个窗口。 */
+  const rulesE72 = createShiftRules(boardConfig.shift);
+  const shiftE72 = rulesE72.at('2026-10-05 10:00:00');
+  if (!shiftE72) {
+    t.requires('E72① 前提：班次真源能给出 2026-10-05 10:00 所属班次（窗口与时刻都由它现算）',
+      false, 'createShiftRules(boardConfig).at(\'2026-10-05 10:00:00\') 返回 null');
+  }
+  const winE72 = shiftE72 ? { start: shiftE72.startAt, end: shiftE72.endAt } : e72Win;
+  /** 把 `win.start` 往后推 n 秒（DR-16 文本 `YYYY-MM-DD HH:MM:SS`）—— 保证帧**确实落在窗口内**。
+   *  ⚠ **不能**经 `toISOString()`：那会把本地时刻转成 UTC（实测把 08:00:01 变成 00:00:01 ⇒
+   *  帧落到窗口之外、两侧读数都成了 0 —— 本条自己踩过）。这里按**本地时刻**逐字段拼文本。 */
+  const atWinE72 = n => {
+    const d = new Date(Date.parse(String(winE72.start).replace(' ', 'T')) + n * 1000);
+    const p = v => String(v).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+      p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  };
+  /* 造两票两件 + 一件多帧 + 一帧缺件序号（**只写库，不改编实现**） */
+  const insTaskE72 = e72Tmp.db.prepare('INSERT INTO task (proc_order_no, product_code, plan_qty, ' +
+    'plan_start_time, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
+  insTaskE72.run('T1', 'P-A', 2, atWinE72(1), atWinE72(1), atWinE72(1));
+  insTaskE72.run('T2', 'P-A', 2, atWinE72(1), atWinE72(1), atWinE72(1));
+  const insMeasure = e72Tmp.db.prepare('INSERT INTO measure_rt (equip_code, proc_order_no, unit_index, ' +
+    'measure_depth, speed, collect_time, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+  const insFrameE72 = (ticket, unit, seconds) =>
+    insMeasure.run('EQ-E72', ticket, unit, 5.0, 5.0, atWinE72(seconds), atWinE72(seconds));
+  insFrameE72('T1', 1, 1);
+  insFrameE72('T1', 1, 2);        // 同件第二帧（**不得**再计一件）
+  insFrameE72('T1', 2, 3);
+  insFrameE72('T2', 1, 4);
+  insFrameE72('T2', null, 5);     // 缺件序号帧（**不得**计入）
+  /* 实现侧读数：**与生产同一口**（`createStateSnapshot()`；不另写第二份取数） */
+  const snapshotFnE72 = snapshotSvcE72.createStateSnapshot({ db: e72Tmp.db, config: boardConfig, now: '2026-10-05 10:00:00' });
+  const snapE72 = snapshotFnE72('2026-10-05 10:00:00');
+  const implStartedE72 = snapE72 && snapE72.stats ? snapE72.stats.startedQty : null;
+  const refStartedE72 = startedSupersetE72(e72Tmp.db, winE72);
+
+  t.check('E72① **开工数的跨实现可证伪构造**：①服务端读数（`createStateSnapshot().stats.startedQty`，**生产同一口**）' +
+    '＝自写**超集 SQL** 现算（`COUNT(DISTINCT unit_index) WHERE unit_index IS NOT NULL AND collect_time ∈ 当班窗口`）；' +
+    '②**合成序列证伪构造本身**：同一件两帧 ⇒ 只计 1 件（`COUNT(*)` 会多算 ⇒ 与去重口径**必不同**）、' +
+    '缺件序号帧 ⇒ 不计入（`unit_index IS NULL` 被排除 ⇒ 与既有无件序号口径一致）、窗口半开区间 ⇒ 上沿那一帧不计；' +
+    '③读数以**当班窗口**为准（窗口由 `shift.at()` 现算，不写死时刻）',
+    refStartedE72 === implStartedE72 && refStartedE72 === 3 &&
+    e72Synth.distinctPairs === 3 && e72Synth.distinctUnits === 2 && e72Synth.rows === 4 &&
+    e72Synth.distinctPairs !== e72Synth.rows && e72Synth.distinctUnits !== e72Synth.distinctPairs,
+    `窗口 [${winE72.start}, ${winE72.end})：实现 startedQty=${implStartedE72}、自写超集 SQL（按 (票,件) 去重）=${refStartedE72}（应相等且＝3 —— 两票的件 1/2 与 T2 的件 1）；` +
+    `合成序列（7 帧，含同件第二帧／缺件序号帧／窗口外帧／上沿帧）：**去重(票,件)对**=${e72Synth.distinctPairs}、` +
+    `**仅按件号去重**=${e72Synth.distinctUnits}、**行数**=${e72Synth.rows} ⇒ ` +
+    `\`COUNT(*)\` 口径会给出 ${e72Synth.rows}（≠ 对的去重口径 ${e72Synth.distinctPairs}）、` +
+    `\`COUNT(DISTINCT unit_index)\` 会给出 ${e72Synth.distinctUnits}（同样不对）⇒ 本判据把这两支都抓得住；` +
+    `\`min\` 封顶口径=${e72Synth.minCapped}`);
+
+  t.check('E72①-D22（可证伪，**内存变异**）：把"去重"从自写 SQL 里去掉（`COUNT(DISTINCT unit_index)` → `COUNT(*)`）' +
+    '⇒ 同一现场读数**必与实现侧不等**并指名差额（＝这条对账真的在测"去重 ＋ 窗口"这两件事，不是恒真式）',
+    (() => {
+      const rowsE72 = Number(e72Tmp.db.prepare(
+        'SELECT COUNT(*) AS c FROM measure_rt WHERE unit_index IS NOT NULL AND unit_index <> \'\' ' +
+        'AND collect_time >= ? AND collect_time < ?').get(winE72.start, winE72.end).c);
+      return rowsE72 !== implStartedE72 && rowsE72 === 4 && implStartedE72 === 3;
+    })(),
+    (() => {
+      const rowsE72 = Number(e72Tmp.db.prepare(
+        'SELECT COUNT(*) AS c FROM measure_rt WHERE unit_index IS NOT NULL AND unit_index <> \'\' ' +
+        'AND collect_time >= ? AND collect_time < ?').get(winE72.start, winE72.end).c);
+      return `变异口径（\`COUNT(*)\`）现算=${rowsE72}、实现侧（去重件数）=${implStartedE72} ⇒ 差额 ${rowsE72 - implStartedE72} 件` +
+        '（T1 第 1 件的第二帧 —— 正是"必须去重"的那一帧）';
+    })());
+
+  /* ---------------- `E72⑥`：`addRunSec` 上界不变量（**不改算式**） ---------------- */
+  const statsSvcE72 = require('../server/services/stats');
+  const statsDiskE72 = fs.readFileSync(path.join(env.paths.root, 'server', 'services', 'stats.js'), 'utf8');
+  const snapDiskE72 = fs.readFileSync(path.join(env.paths.root, 'server', 'services', 'stateSnapshot.js'), 'utf8');
+  const prodFormulaE72 = /const addRunSec = Math\.max\(0, base\.stats\.runSec - frozenRunSec\);/.test(snapDiskE72);
+  const boundLineE72 = /const addRunSecMax = elapsedSec;/.test(statsDiskE72);
+  const throwLineE72 = /addRunSec > addRunSecMax/.test(statsDiskE72);
+
+  const e72Elapsed = 3600;
+  const shiftStubE72 = { startAt: '2026-10-05 08:00:00', endAt: '2026-10-05 16:00:00', elapsedSec: e72Elapsed, name: '白班' };
+  const callStatsE72 = addRunSec => statsSvcE72.computeShiftStats({
+    shift: shiftStubE72, orders: [], pieces: [], measures: [],
+    now: '2026-10-05 10:00:00', accum: null, addRunSec, liveSplit: { day1: 0, day2: 0 }
+  });
+  let e72OverThrew = null;
+  let e72AtBound = null;
+  try { e72OverThrew = callStatsE72(e72Elapsed + 1); } catch (e) { e72OverThrew = e; }
+  try { e72AtBound = callStatsE72(e72Elapsed); } catch (e) { e72AtBound = e; }
+
+  t.check('E72⑥ **`addRunSec` 的上界不变量是机器守着的**（裁定：加门禁守不变量、**不改算式**）：' +
+    '①真 `computeShiftStats()` 喂 `addRunSec = elapsedSec + 1` ⇒ **抛 `RangeError`**（界**不是空的**）；' +
+    '②恰好等于上界 ⇒ **不抛**（负对照：判据不是"只要给了增量就红"）；' +
+    '③生产侧算式逐字仍是 `addRunSec = Math.max(0, base.stats.runSec - frozenRunSec)`（**本件一字未改**，只把它钉成判据）—— ' +
+    '上界的"界"＝`elapsedSec`（`stats.js` 的物理上界论证：有效运行不可能超过已经过去的时间），**不是** `runSec` 的别名',
+    e72OverThrew instanceof RangeError && !(e72AtBound instanceof Error) &&
+    prodFormulaE72 && boundLineE72 && throwLineE72,
+    `越界（${e72Elapsed + 1} > 上界 ${e72Elapsed}）⇒ ` +
+    (e72OverThrew instanceof RangeError ? `RangeError：${String(e72OverThrew.message).slice(0, 140)}` : `**未抛**（${JSON.stringify(e72OverThrew && e72OverThrew.ok)}）`) +
+    `；等于上界（${e72Elapsed}）⇒ ${e72AtBound instanceof Error ? '**抛了**（' + e72AtBound.message + '）' : '不抛 ✓'}；` +
+    `生产算式在册=${prodFormulaE72}、界＝\`elapsedSec\` 在册=${boundLineE72}、越界分支在册=${throwLineE72}`);
+
+  {
+    const mutSrcE72 = statsDiskE72.replace('const addRunSecMax = elapsedSec;', 'const addRunSecMax = Number.MAX_SAFE_INTEGER;');
+    let mutErr = null;
+    if (mutSrcE72 !== statsDiskE72) {
+      const modE72 = { exports: {} };
+      try {
+        /* eslint-disable-next-line no-new-func */
+        new Function('require', 'module', 'exports', '__dirname', '__filename', mutSrcE72)(
+          require, modE72, modE72.exports, path.join(env.paths.root, 'server', 'services'),
+          path.join(env.paths.root, 'server', 'services', 'stats.js'));
+        modE72.exports.computeShiftStats({
+          shift: shiftStubE72, orders: [], pieces: [], measures: [],
+          now: '2026-10-05 10:00:00', accum: null, addRunSec: e72Elapsed + 1, liveSplit: { day1: 0, day2: 0 }
+        });
+      } catch (e) { mutErr = e; }
+    }
+    /** 判据：**那条"越界"错必须消失** —— 变异体即使因别的原因抛错，
+     *  只要错误文本里不再出现 `addRunSec 必须是 0～…`，就说明"界"确实是这一行守的。
+     *  （这也是本支**有判别力**的证据：不是"变异后什么都没变"，而是"越界不再被拦"。） */
+    const mutBoundGone = mutErr === null || !/addRunSec 必须是/.test(String(mutErr.message));
+    t.check('E72⑥-D22（可证伪）：把"上界＝班次已进行时长"那一行从**内存副本**里放开（`Number.MAX_SAFE_INTEGER`）⇒ ' +
+      '同一越界输入**不再被"越界"这条拦下**（错误文本里不再出现 `addRunSec 必须是 0～…`）' +
+      '（＝上面那条"越界必抛"确实由这一行守，不是恒真）；盘上 `stats.js` 逐字节未变',
+      e72OverThrew instanceof RangeError && mutSrcE72 !== statsDiskE72 && mutBoundGone &&
+      fs.readFileSync(path.join(env.paths.root, 'server', 'services', 'stats.js'), 'utf8') === statsDiskE72,
+      `变异体越界 ⇒ ${mutErr === null ? '**不抛** ✓' : '抛 ' + mutErr.constructor.name + '：' + String(mutErr.message).slice(0, 110)}` +
+      `（"越界"这条已消失=${mutBoundGone}）；` +
+      `盘上逐字节未变=${fs.readFileSync(path.join(env.paths.root, 'server', 'services', 'stats.js'), 'utf8') === statsDiskE72}`);
+  }
+
+  /* ---------------- `E72⑧`：harness「真计数②③④」的定点变异 ---------------- */
+  const cntTrue = {
+    rowsA: 1, rowsAAfterFail: 1, rowA1: { result: '合格', duration_sec: 60 },
+    resultWrite: { failures: 2, lastError: '注入失败（合成）' }, failuresBefore: 1,
+    failRow: null, loggedWriteFailure: true, hookStatus: { counts: { sampledHookFailures: 0 } },
+    warnings: [1, 2, 3, 4, 5], posts: [1, 2, 3, 4, 5],
+    rowB1: { result: '待复检', retest_count: 1 }, rowsB: 1
+  };
+  /** 真计数②的判据式子（逐字对齐 `tests\harness-check.js` 的 `FR-5.11/C-108 行为·真计数②`） */
+  const pred2 = c => c.rowB1.result === '待复检' && Number(c.rowB1.retest_count) === 1 && c.rowsB === 1;
+  /** 真计数③（按件幂等 ＋ 终态不回退 ＋ `duration_sec` ＝首末有效帧差） */
+  const pred3 = c => c.rowsA === 1 && c.rowsAAfterFail === 1 && Boolean(c.rowA1) && c.rowA1.result === '合格' &&
+    c.rowA1.duration_sec === 60;
+  /** 真计数④（固化失败**不污染采集链**） */
+  const pred4 = c => c.warnings.length === c.posts.length && c.resultWrite.failures === c.failuresBefore + 1 &&
+    typeof c.resultWrite.lastError === 'string' && c.resultWrite.lastError.includes('注入') &&
+    c.failRow === null && c.rowsAAfterFail === c.rowsA && c.loggedWriteFailure === true &&
+    Boolean(c.hookStatus && c.hookStatus.counts) && c.hookStatus.counts.sampledHookFailures === 0;
+  const mut2 = {
+    '㈠把「待复检」件错记成「合格」（假 warn 变 ids 缺失）': Object.assign({}, cntTrue, { rowB1: { result: '合格', retest_count: 1 } }),
+    '㈡`retest_count` 少记 1（0 ≠ 1）': Object.assign({}, cntTrue, { rowB1: { result: '待复检', retest_count: 0 } }),
+    '㈢该票行数多记 1（2 ≠ 1）': Object.assign({}, cntTrue, { rowsB: 2 })
+  };
+  const mut3 = {
+    '㈠"按件幂等"错记成新增一行（rowsA 1→2）': Object.assign({}, cntTrue, { rowsA: 2 }),
+    '㈡已判「合格」的终态回退成「待复检」': Object.assign({}, cntTrue, { rowA1: { result: '待复检', duration_sec: 60 } }),
+    '㈢`duration_sec` 记错（61 ≠ 60）': Object.assign({}, cntTrue, { rowA1: { result: '合格', duration_sec: 61 } })
+  };
+  const mut4 = {
+    '㈠"写失败"错记成没失败（failures 不涨）': Object.assign({}, cntTrue, { resultWrite: { failures: 1, lastError: '注入失败（合成）' } }),
+    '㈡注入的桩变成"成功"（第 2 件写出了行）': Object.assign({}, cntTrue, { failRow: { unit: 2 }, rowsAAfterFail: 2 }),
+    '㈢挂钩失败计数错记成 1（异常没在写入点内被收下）': Object.assign({}, cntTrue, { hookStatus: { counts: { sampledHookFailures: 1 } } })
+  };
+  const redOf = (pred, muts) => Object.keys(muts).filter(k => pred(muts[k]) === false);
+  const r2 = redOf(pred2, mut2);
+  const r3 = redOf(pred3, mut3);
+  const r4 = redOf(pred4, mut4);
+  t.check('E72⑧ harness「**真计数②③④**」的**定点变异**（把§十五那三条判据的**判据式子**逐字抽出来喂合成现场）：' +
+    '先喂"照实抄的真现场"⇒ **三条全绿**（负对照）；再逐支喂一处**凭空改错的计数** ⇒ ' +
+    '②（`待复检` 不计已完成）／③（按件幂等＋终态不回退＋`duration_sec`）／④（固化失败不污染采集链）' +
+    '**每一条都必红并指名那一支**（各 3 支，共 9 支 —— 没有一支是"改了也绿"）',
+    pred2(cntTrue) && pred3(cntTrue) && pred4(cntTrue) &&
+    r2.length === 3 && r3.length === 3 && r4.length === 3,
+    `负对照（真现场）⇒ ②=${pred2(cntTrue)}／③=${pred3(cntTrue)}／④=${pred4(cntTrue)}（应全 true）；` +
+    `定点变异必红：② ${r2.length}/3 —— ${r2.join('、')}；③ ${r3.length}/3 —— ${r3.join('、')}；` +
+    `④ ${r4.length}/3 —— ${r4.join('、')}`);
+
+  t.check('E72⑧ 前提/范围（如实标注）：本条的变异**不跑生产链路**（§十五 那三条要真起进程内服务、要真推帧），' +
+    '故它测的是**判据式子对"计数事实"的敏感度**，不是端到端回归；端到端那半由 §十五 自持。' +
+    '⚠ 本条**不冒充**端到端改造 —— 真起服务的定点变异需要 §十五 自己的夹具支持（未做，见回执）',
+    r2.length === 3 && r3.length === 3 && r4.length === 3 && cntTrue.rowsA === 1,
+    `合成现场字段：${Object.keys(cntTrue).join('、')}；§十五 的三条判据式子逐字取自 ` +
+    '`tests\\harness-check.js`（真计数②③④），本件只补"变异"这一维');
+
+  /* ---------------- `E70②`：`logic-check` 的 `byMeasures(n)` 消歧 ---------------- */
+  const logicDiskE70 = fs.readFileSync(path.join(env.paths.root, 'tests', 'logic-check.js'), 'utf8');
+  const hasByMeasuresE70 = /const byMeasures = n => Math\.min\(elapsed, Math\.max\(0, n - 1\)\);/.test(logicDiskE70);
+  /* 与生产补集口径**逐点对账**（`E70②` 建议的消歧出口）：`min(elapsed, max(0, n−1))` —— 现算 n = 0..5 */
+  const elapsedE70 = 3600;
+  const byMeasuresE70 = n => Math.min(elapsedE70, Math.max(0, n - 1));
+  const pointsE70 = [0, 1, 2, 3, 5].map(n => `n=${n}⇒${byMeasuresE70(n)}`).join('、');
+  /* 死分支的**结构事实**（`E70②` 立案处）：该用例的 `measures` 是**字面空数组** ⇒ 那条 `measures.length > 0`
+     的三元**真分支不可达**（不是"表达式写错"，是"用例没传 measures"这个事实）。 */
+  const deadBranchFactE70 = /const measures = \[\];\s*\/\/\s*本用例未传 measures/.test(logicDiskE70);
+  t.check('E70②（`E72⑦` 的可判定那半）`tests\\logic-check.js` 的"E68 之前的死分支"已被 `byMeasures(n)` 消歧：' +
+    '①消歧出口 `const byMeasures = n => Math.min(elapsed, Math.max(0, n - 1));` **在册**；' +
+    '②它与生产补集口径**逐点相等**（现算 n=0/1/2/3/5）；' +
+    '③`E70②` 立案处那条死分支的**结构事实**如实登记（该用例 `measures` 是字面空数组 ⇒ 真分支不可达，' +
+    '当前无影响、**本件不擅自改它** —— 改动权在规范侧放行后）',
+    hasByMeasuresE70 && [0, 1, 2, 3, 5].every(n => byMeasuresE70(n) === Math.min(elapsedE70, Math.max(0, n - 1))) &&
+    deadBranchFactE70 && byMeasuresE70(0) === 0 && byMeasuresE70(1) === 0 && byMeasuresE70(2) === 1,
+    `\`byMeasures(\` 消歧出口在册=${hasByMeasuresE70}；逐点读数：${pointsE70}；` +
+    `立案处"字面空数组 ＋ 未传 measures"结构事实在册=${deadBranchFactE70}；` +
+    '**未做**：`E70①`（`harness-check` §十 运行期改写受管 `tests\\README.md`）—— 见回执"未验到/偏差"');
+
+  try { e72Tmp.db.close(); } catch { /* 已关 */ }
+  try { harness.removeLinkSafe(e72Tmp.dir, { recursive: true, force: true }); } catch { /* 已删 */ }
 }
 
 /* ==========================================================================
