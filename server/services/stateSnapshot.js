@@ -68,6 +68,12 @@
        `stats.shift.elapsedSec` 等当班进度**随秒前进**（跨秒两次读取可能差 1 s），这是当班
        进度的应有语义；`link` 与 `frame` 在同一次状态变化之间是稳定的。
      · 缺什么给什么：无工单/无帧/无上报器 ⇒ 对应键为 null 或按上文缺省，**绝不编造**数值。
+     · **`E129`（2026-10-05，T-20261005-09）**：`statsForShift()` 的采样窗口**不再按行数截断**
+       （旧实现 `ORDER BY id DESC LIMIT 1000`）：本表行频＝每秒每设备 1 行（ADR-0001 D7）
+       ⇒ 8 h 当班 28800 行，旧上限把 1 s × 2000 行的窗口算成 999 s（真值 1999 s），
+       `FR-4.11`／`FR-4.15` 两个 **P0** 静默偏低。现改为**按时间范围取全量**，并保留一条
+       "行数超出 D7 口径"的**去重告警**（`warnIfMeasureWindowDense()`，**只告警、一个数都不改**）。
+       判据、取舍与实测见该函数内的注释与 `tests\._verify\T-20261005-09\e129-事实-行频与截断.js`。
      · DR-17 累计运行（**ADR-0009 D4 落地**；**`E83` 起一次给两套投影**）：`stats.accumulate` 的
        日/月/年三档不再是恒 0 ——
        · **已固化部分**＝对 `shift_stat` 求和（读口 `repo/shiftStat.js` 的 `sumRunSec()`；
@@ -148,6 +154,54 @@ const EMPTY_RUN_SUMS = Object.freeze({
   undetermined: Object.freeze({ day: 0, month: 0, year: 0 }),
   rows: 0
 });
+
+/* ---- 技术债 `E129`：采样窗口的"行数超出 ADR-0001 D7 口径"告警（**只告警，不改任何读数**） ----
+   为什么需要它（"改完了为什么还留一个告警"）：`statsForShift()` 的窗口取数已由 `LIMIT 1000` 改成
+   **按时间范围取**（见该函数里 `measures` 那一段的长注释），于是"截断"在结构上不可能再发生；
+   但**读数为什么可信**依赖一条外部前提：本表行频＝**每秒每设备至多 1 行**（ADR-0001 D7 ＋
+   `services/ingest.js` 的同秒去重 ＋ 库层唯一索引 `ux_measure_rt`）。前提一旦被改（有人把 1 s 采样
+   改成亚秒级落库），行数会**再次**悄悄变大 —— 这次方向是偏高。本告警就是把"这个窗口的行数
+   超出了 D7 所允许的量"如实说出来：**判据只有一个数**（`帧数 > 窗口秒数 × 2`）：
+     · **窗口秒数**：由班次真源的 `startAt`/`endAt` 现算（不另造时间源、不查库）；
+     · **× 2**：唯一索引里含 `equip_code` ⇒ 同秒可属不同设备，留"同秒两台设备"这一现实形态的余量；
+       真按 D7 落库时恒有 `帧数 ≤ 窗口秒数 × 2` ⇒ **正常现场永不触发**（不是节流阈值，是口径守护）。
+   纪律（与本仓既有分工一致）：`E146`／`T-20261004-19` 定下"**告警去重（给人看，防刷屏）、
+   计数不去重（给门禁/巡检看，每次都要算）**" —— 本处是**告警**，故去重；去重键＝`班次起点|班次终点`。
+   出口与 `E139` 同款：本模块**没有**注入的 logger，故退 `console.warn`（**绝不静默**，
+   见 `statsOf()` 里 `E139` 那一段的同一句理由）。`console.warn` 是**允许**的（业务代码禁用的是
+   `new Date()` 这类"直接读系统时间"，不是告警出口；`E139` 已开此先例）。 */
+const warnedDenseMeasureWindow = new Set();
+
+/**
+ * 采样窗口"每帧一行"口径的守护告警（`E129`）：**只读不写、一个数都不改**。
+ * @param {{startAt:string, endAt:string}} shift 班次真源给出的窗口（DR-16 文本，可直接比较）
+ * @param {number} rowCount 本次窗口取到的 `measure_rt` 行数（＝ `frameCount`）
+ * @returns {{windowSec:number, cap:number, dense:boolean}} 供探针/调用方核对的纯读数
+ */
+function warnIfMeasureWindowDense(shift, rowCount) {
+  /* 窗口秒数：用 `platform/clock.js` 的既有解析口径（`diffSec` → `toDate`，DR-16 文本可直接喂它，
+     全仓同一个时间真源）；解析不了就**不告警**（判据不成立就不吭声 —— 绝不用"0 秒"去反推"行数超标"）。 */
+  let windowSec = 0;
+  try {
+    windowSec = platformClock.diffSec(shift.startAt, shift.endAt);
+  } catch {
+    return { windowSec: 0, cap: 0, dense: false };
+  }
+  const cap = windowSec * 2;
+  const dense = windowSec > 0 && rowCount > cap;
+  if (dense) {
+    const key = `${shift.startAt}|${shift.endAt}`;
+    if (!warnedDenseMeasureWindow.has(key)) {
+      warnedDenseMeasureWindow.add(key);
+      console.warn('[stateSnapshot] 采样窗口行数超出「1 s 采样」口径（E129）—— '
+        + `班次窗口 [${shift.startAt}, ${shift.endAt}) 内 measure_rt 有 ${rowCount} 行，`
+        + `而 ADR-0001 D7 口径只允许每设备每秒 1 行（窗口 ${windowSec} s × 2 设备余量 ＝ ${cap}）。`
+        + '**本函数不做任何截断**（行数已全量取回、读数未受影响），此句只提示'
+        + '"落库口径可能已改成亚秒级"——请核 services/ingest.js 的同秒去重与 ADR-0001 D7。');
+    }
+  }
+  return { windowSec, cap, dense };
+}
 
 /**
  * 取某班次窗口的当班统计（**唯一的取数口**）：`GET /state` 快照与 DR-06（`shift_stat`）的固化/补记
@@ -245,13 +299,42 @@ function statsForShift(db, shift, options = {}) {
     pieces = rows.map(r => ({ result: r.result, durationSec: r.durationSec }));
   }
   /* 有效运行/待机推导仍用**当班窗口内**的采样时刻串（与票级"有无帧"同源，但用途不同：
-     前者数条数、后者只判有无）。条数上限 1000 与既有实现逐字一致（本包不动该口径）。 */
+     前者数条数、后者只判有无）。
+     ---- 技术债 `E129`（2026-10-05，T-20261005-09）：**这里绝不能用 `LIMIT` 截断** ----------------
+     为什么 ①"**按行数截断**"在这里必错：本段的**唯一**用途是给 `stats.js` 数**条数**
+     （`runSec = min(elapsedSec, 帧数 − 1)`，见 `services/stats.js` 的三、时长段）——
+     `LIMIT n` 让"算不全"与"真的只有 n 帧"**读数完全一样**，于是 `FR-4.11`（当班有效运行时长）
+     与 `FR-4.15`（设备稼动率）这两个 **P0** 静默偏低，而 `E83` 的自然日投影又建立在这个 `runSec` 上
+     ⇒ 一路偏下去且**没有任何地方报警**（正是 `E38`"没算过不能显示成 0"的**同族**：
+     那边是"没算过显示成 0"，这边是"**算不全却显示成一个数**"——后者更危险，见下）。
+     为什么 ②"**偏低的绝对值**"是必然而不是偶发：本表行频＝**每秒每设备 1 行**
+     （ADR-0001 D7 的"只落 1 s 采样；100~500 ms 原始帧只进内存"；落库口两道闸：
+     `services/ingest.js` 的 `isSameStoredSecond()` 同秒不再落 ＋ 库层唯一索引
+     `ux_measure_rt(equip_code, proc_order_no, collect_time)`）⇒ **8 h ÷ 1 s ＝ 28800 行**，
+     是旧上限 1000 的 **28.8 倍**。实测（`tests\._verify\T-20261005-09\e129-事实-行频与截断.js`）：
+     1 s × 2000 行的窗口里旧 SQL 只取到最后 1000 行 ⇒ `runSec` 记成 **999**（真值 **1999**）。
+     为什么 ③改成"按时间范围取"就够、**不必**再设一个人工上限：窗口本身已是**时间范围**判据
+     （半开区间 `>= startAt AND < endAt`，与 `task`／`result`／`startedPieces` 三处同源），
+     行数天然被"**窗口秒数 × 同时采集的设备台数**"封顶 —— 这是**物理上界**，不是拍脑袋的常数。
+     ⚠ 为什么上界是"窗口秒数 **×设备台数**"而不是"窗口秒数"：唯一索引里含 `equip_code`
+     ⇒ **同秒可属于不同设备**；`startedPieces`（本函数上面那段）同样按全设备窗口取数、
+     也**没有**按设备过滤 ⇒ 本段若只数"窗口秒数"就会把多设备现场误报成异常。
+     故下界的守护判据 = `帧数 > 窗口秒数 × 2`（2 ＝ 允许"同秒两台设备"这一现实形态的余量；
+     真按 ADR-0001 D7 落库则恒 ≤ 窗口秒数，**正常现场永不触发**）。
+     为什么 ④**保留这个去重告警**（而不是"既然不截断了就什么都不用做"）：判据③是"物理上界"，
+     而物理上界只有在"落库口径不变"时才成立 —— 一旦将来有人把 1 s 采样改成亚秒级落库，
+     本段的读数就会**又一次**悄悄变大（这次不是偏低而是偏高）。告警**不改变任何读数**，
+     只是把"这个窗口的行数超出了 D7 的口径所允许的量"这件事**说出来**；
+     按本仓"**告警去重、计数不去重**"的既有分工（`E146`／`T-20261004-19`：告警给人看⇒去重防刷屏，
+     计数给门禁看⇒每次都要算），这里给的是**告警**（`console.warn`，与 `E139` 同款出口 ——
+     本模块没有注入 logger），去重键＝`班次起点|班次终点`。 */
   const measures = db
     ? db.prepare(
       `SELECT collect_time AS collectTime FROM measure_rt
         WHERE collect_time >= ? AND collect_time < ?
-        ORDER BY id DESC LIMIT 1000`).all(shift.startAt, shift.endAt)
+        ORDER BY id DESC`).all(shift.startAt, shift.endAt)
     : [];
+  warnIfMeasureWindowDense(shift, measures.length);
   const computed = statsSvc.computeShiftStats({
     shift,
     orders,
@@ -593,4 +676,15 @@ function createStateSnapshot(options = {}) {
   return snapshot;
 }
 
-module.exports = { createStateSnapshot, statsForShift, FRAME_FIELDS, TASK_FIELDS, EMPTY_RUN_SUMS };
+/* `E129`：把"窗口行数是否超出 1 s 采样口径"的守护判据**导出**（纯函数、无副作用可选）——
+   为什么导出：它是**判据**本身，探针/门禁要能对着"真实函数体"跑真值表（与 `tests\env.js` 的
+   `cleanupStaleTemp(maxAgeMs, io)` 注入面、`verifyAuthorityTotals(…, {gitAvailable})` 同一手法），
+   而不是只能靠"造 6000 行数据看有没有打印"。生产调用点只有 `statsForShift()` 一处。 */
+module.exports = {
+  createStateSnapshot,
+  statsForShift,
+  warnIfMeasureWindowDense,
+  FRAME_FIELDS,
+  TASK_FIELDS,
+  EMPTY_RUN_SUMS
+};
