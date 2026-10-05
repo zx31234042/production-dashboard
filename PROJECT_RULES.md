@@ -402,10 +402,15 @@ production-dashboard/
 │   │   └── fieldMap.js           # 三方字段映射（看板 ↔ 上位机报文 ↔ 附录 2 上报）
 │   ├── pages/
 │   │   └── Dashboard.js          # 页面装配：标签切换、定时刷新、初始化
-│   ├── services/                 # 数据层：只负责"取数据"，不碰界面
+│   ├── services/                 # 数据层：只负责"取数据"，不碰界面（**7 个文件**，与盘上一致；`E124` 2026-10-05 对齐实况）
 │   │   ├── api.js                # 接口适配层（IF-A / IF-B / IF-D + 上报补传）
+│   │   ├── auth.js               # 鉴权与解锁态（本机解锁）
+│   │   ├── boardSource.js        # **统一取数通道（SSE）**（ADR-0008 D1/D2）
 │   │   ├── mockData.js           # 模拟数据源（默认，评审演示用）
-│   │   └── mockUpperSource.js    # 内置模拟上位机（?source=upper 时驱动看板）
+│   │   ├── mockUpperSource.js    # 内置模拟上位机（?source=upper 时驱动看板）
+│   │   ├── selfCheckProbe.js     # 自检页的探针取数
+│   │   └── stateAdapter.js       # 形状翻译：服务端状态 → 前端视图模型（ADR-0008 D1/D2）
+│   │                             # ⛔ `wsSource.js`：2026-09-19 的**规划名，从未建立、不另建**（2026-10-05 裁定）
 │   ├── styles/
 │   │   ├── variables.css         # 颜色、字号、间距等变量（原 --bg 等）
 │   │   └── global.css            # 布局与组件样式（原 board.css 主体）
@@ -527,7 +532,7 @@ production-dashboard/
 | `src/components/` | 一个界面区块一个文件，只负责"把数据显示出来" | 不写取数逻辑、不写全局状态 |
 | `src/config/` | **可调参数集中地**：数据源、班次、统计口径、维保、接口地址、字段映射 | 不写业务逻辑；不把可调参数散落到组件里 |
 | `src/pages/` | 页面装配：把组件拼成 8 个标签页，处理切换与刷新 | 不写具体渲染细节（下沉到组件） |
-| `src/services/` | 取数与数据加工：`api.js` 适配层、`mockData.js` 模拟源、`mockUpperSource.js` 内置模拟上位机 | 不操作 DOM、不写样式 |
+| `src/services/` | 取数与数据加工（**7 个文件**）：`api.js` 适配层、**`boardSource.js` 统一取数通道（SSE）＋ `stateAdapter.js` 形状翻译**（ADR-0008 D1/D2）、`mockData.js` 模拟源、`mockUpperSource.js` 内置模拟上位机、`auth.js` 解锁态、`selfCheckProbe.js` 自检探针；⛔ `wsSource.js` **规划名、从未建立、不另建**（2026-10-05 裁定） | 不操作 DOM、不写样式 |
 | `src/styles/` | 全部样式；先改 `variables.css` 里的变量，再改 `global.css` | 不写行内样式（`style="..."` 仅限动态数值） |
 | `src/utils/` | 与业务无关的通用函数：格式化、计算 | 不放与具体页面耦合的逻辑 |
 | `src/assets/` | 图片、图标、字体、界面截图 | 不放代码、不放临时导出文件 |
