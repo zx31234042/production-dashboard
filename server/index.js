@@ -828,7 +828,17 @@ async function start(options = {}) {
     logger,
     now: currentClock().source(),
     /* W5-①：`upload` 事件在待补传队列（upload_log 的唯一写路径）的状态迁移点发布 */
-    bus
+    bus,
+    /* `E48③`（2026-10-05）：`config` 是**必填**，此处必须传**已解析的业务配置** `boardCfg`
+       （`options.boardConfig` 优先、否则读配置文件；见 `:617`）。
+       ⚠ 与 `:907` 记录的静默分叉同一机理：上报器同样读
+       `mes.{baseUrl,pathTemplate,responseStyle,token,timeoutMs,reportPlaceholder}`，
+       若这里不传，它会静默回落到磁盘上那份配置 ⇒ "注入了别的业务配置"的进程里上报打到
+       旧地址/旧阈值，且**不报错**（E48 的立案症状）。故本行是**同批传入**，不是兜底。
+       ⚠ 刻意写成**最后一项且不带尾逗号**：`harness-check` 第二十一节的 D22 用
+       `/^[ \t]*config: boardCfg,\r?\n/m` 替换**第一次**命中来证明"摘掉那一行 ⇒ 判据必红"；
+       若本处也带尾逗号，它会更早命中**本行**，那条定点变异就失效了（T-20261005-13 实测踩到）。 */
+    config: boardCfg
   });
   logger.info(`[路由] IF-B 上报接口已接线（${upload.by}）：${upload.routes.join(' , ')}；` +
     `不做自动重试（V1.31/C-59）：失败落 upload_log 留存 + 告警，重报只能经 POST /upload/retry 人工触发；` +

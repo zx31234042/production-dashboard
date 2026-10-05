@@ -750,3 +750,26 @@ textarea.form-input { resize: none; }
 .auto-lock-tip[hidden] { display: none; }
 .auto-lock-tip .tip-title { font-size: 52px; font-weight: 700; color: var(--warn); }
 .auto-lock-tip .tip-text { color: var(--text); }
+
+/* ==========================================================================
+   `hidden` 兜底（`E127`，2026-10-05）：作者样式**不得**盖掉 `[hidden]`
+   --------------------------------------------------------------------------
+   现场（`E127` 立案）：`#upCard`（`.card`）带 `hidden`，而作者样式 `.card{display:flex}`
+   （见上方"卡片"段）**恒胜** UA 样式表的 `[hidden]{display:none}`（作者样式胜 UA，**与特异度无关**）
+   ⇒ **静态首帧**（作者 JS 一行都没跑时）它照样生成一个 320 px 高的空卡片、挤进 `#panel-setting`
+   的网格；现状只靠 `src\components\UploadPanel.js` 的 `render()` 写一行内联 `style.display`
+   兜住 —— 那是"**靠 JS 兜住的静态正确性**"，脚本没跑/晚一帧就露出来。
+   ⚠ 这是**同一类坑的第四次**（前三次：`.pwd-row{display:flex}`、`#upPendingEmpty`、
+   `#board-status > div{display:flex}`），三次都靠"就近给某个选择器补一条 `[hidden]` 规则"，
+   于是下一个给别的元素加 `hidden` 的人**又踩一次**。故这里改为**一次性的全局兜底**。
+   为什么必须带 `!important`：作者样式里**任何** `display` 声明都会压过 UA 的 `[hidden]`；
+   不加就只能靠"本条排在最后"这一条脆弱前提，而后续任何一条 `#id .cls{display:…}`
+   （特异度更高）又会把它压回去。这是本仓**第一处** `!important`，理由＝"这一条必须绝对
+   优先于所有 `display` 声明"。
+   ⚠ 已核**全仓 `hidden` 用法**：`src\**\*.js` 里 21 处 ＋ `index.html` 里 6 个静态属性，
+   每一处都是**切换 `hidden` 属性本身**（`el.hidden = …`），没有任何一处"带 `hidden` 却靠 CSS
+   把它显示出来"的设计 ⇒ 本规则不会误伤（真浏览器首帧读数见 `T-20261005-13` 回执）。
+   下面几条**按选择器**写的 `[hidden]` 规则（`.std-edit` / `.auto-lock-tip` /
+   `#board-status > div` / `#panel-setting #upPendingEmpty`）**保留不动**：语义与真值一致，
+   且 `tests\ui-check.js` 的 `U10-b` 明确要求 `#board-status` 那条在场（删它会打红门禁）。 */
+[hidden] { display: none !important; }

@@ -340,7 +340,18 @@ function latest(db, query = {}) {
 
 /**
  * 队列状态汇总（供"告警/暴露待补传条数"与运维巡检）。
- * @param {{capacity?:number, warnThreshold?:number}} [options]
+ * ⚠ **告警阈值没有本层缺省**（`E33①`，2026-10-05）：这里原写
+ * `options.warnThreshold === undefined ? <字面量> : …` —— 那是一个**不读真源的独立判据**
+ * （真源＝`src/config/board.config.js` 的 `mes.queueWarnThreshold`，由服务层
+ * `services/uploadQueue.js` 读取后**显式**传进来，见那里的 `configWarnThreshold()`）。
+ * 现在**删掉缺省**：缺参 ⇒ 当场抛错，**不返回一个"看似正常"的 warn**。
+ * 为什么不是"在本层改成读真源"（两种修法里选了这个，理由三条）：
+ *   · 本文件是**只做 SQL 的仓储**（见文件头第 6 行），阈值属业务口径；
+ *   · 在这里再读一次配置 = **第二处真源读取点**：同一进程里内存改配置时，两层会在
+ *     两个时刻各读一次 ⇒ 又制造两判，正是 `E33` 要防的形态；
+ *   · "忘了传"若被静默当成"传了真源"，缺陷永远看不见 —— 显式失败让调用点当场可见。
+ * @param {{capacity?:number, warnThreshold:number}} options
+ *   `warnThreshold` **必填**且须为有限数：待补传条数 ≥ 它即 `warn`；缺参/非有限数 ⇒ `TypeError`。
  */
 function stats(db, options = {}) {
   const pendingOnly = countPending(db);
@@ -349,7 +360,16 @@ function stats(db, options = {}) {
   const oldest = db.prepare(
     `SELECT MIN(created_at) AS first_at FROM upload_log WHERE state IN (?, ?)`
   ).get(STATE.PENDING, STATE.FAILED).first_at;
-  const threshold = options.warnThreshold === undefined ? 1 : Number(options.warnThreshold);
+  /* `E33①`：**不设缺省**、也不在本层读真源（理由见上方 JSDoc）—— 缺参当场失败，
+     不返回一个"看似正常"的 warn（那正是"死配置/散落字面量"制造两判的形态）。 */
+  if (options.warnThreshold === undefined) {
+    throw new TypeError('uploadQueueRepo.stats: 必须显式传 warnThreshold（E33①：本层不做业务判断、不设缺省；' +
+      '真源＝board.config.js 的 mes.queueWarnThreshold，由 services/uploadQueue.js 读取后传入）');
+  }
+  const threshold = Number(options.warnThreshold);
+  if (!Number.isFinite(threshold)) {
+    throw new TypeError(`uploadQueueRepo.stats: warnThreshold 必须是有限数，收到 ${JSON.stringify(options.warnThreshold)}`);
+  }
   return {
     pending,
     pendingOnly,

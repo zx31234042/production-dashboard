@@ -16,6 +16,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');   /* E47：临时名的随机段（内置模块，零依赖） */
 const { loadSqlite, flushWal, verifyIntegrity, formatNow } = require('./index');
 
 /** 备份文件名：`board-YYYYMMDD-HHmmss-SSS.db`（SSS＝毫秒）。
@@ -104,6 +105,65 @@ async function backupTo(db, backupDir, options = {}) {
   };
 }
 
+/** `E47`：**进程唯一**的临时文件名（与目标**同目录** ⇒ 硬链接/复制都不跨卷）。
+ *  形状 `.<目标名>.tmp-<pid>-<12 位随机>`：
+ *   · 前缀 `.` 且结尾不是 `.db` ⇒ `listBackups()` / `pruneBackups()` 的**全串匹配**正则
+ *     （`BACKUP_FILE_RE` / `LEGACY_BACKUP_FILE_RE`，均以 `$` 收尾）**看不见**它 ⇒ 万一残留，
+ *     它既不会被恢复入口当成"一份备份"列出，也不会被保留策略误删/误留；
+ *   · `pid` ＋ `randomBytes(6)` ⇒ 同一进程内的多次调用、多进程并发都不会撞名。
+ *  @param {string} name 目标备份文件名（不含目录）
+ *  @returns {string} 同目录下的临时文件名 */
+function tempNameFor(name) {
+  return '.' + name + '.tmp-' + process.pid + '-' + crypto.randomBytes(6).toString('hex');
+}
+
+/** `E47`：丢弃**本次调用自造**的临时文件 —— **本文件唯一的临时件删除点**。
+ *  为什么并成一处（2026-10-05，门禁回修）：`E161-B①` 对 `server/db/maintain.js` 的
+ *  "单文件删"是**登记制**（清单里 `max` 定额、只减不增）—— 失败路径与成功路径各写一处
+ *  就是一条要登记的漂移；合并后语义**一字不变**（两处删的都是**同一个** `tmp`），
+ *  而"删除点更少"本身就是收益。
+ *  `try` 保留：失败清理**不得**用自己的异常掩盖原始错误（调用方按自己的语义决定是否抛出）。
+ *  @param {string} tmp 本次调用自造的临时文件路径
+ *  @returns {void} */
+function discardTmp(tmp) {
+  try {
+    if (fs.existsSync(tmp)) fs.rmSync(tmp, { force: true });
+  } catch { /* 清理失败不掩盖原始错误 */ }
+}
+
+/** `E47`：把临时文件**排他地**放到 `target`（"到位"这一步；目标已存在 ⇒ 抛 `EEXIST`，
+ *  **绝不覆盖**）。为什么不用更短的 `rename`：`rename` 在目标已存在时是**覆盖**语义
+ *  （Windows 的 MoveFileEx 带 REPLACE_EXISTING、POSIX 亦然）⇒ 若另一进程在这最后一步的
+ *  窗口里抢先建了同名文件，`rename` 会把**它的**成品替换掉 —— "绝不触碰既有文件"仍然破功。
+ *  两条通道都不覆盖、都不删 `target`：
+ *   ①`linkSync(tmp, target)` —— 原子且目标已存在即 `EEXIST`（NTFS / ext4 等支持硬链接）；
+ *   ②文件系统**不支持硬链接**（exFAT / FAT32 的 U 盘、部分网络盘 ⇒ `EPERM`/`ENOTSUP`/`EMLINK`
+ *     等）时退化为 `copyFileSync(tmp, target, COPYFILE_EXCL)` —— 同样排他（在**打开目标**时
+ *     就失败，不会写坏对方文件），代价是"目标可见性"不是原子的。
+ *  @param {string} tmp 本次调用自造的临时文件
+ *  @param {string} target 目标路径（已存在 ⇒ 抛错）
+ *  @returns {'link'|'copy-excl'} 实际走通的通道（供返回值与复核留痕） */
+const LINK_UNSUPPORTED = new Set(['EPERM', 'EACCES', 'ENOTSUP', 'EOPNOTSUPP', 'EMLINK', 'EXDEV', 'ENOSYS', 'EINVAL']);
+function commitExclusive(tmp, target) {
+  let linkErr = null;
+  try {
+    fs.linkSync(tmp, target);
+    return 'link';
+  } catch (err) {
+    if (err && err.code === 'EEXIST') throw err;
+    linkErr = err;
+    if (!LINK_UNSUPPORTED.has(err && err.code)) throw err;
+  }
+  try {
+    fs.copyFileSync(tmp, target, fs.constants.COPYFILE_EXCL);
+  } catch (err2) {
+    if (err2 && err2.code === 'EEXIST') throw err2;
+    throw new Error('排他创建目标失败（硬链接 ' + (linkErr && linkErr.code) +
+      ' ⇒ 退化 COPYFILE_EXCL 亦失败：' + (err2 && err2.code) + '）：' + (err2 && err2.message));
+  }
+  return 'copy-excl';
+}
+
 /**
  * **同步**在线备份 —— E18「迁移前强制备份」的调用形态（与 `backupTo` 是**同一套能力**，不是第二套备份）。
  *
@@ -145,19 +205,48 @@ function backupToSync(db, backupDir, options = {}) {
       'backupToSync 的语义是"新建、绝不覆盖"；需要覆盖请显式改用异步 backupTo()，或换一个文件名');
   }
   const checkpoint = flushWal(db);
-  try {
-    db.prepare('VACUUM INTO ?').run(target);
-  } catch (err) {
-    /* F17-1②：失败清理**只删本次调用新建的文件**（`existedBefore === false` 才可能走到这里）。
-       不做无条件 `rmSync(target)` —— 那正是"失败反而毁掉既有备份"的成因。 */
-    try {
-      if (!existedBefore && fs.existsSync(target)) fs.rmSync(target, { force: true });
-    } catch { /* 清理失败不掩盖原始错误 */ }
-    throw new Error(`同步备份失败（VACUUM INTO ${target}）：${err.message}`);
+  /* **E47**（2026-10-05）：不再直接 `VACUUM INTO target`，而是**先写进程唯一的临时名**，
+     成功后再**排他地**把它放到 `target`（见上方 `commitExclusive()`）。为什么这样就没有窗口了：
+       ①`VACUUM INTO` 的写目标是**本次调用自造的唯一名字**（pid ＋ 随机段）⇒ 别的进程用不到
+         这个名字 ⇒ 并发下 `output file already exists` 这条错误**不可能**再出现
+         （立案时它正是"进入 catch、进而删掉对方成品"的入口）；
+       ②失败清理只按**这个自造名字**删（`tmp`），本函数里**不再出现任何 `rmSync(target)`**
+         ⇒ "把另一个进程刚建好的成品删掉"在结构上不可能发生 —— 不是判据更严，而是那条
+         代码路径不存在了；
+       ③"到位"这一步是**排他创建**而不是 `rename`（理由见 `commitExclusive()` 的注释）。 */
+  const tmp = path.join(dir, tempNameFor(resolved.name));
+  /* 前置断言：这个唯一名字**本不该存在**。若它存在 ⇒ 名字空间被污染 ⇒ **拒绝触碰**
+     （而不是"先删了再写"）—— 这样下面 catch 里删的 `tmp` 一定是**本次 VACUUM 造的**，
+     "失败清理只删自己造的东西"由此可证，而不是靠推断。 */
+  if (fs.existsSync(tmp)) {
+    throw new Error(`同步备份拒绝触碰已存在的临时名（E47）：${tmp} —— ` +
+      '该名字含本次进程号与随机段，正常不可能存在；请人工检查后删除它');
   }
+  let commitMethod = null;
+  try {
+    db.prepare('VACUUM INTO ?').run(tmp);
+    commitMethod = commitExclusive(tmp, target);
+  } catch (err) {
+    /* F17-1② ＋ E47②：失败清理**只删本次调用自造的临时文件**（`tmp`）。
+       不做无条件 `rmSync(target)` —— 那正是"失败反而毁掉既有备份"的成因；
+       现在这里**连一行"删 target"的代码都没有**，故另一个进程的成品不可能被本函数删掉。
+       删除动作走**本文件唯一的** `discardTmp()`（`E161-B①` 的登记制：只减不增）。 */
+    discardTmp(tmp);
+    if (err && err.code === 'EEXIST') {
+      throw new Error(`同步备份放弃：目标在本次写入期间被**另一个进程**创建（E47 的并发窗口）：` +
+        `${target} —— 本次**未覆盖、未删除**对方产物（本次的临时文件已清理）`);
+    }
+    throw new Error(`同步备份失败（VACUUM INTO ${tmp} ⇒ 目标 ${target}）：${err.message}`);
+  }
+  /* 临时文件**成功路径**的清理：与失败路径**共用同一个删除点**（`discardTmp()`）——
+     残留无害（`tempNameFor` 的命名口径保证 `listBackups()` 看不见它），
+     故这里也不把它的异常升级成备份失败。 */
+  discardTmp(tmp);
   const st = fs.statSync(target);
   return {
     path: target, name: resolved.name, bytes: st.size, checkpoint, engine: 'vacuum-into',
+    /* `E47`：本次"到位"走的是哪条排他通道（`link` / `copy-excl`）—— 供复核与巡检读 */
+    commitMethod,
     at: resolved.at, bumpedMs: resolved.bumpedMs
   };
 }

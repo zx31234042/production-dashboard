@@ -81,7 +81,11 @@ window.Components.UploadPanel = (function () {
          （含网格自动放置与网格轨道尺寸计算）⇒ 演示模式下 `#panel-setting` 的渲染结果与
          改动前**逐像素一致**，10 张截图基准（含 `08-操作设置`）不受影响。
          若只写 `hidden`，一旦某处的 `display` 声明覆盖了 UA 的 `[hidden]{display:none}`，
-         卡片会以"空卡片"形态挤进网格，`08-操作设置` 就会漂移。 */
+         卡片会以"空卡片"形态挤进网格，`08-操作设置` 就会漂移。
+      ★ `E127`（2026-10-05）：上面这条风险已由**作者样式**兜住 —— `src\styles\global.css`
+        末段新增全局 `[hidden]{display:none !important}` ⇒ "隐藏即不生成盒子"**不再依赖本函数
+        是否跑过**（静态首帧的真浏览器读数见 `T-20261005-13` 回执）。本行的内联 `style.display`
+        因此降级为**第二道**（保留：它是显式的、且 `#upCard.style.display` 本身可被读数）。 */
     if (card.style) card.style.display = on ? '' : 'none';
     /* `upCardHidden` 供自检读取（证明演示模式确实把它关掉了，不是靠"没渲染"蒙过） */
     state.upCardHidden = !on;
