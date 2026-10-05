@@ -27,4 +27,14 @@
   --idle:      #808080;
   --font: "Microsoft YaHei", "微软雅黑", "Source Han Sans SC", sans-serif;
   --mono: "Consolas", "Cascadia Mono", "Courier New", monospace;
+
+  /* ---------- 间距标度（E184 / T-20261005-23 起用） ----------
+     指标卡之间的格距**与版式其余间距同源**（`.tab-panel{gap:24px}`＝面板之间、
+     `#stage{gap:20px}`＝页头/主区/页脚之间）——不再是散落的字面量。
+     改前读数：`.tile-grid` 写死 `gap:18px`（版式最小间距），且**同一个卡片内相邻的
+     两个指标网格之间没有任何间距**（真实浏览器取 `getBoundingClientRect()`：
+     上排卡 `bottom` 与下排卡 `top` 同为 790.22 CSS px）⇒ 两张卡各自 1px 边框逐像素
+     相邻，形成"双线缝"。两条缺陷都由本变量收口，见 global.css 的 `.tile-grid` 与
+     `.card > .tile-grid + .tile-grid`。 */
+  --gap-tile: 24px;
 }

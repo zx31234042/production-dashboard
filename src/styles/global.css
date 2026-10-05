@@ -280,7 +280,21 @@ html, body {
 .card-title.sm .title-note { font-size: 40px; }
 
 /* ---------- 指标块 ---------- */
-.tile-grid { display: grid; gap: 18px; flex: 1; min-height: 0; grid-auto-rows: 1fr; }
+/* `gap` 只作用于**同一个网格容器内部**；同一个卡片里的"上排主要指标 / 下排分速度"
+   是**两个** `.tile-grid`（HTML 结构不动，见 index.html 实测主参数 / 实时实测数据），
+   故容器之间的缝默认是 **0**——实测（3840×2160 舞台、`getBoundingClientRect()`）：
+   上排卡 `bottom = 790.22`、下排卡 `top = 790.22` ⇒ 两张卡各自 1px 的边框逐像素相邻，
+   形成"双线缝"（用户可见的版式缺陷 E184 / T-20261005-23）。
+   修法：**间距一律由容器出**（本行 `gap` ＋ 下一行的相邻兄弟规则），每个 `.tile` 只保留
+   自己那一条边框（`border: 1px solid`）——**不用逐卡片 margin/负 margin 去凑**：
+   负 margin 让两条边框落到同一设备像素上会随视口缩放（舞台 0.25～1 任意缩放）混色成
+   "一条宽度会变的线"，读数不可判；容器 gap 则给出与卡片数量/列数无关的**可判不变量**：
+   相邻两卡 `next.top - prev.bottom === --gap-tile`（同理横向）。 */
+.tile-grid { display: grid; gap: var(--gap-tile); flex: 1; min-height: 0; grid-auto-rows: 1fr; }
+/* 同一个卡片内相邻的两个指标网格之间的格距（E184 的"双线缝"根因，见上）。
+   一条相邻兄弟规则覆盖所有同构布局（01/02/09/10 页的实测主参数、实时实测数据），
+   不按卡片逐处写 margin。 */
+.card > .tile-grid + .tile-grid { margin-top: var(--gap-tile); }
 .tile-grid.cols-1 { grid-template-columns: 1fr; grid-auto-rows: 1fr; }
 .tile-grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
 .tile-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
