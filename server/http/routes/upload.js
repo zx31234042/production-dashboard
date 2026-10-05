@@ -52,6 +52,18 @@
           本次挂载的订阅者 **0** 条事件），只有显式 `allowReuseWithDifferentDeps: true` 才降级为
           "逐项点名 ＋ 告警"。**默认路径里不再有"不同注入、静默复用、只在日志里说一句"**。
      详见下方 `resolveReporterDetail()` 及其上方的白名单注释。
+    **`E181`／`E182`（2026-10-05，`C·27` 点⑤登记的两条残留；由座位 3 的 `T-20261005-30` 收口）**：
+      ① `E181`：白名单里那四个键（`reportPlaceholder`／`token`／`responseStyle`／`pathTemplate`）
+         **过去只有"值维度"的守卫**（改内容 ⇒ 指纹判冲突），**类型维度漏了** ——
+         `reportPlaceholder='65535'` 是**新值**但**类型不对**，被指纹当成"合法的新配置"放过，一路
+         **原样进报文**（`paramDataList[].uclValue="65535"`）；`token:null` 静默变空串（不发
+         `Authorization` 头）；`responseStyle:'weird'` 静默归一成 `'status'`；`pathTemplate:123`
+         到运行期 `buildUrl()` 才炸 ⇒ 现由 `assertConfigOptionTypes()` 在**装配期**抛错并**指名键**
+         （合法域逐条取自 `uploadReporter.js` 的实际分支，见该函数的注释：合法值一个都不拒）。
+      ② `E182`：指纹的两处边界 —— `lossy` 深度上限由**静默返回**改为**超限即抛**
+         （`LOSSY_MAX_DEPTH`，深层 `Map` 不再"守卫看不见"）；无效 `Date` 先自检并**指名键**
+         （不再是 V8 原生 `Invalid time value`）；`NaN`／`±Infinity` 在标量指纹里与 `null` **分型**
+         （`[nan]`／`[+inf]`／`[-inf]`，不再是"不同内容、同一指纹"）。
    ⚠ 本包**不做**：定时上报/自动重试（W5 接线后才会有周期触发；即使那时也只调 `report()` 一次）、
       SSE 业务推送（W5）、前端切真实源（W5）、**口令与登录流程本身**（那是 `/auth/*` 与
       `services/auth.js` 的事，本文件只**消费**会话令牌，不签发、不比对、不计数）。
@@ -153,10 +165,19 @@ const CONFIG_KEY_PATHS = Object.freeze([
 
 /** 键名排序的稳定序列化（**只用于指纹**：同一份内容的不同对象实例必须给出同一个字符串；
  *  函数／symbol／`Date`／循环引用都要有**稳定表示**，不能被 `JSON.stringify` 悄悄丢掉）。
- *  `undefined` 与 `null` 同形（"没有这个键"与"显式 null"对上报器行为一致）。 */
-function stableJson(value) {
+ *  `undefined` 与 `null` 同形（"没有这个键"与"显式 null"对上报器行为一致）。
+ *
+ *  **`E182`（2026-10-05，`C·27` 点⑤的两条文案/鉴别缺口；本轮加的参数与分支，撤掉即回到"改前"）**：
+ *   ① **无效 `Date` 指名到键**：改前 `v.toISOString()` 直接抛 V8 原生 `RangeError: Invalid time value`
+ *      —— **不是静默**（会炸），但文案**指不出"是配置里的哪个键"**（`E135` 同族：症状指向错方向）。
+ *      现在先自检 `getTime()`，无效 ⇒ 我方 `TypeError` 并**带上遍历路径**（`config.mes.xxx`）；
+ *   ② `path` 参数**只为报错可定位**（`E182①`）：`norm()` 一路把当前路径传下去；
+ *   ③ `rootPath` 缺省 `'config'`（**调用方若已给完整键路径**就原样用它 —— 否则报错会变成笼统的
+ *      `config`，指不出是哪个键；`behaviorOf()` 给的正是 `config.<白名单路径>`）。 */
+function stableJson(value, rootPath) {
   const seen = new WeakSet();
-  const norm = v => {
+  const base = rootPath === undefined ? 'config' : String(rootPath);
+  const norm = (v, path) => {
     if (v === undefined || v === null) return null;
     const t = typeof v;
     if (t === 'function') return '[function]';
@@ -164,24 +185,42 @@ function stableJson(value) {
     if (t !== 'object') return v;
     if (seen.has(v)) return '[circular]';
     seen.add(v);
-    if (Array.isArray(v)) return v.map(norm);
-    if (v instanceof Date) return '[date:' + v.toISOString() + ']';
+    if (Array.isArray(v)) return v.map((x, i) => norm(x, path + '[' + i + ']'));
+    if (v instanceof Date) {
+      /* `E182①`：**先自检、再取名** —— 无效 `Date` 的 `getTime()` 是 `NaN`（V8 在 `toISOString()`
+         里抛 `Invalid time value`）；这里抛我方的错并**指名键**，现场不必自己 diff 配置对象。 */
+      if (!Number.isFinite(v.getTime())) {
+        throw new TypeError('mountUpload/resolveReporter: 配置里的 `' + path + '` 是一个**无效 `Date`**' +
+          '（E182①：`getTime()` 为 `NaN`）—— 它无法按值比较（`toISOString()` 会抛 V8 原生 ' +
+          '`Invalid time value`，报错指不出是哪个键）⇒ 拒绝用它做"行为指纹"。请修正该配置值' +
+          '（或换成一个有效 `Date`／省略该键）。');
+      }
+      return '[date:' + v.toISOString() + ']';
+    }
     const out = {};
-    for (const k of Object.keys(v).sort()) out[k] = norm(v[k]);
+    for (const k of Object.keys(v).sort()) out[k] = norm(v[k], path + '.' + k);
     return out;
   };
-  return JSON.stringify(norm(value));
+  return JSON.stringify(norm(value, base));
 }
 
 /** 标量指纹：**带上类型**（`2000` ≠ `'2000'`、`true` ≠ `'true'`）—— `E48①-b`。
  *  复核实测：旧实现用 `String()` 归一 ⇒ `timeoutMs: 2000` 与 `'2000'` **同指纹**，而后者本会
- *  回落 `mes.timeoutMs`/3000（"被当成同一份配置复用、实例却仍是 2000"）。 */
-function canonScalar(v) {
+ *  回落 `mes.timeoutMs`/3000（"被当成同一份配置复用、实例却仍是 2000"）。
+ *
+ *  **`E182③`（2026-10-05）**：`NaN`／`±Infinity` **与 `null` 分型**。改前 `stableJson(NaN)` 走
+ *  `JSON.stringify` ⇒ **`'null'`**，于是 `canonScalar(NaN) === 'number:null'` 与
+ *  `canonScalar(null) === 'null'` 只差前缀、而"键 `NaN ⇒ null`"与"键 `NaN ⇒ undefined`"是
+ *  **同一个指纹**（`C·27` 实测 `reused`）＝"不同内容、同一指纹"的一处**假同**。现在给非有限数
+ *  一个**自己的名字**（`[nan]`／`[+inf]`／`[-inf]`）—— 与 `null`、与彼此都**不再同形**。 */
+function canonScalar(v, rootPath) {
   if (v === undefined) return 'absent';
   if (v === null) return 'null';
-  return typeof v + ':' + stableJson(v);
+  if (typeof v === 'number' && !Number.isFinite(v)) {
+    return 'number:' + (Number.isNaN(v) ? '[nan]' : (v > 0 ? '[+inf]' : '[-inf]'));
+  }
+  return typeof v + ':' + stableJson(v, rootPath === undefined ? 'config' : rootPath);
 }
-
 /** 按路径读值（白名单是扁平路径串；读不到＝`undefined`） */
 function readPath(root, path) {
   let cur = root;
@@ -203,11 +242,30 @@ function isLossyConfigValue(v) {
   return proto !== Object.prototype && proto !== null;
 }
 
-/** 遍历读段（`CONFIG_READ_TOP`）收集 lossy 值的路径（深度上限 8：配置是数据，不是深树） */
+/** 读段**深度上限**（`E182①`，2026-10-05）。改前是**静默**的 `if (depth > 8) return;` ⇒ 深度 ≥ 9 处
+ *  的 `Map`／类实例**守卫看不见**（`C·27` 实测：`Map` 埋到深度 9/10 ⇒ `mount=ok`，两份各含一个
+ *  **不同** `Map` 的配置 ⇒ `reused` ＝**静默假同**，正是 `E48` 要防的形态）。
+ *  **取舍（本轮的裁定，理由写明）**：改成"**超限即抛**"＝**宁吵闹不静默** ——
+ *    · 配置是**数据、不是深树**：`CONFIG_READ_TOP`（`dataSource`／`device`／`mes`）下 8 层已经是
+ *      "明显不是配置"的形态（真源 `board.config.js` 最深 3 层）；
+ *    · "可配置上限"能让人把上限调大，但**调大之后**又是"更深的地方静默漏掉"——上限本身成了新的
+ *      沉默面；而**超限即抛**没有这个面：要么在守得住的深度内，要么当场红并**指名路径与深度**；
+ *    · 代价（如实登记）：有人真把配置写成 9 层纯数据时会**被拒**，得改成显式注入 `deps.reporter`
+ *      （或把配置压浅）。这是**可见的**代价，可接受。 */
+const LOSSY_MAX_DEPTH = 8;
+
+/** 遍历读段（`CONFIG_READ_TOP`）收集 lossy 值的路径（深度上限 `LOSSY_MAX_DEPTH`，**超限即抛**） */
 function lossyConfigPaths(config) {
   const out = [];
   const walk = (node, prefix, depth) => {
-    if (depth > 8) return;
+    /* `E182①`：**超限即抛**（不再 `return` —— 静默返回正是"深层假同"的成因） */
+    if (depth > LOSSY_MAX_DEPTH) {
+      throw new TypeError('mountUpload/resolveReporter: 读段（' + CONFIG_READ_TOP.join(' / ') +
+        '）的深度超过 ' + LOSSY_MAX_DEPTH + ' 层（E182①）—— 在 `' + prefix + '`（深度 ' + depth +
+        '）处**守卫无法继续下探**，更深处若出现无法按值比较的配置值（`Map`／`Set`／类实例…）就会' +
+        '**静默坍缩成同一指纹**（"假同"）。宁吵闹不静默 ⇒ 拒绝用它做"行为指纹"。' +
+        '请把配置压浅（配置是数据、不是深树），或显式注入 deps.reporter（自建实例）。');
+    }
     if (isLossyConfigValue(node)) {
       const ctor = (node.constructor && node.constructor.name) || typeof node;
       out.push(prefix + '（' + ctor + '）');
@@ -217,6 +275,8 @@ function lossyConfigPaths(config) {
     if (Array.isArray(node)) { node.forEach((v, i) => walk(v, prefix + '[' + i + ']', depth + 1)); return; }
     for (const k of Object.keys(node).sort()) walk(node[k], prefix ? prefix + '.' + k : k, depth + 1);
   };
+  /* 顶层遍历**从这里开始**（`walk(config[top], …, 1)`）：`LOSSY_MAX_DEPTH` 数的是**从读段根起**
+     的层数，即"`config.mes` 本身是第 1 层，`config.mes.a` 是第 2 层…"（改前那条 `> 8` 也是这个口径）。 */
   if (config && typeof config === 'object') {
     for (const top of CONFIG_READ_TOP) {
       if (!Object.prototype.hasOwnProperty.call(config, top)) continue;
@@ -242,7 +302,12 @@ function describeValue(v) {
 const TRACKED_OPTIONS = ['serviceName', 'methodName', 'capacity', 'warnThreshold', 'timeoutMs', 'strict'];
 function behaviorOf(deps) {
   const parts = {};
-  for (const path of CONFIG_KEY_PATHS) parts['config.' + path] = stableJson(readPath(deps.config, path));
+  /* `E182①`：逐键把**带键名的路径**喂给 `stableJson` ⇒ 无效 `Date` 的报错能点名到具体键
+     （`config.mes.xxx`），不是笼统一句 `config`。
+     `E182③`：**改后**这里走 `canonScalar`（含"非有限数分型"），**不是**裸 `stableJson` ——
+     裸 `stableJson` 会把 `NaN` 交给 `JSON.stringify` ⇒ `'null'`，于是"键 `NaN`"与"键 `null`／缺键"
+     又变成同一指纹（`C·27` 实测的原形态：`queueCap: NaN` ⇒ `undefined` 与 `NaN` ⇒ `null` 都 `reused`）。 */
+  for (const path of CONFIG_KEY_PATHS) parts['config.' + path] = canonScalar(readPath(deps.config, path), 'config.' + path);
   for (const k of TRACKED_OPTIONS) parts['options.' + k] = canonScalar(deps[k]);
   return parts;
 }
@@ -286,9 +351,79 @@ function injectedConflicts(createdDeps, deps) {
  *  · `serviceName`/`methodName` 只认非空字符串（否则会被 `join('/')` 隐式转字符串）；
  *  · `idGenerator` 必须带 `next()`（否则在更深处才炸，症状指向错方向）；
  *  · **`null` 一律拒绝**：要表示"不传"请**省略该键** —— 与 `E131` 同一条纪律"含糊即拒绝，
- *    拒绝优于替调用方猜意图"（`E33①` 的残留正是"`null` 被 `Number()` 收下 ⇒ 恒告警"）。 */
+ *    拒绝优于替调用方猜意图"（`E33①` 的残留正是"`null` 被 `Number()` 收下 ⇒ 恒告警"）。
+ *  ⚠ **本函数只管入口标量选项**；`config.mes.*` 那四个键的类型校验在**紧邻的**
+ *    `assertConfigOptionTypes(config)`（`E181`，同一次装配里前后脚调用）。 */
 const NUMBER_OPTIONS = ['capacity', 'warnThreshold', 'timeoutMs'];
 const STRING_OPTIONS = ['serviceName', 'methodName'];
+
+/* ---- **E181**（2026-10-05，`C·27` 点⑤的残留；本轮新加整块，撤掉即回到"改前"） ----
+   `E48` 的白名单（`CONFIG_KEY_PATHS`）守的是**值维度**（"改了这个键 ⇒ 同库第二次挂载必须抛错"），
+   **不守类型维度**：`reportPlaceholder='65535'`（字符串）是**新值**、与旧值 `65535` **类型不同**，
+   于是它被指纹当成一次"**合法的新配置**"放过 —— 一路原样进报文（`paramDataList[i].uclValue="65535"`）。
+   同理 `token:null` 静默变空串（＝不发 `Authorization` 头）、`responseStyle:'weird'` 静默归一成
+   `'status'`、`pathTemplate:123` 要等到**运行期 `buildUrl()`** 才炸（症状指向错方向）。
+   ⇒ 四键纳入**装配期显式校验**：非法 ⇒ 在 `resolveReporterDetail()` 创建实例**之前**抛错并**指名该键**。
+   ⚠ **合法域一律从 `server\services\uploadReporter.js` 的实际分支取**（不发明）：
+     · `reportPlaceholder` :197 —— `=== undefined ? 65535 : 值`（**不做 `Number()` 归一**）⇒ 合法域＝
+       **有限数值**；要"不传"请**省略该键**（`null`／数字字符串过去都会被原样带上报文）；
+     · `token`             :224 —— `q().token || ''` ⇒ 合法域＝**字符串**（`''` 是**正常态**：未配令牌；
+       `null`／数字过去会被静默变成 `''`）；
+     · `responseStyle`     :223 —— `=== 'code' ? 'code' : 'status'` ⇒ 合法域＝**恰两个值**
+       `'status'|'code'`（其余一切值都被**静默归一**成 `'status'`，与"配了但没生效"同形）；
+     · `pathTemplate`      :222 —— `q().pathTemplate || 缺省模板` ⇒ 合法域＝**非空字符串**；
+       `''`／`null` 会静默回落缺省模板（"配了没生效"），数字要等 `buildUrl()` 的 `.replace` 才炸。
+   ⚠ 四个都是**可选键**：键不存在／`undefined` ＝"不传"（合法）；只有**传了非 `undefined` 的值**才校。
+   ⚠ 合法值一个都不拒：上面每条合法域的正对照读数见 `tests\._verify\T-20261005-30\p-e181-config-types.js`。 */
+const RESPONSE_STYLES = Object.freeze(['status', 'code']);      /* :223 的两个分支，不多不少 */
+const MES_CONFIG_OPTION_CHECKS = Object.freeze([
+  {
+    key: 'reportPlaceholder',
+    ok: v => typeof v === 'number' && Number.isFinite(v),
+    why: '必须是**有限数值**（`uploadReporter.js` 的 `mes.reportPlaceholder === undefined ? 65535 : 值` 不做任何' +
+      '数值归一 ⇒ 字符串会被**原样带上报文** `paramDataList[].uclValue`）。要表示"不传"（用缺省 65535）' +
+      '请**省略该键**'
+  },
+  {
+    key: 'token',
+    ok: v => typeof v === 'string',
+    why: '必须是**字符串**（`q().token || \'\'` ⇒ `null`／数字会被静默变成空串＝**不发 `Authorization` 头**）；' +
+      '未配令牌的**正常态**就是空串 `\'\'`'
+  },
+  {
+    key: 'responseStyle',
+    ok: v => RESPONSE_STYLES.indexOf(v) >= 0,
+    why: '只认 ' + RESPONSE_STYLES.map(s => "`'" + s + "'`").join(' / ') +
+      '（`q().responseStyle === \'code\' ? \'code\' : \'status\'` ⇒ **其余一切值都被静默归一成 `status`**，' +
+      '与"配了但没生效"同形）'
+  },
+  {
+    key: 'pathTemplate',
+    ok: v => typeof v === 'string' && v !== '',
+    why: '必须是**非空字符串**（`q().pathTemplate || 缺省模板` ⇒ 空串/`null` 会静默回落缺省模板＝"配了没生效"；' +
+      '数字要等到运行期 `buildUrl()` 的 `.replace` 才炸，症状指向错方向）'
+  }
+]);
+
+/** `config.mes.*` 四个白名单键的**装配期类型校验**（`E181`）—— 只校白名单里 `mes.` 前缀的那几条，
+ *  键从 `CONFIG_KEY_PATHS` **现取**（同一份真源：将来白名单加了 `mes.` 键而这里忘跟手，
+ *  `E178` 的受管对账会把"白名单多出一条无守卫的键"这件事暴露出来，见该键的注释）。 */
+function assertConfigOptionTypes(config) {
+  const mes = config && config.mes;
+  if (mes === null || typeof mes !== 'object') return;   /* `config.mes` 缺失/非对象：无键可校（不新增拒绝面） */
+  for (const path of CONFIG_KEY_PATHS) {
+    if (path.slice(0, 4) !== 'mes.') continue;
+    const key = path.slice(4);
+    const check = MES_CONFIG_OPTION_CHECKS.filter(c => c.key === key)[0];
+    if (!check) continue;
+    const v = mes[key];
+    if (v === undefined) continue;                        /* 键缺失／`undefined` ＝ "不传"（合法） */
+    if (check.ok(v)) continue;
+    throw new TypeError('mountUpload/resolveReporter: `config.mes.' + key + '` 类型非法（E181）—— ' +
+      check.why + '。收到 ' + describeValue(v));
+  }
+}
+
 function assertOptionTypes(deps) {
   for (const k of NUMBER_OPTIONS) {
     const v = deps[k];
@@ -341,7 +476,10 @@ function assertOptionTypes(deps) {
  *            depsConflict:'n/a'|'none'|'allowed-by-opt-in'}}
  *          `ignored` ＝ 本次传入但**不会被采纳**的注入项（默认路径下必然为空：不同就抛错）。
  * @throws {TypeError} 创建路径缺 `deps.config`（`E48③`）／标量选项类型非法（补修②）／
- *                     读段内出现不可按值比较的配置值（补修②）
+ *                     `config.mes` 四个白名单键类型非法（`E181`：`reportPlaceholder` 须有限数、
+ *                     `token` 须串、`responseStyle` 须在 `'status'|'code'` 内、`pathTemplate` 须非空串）／
+ *                     读段内出现不可按值比较的配置值（补修②）／读段深度超 `LOSSY_MAX_DEPTH`（`E182①`）／
+ *                     读段里出现**无效 `Date`**（`E182②`，报错点名到键）
  * @throws {Error} 同库第二次挂载且**行为指纹不同**（`E48②`；消息里逐项指名差异）
  * @throws {Error} 同库第二次挂载且**注入项与创建时不是同一实例**（补修②：默认拒绝复用；
  *                 消息里逐项指名"本次传入的 X 与创建时不是同一个实例 ⇒ 拒绝复用"）
@@ -362,6 +500,11 @@ function resolveReporterDetail(deps = {}) {
     throw new TypeError('mountUpload/resolveReporter: deps.config 必须是**对象**，收到 ' + describeValue(deps.config));
   }
   assertOptionTypes(deps);
+  /* `E181`（2026-10-05）：`config.mes` 里那四个**行为相关**的键（`reportPlaceholder`／`token`／
+     `responseStyle`／`pathTemplate`）在**装配期**校验类型 —— 它们过去只有"值维度"的守卫（改内容 ⇒
+     指纹判冲突），**类型不对时**（`'65535'`／`null`／`'weird'`／`123`）会一路走到运行期或进报文。
+     放在 `config` 形状检查之后、`createUploadReporter()` **之前** ⇒ 抛错时**一个实例都没建**。 */
+  assertConfigOptionTypes(deps.config);
   /* 读段内出现**无法按值比较**的配置值 ⇒ **默认抛错**（否则 `Map`／类实例会"假同"，见白名单注释末段） */
   const allowDiffDeps = deps.allowReuseWithDifferentDeps === true;
   const lossy = lossyConfigPaths(deps.config);
