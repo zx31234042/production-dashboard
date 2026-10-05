@@ -52,7 +52,8 @@
           本次挂载的订阅者 **0** 条事件），只有显式 `allowReuseWithDifferentDeps: true` 才降级为
           "逐项点名 ＋ 告警"。**默认路径里不再有"不同注入、静默复用、只在日志里说一句"**。
      详见下方 `resolveReporterDetail()` 及其上方的白名单注释。
-    **`E181`／`E182`（2026-10-05，`C·27` 点⑤登记的两条残留；由座位 3 的 `T-20261005-30` 收口）**：
+    **`E181`／`E182`／`E185`（2026-10-05，`C·27` 点⑤登记的三条残留；由座位 3 的 `T-20261005-30`
+      与 `T-20261005-32` 收口）**：
       ① `E181`：白名单里那四个键（`reportPlaceholder`／`token`／`responseStyle`／`pathTemplate`）
          **过去只有"值维度"的守卫**（改内容 ⇒ 指纹判冲突），**类型维度漏了** ——
          `reportPlaceholder='65535'` 是**新值**但**类型不对**，被指纹当成"合法的新配置"放过，一路
@@ -60,6 +61,11 @@
          `Authorization` 头）；`responseStyle:'weird'` 静默归一成 `'status'`；`pathTemplate:123`
          到运行期 `buildUrl()` 才炸 ⇒ 现由 `assertConfigOptionTypes()` 在**装配期**抛错并**指名键**
          （合法域逐条取自 `uploadReporter.js` 的实际分支，见该函数的注释：合法值一个都不拒）。
+      ①′ `E185`：上述校验**当时只覆盖 `config.mes` 四键**，白名单里其余五键仍**没有"首挂"类型守卫**
+         （值维度由指纹守 ⇒ 复用不一致必抛；但**首次挂载**传错类型无人拦，`config.dataSource = 123`
+         照常建实例）⇒ 现扩到**白名单全部 9 条**，校验时**遍历白名单**（`assertConfigOptionTypes`）
+         并加**双向自证** `assertConfigChecklistAligned()`（清单少一条／多一条都当场抛）；
+         新增五键的合法域同样逐条从实现分支读出。**不动 `CONFIG_KEY_PATHS` 的成员集合**。
       ② `E182`：指纹的两处边界 —— `lossy` 深度上限由**静默返回**改为**超限即抛**
          （`LOSSY_MAX_DEPTH`，深层 `Map` 不再"守卫看不见"）；无效 `Date` 先自检并**指名键**
          （不再是 V8 原生 `Invalid time value`）；`NaN`／`±Infinity` 在标量指纹里与 `null` **分型**
@@ -352,8 +358,9 @@ function injectedConflicts(createdDeps, deps) {
  *  · `idGenerator` 必须带 `next()`（否则在更深处才炸，症状指向错方向）；
  *  · **`null` 一律拒绝**：要表示"不传"请**省略该键** —— 与 `E131` 同一条纪律"含糊即拒绝，
  *    拒绝优于替调用方猜意图"（`E33①` 的残留正是"`null` 被 `Number()` 收下 ⇒ 恒告警"）。
- *  ⚠ **本函数只管入口标量选项**；`config.mes.*` 那四个键的类型校验在**紧邻的**
- *    `assertConfigOptionTypes(config)`（`E181`，同一次装配里前后脚调用）。 */
+ *  ⚠ **本函数只管入口标量选项**；**白名单 `CONFIG_KEY_PATHS` 全部 9 条**（`dataSource`／
+ *    `device.equipCode`／`mes.*` 七条）的类型校验在**紧邻的** `assertConfigOptionTypes(config)`
+ *    （`E181` 四键 ＋ `E185` 补齐其余五键，同一次装配里前后脚调用）。 */
 const NUMBER_OPTIONS = ['capacity', 'warnThreshold', 'timeoutMs'];
 const STRING_OPTIONS = ['serviceName', 'methodName'];
 
@@ -373,54 +380,145 @@ const STRING_OPTIONS = ['serviceName', 'methodName'];
        `'status'|'code'`（其余一切值都被**静默归一**成 `'status'`，与"配了但没生效"同形）；
      · `pathTemplate`      :222 —— `q().pathTemplate || 缺省模板` ⇒ 合法域＝**非空字符串**；
        `''`／`null` 会静默回落缺省模板（"配了没生效"），数字要等 `buildUrl()` 的 `.replace` 才炸。
-   ⚠ 四个都是**可选键**：键不存在／`undefined` ＝"不传"（合法）；只有**传了非 `undefined` 的值**才校。
-   ⚠ 合法值一个都不拒：上面每条合法域的正对照读数见 `tests\._verify\T-20261005-30\p-e181-config-types.js`。 */
+   ⚠ **全部 9 条都是可选键**：键不存在／`undefined` ＝"不传"（合法）；只有**传了非 `undefined` 的值**才校。
+   ⚠ **`E185`（2026-10-05，座位 3 在 `T-20261005-30` 登记的残留；`T-20261005-32` 收口）**：
+   `E181` 只把 `config.mes` 四键做成了装配期类型校验，**白名单里其余五键仍没有「首挂」类型守卫** ——
+   它们的**值维度**由指纹守（同库第二次挂载、配置不一致 ⇒ 必抛），但**首次挂载**（指纹没有可比对象）
+   传错类型**无人拦**：`config.dataSource = 123` 照常建实例。⇒ 本清单扩到**白名单全部 9 条**
+   （校验时**键从 `CONFIG_KEY_PATHS` 现取** ＋ 模块装载时的**双向自证**
+   `assertConfigChecklistAligned()`；清单条目的**顺序与白名单无关**，自证查的是集合）；
+   新增的五条合法域同样**逐条从 `uploadReporter.js` 的实际分支读出**（不发明）：
+     · `dataSource`        :277 —— `config.dataSource === 'mock' ? 0 : null`（**唯一**比较点：非字符串
+       永远不可能等于 `'mock'` ⇒ 会被静默当成「非 mock」⇒ 无实测帧时**拒发** `NO_TEST_STATUS`）
+       ⇒ 合法域＝**非空字符串**（`'mock'` 走 mock 支；其余字符串按实现走「不伪造设备状态」支）；
+     · `device.equipCode`  :272 —— `(config.device && config.device.equipCode) || ''` 是**真值兜底**、
+       **不做类型归一** ⇒ 数字／对象会被**原样写进上报报文** `body.equipCode` ⇒ 合法域＝**非空字符串**；
+     · `mes.baseUrl`       :219／:221 —— `Boolean(mes.baseUrl)` 只判真值，`String(q().baseUrl || '')`
+       **静默字符串化**（`123` ⇒ 地址变成 `'123'` 并照发）⇒ 合法域＝**字符串**（`''` ＝「未配置」的**正常态**）；
+     · `mes.timeoutMs`     :196 —— `Number.isFinite(mes.timeoutMs) && mes.timeoutMs > 0 ? … : 3000`
+       ⇒ 数字字符串／`0`／负数／`NaN` 一律**静默回落 3000**（「配了值但没生效」）⇒ 合法域＝**有限数值且 > 0**；
+     · `mes.queueCap`      :548 —— `q().queueCap === undefined ? queue.capacity : q().queueCap` 只判
+       `undefined`、**原样**交给 `status().queueCap` ⇒ 字符串会被静默透出到 `/upload/status`
+       ⇒ 合法域＝**有限数值**（**不加下界**：该分支里没有下界依据，与 `reportPlaceholder` 同一条取舍）。
+   ⚠ 与 `E181` 同款的两条性质照旧：①**键缺失／`undefined` ＝「不传」（合法）**，只有传了非 `undefined`
+   的值才校；②清单与白名单**同源**（遍历白名单 ＋ 双向自证 ⇒ 谁漂移谁当场抛，不静默少校）。
+   ⚠ **本条不动 `CONFIG_KEY_PATHS` 的成员集合**（「读点 ↔ 白名单」的双向零差由 `harness-check`
+   第二十四节 `E178-①②③` 守 —— 那是另一条债的面）。
+
+   ⚠ 合法值一个都不拒：上面每条合法域的正对照读数见 `tests\._verify\T-20261005-30\p-e181-e182-before-after.js`（`E181`）与 `tests\._verify\T-20261005-32\p-e185-config-types.js`（`E185`）。 */
 const RESPONSE_STYLES = Object.freeze(['status', 'code']);      /* :223 的两个分支，不多不少 */
-const MES_CONFIG_OPTION_CHECKS = Object.freeze([
+const CONFIG_OPTION_CHECKS = Object.freeze([
   {
-    key: 'reportPlaceholder',
+    path: 'mes.reportPlaceholder',
+    ledger: 'E181',
     ok: v => typeof v === 'number' && Number.isFinite(v),
     why: '必须是**有限数值**（`uploadReporter.js` 的 `mes.reportPlaceholder === undefined ? 65535 : 值` 不做任何' +
-      '数值归一 ⇒ 字符串会被**原样带上报文** `paramDataList[].uclValue`）。要表示"不传"（用缺省 65535）' +
-      '请**省略该键**'
+      '数值归一 ⇒ 字符串会被**原样带上报文** `paramDataList[].uclValue`；缺省 65535 由实现给）'
   },
   {
-    key: 'token',
+    path: 'mes.token',
+    ledger: 'E181',
     ok: v => typeof v === 'string',
     why: '必须是**字符串**（`q().token || \'\'` ⇒ `null`／数字会被静默变成空串＝**不发 `Authorization` 头**）；' +
       '未配令牌的**正常态**就是空串 `\'\'`'
   },
   {
-    key: 'responseStyle',
+    path: 'mes.responseStyle',
+    ledger: 'E181',
     ok: v => RESPONSE_STYLES.indexOf(v) >= 0,
     why: '只认 ' + RESPONSE_STYLES.map(s => "`'" + s + "'`").join(' / ') +
       '（`q().responseStyle === \'code\' ? \'code\' : \'status\'` ⇒ **其余一切值都被静默归一成 `status`**，' +
       '与"配了但没生效"同形）'
   },
   {
-    key: 'pathTemplate',
+    path: 'mes.pathTemplate',
+    ledger: 'E181',
     ok: v => typeof v === 'string' && v !== '',
     why: '必须是**非空字符串**（`q().pathTemplate || 缺省模板` ⇒ 空串/`null` 会静默回落缺省模板＝"配了没生效"；' +
       '数字要等到运行期 `buildUrl()` 的 `.replace` 才炸，症状指向错方向）'
+  },
+  /* ---- 以下五条＝`E185`（2026-10-05）补齐的"其余白名单键"；合法域同样**逐条从实现分支读出** ---- */
+  {
+    path: 'dataSource',
+    ledger: 'E185',
+    ok: v => typeof v === 'string' && v !== '',
+    why: '必须是**非空字符串**（`uploadReporter.js:277` 的 `config.dataSource === \'mock\'` 是**唯一**比较点 ' +
+      '⇒ `123`／`true`／`null` **永远不可能**等于 `\'mock\'`，会被静默当成「非 mock」⇒ 无实测帧时**拒发** ' +
+      '`NO_TEST_STATUS`，与「配了 mock 却没生效」同形；`\'mock\'` 走 mock 支，其余字符串按实现走「不伪造设备状态」支）'
+  },
+  {
+    path: 'device.equipCode',
+    ledger: 'E185',
+    ok: v => typeof v === 'string' && v !== '',
+    why: '必须是**非空字符串**（`uploadReporter.js:272` 的 `(config.device && config.device.equipCode) || \'\'` ' +
+      '是**真值兜底**、不做类型归一 ⇒ 数字／对象会被**原样写进上报报文** `body.equipCode`）'
+  },
+  {
+    path: 'mes.baseUrl',
+    ledger: 'E185',
+    ok: v => typeof v === 'string',
+    why: '必须是**字符串**（`uploadReporter.js:219` 的 `Boolean(mes.baseUrl)` 只判真值、:221 的 ' +
+      '`String(q().baseUrl || \'\').replace(/\\/$/, \'\')` **静默字符串化** ⇒ `123` 会让地址变成 `\'123\'` 并照发）；' +
+      '未配置的**正常态**就是空串 `\'\'`'
+  },
+  {
+    path: 'mes.timeoutMs',
+    ledger: 'E185',
+    ok: v => typeof v === 'number' && Number.isFinite(v) && v > 0,
+    why: '必须是**有限数值且 > 0**（`uploadReporter.js:196` 的 `Number.isFinite(mes.timeoutMs) && mes.timeoutMs > 0 ' +
+      '? mes.timeoutMs : DEFAULT_TIMEOUT_MS` ⇒ 数字字符串 `\'2000\'`／`0`／负数／`NaN` 一律**静默回落 3000**，' +
+      '正是「配了值但没生效」）'
+  },
+  {
+    path: 'mes.queueCap',
+    ledger: 'E185',
+    ok: v => typeof v === 'number' && Number.isFinite(v),
+    why: '必须是**有限数值**（`uploadReporter.js:548` 的 `q().queueCap === undefined ? queue.capacity : q().queueCap` ' +
+      '只判 `undefined`、**原样**交给 `status().queueCap` ⇒ 字符串会被静默透出到 `/upload/status`）；' +
+      '**不加下界**（该分支里没有下界依据，与 `reportPlaceholder` 同一条取舍）'
   }
 ]);
 
-/** `config.mes.*` 四个白名单键的**装配期类型校验**（`E181`）—— 只校白名单里 `mes.` 前缀的那几条，
- *  键从 `CONFIG_KEY_PATHS` **现取**（同一份真源：将来白名单加了 `mes.` 键而这里忘跟手，
- *  `E178` 的受管对账会把"白名单多出一条无守卫的键"这件事暴露出来，见该键的注释）。 */
+/** 清单 `CONFIG_OPTION_CHECKS` 里某条白名单路径的校验项（没有 ⇒ `null`） */
+function configOptionCheckOf(path) {
+  return CONFIG_OPTION_CHECKS.filter(c => c.path === path)[0] || null;
+}
+
+/** **清单 ↔ 白名单的双向自证**（`E185`）——模块**装载时**跑一次：任一方向有差 ⇒ **当场抛**
+ *  （「新增白名单键却忘了给类型守卫」必须是**响亮**的失败，不许退化成"静默少校一个键"）。
+ *  两条同源性质里的第②条就落在这里（第①条＝`assertConfigOptionTypes()` **遍历白名单**本身）。 */
+function assertConfigChecklistAligned() {
+  const missing = CONFIG_KEY_PATHS.filter(p => configOptionCheckOf(p) === null);
+  const phantom = CONFIG_OPTION_CHECKS.map(c => c.path).filter(p => CONFIG_KEY_PATHS.indexOf(p) < 0);
+  if (missing.length || phantom.length) {
+    throw new TypeError('mountUpload: `CONFIG_OPTION_CHECKS`（类型维度清单）与白名单 `CONFIG_KEY_PATHS`' +
+      '（值维度真源）**漂移**（E185）—— ' +
+      (missing.length ? '白名单里有而清单里没有（会**静默少校**）：' + missing.join('、') + '；' : '') +
+      (phantom.length ? '清单里有而白名单里没有（**凭空登记**）：' + phantom.join('、') + '；' : '') +
+      '两条必须同批改（白名单成员集合由 harness-check 第二十四节 E178 守，本清单只负责"每条怎么校"）。');
+  }
+}
+assertConfigChecklistAligned();
+
+/** **白名单全部 9 条**的**装配期类型校验**（`E181` 四键 ＋ `E185` 补齐其余五键）。
+ *  两条性质（`E185` 的验收面）：
+ *   ①**遍历的是白名单 `CONFIG_KEY_PATHS`**（不是清单）⇒ 白名单里的键必然被校到；清单查不到 ⇒ 抛；
+ *   ②**键缺失／`undefined` ＝「不传」（合法）**，只有传了非 `undefined` 的值才校。
+ *  合法域**逐条**来自 `server\services\uploadReporter.js` 的实际分支（出处写在每条 `why` 里，不发明）。 */
 function assertConfigOptionTypes(config) {
-  const mes = config && config.mes;
-  if (mes === null || typeof mes !== 'object') return;   /* `config.mes` 缺失/非对象：无键可校（不新增拒绝面） */
   for (const path of CONFIG_KEY_PATHS) {
-    if (path.slice(0, 4) !== 'mes.') continue;
-    const key = path.slice(4);
-    const check = MES_CONFIG_OPTION_CHECKS.filter(c => c.key === key)[0];
-    if (!check) continue;
-    const v = mes[key];
-    if (v === undefined) continue;                        /* 键缺失／`undefined` ＝ "不传"（合法） */
+    const check = configOptionCheckOf(path);
+    if (!check) {
+      throw new TypeError('mountUpload/resolveReporter: 白名单 `CONFIG_KEY_PATHS` 里的 `config.' + path +
+        '` 在 `CONFIG_OPTION_CHECKS` 里**没有**类型校验项（E185）—— 拒绝继续装配' +
+        '（否则它会**静默没有类型守卫**；两条同批改，见 `assertConfigChecklistAligned()`）。');
+    }
+    const v = readPath(config, path);
+    if (v === undefined) continue;                        /* 键缺失／`undefined` ＝「不传」（合法） */
     if (check.ok(v)) continue;
-    throw new TypeError('mountUpload/resolveReporter: `config.mes.' + key + '` 类型非法（E181）—— ' +
-      check.why + '。收到 ' + describeValue(v));
+    throw new TypeError('mountUpload/resolveReporter: `config.' + path + '` 类型非法（' + check.ledger +
+      '）—— ' + check.why + '。要表示「不传」请**省略该键**（键缺失／`undefined` ＝ 不传，合法）。收到 ' +
+      describeValue(v));
   }
 }
 
@@ -476,8 +574,11 @@ function assertOptionTypes(deps) {
  *            depsConflict:'n/a'|'none'|'allowed-by-opt-in'}}
  *          `ignored` ＝ 本次传入但**不会被采纳**的注入项（默认路径下必然为空：不同就抛错）。
  * @throws {TypeError} 创建路径缺 `deps.config`（`E48③`）／标量选项类型非法（补修②）／
- *                     `config.mes` 四个白名单键类型非法（`E181`：`reportPlaceholder` 须有限数、
- *                     `token` 须串、`responseStyle` 须在 `'status'|'code'` 内、`pathTemplate` 须非空串）／
+ *                     **白名单 `CONFIG_KEY_PATHS` 全部 9 条的类型非法**（`E181` 四键：`reportPlaceholder`
+ *                     须有限数、`token` 须串、`responseStyle` 须在 `'status'|'code'` 内、`pathTemplate`
+ *                     须非空串；`E185` 五键：`dataSource`／`device.equipCode` 须非空串、`mes.baseUrl` 须串、
+ *                     `mes.timeoutMs` 须有限数且 > 0、`mes.queueCap` 须有限数；**报错一律指名到
+ *                     `config.<键>`** 并提示「要表示不传请省略该键」）／
  *                     读段内出现不可按值比较的配置值（补修②）／读段深度超 `LOSSY_MAX_DEPTH`（`E182①`）／
  *                     读段里出现**无效 `Date`**（`E182②`，报错点名到键）
  * @throws {Error} 同库第二次挂载且**行为指纹不同**（`E48②`；消息里逐项指名差异）
@@ -500,9 +601,10 @@ function resolveReporterDetail(deps = {}) {
     throw new TypeError('mountUpload/resolveReporter: deps.config 必须是**对象**，收到 ' + describeValue(deps.config));
   }
   assertOptionTypes(deps);
-  /* `E181`（2026-10-05）：`config.mes` 里那四个**行为相关**的键（`reportPlaceholder`／`token`／
-     `responseStyle`／`pathTemplate`）在**装配期**校验类型 —— 它们过去只有"值维度"的守卫（改内容 ⇒
-     指纹判冲突），**类型不对时**（`'65535'`／`null`／`'weird'`／`123`）会一路走到运行期或进报文。
+  /* `E181`（2026-10-05）＋ `E185`（2026-10-05）：**白名单 `CONFIG_KEY_PATHS` 全部 9 条**在**装配期**
+     校验「类型 ＋ 合法域」—— 它们过去只有"值维度"的守卫（改内容 ⇒ 指纹判冲突），**类型不对时**
+     （`'65535'`／`null`／`'weird'`／`123`／`dataSource: 123`…）会一路走到运行期或进报文；
+     而**首次挂载**（指纹没有可比对象）传错类型过去**完全无人拦**（`E185` 的立案症状）。
      放在 `config` 形状检查之后、`createUploadReporter()` **之前** ⇒ 抛错时**一个实例都没建**。 */
   assertConfigOptionTypes(deps.config);
   /* 读段内出现**无法按值比较**的配置值 ⇒ **默认抛错**（否则 `Map`／类实例会"假同"，见白名单注释末段） */
