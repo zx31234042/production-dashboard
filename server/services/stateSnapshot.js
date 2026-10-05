@@ -70,10 +70,22 @@
      · 缺什么给什么：无工单/无帧/无上报器 ⇒ 对应键为 null 或按上文缺省，**绝不编造**数值。
      · **`E129`（2026-10-05，T-20261005-09）**：`statsForShift()` 的采样窗口**不再按行数截断**
        （旧实现 `ORDER BY id DESC LIMIT 1000`）：本表行频＝每秒每设备 1 行（ADR-0001 D7）
-       ⇒ 8 h 当班 28800 行，旧上限把 1 s × 2000 行的窗口算成 999 s（真值 1999 s），
-       `FR-4.11`／`FR-4.15` 两个 **P0** 静默偏低。现改为**按时间范围取全量**，并保留一条
-       "行数超出 D7 口径"的**去重告警**（`warnIfMeasureWindowDense()`，**只告警、一个数都不改**）。
-       判据、取舍与实测见该函数内的注释与 `tests\._verify\T-20261005-09\e129-事实-行频与截断.js`。
+       ⇒ 8 h 当班 28800 行（`C·25`／本包 `q1` 探针的实测夹具都是"窗内 28800 行"，与旧上限 1000
+       差 28.8 倍），旧上限把 5 s 间距 × 2000 行的窗口算成 999 s（真值 1999 s —— 按"帧数 − 1"口径，
+       见 `E171①` 的勘误），`FR-4.11`／`FR-4.15` 两个 **P0** 静默偏低。现改为**按时间范围取全量**，
+       并保留一条"帧数**超出多设备余量**"的**去重告警**（`E169` 的口径：阈值是 `窗口秒数 × 2`，
+       而 D7 的上界是 `× 1` ⇒ 措辞不得说成"超出 D7 口径"；**只告警、一个数都不改**）。
+       `E167`（2026-10-05）后：判据走**纯函数** `measureWindowDensity()`、告警去重集合在
+       `createStateSnapshot()` **实例内**、并给出门禁可读的计数 `measureWindowDenseCounts()`。
+       判据、取舍与实测见该两处的注释与 `tests\._verify\T-20261005-09\e129-事实-行频与截断.js`、
+       `tests\._verify\T-20261005-11\q2`／`q3` 探针。
+     · **`E170`（2026-10-05，T-20261005-11）**：上一条改成"按时间范围取全量"之后，本查询在
+       `measure_rt` 上**没有可用索引**（原两个索引首列都不是 `collect_time`）⇒ `EXPLAIN QUERY PLAN`
+       ＝ `SCAN measure_rt`，取数那一步的代价随**表内总行数**线性增长（实测 1/30/100 天 ＝
+       10.8/77.8/239.0 ms）。现由 `schema.sql` ＋ `STRUCTURE_UPGRADES` 同批加
+       `ix_measure_rt_collect_time(collect_time)`（`SCHEMA_VERSION` 7 → 8）⇒ 计划变
+       `SEARCH measure_rt USING INDEX ix_measure_rt_collect_time`（同夹具的改后墙钟见
+       `tests\._verify\T-20261005-11\q1-读数-after.txt`）。
      · DR-17 累计运行（**ADR-0009 D4 落地**；**`E83` 起一次给两套投影**）：`stats.accumulate` 的
        日/月/年三档不再是恒 0 ——
        · **已固化部分**＝对 `shift_stat` 求和（读口 `repo/shiftStat.js` 的 `sumRunSec()`；
@@ -155,30 +167,90 @@ const EMPTY_RUN_SUMS = Object.freeze({
   rows: 0
 });
 
-/* ---- 技术债 `E129`：采样窗口的"行数超出 ADR-0001 D7 口径"告警（**只告警，不改任何读数**） ----
+/* ---- 技术债 `E129`：采样窗口的"行数超出多设备余量"守护（**只告警，不改任何读数**） ----
    为什么需要它（"改完了为什么还留一个告警"）：`statsForShift()` 的窗口取数已由 `LIMIT 1000` 改成
    **按时间范围取**（见该函数里 `measures` 那一段的长注释），于是"截断"在结构上不可能再发生；
    但**读数为什么可信**依赖一条外部前提：本表行频＝**每秒每设备至多 1 行**（ADR-0001 D7 ＋
    `services/ingest.js` 的同秒去重 ＋ 库层唯一索引 `ux_measure_rt`）。前提一旦被改（有人把 1 s 采样
-   改成亚秒级落库），行数会**再次**悄悄变大 —— 这次方向是偏高。本告警就是把"这个窗口的行数
-   超出了 D7 所允许的量"如实说出来：**判据只有一个数**（`帧数 > 窗口秒数 × 2`）：
-     · **窗口秒数**：由班次真源的 `startAt`/`endAt` 现算（不另造时间源、不查库）；
-     · **× 2**：唯一索引里含 `equip_code` ⇒ 同秒可属不同设备，留"同秒两台设备"这一现实形态的余量；
-       真按 D7 落库时恒有 `帧数 ≤ 窗口秒数 × 2` ⇒ **正常现场永不触发**（不是节流阈值，是口径守护）。
+   改成亚秒级落库），行数会**再次**悄悄变大 —— 这次方向是偏高。
+   **判据只有一个数：`帧数 > 窗口秒数 × 2`。**
+   ⚠ **这个阈值不是 D7 口径本身，是"D7 口径 ＋ 多设备余量"**（技术债 `E169` 的口径纠正）：
+     · D7 的**口径上界**是 `窗口秒数 × 1`（每秒每设备 1 行）；
+     · **× 2** 是给"同秒可属不同设备"留的余量（唯一索引里含 `equip_code`）；
+     · ⇒ `1× ～ 2×` 这一档**既不告警、也不属于 D7 明确允许**，它是人为放宽的余量档 ——
+       文案必须照此说（原写"行数超出 D7 口径"，与 `> ×2` 的判据不一致：把 1×～2× 说成了"D7 允许"）。
+   `· 窗口秒数`：由班次真源的 `startAt`/`endAt` 现算（不另造时间源、不查库）；
+   真按 D7 落库时恒有 `帧数 ≤ 窗口秒数`；即使按"同秒两台设备"的余量也恒 `≤ 窗口秒数 × 2`
+   ⇒ **正常现场永不触发**（不是节流阈值，是口径守护）。
+   ⚠ **为什么没有把阈值收到 ×1**（`E169` 的另一选项，**刻意不选**）：×1 只在"**单进程单编号**"下才安全
+   —— `services/ingest.js` 的 `isSameStoredSecond()` 用**全进程一个标量** `state.lastStoredSecond` 判同秒
+   ⇒ 同秒的第二台设备会被记成 `raw-500ms` **静默丢弃**（技术债 `E168` 实测：2 台同秒 200 帧 ⇒ 只落 100 行、
+   且全归 `EQ-A`）。现场确实是单编号（`schema.sql` 的"整套系统 1 个编号、覆盖 19 台相机"），
+   所以 ×1 眼下"不会误报"；但那是**既有缺口**（`E168`）而不是保证，把阈值收到 ×1 等于**站在 `E168` 上**。
+   ⇒ 本包选"**不动观测行为、只把话说准**"（`E169` 的方案㈠）：阈值维持 ×2，文案改成
+   "超出**多设备余量**才告警"并写明该余量为何是 ×2。
    纪律（与本仓既有分工一致）：`E146`／`T-20261004-19` 定下"**告警去重（给人看，防刷屏）、
-   计数不去重（给门禁/巡检看，每次都要算）**" —— 本处是**告警**，故去重；去重键＝`班次起点|班次终点`。
+   计数不去重（给门禁/巡检看，每次都要算）**"。
+   ⚠ **`E167`（2026-10-05）的三处纠正**（原实现是"**模块顶层** `const Set` ＋ 导出函数里告警"）：
+     ① **判据与状态分离**：`measureWindowDensity()` 是**纯判据**（不告警、不记账、无副作用），
+        任何人都可以对着它跑真值表而**不影响生产告警**；
+     ② **去重集合改成实例级**：原先挂在模块顶层 ⇒ **永不归零**，且**任何第三方先调一次导出函数
+        就占掉该窗口的生产告警名额**（座位 5 两进程实测：生产先跑 1 条、探针先跑 ⇒ 生产 0 条）
+        —— 而那个函数**正是为探针/门禁导出**的（自伤型设计）。现按**快照实例**记账
+        （`SNAPSHOT_WARN_SETS`：`createStateSnapshot()` 建实例时登记，见下方注册表段的注释；
+        与同文件 `E139` 的 `warnedDegradedSplit` 同一分工；`E146` 那处还随 `start()` 归零）；
+     ③ **补机器可读计数**（`MEASURE_WINDOW_DENSE_COUNTER`，模块导出；**不新增受管文件**）：
+        "这一窗到底告警过没有"从此可被门禁断言 —— 与告警**语义不同、纪律不同**（计数**不去重**）。
    出口与 `E139` 同款：本模块**没有**注入的 logger，故退 `console.warn`（**绝不静默**，
    见 `statsOf()` 里 `E139` 那一段的同一句理由）。`console.warn` 是**允许**的（业务代码禁用的是
    `new Date()` 这类"直接读系统时间"，不是告警出口；`E139` 已开此先例）。 */
-const warnedDenseMeasureWindow = new Set();
+
+/** `E167` 的**机器可读计数**（模块级：跨实例、跨调用点累计，**永不去重**）。
+ *  ① `called`        ＝ 判据被调用过几次（含探针/门禁的调用）；
+ *  ② `dense`         ＝ 其中判据为 `true` 的次数（**同窗重复也算**——"错账在变多"必须看得出）；
+ *  ③ `warned`        ＝ 其中**真的打出了** `console.warn` 的次数（受各调用点的去重影响）；
+ *  ④ `bySource.prod` ＝ 生产取数口（`statsForShift()` 的实例去重出口）的调用次数；
+ *     `bySource.probe`＝ 模块导出口（`warnIfMeasureWindowDense()`）的调用次数。
+ *  为什么计数放模块级（而不是只挂实例）：门禁/巡检要的是"**本进程里这一窗到底告警过没有**"，
+ *  这是**全局事实**，不能被"哪个实例/谁先调"稀释；去重（人读、防刷屏）才需要按调用方分。
+ *  ⚠ 与 `E146`／`T-20261004-19` 的分工一致：**告警去重、计数不去重**。 */
+const MEASURE_WINDOW_DENSE_COUNTER = {
+  called: 0, dense: 0, warned: 0, bySource: { prod: 0, probe: 0 }
+};
+
+/** 计数复位（**只给探针/门禁的进程内自证用**：同一个进程里分两段测"谁消耗了名额"时，
+ *  需要一个起点；生产路径**不调**它 —— 一旦有人拿它去"抹掉计数"，门禁就失去读数，
+ *  故此处写明用途，并且**不**把它接进任何生产调用点）。 */
+function resetMeasureWindowDenseCounts() {
+  MEASURE_WINDOW_DENSE_COUNTER.called = 0;
+  MEASURE_WINDOW_DENSE_COUNTER.dense = 0;
+  MEASURE_WINDOW_DENSE_COUNTER.warned = 0;
+  MEASURE_WINDOW_DENSE_COUNTER.bySource.prod = 0;
+  MEASURE_WINDOW_DENSE_COUNTER.bySource.probe = 0;
+  return measureWindowDenseCounts();
+}
+
+/** 计数快照（纯读；供门禁/巡检断言"这一窗告警过没有"——不返回内部对象本身，防被就地改）。 */
+function measureWindowDenseCounts() {
+  return {
+    called: MEASURE_WINDOW_DENSE_COUNTER.called,
+    dense: MEASURE_WINDOW_DENSE_COUNTER.dense,
+    warned: MEASURE_WINDOW_DENSE_COUNTER.warned,
+    bySource: {
+      prod: MEASURE_WINDOW_DENSE_COUNTER.bySource.prod,
+      probe: MEASURE_WINDOW_DENSE_COUNTER.bySource.probe
+    }
+  };
+}
 
 /**
- * 采样窗口"每帧一行"口径的守护告警（`E129`）：**只读不写、一个数都不改**。
- * @param {{startAt:string, endAt:string}} shift 班次真源给出的窗口（DR-16 文本，可直接比较）
+ * 采样窗口"每帧一行（＋多设备余量）"的**纯判据**：**只读不写、一个数都不改、没有任何副作用**
+ * （不告警、不记账）—— `E167` 的核心：判据与状态分离，探针/门禁调用它**不消耗**任何生产告警名额。
+ * @param {{startAt?:string, endAt?:string}} shift 班次真源给出的窗口（DR-16 文本，可直接比较）
  * @param {number} rowCount 本次窗口取到的 `measure_rt` 行数（＝ `frameCount`）
  * @returns {{windowSec:number, cap:number, dense:boolean}} 供探针/调用方核对的纯读数
  */
-function warnIfMeasureWindowDense(shift, rowCount) {
+function measureWindowDensity(shift, rowCount) {
   /* 窗口秒数：用 `platform/clock.js` 的既有解析口径（`diffSec` → `toDate`，DR-16 文本可直接喂它，
      全仓同一个时间真源）；解析不了就**不告警**（判据不成立就不吭声 —— 绝不用"0 秒"去反推"行数超标"）。 */
   let windowSec = 0;
@@ -188,19 +260,103 @@ function warnIfMeasureWindowDense(shift, rowCount) {
     return { windowSec: 0, cap: 0, dense: false };
   }
   const cap = windowSec * 2;
-  const dense = windowSec > 0 && rowCount > cap;
-  if (dense) {
-    const key = `${shift.startAt}|${shift.endAt}`;
-    if (!warnedDenseMeasureWindow.has(key)) {
-      warnedDenseMeasureWindow.add(key);
-      console.warn('[stateSnapshot] 采样窗口行数超出「1 s 采样」口径（E129）—— '
-        + `班次窗口 [${shift.startAt}, ${shift.endAt}) 内 measure_rt 有 ${rowCount} 行，`
-        + `而 ADR-0001 D7 口径只允许每设备每秒 1 行（窗口 ${windowSec} s × 2 设备余量 ＝ ${cap}）。`
-        + '**本函数不做任何截断**（行数已全量取回、读数未受影响），此句只提示'
-        + '"落库口径可能已改成亚秒级"——请核 services/ingest.js 的同秒去重与 ADR-0001 D7。');
-    }
+  return { windowSec, cap, dense: windowSec > 0 && rowCount > cap };
+}
+
+/** 采样窗口"超多设备余量"的告警文案（**唯一一份**：实例出口与模块导出出口共用，免得两处漂移）。
+ *  @param {{startAt:string, endAt:string}} shift 窗口
+ *  @param {number} rowCount 行数
+ *  @param {{windowSec:number, cap:number}} d `measureWindowDensity()` 的读数
+ *  @returns {string} 告警正文 */
+function measureWindowDenseLine(shift, rowCount, d) {
+  /* `E169`：文案只对"已经超出**多设备余量**"这件事说话 ——
+     不再声称"超出了 D7 口径"（D7 的上界是 ×1，而本判据的阈值是 ×2，两者不是同一件事）。 */
+  return '[stateSnapshot] 采样窗口行数**超出多设备余量**（E129/E169）—— '
+    + `班次窗口 [${shift.startAt}, ${shift.endAt}) 内 measure_rt 有 ${rowCount} 行，`
+    + `而判据上界 ＝ 窗口 ${d.windowSec} s × 1 行/秒/设备（ADR-0001 D7）再乘 **2 设备余量** ＝ ${d.cap}`
+    + '（×2 是给"同秒可属不同设备"留的余量，唯一索引里含 equip_code；'
+    + `${d.windowSec} ～ ${d.cap} 这一档既不告警、也不属于 D7 明确允许）。`
+    + '**本函数不做任何截断**（行数已全量取回、读数未受影响），此句只提示'
+    + '"落库口径可能已改成亚秒级"——请核 services/ingest.js 的同秒去重与 ADR-0001 D7。';
+}
+
+/* ---- `E167`：生产路径的"这一窗报过没有"**按快照实例**记账 -------------------------------------
+   为什么需要这一层（而不是把 `Set` 直接写在 `createStateSnapshot()` 里）：生产取数口
+   `statsForShift()` 是**模块级函数**（不是 `createStateSnapshot()` 的闭包），
+   它拿不到实例作用域里的变量（第一版就是这么写的，实测当场
+   `ReferenceError: warnedDenseMeasureWindow is not defined` —— 见 `d1-诊断-生产路径dense.js` 的读数）。
+   故用"实例对象 → 已告警窗口集合"的注册表：`createStateSnapshot()` 建实例时**登记**一份自己的 `Set`，
+   调用 `statsForShift()` 时按 `options.snapshot`（＝那个实例本身）取用 ⇒ 去重状态**仍然只属于那个实例**
+   （这正是 `E167` 要的：第三方调用模块导出函数**不消耗**生产名额），同时又能在模块级函数里取到。
+   生命周期：注册表的键是**快照函数对象本身**（`WeakMap`）＋ 一张 `seq -> token` 的
+   `Map`；`token` 是一个**不透明对象**（不是 `snapshot`，避免键值互相引用），
+   由 `FinalizationRegistry` 在实例被回收时按 `token` 删掉 `Map` 里那一项
+   ⇒ **不给每个实例留一条永不释放的记录**（进程内实例数极少，即使回收不及时也只是几字节/实例）。
+   ⚠ 用 `WeakMap` 而不是"裸 `Map<seq, Set>`"：后者会**永久持有**每个实例的告警集合；
+   用 `WeakMap` 之后，"谁的去重集合"这件事本身随实例一同回收，`FinalizationRegistry` 只负责
+   顺手把 `Map` 里那条 `{token}` 登记项删掉（它拿不到 `snapshot`，只能靠 token）。 */
+const SNAPSHOT_WARN_SEQ = { next: 0 };
+/** `快照函数对象 -> {seq, windows:Set<string>}`（键弱引用 ⇒ 实例一被回收，这份集合就随之消失）。 */
+const SNAPSHOT_WARN_SETS = new WeakMap();
+/** `seq -> token`：留给 `FinalizationRegistry` 删登记项用（token 是不透明对象，不引用实例）。 */
+const SNAPSHOT_WARN_TOKENS = new Map();
+/** 实例回收时清掉它的登记项（`heldValue` ＝ seq，`unregisterToken` ＝ token） */
+const SNAPSHOT_WARN_RECLAIM = typeof FinalizationRegistry === 'function'
+  ? new FinalizationRegistry(seq => { SNAPSHOT_WARN_TOKENS.delete(seq); })
+  : null;
+
+/** 为某个快照实例建并登记它的告警集合（`createStateSnapshot()` 调用一次）。 */
+function registerWarnSet(snapshot) {
+  const seq = SNAPSHOT_WARN_SEQ.next++;
+  const entry = { seq, windows: new Set() };
+  SNAPSHOT_WARN_SETS.set(snapshot, entry);
+  if (SNAPSHOT_WARN_RECLAIM) {
+    const token = { seq };                       // 不透明 token：`register` 不接受原始值
+    SNAPSHOT_WARN_TOKENS.set(seq, token);
+    SNAPSHOT_WARN_RECLAIM.register(snapshot, seq, token);
   }
-  return { windowSec, cap, dense };
+  return entry;
+}
+
+/** 取某快照实例的告警集合（纯记账，不告警）。`snapshot` 缺省／不是本模块建的对象
+ *  （探针直接调 `statsForShift()`、`server/index.js` 的固化路径）⇒ 返回 null ＝ "没有实例上下文"
+ *  ⇒ **只算判据、不打告警**，与 `E167` 之前"拿不到实例就不报"的观测行为一致。 */
+function warnSetOf(snapshot) {
+  if (!snapshot || typeof snapshot !== 'function') return null;
+  const entry = SNAPSHOT_WARN_SETS.get(snapshot);
+  return entry ? entry.windows : null;
+}
+
+/**
+ * 采样窗口"帧数超出多设备余量"的**模块导出判据口**（`E129` 起既有名字，`E167` 后语义收窄为
+ * "跑一次判据 ＋ 需要时告警"，**判据本体在 `measureWindowDensity()`**）。
+ *
+ * **`E167` 为什么保留告警（而不是彻底改成纯判据）**：本函数是**已导出的公开面**（探针/门禁对着"真实
+ * 函数体"跑真值表用的），把它改成"只返回读数、绝不告警"会让既有取证脚本的读数语义变化；
+ * 而真正必须切断的是"**第三方调用消耗生产告警名额**"这条耦合 —— 那由"生产侧用**自己实例的**
+ * 去重集合 ＋ 纯判据 `measureWindowDensity()`"解决（见 `SNAPSHOT_WARN_REGISTRY` 与 `statsOf()`）。
+ * 故本口的形态是：**判据与生产完全同源（同一个纯函数）**，告警去重**只作用于本口自己**：
+ * 第三方先调 ⇒ 它自己的那份 `Set` 记一笔 ⇒ **生产实例的去重集合不受影响**（名额不再被占）。
+ *
+ * 去重键＝`班次起点|班次终点`（同窗只报一次）；**计数不去重**（见 `MEASURE_WINDOW_DENSE_COUNTER`）。
+ * @param {{startAt:string, endAt:string}} shift 班次真源给出的窗口（DR-16 文本，可直接比较）
+ * @param {number} rowCount 本次窗口取到的 `measure_rt` 行数（＝ `frameCount`）
+ * @returns {{windowSec:number, cap:number, dense:boolean}} 供探针/调用方核对的纯读数
+ */
+const warnedDenseMeasureWindowByCaller = new Set();
+function warnIfMeasureWindowDense(shift, rowCount) {
+  MEASURE_WINDOW_DENSE_COUNTER.called += 1;
+  MEASURE_WINDOW_DENSE_COUNTER.bySource.probe += 1;
+  const d = measureWindowDensity(shift, rowCount);
+  if (!d.dense) return d;
+  MEASURE_WINDOW_DENSE_COUNTER.dense += 1;
+  const key = `${shift.startAt}|${shift.endAt}`;
+  if (!warnedDenseMeasureWindowByCaller.has(key)) {
+    warnedDenseMeasureWindowByCaller.add(key);
+    MEASURE_WINDOW_DENSE_COUNTER.warned += 1;
+    console.warn(measureWindowDenseLine(shift, rowCount, d));
+  }
+  return d;
 }
 
 /**
@@ -312,7 +468,12 @@ function statsForShift(db, shift, options = {}) {
      `services/ingest.js` 的 `isSameStoredSecond()` 同秒不再落 ＋ 库层唯一索引
      `ux_measure_rt(equip_code, proc_order_no, collect_time)`）⇒ **8 h ÷ 1 s ＝ 28800 行**，
      是旧上限 1000 的 **28.8 倍**。实测（`tests\._verify\T-20261005-09\e129-事实-行频与截断.js`）：
-     1 s × 2000 行的窗口里旧 SQL 只取到最后 1000 行 ⇒ `runSec` 记成 **999**（真值 **1999**）。
+     **5 s 间距 × 2000 行**（该脚本自己写着 `const STEP = 5` ⇒ 2000 行覆盖 9995 s）的窗口里，
+     旧 SQL 只取到最后 1000 行 ⇒ `runSec` 记成 **999**（真值 **1999** —— 该真值按"帧数 − 1"口径成立；
+     5 s 间距下真实跨度是 9995 s，见 `stats.js:187` 的 `min(elapsedSec, 帧数 − 1)` 算式）。
+     ⚠ `E171①`（2026-10-05）勘误：本行原写"**1 s** × 2000 行"——那是**本段第 ② 条**的
+     "1 行/秒/设备"前提，不是该探针夹具的真实间距（**数值 999/1999 不受影响**：`runSec` 只由
+     "窗口内帧数"决定，与帧间隔无关；写错的是**前提**，不是读数）。
      为什么 ③改成"按时间范围取"就够、**不必**再设一个人工上限：窗口本身已是**时间范围**判据
      （半开区间 `>= startAt AND < endAt`，与 `task`／`result`／`startedPieces` 三处同源），
      行数天然被"**窗口秒数 × 同时采集的设备台数**"封顶 —— 这是**物理上界**，不是拍脑袋的常数。
@@ -324,17 +485,52 @@ function statsForShift(db, shift, options = {}) {
      为什么 ④**保留这个去重告警**（而不是"既然不截断了就什么都不用做"）：判据③是"物理上界"，
      而物理上界只有在"落库口径不变"时才成立 —— 一旦将来有人把 1 s 采样改成亚秒级落库，
      本段的读数就会**又一次**悄悄变大（这次不是偏低而是偏高）。告警**不改变任何读数**，
-     只是把"这个窗口的行数超出了 D7 的口径所允许的量"这件事**说出来**；
+     只是把"这个窗口的行数**超出了多设备余量**"这件事**说出来**
+     （⚠ `E169` 勘误：原文写"超出了 D7 的口径所允许的量"——D7 的上界是 `窗口秒数 × 1`，而本判据的
+     阈值是 `× 2`，`1×～2×` 这一档是**人为放宽的多设备余量**、不属于 D7 明确允许；文案必须照此说）。
      按本仓"**告警去重、计数不去重**"的既有分工（`E146`／`T-20261004-19`：告警给人看⇒去重防刷屏，
      计数给门禁看⇒每次都要算），这里给的是**告警**（`console.warn`，与 `E139` 同款出口 ——
-     本模块没有注入 logger），去重键＝`班次起点|班次终点`。 */
+     本模块没有注入 logger），去重键＝`班次起点|班次终点`。
+     ⚠ **`E167`（2026-10-05）：本段的告警状态是本实例的，不再是模块级的** ——
+     判据走**纯函数** `measureWindowDensity()`（无副作用），"报过没有"由下面这份**实例级**
+     `Set` 记（在生产路径上占用/消耗名额的只有这个实例自己）；
+     ③ 的机器可读计数由模块级 `MEASURE_WINDOW_DENSE_COUNTER` 承担（**不去重**）。 */
   const measures = db
     ? db.prepare(
       `SELECT collect_time AS collectTime FROM measure_rt
         WHERE collect_time >= ? AND collect_time < ?
         ORDER BY id DESC`).all(shift.startAt, shift.endAt)
     : [];
-  warnIfMeasureWindowDense(shift, measures.length);
+  /* `E167` 的生产出口：**纯判据 ＋ 本实例自己的去重集合**。
+     ① 判据本体＝`measureWindowDensity()`（纯函数）—— 探针/门禁对着它跑真值表**不消耗**生产名额；
+     ② "这一窗报过没有"记在**本实例注册的那份 `Set`** 上（`SNAPSHOT_WARN_SETS`，
+        由 `createStateSnapshot()` 用**实例对象本身**作键登记；`statsForShift()` 是模块级函数、
+        拿不到实例闭包，故走注册表 —— 见那份注册表上方的注释）；
+        ⇒ **任何第三方先调用模块导出函数都不再影响这里**（这正是 `E167` 的病灶：原来那个 `Set`
+        挂在模块顶层，谁先调谁占名额；座位 5 两进程实测 1 条 → 0 条）；
+     ③ 用 `options.snapshot` **显式取**（而不是"缺省回落到模块级那份"）：没有实例上下文时
+        （探针直接调 `statsForShift()`、`server/index.js` 的固化路径）`warnSet` 为 null
+        ⇒ 只算判据、不打告警，不会把状态记到任何人的名额上。 */
+  const denseReadout = measureWindowDensity(shift, measures.length);
+  const warnSet = warnSetOf(options.snapshot);
+  MEASURE_WINDOW_DENSE_COUNTER.called += 1;
+  MEASURE_WINDOW_DENSE_COUNTER.bySource.prod += 1;
+  if (denseReadout.dense) {
+    MEASURE_WINDOW_DENSE_COUNTER.dense += 1;
+    /* ⚠ 去重键＝`班次起点|班次终点`（**班次窗口**粒度）。技术债 `E168` 的实现位就在这一行：
+       "多设备上线前"要把去重键改成 `(equipCode, 秒)`（与库层唯一索引
+       `ux_measure_rt(equip_code, proc_order_no, collect_time)` 同形）—— 因为
+       `services/ingest.js` 的 `isSameStoredSecond()` 用的是**全进程一个标量** `state.lastStoredSecond`，
+       同秒的第二台设备会被记成 `raw-500ms` **静默丢弃**，于是"每设备每秒 1 行"里
+       **"每设备"这一半在本进程内并不成立**。现场是单编号（`schema.sql` 的"整套系统 1 个编号"）
+       ⇒ 本轮**只登记、不改行为**（`E168` 明写"登记为边界；多设备上线前必修"），此处只留指路注释。 */
+    const key = `${shift.startAt}|${shift.endAt}`;
+    if (warnSet && !warnSet.has(key)) {
+      warnSet.add(key);
+      MEASURE_WINDOW_DENSE_COUNTER.warned += 1;
+      console.warn(measureWindowDenseLine(shift, measures.length, denseReadout));
+    }
+  }
   const computed = statsSvc.computeShiftStats({
     shift,
     orders,
@@ -392,6 +588,20 @@ function createStateSnapshot(options = {}) {
   /** `E139`：已告警过的**切段降级原因**（每个实例一份）—— 本函数（`statsOf()`）每拍都被调用，
    *  不设闸会把同一句 `console.warn` 刷成日志洪水；"同一原因只报一次"是告警，不是节流丢弃。 */
   const warnedDegradedSplit = new Set();
+  /** `E167`：本实例的**采样窗口告警序号** —— 去重集合本身放在模块级注册表
+   *  （`SNAPSHOT_WARN_REGISTRY`）里，因为真正用它的 `statsForShift()` 是**模块级函数**、拿不到
+   *  本闭包的变量；这里只负责"分一个号 ＋ 注册/回收"。见那份注册表上方的长注释。
+   *  ⚠ 为什么必须是**每实例一号**（而不是全模块共用一个 `Set`）：模块级 `Set` 有三个实测后果 ——
+   *   ① **永不归零**（进程活多久就记多久，与同文件 `E139` 的实例级、`server/index.js` 那处随
+   *      `start()` 归零的分工都不一致）；
+   *   ② **任何第三方先调一次模块导出的 `warnIfMeasureWindowDense()` 就占掉该窗口的生产告警名额**
+   *      （座位 5 在 `T-20261005-10` 的 `p2b` 两进程实测：生产先跑 ⇒ 1 条；探针先跑 ⇒ 生产 **0 条**，
+   *      而 `dense` 判据本身仍是 `true`）—— 而那个函数**正是为探针/门禁导出**的 ⇒ 自伤型设计；
+   *   ③ 同一进程里**两个调用方**（如固化路径与快照路径）会互相代偿：谁先跑谁把名额用掉。
+   *  现在判据是**纯函数** `measureWindowDensity()`，"报过没有"按实例记账：
+   *  第三方调用**不消耗**这里的名额（`E167` 的验收读数见 `q2` 探针）。
+   *  ⚠ 登记动作在**下面 `snapshot` 定义之后**做（`registerWarnSet(snapshot)`）——
+   *  注册表的键就是 `snapshot` 本身，此处它还没定义（函数声明会提升，`const snapshot = …` 不会）。 */
 
   /** 当前工单行（最近更新的一条；无 ⇒ null） */
   function taskRow() {
@@ -496,8 +706,10 @@ function createStateSnapshot(options = {}) {
     const frozen = db ? shiftStatRepo.getShiftRow(db, shift.date, shift.name) : null;
     const frozenRunSec = frozen && Number.isFinite(frozen.run_sec) ? frozen.run_sec : 0;
     /* 第一次核算只为取当班实时 `runSec`（它是增量算式的一项）；`accum`/`addRunSec` 随后用**同一算式**
-       补上 —— 取数 SQL 只有 `statsForShift()` 一份，不存在第二个口径。 */
-    const base = statsForShift(db, shift, { config, now, addRunSec: 0, accum: null });
+       补上 —— 取数 SQL 只有 `statsForShift()` 一份，不存在第二个口径。
+       ⚠ `E167`：`snapshot` 必须传下去 —— `statsForShift()` 据此取**本实例**的采样窗口告警集合
+       （`SNAPSHOT_WARN_SETS`）；不传 ⇒ 该实例的告警**一次都不会响**（静默）。 */
+    const base = statsForShift(db, shift, { config, now, addRunSec: 0, accum: null, snapshot });
     const addRunSec = Math.max(0, base.stats.runSec - frozenRunSec);
     /* `E83` 的自然日投影（**当班未固化增量**的切段）：与 `addRunSec` **同源同形** ——
        把"实时读数 − 已固化读数"这条增量算式**按段各算一遍**，而不是把整段增量塞进某一天。
@@ -673,17 +885,35 @@ function createStateSnapshot(options = {}) {
     return out;
   }
 
+  /* `E167`：把本实例登记进告警注册表（`snapshot` 此刻才定义）——
+     `registerWarnSet()` 内部同时把它挂进 `FinalizationRegistry` 的回收名单，
+     实例被 GC 时删掉 `seq -> token` 那条登记项（`WeakMap` 里的告警集合随之自动消失）。 */
+  registerWarnSet(snapshot);
+
   return snapshot;
 }
 
-/* `E129`：把"窗口行数是否超出 1 s 采样口径"的守护判据**导出**（纯函数、无副作用可选）——
+/* `E129`：把"窗口行数是否超出多设备余量"的守护判据**导出** ——
    为什么导出：它是**判据**本身，探针/门禁要能对着"真实函数体"跑真值表（与 `tests\env.js` 的
    `cleanupStaleTemp(maxAgeMs, io)` 注入面、`verifyAuthorityTotals(…, {gitAvailable})` 同一手法），
-   而不是只能靠"造 6000 行数据看有没有打印"。生产调用点只有 `statsForShift()` 一处。 */
+   而不是只能靠"造 6000 行数据看有没有打印"。
+   ⚠ **`E167`（2026-10-05）起分成两个口，语义不同，别混用**：
+     · `measureWindowDensity(shift, rowCount)` —— **纯判据**（无副作用：不告警、不记账）。
+       探针/门禁要跑真值表就调**这个**：它不会消耗任何生产告警名额，也不会改任何计数语义。
+     · `warnIfMeasureWindowDense(shift, rowCount)` —— 判据 ＋ **本口自己的**去重告警（`E129` 起的
+       既有名字，保留是为了不打断既有取证脚本）。生产路径**不用**它（`statsForShift()` 自己持有
+       实例级去重集合），故它被谁调都不影响生产告警是否响。
+   `MEASURE_WINDOW_DENSE_COUNTER` / `measureWindowDenseCounts()` 是**机器可读计数**
+   （`E167` 的验收件：让门禁能断言"这一窗到底告警过没有"；**不去重**，与告警的去重语义相反）。
+   生产调用点只有 `statsForShift()` 一处（走纯判据 ＋ 实例级去重）。 */
 module.exports = {
   createStateSnapshot,
   statsForShift,
+  measureWindowDensity,
   warnIfMeasureWindowDense,
+  measureWindowDenseCounts,
+  resetMeasureWindowDenseCounts,
+  MEASURE_WINDOW_DENSE_COUNTER,
   FRAME_FIELDS,
   TASK_FIELDS,
   EMPTY_RUN_SUMS

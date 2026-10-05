@@ -131,6 +131,19 @@ CREATE TABLE IF NOT EXISTS measure_rt (
 -- DR-13：以 equipCode + procOrderNo + collectTime 为去重键
 CREATE UNIQUE INDEX IF NOT EXISTS ux_measure_rt ON measure_rt(equip_code, proc_order_no, collect_time);
 CREATE INDEX IF NOT EXISTS ix_measure_rt_task_time ON measure_rt(proc_order_no, collect_time);
+/* `E170`（2026-10-05，实现 `E166` 的首选修法）：按**采集时刻**取窗口的索引。
+   上面两个索引的**首列都不是 `collect_time`** ⇒ 服务不了"只按 `collect_time` 取半开区间"的那条查询
+   （"有索引"与"服务得了这条查询"是两件事）。而 `server/services/stateSnapshot.js` 的 `statsForShift()`
+   正是这种查询（`FR-4.11` 当班有效运行时长／`FR-4.15` 设备稼动率两个 P0 的取数口）：
+   无可用索引时 `EXPLAIN QUERY PLAN` ＝ `SCAN measure_rt`（全表扫，代价 O(表行数)：实测 1/30/100 天
+   ＝ 10.8/77.8/239.0 ms，随 `DR-14` 保留期 365 天线性增长）；加本索引后 ＝
+   `SEARCH measure_rt USING INDEX ix_measure_rt_collect_time`（代价只看窗口）。
+   ⚠ **本句只保证"新建库"结构正确**；**老库**不会因为这一句长出索引
+   （`CREATE INDEX IF NOT EXISTS` 对已存在的表/索引是空操作）—— 老库的交付路径是
+   `server/db/index.js` 的 `STRUCTURE_UPGRADES` **同一条**幂等步骤（与该文件的 `SCHEMA_VERSION` '7' → '8'
+   同批；`E71`／`E74` 的教训：只改本文件 ⇒ 开发机全绿、现场老库结构分化且无门禁报警）。
+   ⚠ 不碰 `ux_measure_rt`：DR-13 的幂等键列集固定，动它等于换去重口径（见 `schema.sql:131`）。 */
+CREATE INDEX IF NOT EXISTS ix_measure_rt_collect_time ON measure_rt(collect_time);
 /* 旧库兼容（V1.41 之前建的库，`measure_rt` 没有 `unit_index` 列）：该列**允许 NULL**
    ⇒ 既有行天然合法、**不需要任何数据回填**（一行都不 UPDATE）。但 SQLite 的
    `CREATE TABLE IF NOT EXISTS` 对**已存在的旧表是空操作**、列不会凭空出现（且 SQLite 写不出

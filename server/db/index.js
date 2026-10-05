@@ -43,8 +43,20 @@ const path = require('node:path');
  *      ② 旧库的补列走 `STRUCTURE_UPGRADES`（下一条）—— 理由与 `op_log.team_code` 逐字相同：
  *         `CREATE TABLE IF NOT EXISTS` 对旧表是**空操作**，SQLite 又写不出 `ADD COLUMN IF NOT EXISTS`。
  *    升版同样是必须的（正文一变指纹即变），且"库内版本 5 ≠ 当前 6"会命中 `planMigration()`
- *    ⇒ 旧库启动前**强制备份**（E18 不可跳过）。 */
-const SCHEMA_VERSION = '7';
+ *    ⇒ 旧库启动前**强制备份**（E18 不可跳过）。
+ *  2026-10-05 由 '7' 升到 '8'（技术债 `E170`，实现 `E166` 的首选修法）：`measure_rt` 新增
+ *    **索引** `ix_measure_rt_collect_time(collect_time)` —— 给"只按采集时刻取窗口"的那条查询
+ *    （`stateSnapshot.js` 的 `statsForShift()`，`FR-4.11`／`FR-4.15` 两个 P0 的取数口）一个可服务的索引。
+ *    **为什么这算结构变更、必须与迁移同批**（`E71`／`E74` 的教训，见下方 `STRUCTURE_UPGRADES` 那一条）：
+ *    索引是**结构**（在 `sqlite_master` 里），不是代码行为 —— 只改 `schema.sql` 的话
+ *    `CREATE INDEX IF NOT EXISTS` 对**已存在** `measure_rt` 的老库是**空操作**（与 `CREATE TABLE IF NOT EXISTS`
+ *    同一个坑）：开发机新建库全绿，现场老库却**永远没有这个索引** ⇒ 那条查询在老库上仍是全表扫，
+ *    而且**没有任何读数会红**（`verifySchemaConsistency()` 在结构已分化的库上照样返回 `ok:true`）。
+ *    ⇒ 故本包**同一批**做完三件：①升版本（本行）；②`STRUCTURE_UPGRADES` 加幂等建索引步骤；
+ *    ③`schema.sql` 的新建库路径加同一句索引。三处缺一不可。
+ *    另：**本次不涉及任何列**（只建索引）⇒ `tests/db-check.js` 的 `LEGACY_BASELINE_COLUMNS` 维护纪律
+ *    不受影响（那份基线只声明"列"，新索引不进基线、也不需要进）。 */
+const SCHEMA_VERSION = '8';
 
 /** 建表脚本位置（与本文件同目录） */
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
@@ -208,7 +220,33 @@ const STRUCTURE_UPGRADES = [
         ＋ 同批同步 `tests/db-check.js` 的 `REQUIRED_COLUMNS`（需求锚，新列**不进**
         `LEGACY_BASELINE_COLUMNS`）；本文件只负责①升版与②补列两步，③归测试侧（座位 4b）。 */
   'ALTER TABLE shift_stat ADD COLUMN run_sec_day1 INTEGER',
-  'ALTER TABLE shift_stat ADD COLUMN run_sec_day2 INTEGER'
+  'ALTER TABLE shift_stat ADD COLUMN run_sec_day2 INTEGER',
+  /* `E170`（2026-10-05，实现 `E166` 的首选修法；`E129` 的取数改动的配套结构变更）：
+     `measure_rt` 增**索引** `ix_measure_rt_collect_time(collect_time)`。
+     **为什么必须有这一步（而不是只改 `schema.sql`）**：`schema.sql` 的 `CREATE INDEX IF NOT EXISTS`
+     对**已存在** `measure_rt` 的老库是**空操作**（与 `CREATE TABLE IF NOT EXISTS` 对老表空操作同一个坑），
+     老库不会凭空长出这个索引 —— 于是"开发机新建库全绿、现场老库那条查询仍全表扫"，且**没有任何门禁会红**
+     （`E71`／`E74` 立下的形态：结构分化在 `verifySchemaConsistency()` 眼里仍是 `ok:true`，
+     直到第一次真实写入/第一次真实变慢才暴露）。故本步骤是"老库拿到该索引"的**唯一**交付路径。
+     **为什么需要这个索引**（读数出处：座位 5 在 `T-20261005-10` 的 `C·25.6`，以及本包的 `q1` 探针）：
+     `statsForShift()` 的窗口取数（`measure_rt` 上只按 `collect_time` 取半开区间）在**无可用索引**时
+     `EXPLAIN QUERY PLAN` ＝ `SCAN measure_rt`（全表扫）—— 表上原有两个索引
+     `ux_measure_rt(equip_code, proc_order_no, collect_time)` 与
+     `ix_measure_rt_task_time(proc_order_no, collect_time)` 的**首列都不是 `collect_time`**
+     ⇒ **服务不了**"只按 `collect_time` 取范围"的查询（"有索引"与"服务得了这条查询"是两件事）。
+     `E129` 把该查询从 `LIMIT 1000`（靠早停，成本不随表增长）改成按时间范围取全量之后，
+     这一步的代价变成 O(表行数)：实测 1/30/100 天 ＝ 10.8/77.8/239.0 ms，且随保留期（365 天）线性增长
+     ⇒ 加索引是唯一**对症**的修法（`COUNT(*)`＋`MIN/MAX` 同样躲不掉扫描）。
+     ① 形态在白名单内（`CREATE INDEX IF NOT EXISTS`，`E74` 的形态判据当场认它）；
+     ② `IF NOT EXISTS` **天然幂等**：重复执行（含"已是版本 8 的库再启动一次"）是空操作，
+        而"索引已存在"这类报错也已被下面那句容错吞掉；
+     ③ **不得**顺带动 `ux_measure_rt` 的去重键列集（DR-13 幂等键固定为
+        equip_code + proc_order_no + collect_time，动它等于换去重口径）——
+        本步骤只**新增**一个索引，不删不改任何既有索引；
+     ④ 索引**不含**任何"新增列"语义 ⇒ `tests/db-check.js` 的 `LEGACY_BASELINE_COLUMNS`（列基线）
+        与本步骤无关：那条"正方向"判据只对**列**要求 `ADD COLUMN` 步骤，索引由
+        `classifyUpgradeStep()` 单独归类（`create-index`），两处口径不冲突。 */
+  'CREATE INDEX IF NOT EXISTS ix_measure_rt_collect_time ON measure_rt(collect_time)'
 ];
 
 /**
