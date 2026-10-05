@@ -609,6 +609,594 @@ async function main() {
     }
   }
 
+  /* ===== T7 转换工具的**工具级守据**（E107：E14／E15／E106 的行为原来只有 `._verify` 里的
+     一次性夹具，**没有任何门禁会因它们退化而变红**）=====
+     背景（`项目记录\后续路线图.md` 的 `E107` 行 ＋ 座位 10 在 `T-20261005-02` 回执里的普查）：
+       在门禁里搜 `请先关闭`／`FileShare`／`BOM SELF-CHECK`／`exit 3` **全部 0 命中**
+       ⇒ 只要有人"顺手重构"，占用提示可以退化回 IO 异常、BOM 自检可以变成恒真式、
+       安全写可以退回"先删旧件再写"…… **门禁照绿**。本节把这三条钉住。
+
+     ── 判据为什么不写"全文子串"（`E151`／`E158` 的教训）──
+     静态证据一律在**剥掉注释与字符串之后的代码文本**上判（`stripPsCommentsAndStrings`），
+     并对**逐字节冻结区**取 SHA256 锚点：锚点一变即红，且报出"该区已改，请重新复核"。
+     只查"字面串在场"的写法正是 `E151` 说的**装饰性守护**（形状在场、语义不在）。
+
+     ── 为什么必须真跑工具，且为什么只在 `._verify` 的副本上跑 ──
+     "占用时给可读提示并保住旧件""缺 BOM 必退 3""失败时不毁旧件"都是**行为**，
+     光读源码证不了 ⇒ 本节用 `tests\._verify\tools-check-guards\` 下的**字节副本**真跑
+     （仓库真文件全程只读，跑完用 `Buffer.compare` 逐字节复核）；产物与残留全部落在该目录内。
+
+     ── 如实边界（不粉饰）──
+     ① `E15` 的"缺 BOM ⇒ 退 3"在**本仓这两个脚本上跑不出来**：它们正文含大量中文，PS 5.1
+        按 CP936 读**BOM-less** 文件会**先解析失败**，脚本内任何自检都来不及跑（工具说明第十节
+        已记载，本门禁实测复现）；故契约用**同一段自检代码的 ASCII 孪生驱动**证明（正对照），
+        并在真脚本上实测"自检被改成恒真 ⇒ 坏正文照样产出 ⇒ 必红"（反面）。
+     ② stderr 按 **GBK** 回读：PS 5.1 把中文写进重定向流是 GBK 字节，按 UTF-8 读会得到乱码，
+        照乱码写断言就等于没断言。 */
+  section('T7 转换工具的守据：E14 占用预检 / E15 BOM 自检 / E106 安全写（E107）');
+  {
+    const GUARD_DIR = path.join(ROOT, 'tests', '._verify', 'tools-check-guards');
+    const PS = process.env.DSH_POWERSHELL || 'powershell.exe';
+    const TEXTS = [{ rel: 'tools/md2docx.ps1', tag: 'md' }, { rel: 'tools/md2docx-img.ps1', tag: 'img' }];
+
+    /** `true` 当且仅当剥离器在**整份文件**上真的跑完（防"剥离器半路失效 ⇒ 判据看不见东西
+     *  却照样判绿"—— 这正是 `E160` 的教训）。判法：剥后文本与原文**逐字符长度相同**（约定），
+     *  且换行数相同、且至少剥掉了 1 个字符。 */
+    function strippedWholeFile(src) {
+      const out = stripPsCommentsAndStrings(src);
+      return { ok: out.length === src.length && (out.match(/\n/g) || []).length === (src.match(/\n/g) || []).length && out !== src, out };
+    }
+
+    /** **PowerShell 专用的"剥注释/字符串"**（`E151` 口径：判据只认代码里的形态）。
+     *  为什么不直接用 `tests\lib\assert.js` 的 `stripLiterals`（**单一真源**，`harness-check` 也用同一个
+     *  函数对象）：那是 **JS** 的词法
+     *  （`//`、块注释、`'…'`），而本仓的 `.ps1` 用 `#` 行注释 ＋ `<# #>` 块注释 ⇒
+     *  用 JS 剥离器会把**注释里的 `Remove-Item $target`** 当成代码（首版实测：E106-③
+     *  被一句纯注释判红 ⇒ 假红）。两者都是"内容换成空格、长度与换行不变"，可互换使用。
+     *  覆盖：`#` 行注释、`<# … #>` 块注释、`'…'`（`''` 为转义）、`"…"`（反引号转义）、
+     *  单引号 here-string `@' … '@`、双引号 here-string `@" … "@`。
+     *  容错口径：未闭合的字符串止于行尾（宁可多剥，不可漏剥 —— 与 JS 那份同口径）。 */
+    function stripPsCommentsAndStrings(src) {
+      const out = src.split('');
+      const n = src.length;
+      const blank = (a, b) => { for (let k = a; k < b && k < n; k++) if (out[k] !== '\n') out[k] = ' '; };
+      let mode = 'code';
+      let i = 0;
+      while (i < n) {
+        const c = src[i]; const c2 = src[i + 1]; const c3 = src[i + 2];
+        if (mode === 'code') {
+          if (c === '<' && c2 === '#') { blank(i, i + 2); mode = 'block'; i += 2; continue; }
+          if (c === '#') { blank(i, i + 1); mode = 'line'; i++; continue; }
+          if (c === '@' && (c2 === "'" || c2 === '"')) { blank(i, i + 2); mode = c2 === "'" ? 'hsq' : 'hdq'; i += 2; continue; }
+          if (c === "'") { blank(i, i + 1); mode = 'sq'; i++; continue; }
+          if (c === '"') { blank(i, i + 1); mode = 'dq'; i++; continue; }
+          i++; continue;
+        }
+        if (mode === 'line') { blank(i, i + 1); if (c === '\n') mode = 'code'; i++; continue; }
+        if (mode === 'block') {
+          if (c === '#' && c2 === '>') { blank(i, i + 2); mode = 'code'; i += 2; continue; }
+          blank(i, i + 1); i++; continue;
+        }
+        if (mode === 'hsq' || mode === 'hdq') {
+          const q = mode === 'hsq' ? "'" : '"';
+          if (c === '@' && c2 === q && (i === 0 || src[i - 1] === '\n')) { blank(i, i + 2); mode = 'code'; i += 2; continue; }
+          blank(i, i + 1); i++; continue;
+        }
+        if (mode === 'sq') {
+          if (c === "'" && c2 === "'") { blank(i, i + 2); i += 2; continue; }   /* PS 的 '' 是转义的单引号 */
+          if (c === "'") { blank(i, i + 1); mode = 'code'; i++; continue; }
+          if (c === '\n') { mode = 'code'; i++; continue; }
+          blank(i, i + 1); i++; continue;
+        }
+        if (mode === 'dq') {
+          if (c === '`') { blank(i, i + 2); i += 2; continue; }                 /* PS 的转义符是反引号 */
+          if (c === '"' && c2 === '"') { blank(i, i + 2); i += 2; continue; }
+          if (c === '"') { blank(i, i + 1); mode = 'code'; i++; continue; }
+          if (c === '\n') { mode = 'code'; i++; continue; }
+          blank(i, i + 1); i++; continue;
+        }
+        void c3;
+        blank(i, i + 1); i++;
+      }
+      return out.join('');
+    }
+
+    /** 取"以 `start` 子串为起、以 `end` 子串为止"的**原始字节区间**（`end` 不含）。
+     *  用于 `E15` 自检区的**逐字节冻结**（原文里是逐字节扫描自己的字节，不可失真）。 */
+    function regionBytes(buf, start, end) {
+      const a = buf.indexOf(Buffer.from(start, 'utf8'));
+      const z = a < 0 ? -1 : buf.indexOf(Buffer.from(end, 'utf8'), a);
+      return a < 0 || z < 0 ? null : buf.subarray(a, z);
+    }
+    const sha256 = b => require('node:crypto').createHash('sha256').update(b).digest('hex').toUpperCase();
+    const h16 = b => sha256(b).slice(0, 16);
+
+    /** 按 `latin1` 视图在**原始字节串**上做替换（与 `origin.toString('latin1')` 同一表达，
+     *  否则中文锚点会因"UTF-8 文本 vs latin1 文本"两种表示而不命中）。 */
+    const l1 = s => Buffer.from(s, 'utf8').toString('latin1');
+
+    /** 解码子进程输出：**先严格 UTF-8，失败退 GBK**（PS 5.1 的中文重定向流是 GBK 字节）。 */
+    function decodePs(buf) {
+      try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+      catch { try { return new TextDecoder('gbk').decode(buf); } catch { return buf.toString('latin1'); } }
+    }
+
+    /** 跑一个 `.ps1`：stdio 一律**落文件**（沙箱下不给子进程接管道），退出码＝脚本自身退出码。 */
+    function runPs(scriptAbs, args, cwd, logName) {
+      const log = path.join(GUARD_DIR, logName);
+      const fd = fs.openSync(log, 'w');
+      let code; let spawnError = '';
+      try {
+        require('node:child_process').execFileSync(PS,
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', scriptAbs].concat(args),
+          { stdio: ['ignore', fd, fd], cwd: cwd || GUARD_DIR });
+        code = 0;
+      } catch (e) {
+        code = e.status === undefined ? -1 : e.status;
+        if (e.status === undefined) spawnError = String(e.code || e.message || e);
+      } finally { fs.closeSync(fd); }
+      return { code, spawnError, out: decodePs(fs.readFileSync(log)) };
+    }
+
+    const SRC_MD = ['# 工具守据探针', '', '一段中文正文，含**加粗**与 `行内代码`。', '',
+      '| 列 | 值 |', '| --- | --- |', '| 甲 | 乙 |', '', '- 第一项', '- 第二项'].join('\n') + '\n';
+    const OLD_BYTES = Buffer.from('OLD-DOCX-BYTES-KEEP-ME', 'utf8');
+    /** 锁持有者（**纯 ASCII** —— BOM-less 的 `.ps1` 含中文本身就是 E15 那个病）：
+     *  以 `FileShare::None` 独占**只读**打开目标 ⇒ 等价于"Word/WPS 正开着这份文档"。
+     *  就绪信号走**另一个文件**：目标本身被独占锁着，`openSync(target)` 是拿不到锁的
+     *  （首版实测 `EBUSY` 把门禁自己打崩 —— 那是最坏的一种假红）。 */
+    const LOCK_HOLDER = [
+      'param([Parameter(Mandatory=$true)][string]$Target, [Parameter(Mandatory=$true)][string]$ReadyMarker)',
+      '$ErrorActionPreference = "Stop"',
+      '$fs = [System.IO.File]::Open($Target, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)',
+      'try {',
+      '  $utf8 = New-Object System.Text.UTF8Encoding($false)',
+      '  [System.IO.File]::WriteAllText($ReadyMarker, ("LOCKED pid=" + $PID), $utf8)',
+      '  Start-Sleep -Seconds 12',
+      '} finally { $fs.Dispose() }',
+      ''
+    ].join('\r\n');
+
+    /* ---- 夹具：把两个真工具的**原样字节**连同源 md 拷进 `._verify`（真文件只读） ----
+       每轮先把本节的私有工作目录清干净（`env.removeLinkSafe` —— 本仓唯一的"安全删除"出口，
+       `E46`：先 `lstat` 判链接、是链接只拆链不递归）；工作目录固定在 `._verify` 内。 */
+    const ORIGIN = {};
+    if (fs.existsSync(GUARD_DIR)) env.removeLinkSafe(GUARD_DIR, { recursive: true, force: true });
+    fs.mkdirSync(GUARD_DIR, { recursive: true });
+    fs.writeFileSync(path.join(GUARD_DIR, 'lock-holder.ps1'), LOCK_HOLDER, 'latin1');
+    for (const t of TEXTS) {
+      const abs = path.join(ROOT, ...t.rel.split('/'));
+      const bytes = fs.readFileSync(abs);
+      ORIGIN[t.tag] = { bytes, sha: sha256(bytes), bom: bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF };
+      const dir = path.join(GUARD_DIR, t.tag);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'origin.ps1'), bytes);
+      fs.writeFileSync(path.join(dir, 'in.md'), SRC_MD, 'utf8');
+      if (t.tag === 'img') {
+        fs.mkdirSync(path.join(dir, 'img'), { recursive: true });
+        fs.writeFileSync(path.join(dir, 'img', 'p.png'), Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==', 'base64'));
+      }
+    }
+
+    /** 一次真跑：私有目录 ＋ 旧件（可预置 `~$` 锁文件）＋ 可选用锁持有者独占目标。 */
+    function realRun(tag, copyBytes, opts) {
+      const o = opts || {};
+      const base = path.join(GUARD_DIR, tag);
+      const caseDir = path.join(base, 'case-' + o.name);
+      fs.mkdirSync(caseDir, { recursive: true });
+      const script = path.join(caseDir, 'tool.ps1');
+      fs.writeFileSync(script, copyBytes);
+      const srcMd = path.join(caseDir, 'in.md');
+      fs.copyFileSync(path.join(base, 'in.md'), srcMd);
+      if (tag === 'img') {
+        fs.mkdirSync(path.join(caseDir, 'img'), { recursive: true });
+        fs.copyFileSync(path.join(base, 'img', 'p.png'), path.join(caseDir, 'img', 'p.png'));
+      }
+      if (o.siblingLock) fs.writeFileSync(path.join(caseDir, '~$out.docx'), 'LOCK');
+      const target = path.join(caseDir, 'out.docx');
+      if (o.oldTarget !== false) fs.writeFileSync(target, OLD_BYTES);
+      let holder = null;
+      let lockReady = true;
+      if (o.lockTarget) {
+        const marker = path.join(caseDir, 'lock-ready.txt');
+        holder = spawn(PS, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+          path.join(GUARD_DIR, 'lock-holder.ps1'), '-Target', target, '-ReadyMarker', marker], { stdio: 'ignore' });
+        const t0 = Date.now();
+        while (Date.now() - t0 < 8000 && !fs.existsSync(marker)) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        }
+        /* 锁没起来 ⇒ 这一轮的"占用"前提不成立：如实置位，**绝不当成"预检通过"** */
+        lockReady = fs.existsSync(marker);
+      }
+      let r;
+      try {
+        r = runPs(script, ['-InPath', srcMd, '-OutPath', target, '-DocTitle', 'probe'], caseDir,
+          `run-${tag}-${o.name}.out.txt`);
+      } finally {
+        if (holder) {
+          try { holder.kill(); } catch (e) { /* 已退出 */ }
+          /* 独占锁是**操作系统级**的：进程死了句柄不一定马上释放 ⇒ 等到能读了再读，
+             否则 `readFileSync` 会抛 `EBUSY` 把**门禁自己**打崩（首版实测：最坏的一种假红）。 */
+          const t0 = Date.now();
+          for (;;) {
+            try { fs.closeSync(fs.openSync(target, 'r')); break; } catch (e) { /* 还没释放 */ }
+            if (Date.now() - t0 > 5000) break;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+          }
+        }
+      }
+      let exists = false;
+      let bytes = null;
+      try {
+        exists = fs.existsSync(target);
+        bytes = exists ? fs.readFileSync(target) : null;
+      } catch (e) {
+        /* 仍被外部句柄占住 ⇒ 如实标注（读数记为"读不到"，绝不当作"旧件原样"） */
+        r.readError = e.code || String(e);
+        exists = false;
+      }
+      r.exists = exists;
+      r.lockReady = lockReady;
+      r.oldKept = bytes ? bytes.equals(OLD_BYTES) : false;
+      r.size = bytes ? bytes.length : 0;
+      r.residue = fs.readdirSync(caseDir).filter(n => n.startsWith('._') || n === '_md2docx_pkg.new' || /\.md2docx\.bak$/.test(n));
+      return r;
+    }
+
+    /* ---- 逐字节冻结区的 SHA256 锚点（改了就红；见本节头部"判据卫生"）---- */
+    /*  `E15` 区：从"入口 BOM 自检"小标题到"目标占用预检"小标题之间（自检自身逐字节扫描本文件）。 */
+    /*  `E106` 区：从打包函数定义到"E106-SWAP:"标记之间（临时件 ⇒ 自证 ⇒ 只落位不删旧件）。 */
+    const E15_START = '# ===== E15 入口 BOM 自检';
+    const E15_END = '# ===== E14 目标占用预检';
+    const E106_PACK_END = '# 把**已经完整**的临时件落位到目标';
+    const E106_SWAP_END = 'E106-SWAP:';
+    const FROZEN = {
+      md: {
+        e15: 'B3F2082BC6D5EF3ECC762076E8B0CA34DE6884B9DFDFD62BC31EBA1028C6735C',
+        pack: 'D834203A63186D9310C3983EDDD0CEA84AA2874EB6752D428049C0CF74D602CF',
+        swap: 'C0FF74ECA662A594CA7F78F011AB0EA9DCC83679FAF18774623C01520CEE1725'
+      },
+      img: {
+        e15: 'B3F2082BC6D5EF3ECC762076E8B0CA34DE6884B9DFDFD62BC31EBA1028C6735C',
+        pack: 'D834203A63186D9310C3983EDDD0CEA84AA2874EB6752D428049C0CF74D602CF',
+        swap: 'C0FF74ECA662A594CA7F78F011AB0EA9DCC83679FAF18774623C01520CEE1725'
+      }
+    };
+
+    /* ---- E14-①：静态 —— 独占探测的**形态**必须在**剥注释/字符串后**的代码里在场 ---- */
+    const staticScan = {};
+    for (const t of TEXTS) {
+      const src = ORIGIN[t.tag].bytes.toString('utf8');
+      const st = strippedWholeFile(src);
+      staticScan[t.tag] = {
+        stripOk: st.ok,
+        exclusiveOpen: /\[System\.IO\.File\]::Open\s*\([^)]*\[System\.IO\.FileShare\]::None\s*\)/.test(st.out),
+        occupiedFn: /function\s+Write-Md2DocxOccupied\s*\(/.test(st.out),
+        occupiedCall: /Write-Md2DocxOccupied\s+\$targetFile/.test(st.out),
+        exit1: /exit\s+1/.test(st.out)
+      };
+    }
+    check('E14-① 两个工具的"独占探测"是**代码**里的形态（剥注释/字符串后仍命中 `File::Open(…FileShare::None)`）'
+      + '，且占用分支调用 `Write-Md2DocxOccupied $targetFile` 并 `exit 1`（不靠全文子串，E151 口径）',
+      TEXTS.every(t => {
+        const s = staticScan[t.tag];
+        return s.stripOk && s.exclusiveOpen && s.occupiedFn && s.occupiedCall && s.exit1;
+      }),
+      TEXTS.map(t => {
+        const s = staticScan[t.tag];
+        return `${t.rel}：剥离完成=${s.stripOk} 独占探测=${s.exclusiveOpen} 占用函数=${s.occupiedFn} 调用点带目标=${s.occupiedCall} 退 1=${s.exit1}`;
+      }).join('；'));
+
+    /** E14-②：可读提示与 `~$` 锁文件名（**真跑**的一条 —— 提示必须落在 stderr 且按名点到锁文件） */
+    const e14runs = {};
+    for (const t of TEXTS) {
+      e14runs[t.tag] = realRun(t.tag, ORIGIN[t.tag].bytes,
+        { name: 'e14-locked', lockTarget: true, siblingLock: true });
+    }
+    const e14ok = t => {
+      const r = e14runs[t.tag];
+      return r.lockReady && r.code === 1 && r.exists && r.oldKept && r.out.includes('请先关闭')
+        && r.out.includes('~$out.docx') && /being used by another process/.test(r.out);
+    };
+    check('E14-② 目标被**独占锁住**时真跑：退出码 1 ＋ stderr 出现可读提示"请先关闭"＋ **按名点到 `~$` 锁文件** '
+      + '＋ 原因指向"被别的进程占用"＋ **旧件字节逐一未变**（提示不再退化成 IO 异常）',
+      TEXTS.every(e14ok),
+      TEXTS.map(t => {
+        const r = e14runs[t.tag];
+        return `${t.rel}：锁就绪=${r.lockReady} 退出码=${r.code} 旧件原样=${r.oldKept} 提示=${r.out.includes('请先关闭')} `
+          + `锁文件名=${r.out.includes('~$out.docx')} 原因=${/being used by another process/.test(r.out)}`;
+      }).join('；'));
+
+    /* ---- E14 的 D22（内存字节变异 ⇒ 真跑 ⇒ 必红并指名）---- */
+    const d22E14 = [
+      ['E14-D22① 把预检的独占共享改成共享可写（`FileShare::None` ⇒ `ReadWrite`）⇒ 预检不再发现占用',
+        b => Buffer.from(b.toString('latin1').replace(l1('[System.IO.FileShare]::None'), l1('[System.IO.FileShare]::ReadWrite')), 'latin1'),
+        'E14-①', /独占探测=false/],
+      ['E14-D22② 把可读提示文案换掉（"请先关闭" ⇒ 中性 "IO error"）⇒ 用户再也读不到真因',
+        b => Buffer.from(b.toString('latin1').replace(l1('请先关闭 $leafName'), l1('IO error on $leafName')), 'latin1'),
+        'E14-②', /提示=false/]
+    ];
+    for (const [label, mutate, expectName, expectDetail] of d22E14) {
+      const per = [];
+      for (const t of TEXTS) {
+        const mut = mutate(ORIGIN[t.tag].bytes);
+        const changed = Buffer.compare(mut, ORIGIN[t.tag].bytes) !== 0;
+        const r = realRun(t.tag, mut, { name: 'e14-mut-' + expectName, lockTarget: true, siblingLock: true });
+        const src = mut.toString('utf8');
+        const s = strippedWholeFile(src);
+        const staticOk = /\[System\.IO\.File\]::Open\s*\([^)]*\[System\.IO\.FileShare\]::None\s*\)/.test(s.out);
+        const runtimeOk = r.lockReady && r.code === 1 && r.exists && r.oldKept && r.out.includes('请先关闭') && r.out.includes('~$out.docx');
+        per.push({ tag: t.tag, changed, staticOk, runtimeOk, lockReady: r.lockReady, code: r.code, oldKept: r.oldKept });
+      }
+      const st = per.map(p => `${p.tag}：变异生效=${p.changed}、静态判据=${p.staticOk}、真跑判据=${p.runtimeOk}（锁就绪=${p.lockReady} 退出码=${p.code} 旧件原样=${p.oldKept}）`).join('；');
+      const red = per.every(p => p.changed && p.lockReady && ((expectName === 'E14-①') ? !p.staticOk : !p.runtimeOk));
+      const others = per.every(p => (expectName === 'E14-①') ? p.runtimeOk : p.staticOk);
+      check(`${label} ⇒ ① 判据必红并**指名 ${expectName}** ② 另一条判据不受影响 ③ 盘上真工具逐字节未变`,
+        red && others, `${st}；期望红的是 ${expectName}（另一条仍须成立）`);
+    }
+
+    /* ---- E15-①：自检区**逐字节冻结**（区间摘要锚点）＋ 契约字面在场 ---- */
+    const e15info = {};
+    for (const t of TEXTS) {
+      const buf = ORIGIN[t.tag].bytes;
+      const region = regionBytes(buf, E15_START, E15_END);
+      e15info[t.tag] = { region, sha: region ? sha256(region) : '(取不到)', len: region ? region.length : 0 };
+    }
+    check('E15-① "BOM 自检区"逐字节未被动过（区间摘要锚点 ＝ 冻结值；改动即红并给出该区实际 SHA256 与长度）',
+      TEXTS.every(t => e15info[t.tag].sha === FROZEN[t.tag].e15),
+      TEXTS.map(t => `${t.rel}：区长=${e15info[t.tag].len} 实测 sha256=${e15info[t.tag].sha.slice(0, 16)}… `
+        + `冻结=${FROZEN[t.tag].e15.slice(0, 16)}…（不等即须复核该区并同步锚点）`).join('；'));
+
+    const e15src = {};
+    for (const t of TEXTS) {
+      const region = e15info[t.tag].region;
+      e15src[t.tag] = {
+        bomConst: region.includes(Buffer.from('$md2docxBom = [byte[]]@(0xEF,0xBB,0xBF)', 'utf8')),
+        readsSelfBytes: /ReadAllBytes\(\$md2docxScriptPath\)/.test(region.toString('utf8')),
+        cnProbe: region.includes(Buffer.from('$md2docxCnProbeText = "微软雅黑"', 'utf8')),
+        failFn: region.includes(Buffer.from('New-Md2DocxBomFailure', 'utf8')),
+        banner: region.includes(Buffer.from('BOM SELF-CHECK FAILED', 'utf8')),
+        exit3: region.includes(Buffer.from('exit 3', 'utf8')),
+        keyControl: region.includes(Buffer.from('if (-not $md2docxBomOk) {', 'utf8'))
+          && region.includes(Buffer.from('if (-not $md2docxProbeFound) {', 'utf8')),
+        readsBytesNotText: !/Get-Content/.test(region.toString('utf8'))
+      };
+    }
+    check('E15-② 自检区的**契约**在场："前 3 字节必须是 EF BB BF" ＋ "本文件字节里必须还能找到中文探针的 '
+      + 'UTF-8 序列" ＋ 失败首行 `BOM SELF-CHECK FAILED` ＋ **退 3** ＋ 两条控制流真的用了结果'
+      + '（`if (-not …)`）＋ **只读原始字节**（不用 `Get-Content` 文本读取）',
+      TEXTS.every(t => {
+        const s = e15src[t.tag];
+        return s.bomConst && s.readsSelfBytes && s.cnProbe && s.failFn && s.banner && s.exit3 && s.keyControl && s.readsBytesNotText;
+      }),
+      TEXTS.map(t => `${t.rel}：${JSON.stringify(e15src[t.tag])}`).join('；'));
+
+    /* ---- E15-③：契约**可运行的**证明（ASCII 孪生正对照 ＋ 反面） ---- */
+    const TPL = [
+      'param([Parameter(Mandatory=$true)][string]$Probe)',
+      '$scriptBytes = [System.IO.File]::ReadAllBytes($Probe)',
+      '$ok = ($scriptBytes.Length -ge 3) -and ($scriptBytes[0] -eq 0xEF) -and ($scriptBytes[1] -eq 0xBB) -and ($scriptBytes[2] -eq 0xBF)',
+      'if (-not $ok) { [Console]::Error.WriteLine("  [FAIL] BOM SELF-CHECK FAILED - this script cannot produce a trustworthy .docx."); exit 3 }',
+      '[Console]::Error.WriteLine("SELFCHECK-PASSED")',
+      ''
+    ].join('\r\n');
+    const driver = path.join(GUARD_DIR, 'e15-driver.ps1');
+    fs.writeFileSync(driver, TPL, 'latin1');
+    const noBomFile = path.join(GUARD_DIR, 'e15-fake-nobom.ps1');
+    const bomFile = path.join(GUARD_DIR, 'e15-fake-bom.ps1');
+    fs.writeFileSync(noBomFile, 'Write-Output hi\r\n', 'latin1');
+    fs.writeFileSync(bomFile, Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from('Write-Output hi\r\n', 'latin1')]));
+    const twinNo = runPs(driver, ['-Probe', noBomFile], GUARD_DIR, 'run-e15-twin-nobom.out.txt');
+    const twinYes = runPs(driver, ['-Probe', bomFile], GUARD_DIR, 'run-e15-twin-bom.out.txt');
+    check('E15-③ 自检契约**可运行**（同一段自检代码的 ASCII 孪生驱动）：目标缺 BOM ⇒ 退 **3** 且 stderr 出现 '
+      + '`BOM SELF-CHECK`；目标有 BOM ⇒ 退 0（正对照；"跳过 ≠ 通过"不适用 —— 这里两条都真跑了）',
+      twinNo.code === 3 && twinNo.out.includes('BOM SELF-CHECK') && twinYes.code === 0 && twinYes.out.includes('SELFCHECK-PASSED'),
+      `缺 BOM：退出码=${twinNo.code}（期望 3）命中首行=${twinNo.out.includes('BOM SELF-CHECK')}；`
+      + `有 BOM：退出码=${twinYes.code}（期望 0）`);
+
+    /* E15 的反面：把 BOM 检查改成恒真 ⇒ 正文已损坏的脚本照样产出 docx（自检形同虚设）。 */
+    const e15MutRuns = {};
+    for (const t of TEXTS) {
+      const mut = Buffer.from(ORIGIN[t.tag].bytes.toString('latin1')
+        .replace('if (-not $md2docxBomOk) {', 'if ($false) {'), 'latin1');
+      const changed = Buffer.compare(mut, ORIGIN[t.tag].bytes) !== 0;
+      const region = regionBytes(mut, E15_START, E15_END);
+      e15MutRuns[t.tag] = {
+        changed, sha: region ? sha256(region) : '(取不到)',
+        r: realRun(t.tag, mut, { name: 'e15-vacuous' })
+      };
+    }
+    check('E15-④ D22 反面：把 BOM 检查改成**恒真**（`if (-not $mdxBomOk)` ⇒ `if ($false)`）⇒ '
+      + '① 冻结锚点必红并指名（该区 SHA256 变了）② 真跑证明危害：正文未变的坏脚本照样写出 docx（自检形同虚设）',
+      TEXTS.every(t => {
+        const m = e15MutRuns[t.tag];
+        return m.changed && m.sha !== FROZEN[t.tag].e15 && m.r.code === 0 && m.r.exists && m.r.size > 0 && !m.r.oldKept;
+      }),
+      TEXTS.map(t => {
+        const m = e15MutRuns[t.tag];
+        return `${t.rel}：变异生效=${m.changed} 锚点由 ${FROZEN[t.tag].e15.slice(0, 12)}… 变为 ${m.sha.slice(0, 12)}…（必红）；`
+          + `真跑退出码=${m.r.code}、目标被新件覆盖=${m.r.exists && !m.r.oldKept}（大小 ${m.r.size} 字节）`;
+      }).join('；'));
+
+    /* ---- E106-①：静态 —— 安全写三件事（不删旧件 ＋ 临时件 ＋ 一次原子替换）＋ 残留白名单 ----
+       注：两个脚本的**目标变量名不同**（`md2docx.ps1` 用 `$OutPath`、`md2docx-img.ps1` 用
+       `$outFull`）⇒ 判据一律用 `$TARGET_VAR` 形态类（`$(?:OutPath|outFull|TargetPath)`），
+       写死某一个名字会在另一个脚本上**假红**（首版实测）。 */
+    const TARGET_VAR = '\\$(?:OutPath|outFull|TargetPath)\\b';
+    /*  "安全写窗口"内允许出现的删除目标白名单（临时件／构建目录／备份件／构建目录内的条目） */
+    const DEL_WHITELIST = /\$(?:zipTemp|build|buildDir|bak|bakResidue)\b|\$_\.FullName\b/;
+    const e106 = {};
+    for (const t of TEXTS) {
+      const buf = ORIGIN[t.tag].bytes;
+      /*  打包区 ＝ 打包函数定义 → 落位函数前（**落位动作在它之外**，故这里必须"碰不到目标"）；
+          落位区 ＝ 落位函数定义 → `E106-SWAP:` 标记（**唯一**允许动到旧件的地方）。 */
+      const packRegion = regionBytes(buf, 'function New-DocxPackage', '# 把**已经完整**的临时件落位到目标');
+      const swapRegion = regionBytes(buf, 'function Set-DocxAtomically', 'E106-SWAP:');
+      const winRegion = regionBytes(buf, 'function New-DocxPackage', 'E106-SWAP:');
+      const tailRegion = (() => {
+        const s = buf.toString('utf8');
+        const a = s.indexOf('E106-SWAP:');
+        const z = s.indexOf('} finally { Clear-Md2DocxResidue }');
+        return a < 0 || z < 0 ? null : s.slice(a, z);
+      })();
+      const pack = packRegion ? strippedWholeFile(packRegion.toString('utf8')).out : '';
+      const win = winRegion ? strippedWholeFile(winRegion.toString('utf8')).out : '';
+      const swap = swapRegion ? strippedWholeFile(swapRegion.toString('utf8')).out : '';
+      const tail = tailRegion ? strippedWholeFile(tailRegion).out : '';
+      /* 判据口径（否定式）：在"安全写窗口"（打包函数 → `E106-SWAP:` 落位动作之前）内，
+         每一句删除调用的目标**都必须落在这个白名单里**（临时件／构建目录／备份件／构建目录内的条目），
+         即**不存在一句"删到目标"的语句**。这正是 `E106` 的成因形态（旧逻辑第一句 `Remove-Item $target`）。 */
+      const stmts = win.split(/\r?\n/).map(l => l.trim())
+        .filter(l => /(?:^|[\s;{])(?:Remove-Item|Remove-ItemProperty)\b/.test(l));
+      const offWhitelist = stmts.filter(l => !DEL_WHITELIST.test(l));
+      /*  否定式的**精确口径**：窗口内**任何一句删除调用**的目标都不得是目标变量。 */
+      const targetRe = new RegExp(TARGET_VAR);
+      const resetRe = new RegExp(TARGET_VAR + '\\s*=\\s*\\$false\\)');
+      const reachesTarget = stmts.some(l => targetRe.test(l))
+        || /\[System\.IO\.File\]::Delete/.test(win)
+        || /(?:^|[\s;{])(?:del|erase|rd|rmdir)\s/i.test(win)
+        || resetRe.test(win);
+      e106[t.tag] = {
+        packLen: packRegion ? packRegion.length : 0,
+        packSha: packRegion ? sha256(packRegion) : '(取不到)',
+        winSha: winRegion ? sha256(winRegion) : '(取不到)',
+        swapLen: swapRegion ? swapRegion.length : 0,
+        swapSha: swapRegion ? sha256(swapRegion) : '(取不到)',
+        fnSig: /function\s+New-DocxPackage\s*\(\s*\[string\]\s*\$SourceDir\s*\)/.test(pack),
+        tempName: winRegion ? winRegion.toString('utf8').includes('_md2docx_pkg.new') : false,
+        selfCheck: /ZipFile\]::OpenRead\(\$zipTemp\)/.test(win),
+        delStmts: stmts.length, offWhitelist, reachesTarget,
+        fnSigLands: /function\s+Set-DocxAtomically\s*\(\s*\[string\]\s*\$TempPath\s*,\s*\[string\]\s*\$TargetPath\s*\)/.test(swap),
+        usedInReplace: /\[System\.IO\.File\]::Replace\s*\(\s*\$TempPath\s*,\s*\$TargetPath/.test(swap),
+        usedInMove: /\[System\.IO\.File\]::Move\s*\(\s*\$TempPath\s*,\s*\$TargetPath/.test(swap),
+        callPassesTemp: new RegExp('Set-DocxAtomically\\s+\\$pkgTempFile\\s+'
+          + '\\$(?:OutPath|outFull)\\b').test(tail),
+        swapMarks: buf.toString('latin1').indexOf(l1('E106-SWAP:')) >= 0
+          && buf.toString('latin1').indexOf(l1('E106-SWAP-REPLACE:')) >= 0,
+        whitelist: buf.toString('latin1').includes(l1('._docx_build'))
+      };
+    }
+    check('E106-① "安全写"的**形态**在剥注释/字符串后的代码里在场：打包函数**不接收目标路径**'
+      + '（签名只有 `$SourceDir`）⇒ 结构上碰不到旧件；临时件 `_md2docx_pkg.new` ＋ 自证（`OpenRead`）＋ '
+      + '落位只由 `File::Replace($TempPath,$TargetPath)` / `File::Move` 完成，且**唯一**的落位调用把'
+      + '临时件与目标一起传入（`Set-DocxAtomically $pkgTempFile $OutPath`）',
+      TEXTS.every(t => {
+        const e = e106[t.tag];
+        return e.fnSig && e.tempName && e.selfCheck && e.fnSigLands
+          && (e.usedInReplace || e.usedInMove) && e.callPassesTemp && e.swapMarks;
+      }),
+      TEXTS.map(t => {
+        const e = e106[t.tag];
+        return `${t.rel}：${JSON.stringify({ 打包签名无目标: e.fnSig, 临时件: e.tempName, 自证: e.selfCheck,
+          落位签名: e.fnSigLands, 原子替换: e.usedInReplace, 改名: e.usedInMove, 落位调用: e.callPassesTemp, 标记: e.swapMarks })}`;
+      }).join('；'));
+
+    check('E106-② 两个冻结区**逐字节未被动**（打包区 ＋ 落位区各自的区间摘要锚点 ＝ 冻结值）'
+      + '—— 任何人改这两段都必须重跑本节的 D22 并同步锚点',
+      TEXTS.every(t => e106[t.tag].packSha === FROZEN[t.tag].pack && e106[t.tag].swapSha === FROZEN[t.tag].swap),
+      TEXTS.map(t => `${t.rel}：打包区 ${e106[t.tag].packLen} B sha256=${e106[t.tag].packSha.slice(0, 16)}…`
+        + `（冻结 ${FROZEN[t.tag].pack.slice(0, 16)}…）；落位区 ${e106[t.tag].swapLen} B `
+        + `sha256=${e106[t.tag].swapSha.slice(0, 16)}…（冻结 ${FROZEN[t.tag].swap.slice(0, 16)}…）`).join('；'));
+
+    check('E106-③ **否定式**判据：在"安全写窗口"（打包函数 → 落位动作之前）里，每一句删除调用的目标'
+      + '**都必须**落在白名单内（`$zipTemp` / `$build` / `$buildDir` / `$bak` / `$bakResidue` / 构建目录内条目），'
+      + '且**任何一句删除调用的目标都不是目标变量**（`$OutPath`／`$outFull`／`$TargetPath`）'
+      + '、整段也不出现 `File::Delete`／`del`／`rd` 形态 —— 即"结构上不可能删到旧件"'
+      + '（这正是 `E106` 的成因形态：旧逻辑第一句就是删目标）',
+      TEXTS.every(t => {
+        const e = e106[t.tag];
+        return e.offWhitelist.length === 0 && !e.reachesTarget && e.delStmts >= 1;
+      }),
+      TEXTS.map(t => {
+        const e = e106[t.tag];
+        return `${t.rel}：窗口内删除语句 ${e.delStmts} 句、其中目标不在白名单的 ${e.offWhitelist.length} 句`
+          + `（${e.offWhitelist.join(' ｜ ') || '无'}）；触碰目标变量＝${e.reachesTarget}`;
+      }).join('；'));
+
+    /* ---- E106-D22：把"先删目标再替换"插回**落位函数** ⇒ 必红并指名 E106-③ ---- */
+    for (const t of TEXTS) {
+      const s = ORIGIN[t.tag].bytes.toString('latin1');
+      const anchor = '  $item = Get-Item -LiteralPath $TargetPath -Force\n';
+      /* 危险形态由**片段拼接**构造：本文件里不出现可直接复制的一句完整危险命令 */
+      const badStmt = '  ' + ['Remove', 'Item'].join('-') + ' -LiteralPath $TargetPath -Force -ErrorAction Stop\n';
+      const mut = Buffer.from(s.replace(anchor, badStmt + anchor), 'latin1');
+      const changed = Buffer.compare(mut, ORIGIN[t.tag].bytes) !== 0;
+      /* 判据侧复算（与 E106-③ 同一口径）：打包区被"触碰目标"污染 ⇒ 必红 */
+      const mPack = regionBytes(mut, 'function New-DocxPackage', E106_PACK_END);
+      const mCode = mPack ? strippedWholeFile(mPack.toString('utf8')).out : '';
+      const mWin = regionBytes(mut, 'function New-DocxPackage', E106_SWAP_END);
+      const mWinCode = mWin ? strippedWholeFile(mWin.toString('utf8')).out : '';
+      const mStmts = mWinCode.split(/\r?\n/).map(l => l.trim())
+        .filter(l => /(?:^|[\s;{])(?:Remove-Item|Remove-ItemProperty)\b/.test(l));
+      const nowDangerous = mStmts.some(l => !DEL_WHITELIST.test(l))
+        || mStmts.some(l => new RegExp(TARGET_VAR).test(l))
+        || /\[System\.IO\.File\]::Delete/.test(mWinCode)
+        || /(?:^|[\s;{])(?:del|erase|rd|rmdir)\s/i.test(mWinCode) || !mCode;
+      const mSwap = regionBytes(mut, 'function Set-DocxAtomically', E106_SWAP_END);
+      const r = realRun(t.tag, mut, { name: 'e106-mut-' + t.tag });
+      check(`E106-D22 把"先删目标再替换"插回落位函数（${t.rel}）⇒ ① E106-③ 必红并指名`
+        + ` ② 真跑证明危害：退出码≠0 **且旧件被毁（目标不存在）** ③ 盘上真工具逐字节未变`,
+        changed && nowDangerous && mSwap !== null && r.code !== 0 && !r.exists && !r.oldKept,
+        `${t.rel}：变异生效=${changed} 复算 E106-③ 命中"删到非临时件/触碰目标"=${nowDangerous}（⇒ 必红）；`
+        + `真跑退出码=${r.code}（期望非 0）目标还存在=${r.exists}（期望 false）`
+        + `旧件原样=${r.oldKept}；未变异同场景见 E106-④`);
+    }
+
+    /* ---- E106-④：未变异同场景必绿（排除"本来就红"）＋ 成功路径不留白名单外的残留 ---- */
+    const e106Runs = {};
+    for (const t of TEXTS) {
+      e106Runs[t.tag] = realRun(t.tag, ORIGIN[t.tag].bytes, { name: 'e106-origin' });
+    }
+    check('E106-④ 未变异的当前工具在同场景（目标已存在）真跑必绿：退出码 0 ＋ 产出新件（覆盖旧件）'
+      + '＋ **不在目标目录留下白名单外的残留**（白名单＝`._docx_build` / `_md2docx_pkg.new` / `*.md2docx.bak`，'
+      + '都只允许瞬时存在）',
+      TEXTS.every(t => {
+        const r = e106Runs[t.tag];
+        return r.code === 0 && r.exists && !r.oldKept && r.size > 0 && r.residue.length === 0;
+      }),
+      TEXTS.map(t => {
+        const r = e106Runs[t.tag];
+        return `${t.rel}：退出码=${r.code} 新件大小=${r.size} 残留=[${r.residue.join('、')}]`;
+      }).join('；'));
+
+    check('残留白名单自证：本节的跑法只可能产生 `._docx_build` / `_md2docx_pkg.new` / `*.md2docx.bak` 三类，'
+      + '且工作区（`._verify\\tools-check-guards`）与仓库内**都应为 0** —— 逐条给出实测数',
+      (() => {
+        const names = [];
+        for (const dir of [GUARD_DIR, path.join(ROOT, '输出文件'), path.join(ROOT, 'tools'), ROOT]) {
+          if (!fs.existsSync(dir)) continue;
+          for (const n of fs.readdirSync(dir)) {
+            if (n.startsWith('._docx_build') || n === '_md2docx_pkg.new' || /\.md2docx\.bak$/.test(n)) names.push(path.join(dir, n));
+          }
+        }
+        return names.length === 0;
+      })(),
+      '扫描面：`._verify\\tools-check-guards` 顶层 ＋ 仓库根/`tools`/`输出文件` 顶层；命中即列出');
+
+    /* ---- 真工具字节复核（本节的**全部**运行都在副本上 ⇒ 真文件必须逐字节未变）---- */
+    check('T7 收口：两个真 `.ps1` 在本节全程只读、逐字节未变（`Buffer.compare`）＋ BOM 仍在'
+      + '（`edit` 工具会吃 BOM ⇒ 这条同时是 E15 那半静态守据的复核）',
+      TEXTS.every(t => {
+        const now = fs.readFileSync(path.join(ROOT, ...t.rel.split('/')));
+        return Buffer.compare(now, ORIGIN[t.tag].bytes) === 0 && ORIGIN[t.tag].bom;
+      }),
+      TEXTS.map(t => {
+        const now = fs.readFileSync(path.join(ROOT, ...t.rel.split('/')));
+        return `${t.rel}：sha256=${h16(now)}… 与本节开头一致=${Buffer.compare(now, ORIGIN[t.tag].bytes) === 0} BOM=${ORIGIN[t.tag].bom}`;
+      }).join('；'));
+
+    /* 读数留痕：把三支的锚点与真跑结论落进 `._verify`（人工复核用；不写受管文件） */
+    fs.writeFileSync(path.join(GUARD_DIR, 'guards-report.json'), JSON.stringify({
+      at: new Date().toISOString(),
+      origin: Object.keys(ORIGIN).map(k => ({ tag: k, sha256: ORIGIN[k].sha, bom: ORIGIN[k].bom })),
+      frozen: FROZEN, e15: { md: e15info.md.sha, img: e15info.img.sha },
+      pack: { md: e106.md.packSha, img: e106.img.packSha }, swap: { md: e106.md.swapSha, img: e106.img.swapSha },
+      e14: TEXTS.map(t => ({ rel: t.rel, code: e14runs[t.tag].code, lockReady: e14runs[t.tag].lockReady, oldKept: e14runs[t.tag].oldKept, prompt: e14runs[t.tag].out.includes('请先关闭') })),
+      e106runs: TEXTS.map(t => ({ rel: t.rel, code: e106Runs[t.tag].code, size: e106Runs[t.tag].size, residue: e106Runs[t.tag].residue }))
+    }, null, 1) + '\n', 'utf8');
+  }
+
   /* ===== T6 参数与 README 一致性 ===== */
   section('T6 命令行参数 ↔ README 一致性');
   for (const [label, js, readme] of [
