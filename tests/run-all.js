@@ -821,7 +821,7 @@ function sweepCountSelfCheck() {
   const base = env.paths.tempRootBase;
   const verify = env.paths.verify;
   const nowMs = Date.now();
-  const oldMs = nowMs - 25 * 3600 * 1000;                        /* > 24h：过期 */
+  const oldMs = nowMs - 25 * 3600 * 1000;                        /* 25h ≫ 2h 窗口：过期（数值不动） */
   const freshMs = nowMs - 60 * 1000;                             /* 新鲜 */
   const layout = new Map([
     [base, [
@@ -883,7 +883,7 @@ function sweepCountSelfCheck() {
   if (touched(path.join(verify, env.MAIN_LEDGER_NAME))) {
     problems.push(`E114 判据自检：**主账本被碰**（${env.MAIN_LEDGER_NAME}）—— 它是 docs-cross-check 第十一节的取数面`);
   }
-  if (touched(path.join(verify, 'run-totals.subset-fresh.json'))) problems.push('E114 判据自检：**新鲜**子集账本被回收（24 h 口径被破坏）');
+  if (touched(path.join(verify, 'run-totals.subset-fresh.json'))) problems.push('E114 判据自检：**新鲜**子集账本被回收（2 h 口径被破坏）');
   if (touched(path.join(base, 'run-900002-20200101T000000-bbbb'))) {
     problems.push('E114 判据自检：**新鲜**整轮目录被清（本轮/他路正在用的产物不该被清）');
   }
@@ -1557,12 +1557,16 @@ async function main() {
      证据标签放在最后一行，保证"稳定"是被记录下来的事实，而不是"没打印东西"的默认解读。 */
   console.log(`\n${verdict.evidence}`);
 
-  /* 收尾：清掉 24 小时前的临时区残留（P2-16 —— `harness.cleanup()` 此前只被"测试存在"，
-     从未在真实运行里被调用过；放在全绿收尾处，既不干扰本轮用例，又能防止临时目录无限堆积）。
+  /* 收尾：清掉 **2 小时前、且其轮次进程已不在**的临时区残留（P2-16 —— `harness.cleanup()`
+     此前只被"测试存在"，从未在真实运行里被调用过；放在全绿收尾处，既不干扰本轮用例，
+     又能防止临时目录无限堆积）。**窗口与判据的唯一出处**＝`tests\env.js` 的
+     `STALE_MAX_AGE_MS`／`cleanupStaleTemp()`：`T-20261005-37`（2026-10-05）把窗口
+     24h → **2h**，并改成**双条件**（年龄 > 2h **且**名字里的 pid 不存活）—— 只按年龄会
+     误删 `node tests\stress-check.js --hours 8` 的**浸泡轮**（它活过 2h）。
      `E90`（2026-10-03）后清扫对象＝**公共根** `tests\._verify\tmp`（`env.paths.tempRootBase`）
      下的**整轮目录** `run-<pid>-…` —— 本轮自己的那一轮目录刚建（mtime 新）绝不被它命中，
-     另一路正在跑的整轮目录也不会（除非已过期 24 h）。**不要**改成 `cleanup(true)`：
-     那正是 `E90` 的病灶（把"另一轮正在用的产物"当垃圾删）。 */
+     另一路正在跑的整轮目录也不会（即便已过期 2 h，只要那一轮的 pid 还活着就不清）。
+     **不要**改成 `cleanup(true)`：那正是 `E90` 的病灶（把"另一轮正在用的产物"当垃圾删）。 */
   try {
     const { cleanup } = require('./lib/harness');
     const swept = cleanup(false);
@@ -1570,14 +1574,15 @@ async function main() {
        "N 个整轮目录"，于是"拆了 1 个链接"会被读成"清了 1 个过期轮次目录"（`E114` 立案事实：
        座位 5 实测 `removed:1` 其实是它植入的链接）；且 `removedLedgers`（`E105` 新增字段）
        此前**全仓无调用方读取** ⇒ `E105` 到底回收了什么在正常日志里看不见。
-       ⚠ 打印口径变了，**清扫行为一字未变**（链接只拆链、主账本绝不碰、只清 >24h，见 env.js）。 */
+       ⚠ 打印口径变了，**清扫行为一字未变**（链接只拆链、主账本绝不碰、只清 >2h **且该轮次
+       pid 不存活**，见 `tests\env.js` 的 `STALE_MAX_AGE_MS`／`T-20261005-37`）。 */
     if (swept && (swept.removed > 0 || swept.removedLedgers > 0)) {
       const parts = [];
       if (swept.removedRounds > 0) parts.push(`${swept.removedRounds} 个整轮目录`);
       if (swept.removedLinks > 0) parts.push(`${swept.removedLinks} 个链接（只拆链，未递归）`);
       if (swept.removedLedgers > 0) parts.push(`${swept.removedLedgers} 个过期子集账本（run-totals.subset-*.json）`);
       if (!parts.length) parts.push(`${swept.removed} 个条目（分类字段缺失：cleanupStaleTemp 未给 removedRounds/removedLinks）`);
-      console.log(`\n  临时区收尾：清理 24 小时前的残留 —— ${parts.join('、')}（保留 ${swept.kept} 个：本轮与其它仍在用的轮次）`);
+      console.log(`\n  临时区收尾：清理 2 小时前（且其轮次进程已不在）的残留 —— ${parts.join('、')}（保留 ${swept.kept} 个：本轮与其它仍在用的轮次）`);
     }
   } catch (err) {
     console.log(`\n  临时区收尾失败（不影响门禁结论）：${err && err.message}`);

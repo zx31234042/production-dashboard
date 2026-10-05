@@ -37,7 +37,8 @@ const env = require('../env');
         ⇒ `rmSync` 中途 `EPERM`、被 `catch` 吞掉 ⇒ 断言报"残留目录仍在=true"。
    两个概念**显式分开**：
      · `tempRootBase` ＝ **公共根**（＝旧 `tempRoot` 的原意 `tests\._verify\tmp`）：
-       只作为"各轮目录的父目录"与 24 小时过期清扫的对象；
+       只作为"各轮目录的父目录"与过期清扫（`T-20261005-37`：窗口 2 小时，判据＝
+       "年龄 > 2h **且**该轮次名字里的 pid 不存活"**双条件**）的对象；
      · `tempRoot`     ＝ **本轮专属**目录 `<base>\run-<pid>-<本地启动时刻>-<4 hex>`：
        本轮所有临时目录/临时库/子进程日志都落在它下面 ⇒ **任一路的 `cleanup` 只能删到
        自己的 `run-<pid>-…`，物理上删不到别人的** —— 这就是"并发不再互相删"的全部机制。
@@ -359,12 +360,23 @@ const removeLinkSafe = env.removeLinkSafe;                     /* E46：是链�
 /**
  * 清理测试临时区。
  *
- * `force=false`（日常收尾，`run-all` 全绿时调用）：只清**公共根**下超过 24 小时的
- *   **整轮目录**（`run-<pid>-…`）—— 本轮目录刚建、mtime 是新的，故自己与别人的这一清理都
- *   命不中它；返回 `{removed, kept, removedLedgers}`（`removed`/`kept` 是**条数**，与旧口径一致，
- *   `harness-check` §五按其类型判）。`T-20261003-14`（`E105`）起，**同一份 24h 口径**也回收
- *   `tests\._verify\` 根下过期的**子集轮账本** `run-totals.subset-*.json`，计入 `removedLedgers`
- *   （**主账本 `run-totals.json` 是 `docs-cross-check` 的取数面，永不被这条清扫碰到**）。
+ * `force=false`（日常收尾，`run-all` 全绿时调用）：只清**公共根**下超过 **2 小时**、
+ *   **且该轮次名字里的 pid 已不存活**的**整轮目录**（`run-<pid>-…`）—— 双条件见
+ *   `T-20261005-37`（窗口 24h → 2h；只按年龄会误删 `node tests\stress-check.js --hours 8`
+ *   的**浸泡轮**）。本轮目录刚建、mtime 是新的 ⇒ 命不中它；别人的这一清理也命不中；
+ *   返回 **5 键** `{removed, kept, removedRounds, removedLinks, removedLedgers}` —— 原样透传
+ *   `tests\env.js` 的 `cleanupStaleTemp()`，本文件一个字段都不加工：
+ *     · `removed`＝**拆掉/删掉的条目总数**（＝ `removedRounds + removedLinks`；与 `E114` 之前
+ *       **逐字同口径** ⇒ 旧读者仍按"条数"读它，`harness-check` §五按其类型判）；
+ *     · `removedRounds`／`removedLinks`＝把上面那个总数**按物分类**：前者＝按过期口径**递归删掉**
+ *       的**整轮目录**数，后者＝**只拆链**拆掉的**链接**数（`E101`：链接不看年龄、无条件拆链
+ *       ⇒ 它**不是**"过期整轮目录"，这正是 `E114` 立案的读数误导）；新读者请**优先读这两个
+ *       分类键**，而不是读 `removed` 再猜它指的是什么；
+ *     · `kept`＝**留下的条目数**（两个清扫面上未被命中、且**成功判定**的条目 ＋ 年龄够了但
+ *       **pid 还活着**的轮次目录 —— 后者就是 `T-20261005-37` 的双条件）；
+ *     · `removedLedgers`＝`T-20261003-14`（`E105`）起、**同一份 2h 口径**回收的
+ *       `tests\._verify\` 根下**过期子集轮账本** `run-totals.subset-*.json` 个数
+ *       （**主账本 `run-totals.json` 是 `docs-cross-check` 的取数面，永不被这条清扫碰到**）。
  *   **公共根口径不写第二份**：清扫策略与目标都在 `tests\env.js` 的 `cleanupStaleTemp()` 里
  *   （`T-20261003-10` 收口后它**就是**清公共根，不再需要"临时把 `tempRoot` 指回公共根"那种
  *   改写单源对象的做法 —— 那既容易被别处观察到，也是"同一份数据两处口径"的温床）。

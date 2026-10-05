@@ -462,6 +462,10 @@ function main() {
    * 足够用于静态扫描，不追求完整 JS 词法分析。
    * E42 补：成对的块注释也可能**全在同一行**（首版只处理跨行块，一行 JSDoc 里的 `new Date()`
    * 就被误判成"裸时钟"）—— 注释必须先剥干净，判据才对事不对字面。
+   * `E189` 补（2026-10-05，座位 4b `T-20261005-35`）：剥注释之后**再剥字符串与模板串**
+   * （只剥**字面量段**、保持列位、插值 `${…}` 内的真代码逐字保留）—— 逐条理由见下面两个助手函数
+   * 的抬头注释。⚠ `stripComments` 的**函数名**与调用它的两个 ASCII 锚点行不许改：
+   * `harness-check` §二十七 靠它们从本文件真源码字节里切段并编译（改了 ⇒ 抽取失败 ⇒ §二十七 判红）。
    */
   const stripComments = (src) => {
     const out = [];
@@ -483,9 +487,71 @@ function main() {
       }
       const slash = line.indexOf('//');
       if (slash >= 0) line = line.slice(0, slash);
-      out.push(line);
+      out.push(blankStringsKeepPosE189(line));
     }
     return out;
+  };
+
+  /* ---------- `E189`（2026-10-05，座位 4b `T-20261005-35`）：剥字符串/模板串（**保持列位**） ----------
+     立案（`项目记录\后续路线图.md` `E189`；由上一件 `T-20261005-31` 在收紧判据时**实测报出**）：
+     本判据此前**只剥注释** ⇒ `const s = "new Date()"` 这类**字符串字面量**里的时钟形态会被判红
+     （`D17` 主判据与 `EXT-A`／`EXT-B` **三面同病**，因为三者共用 `stripComments`）。**真树 0 命中**
+     （故当前不发作），但这是一条**过报（假阳）边界**：说明性字面量（URL、示例串、错误模板、SQL 文本）
+     一旦出现，就会把一条**正确**的行判红 —— 假红与假绿同价，都让门禁失去指向性。
+     修法＝在**剥注释之后**把字符串/模板串的**字面量段**置空。三条硬约束（踩了当场出事）：
+       ① **函数名与两个锚点行的字面不许改**：`harness-check` §二十七 靠**两个 ASCII 锚点行**
+          （`stripComments` 的定义行 ＋ `clockHits` 的初始化行；逐字字面见该节常量
+          `D17_A0`／`D17_A1`，此处**故意不复述** —— 复述会让锚点在真源码里命中两次、抽取当场失效）
+          从本文件**真源码字节**里切连续区间再 `new Function` 编译（**同一把尺子**，`E153`）。
+          故本段全部落在**两个锚点之间**（抽取区间内）—— 放到 `clockHits` 那一行之后，
+          抽出的判据就会引用不到它（`new Function` 编译期 `ReferenceError`）。
+       ② **必须保持字符位置**：字面量内容换成**等长空格**、不删字符。删字面量会让列索引左移 ⇒
+          `injectableCall(line, m.index, m.index + m[0].length)` 看到的 `before`/`after` 错位 ⇒
+          正常行被判成"有注入出口"（**假绿**）。
+       ③ **模板串插值 `${…}` 里的真代码仍要判**（它是代码、不是字面量）⇒ 只**跳过**、**不置空**。
+     顺序（为什么不先剥字符串再剥注释）：注释里常带撇号/引号（英文注释尤甚）；字符串先剥会把
+     块注释里的**撇号**当成字符串起点，把**同一行的真代码**一并置空 ⇒ 那是**漏报**，比过报更危险。
+     故沿用既有顺序：**先注释、后字符串**（本函数在每行剥完注释后调用下面的助手）。
+     **能力边界（如实登记，不靠加正则掩盖）**：
+       · 行内**未闭合**的引号 ⇒ 该行余下内容全部置空（非法 JS，代价可接受）；
+       · **正则字面量**里的引号（`/['"]/`）会被当成字符串起点 ⇒ 该行余下内容置空（**漏报**方向），
+         与"正则 vs 除号"歧义同源，属**文本启发式**的固有边界；
+       · 字符串里出现 `//` 时仍会**先被注释剥掉**（既有顺序的固有边界）。
+     上述三条边界与 `D17`／`EXT-A`／`EXT-B` 的既有边界同族：本判据**不是**数据流证明。 */
+  const braceEndE189 = (line, openIdx) => {
+    let depth = 0;
+    for (let i = openIdx; i < line.length; i++) {
+      const c = line[i];
+      if (c === '{') depth++;
+      else if (c === '}') { depth--; if (depth === 0) return i; }
+    }
+    return -1;
+  };
+  const blankStringsKeepPosE189 = (line) => {
+    const chars = line.split('');
+    let i = 0;
+    while (i < line.length) {
+      const q = line[i];
+      if (q !== '"' && q !== "'" && q !== '`') { i++; continue; }
+      chars[i] = ' ';
+      let j = i + 1;
+      while (j < line.length) {
+        const c = line[j];
+        if (c === '\\') { chars[j] = ' '; if (j + 1 < line.length) chars[j + 1] = ' '; j += 2; continue; }
+        if (c === q) { chars[j] = ' '; j++; break; }
+        const isInterpE189 = q === '`' && c === '$' && line[j + 1] === '{';
+        if (isInterpE189) {
+          const end = braceEndE189(line, j + 1);
+          if (end < 0) { for (let k = j; k < line.length; k++) chars[k] = ' '; j = line.length; break; }
+          j = end + 1;
+          continue;                       /* E189-INTERP-KEEP：插值内是真代码 ⇒ 只跳段、不置空 */
+        }
+        chars[j] = ' ';
+        j++;
+      }
+      i = j;
+    }
+    return chars.join('');
   };
 
   /* 被管的时钟调用：`new Date()` 与 `Date.now()` **同等**（E42②：此前只看 `new Date()`）。 */
@@ -2014,33 +2080,109 @@ function main() {
     const scriptTruth16 = (name) => truthReason16(name).value;
 
     /* —— 范围与形态表（**唯一**的命中口径；改口径必须同步这段注释） —— */
-    /** dated 历史记录的排除口径（三条，取并集；都是"按小节/行前缀/显式锚点限定"，不按数字大小猜）：
+    /** dated 历史记录的排除口径（四条，取并集；都是"按小节/行前缀/显式标注限定"，**不按数字大小猜、
+     *  更不按行号白名单**）：
      *  ① 行前缀是 `| <4 位年>-<2 位月>-<2 位日>`（变更记录表格行）；
      *  ② 位于「变更记录」小节标题之后的**所有**行（该小节整体是历史）；
      *  ③ 带**dated 引文标记**的行（`原始输出引文`／`（最近一轮：2026-10-02`／`截至 <日期>`）——
      *     实测例子：`项目架构与技术栈.md:292` 的「权威区合计 **1248 ＝ 1248**（最近一轮：2026-10-02 …）」
      *     是**当轮的原始输出引文**（≠ 现在的真值，也不该改），但它**不带日期行前缀、也在变更记录之前**
-     *     ⇒ 只靠 ①② 抓不到它（本轮如实补上 ③，并把理由写在这里）。 */
+     *     ⇒ 只靠 ①② 抓不到它（本轮如实补上 ③，并把理由写在这里）。
+     *  ④ **带"历史/现场读数"标注的行**（`E190` 新增，2026-10-05 座位 4b `T-20261005-35`）——
+     *     标注词：`现场读数`／`本机不可复跑`／`（当时口径）`（全角）或 `(当时口径)`（半角）。
+     *     **依据（本仓 `E120` 已立的标注约定，不是本件新造）**：`项目架构与技术栈.md:348` 是那份文档
+     *     里**已写明**的口径 —— "历史读数与现状声明混在同一文档里、又都不写性质，正是技术债 `E120`
+     *     的成因"，处理办法是**就地补注"（当时口径）"**；`E120` 的另一半是"描述**现状**的数字**必须**
+     *     等于实跑值／权威值"。⇒ 于是"**行内已自证是历史/现场读数**"的行，其数字**不是现状声明**
+     *     ⇒ 不进判定（既不改它，也不判它红）。
+     *     ⚠ 为什么必须给它一条**通用规则**而不是"把某一行排除掉"：新族 ⓐ（裸 `P/F`）实测会在
+     *     `项目架构与技术栈.md:88` 命中 4 处（`screenshot-diff` 24/0／`browser-check` 33/0／
+     *     `overlap-check` 27/0／`stress-check` 11/0/3）—— 那一句明写"**现场读数，本机不可复跑**"，
+     *     并与"**已复核到原件**"的现场门禁报告绑在一起 ⇒ 判它红＝要求改写一份**现场事实**（硬纪律 10）。
+     *     按行号白名单排除则"文档一改结构就静默失效"（`E186` 的反面教材），故**按行内标注**判定。 */
     const isDated16 = s => /^\s*\|?\s*\d{4}-\d{2}-\d{2}/.test(s)
-      || /原始输出引文|最近一轮[:：]|截至\s*\d{4}-\d{2}-\d{2}/.test(s);
+      || /原始输出引文|最近一轮[:：]|截至\s*\d{4}-\d{2}-\d{2}/.test(s)
+      || /现场读数|本机不可复跑|（当时口径）|\(当时口径\)/.test(s);
     const archAll16 = read(ARCH_REL).split(/\r?\n/);
     const cutPos16 = archAll16.findIndex(l => /^#+\s*.*变更记录/.test(l));
-    const archRows16 = archAll16.map((text, i) => ({ file: ARCH_REL, no: i + 1, text }))
+    /* `E190`：报名字符串用**稳定的受管文档名**（`ARCH_LABEL16`），**不用** `ARCH_REL` —— 后者在
+       `DSH_DC_ARCH_OVERRIDE`（**仅调试用**的读数重定向）生效时是**副本路径**，而 D22 的取证要求
+       "指名**受管文档**的 `文件:行号`"（副本与真文件逐字节相同、只差被替换掉的那一处 ⇒ 行号一致）。
+       README 那两条范围本来就写死 `tests/README.md`，这里与之对齐。 */
+    const ARCH_LABEL16 = '项目架构与技术栈.md';
+    const archRows16 = archAll16.map((text, i) => ({ file: ARCH_LABEL16, no: i + 1, text }))
       .filter(r => !isDated16(r.text) && (cutPos16 < 0 || r.no - 1 < cutPos16));
     const archExcluded16 = archAll16.length - archRows16.length;
     const readmeNo16 = readmeSrc.split(/\r?\n/).findIndex(l => l.includes('离线可跑部分')) + 1;
     const authRows16 = [{ file: 'tests/README.md', no: readmeNo16, text: authLine }];
+
+    /* `E190`（2026-10-05，座位 4b `T-20261005-35`）：**新增两族形态**。负责人当日裁定：
+       **收进 §16，不新增第 18 个脚本**（理由：同一张"声明面"的口径必须只有一处实现，
+       否则又变成"两个真源各自漂移"）。
+       立案＝主代理本批把 `harness 461→465`／`files 24→27`／`db 298→301` 三种变化**分三轮**才同步
+       干净，每一步都靠 `docs-cross-check` **报错才找到** —— 漏掉的正是下面两族：
+         ⓐ **裸 `P/F`（可含跳过位）**：形如 `` `db-check` 296/0 ``／`` `screenshot-diff` 24/0 ``／
+            `` `stress-check` 11/0/3 ``（加粗可有可无、空格可有可无）。**为什么它当时没有门禁**：
+            §11 只扫 `tests\README.md`（权威行 ＋ 全文），本节原有的 `scriptJ`／`scriptC` 只认
+            "（N 项）"形态 ⇒ **架构文档正文里的裸 `P/F` 一处都没人看**。实测：`项目架构与技术栈.md`
+            `:37`／`:83` 的 `` `db-check` 296/0 `` 与真源 301/0 不符 —— 那是**仓外审计脚本**
+            `e190-decl-audit.js` 抓出来的，**不是门禁**抓出来的。
+         ⓑ **自指脚本的中文形式**：`tests\README.md` 脚本表里 `docs-cross-check` 那一格的
+            「**跨文档一致性（N 项）**」。**为什么这一族必须单列**（三条，缺一条都说不通）：
+              ① §11 的两条逐脚本断言**按设计**都排除自指脚本（原文："自指脚本：两条逐脚本断言都比
+                 不了它"——它执行时"自己这次跑出来的通过数"还没确定，拿账本里的**中途值**去比会变成
+                 永远红的假失败）；
+              ② 本节原有的 `scriptC` 要求"反引号脚本名**紧跟**左括号"，而脚本表那一格的形态是
+                 "表格单元里 `tests/docs-cross-check.js` ＋ 中文短语 ＋（N 项）" ⇒ 该族**命中不到**；
+              ③ 于是一个**真漂移**（README 脚本表写 **72**、权威行写 **84**）在当时的两族下**都不报**。
+            ⇒ 该族的真源＝**权威区对自指脚本的声明数**（`declaredOf(SELF_REF)`），与和值族 ④ 里
+               `selfDecl` 的取数**同源** ⇒ "脚本表的中文形式"与"权威行的三元"由同一个真源对账。
+       两族共用**同一套**排除口径（`isDated16`，含新增规则 ④）与**同一套**取数
+       （`truthReason16()`：账本快路径 ＋ 冲突复核；前提不成立 ⇒ `incomparable` 单列、报"本轮不可比"）——
+       口径不许各写一份，否则"两族"立刻变成"两个真源"。 */
+    const readmeTableRows16 = readmeSrc.split(/\r?\n/)
+      .map((text, i) => ({ file: 'tests/README.md', no: i + 1, text }))
+      .filter(r => /^\|\s*`tests[\\/][a-z0-9-]+\.js`\s*\|/.test(r.text) && !isDated16(r.text));
+    /** ⓑ 的形态串**不硬编码**：从 §11 已解析出的"脚本表中文短语"（`tableDeclarations`）现取
+     *  ⇒ 文档改标题时本族跟着走；连短语都解析不到 ⇒ 正则退化为"永不命中"、`must` 当场判红
+     *  （"锚点丢失即红"，`E186`：不许静默架空）。 */
+    const selfCnForm16 = (() => {
+      const d = tableDeclarations.get(SELF_REF);
+      return d && d.form ? d.form : null;
+    })();
+    const escRe16 = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const FAM16 = {
       comp: { id: '①N 个（界面）组件', re: /(\d+)\s*个\s*\*{0,2}(?:界面)?组件/g, kind: 'count', truth: () => compCount16 },
       gates: { id: '②N 个（离线）门禁', re: /(\d+)\s*个\s*\*{0,2}(?:为)?(?:带断言的)?(?:（离线）|\(离线\)|离线)?\s*门禁/g, kind: 'count', truth: () => offlineCount16 },
       js: { id: '③a N 个 `tests\\*.js`', re: /(\d+)\s*个\*{0,2}\s*`(?:\*\.js|tests\\\*\.js)`/g, kind: 'count', truth: () => jsTop16 },
       scriptJ: { id: '③b `脚本.js`（N 项）', re: /`([a-z0-9-]+)\.js`\s*（\s*\*{0,2}\s*(\d+)\s*项/g, kind: 'script' },
       scriptC: { id: '③c `脚本`（…N 项）', re: /`([a-z0-9-]+)`\s*（[^（）|]{0,14}?\*{0,2}(\d+)\s*项/g, kind: 'script' },
+      scriptpf: {
+        id: '⑤裸 `脚本名` P/F（可含跳过位）',
+        /* `E190`ⓐ：加粗可有可无、空格可有可无；第三位（跳过数）可选。**只认紧贴**的形态
+           （反引号脚本名 ＋ 数字/数字），故 `E123 的 REQUIRED_TABLES ＝ 14` 这类断言不会误入。
+           ⚠ 名字字符集与 §11 的 `nameDecl` 同口径（`[a-z0-9-]`，不含点/斜杠）⇒ 「`judge.js` 15/15」
+           这种**非门禁**形态不会被抓（它不是"`脚本名` P/F"，而 `judge.js` 也不在门禁清单里）。 */
+        re: /`([a-z0-9-]+)`\s*\*{0,2}\s*(\d+)\s*\/\s*(\d+)(?:\s*\/\s*(\d+))?/g,
+        kind: 'scriptpf'
+      },
+      selfcn: {
+        id: '⑥自指脚本的中文形式（`跨文档一致性（N 项）`）',
+        /* `E190`ⓑ：形态串从 §11 已解析出的"脚本表中文短语"现取（**不硬编码**标题）；
+           取不到 ⇒ 退化为"永不命中"，由 `must` 当场判红（锚点丢失不许静默）。 */
+        re: selfCnForm16 ? new RegExp(escRe16(selfCnForm16) + '（(?:\\*\\*|\\s)*(\\d+)\\s*项', 'g') : /(?!)/g,
+        kind: 'selfcn'
+      },
       sum: { id: '④N 个的和是 M', re: /(\d+)\s*\*{0,2}\s*个\s*\*{0,2}\s*的和是\s*\*{0,2}(\d+)/g, kind: 'sum' }
     };
     const SRC16 = [
-      { file: ARCH_REL, rows: archRows16, fams: ['comp', 'gates', 'js', 'scriptJ', 'scriptC', 'sum'], must: ['comp', 'gates', 'js', 'scriptJ'] },
-      { file: 'tests/README.md', rows: authRows16, fams: ['gates', 'js', 'sum'], must: ['gates', 'sum'] }
+      { file: ARCH_LABEL16, rows: archRows16, fams: ['comp', 'gates', 'js', 'scriptJ', 'scriptC', 'scriptpf', 'sum'], must: ['comp', 'gates', 'js', 'scriptJ', 'scriptpf'] },
+      { file: 'tests/README.md', rows: authRows16, fams: ['gates', 'js', 'sum'], must: ['gates', 'sum'] },
+      /* `E190`ⓑ：**单列一条范围**（同一文件、另一段行区间）—— 不去扩 README 的权威行范围，
+         因为那样会让 ①②③④ 族也去扫整张脚本表（实测会命中"性能微基准/失败条数"那类**归属不同**
+         的数字，见本节抬头"为什么范围必须显式列明"）。`label` 只用于范围读数，`file` 仍用于报
+         `文件:行号`（必须可 grep 回原文）。 */
+      { file: 'tests/README.md', label: 'tests/README.md（脚本表行）', rows: readmeTableRows16, fams: ['selfcn'], must: ['selfcn'] }
     ];
     /** 判据本体（**纯函数**：D22 复用同一个函数，否则变异绿了也证明不了可证伪）。
      *  @returns {{hits:Object, findings:Array<{key:string,msg:string}>, lost:Array<string>, checked:number}} */
@@ -2073,6 +2215,43 @@ function main() {
                   findings.push({ key, msg: `${where} ${fam.id}：\`${name}\` 正文写 ${got} 项 ≠ 真源 ${t16.value}` +
                     `${name === SELF_REF ? '（自指 ⇒ 与权威区声明比对）' : '（实跑通过数）'}（"${raw}"）` });
                 }
+              } else if (fam.kind === 'scriptpf') {
+                /* `E190`ⓐ：裸 `P/F`（可含跳过位）⇒ 与逐脚本真源比对。**取数口径与 §11／本节其余族一致**：
+                   通过数走 `truthReason16()`（账本快路径 ＋"声明≠账"时的冲突复核实跑；自指 ⇒ 权威区声明）；
+                   失败/跳过位只有**账本**这一个真源（`ledgerSummary`），账本没有该脚本的完整三元 ⇒
+                   `incomparable`（**不许**拿"没第三位"当"跳过为 0"、也不许只比通过数就算过）。 */
+                const name = m[1];
+                const gotP = Number(m[2]); const gotF = Number(m[3]);
+                const gotS = m[4] === undefined ? null : Number(m[4]);
+                const t16 = truthReason16(name);
+                const led = ledgerSummary[name];
+                if (!t16.data || !led) {
+                  findings.push({ key, incomparable: true, msg: `${where} ${fam.id}：\`${name}\`（"${raw}"）**本轮不可比**（`
+                    + (!t16.data ? t16.reason : `账本里没有 \`${name}\` 的完整三元 ⇒ 失败/跳过位无从比对`) + '）' });
+                } else {
+                  const want = `${t16.value}/${led.failed}${gotS === null ? '' : '/' + led.skipped}`;
+                  const badP = gotP !== t16.value; const badF = gotF !== led.failed;
+                  const badS = gotS !== null && gotS !== led.skipped;
+                  if (badP || badF || badS) {
+                    findings.push({ key, msg: `${where} ${fam.id}：\`${name}\` 正文写 ${gotP}/${gotF}`
+                      + `${gotS === null ? '' : '/' + gotS} ≠ 真源 ${want}`
+                      + `（通过数＝${name === SELF_REF ? '权威区对自指脚本的声明' : '账本快路径／冲突复核实跑'}；`
+                      + '失败与跳过位＝本轮账本 `run-totals.json`）'
+                      + (badS ? `｜**跳过位**：正文写 ${gotS} ≠ 账本 ${led.skipped}` : '') + `（"${raw}"）` });
+                  }
+                }
+              } else if (fam.kind === 'selfcn') {
+                /* `E190`ⓑ：自指脚本的中文形式 ⇒ 与"权威区对自指脚本的声明数"比对（与和值族 ④ 同源）。
+                   取不到权威区声明 ⇒ `incomparable`（不静默放过、也不把"取不到"说成"文档写错"）。 */
+                const got = Number(m[1]);
+                const selfDecl16 = declaredOf(SELF_REF);
+                if (selfDecl16 === null) {
+                  findings.push({ key, incomparable: true, msg: `${where} ${fam.id}：**本轮不可比**`
+                    + `（权威区对自指脚本 \`${SELF_REF}\` 的声明数解析不到）` });
+                } else if (got !== selfDecl16) {
+                  findings.push({ key, msg: `${where} ${fam.id}：正文写 ${got} 项 ≠ 权威区对自指脚本 `
+                    + `\`${SELF_REF}\` 的声明 ${selfDecl16}（自指 ⇒ 与权威区比对，与和值族同源）（"${raw}"）` });
+                }
               } else {
                 const n2 = Number(m[1]); const got = Number(m[2]);
                 if (n2 !== offlineCount16) {
@@ -2101,26 +2280,65 @@ function main() {
     t.check('E112 §16 前提：正文「内部引数」的范围锚点都可定位（**文件 × 行范围 × 形态**三元组；' +
       '必守形态族命中 0 处即判红 —— 文档改结构必须同步本节，不许静默架空）',
       A16.lost.length === 0 && A16.checked > 0,
-      `${A16.checked} 处命中｜${famCounts16}｜范围：${SRC16.map(s => `${s.file}（${s.rows.length} 行）`).join('、')}` +
-      `｜dated 历史记录**已排除** ${archExcluded16} 行（口径：日期行前缀 ／ 变更记录小节之后 ／ dated 引文标记）` +
+      `${A16.checked} 处命中｜${famCounts16}｜范围：${SRC16.map(s => `${s.label || s.file}（${s.rows.length} 行）`).join('、')}` +
+      `｜dated/标注历史记录**已排除** ${archExcluded16} 行（口径：日期行前缀 ／ 变更记录小节之后 ／ dated 引文标记 ／ ` +
+      `行内「现场读数·本机不可复跑·（当时口径）」标注 —— 见 \`E190\` 规则 ④）` +
       (A16.lost.length ? `｜**锚点丢失**：${A16.lost.join('；')}` : '') +
       `｜真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／和值 `
       + (sumTruthReady16 ? sumTruth16 : `（**本轮不可比**：${sumEval16.reason}）`) +
       (sumMissing16.length ? `（**和的取数不完整**：${sumMissing16.join('、')} 无实跑值）` : ''));
+    /* `E190` 的**排除口径真值表**（合成样本，两组对照）—— 不进主判定，只证明"规则 ④"是承重的。
+       为什么用**合成**样本：真行（`项目架构与技术栈.md:88`）的"现场读数"是否恰好与当前账本不符，
+       取决于**现场那台机器**当时的读数，会随环境变；把它当判据会变成"看运气"的门禁。
+       合成的两组共用同一行文本，**只差标注词** ⇒ 命中差异只能由规则 ④ 解释。 */
+    const cfText16 = '| 兆芯平台与 4K 真机实测 | 🟡 部分实测 | `screenshot-diff` 24/0、`browser-check` 33/0**现场读数，本机不可复跑** |';
+    const cfRow16 = (text) => [{ file: '（合成）排除口径样本', no: 1, text }];
+    const auditCf16 = (rows) => audit16([{ file: '（合成）排除口径样本', rows, fams: ['scriptpf'], must: [] }]);
+    const cfWithMark16 = auditCf16(cfRow16(cfText16).filter(r => !isDated16(r.text)));
+    const cfNoMark16 = auditCf16(cfRow16(cfText16.replace('**现场读数，本机不可复跑**', '')).filter(r => !isDated16(r.text)));
+    /* 真行上的**反事实读数**（只作留痕）：把带标注的真行塞回扫描面 ⇒ 会多出哪些失配。 */
+    const archAnnotRows16 = archAll16.map((text, i) => ({ file: ARCH_LABEL16, no: i + 1, text }))
+      .filter(r => isDated16(r.text) && !/^\s*\|?\s*\d{4}-\d{2}-\d{2}/.test(r.text)
+        && !/原始输出引文|最近一轮[:：]|截至\s*\d{4}-\d{2}-\d{2}/.test(r.text) && (cutPos16 < 0 || r.no - 1 < cutPos16));
+    const A16cfReal = audit16(SRC16.map(s => (s.rows === archRows16 ? { ...s, rows: archRows16.concat(archAnnotRows16) } : s)));
+    const cfReal16 = A16cfReal.findings.filter(f => !f.incomparable && f.key === 'scriptpf');
+    t.check('`E190` §16 排除口径（**按行内标注、不按行号白名单**）：带「现场读数／本机不可复跑／（当时口径）」' +
+      '标注的行**整行不进判定**（依据＝`E120` 已立的标注约定：行内已自证是历史/现场读数 ⇒ 其数字不是现状声明），' +
+      '且这条口径**是承重的**（同一行去掉标注词就会判红并指名）—— 既不许误判现场读数，也不许把规则写成"恒排除"',
+      archAnnotRows16.length > 0 && archAnnotRows16.every(r => !archRows16.some(x => x.no === r.no))
+        && cfWithMark16.findings.length === 0 && cfNoMark16.findings.length > 0,
+      `按规则 ④ 排除的**非 dated** 行：${archAnnotRows16.map(r => `${r.file}:${r.no}`).join('、') || '（无）'}；`
+      + `合成真值表：带标注 ⇒ 失配 ${cfWithMark16.findings.length} 处（应 0）、去掉标注 ⇒ 失配 ${cfNoMark16.findings.length} 处（应 >0，`
+      + `${cfNoMark16.findings.map(f => f.msg).join('；')}）；`
+      + `**真行反事实读数（只作留痕）**：若把上述真行塞回扫描面，新族 ⑤ 会多出 ${cfReal16.length} 处失配`
+      + `${cfReal16.length ? `：${cfReal16.map(f => f.msg).join('；')}` : ''}（**这些正是"现场读数"不该被判的地方**）`);
+    /* `E190` 的**每轮可见读数**（`PASS` 详情不打印 ⇒ 用 `t.info` 留痕）：两族的命中数与排除面 ——
+       没有这一行，"排除口径把 :88 挡掉了"这件事只能靠读代码相信（`D19` 的"看起来验过了"）。 */
+    t.info('`E190` §16 新增两族读数（每轮可见）：'
+      + `⑤ 裸 \`脚本名\` P/F（可含跳过位）命中 ${A16.hits.scriptpf || 0} 处、`
+      + `⑥ 自指脚本中文形式命中 ${A16.hits.selfcn || 0} 处（形态串：「${selfCnForm16 === null ? '**解析不到**' : selfCnForm16}」）；`
+      + `排除口径 ④ 排除的**非 dated** 行＝${archAnnotRows16.map(r => `${r.file}:${r.no}`).join('、') || '（无）'}；`
+      + `**真行反事实（若不排除会多出的 ⑤ 失配）**＝${cfReal16.map(f => f.msg).join('；') || '（无）'}`
+      + `｜本次读入：架构＝${ARCH_REL}、README＝${README_REL}`
+      + `${ARCH_REL === '项目架构与技术栈.md' && README_REL === 'tests/README.md' ? '（**盘上真文件**）'
+        : '（**⚠ `DSH_DC_*_OVERRIDE` 生效，读的是副本** —— 报文里的 `文件:行号` 仍按受管文档名给出）'}`);
 
     const badNum16 = A16.findings.filter(f => f.key !== 'sum' && !f.incomparable);
     const badSum16 = A16.findings.filter(f => f.key === 'sum' && !f.incomparable);
     /* `E141`：**不可比**单列一桶 —— 它仍判红（见下一条），但**不许**混进"声明 ≠ 真源"的失配清单
        （否则同一次探针超时会被读成"文档没同步"，正是本件要消掉的那个误导方向）。 */
     const incomp16 = A16.findings.filter(f => f.incomparable);
-    t.check('E112 §16 断言（数量族 ①②③）：正文内部引数（N 个组件／N 个（离线）门禁／N 个 `tests\\*.js`／' +
-      '`<脚本名>`（N 项））与真源**零失配**（逐处指名 `文件:行号`；真源＝`src\\components\\*.js` 文件数／' +
-      '`run-all` 的 `SUITES` 过滤结果／各脚本**实跑**条数）；**前提不成立（探针超时/取不到汇总行）的项走"本轮不可比"**，' +
+    t.check('E112 §16 断言（数量族 ①②③⑤⑥）：正文内部引数（N 个组件／N 个（离线）门禁／N 个 `tests\\*.js`／' +
+      '`<脚本名>`（N 项）／`E190`ⓐ **裸 `脚本名` P/F（可含跳过位）**／`E190`ⓑ **自指脚本的中文形式**）与真源**零失配**' +
+      '（逐处指名 `文件:行号`；真源＝`src\\components\\*.js` 文件数／`run-all` 的 `SUITES` 过滤结果／各脚本**实跑**条数／' +
+      'ⓐ＝逐脚本三元（通过数走账本快路径＋冲突复核，失败与跳过位取本轮账本）／ⓑ＝权威区对自指脚本的声明数）；' +
+      '**前提不成立（探针超时/取不到汇总行/账本无完整三元）的项走"本轮不可比"**，' +
       '不在此清单里（`E141`：两节的判定口径现已一致）',
       badNum16.length === 0,
       badNum16.length ? `失配 ${badNum16.length} 处：${badNum16.map(f => f.msg).join('；')}`
         : `零失配（${Object.keys(FAM16).filter(k => k !== 'sum').map(k => `${FAM16[k].id}=${A16.hits[k] || 0} 处`).join('、')}）；` +
           `真源：组件 ${compCount16}／离线门禁 ${offlineCount16}／tests\\*.js ${jsTop16}／各脚本实跑条数` +
+          `／ⓑ 自指中文形式串＝${selfCnForm16 === null ? '**解析不到**（锚点丢失）' : `「${selfCnForm16}」`}` +
           (incomp16.length ? `；**本轮不可比 ${incomp16.length} 处**（见下一条断言）` : ''));
 
     t.check('E112 §16 断言（和值族 ④）：「N 个的和是 M」的 N ＝ 离线门禁实数、M ＝ 真源和值' +
@@ -2177,6 +2395,24 @@ function main() {
                 const exp = scriptTruth16(m[1]);
                 if (exp !== undefined && exp !== null) rep = rep.replace(/(\d+)(\s*项)/, exp + '$2');
                 else skipped.push(`${key}（\`${m[1]}\` 本轮不可比 ⇒ **拒绝按真源更正**）`);
+              } else if (fam.kind === 'scriptpf') {
+                /* `E190`ⓐ：按**逐脚本三元**更正（通过数＝`truthReason16`，失败/跳过＝账本）。
+                   只改**第二个反引号之后**的数字 ⇒ 脚本名里万一有数字也不会被误改。 */
+                const tie16 = truthReason16(m[1]);
+                const led16 = ledgerSummary[m[1]];
+                if (!tie16.data || !led16) {
+                  skipped.push(`${key}（\`${m[1]}\` 本轮不可比 ⇒ **拒绝按真源更正**）`);
+                } else {
+                  const cut16 = m[0].indexOf('`', 1) + 1;
+                  const exp16 = [tie16.value, led16.failed].concat(m[4] === undefined ? [] : [led16.skipped]);
+                  let ki16 = 0;
+                  rep = m[0].slice(0, cut16) + m[0].slice(cut16).replace(/\d+/g, () => String(exp16[ki16++]));
+                }
+              } else if (fam.kind === 'selfcn') {
+                /* `E190`ⓑ：按"权威区对自指脚本的声明数"更正（与和值族同源）。 */
+                const selfRep16 = declaredOf(SELF_REF);
+                if (selfRep16 === null) skipped.push(`${key}（自指脚本的权威区声明解析不到 ⇒ **拒绝按真源更正**）`);
+                else rep = rep.replace(/(\d+)(\s*项)/, selfRep16 + '$2');
               } else if (Number(m[1]) === offlineCount16) {
                 if (!sumEval16.data) {
                   /* ← `E152`：**前提不成立 ⇒ 不改基线**（旧写法在这里会写进滞后账本的和值） */
@@ -2236,13 +2472,14 @@ function main() {
     const sumRepairHeld16 = sumEval16.data
       ? base16R.sumRowsAfter.includes(String(sumTruth16))
       : sumBaselineUntouched16;
-    const mutants = ['comp', 'gates', 'scriptC', 'sum'].map(k => ({ k, m: bump16(base16, k) }))
+    const mutants = ['comp', 'gates', 'scriptC', 'scriptpf', 'selfcn', 'sum'].map(k => ({ k, m: bump16(base16, k) }))
       .map(x => ({ ...x, a: x.m ? audit16(x.m.srcs) : null }));
     const directed = mutants.every(x => x.m && x.a
       && x.a.findings.some(f => f.key === x.k && f.msg.startsWith(x.m.where)));
-    t.check('E112 §16 D22 定点变异（**内存文本变异**，同一次变异改坏四个族各一处）：' +
-      '①「N 个组件」改错、②「N 个（离线）门禁」改错、③一处「`<脚本>`（N 项）」改错、④「N 个的和是 M」改错 ⇒ ' +
-      '四条判据必须各自**红并逐处指名 `文件:行号`**；按真源更正后的基线必绿（**`E152`：`incomparable` 项单列一桶、不算失配**，' +
+    t.check('E112 §16 D22 定点变异（**内存文本变异**，同一次变异改坏**六个族**各一处）：' +
+      '①「N 个组件」改错、②「N 个（离线）门禁」改错、③一处「`<脚本>`（N 项）」改错、' +
+      '⑤`E190`ⓐ「裸 `脚本名` P/F」改错、⑥`E190`ⓑ「自指脚本的中文形式」改错、④「N 个的和是 M」改错 ⇒ ' +
+      '六条判据必须各自**红并逐处指名 `文件:行号`**；按真源更正后的基线必绿（**`E152`：`incomparable` 项单列一桶、不算失配**，' +
       '它们由 §16 的"本轮不可比"那条断言判红）；**前提不成立时和值族一个字都不许改**（基线不被污染）；盘上两个文件逐字节未变',
       baseBad16.length === 0 && A16base.lost.length === 0 && directed
         && sumRepairHeld16

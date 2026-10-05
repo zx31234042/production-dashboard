@@ -4123,6 +4123,400 @@ async function main() {
     + `⑨D22（内存退化命名）⇒ 同秒 5 次去重后 **${new Set(e44MutNames).size}** 份（**原件**同场景去重 ${new Set(e44Names).size} 份）、`
     + `锚点命中 ${e44MutAnchorN} 次、载入=${e44MutLoad}、盘上逐字节未变=${e44MutDiskSame}`);
 
+  /* ==========================================================================
+     九之二之②、`E188` 备份命名"**排他占名**"（`T-20261005-34`）
+     --------------------------------------------------------------------------
+     立案（`E188`）：`resolveBackupName()` 过去只用 `fs.existsSync` 探测候选刻度 ——
+       "**此刻这一格空不空**"与"**这一格归我**"是**两步** ⇒ 两个调用可以同时看到同一刻度空闲（TOCTOU）。
+     现实现：每个候选刻度先 `claimNameSlot()` 用 `fs.openSync(target,'wx')`（`O_CREAT|O_EXCL`）
+       **排他创建 0 字节占位件**，占到才算这一格归本调用；被占（`EEXIST`）⇒ 递增 1 ms 重试。
+     ⇒ 本节守的就是"**探测与占据是同一个 syscall**"这件事，以及它的三处可观测后果：
+       **各得其所**（谁占谁写）／**别人的成品一份不动**／**零残留 ＋ 失败清理**。
+     ⚠ **能力边界如实登记**（见本节 D22 的 `t.info`）：把占名那一步退回"只探测"之后，
+       **默认路径**（`backupTo()` 不带 `name`）在真并发下**并不必然**撞名（本机 5 轮实测 5/5 互异：
+       一个真进程的 `flushWal` ＋ 写入比另一个的探测慢）⇒ D22 的判红由"**命名步骤单独并发**"那半
+       承担（那半是**确定性**的：两支都不建文件 ⇒ 必然看同一格）。
+     锚点纪律（`E186`）：本节所有文本锚点**只许 ASCII**、逐锚点自证**恰命中 1 次**，变异一律
+       `split/join` 的函数式替换（9.5-7④），盘上文件**全程只读**。
+     ========================================================================== */
+  t.section('九之二之②、E188 备份命名"排他占名"（先占名再写内容 ⇒ TOCTOU 收口）');
+  {
+    const cryptoE188 = require('node:crypto');
+    const ModuleCtorE188 = require('node:module');
+    const { spawn: spawnE188 } = require('node:child_process');
+    const { DatabaseSync: DbE188 } = require('node:sqlite');
+    const sha256E188 = b => cryptoE188.createHash('sha256').update(b).digest('hex');
+    const stallE188 = ms => new Promise(r => setTimeout(r, ms));
+    const ownDirsE188 = [];                       /* 本段自建目录（收尾逐条回读，证"不留 e188-* 残留"） */
+    const newDirE188 = tag => { const d = makeTempDir(tag); ownDirsE188.push(d); return d; };
+
+    const maintPathE188 = require.resolve('../server/db/maintain.js');
+    const maintBytesE188 = fs.readFileSync(maintPathE188);
+    const maintSha0E188 = sha256E188(maintBytesE188);
+    const maintSrcE188 = maintBytesE188.toString('utf8');
+    /** 内存变异体（`Module._compile`，文件名仍是真文件名 ⇒ 内部的 `require('./index')` 照常解析）。
+     *  `hit` 自证锚点**恰命中 1 次**（E186）；非 1 ⇒ 本支**不作数**（`api=null`）。 */
+    const compileMutantE188 = (from, to) => {
+      const hit = maintSrcE188.split(from).length - 1;
+      if (hit !== 1) return { api: null, hit, err: new Error('锚点命中 ' + hit + ' 次（须恰 1）') };
+      try {
+        const mm = new ModuleCtorE188(maintPathE188, null);
+        mm.filename = maintPathE188;
+        mm.paths = ModuleCtorE188._nodeModulePaths(path.dirname(maintPathE188));
+        mm._compile(maintSrcE188.split(from).join(to), maintPathE188);
+        return { api: mm.exports, hit, err: null };
+      } catch (err) { return { api: null, hit, err }; }
+    };
+    /* ⚠ 变异锚点里的删除 API 字样**按仓内既有写法拆开拼**（`'fs.' + 'rmSync(…'`）：
+       避免本节自己的源码被静态判据当成一处"裸删调用形态"（判据走剥字面量，但拆开是更稳的写法）。 */
+    const MUT_CLAIM_FROM_E188 = 'const claimed = claimNameSlot(path.join(dir, name));';
+    const MUT_CLAIM_TO_E188 = 'const claimed = false;   /* D22 变异：只探测、不占名 */';
+    const MUT_DISCARD_FROM_E188 = 'if (' + 'fs.existsSync(p)) fs.' + 'rmSync(p, { force: true });';
+    const MUT_DISCARD_TO_E188 = '/* D22 变异：失败清理改成空转 */';
+
+    /* ---- 取材：一份**可用备份**（"别人的成品"与"正式备份"读数都取材于它，不依赖前面各段的中间状态） ---- */
+    const goodDirE188 = newDirE188('e188-make-good');
+    const goodE188 = maintain.backupToSync(handle.db, goodDirE188, { now: new Date(2026, 9, 5, 13, 0, 0, 0) });
+    const goodVerifyE188 = maintain.verifyBackup(goodE188.path);
+    t.requires('E188 前提：能造出一份**可用备份**（"别人的成品"与"正式备份"两处读数都取材于它）',
+      Boolean(goodE188) && fs.existsSync(goodE188.path) && fs.statSync(goodE188.path).size > 0 && goodVerifyE188.ok,
+      `备份=${goodE188 && goodE188.name}、${goodE188 ? fs.statSync(goodE188.path).size : '-'}B、verify=${JSON.stringify(goodVerifyE188)}`);
+
+    /* ---- 子进程夹具（**真进程** ＋ **两道闸门**）：写进本轮临时区，用完即删 ----
+       闸门用"文件存在性"（不依赖管道）：两支各自**忙等**起跑闸 ⇒ 起跑同刻；
+       `claim` 模式还有第二道闸：**两支的占名都做完之后**才放开写入 ⇒ "占名与写入分成两步"成为结构事实。 */
+    const childPathE188 = path.join(newDirE188('e188-child'), 'e188-child.js');
+    const CHILD_SRC_E188 = [
+      "'use strict';",
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      "const argv = process.argv.slice(2);",
+      "const [mode, dir, dbPath, whenMs, gateStart, gateWrite, claimOut, doneOut, maintPath, mutFrom, mutTo] = argv;",
+      'function waitFor(p) {',
+      '  const t0 = Date.now();',
+      "  while (!fs.existsSync(p)) { if (Date.now() - t0 > 30000) throw new Error('闸门超时：' + p); }",
+      '}',
+      '(async () => {',
+      "  const { DatabaseSync } = require('node:sqlite');",
+      '  const db = new DatabaseSync(dbPath);',
+      "  db.prepare('PRAGMA journal_mode = WAL').get();",
+      '  let api = require(maintPath);',
+      "  if (mutFrom !== '-') {",
+      "    const src = fs.readFileSync(maintPath, 'utf8');",
+      '    const from = JSON.parse(mutFrom);',
+      '    const to = JSON.parse(mutTo);',
+      '    const hit = src.split(from).length - 1;',
+      "    if (hit !== 1) throw new Error('变异锚点命中 ' + hit + ' 次（须恰 1）');",
+      "    const ModuleCtor = require('node:module');",
+      '    const mm = new ModuleCtor(maintPath, null);',
+      '    mm.filename = maintPath;',
+      '    mm.paths = ModuleCtor._nodeModulePaths(path.dirname(maintPath));',
+      '    mm._compile(src.split(from).join(to), maintPath);',
+      '    api = mm.exports;',
+      '  }',
+      '  const when = new Date(Number(whenMs));',
+      '  waitFor(gateStart);',
+      "  if (mode === 'claim') {",
+      '    const claimed = api.resolveBackupName(dir, when);',
+      '    fs.writeFileSync(claimOut, JSON.stringify({ pid: process.pid, claimed: claimed.name, bumpedMs: claimed.bumpedMs }));',
+      '    waitFor(gateWrite);',
+      '    const w = await api.backupTo(db, dir, { name: claimed.name, now: when });',
+      '    fs.writeFileSync(doneOut, JSON.stringify({ pid: process.pid, name: claimed.name, bytes: w.bytes, method: w.commitMethod }));',
+      '  } else {',
+      '    const w = await api.backupTo(db, dir, { now: when });',
+      '    fs.writeFileSync(doneOut, JSON.stringify({ pid: process.pid, name: w.name, bytes: w.bytes, method: w.commitMethod }));',
+      '  }',
+      '  db.close();',
+      '})().catch(err => {',
+      "  try { fs.writeFileSync(doneOut + '.err', String((err && err.stack) || err)); } catch { /* 忽略 */ }",
+      '  process.exit(1);',
+      '});'
+    ].join('\n');
+    fs.writeFileSync(childPathE188, CHILD_SRC_E188, 'utf8');
+
+    /** 起一轮**真并发**（两个真子进程 ＋ 起跑闸门）。返回**原始读数**；
+     *  判据由纯函数 `exclusivityE188()` 给 ⇒ 主断言与 D22 **共用同一个函数**（`E153` 的教训）。 */
+    const runPairE188 = async (mode, mutFrom, mutTo) => {
+      const root = newDirE188('e188-conc-' + mode);
+      const backups = path.join(root, 'backups');
+      fs.mkdirSync(backups);
+      const when = new Date(2026, 9, 5, 15, 0, 0, 0);
+      /* 预置**别人的成品**占住本刻第 0 格：两支都必须**让位**，且这份成品**逐字节不许动** */
+      const foreignName = maintain.backupName(when);
+      const foreignPath = path.join(backups, foreignName);
+      fs.copyFileSync(goodE188.path, foreignPath);
+      const foreignShaBefore = sha256E188(fs.readFileSync(foreignPath));
+      const gateStart = path.join(root, 'gate-start');
+      const gateWrite = path.join(root, 'gate-write');
+      const claimOuts = [0, 1].map(i => path.join(root, 'claim' + i + '.json'));
+      const doneOuts = [0, 1].map(i => path.join(root, 'done' + i + '.json'));
+      const kids = [0, 1].map(i => {
+        const fd = fs.openSync(path.join(root, 'child' + i + '.log'), 'a');
+        const p = spawnE188(process.execPath,
+          [childPathE188, mode, backups, path.join(root, 'db' + i + '.sqlite'), String(when.getTime()),
+            gateStart, gateWrite, claimOuts[i], doneOuts[i], maintPathE188, mutFrom, mutTo],
+          { stdio: ['ignore', fd, fd], windowsHide: true });
+        return { p, fd, exited: null };
+      });
+      kids.forEach(k => k.p.on('exit', code => { k.exited = code; }));
+      await stallE188(700);                     /* 宽限：让两支都打开库、走到闸门前（闸门本身保证同刻起跑） */
+      fs.writeFileSync(gateStart, 'go');
+      const waitFiles = async (files, ms) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < ms) {
+          if (files.every(f => fs.existsSync(f))) return true;
+          await stallE188(15);
+        }
+        return false;
+      };
+      const claimsReady = mode === 'claim' ? await waitFiles(claimOuts, 20000) : true;
+      if (mode === 'claim') fs.writeFileSync(gateWrite, 'go');   /* 两支**都占完名**才放开写入 */
+      const doneReady = await waitFiles(doneOuts, 30000);
+      if (kids.some(k => k.exited === null)) kids.forEach(k => { try { k.p.kill(); } catch { /* 已退出 */ } });
+      await stallE188(60);
+      kids.forEach(k => { try { fs.closeSync(k.fd); } catch { /* 忽略 */ } });
+      const readJsonE188 = f => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+      const claims = claimOuts.map(readJsonE188);
+      const dones = doneOuts.map(readJsonE188);
+      const files = fs.readdirSync(backups).map(n => ({ name: n, size: fs.statSync(path.join(backups, n)).size }));
+      const childErrs = doneOuts
+        .map(f => { try { return fs.readFileSync(f + '.err', 'utf8').split('\n')[0].slice(0, 120); } catch { return null; } })
+        .filter(Boolean);
+      return {
+        mode,
+        foreignName,
+        claimedNames: (mode === 'claim' ? claims : dones).map(x => (x && (x.claimed || x.name)) || null),
+        methods: dones.map(x => (x && x.method) || null),
+        bytes: dones.map(x => (x && x.bytes) || 0),
+        verifyOk: dones.every(x => Boolean(x) && Boolean(x.name)
+          && fs.existsSync(path.join(backups, x.name)) && maintain.verifyBackup(path.join(backups, x.name)).ok),
+        fileCount: files.length,
+        zeroByte: files.filter(f => f.size === 0).map(f => f.name),
+        foreignSame: sha256E188(fs.readFileSync(foreignPath)) === foreignShaBefore,
+        claimsReady, doneReady, childErrs
+      };
+    };
+    /** **受管判据的纯函数**（主断言与 D22 共用）：一条不满足就给出**指名**的理由 */
+    const exclusivityE188 = r => {
+      const why = [];
+      if (r.claimedNames.length !== 2 || r.claimedNames.some(n => !n)) why.push('有子进程没报告名字（异常）');
+      else if (new Set(r.claimedNames).size !== 2) {
+        why.push('同刻两支**没有各得其所**：名字=[' + r.claimedNames.join(', ') + ']');
+      }
+      if (r.claimedNames.indexOf(r.foreignName) >= 0) why.push('有一支占到了**别人的成品**那一格（' + r.foreignName + '）');
+      if (!r.foreignSame) why.push('别人的成品被改动（sha256 变了）');
+      if (r.zeroByte.length) why.push('目录里仍有 **0 字节占位件**：' + r.zeroByte.join('、'));
+      if (r.fileCount !== 3) why.push('目录文件数=' + r.fileCount + '（应为 预置 1 ＋ 新产 2）');
+      if (!r.verifyOk) why.push('两支写出的备份未全部可通过 `verifyBackup()`');
+      if (r.childErrs.length) why.push('子进程异常：' + r.childErrs.join(' | '));
+      if (!r.claimsReady || !r.doneReady) why.push('闸门/子进程未按时完成');
+      return { ok: why.length === 0, why };
+    };
+
+    /* ---------------- `E188-①` 单进程确定性读数 ---------------- */
+    const dirOneE188 = newDirE188('e188-naming');
+    const whenOneE188 = new Date(2026, 9, 5, 14, 0, 0, 0);
+    const firstOneE188 = maintain.resolveBackupName(dirOneE188, whenOneE188);
+    const firstSizeE188 = fs.statSync(path.join(dirOneE188, firstOneE188.name)).size;
+    const secondOneE188 = maintain.resolveBackupName(dirOneE188, whenOneE188);
+    const secondSizeE188 = fs.existsSync(path.join(dirOneE188, secondOneE188.name))
+      ? fs.statSync(path.join(dirOneE188, secondOneE188.name)).size : null;
+    t.check('E188-① **"探测到空格"与"占住它"是同一个 syscall**（单进程确定性读数）：同一目录、同一毫秒连调两次 '
+      + '`resolveBackupName()`，**两次之间不写任何内容** ⇒ 第二次**必须**拿到下一个刻度（名字互异），'
+      + '且两次占下的名字处都留下 **0 字节占位件**（＝`O_CREAT|O_EXCL` 真的建了它，不是"记了个名字"）；'
+      + '退回"只探测、不占名"后两次**必然同名**（变异读数见 `E188-⑥`）',
+      firstOneE188.name !== secondOneE188.name && firstSizeE188 === 0 && secondSizeE188 === 0
+        && secondOneE188.bumpedMs > 0,
+      `第一次=${firstOneE188.name}（${firstSizeE188}B、bumpedMs=${firstOneE188.bumpedMs}）／`
+        + `第二次=${secondOneE188.name}（${secondSizeE188}B、bumpedMs=${secondOneE188.bumpedMs}）`);
+
+    /* ---------------- `E188-②`／`E188-③` 真并发（两支真进程） ---------------- */
+    const concClaimE188 = await runPairE188('claim', '-', '-');
+    const concDefaultE188 = await runPairE188('default', '-', '-');
+    const concClaimOkE188 = exclusivityE188(concClaimE188);
+    const concDefaultOkE188 = exclusivityE188(concDefaultE188);
+    t.check('E188-② **真并发：两支真进程在同一毫秒抢占同一格**（起跑闸门 ＋ 各自 `resolveBackupName()` ＋ 再写进'
+      + '**自己占下的那一格**）⇒ ①两支**各得其所**（名字互异，且都没占到预置的那一格）；②两支都把**自己占下的那一格**'
+      + '写满（体积 > 0 且 `verifyBackup().ok`）；③**别人的成品逐字节未动**（sha256 前后比对）；'
+      + '④**零残留**（目录里没有 0 字节 `board-*.db`，文件数＝预置 1 ＋ 新产 2）',
+      concClaimOkE188.ok,
+      concClaimOkE188.ok
+        ? `claimed=[${concClaimE188.claimedNames.join(', ')}]（预置=${concClaimE188.foreignName}）、`
+          + `写满=${concClaimE188.bytes.join('／')}B、commitMethod=[${concClaimE188.methods.join(', ')}]、`
+          + `别人成品未动=${concClaimE188.foreignSame}、目录文件数=${concClaimE188.fileCount}、0 字节件=${concClaimE188.zeroByte.length}`
+        : '判红：' + concClaimOkE188.why.join('；'));
+    const syncDirE188 = newDirE188('e188-sync-method');
+    const syncOneE188 = maintain.backupToSync(handle.db, syncDirE188, { now: new Date(2026, 9, 5, 16, 0, 0, 0) });
+    const expWhenE188 = new Date(2026, 9, 5, 16, 0, 1, 0);
+    const explicitOneE188 = await maintain.backupTo(handle.db, newDirE188('e188-explicit'),
+      { name: maintain.backupName(expWhenE188), now: expWhenE188 });
+    t.check('E188-③ **默认路径**（`backupTo()` 不带 `name`）在真并发下同样满足②的四条（⇒ 两条备份路径共用'
+      + '**同一套占名**，不是"只有手动占名那条能用"）；并核**返回形状**：默认/同步路径 `commitMethod===\'claim-wx\'`、'
+      + '显式名 `===\'fixed-name\'`（`E188` 新加的字段可读、可核）',
+      concDefaultOkE188.ok && concDefaultE188.methods.every(m => m === 'claim-wx')
+        && syncOneE188.commitMethod === 'claim-wx' && explicitOneE188.commitMethod === 'fixed-name',
+      `默认路径真并发：${concDefaultOkE188.ok ? '四条全过' : '判红 —— ' + concDefaultOkE188.why.join('；')}`
+        + `（claimed=[${concDefaultE188.claimedNames.join(', ')}]、方法=[${concDefaultE188.methods.join(', ')}]）；`
+        + `backupToSync.commitMethod=${syncOneE188.commitMethod}；显式名 backupTo.commitMethod=${explicitOneE188.commitMethod}`);
+
+    /* ---------------- `E188-④` 失败清理（占名**之前**／**之后**各一针） ---------------- */
+    const txnSrcE188 = makeTempDb({ name: 'e188-txn-src' });
+    txnSrcE188.db.exec('CREATE TABLE t(a INTEGER)');
+    const closedDirE188 = newDirE188('e188-closed');
+    const closedHandleE188 = new DbE188(txnSrcE188.path);
+    closedHandleE188.close();
+    const closedWhenE188 = new Date(2026, 9, 5, 18, 0, 0, 0);
+    let closedAsyncErrE188 = null;
+    let closedSyncErrE188 = null;
+    try { await maintain.backupTo(closedHandleE188, closedDirE188, { now: closedWhenE188 }); } catch (e) { closedAsyncErrE188 = e; }
+    try { maintain.backupToSync(closedHandleE188, closedDirE188, { now: closedWhenE188 }); } catch (e) { closedSyncErrE188 = e; }
+    const txnWhenE188 = new Date(2026, 9, 5, 19, 0, 0, 0);
+    const txnDirE188 = newDirE188('e188-txn');
+    const txnHandleE188 = new DbE188(txnSrcE188.path);
+    txnHandleE188.prepare('PRAGMA journal_mode = WAL').get();
+    txnHandleE188.exec('BEGIN');                 /* 写入动作必失败，而 checkpoint 仍成功 ⇒ 失败落在**占名之后** */
+    let txnErrE188 = null;
+    try { maintain.backupToSync(txnHandleE188, txnDirE188, { now: txnWhenE188 }); } catch (e) { txnErrE188 = e; }
+    try { txnHandleE188.exec('ROLLBACK'); } catch { /* 忽略 */ }
+    txnHandleE188.close();
+    const txnTargetNameE188 = maintain.backupName(txnWhenE188);
+    const txnNamesTargetE188 = Boolean(txnErrE188) && String(txnErrE188.message).indexOf(txnTargetNameE188) >= 0;
+    t.check('E188-④ **失败清理**（两条注入，各挡一半）：㈠**占名之前**失败（闭合句柄 ⇒ `flushWal()` 先抛）——'
+      + '**如实标注：这一支根本没走到占名**；㈡**占名之后**失败（`BEGIN` 事务 ⇒ checkpoint 成功、**占名已发生**、'
+      + '`VACUUM INTO` 在事务内抛）—— 两支都必须**抛错**，且两个目录里都**不留 0 字节占位件**；'
+      + '㈡的错误文案里带的是**那个已占下的目标名**（＝本刻第 0 格）⇒ 证明清理确实发生在占名之后',
+      Boolean(closedAsyncErrE188) && Boolean(closedSyncErrE188) && Boolean(txnErrE188)
+        && /VACUUM/.test(String(txnErrE188.message)) && txnNamesTargetE188
+        && fs.readdirSync(closedDirE188).length === 0 && fs.readdirSync(txnDirE188).length === 0,
+      `㈠闭合句柄：backupTo ⇒ ${closedAsyncErrE188 ? String(closedAsyncErrE188.message).slice(0, 50) : '（竟未抛）'}／`
+        + `backupToSync ⇒ ${closedSyncErrE188 ? String(closedSyncErrE188.message).slice(0, 50) : '（竟未抛）'}；`
+        + `两目录条目数 ${fs.readdirSync(closedDirE188).length}（应 0）；`
+        + `㈡BEGIN 事务：抛=${Boolean(txnErrE188)}、错误出自写入步骤=${Boolean(txnErrE188) && /VACUUM/.test(String(txnErrE188.message))}、`
+        + `消息含本刻目标名 \`${txnTargetNameE188}\`=${txnNamesTargetE188}、目录条目数 ${fs.readdirSync(txnDirE188).length}（应 0：占位件已被失败清理清掉）`);
+
+    /* ---------------- `E188-⑤` 占位中间态：**如实钉住**（不粉饰） ---------------- */
+    const phDirE188 = newDirE188('e188-placeholder');
+    const phWhenE188 = new Date(2026, 9, 5, 17, 0, 0, 0);
+    const phE188 = maintain.resolveBackupName(phDirE188, phWhenE188);
+    const phPathE188 = path.join(phDirE188, phE188.name);
+    const phSizeE188 = fs.statSync(phPathE188).size;
+    const phVerifyE188 = maintain.verifyBackup(phPathE188);
+    const phListE188 = maintain.listBackups(phDirE188);
+    t.check('E188-⑤ **"占名后未写满"这一中间态如实钉住**：那份 0 字节 `board-*.db` **本身是一个合法的空 SQLite 库** ⇒ '
+      + '`verifyBackup()` 的 `ok` **判不出它**（实测 `ok=true`），**唯一可鉴别的读数是 `tables`**'
+      + '（占位件 0 张表，正式备份 ≥ 需求点名的表数）；`listBackups()` 会把它列为一份（`bytes=0` 可见）'
+      + '⇒ 现场"看见它"的通道是**体积/表数**，不是 `ok`',
+      phSizeE188 === 0 && phVerifyE188.ok && phVerifyE188.tables === 0
+        && goodVerifyE188.ok && goodVerifyE188.tables >= REQUIRED_TABLES.length
+        && phListE188.length === 1 && phListE188[0].bytes === 0,
+      `占位件=${phE188.name}（${phSizeE188}B）⇒ verifyBackup=${JSON.stringify(phVerifyE188)}；`
+        + `正式备份 ${goodE188.name} ⇒ ${JSON.stringify(goodVerifyE188)}（需求点名 ${REQUIRED_TABLES.length} 张表）；`
+        + `listBackups=[${phListE188.map(b => b.name + '(' + b.bytes + 'B)').join('、')}]`);
+
+    /* ---------------- `E188-⑥` D22（内存变异 ＋ 同一场景 ＋ 负对照） ---------------- */
+    const mutClaimE188 = compileMutantE188(MUT_CLAIM_FROM_E188, MUT_CLAIM_TO_E188);
+    const mutDiscardE188 = compileMutantE188(MUT_DISCARD_FROM_E188, MUT_DISCARD_TO_E188);
+    let mutPairE188 = null;
+    if (mutClaimE188.api) {
+      const mutDirE188 = newDirE188('e188-mut-naming');
+      const mutWhenE188 = new Date(2026, 9, 5, 21, 0, 0, 0);
+      const aE188 = mutClaimE188.api.resolveBackupName(mutDirE188, mutWhenE188);
+      const bE188 = mutClaimE188.api.resolveBackupName(mutDirE188, mutWhenE188);
+      mutPairE188 = { a: aE188.name, b: bE188.name, files: fs.readdirSync(mutDirE188).length };
+    }
+    const mutConcE188 = mutClaimE188.api
+      ? await runPairE188('claim', JSON.stringify(MUT_CLAIM_FROM_E188), JSON.stringify(MUT_CLAIM_TO_E188))
+      : null;
+    let mutDiscardLeaveE188 = null;
+    if (mutDiscardE188.api) {
+      const dE188 = newDirE188('e188-mut-discard');
+      const hE188 = new DbE188(txnSrcE188.path);
+      hE188.prepare('PRAGMA journal_mode = WAL').get();
+      hE188.exec('BEGIN');
+      try { mutDiscardE188.api.backupToSync(hE188, dE188, { now: txnWhenE188 }); } catch { /* 预期抛（写入步骤失败） */ }
+      try { hE188.exec('ROLLBACK'); } catch { /* 忽略 */ }
+      hE188.close();
+      mutDiscardLeaveE188 = fs.readdirSync(dE188)
+        .map(n => ({ name: n, size: fs.statSync(path.join(dE188, n)).size }));
+    }
+    const diskSameE188 = sha256E188(fs.readFileSync(maintPathE188)) === maintSha0E188;
+    const mutConcSameNameE188 = Boolean(mutConcE188) && mutConcE188.claimedNames.length === 2
+      && new Set(mutConcE188.claimedNames).size === 1;
+    t.check('E188-⑥ D22（可证伪，**内存变异 ＋ 同一场景**）：㈠把 `claimNameSlot()` 那一步退回"**只探测、不占名**"'
+      + '（＝`resolveBackupName()` 的机制内核）⇒ **同刻两次命名必然同名**、**真并发两支也同名**'
+      + '（`E188-①`／`②` 的合取式**必红并指名那条名字**）；㈡把失败清理 `discardTmp()` 改成**空转** ⇒'
+      + '`E188-④` 的"占名之后失败不得留 0 字节占位件"**必红**，且留下的正是**那个已占下的目标名**'
+      + '（这一支同时反证④不是空转：占名真的建过文件）；负对照＝原实现（①–⑤）全绿；'
+      + '盘上 `server\\db\\maintain.js` **逐字节未变**',
+      mutClaimE188.hit === 1 && Boolean(mutClaimE188.api) && mutPairE188
+        && mutPairE188.a === mutPairE188.b && mutPairE188.files === 0
+        && mutConcSameNameE188
+        && mutDiscardE188.hit === 1 && Boolean(mutDiscardE188.api)
+        && mutDiscardLeaveE188 && mutDiscardLeaveE188.length === 1
+        && mutDiscardLeaveE188[0].size === 0 && mutDiscardLeaveE188[0].name === txnTargetNameE188
+        && concClaimOkE188.ok && concDefaultOkE188.ok && diskSameE188,
+      `㈠不占名：锚点命中 ${mutClaimE188.hit} 次（须恰 1）、装载=${Boolean(mutClaimE188.api)}、`
+        + `同刻两次=[${mutPairE188 ? mutPairE188.a + ' , ' + mutPairE188.b : 'n/a'}]（**同名=${Boolean(mutPairE188) && mutPairE188.a === mutPairE188.b}**）、`
+        + `命名后目录文件数=${mutPairE188 ? mutPairE188.files : 'n/a'}（原实现同场景为 2）；`
+        + `真并发两支 claimed=[${mutConcE188 ? mutConcE188.claimedNames.join(', ') : 'n/a'}]（**同名=${mutConcSameNameE188}**）、`
+        + `目录文件数=${mutConcE188 ? mutConcE188.fileCount : 'n/a'}（应 3）；`
+        + `㈡失败清理空转：锚点命中 ${mutDiscardE188.hit} 次、装载=${Boolean(mutDiscardE188.api)}、`
+        + `失败后目录=[${(mutDiscardLeaveE188 || []).map(f => f.name + '(' + f.size + 'B)').join('、') || '（空）'}]`
+        + `（**留下的正是** \`${txnTargetNameE188}\`=${Boolean(mutDiscardLeaveE188) && mutDiscardLeaveE188.length === 1 && mutDiscardLeaveE188[0].name === txnTargetNameE188}）；`
+        + `㈢负对照：②=${concClaimOkE188.ok}、③=${concDefaultOkE188.ok}、盘上逐字节未变=${diskSameE188}（sha256=${maintSha0E188.slice(0, 12)}…）`);
+
+    /* **现算读数**（`E44` 同款纪律：runner 在 PASS 时不打印 `check` 的 detail ⇒ 关键读数必须另给一行）。
+       这一行**不参与判定**，只作证据；失败清单里的判红理由见各 `check` 的 detail。 */
+    t.info(`E188 **现算读数**：①同刻两次命名=[${firstOneE188.name} → ${secondOneE188.name}]`
+      + `（占位件 ${firstSizeE188}B／${secondSizeE188}B）；`
+      + `②真并发（claim 模式）claimed=[${concClaimE188.claimedNames.join(', ')}]、别人成品未动=${concClaimE188.foreignSame}、`
+      + `目录文件数=${concClaimE188.fileCount}、0 字节件=${concClaimE188.zeroByte.length}；`
+      + `③默认路径真并发 claimed=[${concDefaultE188.claimedNames.join(', ')}]、方法=[${concDefaultE188.methods.join(', ')}]；`
+      + `同步/显式名 commitMethod=${syncOneE188.commitMethod}／${explicitOneE188.commitMethod}；`
+      + `④失败清理：占名前失败目录条目 ${fs.readdirSync(closedDirE188).length}、占名后失败目录条目 ${fs.readdirSync(txnDirE188).length}（都应 0）；`
+      + `⑤占位件 verifyBackup=${JSON.stringify(phVerifyE188)}、正式备份 tables=${goodVerifyE188.tables}（需求点名 ${REQUIRED_TABLES.length} 张）；`
+      + `⑥D22 不占名 ⇒ 同刻两次=[${mutPairE188 ? mutPairE188.a + ' , ' + mutPairE188.b : 'n/a'}]、`
+      + `真并发 claimed=[${mutConcE188 ? mutConcE188.claimedNames.join(', ') : 'n/a'}]（**同名=${mutConcSameNameE188}**）、`
+      + `失败清理空转 ⇒ 留下 [${(mutDiscardLeaveE188 || []).map(f => f.name + '(' + f.size + 'B)').join('、') || '（空）'}]；`
+      + `盘上 maintain.js 逐字节未变=${diskSameE188}（sha256=${maintSha0E188.slice(0, 12)}…）`);
+
+    /* ---- 「占位中间态」的**尖锐形态**：**现算**（不引用探针文件）—— 崩溃留下的 0 字节占位件
+       会不会把**真备份**挤出"保留最近 N 份"？ ⇒ **读数进门禁不作判据**，理由见下一条 `t.info`。 */
+    const evictDirE188 = newDirE188('e188-prune-evict');
+    const evictT0E188 = new Date(2026, 9, 5, 20, 0, 0, 0);
+    const evictRealE188 = await maintain.backupTo(handle.db, evictDirE188,
+      { name: maintain.backupName(evictT0E188), now: evictT0E188 });                       /* 真备份：名字**更旧** */
+    const evictPhE188 = maintain.resolveBackupName(evictDirE188, new Date(evictT0E188.getTime() + 5));
+    const evictPrunedE188 = maintain.pruneBackups(evictDirE188, 1);
+    const evictRealGoneE188 = !fs.existsSync(evictRealE188.path);
+    t.info(`E188 **现算读数（口径已随 \`E191\` 更新）**：①0 字节占位件**仍**会被 \`listBackups()\` 当成一份`
+      + `（见 E188-⑤ —— 该判据钉的是"占位件**看得见**"；本次选的是"留在列表里 ＋ 打 \`isComplete\` 标记"，`
+      + `**没有**把它藏起来 ⇒ E188-⑤ **未红**）；`
+      + `②**崩溃形态**（真备份更旧 ＋ 占名后被杀留下**更新**的 0 字节件 \`${evictPhE188.name}\`）⇒ `
+      + `\`pruneBackups(dir, 1)\` 实测 kept=${evictPrunedE188.kept}、removed=[${evictPrunedE188.removed.join('、')}]、`
+      + `incomplete=[${(evictPrunedE188.incomplete || []).join('、')}] ⇒ `
+      + `**真备份被 0 字节占位件挤出保留名额=${evictRealGoneE188}**`
+      + `（\`T-20261005-36\` 之前这条读数曾是 \`removed=[真备份]\`／真备份消失＝true —— 那是 \`T-20261005-34\` 的立案现场；`
+      + `现在它已从"**登记读数、不判红**"升格为**门禁断言**：见本节后面的 \`九之二之③\` 的 \`E191-②\`）；`
+      + `③**判别力边界**（如实登记，本次未变）：把占名退回"只探测"后，**默认路径**的真并发**并不必然**撞名`
+      + `（本机 5 轮实测 5/5 互异：写入比探测慢）⇒ D22 的判红由"**命名步骤单独并发**"那半承担（确定性）；`
+      + `探针读数见 \`tests\\._verify\\T-20261005-34\\probe-e188b.js\`；`
+      + `④**残余面**（\`E191\` 的 \`isComplete\` 只认 \`bytes > 0\`）：崩溃落在**写入中途**留下的**非 0 字节半成品**`
+      + `这条读数判不出来 ⇒ 由 \`九之二之③\` 的 \`E191-⑦\` 用 \`verifyBackup()\` 的 \`ok\`／\`tables\` 如实登记（不假称已覆盖）。`);
+
+    /* ---- 收尾：本段自建目录用完即删（`makeTempDir()` 只建不回收），并**逐条回读**证明不留 e188-* 残留 ---- */
+    const txnSrcProblemsE188 = txnSrcE188.close();
+    for (const d of ownDirsE188) {
+      /* `E117`：删除走受校验的安全出口（这些目录全部由 `makeTempDir()` 在本轮临时区里刚建，结构上不可能是链接） */
+      try { env.removeLinkSafe(d, { recursive: true, force: true }); } catch { /* 删不掉要能看见，故下面单独断言 */ }
+    }
+    t.check('E188：本段自建的目录（含两份真子进程的并发目录与子进程夹具）用完即删，临时区不留 e188-* 残留',
+      ownDirsE188.every(d => !fs.existsSync(d)),
+      ownDirsE188.map(d => `${path.basename(d)}=${fs.existsSync(d) ? '仍在' : '已删'}`).join('，')
+        + `；临时源库回收=${JSON.stringify(txnSrcProblemsE188)}`);
+  }
+
+
   /* 本段收尾：自建的备份目录用完即删 —— `makeTempDir()` 只建不回收（能回收的是 `makeTempDb` 的句柄），
      不删就会在临时区里堆 e44-* 目录（与第十节"临时区与残留"的口径一致）。 */
   const e44OwnDirs = [e44Dir, e44SyncDir, e44EqDir, e44LegacyDir, e44PreDir, e44MixDir, e44RollDir, e44RaceDir, e44MutDir];
@@ -4134,6 +4528,268 @@ async function main() {
   t.check('E44：本段自建的备份目录（含同秒 5 份的那几个）用完即删，临时区不留 e44-* 残留',
     e44OwnDirs.every(d => !fs.existsSync(d)),
     e44OwnDirs.map(d => `${path.basename(d)}=${fs.existsSync(d) ? '仍在' : '已删'}`).join('，'));
+
+  /* ==========================================================================
+     九之二之③、`E191`（`T-20261005-36`）：0 字节占位件**只报不删**（真备份不再被挤出保留名额）
+     --------------------------------------------------------------------------
+     立案（`T-20261005-34` 独立复核出的**加重形态**）：`E188` 用 `openSync(target,'wx')` 排他占名闭合了
+     TOCTOU，代价＝崩溃/读取窗口内目标名下会留下**0 字节不完整备份**；而"真备份更旧 ＋ 占位件更新"时，
+     `pruneBackups(dir, 1)` 会**把真备份删掉、留着占位件** —— "看起来保住了 N 份、其实真备份没了"。
+     现实现（`T-20261005-36`）三条，本节逐条钉住：
+       ① `listBackups()` 每条读数**纯增量**补 `isComplete: st.size > 0`（老字段集与**相对顺序**不动）；
+       ② `pruneBackups(dir, keep)` 的**保留名额与 `kept` 只数完整备份**；0 字节件**只报不删**；
+       ③ 返回值补稳定形状 `incomplete: string[]`（与 `listBackups()` **同序**＝新→旧；**空数组＝没有**），
+          `kept` 是**删后回读**得来（不靠算式推断）。
+     ⚠ 本节的 D22 **两支**（`ADR-0004 D22`：判据必须可证伪；负对照＝真实现全绿）：
+       ㈠ `isComplete` 退回**恒 `true`** ⇒ `E191-②` 的合取式**必红并指名那份真备份**；
+       ㈡ `incomplete` 出口退回**恒 `[]`** ⇒ `E191-②`／`③` **必红并指名那个占位件**。
+     ⚠ **能力边界如实登记**（`E191-⑦`，**不假称已覆盖**）：`isComplete` 只认 `bytes > 0` ⇒ 崩溃落在
+       **写入中途**留下的**非 0 字节半成品**这条读数判不出来（那一类只有 `verifyBackup()` 的
+       `ok`／`tables` 判得出）。
+     ⚠ `E188-⑤` **零改动**：它钉的是"占位件**被列出一份**（`bytes=0` 可见）"；本次选的是"留在列表里
+       ＋ 打标记" ⇒ 该判据**未红**（口径见 `server\db\maintain.js` 的 `listBackups`／`pruneBackups` JSDoc）。
+     锚点纪律（`E186`）：本节所有文本锚点**只许 ASCII**、逐锚点自证**恰命中 1 次**，变异一律
+       `split/join` 的函数式替换（9.5-7④），盘上 `server\db\maintain.js` **全程只读**。
+     ========================================================================== */
+  t.section('九之二之③、`E191`：0 字节占位件"只报不删"（真备份不再被挤出保留名额）');
+  {
+    const cryptoE191 = require('node:crypto');
+    const ModuleCtorE191 = require('node:module');
+    const HOUR_E191 = 3600 * 1000;
+    const sha256E191 = b => cryptoE191.createHash('sha256').update(b).digest('hex');
+    const ownDirsE191 = [];                        /* 本节自建目录（收尾逐条回读，证"不留 e191-* 残留"） */
+    const newDirE191 = tag => { const d = makeTempDir(tag); ownDirsE191.push(d); return d; };
+
+    const maintPathE191 = require.resolve('../server/db/maintain.js');
+    const maintBytesE191 = fs.readFileSync(maintPathE191);
+    const maintSha0E191 = sha256E191(maintBytesE191);
+    const maintSrcE191 = maintBytesE191.toString('utf8');
+    /** 内存变异体（`Module._compile`，文件名仍是真文件名 ⇒ 内部的 `require('./index')` 照常解析）。
+     *  `hit` 自证锚点**恰命中 1 次**（`E186`）；非 1 ⇒ 本支**不作数**（`api=null`）。 */
+    const compileMutantE191 = (from, to) => {
+      const hit = maintSrcE191.split(from).length - 1;
+      if (hit !== 1) return { api: null, hit, err: new Error('锚点命中 ' + hit + ' 次（须恰 1）') };
+      try {
+        const mm = new ModuleCtorE191(maintPathE191, null);
+        mm.filename = maintPathE191;
+        mm.paths = ModuleCtorE191._nodeModulePaths(path.dirname(maintPathE191));
+        mm._compile(maintSrcE191.split(from).join(to), maintPathE191);
+        return { api: mm.exports, hit, err: null };
+      } catch (err) { return { api: null, hit, err }; }
+    };
+    /* 两个 D22 锚点都取自**判据行本身**（不是注释），且都是 ASCII。 */
+    const MUT_ISCOMPLETE_FROM_E191 = 'isComplete: st.size > 0,';
+    const MUT_ISCOMPLETE_TO_E191 = 'isComplete: true,   /* D22：判据退回「凡列出即完整」 */';
+    const MUT_INCOMPLETE_FROM_E191 = 'const incomplete = all.filter(b => !b.isComplete).map(b => b.name);';
+    const MUT_INCOMPLETE_TO_E191 = 'const incomplete = [];   /* D22：出口恒空 */';
+    const OLD_KEYS_E191 = ['name', 'path', 'bytes', 'modifiedAt', 'mtimeMs'];   /* `E191` **之前**的字段集 */
+
+    /** 造"**真备份更旧 ＋ 0 字节占位件更新**"的目录（`T-20261005-34` 的加重形态）。
+     *  mtime 与名字时刻**同向**摆好（`backupOrderMs` 取 `max(mtime, 名字时刻)`）⇒ 读数与系统墙钟无关
+     *  （否则就会依赖"此刻恰好在那个名字时刻之前"这种墙钟前提，换个钟点跑就翻车）。 */
+    const mkEvictE191 = (api, tag) => {
+      const dir = newDirE191(tag);
+      const now = Date.now();
+      const real = api.backupToSync(handle.db, dir, { now: new Date(now - 3 * HOUR_E191) });   /* 真备份：更旧 */
+      const ph = api.resolveBackupName(dir, new Date(now - 1 * HOUR_E191));                    /* 占位件：更新 */
+      const phPath = path.join(dir, ph.name);
+      fs.utimesSync(real.path, new Date(now - 2 * HOUR_E191), new Date(now - 2 * HOUR_E191));
+      fs.utimesSync(phPath, new Date(now - 30 * 60 * 1000), new Date(now - 30 * 60 * 1000));
+      return { dir, real, ph, phPath };
+    };
+
+    /* ---- 前提：真备份确实是一份**可用成品**、占位件确实 0 字节且排在 `listBackups()` 第 0 位 ---- */
+    const ev1E191 = mkEvictE191(maintain, 'e191-evict');
+    const ev1VerifyE191 = maintain.verifyBackup(ev1E191.real.path);
+    const ev1PhSizeE191 = fs.statSync(ev1E191.phPath).size;
+    const ev1ListE191 = maintain.listBackups(ev1E191.dir);
+    t.requires('`E191` 前提：能造出"真备份（可用成品）＋ 0 字节占位件"两件，且**占位件更新**'
+      + '（`listBackups()` 第 0 位就是它 —— 否则"立案形态"根本没被搭出来）',
+      ev1VerifyE191.ok && ev1VerifyE191.tables >= REQUIRED_TABLES.length && ev1PhSizeE191 === 0
+        && ev1ListE191.length === 2 && ev1ListE191[0].name === ev1E191.ph.name,
+      `真备份=${ev1E191.real.name}（verify=${JSON.stringify(ev1VerifyE191)}）、占位件=${ev1E191.ph.name}（${ev1PhSizeE191}B）；`
+        + `listBackups 顺序=[${ev1ListE191.map(b => b.name + '(' + b.bytes + 'B)').join('、')}]`);
+
+    /* ---- `E191-①` 纯增量读数 ---- */
+    const keysOkE191 = ev1ListE191.length === 2 && ev1ListE191.every(b =>
+      Object.keys(b).filter(k => OLD_KEYS_E191.indexOf(k) >= 0).join(',') === OLD_KEYS_E191.join(',')
+      && typeof b.isComplete === 'boolean' && b.isComplete === (b.bytes > 0));
+    t.check('E191-① **纯增量**读数：`listBackups()` 每条多出 `isComplete`（判据＝`bytes > 0`），'
+      + '而老字段集 `[name,path,bytes,modifiedAt,mtimeMs]` 与它们的**相对顺序逐字未动**；0 字节件 ⇒ `isComplete=false`',
+      keysOkE191,
+      `字段集逐条=${JSON.stringify(ev1ListE191.map(b => Object.keys(b)))}；`
+        + `isComplete=${JSON.stringify(ev1ListE191.map(b => b.isComplete))}、bytes=${JSON.stringify(ev1ListE191.map(b => b.bytes))}`);
+
+    /* ---- `E191-②` 立案形态**不再复现**（本节的"D22 靶心"） ---- */
+    const pr1E191 = maintain.pruneBackups(ev1E191.dir, 1);
+    const pred2E191 = Array.isArray(pr1E191.incomplete) && pr1E191.incomplete.length === 1
+      && pr1E191.incomplete[0] === ev1E191.ph.name
+      && pr1E191.removed.length === 0 && pr1E191.kept === 1
+      && fs.existsSync(ev1E191.real.path) && fs.existsSync(ev1E191.phPath);
+    t.check('E191-② **立案形态不再复现**（真备份更旧 ＋ 0 字节占位件更新）：`pruneBackups(dir, 1)` ⇒ '
+      + '`removed=[]`（**一份都不删**）、`kept=1`（只数**完整**备份）、`incomplete=[占位件名]`、'
+      + '**真备份仍在原地**（`T-20261005-36` 之前这里 `removed=[真备份]`、真备份消失）',
+      pred2E191,
+      `pruneBackups(dir,1)=${JSON.stringify(pr1E191)}；真备份 \`${ev1E191.real.name}\` 仍在=${fs.existsSync(ev1E191.real.path)}（应 true）；`
+        + `占位件 \`${ev1E191.ph.name}\` 仍在=${fs.existsSync(ev1E191.phPath)}（应 true：只报不删）；`
+        + `占位件仍在 \`listBackups()\` 名单里=${maintain.listBackups(ev1E191.dir).some(b => b.name === ev1E191.ph.name)}`);
+
+    /* ---- `E191-③` `incomplete` 的**形状与同序**（多个占位件 ＋ 空目录两种情形） ---- */
+    const orderDirE191 = newDirE191('e191-incomplete-order');
+    const orderNowE191 = Date.now();
+    const orderRealNamesE191 = [];
+    for (const h of [5, 4]) {
+      const b = maintain.backupToSync(handle.db, orderDirE191, { now: new Date(orderNowE191 - h * HOUR_E191) });
+      fs.utimesSync(b.path, new Date(orderNowE191 - h * HOUR_E191), new Date(orderNowE191 - h * HOUR_E191));
+      orderRealNamesE191.push(b.name);
+    }
+    const orderPhNamesE191 = [];
+    for (const h of [3, 2, 1]) {
+      const ph = maintain.resolveBackupName(orderDirE191, new Date(orderNowE191 - h * HOUR_E191));
+      orderPhNamesE191.push(ph.name);
+      const p = path.join(orderDirE191, ph.name);
+      fs.utimesSync(p, new Date(orderNowE191 - h * HOUR_E191 + 60 * 1000), new Date(orderNowE191 - h * HOUR_E191 + 60 * 1000));
+    }
+    const orderListE191 = maintain.listBackups(orderDirE191);
+    const orderPrE191 = maintain.pruneBackups(orderDirE191, 5);          /* keep 够大 ⇒ 只看 incomplete */
+    const expectIncE191 = orderListE191.filter(b => !b.isComplete).map(b => b.name);
+    const emptyPrE191 = maintain.pruneBackups(newDirE191('e191-empty'), 2);
+    t.check('E191-③ `incomplete` 是**稳定形状**（`string[]`）：与 `listBackups()` 里 `isComplete === false` 的'
+      + '子序列**逐字同序**（新→旧），且**本次一个都没删**；空目录 ⇒ **空数组**（＝"没有未写完的备份"）',
+      orderListE191.length === 5 && expectIncE191.length === 3
+        && JSON.stringify(orderPrE191.incomplete) === JSON.stringify(expectIncE191)
+        && JSON.stringify(expectIncE191) === JSON.stringify(orderPhNamesE191.slice().reverse())
+        && orderPrE191.removed.length === 0 && orderPrE191.kept === 2
+        && Array.isArray(emptyPrE191.incomplete) && emptyPrE191.incomplete.length === 0,
+      `目录内 ${orderListE191.length} 条（完整 ${orderPrE191.kept} ＋ 占位 ${expectIncE191.length}）；`
+        + `listBackups 顺序=[${orderListE191.map(b => b.name + (b.isComplete ? '' : '(0B)')).join('、')}]；`
+        + `incomplete=${JSON.stringify(orderPrE191.incomplete)}（期望＝新→旧 ${JSON.stringify(expectIncE191)}）；`
+        + `空目录 ⇒ incomplete=${JSON.stringify(emptyPrE191.incomplete)}（应 []）、removed=${JSON.stringify(emptyPrE191.removed)}`);
+
+    /* ---- `E191-④` **回归**：4 份正常备份 `keep=2` ⇒ "三支名单逐字一致" ＋ `incomplete=[]` ----
+       "三支" ＝ 真实现／D22㈠（`isComplete` 恒 `true`，即**改前的名额口径**）／D22㈡（`incomplete` 恒 `[]`）。
+       三支都建**同一批时刻**的 4 份真备份（名字只由 `now` 决定 ⇒ 三支名字逐字相同）。 */
+    const mut1E191 = compileMutantE191(MUT_ISCOMPLETE_FROM_E191, MUT_ISCOMPLETE_TO_E191);
+    const mut2E191 = compileMutantE191(MUT_INCOMPLETE_FROM_E191, MUT_INCOMPLETE_TO_E191);
+    const regDirsE191 = {
+      real: newDirE191('e191-reg-real'),
+      mut1: newDirE191('e191-reg-mut1'),
+      mut2: newDirE191('e191-reg-mut2')
+    };
+    const regWhensE191 = [4, 3, 2, 1].map(h => new Date(Date.now() - h * HOUR_E191));
+    const buildRegE191 = (api, dir) => {
+      const names = [];
+      for (const w of regWhensE191) {
+        const b = api.backupToSync(handle.db, dir, { now: w });
+        fs.utimesSync(b.path, w, w);                                   /* mtime 与名字时刻同向 ⇒ 顺序确定 */
+        names.push(b.name);
+      }
+      return names;
+    };
+    const regNamesE191 = buildRegE191(maintain, regDirsE191.real);
+    const regBeforeE191 = maintain.listBackups(regDirsE191.real).map(b => b.name);
+    const regRealE191 = maintain.pruneBackups(regDirsE191.real, 2);
+    const regAfterE191 = maintain.listBackups(regDirsE191.real).map(b => b.name);
+    const regMutE191 = {};
+    if (mut1E191.api) { buildRegE191(mut1E191.api, regDirsE191.mut1); regMutE191.mut1 = mut1E191.api.pruneBackups(regDirsE191.mut1, 2); }
+    if (mut2E191.api) { buildRegE191(mut2E191.api, regDirsE191.mut2); regMutE191.mut2 = mut2E191.api.pruneBackups(regDirsE191.mut2, 2); }
+    const regExpectKeptE191 = regBeforeE191.filter(n => regRealE191.removed.indexOf(n) < 0);
+    const regSameE191 = Boolean(regMutE191.mut1) && Boolean(regMutE191.mut2)
+      && JSON.stringify(regMutE191.mut1.removed) === JSON.stringify(regRealE191.removed)
+      && JSON.stringify(regMutE191.mut2.removed) === JSON.stringify(regRealE191.removed);
+    t.check('E191-④ **回归（不许改口径）**：4 份**正常**备份 `pruneBackups(dir, 2)` ⇒ 真实现与 D22 两支的 '
+      + '`removed` 名单**逐字一致**（`isComplete` 全为 true 时，新旧名额口径必须给出同一份名单）、'
+      + '`kept=2`、删后回读＝"留下的正好是最近两份"、且 `incomplete=[]`（全完整备份 ⇒ 空数组）',
+      regNamesE191.length === 4 && new Set(regNamesE191).size === 4 && regBeforeE191.length === 4
+        && regRealE191.removed.length === 2 && regRealE191.kept === 2
+        && regRealE191.incomplete.length === 0 && regAfterE191.length === 2
+        && JSON.stringify(regAfterE191) === JSON.stringify(regExpectKeptE191)
+        && regSameE191,
+      `建 ${JSON.stringify(regNamesE191)}；改前名单=${JSON.stringify(regBeforeE191)}；`
+        + `真实现 pruneBackups(dir,2)=${JSON.stringify(regRealE191)}；改后名单=${JSON.stringify(regAfterE191)}（期望 ${JSON.stringify(regExpectKeptE191)}）；`
+        + `D22㈠ removed=${JSON.stringify(regMutE191.mut1 ? regMutE191.mut1.removed : null)}、`
+        + `D22㈡ removed=${JSON.stringify(regMutE191.mut2 ? regMutE191.mut2.removed : null)} ⇒ 三支逐字一致=${regSameE191}`);
+
+    /* ---- `E191-⑤` D22㈠：`isComplete` 退回恒 `true` ⇒ `E191-②` 的合取式必红并**指名那份真备份** ---- */
+    const evMut1E191 = mut1E191.api ? mkEvictE191(mut1E191.api, 'e191-mut1-evict') : null;
+    const prMut1E191 = evMut1E191 ? mut1E191.api.pruneBackups(evMut1E191.dir, 1) : null;
+    const realGoneMut1E191 = Boolean(evMut1E191) && !fs.existsSync(evMut1E191.real.path);
+    const pred2UnderMut1E191 = Boolean(prMut1E191) && prMut1E191.removed.length === 0
+      && prMut1E191.kept === 1 && JSON.stringify(prMut1E191.incomplete) === JSON.stringify([evMut1E191.ph.name])
+      && fs.existsSync(evMut1E191.real.path) && fs.existsSync(evMut1E191.phPath);
+    t.check('E191-⑤ D22㈠（可证伪，**内存变异 ＋ 同一场景 ＋ 负对照**）：把 `isComplete` 退回**恒 `true`**'
+      + '（`Module._compile` 的内存字节副本，盘上文件只读）⇒ 同一"崩溃形态"下 `removed=[真备份名]`、'
+      + '**真备份被删掉、占位件留下** ⇒ `E191-②` 的合取式**必红并指名那份真备份**',
+      mut1E191.hit === 1 && Boolean(mut1E191.api) && realGoneMut1E191
+        && JSON.stringify(prMut1E191.removed) === JSON.stringify([evMut1E191.real.name])
+        && pred2UnderMut1E191 === false,
+      `锚点 \`${MUT_ISCOMPLETE_FROM_E191}\` 命中 ${mut1E191.hit} 次（须恰 1）、装载=${Boolean(mut1E191.api)}；`
+        + `变异体 pruneBackups(dir,1)=${JSON.stringify(prMut1E191)}；真备份 \`${evMut1E191 ? evMut1E191.real.name : 'n/a'}\` 被删=${realGoneMut1E191}（应 true）；`
+        + `⇒ \`E191-②\` 的合取式在变异体下=${pred2UnderMut1E191}（**应 false ⇒ 必红并指名 \`${evMut1E191 ? evMut1E191.real.name : 'n/a'}\`**）；`
+        + `负对照＝真实现同场景 removed=[${pr1E191.removed.join('、')}]、真备份仍在=${fs.existsSync(ev1E191.real.path)}`);
+
+    /* ---- `E191-⑥` D22㈡：`incomplete` 出口退回恒 `[]` ⇒ `E191-②`／`③` 必红并**指名那个占位件** ---- */
+    const evMut2E191 = mut2E191.api ? mkEvictE191(mut2E191.api, 'e191-mut2-evict') : null;
+    const prMut2E191 = evMut2E191 ? mut2E191.api.pruneBackups(evMut2E191.dir, 1) : null;
+    const mut2PhSizeE191 = evMut2E191 && fs.existsSync(evMut2E191.phPath) ? fs.statSync(evMut2E191.phPath).size : null;
+    const pred2IncUnderMut2E191 = Boolean(prMut2E191)
+      && JSON.stringify(prMut2E191.incomplete) === JSON.stringify([evMut2E191.ph.name]);
+    t.check('E191-⑥ D22㈡（可证伪）：把 `incomplete` 出口退回**恒 `[]`**（内存副本）⇒ 磁盘上**确有**那份 0 字节'
+      + '占位件、`pruneBackups()` 却报 `incomplete=[]` ⇒ `E191-②`／`③` 里"点名那个占位件"的合取式'
+      + '**必红并指名它**（本支同时反证 `E191-②` 不是恒真式：两份真备份的删除面**照样**没删）',
+      mut2E191.hit === 1 && Boolean(mut2E191.api) && pred2IncUnderMut2E191 === false
+        && prMut2E191.removed.length === 0 && fs.existsSync(evMut2E191.real.path)
+        && mut2PhSizeE191 === 0,
+      `锚点 \`${MUT_INCOMPLETE_FROM_E191}\` 命中 ${mut2E191.hit} 次（须恰 1）、装载=${Boolean(mut2E191.api)}；`
+        + `变异体 pruneBackups(dir,1)=${JSON.stringify(prMut2E191)}；磁盘上 0 字节件 `
+        + `\`${evMut2E191 ? evMut2E191.ph.name : 'n/a'}\` 仍在=${Boolean(evMut2E191) && fs.existsSync(evMut2E191.phPath)}、体积=${mut2PhSizeE191}B；`
+        + `真备份仍在=${Boolean(evMut2E191) && fs.existsSync(evMut2E191.real.path)}（本支只改"报不报"，不改"删不删"）；`
+        + `⇒ 那个名字在变异体读数里=${JSON.stringify(prMut2E191 ? prMut2E191.incomplete : null)}（**应 false ⇒ 必红并指名 \`${evMut2E191 ? evMut2E191.ph.name : 'n/a'}\`**）`);
+
+    /* ---- `E191-⑦` 残余面**如实登记**（不假称已覆盖）：非 0 字节半成品 ---- */
+    const halfDirE191 = newDirE191('e191-halfwritten');
+    const halfPathE191 = path.join(halfDirE191, maintain.backupName(new Date(Date.now() - 10 * 60 * 1000)));
+    fs.writeFileSync(halfPathE191, Buffer.from([0x53]));      /* 1 字节垃圾：`VACUUM INTO` 写到一半崩的形态 */
+    const halfListE191 = maintain.listBackups(halfDirE191);
+    let halfVerifyE191 = null;
+    try { halfVerifyE191 = maintain.verifyBackup(halfPathE191); }
+    catch (e) { halfVerifyE191 = { ok: false, threw: String(e.message) }; }
+    const halfPrE191 = maintain.pruneBackups(halfDirE191, 0);
+    t.check('E191-⑦ **能力边界如实登记（不假称已覆盖）**：崩溃落在**写入中途**留下的**非 0 字节**半成品，'
+      + '`isComplete` **仍报 `true`**（判据只认 `bytes > 0`）⇒ 这一层**判不出它**；能鉴别它的是 '
+      + '`verifyBackup()` 的 `ok`（实测 `ok=false`）；且 `pruneBackups(dir, 0)` 会把它当**完整备份**删掉'
+      + '（⇒ 这一层只认"0 字节"这一种残骸）',
+      halfListE191.length === 1 && halfListE191[0].bytes === 1 && halfListE191[0].isComplete === true
+        && Boolean(halfVerifyE191) && halfVerifyE191.ok === false
+        && halfPrE191.removed.length === 1 && !fs.existsSync(halfPathE191),
+      `1 字节半成品 \`${path.basename(halfPathE191)}\` ⇒ isComplete=${halfListE191[0] && halfListE191[0].isComplete}、`
+        + `bytes=${halfListE191[0] && halfListE191[0].bytes}；verifyBackup=${JSON.stringify(halfVerifyE191)}；`
+        + `pruneBackups(dir, 0)=${JSON.stringify(halfPrE191)}`);
+
+    /* **现算读数**（`E44` 同款纪律：runner 在 PASS 时不打印 `check` 的 detail ⇒ 关键读数必须另给一行）。 */
+    const diskSameE191 = sha256E191(fs.readFileSync(maintPathE191)) === maintSha0E191;
+    t.info(`E191 **现算读数**：①纯增量 ⇒ 字段集=${JSON.stringify(ev1ListE191.map(b => Object.keys(b)))}、`
+      + `isComplete=${JSON.stringify(ev1ListE191.map(b => b.isComplete))}；`
+      + `②立案形态 ⇒ pruneBackups(dir,1)=${JSON.stringify(pr1E191)}、真备份仍在=${fs.existsSync(ev1E191.real.path)}；`
+      + `③incomplete 同序=${JSON.stringify(orderPrE191.incomplete)}、空目录=${JSON.stringify(emptyPrE191.incomplete)}；`
+      + `④回归 ⇒ 建 ${JSON.stringify(regNamesE191)}、removed=${JSON.stringify(regRealE191.removed)}、kept=${regRealE191.kept}、`
+      + `三支名单逐字一致=${regSameE191}；`
+      + `⑤D22㈠（isComplete 恒 true）⇒ ${JSON.stringify(prMut1E191)}、真备份被删=${realGoneMut1E191}；`
+      + `⑥D22㈡（incomplete 恒 []）⇒ ${JSON.stringify(prMut2E191)}；`
+      + `⑦残余面 ⇒ 1 字节半成品 isComplete=${halfListE191[0] && halfListE191[0].isComplete}、verifyBackup.ok=${halfVerifyE191 && halfVerifyE191.ok}；`
+      + `盘上 maintain.js 逐字节未变=${diskSameE191}（sha256=${sha256E191(fs.readFileSync(maintPathE191)).slice(0, 12)}…／原件 ${maintSha0E191.slice(0, 12)}…）`);
+
+    /* ---- 收尾：本段自建目录用完即删（`makeTempDir()` 只建不回收），并**逐条回读**证明不留 e191-* 残留 ---- */
+    for (const d of ownDirsE191) {
+      /* `E117`：删除走受校验的安全出口（这些目录全部由 `makeTempDir()` 在本轮临时区里刚建，结构上不可能是链接） */
+      try { env.removeLinkSafe(d, { recursive: true, force: true }); } catch { /* 删不掉要能看见，故下面单独断言 */ }
+    }
+    t.check('E191-⑧ 本段自建的目录用完即删（临时区不留 e191-* 残留）＋ 盘上 `server\\db\\maintain.js` '
+      + '**逐字节未变**（D22 全程在内存副本上做）',
+      ownDirsE191.every(d => !fs.existsSync(d)) && diskSameE191,
+      ownDirsE191.map(d => `${path.basename(d)}=${fs.existsSync(d) ? '仍在' : '已删'}`).join('，')
+        + `；盘上 maintain.js sha256=${sha256E191(fs.readFileSync(maintPathE191)).slice(0, 12)}…（原件 ${maintSha0E191.slice(0, 12)}…）`);
+  }
 
   /* ---------------- 九之三、鉴权（ADR-0007：scrypt 哈希 / 错误次数锁定 / 内存会话令牌 / 本机一次性初始化） ----------------
      本节覆盖 ADR-0007 **D6.2** 点名的五类判据（①哈希非明文 ②错误次数 ③令牌 ④未初始化态 ⑤与 IF-A 静态令牌

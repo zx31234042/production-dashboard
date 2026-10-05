@@ -280,8 +280,10 @@ t.section('三、日志分级、按日滚动与保留清理（NFR-21）');
      上面已删掉本节自建的日志目录，这里**只在本轮目录已空时**把它一并收掉，免得每跑一次
      就在公共根下留一个空目录（与 `preflight` 收掉写探针那一轮同一理由，P3-14）。
      `rmdirSync` **非递归**：目录非空（还有别的产物）或已不存在 ⇒ 抛错被吞 ⇒
-     那些产物归公共根的 24 小时清扫（`env.cleanupStaleTemp`），绝不误删他物。 */
-  try { fs.rmdirSync(env.paths.tempRoot); } catch { /* 非空或已不在：交给 24h 清扫 */ }
+     那些产物归公共根的 **2 小时**清扫（`env.cleanupStaleTemp`；窗口＝`env.STALE_MAX_AGE_MS`
+     ＝`2*3600*1000`，且判据是"**年龄 > 2h 且该轮次名字里的 pid 不存活**"**双条件** ——
+     `T-20261005-37`（2026-10-05 负责人裁定）由 24h 收到 2h），绝不误删他物。 */
+  try { fs.rmdirSync(env.paths.tempRoot); } catch { /* 非空或已不在：交给 2h 清扫 */ }
 }
 
   t.finish();

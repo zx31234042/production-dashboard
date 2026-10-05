@@ -102,7 +102,7 @@ const paths = {
   root: ROOT,
   tests: TESTS,
   verify: VERIFY,                                              // 自检产物总目录（已忽略）
-  tempRootBase: TEMP_ROOT_BASE,                                // 公共根（各轮目录之父 ＋ 24h 清扫对象）
+  tempRootBase: TEMP_ROOT_BASE,                                // 公共根（各轮目录之父 ＋ 2h 清扫对象）
   tempRoot: RUN_TEMP_ROOT,                                     // **本轮专属**临时区（E90：可写的就是它）
   testData: path.join(VERIFY, 'data', 'test'),                 // D16：测试唯一允许写的数据目录
   captures: path.join(VERIFY, 'captures'),                     // 截图候选目录（screenshot-diff 默认读这里）
@@ -247,11 +247,55 @@ function removeLinkSafe(target, options = {}) {
 }
 
 /* ==========================================================================
-   **过期清扫的 24 小时口径：只有这一份**
+   **过期清扫的 2 小时口径：只有这一份**（`T-20261005-37`：24h → 2h）
    `E90` 之后的 `cleanupStaleTemp()` 与 `E105`（子集账本回收）**共用**同一个常量 ⇒
-   改口径只改这一行，不会出现"目录按 24h、账本按别的时长"这种第二份口径。
+   改口径只改这一行，不会出现"目录按 2h、账本按别的时长"这种第二份口径。
    ========================================================================== */
-const STALE_MAX_AGE_MS = 24 * 3600 * 1000;
+const STALE_MAX_AGE_MS = 2 * 3600 * 1000;                      /* `T-20261005-37`：24h → 2h */
+
+/* `T-20261005-37`（2026-10-05 负责人裁定）：**窗口 2 小时 ＋ "该轮次还在跑就不清"**。
+   ① 为什么从 24h 收到 2h：主代理 2026-10-05 只读实测 —— `tests\._verify\tmp\` 里 **882 个轮次目录
+     全都在 24 小时内**（>24h 的 **0 个**）⇒ 24h 自清扫**根本轮不到**它们；一天 882 轮积到 **1.1 GB**
+     （已手工清掉 2 小时前的 705 个、释放 1,082 MB）⇒ 口径＝"保留最近 2 小时 ＋ 在跑的轮次"。
+   ② ⚠ 为什么**不能只按年龄**：`node tests\stress-check.js --hours 8`（整班次浸泡）会让**一个**轮次
+     目录**活过 2 小时** ⇒ 只按年龄就会把**正在泡的那一轮**端掉（`E90` 的轮次隔离只解决"谁也别删谁"，
+     解决不了"它还没跑完"）⇒ 判据必须是**双条件**：`年龄 > maxAgeMs` **且** `名字里的 pid 已不存活`。
+   ③ 判活＝`process.kill(pid, 0)`（**信号 0 不投递任何信号**，只探存在性 ⇒ 零副作用、零依赖）：
+     **`ESRCH` ⇒ 判死**；**其余一律判活** —— Windows 上"进程**存在**但无权限"正是 `EPERM`／`EACCES`，
+     探针自身报错也倒向"活"。错向**刻意偏保守**：多留一个死目录只是少回收一圈，
+     **误删一个活轮次不可逆**（`E90` 的教训）。本机实测（win32／Node v24.21.0）：自己的 pid 不抛、
+     `999999`／`900001`／`900002` ⇒ `ESRCH`。
+   ④ 谁走这条判据：**只有名字形状＝`E90` 的 `run-<pid>-…` 的条目**（`roundPidOf`）；**其它条目只按
+     年龄**，与改前**逐字同语义**（`tempRootBase` 下还住着测试自建的 `zz-*`，它们没有 pid 可言）。
+     本轮自己的 pid 必然存活 ⇒ 自己的目录永不被清，**不另设"豁免当前进程"的旁路**
+     （两处判据＝两处会漂的口径）。边界如实登记：ⓐ pid 被无关进程**复用** ⇒ 多留一圈（保守侧）；
+     ⓑ 探活是**瞬时**读数 ⇒ TOCTOU 两侧都落在"最多多留一圈"；ⓒ 非整数／`≤ 0`／超 int32 ⇒
+     **直接判死且不探**（`process.kill(0, 0)` 在 POSIX 上指**整个进程组**，不是某个进程）；
+     ⓓ 探针**不进** `makeRealSweepIo()` 的键集（那 8 键被 `run-all` 的 `E114` **逐键比对**，
+     探活无副作用、无需假体）。实测读数与完整理由：`tests\._verify\T-20261005-37\`。 */
+
+/** 轮次目录名形状（`E90` 的命名口径）：`run-<pid>-<本地启动时刻>-<4hex>`；只用来**取 pid**。 */
+const RUN_DIR_RX = /^run-(\d+)-/;
+
+/** 从轮次目录名取创建者的 pid；名字不是该形状 ⇒ `null`（＝本判据不管这个条目）。 */
+function roundPidOf(name) {
+  const m = RUN_DIR_RX.exec(String(name));
+  if (!m) return null;
+  const pid = Number(m[1]);
+  return Number.isInteger(pid) ? pid : null;
+}
+
+/** pid 还活着吗 —— 判据与边界见上面 ③④；**错向刻意偏保守**（除 `ESRCH` 外一律判活）。 */
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || pid > 2147483647) return false;   /* 畸形 pid ＋ 不探 0 */
+  try {
+    process.kill(pid, 0);                                        /* 信号 0＝只探存在性，不投递 */
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;               /* 没有这个进程 ⇒ 判死 */
+    return true;                                                 /* 其余一律判活（保守侧） */
+  }
+}
 
 /** `._verify\` 根下**子集轮账本**的文件名（`E99`：`--only` 子集轮写自己的账，刻意保留 pid
  *  ⇒ 同机多轮不互相覆写）。回收面**只认这个名字形状**，见 `cleanupStaleTemp`。 */
@@ -264,16 +308,17 @@ const SUBSET_LEDGER_RX = /^run-totals\.subset-.+\.json$/;
 const MAIN_LEDGER_NAME = 'run-totals.json';
 
 /**
- * 清理**过期**（默认 24 小时前）的测试产物。`T-20261003-14` 之后有**两个**清扫面，
+ * 清理**过期**（默认 2 小时前）的测试产物。`T-20261003-14` 之后有**两个**清扫面，
  * 共用 `STALE_MAX_AGE_MS` 这一份口径：
  *   ① **公共根**（`paths.tempRootBase` ＝ `tests\._verify\tmp`）下的**整轮**临时目录；
- *   ② `tests\._verify\` **根下** >24h 的**子集轮账本** `run-totals.subset-*.json`
+ *   ② `tests\._verify\` **根下** >2h 的**子集轮账本** `run-totals.subset-*.json`
  *      （`E105`：`E99` 的子集轮账本每轮 4~5 个、~1 KB/个，只写不回收 ⇒ 无限增长）。
  *
  * 为什么①的目标**不是** `paths.tempRoot`（这是 `T-20261003-10` 明确下来的口径）：`E90` 之后
  *   `tempRoot` 是**本轮专属**目录 —— 它刚建、mtime 是新的，拿它当目标等于"一圈都清不掉"；
  *   而"过期清扫"的语义本来就只对公共根下的 `run-<pid>-…` 成立（本轮与他路刚建的都不该被清）。
- *   `lib\harness.js` 的 `cleanup(false)` 与 `run-all` 的全绿收尾都走这里 ⇒ "24 小时"只有这一份。
+ *   `lib\harness.js` 的 `cleanup(false)` 与 `run-all` 的全绿收尾都走这里 ⇒ "2 小时"只有这一份；
+ *   而**轮次目录**另加一条判据（"名字里的 pid 已不存活"）—— 见上面的 `T-20261005-37` 段。
  *
  * **`E101`（★★★）安全判据 —— 顺序不能调**：每个条目**先用 `lstatSync` 判"是不是链接"**：
  *   · **是链接** ⇒ **只拆链**（`removeLinkSafe`：`rmdirSync` 优先／`unlinkSync` 兜底，两法皆非递归），
@@ -281,7 +326,7 @@ const MAIN_LEDGER_NAME = 'run-totals.json';
  *   · **不是链接** ⇒ 才按 mtime 判过期、才允许对**真实目录** `rmSync(…, {recursive:true})`。
  *   为什么"先 lstat 再 stat"而不是"直接 stat 看 mtime"：旧版用 `statSync(full).mtimeMs` ——
  *   `statSync` **跟随**链接 ⇒ 链接的"年龄"其实是**目标**的年龄，一个指向仓内真实目录的
- *   `zz -> tests` junction 只要目标够旧，就会被"24h 清扫"当成过期目录**递归删**。
+ *   `zz -> tests` junction 只要目标够旧，就会被过期清扫当成过期目录**递归删**。
  *   判别与删除必须用**同一口径**（lstat），否则判据与动作之间就有"穿链"的缝。
  *
  * 回收面的三重边界（都不是"顺手多删"）：
@@ -299,7 +344,8 @@ const MAIN_LEDGER_NAME = 'run-totals.json';
  *   · `removedLinks`＝**只拆链**拆掉的链接条数（`E101`：链接不看年龄、无条件拆链 —— 所以它
  *     **不是**"过期整轮目录"，这正是 `E114` 立案的读数误导：旧日志把两者打成一个数）；
  *   · `removedLedgers`＝回收的**过期子集账本** `run-totals.subset-*.json` 个数（`E105`）；
- *   · `kept`＝**留下的条目数**（两个清扫面上未被命中、且成功判定的条目）。
+ *   · `kept`＝**留下的条目数**（两个清扫面上未被命中、且**成功判定**的条目 ＋ 年龄够了但
+ *     **pid 还活着**的轮次目录 —— 后者是 `T-20261005-37` 的双条件判据，见上面那段）。
  *   异常不抛出（逐条 `try/catch`），避免影响门禁；计数**只在动作成功返回后**自增（与旧实现一致）。
  *
  * **注入面（`E114`）**：第二个参数 `io` 是给**定点回归**用的清扫 IO 替身（默认 `null` ＝真文件系统）。
@@ -323,8 +369,18 @@ function cleanupStaleTemp(maxAgeMs = STALE_MAX_AGE_MS, io = null) {
           continue;
         }
         const mtimeMs = fsi.mtimeMs(full);                       /* ② 已确认非链接，stat 不再有"穿链"语义 */
-        if (now - mtimeMs > maxAgeMs) { fsi.removeDir(full); result.removedRounds++; result.removed++; }
-        else result.kept++;
+        if (now - mtimeMs <= maxAgeMs) { result.kept++; continue; }   /* 年龄不够 ⇒ 留 */
+        /* 年龄够了，再过"**这一轮还在跑吗**"这一关（`T-20261005-37` 的双条件，理由见上）。
+           ⚠ 顺序不可倒：先比年龄再探活（绝大多数条目死在年龄这一关，省掉一次探针调用）。
+           `roundPidOf` 返回 `null`（名字不是轮次形状）⇒ 不探活、只按年龄 ⇒ 与改前**逐字同语义**。
+           注入面可**可选**提供 `isPidAlive`（假体自带这一维即可把定点回归钉死；
+           `makeRealSweepIo()` 刻意不暴露它 —— 那 8 个键被 `run-all` 的 `E114` 逐键比对）。 */
+        const roundPid = roundPidOf(name);
+        const stillRunning = roundPid !== null
+          && (typeof fsi.isPidAlive === 'function' ? fsi.isPidAlive(roundPid) : isPidAlive(roundPid));
+        if (stillRunning) { result.kept++; continue; }                /* 在跑的轮次：一根毫毛都不动 */
+        fsi.removeDir(full); result.removedRounds++; result.removed++;
+        /* （改前此处是 `else result.kept++;` —— 它的语义已由上面"年龄不够 ⇒ 留"接手） */
       } catch { /* 忽略：被别人占用或已删除 */ }
     }
   }
@@ -440,6 +496,10 @@ module.exports = {
   SUBSET_LEDGER_RX,
   MAIN_LEDGER_NAME,
   cleanupStaleTemp,
+  /* `T-20261005-37`：判活判据与其解析器一并导出 —— 只为让探针能**直接**给"判活方式"的读数
+     （`process.kill(pid, 0)` 的边界），不在任何生产路径上新增调用点。 */
+  isPidAlive,
+  roundPidOf,
   /* `E114`：清扫的**注入面真实现** —— 一并导出是为了让收尾自检能比对"假体与真实现的键集一致"
      （见 `tests\run-all.js` 的 `sweepCountSelfCheck`），不改变任何调用点的行为。 */
   makeRealSweepIo,

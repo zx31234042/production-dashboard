@@ -5082,8 +5082,11 @@ t.section('五、临时区与清理');
           sha256BytesE70(REAL_READ.call(fs, harnessPath)).slice(0, 12)}…，原件 ${sha0.slice(0, 12)}…）`);
   }
 
-  /* ⑤ `cleanup(false)`：仍返回**数字**统计，且只清公共根下 **> 24 h** 的**整轮目录**。
-     造一个 mtime 改到 25 h 前的**假整轮目录**，并用"本轮目录"当对照 ⇒ 验"清的正好是它、我的还在"。 */
+  /* ⑤ `cleanup(false)`：仍返回**数字**统计，且只清公共根下**过期**（`T-20261005-37` 之后窗口
+     ＝`env.STALE_MAX_AGE_MS`＝2 h，**且**该轮次名字里的 pid 已不存活）的**整轮目录**。
+     造一个 mtime 改到 25 h 前的**假整轮目录**，并用"本轮目录"当对照 ⇒ 验"清的正好是它、我的还在"。
+     ⚠ **样本回拨 25 h 是刻意的**：一个样本要同时越过 24 h（旧窗口）与 2 h（现窗口）⇒ 这条判据
+     不随窗口改口径而变（本次只同步文案，判据与期望值一个字没动，ADR-0004 D21）。 */
   const fakeOldRun = path.join(baseE90, 'run-999999-19700101T000000-dead');
   env.ensureDir(fakeOldRun);
   fs.writeFileSync(path.join(fakeOldRun, 'old.txt'), 'old', 'utf8');
@@ -5094,14 +5097,284 @@ t.section('五、临时区与清理');
   env.ensureDir(runRootE90);                              /* 上一段刚把本轮目录清掉 ⇒ 重建以代表"我的还在" */
   fs.writeFileSync(path.join(runRootE90, 'mine.txt'), 'mine', 'utf8');
   const staleSwept = harness.cleanup(false);
-  t.check('E90⑤ `cleanup(false)`：仍返回**数字**统计，且只清公共根下 **> 24 h** 的整轮目录' +
-    '（清掉的正好是那个 25 h 前的假整轮目录；**本轮目录一根毫毛都不少**）',
+  t.check('E90⑤ `cleanup(false)`：仍返回**数字**统计，且只清公共根下**过期**（窗口＝`env.STALE_MAX_AGE_MS`'
+    + '＝2 h，见 `T-20261005-37`；**且**该轮次名字里的 pid 已不存活）的整轮目录'
+    + '（样本回拨 **25 h** ⇒ 同时越过旧窗口 24 h 与现窗口 2 h；清掉的正好是它；**本轮目录一根毫毛都不少**）',
     typeof staleSwept.removed === 'number' && typeof staleSwept.kept === 'number'
       && !fs.existsSync(fakeOldRun) && fs.existsSync(runRootE90)
       && fs.existsSync(path.join(runRootE90, 'mine.txt')),
     `返回=${JSON.stringify(staleSwept)}；假整轮目录仍在=${fs.existsSync(fakeOldRun)}；`
       + `本轮目录仍在=${fs.existsSync(runRootE90)}（mine.txt=${fs.existsSync(path.join(runRootE90, 'mine.txt'))}）`);
   try { harness.removeLinkSafe(fakeOldRun, { recursive: true, force: true }); } catch { /* 已被清掉就忽略 */ }  e103LinkSafetyChecks(t);   /* `E103`：链接安全门禁守护（定义在本文件尾部，抬头有口径与偏差说明） */
+}
+
+/* ==========================================================================
+   五之②、清扫窗口 **2 小时** ＋ "**该轮次还在跑就不清**"的**双条件**（`T-20261005-37`）
+   --------------------------------------------------------------------------
+   立案：`env.STALE_MAX_AGE_MS` 由 24 h 收到 **2 h**（`tests\env.js`），而"**只按年龄**"会**误删
+   正在跑的轮次** —— `node tests\stress-check.js --hours 8`（整班次浸泡）会让**一个**轮次目录活过
+   2 小时。⇒ 判据＝"**年龄 > 2h 且该轮次名字里的 pid 已不存活**"**双条件**；判活用
+   `process.kill(pid, 0)`（**`ESRCH` ⇒ 死；其余一律判活**，含 `EPERM`／未知／探针自身报错）。
+   本节把《`T-20261005-37` 探针》的读数搬成**门禁断言**（**同款做法**：自建合成目录 ＋
+   `fs.utimesSync` 回拨 ＋ 起一个**真子进程**持 pid ⇒ 走**真 IO**，不注入假体），逐条：
+     `T37-①` 常量＝`2*3600*1000`（且**不是**旧 24 h 值）；
+     `T37-②` 判活尺子：自己＝活、探不到的 pid＝死、**畸形 pid（0／负数／小数／超 int32）直接判死且不探**
+       （`isPidAlive(0)===false`：`kill(0,0)` 在 POSIX 上指**整个进程组**）；
+     `T37-③` 孤儿（3h、pid 不存在）⇒ **被清**（"该清"的基线臂）；负对照（30min）⇒ **留下**；
+     `T37-④` **8h 浸泡形态**（8h、pid 存活）⇒ **不被清**（**本次裁定最容易翻车的形态，单独一条**）；
+     `T37-⑤` 对照臂（同 8h、pid 不存在）⇒ **被清**（⇒ ④ 的"留下"**不是**"清扫坏了"的假绿）；
+     `T37-⑥` 非 `run-<pid>-…` 形状（`zz-*`，3h）⇒ **被清**（`E103-E②` 的 `zz-e103-old-*` 语义逐字保留）；
+     `T37-⑦` 本轮自己的目录（`env.paths.tempRoot`，回拨 3h）⇒ **不被清**（判据对自己同样成立）；
+     `T37-⑧` D22（可证伪）：把判据退回"**只按年龄**"（`Module._compile` 的**内存字节副本**）
+       ⇒ `T37-④` **必红并指名那个目录名**；**负对照**＝真实现同场景全绿；`tests\env.js` 盘上**逐字节未变**；
+     `T37-⑨` 收尾：自建的一切清理干净（残留＝[]）。
+   ⚠ **靶子纪律**：本节**只**在 `env.paths.tempRootBase`（＝`tests\._verify\tmp`）下**自建**合成目录，
+     删除一律走 `env.removeLinkSafe()`（`E46`／`E101`／`E103` 的唯一出口）；**本轮自己的目录绝不删**。
+   ⚠ `env.makeRealSweepIo()` 的 8 键集合**不得新增**（`run-all` 的 `E114` **逐键比对**正是守着它 ⇒
+     本节**不重复实现**那条；探活因此**不进**那个键集）。
+   ========================================================================== */
+t.section('五之②、清扫窗口 2h ＋ "轮次还在跑就不清"双条件（`T-20261005-37`）');
+{
+  const HOUR_T37 = 3600 * 1000;
+  const BASE_T37 = env.paths.tempRootBase;
+  const MYRUN_T37 = env.paths.tempRoot;                        /* 本轮专属目录（名字里＝本进程 pid） */
+  const SHA_T37 = require('node:crypto').createHash;            /* D22 的"盘上逐字节未变"自证要它 */
+  const sha256T37 = (buf) => SHA_T37('sha256').update(buf).digest('hex');
+  const ModuleT37 = require('node:module');                     /* D22：`Module._compile` 载内存字节副本 */
+  const TAG_T37 = `t38-${process.pid}-${Math.random().toString(16).slice(2, 6)}`;
+  /* ⚠ 本节的 marker 名**用拼接**而不是嵌套模板字面量：`stripLiterals` 是静态判据的地面，
+     嵌套模板会让"剥字面量"的边界难判 ⇒ 一律只用单层模板／拼接（`E103` 的扫描面含本文件）。 */
+  const markerNameT37 = 'marker-' + TAG_T37 + '.txt';
+  const MADE_T37 = [];                                         /* 本节自建的合成目录（收尾逐条删） */
+  const mkUnderT37 = (parent, name, ageMs) => {
+    const dir = path.join(parent, name);
+    env.ensureDir(dir);
+    fs.writeFileSync(path.join(dir, 'marker.txt'), `synthetic ${TAG_T37}`, 'utf8');
+    const past = new Date(Date.now() - ageMs);
+    fs.utimesSync(path.join(dir, 'marker.txt'), past, past);
+    fs.utimesSync(dir, past, past);
+    MADE_T37.push(dir);
+    return dir;
+  };
+  /** 造一个合成目录并回拨 mtime —— 目录**自身**的 mtime 才是清扫的判据（与 `T-20261005-37` 探针同款）。 */
+  const mkT37 = (name, ageMs) => mkUnderT37(BASE_T37, name, ageMs);
+  const ageHT37 = (p) => (Date.now() - fs.statSync(p).mtimeMs) / HOUR_T37;
+
+  /* ---- 尺子的两个参照物：一个"探不到的 pid"（**现算**，不写死）＋ 一个真子进程持有的活 pid ---- */
+  let probeDeadT37 = null;
+  for (let c = 9999999; c > 4000000 && probeDeadT37 === null; c--) { if (!env.isPidAlive(c)) probeDeadT37 = c; }
+  const childT37 = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'],
+    { stdio: 'ignore', windowsHide: true });
+  let childErrT37 = null;
+  await new Promise((res) => {
+    childT37.once('spawn', res);
+    childT37.once('error', (e) => { childErrT37 = e; res(); });
+  });
+  const childAliveT37 = childErrT37 === null && childT37.pid !== undefined && env.isPidAlive(childT37.pid);
+  /* 兜底：子进程起不来也**不能**退化成"拿死 pid 当活 pid"的假读数 —— 本进程自己的 pid 必然存活。 */
+  const LIVE_T37 = childAliveT37 ? childT37.pid : process.pid;
+  const DEAD_T37 = probeDeadT37 === null ? 999999 : probeDeadT37;
+  const killT37 = () => { try { childT37.kill(); } catch { /* 已退出 */ } };
+  const liveSrcT37 = childAliveT37 ? `真子进程 pid=${LIVE_T37}` : `（子进程未起：${String(childErrT37 && childErrT37.message)}）⇒ 兜底用本进程 pid=${LIVE_T37}`;
+  const preT37 = env.isPidAlive(LIVE_T37) === true && env.isPidAlive(DEAD_T37) === false;
+  t.requires('`T-20261005-37` 清扫断言的前提：手上有一个**确实存活**的 pid 与一个**确实探不到**的 pid',
+    preT37, `${liveSrcT37} ⇒ isPidAlive=${env.isPidAlive(LIVE_T37)}；探不到的 pid=${DEAD_T37} ⇒ isPidAlive=${env.isPidAlive(DEAD_T37)}`);
+
+  /* ---- `T37-①` 常量口径（`ADR-0004 D21`：断言的是"口径"，不是"把期望改到与实际一致"） ---- */
+  t.check('T37-① 清扫窗口常量：`env.STALE_MAX_AGE_MS` 恰为 **2 h**（`2*3600*1000` ms），且**不是**旧的 24 h 值',
+    env.STALE_MAX_AGE_MS === 2 * HOUR_T37 && env.STALE_MAX_AGE_MS !== 24 * HOUR_T37,
+    `STALE_MAX_AGE_MS=${env.STALE_MAX_AGE_MS} ms（＝${env.STALE_MAX_AGE_MS / HOUR_T37} h）；`
+      + `旧 24 h 值＝${24 * HOUR_T37} ms（必须不相等）；来源=\`tests\\env.js\` 的 \`T-20261005-37\` 段`);
+
+  /* ---- `T37-②` 判活尺子（先证"尺子"可信，再拿它量） ---- */
+  const malformedT37 = [
+    ['0（POSIX 上 `kill(0, 0)` 指**整个进程组**）', 0],
+    ['负数 -1', -1],
+    ['小数 1.5', 1.5],
+    ['超 int32 的 4000000000', 4000000000]
+  ];
+  const badMalformedT37 = malformedT37.filter(([, pid]) => env.isPidAlive(pid) !== false);
+  const nameParseT37 = env.roundPidOf('run-1234-20261005T000000-abcd') === 1234
+    && env.roundPidOf(`zz-${TAG_T37}-old`) === null;
+  t.check('T37-② 判活尺子（`process.kill(pid, 0)`：**`ESRCH` ⇒ 死、其余一律判活**）＋ **畸形 pid 直接判死且不探**'
+    + '（`isPidAlive(0)===false` 防把 `kill(0,0)` 的**进程组**语义当进程判活）；`roundPidOf` 只认 `run-<pid>-…`',
+    env.isPidAlive(LIVE_T37) && env.isPidAlive(process.pid) && env.isPidAlive(DEAD_T37) === false
+      && badMalformedT37.length === 0 && nameParseT37,
+    `${liveSrcT37} ⇒ ${env.isPidAlive(LIVE_T37)}；本进程 pid=${process.pid} ⇒ ${env.isPidAlive(process.pid)}；`
+      + `探不到的 pid=${DEAD_T37} ⇒ ${env.isPidAlive(DEAD_T37)}（应 false）；`
+      + `畸形 pid 逐条＝${malformedT37.map(([l, p]) => `${p} ⇒ ${env.isPidAlive(p)}（应 false：${l}）`).join('；')}；`
+      + `roundPidOf('run-1234-…')=${env.roundPidOf('run-1234-20261005T000000-abcd')}（应 1234）、`
+      + `roundPidOf('zz-…')=${env.roundPidOf(`zz-${TAG_T37}-old`)}（应 null）`);
+
+  /* ---- 布局（**一次清扫覆盖全部**；全部先证存在，否则"消失"读不出因果） ---- */
+  const dOrphanT37 = mkT37(`run-${DEAD_T37}-19990101T000000-${TAG_T37}-orphan3h`, 3 * HOUR_T37);
+  env.ensureDir(MYRUN_T37);                                    /* ⑦ 本轮自己的目录：**不删** */
+  const markerT37 = path.join(MYRUN_T37, markerNameT37);
+  fs.writeFileSync(markerT37, `synthetic ${TAG_T37}`, 'utf8');
+  const backT37 = new Date(Date.now() - 3 * HOUR_T37);
+  fs.utimesSync(MYRUN_T37, backT37, backT37);
+  const dLive3hT37 = mkT37(`run-${LIVE_T37}-19990101T000000-${TAG_T37}-live3h`, 3 * HOUR_T37);
+  const dSoakT37 = mkT37(`run-${LIVE_T37}-19990101T000000-${TAG_T37}-soak8h`, 8 * HOUR_T37);
+  const dSoakDeadT37 = mkT37(`run-${DEAD_T37}-19990101T000000-${TAG_T37}-soak8h-dead`, 8 * HOUR_T37);
+  const dFreshT37 = mkT37(`run-${DEAD_T37}-19990101T000000-${TAG_T37}-fresh30m`, 30 * 60 * 1000);
+  const dZzT37 = mkT37(`zz-${TAG_T37}-old`, 3 * HOUR_T37);
+  const beforeExistT37 = [dOrphanT37, dLive3hT37, dSoakT37, dSoakDeadT37, dFreshT37, dZzT37, MYRUN_T37]
+    .map(p => fs.existsSync(p));
+  /* 年龄读数**必须在清扫前取**：清完之后那几个目录已经不在了（"对着已删的目录 stat"会当场 ENOENT）。 */
+  const ageOrphanT37 = ageHT37(dOrphanT37);
+  const ageSoakT37 = ageHT37(dSoakT37);
+  const ageSoakDeadT37 = ageHT37(dSoakDeadT37);
+  const ageFreshT37 = ageHT37(dFreshT37) * 60;
+  const ageZzT37 = ageHT37(dZzT37);
+  const beforeCountT37 = fs.existsSync(BASE_T37) ? fs.readdirSync(BASE_T37).length : 0;
+
+  /* ---- 一次**真清扫**（走生产函数 `env.cleanupStaleTemp()`；再扫一次验幂等面） ---- */
+  const swept1T37 = env.cleanupStaleTemp();
+  const aliveAfter1T37 = fs.existsSync(dSoakT37);
+  const swept2T37 = env.cleanupStaleTemp();
+  const afterCountT37 = fs.existsSync(BASE_T37) ? fs.readdirSync(BASE_T37).length : 0;
+
+  const orphanGoneT37 = !fs.existsSync(dOrphanT37);
+  const freshKeptT37 = fs.existsSync(dFreshT37);
+  const soakKeptT37 = fs.existsSync(dSoakT37);
+  const soakDeadGoneT37 = !fs.existsSync(dSoakDeadT37);
+  const zzGoneT37 = !fs.existsSync(dZzT37);
+  const myRunKeptT37 = fs.existsSync(MYRUN_T37);
+  const live3hKeptT37 = fs.existsSync(dLive3hT37);
+
+  t.check('T37-③ "该清"的基线臂（**孤儿**：年龄 3h > 2h、pid 不存在）⇒ **被清**；负对照（年龄 30min）⇒ **留下**'
+    + '（否则后面的"留下"都可能是"清扫坏了、什么都不删"的假绿）',
+    beforeExistT37.every(Boolean) && orphanGoneT37 && freshKeptT37,
+    `清扫前全部存在=${beforeExistT37.every(Boolean)}；孤儿 [${path.basename(dOrphanT37)}] 年龄=${ageOrphanT37.toFixed(3)} h`
+      + ` ⇒ ${orphanGoneT37 ? '已消失' : '仍在'}（应已消失）；负对照 [${path.basename(dFreshT37)}] 年龄=${ageFreshT37.toFixed(1)} min`
+      + ` ⇒ ${freshKeptT37 ? '仍在' : '已消失'}（应仍在）；清扫返回1=${JSON.stringify(swept1T37)}`);
+
+  t.check('T37-④ **8 小时浸泡形态**（`node tests\\stress-check.js --hours 8` 的现场：年龄 8h **远过** 2h 窗口、'
+    + '但名字里的 pid **仍然存活**）⇒ **一根毫毛都不动**（"只按年龄"的实现会在此**必红并指名**这个目录名）',
+    beforeExistT37.every(Boolean) && aliveAfter1T37 && soakKeptT37,
+    `[${path.basename(dSoakT37)}] 年龄=${ageSoakT37.toFixed(3)} h > 窗口 ${env.STALE_MAX_AGE_MS / HOUR_T37} h、`
+      + `pid=${LIVE_T37} 存活=${env.isPidAlive(LIVE_T37)} ⇒ 清扫后仍在=${soakKeptT37}（应 true）；`
+      + `第一次清扫后已在=${aliveAfter1T37}、第二次清扫后仍在=${soakKeptT37}（幂等面：留下的仍留下）`);
+
+  t.check('T37-⑤ 对照臂（**同 8h、pid 不存在**）⇒ **被清** —— ⇒ ④ 的"留下"不是因为清扫坏了，'
+    + '而是双条件真的在读 pid（同年龄的死轮次照样被清）',
+    beforeExistT37.every(Boolean) && soakDeadGoneT37 && soakKeptT37 && live3hKeptT37,
+    `[${path.basename(dSoakDeadT37)}] 年龄=${ageSoakDeadT37.toFixed(3)} h、pid=${DEAD_T37} 不存在`
+      + ` ⇒ ${soakDeadGoneT37 ? '已消失' : '仍在'}（应已消失）；同批存活 pid 的 [${path.basename(dLive3hT37)}]`
+      + ` 仍在=${live3hKeptT37}（应 true）；清扫返回2=${JSON.stringify(swept2T37)}`);
+
+  t.check('T37-⑥ **非** `run-<pid>-…` 形状（`zz-*`，年龄 3h）⇒ **只按年龄、被清**（`E103-E②` 的 `zz-e103-old-*` '
+    + '语义逐字保留：那些条目没有 pid 可言，改前怎么算现在还是怎么算）',
+    beforeExistT37.every(Boolean) && zzGoneT37,
+    `[${path.basename(dZzT37)}] 年龄=${ageZzT37.toFixed(3)} h、名字形状=${env.roundPidOf(path.basename(dZzT37)) === null ? '非轮次（roundPidOf⇒null）' : '轮次'}`
+      + ` ⇒ ${zzGoneT37 ? '已消失' : '仍在'}（应已消失）`);
+
+  t.check('T37-⑦ **本轮自己的目录**（`env.paths.tempRoot`，mtime 回拨 3h）⇒ **不被清**'
+    + '（判据对自己同样成立 ⇒ 不需要"豁免当前进程"的旁路，也就不会有第二份会漂的口径）',
+    beforeExistT37.every(Boolean) && myRunKeptT37 && fs.existsSync(markerT37),
+    `${path.relative(env.paths.root, MYRUN_T37)} 回拨 3h ⇒ 清扫后仍在=${myRunKeptT37}（应 true）、`
+      + `其中本节的 marker 仍在=${fs.existsSync(markerT37)}；`
+      + `公共根条目数 ${beforeCountT37} → ${afterCountT37}（本节自建 6 个整轮目录，另回拨了本轮目录的 mtime）`);
+
+  /* ---- `T37-⑧` D22（可证伪）：把判据退回"**只按年龄**"（内存字节副本，盘上 `tests\env.js` 全程只读） ----
+     ⚠ **变异体的清扫必须关进沙箱**：变异体是"只按年龄"，若让它对着**真公共根**扫，它会把
+     **本轮自己的目录**也端掉（该目录的 mtime 刚被 `T37-⑦` 回拨了 3h）—— 本节第一版**实测踩过**：
+     本轮临时区当场消失。做法＝把变异体模块自己的 `paths.tempRootBase` 改指**本节自建的沙箱根**
+     （`cleanupStaleTemp()` 在**调用时刻**读 `paths.tempRootBase` ⇒ 可重定向），扫完复原并回读
+     "真公共根与本轮目录一个字节没动"。⚠ `._verify\` 根下的子集账本面（`E105`）重定向不了
+     （它读模块内的 `VERIFY` 常量），但那一面**真清扫已经扫过一遍**，变异体这遍不新增任何影响。 */
+  const envFileT37 = path.join(env.paths.tests, 'env.js');
+  const envBytes0T37 = fs.readFileSync(envFileT37);
+  const envSha0T37 = sha256T37(envBytes0T37);
+  const ANCHOR_PID_T37 = 'const roundPid = roundPidOf(name);';   /* `E186`：锚点**只许 ASCII** */
+  const anchorHitT37 = envBytes0T37.toString('utf8').split(ANCHOR_PID_T37).length - 1;
+  const mutantBytesT37 = Buffer.from(envBytes0T37.toString('utf8')
+    .split(ANCHOR_PID_T37).join('const roundPid = null;   /* D22：判据退回"只按年龄" */'), 'utf8');
+  let mutApiT37 = null;
+  let mutErrT37 = null;
+  if (anchorHitT37 === 1) {
+    try {
+      const mv = new ModuleT37(envFileT37, null);
+      mv.filename = envFileT37;
+      mv.paths = ModuleT37._nodeModulePaths(path.dirname(envFileT37));
+      mv._compile(mutantBytesT37.toString('utf8'), envFileT37);
+      mutApiT37 = mv.exports;
+    } catch (e) { mutErrT37 = e; }
+  }
+  const sandboxT37 = mkT37(`run-${process.pid}-19990101T000000-${TAG_T37}-d22-sandbox`, 0);
+  const dMutSoakT37 = mkUnderT37(sandboxT37, `run-${LIVE_T37}-19990101T000000-${TAG_T37}-d22-soak8h`, 8 * HOUR_T37);
+  const dMutLive3hT37 = mkUnderT37(sandboxT37, `run-${LIVE_T37}-19990101T000000-${TAG_T37}-d22-live3h`, 3 * HOUR_T37);
+  const dMutFreshT37 = mkUnderT37(sandboxT37, `run-${DEAD_T37}-19990101T000000-${TAG_T37}-d22-fresh30m`, 30 * 60 * 1000);
+  const mutHasDirT37 = fs.existsSync(sandboxT37) && fs.existsSync(dMutSoakT37) && env.isPidAlive(LIVE_T37);
+  let mutSweptT37 = null;
+  let mutKeptT37 = null;
+  let mutFreshKeptT37 = null;
+  let mutBaseBeforeT37 = null;
+  if (mutApiT37) {
+    mutBaseBeforeT37 = mutApiT37.paths.tempRootBase;             /* 自证：只改变异体实例这一个字段 */
+    mutApiT37.paths.tempRootBase = sandboxT37;
+    mutSweptT37 = mutApiT37.cleanupStaleTemp();
+    mutKeptT37 = fs.existsSync(dMutSoakT37);
+    mutFreshKeptT37 = fs.existsSync(dMutFreshT37);               /* 变异体自己的负对照：30min **不**删 */
+    mutApiT37.paths.tempRootBase = mutBaseBeforeT37;             /* 复原 */
+  }
+  /* 沙箱生效的三条回读：真公共根没被变异体碰过（被测的 8h 目录与本轮目录都还在）。 */
+  const soakAfterMutantT37 = fs.existsSync(dSoakT37);
+  const myRunAfterMutantT37 = fs.existsSync(MYRUN_T37);
+  const sandboxOnlyT37 = mutBaseBeforeT37 === BASE_T37 && env.paths.tempRootBase === BASE_T37;
+  const envBytes1T37 = fs.readFileSync(envFileT37);
+  const diskSameT37 = Buffer.compare(envBytes0T37, envBytes1T37) === 0 && sha256T37(envBytes1T37) === envSha0T37;
+  /* ④ 的判据在**变异体读数**下长什么样：同一个合取式喂进去 ⇒ 必红，并指名那个目录名。 */
+  const soakPredicateUnderMutantT37 = mutHasDirT37 && mutKeptT37 === true;
+  t.check('T37-⑧ D22（可证伪，**内存变异 ＋ 同一场景 ＋ 负对照**）：把 `cleanupStaleTemp()` 的判据退回'
+    + '"**只按年龄**"（`roundPidOf` 那一步置 `null`，`Module._compile` 的内存字节副本；清扫面**关进沙箱**，'
+    + '免得变异体把本轮临时区一起端掉）⇒ `T37-④` 的合取式**必红并指名那个 8h 目录名**；'
+    + '**负对照**＝真实现同场景不删（`T37-④` 全绿）＋ 变异体不删 30min 的新鲜目录；'
+    + '`tests\\env.js` 盘上字节**逐字节未变**',
+    anchorHitT37 === 1 && Boolean(mutApiT37) && mutHasDirT37
+      && mutKeptT37 === false && soakPredicateUnderMutantT37 === false && mutFreshKeptT37 === true
+      && soakKeptT37 === true && soakAfterMutantT37 === true && myRunAfterMutantT37 === true
+      && sandboxOnlyT37 && diskSameT37,
+    `锚点 \`${ANCHOR_PID_T37}\` 命中 ${anchorHitT37} 次（须恰 1）、变异体装载=${Boolean(mutApiT37)}`
+      + `${mutErrT37 ? `（装载异常：${String(mutErrT37.message)}）` : ''}、变异体 sha256=${sha256T37(mutantBytesT37).slice(0, 12)}…（原件 ${envSha0T37.slice(0, 12)}…）；`
+      + `沙箱=${path.basename(sandboxT37)}（变异体的 \`paths.tempRootBase\` 原值＝真公共根=${sandboxOnlyT37}）；`
+      + `变异体清扫返回=${JSON.stringify(mutSweptT37)}；被测目录 [${path.basename(dMutSoakT37)}]（年龄 8h、pid=${LIVE_T37} 存活）`
+      + ` ⇒ 清扫后仍在=${mutKeptT37}（**应 false＝被删**）⇒ \`T37-④\` 的合取式在变异体下=${soakPredicateUnderMutantT37}`
+      + `（**应 false ⇒ 该条必红并指名 \`${path.basename(dMutSoakT37)}\`**）；`
+      + `变异体的新鲜负对照 [${path.basename(dMutFreshT37)}]（30min）仍在=${mutFreshKeptT37}（应 true ⇒ 它不是"见目录就删"）；`
+      + `**负对照**：真实现下同形状目录 [${path.basename(dSoakT37)}] 仍在=${soakKeptT37}（应 true）、`
+      + `变异体扫完之后真公共根里的它仍在=${soakAfterMutantT37}、本轮目录仍在=${myRunAfterMutantT37}；`
+      + `盘上 \`tests\\env.js\` 逐字节未变=${diskSameT37}`);
+
+  /* ---- `T37-⑨` 收尾：自建的一切清理干净（只走安全出口）＋ 逐条回读 ---- */
+  killT37();
+  for (const p of MADE_T37) {
+    try { env.removeLinkSafe(p, { recursive: true, force: true }); } catch { /* 已被清扫收走 */ }
+  }
+  try { env.removeLinkSafe(markerT37, { force: true }); } catch { /* 已不在 */ }
+  const residueT37 = fs.existsSync(BASE_T37) ? fs.readdirSync(BASE_T37).filter(n => n.includes(TAG_T37)) : [];
+  t.check('T37-⑨ 本节自建的合成目录**全部清理干净**（公共根下带本节标签的条目＝[]；'
+    + '删除走 `env.removeLinkSafe()`，**本轮自己的目录一个字节都没动**）',
+    residueT37.length === 0 && myRunKeptT37 && fs.existsSync(MYRUN_T37),
+    `残留=${JSON.stringify(residueT37)}；本轮目录仍在=${fs.existsSync(MYRUN_T37)}、其 marker 已清=`
+      + `${!fs.existsSync(markerT37)}；`
+      + `子进程杀后 isPidAlive(${childT37.pid})=${childT37.pid === undefined ? 'n/a' : env.isPidAlive(childT37.pid)}`
+      + `（应 false：顺带证明这把尺子对"刚死的"也准）`);
+
+  /* **现算读数**（`E44` 同款纪律：runner 在 PASS 时**不打印** `check` 的 detail ⇒ 关键读数必须另给一行）。 */
+  t.info(`\`T-20261005-37\` **现算读数**：窗口=${env.STALE_MAX_AGE_MS} ms（＝${env.STALE_MAX_AGE_MS / HOUR_T37} h）；`
+    + `判活尺子：本进程 ${process.pid}⇒${env.isPidAlive(process.pid)}、${liveSrcT37}⇒${env.isPidAlive(LIVE_T37)}、`
+    + `探不到的 ${DEAD_T37}⇒${env.isPidAlive(DEAD_T37)}、isPidAlive(0)=${env.isPidAlive(0)}；`
+    + `第一次 cleanupStaleTemp()=${JSON.stringify(swept1T37)}、第二次=${JSON.stringify(swept2T37)}`
+    + `（其中 \`removedLedgers\` 是 \`E105\` 的既定面、不属本节对象）；`
+    + `孤儿 [${path.basename(dOrphanT37)}] 年龄 ${ageOrphanT37.toFixed(3)}h ⇒ ${orphanGoneT37 ? '已消失' : '仍在'}、`
+    + `8h 浸泡 [${path.basename(dSoakT37)}] ⇒ ${soakKeptT37 ? '仍在' : '已消失'}、`
+    + `8h 死 pid 对照 [${path.basename(dSoakDeadT37)}] ⇒ ${soakDeadGoneT37 ? '已消失' : '仍在'}、`
+    + `3h 存活 pid [${path.basename(dLive3hT37)}] ⇒ ${live3hKeptT37 ? '仍在' : '已消失'}、`
+    + `30min 负对照 ⇒ ${freshKeptT37 ? '仍在' : '已消失'}、\`zz-*\`（3h）⇒ ${zzGoneT37 ? '已消失' : '仍在'}、`
+    + `本轮目录（回拨 3h）⇒ ${myRunKeptT37 ? '仍在' : '已消失'}；`
+    + `D22（只按年龄）⇒ 同形状目录 8h 存活 pid 被删=${mutKeptT37 === false}、\`T37-④\` 合取式=${soakPredicateUnderMutantT37}（应 false）、`
+    + `锚点命中 ${anchorHitT37} 次、盘上 env.js 逐字节未变=${diskSameT37}、公共根条目 ${beforeCountT37} → ${afterCountT37}`);
 }
 
 /* ---------------- 六、断言器自身 ---------------- */
@@ -11174,6 +11447,254 @@ t.section('二十四、`E178` 配置读点 ↔ 白名单**双向零差**（新�
 }
 
 /* ==========================================================================
+   二十四之②、`E185` 白名单**全部键**的"首挂类型守卫"（`T-20261005-34`）
+   --------------------------------------------------------------------------
+   立案（`E185`）：`E181` 的装配期类型校验**当时只覆盖 `config.mes` 四键**，白名单里其余五键
+   **首挂**传错类型时无人拦（`config.dataSource = 123` 照常建实例）—— 值维度由行为指纹守
+   （同库二次挂载不一致必抛），但**首次挂载没有可比对象**。
+   本节守两处**新结构**（实现已冻结；本座位**只写断言、不改实现**）：
+     · `assertConfigChecklistAligned()`：**模块装载时**跑一次，清单 ↔ 白名单**双向自证**
+       （白名单缺条目／清单凭空登记 ⇒ 都当场抛）；
+     · `assertConfigOptionTypes(config)`：**遍历白名单**（不是只筛 `mes.` 前缀）；键缺失／`undefined`
+       ＝「不传」（合法、跳过），非法 ⇒ `TypeError` 且文案含 `config.<路径>` ＋「要表示不传请省略该键」。
+   ⚠ **本节不重复实现 `E178`**（第二十四节守的是"代码读点 ↔ 白名单**成员集合**"的双向零差）：
+     本节守的是"白名单 ↔ **类型清单** `CONFIG_OPTION_CHECKS`"的**另一条面**，两者同名不同物；
+     `CONFIG_KEY_PATHS` 的成员集合**不动**（那是 `E178` 的地面）。
+   ⚠ **不硬编码条数、不固化清单内容**：两个集合都**现取自盘上源码**；逐键行为用**与键无关的公共
+     类型样本电池**，判据**不引用**清单里的 `ok` 谓词（引用它＝"拿期望比期望"的循环断言，ADR-0004 D21）。
+   锚点纪律（`E186`）：本节所有文本锚点**只许 ASCII**、逐锚点自证**恰命中 1 次**；内存变异一律
+     `split/join` 的函数式替换（9.5-7④），盘上文件**全程只读**。
+   ========================================================================== */
+t.section('二十四之②、`E185` 白名单全部键的"首挂类型守卫"（清单↔白名单双向自证 ＋ 逐键行为 ＋ D22）');
+{
+  const cryptoE185 = require('node:crypto');
+  const ModuleCtorE185 = require('node:module');
+  const uploadPathE185 = path.join(env.paths.root, 'server', 'http', 'routes', 'upload.js');
+  const uploadSrcE185 = fs.readFileSync(uploadPathE185, 'utf8');
+  const uploadSha0E185 = cryptoE185.createHash('sha256').update(fs.readFileSync(uploadPathE185)).digest('hex');
+  const NL_E185 = uploadSrcE185.includes('\r\n') ? '\r\n' : '\n';   /* 变异体按**目标文件自身行尾**拼 */
+
+  /* ---- 两个集合都从**盘上源码**取（不 import、不硬编码） ---- */
+  /** 白名单（`CONFIG_KEY_PATHS`）—— 与第二十四节 `E178` **同一条正则**（单一真源口径，不另写第二份） */
+  const whitelistFromSrcE185 = src => {
+    const m = /const CONFIG_KEY_PATHS = Object\.freeze\(\[([\s\S]*?)\]\);/.exec(src);
+    if (!m) return null;
+    return (m[1].match(/'[^']+'/g) || []).map(s => s.replace(/'/g, ''));
+  };
+  /** 类型清单（`CONFIG_OPTION_CHECKS`）的 `path` 集合 —— 认**成对形状**（`path:` 紧跟 `ledger:`），
+   *  故不会与文件里其它 `path: '/upload/…'`（路由字面量）混淆；`ledger` 一并取出，只作读数。 */
+  const checklistFromSrcE185 = src => {
+    const out = [];
+    const re = /path:\s*'([^']+)',\s*ledger:\s*'([^']+)'/g;
+    let m;
+    while ((m = re.exec(src)) !== null) out.push({ path: m[1], ledger: m[2] });
+    return out;
+  };
+  /** **纯函数**：清单 ↔ 白名单双向对账（主断言、漂移反证、D22 共用同一个函数 —— `E153` 的教训） */
+  const reconcileE185 = (wl, clPaths) => ({
+    missing: wl.filter(p => clPaths.indexOf(p) < 0),
+    phantom: clPaths.filter(p => wl.indexOf(p) < 0)
+  });
+  /** 在**内存**里编译一份（可能变异的）`upload.js`：盘上文件**全程只读**（`Module._compile`，
+   *  文件名仍是真文件名 ⇒ 内部的相对 `require` 照常解析）。返回 `{mod, err}`；
+   *  `err` 非空 ⇒ **装载期**就抛了（`assertConfigChecklistAligned()` 可达的证据）。 */
+  const compileUploadE185 = src => {
+    try {
+      const mm = new ModuleCtorE185(uploadPathE185, null);
+      mm.filename = uploadPathE185;
+      mm.paths = ModuleCtorE185._nodeModulePaths(path.dirname(uploadPathE185));
+      mm._compile(src, uploadPathE185);
+      return { mod: mm.exports, err: null };
+    } catch (err) { return { mod: null, err }; }
+  };
+  /** 变异一条源码（`split/join` ＝ 9.5-7④ 的函数式替换口径；`hit` 自证恰命中 1 次） */
+  const mutateE185 = (src, from, to) => ({ src: src.split(from).join(to), hit: src.split(from).length - 1 });
+  /** 深拷贝（**不走 JSON**：`NaN`／`Infinity` 会被它悄悄变成 `null`） */
+  const cloneE185 = o => {
+    if (Array.isArray(o)) return o.map(cloneE185);
+    if (o && typeof o === 'object') {
+      const r = {};
+      for (const k of Object.keys(o)) r[k] = cloneE185(o[k]);
+      return r;
+    }
+    return o;
+  };
+
+  const wlE185 = whitelistFromSrcE185(uploadSrcE185);
+  const clE185 = checklistFromSrcE185(uploadSrcE185);
+  const wl0E185 = wlE185 || [];
+  const clPathsE185 = clE185.map(c => c.path);
+  const recE185 = reconcileE185(wl0E185, clPathsE185);
+  const ledgerStatE185 = clE185.reduce((a, c) => { a[c.ledger] = (a[c.ledger] || 0) + 1; return a; }, {});
+
+  t.requires('E185 前提：能从 `server\\http\\routes\\upload.js` 的**盘上源码**取到 `CONFIG_KEY_PATHS` 与 '
+    + '`CONFIG_OPTION_CHECKS` 两项清单（两个集合都非空 —— 任一为空都会让"双向零差"退化成恒真）',
+    Array.isArray(wlE185) && wl0E185.length > 0 && clPathsE185.length > 0,
+    `白名单 ${wlE185 === null ? '取不到（正则未命中 ⇒ 结构被改动了）' : wl0E185.length + ' 条'}；`
+      + `类型清单 ${clPathsE185.length} 条；ledger 分布 ${JSON.stringify(ledgerStatE185)}`);
+
+  /* ---------------- `E185-①` 结构不变量：双向零差 ---------------- */
+  t.check('E185-① **清单 ↔ 白名单双向零差**（受管门禁；两个集合都**现取自盘上源码**，不硬编码条数、'
+    + '不固化清单内容）：①白名单每一条都必须在类型清单里有校验项（少一条 ⇒ 该键的"**首挂**类型守卫"'
+    + '静默缺失 —— 正是 `E185` 的立案形态）；②类型清单每一项的 `path` 也必须在白名单里'
+    + '（凭空登记 ⇒ 与"改了一个不生效的键"同族的假守卫）',
+    wl0E185.length > 0 && clPathsE185.length > 0 && recE185.missing.length === 0 && recE185.phantom.length === 0,
+    (recE185.missing.length || recE185.phantom.length)
+      ? '判红：'
+        + (recE185.missing.length
+          ? `**白名单里有而类型清单里没有 ${recE185.missing.length} 条** —— `
+            + recE185.missing.map(p => 'config.' + p).join('、') + '（这些键首挂传错类型无人拦）；'
+          : '')
+        + (recE185.phantom.length
+          ? `**类型清单里有而白名单里没有 ${recE185.phantom.length} 条** —— `
+            + recE185.phantom.map(p => 'config.' + p).join('、')
+          : '')
+      : `白名单 ${wl0E185.length} 条＝[${wl0E185.map(p => 'config.' + p).join('、')}]；`
+        + `类型清单 ${clPathsE185.length} 条（ledger 分布 ${JSON.stringify(ledgerStatE185)}）；`
+        + 'missing=0、phantom=0（**条数由源码现取**，本判据不写死任何数字、也不比对清单内容）');
+
+  /* ---------------- `E185-②` 漂移必红：「白名单加一条而清单不跟」 ---------------- */
+  const W_TAIL_E185 = "'mes.queueCap'" + NL_E185 + ']);';
+  const driftE185 = mutateE185(uploadSrcE185, W_TAIL_E185,
+    "'mes.queueCap'," + NL_E185 + "  'mes.noTypeGuardProbe'" + NL_E185 + ']);');
+  const driftRecE185 = reconcileE185(whitelistFromSrcE185(driftE185.src) || [],
+    checklistFromSrcE185(driftE185.src).map(c => c.path));
+  const driftLoadE185 = driftE185.hit === 1 ? compileUploadE185(driftE185.src) : { mod: null, err: null };
+  const driftNamedE185 = Boolean(driftLoadE185.err)
+    && String(driftLoadE185.err.message).includes('mes.noTypeGuardProbe');
+  t.check('E185-② 「**白名单加一条而清单不跟**」这种漂移**必能被判红**（两层都要挡，缺一层都不算）：'
+    + '①**纯结构对账**在同一份内存变异源码上 ⇒ `missing` 非空并**指名该键**；'
+    + '②**真模块装载** ⇒ 装载期的 `assertConfigChecklistAligned()` **当场抛**并指名该键'
+    + '（⇒ 这条自证**是可达的**，不是"写在源码里却一次也没跑过"—— 规范 9.5-5「门禁机制必须可达」的同族）',
+    driftE185.hit === 1 && driftRecE185.missing.indexOf('mes.noTypeGuardProbe') >= 0
+      && driftRecE185.phantom.length === 0 && driftNamedE185,
+    `白名单尾部锚点命中 ${driftE185.hit} 次（须恰 1）；漂移源码对账 ⇒ `
+      + `missing=[${driftRecE185.missing.join('、') || '（空）'}]／phantom=[${driftRecE185.phantom.join('、') || '（空）'}]；`
+      + `装载 ⇒ 抛=${Boolean(driftLoadE185.err)}、消息含新键=${driftNamedE185}`
+      + `${driftLoadE185.err ? '（' + String(driftLoadE185.err.message).slice(0, 110) + '）' : ''}`);
+
+  /* ---------------- `E185-③` 逐键行为（公开入口 ＋ 与键无关的公共样本电池） ---------------- */
+  const uploadModE185 = require('../server/http/routes/upload');
+  /** 类型样本电池：**一份与键无关的公共样本集**（这就是"不固化清单内容"的落法）——
+   *  每键都必须从**天生的类型空间**里拒掉至少一个、收下至少一个，且"省略该键"恒合法。 */
+  const TYPE_BATTERY_E185 = [123, '123', '', true, false, null, [], {}, 'mock', 0, -1, 'status', 'code', 65535, NaN, Infinity];
+  /** db 池的键是**句柄本身**（`WeakMap`）⇒ 每例一份**新桩** ⇒ 不会撞上 `E48②` 的"同库二次挂载指纹不同"
+   *  （那是另一条债的面，本节不碰）。桩的 `prepare` 故意抛错：本节的被测对象是**装配期类型校验**，
+   *  一旦走到真取数就说明校验没拦住。 */
+  const stubDbE185 = () => ({ prepare: () => { throw new Error('E185：类型校验未拦住 ⇒ 竟走到了取数'); } });
+  const setPathE185 = (root, p, v) => {
+    const segs = p.split('.');
+    let cur = root;
+    for (let i = 0; i < segs.length - 1; i++) {
+      if (cur[segs[i]] === undefined) cur[segs[i]] = {};
+      cur = cur[segs[i]];
+    }
+    cur[segs[segs.length - 1]] = v;
+    return root;
+  };
+  const feedE185 = (mod, config) => {
+    try { mod.resolveReporterDetail({ config, db: stubDbE185() }); return { threw: false, err: null }; }
+    catch (err) { return { threw: true, err }; }
+  };
+  const perKeyE185 = wl0E185.map(p => {
+    const rejected = [];
+    const accepted = [];
+    for (const s of TYPE_BATTERY_E185) {
+      const r = feedE185(uploadModE185, setPathE185({}, p, s));
+      if (r.threw) {
+        rejected.push({ s, typeErr: r.err instanceof TypeError, names: String(r.err.message).indexOf('config.' + p) >= 0 });
+      } else accepted.push(s);
+    }
+    return {
+      path: p, rejected, accepted,
+      firstAccepted: accepted.length ? accepted[0] : undefined,
+      allRejectNamed: rejected.every(x => x.typeErr && x.names)
+    };
+  });
+  const baselineE185 = {};
+  for (const r of perKeyE185) if (r.firstAccepted !== undefined) setPathE185(baselineE185, r.path, r.firstAccepted);
+  const baselineFeedE185 = feedE185(uploadModE185, baselineE185);
+  const emptyFeedE185 = feedE185(uploadModE185, {});
+  const explicitUndefE185 = {};
+  for (const p of wl0E185) setPathE185(explicitUndefE185, p, undefined);
+  const explicitUndefFeedE185 = feedE185(uploadModE185, explicitUndefE185);
+  const omitReadingsE185 = perKeyE185.map(r => {
+    const cfg = cloneE185(baselineE185);
+    const segs = r.path.split('.');
+    let cur = cfg;
+    for (let i = 0; i < segs.length - 1; i++) cur = cur[segs[i]];
+    delete cur[segs[segs.length - 1]];
+    const f = feedE185(uploadModE185, cfg);
+    return { path: r.path, ok: !f.threw, msg: f.threw ? String(f.err.message).slice(0, 80) : null };
+  });
+  const keyFailsE185 = perKeyE185.filter(r => r.rejected.length === 0 || r.accepted.length === 0 || !r.allRejectNamed);
+  const omitFailsE185 = omitReadingsE185.filter(o => !o.ok);
+  t.check('E185-③ **逐键行为**（键集合**现取自白名单**；全走**公开入口** `resolveReporterDetail()`，不直调私有函数）：'
+    + '逐键 —— ①电池里**至少一个**非法样本 ⇒ 抛 `TypeError` 且文案含 `config.<该键>`（**每个**被拒样本都必须如此）；'
+    + '②**至少一个**合法样本 ⇒ 不抛（合法域没被"一拒了之"）；③**省略该键恒合法**：全不传（`{}`）、'
+    + '显式 `undefined`、以及"从全合法基线里只删这一条"三种形态都必须不抛',
+    wl0E185.length > 0 && keyFailsE185.length === 0 && omitFailsE185.length === 0
+      && !baselineFeedE185.threw && !emptyFeedE185.threw && !explicitUndefFeedE185.threw,
+    `逐键（${wl0E185.length} 键，键名现取自源码）：`
+      + perKeyE185.map(r => `${r.path}（拒 ${r.rejected.length}／收 ${r.accepted.length}／省略 ${omitReadingsE185.filter(o => o.path === r.path)[0].ok ? 'ok' : '**抛**'}）`).join('；')
+      + `；全合法基线（每键取首个被收样本）不抛=${!baselineFeedE185.threw}`
+      + `；全不传 \`{}\` 不抛=${!emptyFeedE185.threw}；全显式 \`undefined\` 不抛=${!explicitUndefFeedE185.threw}`
+      + `；违规键=${keyFailsE185.length ? keyFailsE185.map(r => r.path).join('、') : '（无）'}`
+      + `；省略违规键=${omitFailsE185.length ? omitFailsE185.map(o => o.path + '（' + o.msg + '）').join('、') : '（无）'}`);
+
+  /* ---------------- `E185-④` D22：三支内存变异 ＋ 负对照 ---------------- */
+  const m2E185 = mutateE185(uploadSrcE185, "    path: 'mes.queueCap'," + NL_E185 + "    ledger: 'E185',",
+    "    path: 'mes.queueCap'," + NL_E185 + "    ledger: 'E185'," + NL_E185 + '  },' + NL_E185 + '  {' + NL_E185
+      + "    path: 'mes.neverInWhitelist'," + NL_E185 + "    ledger: 'E185',");
+  const m3E185 = mutateE185(uploadSrcE185, "path: 'dataSource',", "path: 'dataSource.movedAway',");
+  const OK_ANCHOR_E185 = "ok: v => typeof v === 'number' && Number.isFinite(v) && v > 0,";
+  const m4E185 = mutateE185(uploadSrcE185, OK_ANCHOR_E185, 'ok: v => true,   /* D22 变异：该键的类型守卫放宽成恒真 */');
+  const m2LoadE185 = m2E185.hit === 1 ? compileUploadE185(m2E185.src) : { mod: null, err: null };
+  const m3LoadE185 = m3E185.hit === 1 ? compileUploadE185(m3E185.src) : { mod: null, err: null };
+  const m4LoadE185 = m4E185.hit === 1 ? compileUploadE185(m4E185.src) : { mod: null, err: null };
+  const m2NamedE185 = Boolean(m2LoadE185.err) && String(m2LoadE185.err.message).includes('mes.neverInWhitelist');
+  const m3NamedE185 = Boolean(m3LoadE185.err) && String(m3LoadE185.err.message).includes('dataSource');
+  /** ㈢的靶子键＝**那条 `ok` 所属的键**（从**变异前源码的上下文**取，不写死键名） */
+  const m4KeyE185 = (() => {
+    const head = uploadSrcE185.slice(0, uploadSrcE185.split(OK_ANCHOR_E185)[0].length);
+    const ms = head.match(/path:\s*'([^']+)'/g) || [];
+    return ms.length ? ms[ms.length - 1].replace(/path:\s*'/, '').replace(/'$/, '') : null;
+  })();
+  const m4RejectedE185 = (m4LoadE185.mod && m4KeyE185)
+    ? TYPE_BATTERY_E185.filter(s => feedE185(m4LoadE185.mod, setPathE185({}, m4KeyE185, s)).threw).length
+    : null;
+  const diskSameE185 = cryptoE185.createHash('sha256').update(fs.readFileSync(uploadPathE185)).digest('hex')
+    === uploadSha0E185;
+  t.check('E185-④ D22（可证伪，**三支内存变异 ＋ 负对照**）：㈠清单**凭空登记**一条（白名单里没有）⇒ 装载**必抛**'
+    + '并指名该键；㈡把某键的校验项**挪走**（`path` 改名 ⇒ 该键在清单里"消失"）⇒ 装载必抛并**指名原键**；'
+    + '㈢把某键的 `ok` **放宽成恒真** ⇒ 装载成功，但**该键**在③的"非法样本必被拒"上**必红并指名它**；'
+    + '㈣负对照＝盘上源码（未变异）⇒ ①③全绿；盘上 `upload.js` **逐字节未变**',
+    m2E185.hit === 1 && m3E185.hit === 1 && m4E185.hit === 1
+      && m2NamedE185 && m3NamedE185
+      && Boolean(m4LoadE185.mod) && m4KeyE185 !== null && m4RejectedE185 === 0
+      && recE185.missing.length === 0 && recE185.phantom.length === 0 && keyFailsE185.length === 0
+      && diskSameE185,
+    `锚点命中：㈠${m2E185.hit}／㈡${m3E185.hit}／㈢${m4E185.hit}（都须恰 1）；`
+      + `㈠装载抛=${Boolean(m2LoadE185.err)}、含新键=${m2NamedE185}；`
+      + `㈡装载抛=${Boolean(m3LoadE185.err)}、含原键=${m3NamedE185}；`
+      + `㈢靶子键=${m4KeyE185}、装载=${Boolean(m4LoadE185.mod)}、被拒样本数=**${m4RejectedE185}**（原模块同键必 >0 ⇒ ③必红）；`
+      + `㈣负对照 missing=${recE185.missing.length}／phantom=${recE185.phantom.length}／③违规键=${keyFailsE185.length}；`
+      + `盘上逐字节未变=${diskSameE185}（sha256=${uploadSha0E185.slice(0, 12)}…）`);
+
+  /* **现算读数**（`E44` 同款纪律：runner 在 PASS 时不打印 `check` 的 detail ⇒ 关键读数必须另给一行，
+     否则"守了什么、读数是多少"只在红的时候才看得见）。这一行**不参与判定**，只作证据。 */
+  t.info(`E185 **现算读数**：白名单 ${wl0E185.length} 条、类型清单 ${clPathsE185.length} 条`
+    + `（ledger 分布 ${JSON.stringify(ledgerStatE185)}）、双向 missing=${recE185.missing.length}／phantom=${recE185.phantom.length}；`
+    + `逐键（键名现取自源码）` + perKeyE185.map(r => `${r.path} 拒${r.rejected.length}收${r.accepted.length}`).join('、') + `；`
+    + `省略合法：全不传=${!emptyFeedE185.threw}、全 undefined=${!explicitUndefFeedE185.threw}、全合法基线=${!baselineFeedE185.threw}；`
+    + `D22 ㈠清单凭空登记 ⇒ 装载抛=${Boolean(m2LoadE185.err)}（含键=${m2NamedE185}）、`
+    + `㈡挪走校验项 ⇒ 装载抛=${Boolean(m3LoadE185.err)}（含原键=${m3NamedE185}）、`
+    + `㈢放宽 \`${m4KeyE185}\` 的 ok ⇒ 该键被拒样本 **${m4RejectedE185}** 个（原模块同键 >0 ⇒ E185-③ 必红）；`
+    + `负对照：盘上 upload.js 逐字节未变=${diskSameE185}（sha256=${uploadSha0E185.slice(0, 12)}…）`);
+}
+
+
+/* ==========================================================================
    二十五、`E183` 台账渲染器的**转义／保真判据**（`T-20261005-21`）
    --------------------------------------------------------------------------
    事故（`E183` 立案）：仓外台账渲染器把注记**直接内插**进单引号 JS 字符串 ⇒
@@ -11681,7 +12202,8 @@ t.section('二十六、`E72①⑥⑦⑧`（开工数跨实现可证伪／`addRun
 /* ==========================================================================
    `E103`（链接安全的**门禁守护**，`T-20261004-01` 甲组，2026-10-04）
    --------------------------------------------------------------------------
-   为什么要有这一段：`E46`（对 junction 递归删除危险）与 `E101`（24h 清扫跟随链接）都改好了，
+   为什么要有这一段：`E46`（对 junction 递归删除危险）与 `E101`（清扫跟随链接；立案时的窗口是
+   24h，现由 `T-20261005-37` 收到 2h）都改好了，
    但"不得对**可能**是链接的路径递归删除"这条此前**只有纪律、没有门禁** —— `E46` 的事故正是
    **探针的第一版**踩出来的。没有门禁 ⇒ 下一个人、下一支探针还会踩，且删除是合法 git 操作、
    事后无从追责。本节把 `E103` 行给出的 A–E 五条判据落地（口径与偏差逐条写在判据旁边）：
@@ -13047,7 +13569,7 @@ function e103LinkSafetyChecks(t) {
   const eBefore1 = RUN_E103 ? mkVictimE103(e103SweepVictim, 5) : {};
   const eBefore2 = RUN_E103 ? mkVictimE103(e103SweepVictim2, 5) : {};
   if (RUN_E103) {
-    fs.utimesSync(e103SweepVictim, oldStamp, oldStamp);            /* 目标"年龄"回拨 >24h（旧版 statSync 会顺链取到它） */
+    fs.utimesSync(e103SweepVictim, oldStamp, oldStamp);            /* 目标"年龄"回拨 25h（> 2h 窗口 ⇒ 越界；旧版 statSync 会顺链取到它） */
     fs.symlinkSync(e103SweepVictim, e103StaleLink, 'junction');
     fs.symlinkSync(e103SweepVictim2, e103FreshLink, 'junction');   /* 新鲜链接（目标 mtime＝现在） */
     fs.mkdirSync(e103FreshDir, { recursive: true });
@@ -13066,7 +13588,7 @@ function e103LinkSafetyChecks(t) {
     && Object.keys(eBefore1).every(n => eAfter1[n] === eBefore1[n]);
   const eVictim2Kept = RUN_E103 && Object.keys(eAfter2).length === 5
     && Object.keys(eBefore2).every(n => eAfter2[n] === eBefore2[n]);
-  t.check('E103-E① 清扫回归（**过期**链接）：`tempRootBase` 下 `zz-e103-stale-* -> victim`（victim mtime 回拨 >24 h）⇒ `env.cleanupStaleTemp()` 后**链接消失**、且 victim **5/5 逐文件 sha256 守恒**（旧形态会顺着链接进目标目录 —— 那时这里就不是"只拆链"了）',
+  t.check('E103-E① 清扫回归（**过期**链接）：`tempRootBase` 下 `zz-e103-stale-* -> victim`（victim mtime 回拨 **25 h**；窗口＝2 h 见 `env.STALE_MAX_AGE_MS`）⇒ `env.cleanupStaleTemp()` 后**链接消失**、且 victim **5/5 逐文件 sha256 守恒**（旧形态会顺着链接进目标目录 —— 那时这里就不是"只拆链"了）',
     RUN_E103 && eStaleLinkGone && eVictim1Kept,
     `链接已消失=${eStaleLinkGone}；victim 文件=${Object.keys(eAfter1).length}（应 5）、逐文件 sha256 守恒=${eVictim1Kept}；`
       + `清扫返回=${JSON.stringify(eSweep)}`);
@@ -13388,7 +13910,7 @@ function e103LinkSafetyChecks(t) {
 /* ==========================================================================
    二十七、`E42`／`E43`：ADR-0003 D17 时钟门禁的**真值表** ＋ **扩大覆盖** ＋ **能力边界登记**
    --------------------------------------------------------------------------
-   立案（两条技术债，**同一个根因**）：D17 那条门禁（`tests\docs-cross-check.js` 的
+   立案（三条技术债，`E189` 与上面两条**同一个根因**）：D17 那条门禁（`tests\docs-cross-check.js` 的
    「ADR-0003 D17：业务代码的 `new Date()` 都留有注入出口」）是一条**同行文本启发式**判据 ——
      · **`E42`**（★★）：它曾把"**对象字面量的键冒号**"当成注入出口 ⇒ `{ …, at: new Date() }` 侥幸过闸；
        而 `Date.now()` **完全不在覆盖内**。收紧已落地（该文件里的 `E42 收紧（2026-09-27）` 注释），
@@ -13397,6 +13919,10 @@ function e103LinkSafetyChecks(t) {
        安全感错位）：① 只认 `new Date()`／`Date.now()` ⇒ `performance.now()`／`process.hrtime()`／
        `setInterval` 周期**完全不在覆盖内**；② **"出口形状"不等于"真注入源"** ⇒
        `retry ? Date.now() : Date.now()` 这种"两侧都是裸时钟"的行**照样过闸**。
+     · **`E189`**（★，2026-10-05 座位 4b `T-20261005-35`）：**反方向**的边界 —— 判据当时**只剥注释**、
+       **不剥字符串/模板串** ⇒ `const s = "new Date()"` 这类**说明性字面量**会被判红（**过报/假阳**；
+       `D17`／`EXT-A`／`EXT-B` **三面同病**，因为三者共用 `stripComments`）。真树 0 命中（故当时不发作），
+       但假红与假绿同价：一条把**正确**的行判红的门禁，会训练人**忽略**它。
    本节的处置**不是**"再写一条更宽的正则把它盖住"（那只会把漏网换成一个新的、更隐蔽的漏网），而是：
      甲、**把判据抽出来、喂真值表** —— 判据本体从 `docs-cross-check.js` 的**真源码字节**里用
          **锚点**切出连续区间、交 `new Function` 编译（**同一把尺子**；`E153` 的教训：判据与 D22
@@ -13408,6 +13934,10 @@ function e103LinkSafetyChecks(t) {
          漏网留在**明处**，不留暗处。
      丙、`D22`（可证伪）：在**真实 `server\index.js` 的内存字节副本**中部植入**真实漏网点** ⇒
          同一判据**必红并指名**；负对照（现行盘上）必绿；盘上逐字节未变。
+     丁、`E189` 的**正反两支 `D22`**（**内存文本变异**，打在从真源码切出的**区间文本**上）：
+         ㈠**撤掉"剥字符串"** ⇒ 字符串/模板串样例**必红**（过报回归）；㈡**假修**＝把模板串插值
+         `${…}` **也当字符串剥掉** ⇒ 插值里的**真代码必漏网（判绿）**。两支合起来证明"剥字符串
+         ＋ 插值内继续判"这两件事**各自都是承重的**（少了任一支，另一种改坏方式会静默通过）。
    ⚠ **面（不许读成"全仓"）**：与 `docs-cross-check.js` **完全同面** ＝ `server\**\*.js` ＋
      `platform\**\*.js`，且 `platform\clock.js`（时间来源本身）豁免。
    ⚠ **中心论断：为什么"启发式判据的漏网必须显式登记为能力边界，而不是靠加正则掩盖"**：
@@ -13462,14 +13992,17 @@ t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ �
   } else {
     /* ---- 二十七之二：与门禁**完全同一条循环**的判据入口（逐行剥注释 → 逐个被管时钟调用 →
              无注入出口即命中；每行至多报 1 处；行号 1-based；`rel` 用 `path.relative` 原样，
-             即 Windows 反斜杠 —— 与 `docs-cross-check.js` 的报名字符串**逐字同形**） ---- */
-    const d17Hits = (sources) => {
+             即 Windows 反斜杠 —— 与 `docs-cross-check.js` 的报名字符串**逐字同形**）
+             `E189`（2026-10-05，座位 4b `T-20261005-35`）：抽出来的是**参数化的判据对象**（`J`），
+             这样 D22 可以把"内存变异体"编译成**另一个 J** 喂同一段循环 —— 判据与变异体**共用同一份
+             循环**（`E153`：两处各写一份，D22 证明的就不是主判据那一件事）。 ---- */
+    const d17HitsWith27 = (J, sources) => {
       const hits = [];
       for (const s of sources) {
-        D17.stripComments(s.src).forEach((line, i) => {
-          D17.CLOCK_CALL_RE.lastIndex = 0;
-          for (let m = D17.CLOCK_CALL_RE.exec(line); m; m = D17.CLOCK_CALL_RE.exec(line)) {
-            if (D17.injectableCall(line, m.index, m.index + m[0].length)) continue;
+        J.stripComments(s.src).forEach((line, i) => {
+          J.CLOCK_CALL_RE.lastIndex = 0;
+          for (let m = J.CLOCK_CALL_RE.exec(line); m; m = J.CLOCK_CALL_RE.exec(line)) {
+            if (J.injectableCall(line, m.index, m.index + m[0].length)) continue;
             hits.push(`${s.rel}:${i + 1}（裸 ${m[0]}）`);
             break;
           }
@@ -13477,21 +14010,29 @@ t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ �
       }
       return hits;
     };
+    const d17Hits = (sources) => d17HitsWith27(D17, sources);
     const stripC27 = src => D17.stripComments(src);
-    const countClock27 = (line) => {
-      D17.CLOCK_CALL_RE.lastIndex = 0; let n = 0;
-      for (let m = D17.CLOCK_CALL_RE.exec(line); m; m = D17.CLOCK_CALL_RE.exec(line)) n++;
+    /** 编译一段"判据区间文本"成一个判据对象（**与二十七之一抽出真源码时同一句**；D22 复用）。 */
+    const compileRegion27 = (text) => new Function(text
+      + '\nreturn { stripComments, CLOCK_CALL_RE, isTernaryColon, injectableCall };\n')();
+    const countClockWith27 = (J, line) => {
+      J.CLOCK_CALL_RE.lastIndex = 0; let n = 0;
+      for (let m = J.CLOCK_CALL_RE.exec(line); m; m = J.CLOCK_CALL_RE.exec(line)) n++;
       return n;
     };
+    const countClock27 = (line) => countClockWith27(D17, line);
     const SAMPLE_REL = '（合成样本）';
     const hitsOf27 = src => d17Hits([{ rel: SAMPLE_REL, src }]);
     /* `EXT-A`：**未受管**的时钟来源形态（`E43①` 里"能判"的那一半）。
-       逐码位/逐形态写死，不做"看起来像取时间"的宽松匹配。 */
+       逐码位/逐形态写死，不做"看起来像取时间"的宽松匹配。
+       `E189`：它**共用** `stripComments` ⇒ 剥字符串的改动对它同样生效（故这里也收 `J` 参数：
+       D22 ㈠ 撤掉剥字符串后，字符串里的 `performance.now()` 会**重新**被判红 —— 那份读数由
+       §二十七之八的 D22 给出）。 */
     const EXT_A_RE = new RegExp('(?:performance\\s*\\.\\s*now|process\\s*\\.\\s*hrtime)\\s*\\(', 'g');
-    const extAHits = (sources) => {
+    const extAHitsWith27 = (J, sources) => {
       const hits = [];
       for (const s of sources) {
-        stripC27(s.src).forEach((line, i) => {
+        J.stripComments(s.src).forEach((line, i) => {
           EXT_A_RE.lastIndex = 0;
           const ms = line.match(EXT_A_RE);
           if (ms) hits.push(`${s.rel}:${i + 1}（未受管的时钟来源 ${ms.join('、')}）`);
@@ -13499,18 +14040,21 @@ t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ �
       }
       return hits;
     };
+    const extAHits = (sources) => extAHitsWith27(D17, sources);
     /* `EXT-B`：**同一行 ≥2 处被管时钟调用** ⇒ 该行不可能"每一处都有独立注入出口"
-       （一个出口只接得住一处调用）—— 这正是 `retry ? Date.now() : Date.now()` 的形态。 */
-    const extBHits = (sources) => {
+       （一个出口只接得住一处调用）—— 这正是 `retry ? Date.now() : Date.now()` 的形态。
+       `E189`：同 `EXT-A`，共用剥器 ⇒ 也收 `J` 参数。 */
+    const extBHitsWith27 = (J, sources) => {
       const hits = [];
       for (const s of sources) {
-        stripC27(s.src).forEach((line, i) => {
-          const n = countClock27(line);
+        J.stripComments(s.src).forEach((line, i) => {
+          const n = countClockWith27(J, line);
           if (n >= 2) hits.push(`${s.rel}:${i + 1}（同行 ${n} 处被管时钟调用）`);
         });
       }
       return hits;
     };
+    const extBHits = (sources) => extBHitsWith27(D17, sources);
 
     /* ---- 二十七之三：`E42` 真值表（**扩大覆盖**：`Date.now()` ＋ 多类"非对象字面量"/对象字面量形态） ----
        `hit: true` ⇒ 期望**判红**（判据认为"没有注入出口"）。期望来自**设计口径**（`E42`／`E43` 行内 ＋
@@ -13544,10 +14088,11 @@ t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ �
       ['⑮ `setInterval` 周期里的裸 `Date.now()`（真阳）',
         'setInterval(() => tick(Date.now() - started), 1000);', true,
         '**真漏网**：`Date.now()` 被拿来做时长逻辑'],
-      ['⑯ 字符串字面量里的 `new Date()`（**过报**）', "const s = 'new Date()';", true,
-        '**能力边界（过报）**：判据只剥注释、**不剥字符串/模板串** ⇒ 说明性字面量会被判红'],
-      ['⑰ 模板串里的 `new Date()`（**过报**）', 'const s = ' + '`' + 'a ' + '${1}' + ' new Date()' + '`' + ';', true,
-        '同上（模板串也不剥）'],
+      ['⑯【`E189` 改判】字符串字面量里的 `new Date()`', "const s = 'new Date()';", false,
+        '`E189`（2026-10-05，座位 4b）：判据在剥注释之后**再剥字符串** ⇒ 说明性字面量**不再被判红**'
+        + '（此前是**过报边界**：判据只剥注释 ⇒ `const s = "new Date()"` 会被判红；真树 0 命中故当时不发作）'],
+      ['⑰【`E189` 改判】模板串**字面量**里的 `new Date()`', 'const s = ' + '`' + 'a ' + '${1}' + ' new Date()' + '`' + ';', false,
+        '模板串的**字面量段**同样置空（`${1}` 是插值，里面是数字 `1`、不是时钟调用 ⇒ 本行应绿）'],
       ['⑱ **`E43②` 的漏网**：`retry ? Date.now() : Date.now()`', 'const t = retry ? Date.now() : Date.now();', false,
         '**固有漏网**：出口形状齐备、但两侧来源全是裸时钟 ⇒ D17 判**绿**（由 `EXT-B` 判红）'],
       ['⑲ **`E43①` 的漏网**：`performance.now()`', 'const t = performance.now();', false,
@@ -13555,21 +14100,99 @@ t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ �
       ['⑳ **`E43①` 的漏网**：`process.hrtime()`', 'const h = process.hrtime();', false,
         '同上（由 `EXT-A` 判红）'],
       ['㉑ **非调用语法**：`const f = new Date; const t = f();`', 'const f = new Date; const t = f();', false,
-        '**能力边界**：判据正则要求调用括号 `()` ⇒ 取函数引用再调用、别名、经中间变量间接取时间**一律看不见**']
+        '**能力边界**：判据正则要求调用括号 `()` ⇒ 取函数引用再调用、别名、经中间变量间接取时间**一律看不见**'],
+      /* ---- `E189` 新增（2026-10-05，座位 4b `T-20261005-35`）：剥字符串/模板串的**正反两支** ---- */
+      ['㉒【`E189` 反例】模板串**插值 `${…}` 内**的裸 `new Date()`',
+        'const s = ' + '`' + 'a ' + '${new Date()}' + ' b' + '`' + ';', true,
+        '**插值里是真代码** ⇒ 必须仍然判红 —— "剥字符串"绝不许把插值一起剥掉（本条是下面 D22 ㈡ 的靶子）'],
+      ['㉓ 模板串**插值内**的**真注入出口**（反向对照）',
+        'const s = ' + '`' + 'a ' + '${options.now || new Date()}' + ' b' + '`' + ';', false,
+        '插值内走的是**同一套**"注入出口"判据（证明 ㉒ 的红不是"插值一律红"）'],
+      ['㉔ 字符串字面量里的 `Date.now()`', "const s = 'Date.now()';", false,
+        '`Date.now()` 与 `new Date()` **同等**受管（`E42②`）⇒ 字符串的豁免也同等'],
+      ['㉕ 转义引号不误判', "const s = 'it\\'s new Date()';", false,
+        '`\\\'` 是转义 ⇒ 不提前结束字符串（否则后半段会被当代码、又变成**过报**）'],
+      ['㉖ 字符串**之后**的裸时钟（**列位不许错位**）', 'const s = "x"; const d = new Date();', true,
+        '**"等长置空"的验收点**：若剥字符串时删字符，`m.index` 会左移 ⇒ `injectableCall()` 看到的'
+        + '`before`/`after` 错位 ⇒ 这一行会被误判成"有注入出口"（**假绿**）']
     ];
     const d17Rows = d17Table.map(([name, src, want]) => {
       const got = hitsOf27(src);
       return { name, src, want, got, ok: (got.length > 0) === want };
     });
     const d17TableBad = d17Rows.filter(r => !r.ok);
-    t.check('`E42`-① D17 判据**真值表**（从真源码抽出、**同一把尺子**喂 21 个样本）：'
+    t.check('`E42`-① D17 判据**真值表**（从真源码抽出、**同一把尺子**喂样本，逐例见下）：'
       + '**裸 `Date.now()`** 与**对象字面量键冒号**（含嵌套/展开）**必红且指名行号**；'
-      + '**真注入出口**（`||`／形参默认值／三元假分支／`??`）与**注释里的字样**必绿 —— '
+      + '**真注入出口**（`||`／形参默认值／三元假分支／`??`）与**注释里的字样**必绿；'
+      + '**`E189`（2026-10-05）：字符串/模板串的**字面量段**必绿、而**模板串插值 `${…}` 内的真代码**必红** —— '
       + '即"**扩大覆盖**"而不是"把判据放宽成只认已知写法"',
       d17TableBad.length === 0,
       (d17TableBad.length ? `**判红：${d17TableBad.length} 例期望与实际不符** —— `
-        + d17TableBad.map(r => `${r.name}：期望${r.want ? '红' : '绿'}、实得[${r.got.join('、') || '绿'}]`).join('；') + '；' : '21 例**逐例相符**；')
+        + d17TableBad.map(r => `${r.name}：期望${r.want ? '红' : '绿'}、实得[${r.got.join('、') || '绿'}]`).join('；') + '；'
+        : `${d17Rows.length} 例**逐例相符**；`)
       + `逐例读数：${d17Rows.map(r => `${r.name.slice(0, 6)}…→${r.got.length ? '红' : '绿'}`).join('／')}`);
+
+    /* ---- 二十七之三b：`E189` D22（**内存变异**：①撤掉"剥字符串" ②假修＝把插值也当字符串剥） ----
+       `E189` 改的是判据的**覆盖边界**（从"只剥注释"到"再剥字符串/模板串、但插值内仍判"）。这类改动
+       最危险的形态是**两种情况**，两支 D22 各自钉住一种：
+         · ㈠ **改动被回退**（"剥字符串"被删掉）⇒ 字符串/模板串里的时钟形态**重新变成过报**：
+           本支要求**字符串样例必红**（而且 `EXT-A`／`EXT-B` 也一起变红 —— 三面共用同一个剥器）；
+         · ㈡ **假修**＝"连插值 `${…}` 一起剥掉"（看起来"字符串问题全解决了"）⇒ 插值里的**真代码**
+           会被静默漏掉：本支要求**插值反例必漏网/变绿** —— 这就是"这条反例承重"的机器证据。
+       两支都打在**从真源码字节切出来的区间文本**（`d17Region`）上，编译成**另一个判据对象 J**，
+       再喂**同一段循环**（`d17HitsWith27`／`extAHitsWith27`／`extBHitsWith27`）⇒ 判据与变异体
+       共用同一个判据入口；不落地、不改盘上字节（下方复核 sha）。 */
+    const d17GateFile27 = path.join(ROOT27, D17_GATE_REL);
+    const sha27 = p => require('node:crypto').createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    const d17GateSha27 = sha27(d17GateFile27);
+    const E189_STRIP_CALL = '      out.push(blankStringsKeepPosE189(line));';
+    const E189_INTERP_DEF = "        const isInterpE189 = q === '`' && c === '$' && line[j + 1] === '{';";
+    const E189_STR_SAMPLES = ["const s = 'new Date()';",
+      'const s = ' + '`' + 'a ' + '${1}' + ' new Date()' + '`' + ';'];
+    const E189_INTERP_SAMPLE = 'const s = ' + '`' + 'a ' + '${new Date()}' + ' b' + '`' + ';';
+    const EXT_A_STR_SAMPLE = "const s = 'performance.now()';";
+    const EXT_B_STR_SAMPLE = "const s = 'Date.now(); Date.now()';";
+    /** 把区间文本里的**唯一一处**锚点换成"变异后"的写法，编译成新 J（锚点必须恰 1 次，否则不出 J）。 */
+    const mkE189Mutant27 = (anchor, to) => {
+      const n = d17Region ? aCount27(d17Region, anchor) : 0;
+      let J = null; let err = '';
+      if (d17Region && n === 1) {
+        try { J = compileRegion27(d17Region.split(anchor).join(to)); }
+        catch (e) { err = String((e && e.message) || e); }
+      }
+      return { n, J, err };
+    };
+    const e189NoStrip27 = mkE189Mutant27(E189_STRIP_CALL, '      out.push(line);   /* D22 ㈠ */');
+    const e189FakeFix27 = mkE189Mutant27(E189_INTERP_DEF, '        const isInterpE189 = false;   /* D22 ㈡ */');
+    const e189MutSamples27 = (J) => (J ? E189_STR_SAMPLES.map(s => d17HitsWith27(J, [{ rel: SAMPLE_REL, src: s }])) : []);
+    const e189a27 = e189MutSamples27(e189NoStrip27.J);
+    const e189aInt27 = e189NoStrip27.J ? d17HitsWith27(e189NoStrip27.J, [{ rel: SAMPLE_REL, src: E189_INTERP_SAMPLE }]) : [];
+    const e189aExtA27 = e189NoStrip27.J ? extAHitsWith27(e189NoStrip27.J, [{ rel: SAMPLE_REL, src: EXT_A_STR_SAMPLE }]) : [];
+    const e189aExtB27 = e189NoStrip27.J ? extBHitsWith27(e189NoStrip27.J, [{ rel: SAMPLE_REL, src: EXT_B_STR_SAMPLE }]) : [];
+    const e189b27 = e189FakeFix27.J ? d17HitsWith27(e189FakeFix27.J, [{ rel: SAMPLE_REL, src: E189_INTERP_SAMPLE }]) : null;
+    t.check('`E189` D22（可证伪，**内存文本变异 ＋ 同一段判据循环**，两支各自钉住一种失败形态）：' +
+      '㈠把"剥字符串"**撤掉** ⇒ 字符串/模板串样例**必红**（过报回归；`EXT-A`／`EXT-B` 的字符串样例也**一起变红**，' +
+      '因为三面**共用同一个剥器**）；㈡**假修**＝把插值 `${…}` **也当字符串剥掉** ⇒ 插值内的真代码**必漏网（判绿）** ' +
+      '（⇒ 证明真值表 ㉒ 那条反例是**承重的**：没有它，"假修"看起来全绿）；' +
+      '两个变异锚点在区间里各**恰命中 1 次**、变异体都能编译；盘上 `' + D17_GATE_REL + '` **逐字节未变**',
+      e189NoStrip27.n === 1 && e189FakeFix27.n === 1 && e189NoStrip27.J && e189FakeFix27.J
+        && e189a27.length === E189_STR_SAMPLES.length && e189a27.every(h => h.length > 0)
+        && e189aInt27.length > 0 && e189aExtA27.length > 0 && e189aExtB27.length > 0
+        && Array.isArray(e189b27) && e189b27.length === 0
+        && sha27(d17GateFile27) === d17GateSha27,
+      `锚点命中（须各恰 1）：㈠「${E189_STRIP_CALL.trim()}」=${e189NoStrip27.n} 次、`
+      + `㈡「${E189_INTERP_DEF.trim()}」=${e189FakeFix27.n} 次；`
+      + `㈠撤掉剥字符串 ⇒ 双引号样例命中[${(e189a27[0] || []).join('、') || '（无）'}]、模板串样例命中[${(e189a27[1] || []).join('、') || '（无）'}]（**都应变红**）、`
+      + `插值反例命中[${e189aInt27.join('、') || '（无）'}]、`
+      + `\`EXT-A\` 字符串样例命中[${e189aExtA27.join('、') || '（无）'}]、\`EXT-B\` 字符串样例命中[${e189aExtB27.join('、') || '（无）'}]；`
+      + `㈡假修（插值也剥）⇒ 插值反例命中[${(e189b27 || []).join('、') || '（无）'}]（**0 ＝ 漏网**，正是"假修看起来全绿"的机器证据）；`
+      + `盘上 ${D17_GATE_REL} 逐字节未变=${sha27(d17GateFile27) === d17GateSha27}（sha256=${d17GateSha27.slice(0, 12)}…）`);
+    /* `E189` 的读数**每轮可见**（`PASS` 详情不打印 ⇒ 用 `t.info` 留痕；与 `E152` 同一条理由）。 */
+    t.info('`E189` D22 读数（每轮可见）：㈠撤掉"剥字符串" ⇒ '
+      + `双引号样例[${(e189a27[0] || []).join('、') || '绿'}]／模板串样例[${(e189a27[1] || []).join('、') || '绿'}]／`
+      + `插值反例[${e189aInt27.join('、') || '绿'}]／EXT-A 字符串样例[${e189aExtA27.join('、') || '绿'}]／EXT-B 字符串样例[${e189aExtB27.join('、') || '绿'}]；`
+      + `㈡假修（插值也剥）⇒ 插值反例[${(e189b27 || []).join('、') || '绿（**漏网**）'}]；`
+      + `真值表 ${d17Rows.length} 例不符 ${d17TableBad.length} 例；真树读数见下一条。`);
 
     /* ---- 二十七之四：`E42`-② D22（**内存变异**：在真实 `server\index.js` 中部造真实漏网点） ----
        为什么必须打在**真源码**上而不是合成字符串上：合成字符串只能证明"判据对合成样本有效"，
@@ -13634,14 +14257,19 @@ t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ �
     const extASamp = extAHits([{ rel: SAMPLE_REL, src: 'const t = performance.now();' },
       { rel: SAMPLE_REL, src: 'const h = process.hrtime();' }]);
     const extASampD17 = hitsOf27('const t = performance.now();').length + hitsOf27('const h = process.hrtime();').length;
+    /* `E189` 负对照（同一族"过报"边界的另一面）：**字符串里的** `performance.now()` 不许被判红
+       （三面共用同一个剥器 ⇒ 剥字符串的改动必须同时覆盖 `EXT-A`／`EXT-B`）。 */
+    const extAStrSamp = extAHits([{ rel: SAMPLE_REL, src: EXT_A_STR_SAMPLE }]);
     t.check('`E43`-① 扩大覆盖（**能判的判红并指名**）：新增可判判据 `EXT-A` 把 **`performance.now()`／'
       + '`process.hrtime()`** 纳入同一面（`server\\`＋`platform\\`）—— 真树必须 **0 处**；'
       + '合成样本两支**必红且指名 `文件:行`**；**同时**证明原 D17 判据对这两支**判绿**（＝漏网被**指名登记**，'
       + '不是含糊带过）',
-      faceExtA27.length === 0 && extASamp.length === 2 && extASampD17 === 0,
+      faceExtA27.length === 0 && extASamp.length === 2 && extASampD17 === 0 && extAStrSamp.length === 0,
       `真树 EXT-A 命中 ${faceExtA27.length} 处（应 0）：[${faceExtA27.join('、') || '（无）'}]；`
       + `合成样本 EXT-A 命中 ${extASamp.length}/2：[${extASamp.join('、')}]；`
       + `**原 D17 判据对这两支命中 ${extASampD17} 处（＝0 才说明"漏网"是真的）**；`
+      + `**` + '`E189`' + ` 负对照**：字符串里的 \`${EXT_A_STR_SAMPLE}\` ⇒ EXT-A 命中 ${extAStrSamp.length} 处（应 0；`
+      + `撤掉剥字符串即变红，读数见上面的 D22 ㈠）；`
       + `**能力边界（判不了的，如实登记）**：` + '`EXT-A` 也是**文本**判据 —— '
       + '`setInterval`／`setTimeout` **周期本身**、`Date` 的静态取值形态（`Date.parse`／`Date.UTC`）、'
       + '取函数引用再调用（`const f = new Date; f()`）、经**中间变量/参数**间接取得的时间，**一律不在覆盖内**；'
@@ -13654,13 +14282,16 @@ t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ �
     const EXT_B_SAMPLE = 'const t = retry ? Date.now() : Date.now();';
     const extBSamp = extBHits([{ rel: SAMPLE_REL, src: EXT_B_SAMPLE }]);
     const extBSampD17 = hitsOf27(EXT_B_SAMPLE);
+    const extBStrSamp = extBHits([{ rel: SAMPLE_REL, src: EXT_B_STR_SAMPLE }]);
     t.check('`E43`-② 扩大覆盖（**能判的判红并指名**）：新增可判判据 `EXT-B`＝"**同一行 ≥2 处被管时钟调用**"'
       + '（一个注入出口只接得住一处调用）—— 真树必须 **0 处**；合成样本 `retry ? Date.now() : Date.now()` '
       + '**必红且指名 `文件:行`**；**同时**证明原 D17 判据对该样本**判绿**（`E43②` 的固有漏网由此**固化成可判形式**）',
-      faceExtB27.length === 0 && extBSamp.length === 1 && extBSampD17.length === 0,
+      faceExtB27.length === 0 && extBSamp.length === 1 && extBSampD17.length === 0 && extBStrSamp.length === 0,
       `真树 EXT-B 命中 ${faceExtB27.length} 处（应 0）：[${faceExtB27.join('、') || '（无）'}]；`
       + `合成样本 \`${EXT_B_SAMPLE}\` ⇒ EXT-B 命中 [${extBSamp.join('、')}]、**原 D17 判据命中 ${extBSampD17.length} 处**`
       + `（0 ＝ 它确实**过闸**了 —— 这就是要固化的那条漏网）；`
+      + `**` + '`E189`' + ` 负对照**：字符串里的 \`${EXT_B_STR_SAMPLE}\` ⇒ EXT-B 命中 ${extBStrSamp.length} 处（应 0；`
+      + `撤掉剥字符串即变红，读数见上面的 D22 ㈠）；`
       + `**能力边界（判不了的，如实登记）**：` + '`EXT-B` 只数**被管时钟调用**的**条数**，'
       + '判不了"出口的后备值本身是不是**别的**时间源"（`a || b || new Date()` 里 a/b 若也是时钟，本行数不到）；'
       + '也判不了跨行/跨语句的同一个出口（本行**只做同行**判定）；'
