@@ -31,7 +31,7 @@
      `server/index.js` 与这里同批传 `boardCfg`，**不读全局配置兜底**）。
      补修②把复核实测出来的三个洞一并补上：
        ① 配置覆盖面：由"只挑几个"改为**显式白名单**（含 `config.dataSource`／
-          `config.device.equipCode`／`config.mes.*`，逐项附代码出处）—— 见 `CONFIG_KEY_PATHS`；
+          `config.device.equipCode`／`config.mes.*`（**除 `queueWarnThreshold`**：它不是注入配置的读点，队列阈值的真源在磁盘那份 `board.config.js`，见 `E179`），逐项附代码出处）—— 见 `CONFIG_KEY_PATHS`；
        ② 标量选项**按类型严格校验与比较**（`timeoutMs: 2000` ≠ `'2000'`；后者过去会静默回落
           `mes.timeoutMs`/3000）—— 见 `assertOptionTypes()`／`canonScalar()`；
        ③ `logger`/`now`/`fetch`/`queue`/`bus`/`idGenerator` 这类**无法按值比较的注入**，本次与创建时
@@ -88,12 +88,16 @@ const pool = { byDb: new WeakMap(), nullDb: null };
      · `config.mes.timeoutMs`          :196（`timeoutMs` 的缺省来源）
      · `config.mes.reportPlaceholder`  :197（`paramDataList` 的占位哨兵）
      · `config.mes.queueCap`           :548（`status().queueCap` 的读数；只影响状态输出，仍属"读到过"）
-     · `config.mes.queueWarnThreshold` `services/uploadQueue.js:48-49`（模块级快照）／
-       `:52-55`（运行期 `configWarnThreshold()`）—— **保守纳入**：它读的是**磁盘那份**
-       `board.config.js`（不是本入口注入的 `config`），故"只改注入配置里的这一项"其实不改行为
-       ⇒ 会制造一次**假冲突**；但假冲突是**吵闹**的（现场立刻看见，按提示传同一份配置即可），
-       而漏项是**静默**的（正是 `E48` 要防的形态）。⇒ **宁可吵闹，不可静默**。
-       （"队列阈值仍读磁盘真源"本身另行登记，不属本包可改面。）
+     · **`config.mes.queueWarnThreshold` 不在本表**（`E179`，2026-10-05 落地）：
+       它**不是注入配置的读点** —— 队列告警阈值的**唯一真源＝「磁盘那份」** `src/config/board.config.js`
+       （`require` 在 `services/uploadQueue.js`：模块级 `DEFAULT_WARN_THRESHOLD` ＋ 运行期
+       `configWarnThreshold()`；本入口注入的 `deps.config` 里那个**同名键没有任何调用点读它**）。
+       上一版的"保守纳入（宁可吵闹不可静默）"**已按 `C·27` 的实测撤销**：纳入它并不守任何行为
+       （实测摘掉后行为**完全不变**），却会把"改了一个不生效的键"变成一次**假冲突**（拒绝复用，
+       而队列实际用的阈值一字未动）⇒ 那是**指向错方向**的吵闹。**真读点**仍由本表逐条守住：
+       负对照靶子改用 `config.mes.queueCap`（摘掉它 ⇒ "同一 db 第二次挂载必须拒绝复用并逐项指名"**必红**，
+       取证＝`tests\._verify\T-20261005-20\p-e179-queue-threshold-source.js` 的 `E179-C1`／`E179-B2`）。
+       ⚠ 若**将来**把队列阈值改成读注入配置，必须把它**同时**加回本表 —— 那时它才属于行为指纹。
      · `config.device.equipCode`       :272（报文 `equipCode` 的本机兜底，FR-8.6）
      · `config.dataSource`             :277（`'mock'` ⇒ 无帧时 `testStatus=0` **照发**；否则**拒发**
                                         `NO_TEST_STATUS`）—— 复核实测的两处漏项之一
@@ -116,7 +120,10 @@ const pool = { byDb: new WeakMap(), nullDb: null };
 const CONFIG_READ_TOP = Object.freeze(['dataSource', 'device', 'mes']);
 
 /** 扁平白名单：每条＝代码里**确实读过**的配置路径（推导逐处见上方注释）。
- *  ⚠ **新增读取点必须同步本表**（否则指纹漏项 ⇒ 又回到"改了配置却复用"）；同步后重跑上面那条对账探针。 */
+ *  ⚠ **新增读取点必须同步本表**（否则指纹漏项 ⇒ 又回到"改了配置却复用"）；同步后重跑上面那条对账探针。
+ *  ⚠ `'mes.queueWarnThreshold'` **已于 2026-10-05 移出**（`E179`）：它不是注入配置的读点
+ *    （队列阈值的真源＝**磁盘那份** `src/config/board.config.js`，读点在 `services/uploadQueue.js`），
+ *    列入本表只会把"改了一个不生效的键"变成一次**假冲突**。理由与 D22 替代靶子见上方注释。 */
 const CONFIG_KEY_PATHS = Object.freeze([
   'dataSource',
   'device.equipCode',
@@ -126,8 +133,7 @@ const CONFIG_KEY_PATHS = Object.freeze([
   'mes.token',
   'mes.timeoutMs',
   'mes.reportPlaceholder',
-  'mes.queueCap',
-  'mes.queueWarnThreshold'
+  'mes.queueCap'
 ]);
 
 /** 键名排序的稳定序列化（**只用于指纹**：同一份内容的不同对象实例必须给出同一个字符串；
