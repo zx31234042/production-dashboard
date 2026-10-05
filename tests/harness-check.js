@@ -7087,6 +7087,32 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
        且并行账本的 `ranSuites` 仍按 SUITES 原顺序（并行完成顺序是乱的，落账必须归一）。
    实测（本机 i7-14650HX/24 逻辑核）：串行 74.2 s → 并行 43.3 s（各脚本之和 74.1 s，加速 1.71×）。 */
 {
+  /* **`ADR-0010 D5`（2026-10-06，已接受）：默认档子轮清单 6 → 2 —— 为什么默认档只跑 2 个**
+     --------------------------------------------------------------------------
+     ① **决策依据**：`项目记录\ADR\ADR-0010-测试执行的档位与可作证性.md` 的 **D5**；负责人
+        2026-10-06 **显式批准**"默认档门禁数 6 → 2"。本节据此把默认档子轮清单缩成 **2 个最便宜的脚本**
+        （`contract-check`／`trace-check`）—— 本机实测（`T-20261006-01` 的 `suite-cost.js`，各 3 次取中位，
+        与 `run-all.js` 的 `runScript()` 同形：`spawnSync(node, tests\<name>.js)`）：**328 ms**（83/0/0）
+        ／ **279 ms**（39/0/0），合计 **607 ms ＝ 一轮**子轮的脚本自身成本（不含 node 启动与 run-all 开销）。
+     ② **改前那笔实测账（2026-10-05 终局全量，`run-all` 同一 pid 19164，全量墙钟 401 s）**：
+        `harness-check` 一轮 133.6 s，其中 **≈64 s** 是本节默认档的两轮真子轮
+        （47.2 s 串行请求 ＋ 16.7 s 并行请求）⇒ 占本脚本 **48%**、占全量墙钟 **16%**。
+        缩表后这两轮只跑 2 个脚本 ⇒ 全量预期 **−62 s（−15%）**（本包的墙钟读数见 §15 回执）。
+     ③ **为什么这 64 s 是白付的**：默认档**本来就判定不了** —— 子轮以 `--only` 发起，而
+        `run-all.scheduleSuites()` 的**第一条分支**就是
+        `if (!(jobs > 1) || optValue('--only')) return { parallel: [], serial: suites.slice(), jobs: 1 };`
+        ⇒ **强制并发 1**，"并行 vs 串行"无从比较 ⇒ `§15-C`／`§15-D` 恒为"**本轮不判定**"
+        （现行输出已如实报 `[SKIP] … 不判定`，本包**一字未改**）。能拿到可判定读数的只有
+        `DSH_HARNESS_S15_FULL=1` 档（`--fast` 真并行波）—— 该档**一字未改**。
+     ④ **缩表没有削弱任何判据**：默认档这两轮要取的是"**调度与账本归属**"这一**机制层**的证据
+        （`§15-C′`：两轮各读**自己的**子集账、账内脚本清单＝本轮请求清单、两份都不是主账本），
+        而该判据比的是"**请求清单 ↔ 账内清单**"、**与脚本个数无关** ⇒ 2 个脚本能给出的机制证据，
+        6 个一个也不多（ADR-0010 D5 的接受理由：那 6 条里没有一条提供 2 条给不了的机制证据）。
+        **代价如实登记**：默认档"能真跑一轮、真写自己子集账"的**取证样本由 6 个降到 2 个**；
+        该代价的**可证伪守据**是 `§15-C′①`／`§15-C′②`（两条 D22 反事实真值表：把账内清单换成
+        缩表前的 6 个、或换成主账本 ⇒ 归属判据**必红并指名**）＋ `§15-G`（缩表事实自证）。
+     ⑤ **判定话术与判定分支一字不改**：默认档仍报"不判定"（`§15-C`／`§15-D` 的 `t.skip` 与
+        文案原样保留，本包只动"子轮跑几个脚本"这一件事）。 */
   const runAll15 = require('./run-all.js');
   const src15 = fs.readFileSync(path.join(env.paths.tests, 'run-all.js'), 'utf8');
   /* 本节自带变异加载器：不依赖第十四节块内的局部 `loadSourceVariant`（那是块级作用域，取不到）。
@@ -7139,9 +7165,26 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
      （2026-09-29 实测踩坑：PID 每 ~60 s 换一轮 `harness-check-10000 → -23888 → -29548`
      —— 每轮都能"通过"，所以不会报错，只会永远跑下去。）
      改为**显式允许清单**：挑几个覆盖"串行尾"与"并行波"两类的脚本，且**不含本脚本**。 */
-  const S15_SUITES = ['contract-check', 'db-check', 'docs-check', 'files-check', 'logic-check', 'trace-check'];
+  /** **默认档（子集档）的子轮清单**（`ADR-0010 D5` 缩表后＝**2 个最便宜的脚本**）。
+   *  两轮**照跑**（保留"两轮各读自己的子集账"这条机制层取证 —— 见本节抬头 ④）。 */
+  const S15_SUITES_MINI = ['contract-check', 'trace-check'];
+  /** 缩表**前**的 6 个脚本清单：**不参与任何真跑** —— 它只作 `§15-C′①`（D22 反事实真值表）的
+   *  **变异输入**（"把清单改回 6 个"必须是**真实旧值**，不是现编一份）。删掉它 ＝ 删掉那条 D22。 */
+  const S15_SUITES_LEGACY = ['contract-check', 'db-check', 'docs-check', 'files-check', 'logic-check', 'trace-check'];
+  /** 本节真跑时**实际**喂给 `--only` 的清单（＝默认档清单）；`fast` 档不用它（走 `--fast`）。
+   *  口径：`--only` 的请求清单**只能有这一个出处** —— 判据、护栏、留痕全读它。 */
+  const S15_SUITES = S15_SUITES_MINI;
   const RECURSION_GUARD = "不允许用 --fast/--only harness-check";
   const RUN15_TIMEOUT = 10 * 60 * 1000;
+  /** **递归护栏的唯一实现**（`D23` 意义上的"反自证"）：子集档的请求清单里一旦混进**本脚本**
+   *  （`harness-check`），就必须**当场抛** —— 否则子轮会 fork 出自己，每轮都"通过"地无限递归下去
+   *  （2026-09-29 实测：PID 每 ~60 s 换一轮 `harness-check-10000 → -23888 → -29548`，不报错、永远跑不完）。
+   *  `fast` 档**刻意不靠这里兜**：那一档的递归由 `DSH_HARNESS_S15_CHILD=1`（嵌套层不再 fork）挡住。
+   *  两个方向都由 `§15-H` 的反事实真值表钉住（**该抛的必抛并指名**、**不该抛的必不抛**）——
+   *  缩表后清单里没有 `harness-check` ⇒ 这一行现状恒不触发，`§15-H` 就是"证明它在守"的那条守据。 */
+  const assertNoSelfSpawn15 = (mode, suites) => {
+    if (mode === 'subset' && Array.isArray(suites) && suites.includes('harness-check')) throw new Error(RECURSION_GUARD);
+  };
   /* **`E96` 收口**（`T-20261003-04`，座位 4b）—— 本节"并行 vs 串行"的对照，在**子集场景**下本来
      **无法失败**：`run-all` 的 `scheduleSuites()` 第一条分支是
        `if (!(jobs > 1) || optValue('--only')) return { parallel: [], serial: suites.slice(), jobs: 1 };`
@@ -7234,6 +7277,30 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     };
   };
 
+  /* **`§15-C′` 的读数归属判据的唯一实现**（`ADR-0010 D5` 缩表后新立的可证伪守据）：
+     `§15-C′` 本体与 `§15-C′①`／`§15-C′②` 两条 D22 反事实真值表**调的是同一个函数** ——
+     绝不另抄一份口径（`D19`／`D23`：第二份口径本身就是缺陷源）。
+     判据文字**逐字等于缩表前的原式**（只把"读的是哪份账、账内清单是什么"先摊成 `ownershipFacts15`
+     的事实对象）：请求清单 ↔ 账内清单、两份**都不是主账本**、两份路径**不同**、两份都**真读到**。
+     唯一的行为差异：`serFacts`／`parFacts` 缺一侧 ⇒ **返回 false**（旧写法在这一支会抛 TypeError，
+     把整脚本变成退 2 —— 判"红"才是本判据的本意，判定方向一字未改）。 */
+  const ownershipFacts15 = (run) => ({
+    ledgerName: run && run.ledgerPath ? path.basename(run.ledgerPath) : null,
+    ledgerPath: run ? run.ledgerPath : null,
+    ledgerExists: Boolean(run && run.ledgerExists),
+    ranSuites: (run && run.ledger && Array.isArray(run.ledger.ranSuites))
+      ? run.ledger.ranSuites.filter(n => runAll15.SUITES.some(s => s.name === n)).sort()
+      : null
+  });
+  const subsetOwnershipOk15 = (mode, serFacts, parFacts, req, mainName) => {
+    if (mode !== 'subset') return true;
+    if (!serFacts || !parFacts) return false;
+    return serFacts.ledgerName !== mainName && parFacts.ledgerName !== mainName
+      && serFacts.ledgerPath !== parFacts.ledgerPath
+      && serFacts.ledgerExists && parFacts.ledgerExists
+      && JSON.stringify(serFacts.ranSuites) === JSON.stringify(req)
+      && JSON.stringify(parFacts.ranSuites) === JSON.stringify(req);
+  };
   let ser15 = null, par15 = null;
   if (S15_CHILD) {
     /* 嵌套子轮：**不再 fork**（递归护栏）。显式记账，不许"静默少跑两条断言"。 */
@@ -7245,7 +7312,7 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       ser15 = runFast15(1);
       /* 递归护栏（D23 意义上的"反自证"）：子集档清单里一旦混进本脚本，就必须当场判红 ——
          否则整节会安静地无限递归下去（每轮都"通过"，不报错）。 */
-      if (S15_MODE === 'subset' && S15_SUITES.includes('harness-check')) throw new Error(RECURSION_GUARD);
+      assertNoSelfSpawn15(S15_MODE, S15_SUITES);
       par15 = runFast15(S15_JOBS);
     } catch (err) {
       t.info('§15-C 未执行：' + (err && err.message));
@@ -7268,6 +7335,10 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
        · `DSH_HARNESS_S15_FULL=1`（`--fast`）档：两轮读的**必须都是主账本** ——
          把"`--fast` 不改道"这条 `run-all.js` 的刻意意图钉在判据里（若哪天有人给 `--fast` 也改道，
          这里会红，而不是悄悄退回"拿两份旧账互比"）。 */
+  /* ⚠ **缩表后的话术更正（只此一处）**：上一段说明里"…账内 `ranSuites` ＝本轮请求的**那 6 个脚本**"
+     是 `ADR-0010 D5` **缩表前**的数字；缩表后该处恒为 `S15_SUITES_MINI`（**2 个**）。
+     本包按"锚点只许 ASCII"的纪律**不动那行中文**（`E186`），改在这里如实更正，并由 `§15-G`
+     的 detail 把**现行**清单与实际喂给 `--only` 的参数打进输出 —— 读输出的人不会拿旧数字当现状。 */
   const mainLedgerName15 = runAll15.MAIN_LEDGER_NAME;   /* 'run-totals.json'：按**文件名**比，
      因为 `ledgerRel` 是"相对仓库根的路径"（`tests\._verify\run-totals.json`），两者不是一回事 */
   if (S15_CHILD) {
@@ -7285,12 +7356,8 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       ? run.ledger.ranSuites.filter(n => suitesAll15.indexOf(n) >= 0).sort() : null);
     const bothPresent15 = Boolean(ser15 && par15 && ser15.ledger && par15.ledger);
     const nameOfLedger15 = (run) => (run && run.ledgerPath ? path.basename(run.ledgerPath) : null);
-    const ownSubsetOk15 = S15_MODE !== 'subset' || (
-      nameOfLedger15(ser15) !== mainLedgerName15 && nameOfLedger15(par15) !== mainLedgerName15
-      && ser15.ledgerPath !== par15.ledgerPath
-      && ser15.ledgerExists && par15.ledgerExists
-      && JSON.stringify(ranOf15(ser15)) === JSON.stringify(reqSuites15)
-      && JSON.stringify(ranOf15(par15)) === JSON.stringify(reqSuites15));
+    const ownSubsetOk15 = subsetOwnershipOk15(S15_MODE, ownershipFacts15(ser15), ownershipFacts15(par15),
+      reqSuites15, mainLedgerName15);
     const fastMainOk15 = S15_MODE !== 'fast' || (
       nameOfLedger15(ser15) === mainLedgerName15 && nameOfLedger15(par15) === mainLedgerName15);
     t.check('§15-C′ 读数归属（`E110`）：§15-C／§15-D 打印的"实测读数"来自**本轮自己的账本**'
@@ -7320,6 +7387,85 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
      **判定（ADR-0004 D21）：改期望，不改 `run-all` 的调度** —— 依据是 `run-all` 自己的契约
      （波内归一 ＋ 尾段后置；增量落账语义下"整条按 SUITES 顺序"本就不成立），
      而"波内不得按完成顺序落账"这个**原意**由下面 ③ 的两条断言原样保住。 */
+  /* ---- `ADR-0010 D5` 缩表的两条**可证伪守据**（D22 反事实真值表）----
+     为什么必须有这两条：缩表把"能真跑一轮"的取证样本从 6 个降到 2 个，**风险是某条判据被缩成恒真**
+     （`D23`：那种判据"看起来在守、实际守不住"，比没有判据更坏）。两条都喂**同一个**
+     `subsetOwnershipOk15`（＝`§15-C′` 本体用的那个函数，不另抄口径）：
+       · `§15-C′①`（㈠）＝ 请求 2 个（现行清单）而**账内 6 个**（缩表**前**的清单）⇒ 判据必红并指名多出的 4 个；
+       · `§15-C′②`（㈡）＝ 子集档却读到**主账本**（＝把 `--only <mini>` 换成 `--fast` 的**真实后果**：
+         `--fast` 轮按 `run-all.resolveLedgerFile()` 写主账本）⇒ 判据必红并指名 `run-totals.json`。
+     ⚠ **两侧来源如实登记**（`D21`：期望值不许手写魔数）：**请求清单**＝`S15_SUITES_MINI`（真源，
+       就是实跑喂给 `--only` 的那一个）、**主账本名**＝`runAll15.MAIN_LEDGER_NAME`、② 里"改走 `--fast`
+       会落到哪份账"＝**真调** `runAll15.resolveLedgerFile({ only: null })`；**只有"账内清单"这一侧**
+       是合成账本 —— **不为这条 D22 真跑一轮 6 脚本**（那会把本包刚省下的 47 s 又花回去；
+       这一侧要验的是"判据拿到 6 个会不会红"，与那 6 个脚本各自跑出什么无关）。 */
+  const reqMini15 = S15_SUITES_MINI.slice().sort();
+  const ownerFactsOf15 = (ledgerName, ran, exists = true) => ownershipFacts15({
+    ledgerPath: path.join(env.paths.verify, ledgerName),
+    ledgerExists: exists,
+    ledger: { ranSuites: Array.isArray(ran) ? ran.slice() : null, suites: [] }
+  });
+  const subsetLedgerName15 = (pid) => `run-totals.subset-${pid}.json`;
+  const miniNameA15 = subsetLedgerName15(10001), miniNameB15 = subsetLedgerName15(10002);
+  const okMini15 = subsetOwnershipOk15('subset',
+    ownerFactsOf15(miniNameA15, S15_SUITES_MINI), ownerFactsOf15(miniNameB15, S15_SUITES_MINI),
+    reqMini15, runAll15.MAIN_LEDGER_NAME);
+  const okLegacy15 = subsetOwnershipOk15('subset',
+    ownerFactsOf15(subsetLedgerName15(10003), S15_SUITES_LEGACY), ownerFactsOf15(subsetLedgerName15(10004), S15_SUITES_LEGACY),
+    reqMini15, runAll15.MAIN_LEDGER_NAME);
+  const okFastMode15 = subsetOwnershipOk15('fast',
+    ownerFactsOf15(runAll15.MAIN_LEDGER_NAME, reqMini15), ownerFactsOf15(runAll15.MAIN_LEDGER_NAME, reqMini15),
+    reqMini15, runAll15.MAIN_LEDGER_NAME);
+  const legacyExtras15 = S15_SUITES_LEGACY.filter(n => !S15_SUITES_MINI.includes(n));
+  t.check('§15-C′① D22（㈠，反事实真值表）：**把子轮清单改回缩表前的 6 个**（内存里把账内清单换成那 6 个、'
+    + '请求仍是现行的 2 个）⇒ `§15-C′` 的读数归属判据**必红并指名多出的 4 个**；而"请求 ↔ 账内"两侧'
+    + '都是现行 2 个 mini 时**必绿**、`fast` 档**照样短路为绿**（⇒ 缩表**没有**把这条判据变成恒真／恒假）',
+    okMini15 === true && okLegacy15 === false && okFastMode15 === true
+      && legacyExtras15.length === S15_SUITES_LEGACY.length - S15_SUITES_MINI.length,
+    `请求清单（${reqMini15.length} 个）=[${reqMini15.join('、')}]；`
+      + `账内＝现行 ${S15_SUITES_MINI.length} 个 ⇒ 判据 ${okMini15}（应 true）；`
+      + `账内＝缩表前 ${S15_SUITES_LEGACY.length} 个 [${S15_SUITES_LEGACY.join('、')}] ⇒ 判据 ${okLegacy15}（应 false）`
+      + `，**多出的并指名** = [${legacyExtras15.join('、')}]（${legacyExtras15.length} 个）；`
+      + `mode=fast ⇒ 判据 ${okFastMode15}（应 true：那一侧由 §15-C′ 的 fastMainOk15 管）`);
+
+  /* `§15-C′②`（㈡）：把 `--only <mini>` 在内存里**改成 `--fast`** ⇒ 两轮会落到**主账本**
+     ⇒ 归属判据必红并指名主账本。前提用**真源**现算（`resolveLedgerFile` 是 `run-all` 自己的导出），
+     不手写 `'run-totals.json'` —— 否则就是"拿自己写的期望值判自己"。 */
+  /* `t.check` 的 detail 默认**只在 verbose 模式**打印（`lib\assert.js`）⇒ D22 的读数必须另外用
+     `t.info` 落进输出，否则"可证伪"只存在于源码里、复核者看不见。本节四条新判据都配一条。 */
+  t.info(`§15-C′① D22（㈠）读数：请求 ${reqMini15.length} 个=[${reqMini15.join('、')}]；`
+    + `账内＝现行 ${S15_SUITES_MINI.length} 个 ⇒ 判据 ${okMini15}（应 true）；`
+    + `账内＝缩表前 ${S15_SUITES_LEGACY.length} 个 ⇒ 判据 ${okLegacy15}（应 false），`
+    + `**多出的并指名** = [${legacyExtras15.join('、')}]（${legacyExtras15.length} 个）；`
+    + `mode=fast ⇒ ${okFastMode15}（应 true）`);
+  const subsetPath15 = runAll15.resolveLedgerFile({
+    explicit: null, only: S15_SUITES_MINI.join(','), verifyDir: env.paths.verify, pid: 10005, root: env.paths.root
+  });
+  const fastPath15 = runAll15.resolveLedgerFile({
+    explicit: null, only: null, verifyDir: env.paths.verify, pid: 10005, root: env.paths.root
+  });
+  const asFastRounds15 = ownershipFacts15({
+    ledgerPath: fastPath15, ledgerExists: true, ledger: { ranSuites: reqMini15, suites: [] }
+  });
+  const okMutFast15 = subsetOwnershipOk15('subset', asFastRounds15, asFastRounds15, reqMini15, runAll15.MAIN_LEDGER_NAME);
+  const okSubsetReal15 = subsetOwnershipOk15('subset',
+    ownerFactsOf15(path.basename(subsetPath15), reqMini15), ownerFactsOf15(subsetLedgerName15(10006), reqMini15),
+    reqMini15, runAll15.MAIN_LEDGER_NAME);
+  const mutFastNamesMain15 = path.basename(fastPath15) === runAll15.MAIN_LEDGER_NAME;
+  const mutFastChangesLedger15 = path.basename(subsetPath15) !== path.basename(fastPath15);
+  t.check('§15-C′② D22（㈡，反事实真值表）：把 `--only <mini>` **在内存里改成 `--fast`** ⇒ 两轮按'
+    + ' `run-all.resolveLedgerFile()` 落到**主账本** ⇒ 读数归属判据**必红并指名主账本**'
+    + '（＝缩表后这条判据仍在读"谁写了哪份账"，不是恒真）',
+    mutFastNamesMain15 && mutFastChangesLedger15 && okMutFast15 === false && okSubsetReal15 === true,
+    `\`--only ${S15_SUITES_MINI.join(',')}\` ⇒ \`${path.basename(subsetPath15)}\`；改成 \`--fast\`（不带 \`--only\`）`
+      + ` ⇒ \`${path.basename(fastPath15)}\`（＝主账本名：${mutFastNamesMain15}，换道：${mutFastChangesLedger15}）；`
+      + `把这两轮喂给归属判据 ⇒ 判据 ${okMutFast15}（应 false，**指名** \`${runAll15.MAIN_LEDGER_NAME}\`）；`
+      + `而"各读自己的子集账"那一组 ⇒ 判据 ${okSubsetReal15}（应 true，② 不是单边断言）`);
+
+  t.info(`§15-C′② D22（㈡）读数：--only ${S15_SUITES_MINI.join(',')} ⇒ ${path.basename(subsetPath15)}；`
+    + `改成 --fast（不带 --only）⇒ ${path.basename(fastPath15)}（＝主账本名 ${mutFastNamesMain15}，换道 ${mutFastChangesLedger15}）；`
+    + `把这两轮喂给归属判据 ⇒ ${okMutFast15}（应 false，**指名** ${runAll15.MAIN_LEDGER_NAME}）；`
+    + `各读自己的子集账那一组 ⇒ ${okSubsetReal15}（应 true）`);
   const suiteNames15 = runAll15.SUITES.map(s => s.name);
   const tailNames15 = new Set(runAll15.SUITES.filter(s => s.serialTail).map(s => s.name));
   /** 只保留"真在 SUITES 清单里"的脚本名（`capture-baseline` 是 `E91` 的前置刷新，不在 SUITES 里） */
@@ -7407,6 +7553,74 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
      **同一份判据**（`missingTail15` 的计算方式与 §15-A 逐字同源：都拿 `needTail15` 逐个比对）。
      实现细节（可证伪性的门槛）：锚点**按符号定位、不引行号**（清单那行由别人维护，行号会漂），
      且**回读命中数**——`!== 1` 就判红（锚点再漂移时明确报"锚点回读失败"，不许静默空转）。 */
+  /* ---- `§15-G` 缩表事实自证（`ADR-0010 D5`）----
+     守两件事：①默认档请求的清单**恰是 2 个**（ADR 的决定值），不是"随手又加回去"；
+     ②现行这 2 个**确实取自**缩表前那 6 个（＝真缩表；若换成两个别的脚本，"取证样本 6→2"这句
+     代价登记就对不上账了）。判据抽成纯函数 ⇒ 连同"改回 6 个"的反事实一起喂，**两侧读数都给**
+     （`D23`：只报单侧的判据证不了自己有判别力）。 */
+  const shrinkFactOk15 = (effective, mini, legacy) => effective.length === 2 && mini.length === 2
+    && JSON.stringify(effective) === JSON.stringify(mini)
+    && legacy.length === 6
+    && mini.every(n => legacy.includes(n))
+    && mini.every(n => runAll15.SUITES.some(s => s.name === n))
+    && mini.length < legacy.length;
+  const gNow15 = shrinkFactOk15(S15_SUITES, S15_SUITES_MINI, S15_SUITES_LEGACY);
+  const gReverted15 = shrinkFactOk15(S15_SUITES_LEGACY, S15_SUITES_MINI, S15_SUITES_LEGACY);
+  t.check('§15-G 缩表事实自证（`ADR-0010 D5`）：默认档子轮清单**恰为 2 个**（`contract-check`／`trace-check`，'
+    + '且这 2 个**确实取自**缩表前那 6 个的清单）⇒ 实跑请求参数＝现行清单现算；'
+    + '反证：把清单**改回 6 个**（同一判据喂缩表前的清单）⇒ 本条**必红**（⇒ 它不是恒真式）',
+    gNow15 === true && gReverted15 === false,
+    `现行默认档清单（${S15_SUITES.length} 个）=[${S15_SUITES.join('、')}]；`
+      + `缩表前清单（${S15_SUITES_LEGACY.length} 个）=[${S15_SUITES_LEGACY.join('、')}]`
+      + `（**只**作 §15-C′① 的反事实输入，不参与真跑）；`
+      + `实跑请求参数＝\`--only ${S15_SUITES.join(',')}\` ⇒ 现算判据 ${gNow15}（应 true）；`
+      + `反事实"改回 6 个" ⇒ 同一判据 ${gReverted15}（应 false）。`
+      + `⚠ §15-C0 的 detail 里那句"6 个脚本"是缩表**前**的话术：本包按任务包"§15-C0 那条不变"的要求`
+      + `**一字未动**，**现行数字以本条为准**（2 个）`);
+
+  /* ---- `§15-H` 递归护栏的**反事实真值表**（`ADR-0010 D5` 顺带要求：不许把"看起来在守"留在原地）----
+     缩表后清单里**没有** `harness-check` ⇒ 护栏那一行现状恒不触发（"未来防护"）。按 `ADR-0004 D23`
+     处置为**方案㈠**：**保留该行 ＋ 补真值表** —— ①把 `harness-check` 在内存里加进清单 ⇒ 必须**抛**
+     并**指名**；②现行清单（真实入参）与 `fast` 档 ⇒ 必须**不抛**（抛了就说明护栏把正常路径也拦了，
+     那种"守住了"同样不可信）；③**接线自证**：该函数的**调用点**与**定义处**在 `tests\harness-check.js`
+     里各**恰 1 处** —— "定义了但没人调"的护栏正是 `D23` 要堵的形态。 */
+  t.info(`§15-G 读数：现行默认档清单 ${S15_SUITES.length} 个=[${S15_SUITES.join('、')}]；`
+    + `缩表前 ${S15_SUITES_LEGACY.length} 个=[${S15_SUITES_LEGACY.join('、')}]（只作反事实输入）；`
+    + `实跑请求参数＝--only ${S15_SUITES.join(',')}；现算判据 ${gNow15}（应 true）；`
+    + `反事实"改回 6 个" ⇒ ${gReverted15}（应 false）。⚠ §15-C0 的 detail 那句"6 个脚本"是缩表前话术，`
+    + `本包按"§15-C0 那条不变"一字未动 —— **现行数字以本条为准（2 个）**`);
+  const guardTry15 = (mode, suites) => {
+    try { assertNoSelfSpawn15(mode, suites); return { threw: false, msg: '' }; }
+    catch (err) { return { threw: true, msg: String((err && err.message) || err) }; }
+  };
+  const gLive15 = guardTry15(S15_MODE, S15_SUITES);
+  const gCounter15 = guardTry15('subset', S15_SUITES.concat(['harness-check']));
+  const gFast15 = guardTry15('fast', ['harness-check']);
+  /* ⚠ 两条探针字符串**现场拼装**：若把 `assertNoSelfSpawn15(<mode>, <suites>)` 那一整句（本注释**只写形态、不写字面量**） 或定义那半句
+     整串写在这里，它自己也会出现在本文件里 ⇒ 命中数变 2 ⇒ 本条**假红**（"拿自己数自己"）。 */
+  const guardCallNeedle15 = ['assertNoSelfSpawn15(', 'S15_MODE, S15_SUITES);'].join('');
+  const guardDefNeedle15 = ['const assertNoSelfSpawn15 = ', '(mode, suites) => {'].join('');
+  const selfSrc15 = fs.readFileSync(path.join(env.paths.tests, 'harness-check.js'), 'utf8');
+  const guardCallHits15 = selfSrc15.split(guardCallNeedle15).length - 1;
+  const guardDefHits15 = selfSrc15.split(guardDefNeedle15).length - 1;
+  t.check('§15-H 递归护栏反事实真值表（**方案㈠**：保留该行 ＋ 证明它在守）：子集档清单里混进'
+    + ' `harness-check` ⇒ `assertNoSelfSpawn15()` **必抛并指名**；现行清单（真实入参）与 `fast` 档'
+    + ' ⇒ **必不抛**；且该函数的**调用点与定义处在 `tests\\harness-check.js` 里各恰 1 处**'
+    + '（不是"定义了没人调"的空护栏）',
+    gCounter15.threw === true && gCounter15.msg.includes('harness-check')
+      && gLive15.threw === false && gFast15.threw === false
+      && guardCallHits15 === 1 && guardDefHits15 === 1,
+    `真实入参 \`(${S15_MODE}, [${S15_SUITES.join('、')}])\` ⇒ threw=${gLive15.threw}（应 false）；`
+      + `反事实 \`(subset, [${S15_SUITES.concat(['harness-check']).join('、')}])\` ⇒ threw=${gCounter15.threw}`
+      + `（应 true）、抛出信息＝\`${gCounter15.msg}\`（含 harness-check＝${gCounter15.msg.includes('harness-check')}）；`
+      + `\`(fast, [harness-check])\` ⇒ threw=${gFast15.threw}（应 false：那一档的递归由 DSH_HARNESS_S15_CHILD 兜）；`
+      + `接线自证：调用点命中 ${guardCallHits15} 处、定义处命中 ${guardDefHits15} 处（都应 1）`);
+
+  t.info(`§15-H 读数：真实入参 (${S15_MODE}, ${S15_SUITES.length} 个) ⇒ threw=${gLive15.threw}（应 false）；`
+    + `反事实 (subset, 清单+harness-check) ⇒ threw=${gCounter15.threw}（应 true），`
+    + `抛出信息＝${gCounter15.msg}（含 harness-check=${gCounter15.msg.includes('harness-check')}）；`
+    + `(fast, [harness-check]) ⇒ threw=${gFast15.threw}（应 false）；`
+    + `接线自证：调用点命中 ${guardCallHits15} 处、定义处命中 ${guardDefHits15} 处（都应 1）`);
   const dropTailMutant15 = (name) => {
     const re = new RegExp(`\\{ name: '${name}',[^\\n]*?, serialTail: true`);
     const hits = src15.match(new RegExp(re.source, 'g'));
@@ -7442,6 +7656,8 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
   try {
     fs.writeFileSync(path.join(env.paths.verify, 's15-parallel-runs.txt'),
       JSON.stringify({ mode: S15_MODE, jobs: S15_JOBS, child: S15_CHILD, judged: round15.judged,
+        /* `ADR-0010 D5`：把**本轮真正请求的子集清单**一并留痕 —— 缩表后默认档＝2 个，读留痕即可核 */
+        subsetSuites: S15_MODE === 'subset' ? S15_SUITES.slice() : null,
         reason: round15.reason, wave: round15.wave, waveJobs: round15.waveJobs, scripts: round15.count,
         serialMs: ser15 && ser15.ms, parallelMs: par15 && par15.ms,
         /* `E110`：把"读数归属"（每一轮实际读的是哪份账）一并留痕，便于复核者核对 */
