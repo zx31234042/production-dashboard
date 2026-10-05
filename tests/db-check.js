@@ -329,6 +329,82 @@ function parseSchemaTables(sql) {
   return names;
 }
 
+/** `E123` **口径关系**（纯函数：只吃两个集合，不读盘 ⇒ 可以直接喂变异体做 `D22`）。
+ *
+ *  **「13 张表」＝业务表口径**（2026-10-05 负责人按建议批准）。三套数各有其位：
+ *    · `declared`（`schema.sql` 物理建表）含内部簿记 `schema_meta` 与鉴权 `auth_credential`；
+ *    · `required`（`REQUIRED_TABLES` ＝门禁覆盖面）＝ 业务表 ＋ `auth_credential`；
+ *    · 文档/权威区/门禁硬串里的「13 张表」＝ **业务表** ＝ `declared − {schema_meta, auth_credential}`。
+ *
+ *  判据（每条都**逐条指名**差集，不许"看着差不多就过"）：
+ *    ① `declared − required` 必须**恰好**是 `[schema_meta]`（schema 里"需求未点名"的只能是内部簿记）；
+ *    ② `required − declared` 必须为空（需求点名的表一张都不许少）；
+ *    ③ `required − 业务表` 必须**恰好**是 `[auth_credential]`（门禁覆盖面唯一超出业务口径的那张）；
+ *    ④ `declared` 必须被"业务／簿记／鉴权"**三分**：两两不交、并集 ＝ `declared`、无重复建表；
+ *    ⑤ **业务表必须全被 `REQUIRED_TABLES` 覆盖**（"13 张业务表都得有人看着"——这条最直接：
+ *       少登记一张业务表时它**第一个**指名那张表）。
+ *
+ *  @param {string[]} declared  `schema.sql` 的 `CREATE TABLE` 名单（可含重复，本函数会查重）
+ *  @param {string[]} required  `REQUIRED_TABLES`
+ *  @returns {{ok:boolean, problems:string[], business:string[], numbers:object}} */
+function gaugeRelation(declared, required) {
+  const BOOKKEEPING = 'schema_meta';        /* 内部簿记（结构版本/建表脚本指纹），不属于业务数据表 */
+  const AUTH = 'auth_credential';           /* ADR-0007 D1：设置页口令凭证表（E86① 引入） */
+  const uniq = a => [...new Set(a)];
+  const declaredSet = uniq(declared);
+  const requiredSet = uniq(required);
+  const business = declaredSet.filter(t => t !== BOOKKEEPING && t !== AUTH);
+  const diff = (a, b) => a.filter(x => !b.includes(x));
+  const fmt = a => (a.length ? a.join('、') : '∅');
+  const problems = [];
+
+  const notRequired = diff(declaredSet, requiredSet);
+  if (notRequired.length !== 1 || notRequired[0] !== BOOKKEEPING) {
+    problems.push(`① schema.sql 里"REQUIRED_TABLES 未点名"的表应恰好是 [${BOOKKEEPING}]，`
+      + `实际是 [${fmt(notRequired)}]`);
+  }
+  const missing = diff(requiredSet, declaredSet);
+  if (missing.length) problems.push(`② REQUIRED_TABLES 点名但 schema.sql 里没有的表：[${fmt(missing)}]`);
+  const beyondBusiness = diff(requiredSet, business);
+  if (beyondBusiness.length !== 1 || beyondBusiness[0] !== AUTH) {
+    problems.push(`③ REQUIRED_TABLES 相对"业务表口径"多出的表应恰好是 [${AUTH}]，`
+      + `实际是 [${fmt(beyondBusiness)}]`);
+  }
+  const businessUncovered = diff(business, requiredSet);
+  if (businessUncovered.length) {
+    problems.push(`⑤ 业务表里 `+"`REQUIRED_TABLES`"+` 未覆盖的：[${fmt(businessUncovered)}]`
+      + `（业务表必须全被结构门禁看着）`);
+  }
+  const buckets = [['业务表', business], ['内部簿记', [BOOKKEEPING]], ['鉴权', [AUTH]]];
+  for (let i = 0; i < buckets.length; i++) {
+    for (let j = i + 1; j < buckets.length; j++) {
+      const both = buckets[i][1].filter(t => buckets[j][1].includes(t));
+      if (both.length) problems.push(`④ "${buckets[i][0]}"与"${buckets[j][0]}"两个口径重叠：[${fmt(both)}]`);
+    }
+  }
+  const union = uniq(buckets.flatMap(([, b]) => b));
+  const unclassified = diff(declaredSet, union);
+  const ghost = diff(union, declaredSet);
+  if (unclassified.length) problems.push(`④ schema.sql 里落不进三桶的"第四类"表：[${fmt(unclassified)}]`);
+  if (ghost.length) problems.push(`④ 三桶里有 schema.sql 并不存在的表（幽灵）：[${fmt(ghost)}]`);
+  if (declared.length !== declaredSet.length) {
+    problems.push(`④ schema.sql 有重复建表：${declared.length} 条声明 / ${declaredSet.length} 个名字`);
+  }
+
+  return {
+    ok: problems.length === 0,
+    problems,
+    business,
+    numbers: {
+      declared: declaredSet.length,
+      business: business.length,
+      required: requiredSet.length,
+      arithmeticA: `${declaredSet.length} − {${BOOKKEEPING}, ${AUTH}} = ${business.length}`,
+      arithmeticB: `${business.length} ＋ {${AUTH}} = ${requiredSet.length}`
+    }
+  };
+}
+
 /** 在**顶层逗号**处切分建表段（括号内的逗号不切，如 `UNIQUE(a, b)`） */
 function splitTopLevel(body) {
   const parts = [];
@@ -423,6 +499,51 @@ async function main() {
     declaredTables.length > 0 && declaredTables.length === tables.length && tableProblems.length === 0,
     tableProblems.length ? tableProblems.join('；')
       : `schema.sql ${declaredTables.length} 张 = 库内 ${tables.length} 张：${tables.join(', ')}`);
+
+  /* ---------------- 一之二、`E123` 口径关系（「13 张表」＝业务表口径） ----------------
+     **裁定**（2026-10-05 负责人按建议批准；门禁侧照此实现，**不改任何一处数字**）：
+       三套数各有其位 ——
+         · `schema.sql` 物理建表：含内部簿记 `schema_meta` 与鉴权 `auth_credential`；
+         · `REQUIRED_TABLES`（**门禁覆盖面**）＝ 业务表 ＋ `auth_credential`；
+         · 文档／权威区／门禁硬串里的「**13 张表**」＝ **业务表**
+           （＝物理表 − `schema_meta` − `auth_credential`）。
+     **为什么加这条**：同一事实有 3 个数字（15／14／13）散布在 schema、门禁与 6 处文档里，
+     任何**单改一处**都会把门禁打红（`E123` 原文实测：`docs-cross-check.js:445` 是硬串），
+     而不改又没人能判断"13"是笔误还是另一种口径 ⇒ 必须把**口径之间的关系**写成判据，
+     让它**现算、逐条指名差集**，而不是让读者去猜。
+     **为什么不写死 13／14／15**：写死就把"口径关系"退化成"三个常数比对" —— 合法地加一张
+     业务表时判据只会喊"数字不对"，却说不出"关系哪里破了"。现算之后，加一张业务表 ⇒
+     下面各条同时变红并**指名那张表** ⇒ 逼着先定"它算业务表还是簿记表"（与本题裁定同路）。
+     **可证伪（`D22`）**：把任一张业务表从 `REQUIRED_TABLES` **内存删掉** ⇒ 必红并指名它
+     （见本节末的 `E123 D22`）。 */
+  {
+    const rel = gaugeRelation(declaredTables, REQUIRED_TABLES);
+    t.check(`E123 口径关系（现算）：schema.sql ${rel.numbers.declared} 张 `
+      + `− {schema_meta, auth_credential} = 业务表 ${rel.numbers.business} 张；`
+      + `业务表 ＋ {auth_credential} = REQUIRED_TABLES ${rel.numbers.required} 张`
+      + `（差集必须**恰好**是那两张，否则判红并列出实际差集）`,
+      rel.ok,
+      rel.problems.length ? rel.problems.join('；')
+        : `${rel.numbers.arithmeticA}；${rel.numbers.arithmeticB}；`
+          + `业务表 ${rel.numbers.business} 张：${rel.business.join('、')}`);
+
+    /* `D22`：内存变异（**不动盘上任何字节**）—— 从 `REQUIRED_TABLES` 删掉一张业务表 */
+    const D22_DROP = 'notice';
+    const relMut = gaugeRelation(declaredTables, REQUIRED_TABLES.filter(x => x !== D22_DROP));
+    const namedDrop = relMut.problems.some(p => p.includes(D22_DROP));
+    /* 盘上自证：本文件在本条前后逐字节相同（变异只发生在内存数组上） */
+    const selfPath = path.join(env.paths.tests, 'db-check.js');
+    const selfSha = b => require('node:crypto').createHash('sha256').update(b).digest('hex');
+    const selfBytes = fs.readFileSync(selfPath);
+    const selfSame = fs.readFileSync(selfPath).equals(selfBytes);
+    t.check(`E123 D22（内存变异）：从 REQUIRED_TABLES 删掉业务表 \`${D22_DROP}\` ⇒ 判据**必红并指名它**；`
+      + `未变异的当前源码同判据必绿；盘上文件逐字节未变`,
+      !relMut.ok && namedDrop && rel.ok && selfSame && /'notice'/.test(selfBytes.toString('utf8')),
+      `变异后 ok=${relMut.ok}（应 false）、命中问题 ${relMut.problems.length} 条、`
+      + `其中指名 \`${D22_DROP}\`=${namedDrop}；未变异 ok=${rel.ok}（应 true）；`
+      + `盘上 db-check.js sha256=${selfSha(selfBytes).slice(0, 12)}… 前后一致=${selfSame}；`
+      + `变异后问题清单：${relMut.problems.join(' ｜ ') || '（空 ⇒ 判据没抓住）'}`);
+  }
 
   const colProblems = [];
   for (const [table, cols] of Object.entries(REQUIRED_COLUMNS)) {
