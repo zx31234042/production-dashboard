@@ -13385,6 +13385,294 @@ function e103LinkSafetyChecks(t) {
    （`unverified` 只对"**退 0** 且无汇总行／通过 0 项"成立）。故必须把 `.catch()` 挂在 promise 上
    接住，并按规范 9.5-5 退 **2**（脚本自身异常），异常**打印出来**（可 grep）。
    打印前缀现状见 `lib/assert.js` 末注：`[脚本异常]` 目前只有 E76 修的这 3 个脚本在用。 */
+/* ==========================================================================
+   二十七、`E42`／`E43`：ADR-0003 D17 时钟门禁的**真值表** ＋ **扩大覆盖** ＋ **能力边界登记**
+   --------------------------------------------------------------------------
+   立案（两条技术债，**同一个根因**）：D17 那条门禁（`tests\docs-cross-check.js` 的
+   「ADR-0003 D17：业务代码的 `new Date()` 都留有注入出口」）是一条**同行文本启发式**判据 ——
+     · **`E42`**（★★）：它曾把"**对象字面量的键冒号**"当成注入出口 ⇒ `{ …, at: new Date() }` 侥幸过闸；
+       而 `Date.now()` **完全不在覆盖内**。收紧已落地（该文件里的 `E42 收紧（2026-09-27）` 注释），
+       但"**判据本身**有没有被证明过"一直没有机器守据 —— **判据自己没有门禁**。
+     · **`E43`**（★★）：收紧之后**仍是启发式**，存在两类**固有**漏网（最容易演成"以为已全覆盖"的
+       安全感错位）：① 只认 `new Date()`／`Date.now()` ⇒ `performance.now()`／`process.hrtime()`／
+       `setInterval` 周期**完全不在覆盖内**；② **"出口形状"不等于"真注入源"** ⇒
+       `retry ? Date.now() : Date.now()` 这种"两侧都是裸时钟"的行**照样过闸**。
+   本节的处置**不是**"再写一条更宽的正则把它盖住"（那只会把漏网换成一个新的、更隐蔽的漏网），而是：
+     甲、**把判据抽出来、喂真值表** —— 判据本体从 `docs-cross-check.js` 的**真源码字节**里用
+         **锚点**切出连续区间、交 `new Function` 编译（**同一把尺子**；`E153` 的教训：判据与 D22
+         各写一份，D22 证明的就不是主判据那一件事）。真值表覆盖 `Date.now()` 与**非对象字面量**
+         的多类形态 —— 这是 `E42` 要的"**扩大覆盖**"：**不许**把判据放宽成"只认已知写法"。
+     乙、**把两类漏网逐类固化成可判形式**（`E43`）：**能判的**新增两条可判的扩大判据
+         （`EXT-A` 未受管的时钟来源／`EXT-B` 同行 ≥2 处被管时钟调用）扫**同一面**、**判红并指名**；
+         **判不了的**显式登记为"**能力边界**"并**写进断言 `msg` 与下面的 `t.info`** ——
+         漏网留在**明处**，不留暗处。
+     丙、`D22`（可证伪）：在**真实 `server\index.js` 的内存字节副本**中部植入**真实漏网点** ⇒
+         同一判据**必红并指名**；负对照（现行盘上）必绿；盘上逐字节未变。
+   ⚠ **面（不许读成"全仓"）**：与 `docs-cross-check.js` **完全同面** ＝ `server\**\*.js` ＋
+     `platform\**\*.js`，且 `platform\clock.js`（时间来源本身）豁免。
+   ⚠ **中心论断：为什么"启发式判据的漏网必须显式登记为能力边界，而不是靠加正则掩盖"**：
+     ① **加正则只能覆盖"我已经想到的写法"**：判据的**真实覆盖**一点没变，变的只是"**看门人以为
+        自己覆盖了什么**"（`D19` 的"看起来验过了"）。漏网于是从"看得见的绿"变成"看不见的绿"，
+        而**看不见的绿比红更危险** —— 它连一条读数都不产生。
+     ② **文本启发式不是数据流证明**：出口**形状**可以匹配，"这个值真的来自注入源"匹配不出来
+        （`retry ? Date.now() : Date.now()` 就是反例：形状齐备、来源全是裸时钟）。把这条边界
+        **写在断言 `msg` 里**，读回执的人才知道那个"绿"的**确切含义**；靠加正则会把边界一并抹掉。
+     ③ **能力边界本身也可以可证伪**：登记成 `EXT-A`／`EXT-B` 之后，它就有了**样本 ＋ 期望 ＋ D22**：
+        漏网再扩大时（出现新的时间源形态）本节**会红**，而不是继续"安静地绿"。
+     ④ 所以本节对每一类漏网都做**两件事**：能判的**判红并指名**，判不了的**逐条写进 `msg`**；
+        **两者都不许省** —— 只做前者＝把边界留给下一个人的记忆，只做后者＝把"判得了"也一起放弃了。
+   ========================================================================== */
+t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ 扩大覆盖 ＋ 能力边界登记');
+{
+  const ROOT27 = env.paths.root;
+
+  /* ---- 二十七之一：从**真源码字节**抽出 D17 判据（锚点只用 ASCII；命中次数**现算并断言**） ---- */
+  const D17_GATE_REL = 'tests/docs-cross-check.js';
+  const d17GateSrc = fs.readFileSync(path.join(ROOT27, D17_GATE_REL), 'utf8');
+  const aCount27 = (hay, a) => { let n = 0; let i = hay.indexOf(a); while (i >= 0) { n++; i = hay.indexOf(a, i + a.length); } return n; };
+  const D17_A0 = '  const stripComments = (src) => {';
+  const D17_A1 = '  const clockHits = [];';
+  const d17A0n = aCount27(d17GateSrc, D17_A0);
+  const d17A1n = aCount27(d17GateSrc, D17_A1);
+  const d17I0 = d17GateSrc.indexOf(D17_A0);
+  const d17I1 = d17GateSrc.indexOf(D17_A1);
+  const d17Region = (d17A0n === 1 && d17A1n === 1 && d17I1 > d17I0) ? d17GateSrc.slice(d17I0, d17I1) : null;
+  let D17 = null;
+  let d17ExtractErr = '未尝试';
+  if (d17Region) {
+    try {
+      D17 = new Function(d17Region
+        + '\nreturn { stripComments, CLOCK_CALL_RE, isTernaryColon, injectableCall };\n')();
+    } catch (err) { d17ExtractErr = (err && err.constructor ? err.constructor.name : 'Error') + ': ' + (err && err.message); }
+  }
+  const d17Usable = !!D17 && typeof D17.stripComments === 'function' && typeof D17.CLOCK_CALL_RE === 'object'
+    && typeof D17.isTernaryColon === 'function' && typeof D17.injectableCall === 'function';
+  /* `D20`：前提**独立**成一条 —— 抽不出判据就"判不了"，而"判不了"必须**判红**，不得静默放过
+     （"抽不到区间"与"判据没问题"在报告上看起来一样，这正是 `E81`／`E82` 踩过的形态）。 */
+  t.requires('`E42`/`E43` 的前提：能从 `' + D17_GATE_REL + '` 的**真源码字节**切出 D17 判据并编译'
+    + '（两个 ASCII 锚点各**恰 1 次**；抽出的区间含 `stripComments`／`CLOCK_CALL_RE`／`isTernaryColon`／'
+    + '`injectableCall` 四件）—— 拿不到区间即**判红**（不许"抽不到就当没问题"）',
+    d17Usable, `锚点命中：${D17_A0} → ${d17A0n} 次、${D17_A1} → ${d17A1n} 次；`
+    + `抽出区间 ${d17Region ? d17Region.length + ' 字符（盘上行 ' + (d17GateSrc.slice(0, d17I0).split('\n').length) + '–' + (d17GateSrc.slice(0, d17I1).split('\n').length) + '）' : '拿不到'}；`
+    + `编译${D17 ? '成功' : '失败（' + d17ExtractErr + '）'}`);
+
+  if (!d17Usable) {
+    t.info('⚠ 判据抽不出来 ⇒ 本节其余断言**一条都不跑**（`D20`：前提不成立单列，且上面那条已判红）——'
+      + ' 这正是"抽不到"与"没问题"必须分开记账的理由。');
+  } else {
+    /* ---- 二十七之二：与门禁**完全同一条循环**的判据入口（逐行剥注释 → 逐个被管时钟调用 →
+             无注入出口即命中；每行至多报 1 处；行号 1-based；`rel` 用 `path.relative` 原样，
+             即 Windows 反斜杠 —— 与 `docs-cross-check.js` 的报名字符串**逐字同形**） ---- */
+    const d17Hits = (sources) => {
+      const hits = [];
+      for (const s of sources) {
+        D17.stripComments(s.src).forEach((line, i) => {
+          D17.CLOCK_CALL_RE.lastIndex = 0;
+          for (let m = D17.CLOCK_CALL_RE.exec(line); m; m = D17.CLOCK_CALL_RE.exec(line)) {
+            if (D17.injectableCall(line, m.index, m.index + m[0].length)) continue;
+            hits.push(`${s.rel}:${i + 1}（裸 ${m[0]}）`);
+            break;
+          }
+        });
+      }
+      return hits;
+    };
+    const stripC27 = src => D17.stripComments(src);
+    const countClock27 = (line) => {
+      D17.CLOCK_CALL_RE.lastIndex = 0; let n = 0;
+      for (let m = D17.CLOCK_CALL_RE.exec(line); m; m = D17.CLOCK_CALL_RE.exec(line)) n++;
+      return n;
+    };
+    const SAMPLE_REL = '（合成样本）';
+    const hitsOf27 = src => d17Hits([{ rel: SAMPLE_REL, src }]);
+    /* `EXT-A`：**未受管**的时钟来源形态（`E43①` 里"能判"的那一半）。
+       逐码位/逐形态写死，不做"看起来像取时间"的宽松匹配。 */
+    const EXT_A_RE = new RegExp('(?:performance\\s*\\.\\s*now|process\\s*\\.\\s*hrtime)\\s*\\(', 'g');
+    const extAHits = (sources) => {
+      const hits = [];
+      for (const s of sources) {
+        stripC27(s.src).forEach((line, i) => {
+          EXT_A_RE.lastIndex = 0;
+          const ms = line.match(EXT_A_RE);
+          if (ms) hits.push(`${s.rel}:${i + 1}（未受管的时钟来源 ${ms.join('、')}）`);
+        });
+      }
+      return hits;
+    };
+    /* `EXT-B`：**同一行 ≥2 处被管时钟调用** ⇒ 该行不可能"每一处都有独立注入出口"
+       （一个出口只接得住一处调用）—— 这正是 `retry ? Date.now() : Date.now()` 的形态。 */
+    const extBHits = (sources) => {
+      const hits = [];
+      for (const s of sources) {
+        stripC27(s.src).forEach((line, i) => {
+          const n = countClock27(line);
+          if (n >= 2) hits.push(`${s.rel}:${i + 1}（同行 ${n} 处被管时钟调用）`);
+        });
+      }
+      return hits;
+    };
+
+    /* ---- 二十七之三：`E42` 真值表（**扩大覆盖**：`Date.now()` ＋ 多类"非对象字面量"/对象字面量形态） ----
+       `hit: true` ⇒ 期望**判红**（判据认为"没有注入出口"）。期望来自**设计口径**（`E42`／`E43` 行内 ＋
+       ADR-0003 D17 的"允许可注入 ＋ 缺省兜底"），不是"看它怎么跑就怎么写"。 */
+    const d17Table = [
+      ['① 裸 `new Date()`（D17 的原始形态）', 'const a = new Date();', true,
+        '裸取当前时间参与逻辑 ⇒ 必须红'],
+      ['② 裸 `Date.now()`（**`E42②`：此前完全不在覆盖内**）', 'const a = Date.now();', true,
+        '与 `new Date()` 同等受管'],
+      ['③ 对象字面量键冒号 `{ at: new Date() }`（**`E42①` 的盲点形态**）',
+        'state.lastError = { at: new Date().toISOString() };', true,
+        '键冒号**不是**三元兜底；`server\\index.js` 曾有四处靠它过闸'],
+      ['④ 对象字面量键冒号 ＋ `Date.now()`', 'state.tick = { at: Date.now(), n: 1 };', true,
+        '两种口径都要认'],
+      ['⑤ 展开 ＋ 键冒号', 'const d = { ...x, at: new Date() };', true, '展开不改变键冒号的语义'],
+      ['⑥ 单层对象字面量 `{ now: Date.now() }`', 'const o = { now: Date.now() };', true, '同上'],
+      ['⑦ **嵌套**对象字面量 `{ a: { b: new Date() } }`', 'const o = { a: { b: new Date() } };', true,
+        '最近的一层未配对 `{` 才是判据依据'],
+      ['⑧ 缺省兜底 `||`（**真注入出口**）', 'const now = options.now || new Date();', false,
+        'D17 允许"可注入 ＋ 缺省兜底"'],
+      ['⑨ 形参默认值（**真注入出口**）', 'function f(d = new Date()) { return d; }', false,
+        '要求左侧是 `(param =`、右侧紧跟逗号/右括号'],
+      ['⑩ 三元兜底（`new Date()`）', 'const x = clock ? clock.now() : new Date();', false, '真三元假分支'],
+      ['⑪ 三元兜底（`Date.now()`）', 'const x = clock ? clock.now() : Date.now();', false,
+        '`Date.now()` 与 `new Date()` 同等'],
+      ['⑫ 空值兜底 `??`', 'const y = options.now ?? new Date();', false,
+        '`??` 与 `||` 同义（也是兜底出口）'],
+      ['⑬ 行注释里的 `new Date()`', '// 禁止裸 new Date()', false, '注释必须先剥干净'],
+      ['⑭ **同行块注释**里的 `new Date()`', '/* x */ const p = 1; /* new Date() */', false,
+        '`E42` 补的"同行的成对块注释"也要剥'],
+      ['⑮ `setInterval` 周期里的裸 `Date.now()`（真阳）',
+        'setInterval(() => tick(Date.now() - started), 1000);', true,
+        '**真漏网**：`Date.now()` 被拿来做时长逻辑'],
+      ['⑯ 字符串字面量里的 `new Date()`（**过报**）', "const s = 'new Date()';", true,
+        '**能力边界（过报）**：判据只剥注释、**不剥字符串/模板串** ⇒ 说明性字面量会被判红'],
+      ['⑰ 模板串里的 `new Date()`（**过报**）', 'const s = ' + '`' + 'a ' + '${1}' + ' new Date()' + '`' + ';', true,
+        '同上（模板串也不剥）'],
+      ['⑱ **`E43②` 的漏网**：`retry ? Date.now() : Date.now()`', 'const t = retry ? Date.now() : Date.now();', false,
+        '**固有漏网**：出口形状齐备、但两侧来源全是裸时钟 ⇒ D17 判**绿**（由 `EXT-B` 判红）'],
+      ['⑲ **`E43①` 的漏网**：`performance.now()`', 'const t = performance.now();', false,
+        '**固有漏网**：D17 的正则根本匹配不到它（由 `EXT-A` 判红）'],
+      ['⑳ **`E43①` 的漏网**：`process.hrtime()`', 'const h = process.hrtime();', false,
+        '同上（由 `EXT-A` 判红）'],
+      ['㉑ **非调用语法**：`const f = new Date; const t = f();`', 'const f = new Date; const t = f();', false,
+        '**能力边界**：判据正则要求调用括号 `()` ⇒ 取函数引用再调用、别名、经中间变量间接取时间**一律看不见**']
+    ];
+    const d17Rows = d17Table.map(([name, src, want]) => {
+      const got = hitsOf27(src);
+      return { name, src, want, got, ok: (got.length > 0) === want };
+    });
+    const d17TableBad = d17Rows.filter(r => !r.ok);
+    t.check('`E42`-① D17 判据**真值表**（从真源码抽出、**同一把尺子**喂 21 个样本）：'
+      + '**裸 `Date.now()`** 与**对象字面量键冒号**（含嵌套/展开）**必红且指名行号**；'
+      + '**真注入出口**（`||`／形参默认值／三元假分支／`??`）与**注释里的字样**必绿 —— '
+      + '即"**扩大覆盖**"而不是"把判据放宽成只认已知写法"',
+      d17TableBad.length === 0,
+      (d17TableBad.length ? `**判红：${d17TableBad.length} 例期望与实际不符** —— `
+        + d17TableBad.map(r => `${r.name}：期望${r.want ? '红' : '绿'}、实得[${r.got.join('、') || '绿'}]`).join('；') + '；' : '21 例**逐例相符**；')
+      + `逐例读数：${d17Rows.map(r => `${r.name.slice(0, 6)}…→${r.got.length ? '红' : '绿'}`).join('／')}`);
+
+    /* ---- 二十七之四：`E42`-② D22（**内存变异**：在真实 `server\index.js` 中部造真实漏网点） ----
+       为什么必须打在**真源码**上而不是合成字符串上：合成字符串只能证明"判据对合成样本有效"，
+       而 `E42` 的病是"**下一处裸时钟继续静默过闸**" —— 要证明的正是"**真文件里**多出来的那一处
+       会被指名"。两支各自对应 `E42` 的一个盲点：㈠对象字面量键冒号形态 ㈡裸 `Date.now()`。 */
+    const D22_REL27 = path.join('server', 'index.js');
+    const d22Abs27 = path.join(ROOT27, D22_REL27);
+    const d22Bytes27 = fs.readFileSync(d22Abs27);                 /* 字节副本（只读） */
+    const d22Sha27 = require('node:crypto').createHash('sha256').update(d22Bytes27).digest('hex');
+    const d22Lines27 = d22Bytes27.toString('utf8').split('\n');
+    /* 植入点必须落在**真代码**上：首版把插入点钉成"第 12 行之前"，而 `server\index.js` 的前 27 行
+       是**文件头块注释** ⇒ 植入行被 `stripComments` 正确剥掉、读数 0（D22 当场判红，如实留痕）。
+       现改为**锚定真代码行**：`'use strict';` 之后（且要求该行**全文件恰 1 次**）。 */
+    const d22Strict27 = "'use strict';";
+    /* ⚠ 盘上是 **CRLF** ⇒ `split('\n')` 会留下行尾 `\r`，按**整行相等**找锚点必须先剥 `\r`
+       （首版没剥 ⇒ 锚点出现 0 次、插入点退化成第 1 行，D22 当场把自己判红 —— 如实留痕）。 */
+    const d22Trim27 = l => (l.endsWith('\r') ? l.slice(0, -1) : l);
+    const d22StrictIdx27 = d22Lines27.findIndex(l => d22Trim27(l) === d22Strict27);
+    const d22StrictN27 = d22Lines27.filter(l => d22Trim27(l) === d22Strict27).length;
+    const d22AnchorOk27 = d22StrictIdx27 >= 0 && d22StrictN27 === 1;
+    const d22At27 = d22StrictIdx27 + 1;                            /* 插到 `'use strict';` 的下一行之前 */
+    const d22Rel27 = path.relative(ROOT27, d22Abs27);              /* 与门禁同一条路径算法（Windows 反斜杠） */
+    const d22Base27 = d17Hits([{ rel: d22Rel27, src: d22Bytes27.toString('utf8') }]);
+    const d22Case27 = (insertLine, callText) => {
+      const mut = d22Lines27.slice(0, d22At27).concat([insertLine], d22Lines27.slice(d22At27)).join('\n');
+      const hits = d17Hits([{ rel: d22Rel27, src: mut }]);
+      const expect = `${d22Rel27}:${d22At27 + 1}（裸 ${callText}）`;
+      return { hits, expect, ok: hits.length === 1 && hits[0] === expect };
+    };
+    const d22a27 = d22Case27('  state.lastError = Object.assign({}, state.lastError, { at: new Date().toISOString() });', 'new Date()');
+    const d22b27 = d22Case27('  const __e42ProbeAt = Date.now();', 'Date.now()');
+    const d22DiskSame27 = require('node:crypto').createHash('sha256').update(fs.readFileSync(d22Abs27)).digest('hex') === d22Sha27;
+    t.check('`E42`-② D22（可证伪，**真实漏网点 ＋ 内存字节副本**）：在真实 `server\\index.js` 中部'
+      + '分别植入㈠**对象字面量键冒号**形态㈡**裸 `Date.now()`** ⇒ 同一判据**必红**且**指名 `文件:行（裸 …）`**；'
+      + '负对照（现行盘上）**必绿**；盘上文件**逐字节未变**',
+      d22Base27.length === 0 && d22a27.ok && d22b27.ok && d22DiskSame27 && d22AnchorOk27,
+      `植入锚点 \`${d22Strict27}\` 在盘上行 ${d22StrictIdx27 + 1}（出现 ${d22StrictN27} 次，须恰 1 次 ⇒ ${d22AnchorOk27}）；`
+      + `负对照（盘上真源码）命中 ${d22Base27.length} 处（应 0）；`
+      + `㈠植入点=${d22a27.expect} ⇒ 命中[${d22a27.hits.join('、') || '（无）'}]；`
+      + `㈡植入点=${d22b27.expect} ⇒ 命中[${d22b27.hits.join('、') || '（无）'}]；`
+      + `盘上 \`${d22Rel27}\` 逐字节未变=${d22DiskSame27}（sha256=${d22Sha27.slice(0, 12)}…）`);
+
+    /* ---- 二十七之五：真树读数（面＝`server\\`＋`platform\\`，`platform\\clock.js` 豁免） ---- */
+    const walkJs27 = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) return walkJs27(full);
+      return e.isFile() && e.name.endsWith('.js') ? [full] : [];
+    });
+    const face27 = [];
+    for (const dir of ['server', 'platform']) {
+      for (const f of walkJs27(path.join(ROOT27, dir))) {
+        const rel = path.relative(ROOT27, f);
+        if (rel === path.join('platform', 'clock.js')) continue;      /* 时间来源本身豁免（同门禁） */
+        face27.push({ rel, src: fs.readFileSync(f, 'utf8') });
+      }
+    }
+    const faceHits27 = d17Hits(face27);
+    const faceExtA27 = extAHits(face27);
+    const faceExtB27 = extBHits(face27);
+
+    /* ---- 二十七之六：`E43`-① EXT-A（**能判的那一半**：未受管的时钟来源）＋ **能力边界** ---- */
+    const extASamp = extAHits([{ rel: SAMPLE_REL, src: 'const t = performance.now();' },
+      { rel: SAMPLE_REL, src: 'const h = process.hrtime();' }]);
+    const extASampD17 = hitsOf27('const t = performance.now();').length + hitsOf27('const h = process.hrtime();').length;
+    t.check('`E43`-① 扩大覆盖（**能判的判红并指名**）：新增可判判据 `EXT-A` 把 **`performance.now()`／'
+      + '`process.hrtime()`** 纳入同一面（`server\\`＋`platform\\`）—— 真树必须 **0 处**；'
+      + '合成样本两支**必红且指名 `文件:行`**；**同时**证明原 D17 判据对这两支**判绿**（＝漏网被**指名登记**，'
+      + '不是含糊带过）',
+      faceExtA27.length === 0 && extASamp.length === 2 && extASampD17 === 0,
+      `真树 EXT-A 命中 ${faceExtA27.length} 处（应 0）：[${faceExtA27.join('、') || '（无）'}]；`
+      + `合成样本 EXT-A 命中 ${extASamp.length}/2：[${extASamp.join('、')}]；`
+      + `**原 D17 判据对这两支命中 ${extASampD17} 处（＝0 才说明"漏网"是真的）**；`
+      + `**能力边界（判不了的，如实登记）**：` + '`EXT-A` 也是**文本**判据 —— '
+      + '`setInterval`／`setTimeout` **周期本身**、`Date` 的静态取值形态（`Date.parse`／`Date.UTC`）、'
+      + '取函数引用再调用（`const f = new Date; f()`）、经**中间变量/参数**间接取得的时间，**一律不在覆盖内**；'
+      + 'D17＋EXT 两者**合起来仍不是数据流证明**。');
+    t.info('`E43`-① 真树读数（每轮可见）：面＝`server\\`＋`platform\\` 共 ' + face27.length + ' 个 .js'
+      + '（豁免 `platform\\clock.js`）；D17 命中 ' + faceHits27.length + ' 处、`EXT-A` 命中 ' + faceExtA27.length + ' 处、'
+      + '`EXT-B` 命中 ' + faceExtB27.length + ' 处 —— 三者**同结论**（全 0）才说明这条面是干净的。');
+
+    /* ---- 二十七之七：`E43`-② EXT-B（**能判的那一半**："出口形状 ≠ 真注入源"） ---- */
+    const EXT_B_SAMPLE = 'const t = retry ? Date.now() : Date.now();';
+    const extBSamp = extBHits([{ rel: SAMPLE_REL, src: EXT_B_SAMPLE }]);
+    const extBSampD17 = hitsOf27(EXT_B_SAMPLE);
+    t.check('`E43`-② 扩大覆盖（**能判的判红并指名**）：新增可判判据 `EXT-B`＝"**同一行 ≥2 处被管时钟调用**"'
+      + '（一个注入出口只接得住一处调用）—— 真树必须 **0 处**；合成样本 `retry ? Date.now() : Date.now()` '
+      + '**必红且指名 `文件:行`**；**同时**证明原 D17 判据对该样本**判绿**（`E43②` 的固有漏网由此**固化成可判形式**）',
+      faceExtB27.length === 0 && extBSamp.length === 1 && extBSampD17.length === 0,
+      `真树 EXT-B 命中 ${faceExtB27.length} 处（应 0）：[${faceExtB27.join('、') || '（无）'}]；`
+      + `合成样本 \`${EXT_B_SAMPLE}\` ⇒ EXT-B 命中 [${extBSamp.join('、')}]、**原 D17 判据命中 ${extBSampD17.length} 处**`
+      + `（0 ＝ 它确实**过闸**了 —— 这就是要固化的那条漏网）；`
+      + `**能力边界（判不了的，如实登记）**：` + '`EXT-B` 只数**被管时钟调用**的**条数**，'
+      + '判不了"出口的后备值本身是不是**别的**时间源"（`a || b || new Date()` 里 a/b 若也是时钟，本行数不到）；'
+      + '也判不了跨行/跨语句的同一个出口（本行**只做同行**判定）；'
+      + '且它是**上界**判据 —— 同行两处合法调用也会被它判红（**宁可过报**，因为"一行两处取时间"本身就可疑）。');
+    t.info('`E43` 两类**固有漏网**的登记（**固化成可判形式**，不是含糊带过）：'
+      + '① 未受管时钟来源 ⇒ 由 `EXT-A` **判红并指名**（真树 0 处）；能力边界见 `E43`-① 的 msg。'
+      + '② 出口形状 ≠ 真注入源 ⇒ 由 `EXT-B` **判红并指名**（真树 0 处）；能力边界见 `E43`-② 的 msg。'
+      + '两者都**不是**数据流证明 —— ADR-0003 D17 需要写明的那句边界（"D17 门禁只查 `new Date()`/`Date.now()` '
+      + '的同行出口形状，**不是**数据流证明"）**已逐字写进本节两条断言名与 msg**，读回执的人不必再靠记忆。');
+  }
+}
+
 main().catch(err => {
   console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
   process.exit(2);

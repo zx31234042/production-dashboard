@@ -542,12 +542,45 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
   }
 
   /** 逐行类命中最多收这么多条（真值另记 `counts`）—— 防"一个 80545 行的日志把内存吃掉" */
+  /* ==================== `E186`（★★）：**文件中部**的格式字符 ====================
+     立案原因：源码注释里混着**零宽字符**（`U+200B` 等）⇒ 把它当"锚点"会"命中 0 次"或
+     "多匹配一大段"（2026-10-05 座位 3 在 `T-20261005-30` 实测踩到 3 次）。而本文件原来的
+     `E40` 家族只抓 **BOM（仅文件首 3 字节）**／`U+FFFD`／PUA／无损 GBK 乱码／混行尾／缺末行尾
+     ⇒ **文件中部**的 `U+200B`／`U+200C`／`U+200D`／`U+200E`／`U+200F`／`U+2028`–`U+202E`
+     ／非首字符的 `U+FEFF` **一律漏过** ✗（它们全在 ASCII 之外、却**既不是** `U+FFFD`、
+     **也不在** PUA 区，视觉上与"一切都好"逐字同形 —— 与 `E40` 同一种"看不见的损坏"）。
+     ⚠ **不许把合法的全角/中文标点当格式字符**：下面的集合**逐码位写死**，只有 13 个码位；
+     `U+2026`（…）／`U+2014`（—）／`U+201C`／`U+201D`／`U+3000`／`U+FF0C`（，）等**一律不在**其中。
+     判据面：受管面**零容忍**（落成 `E40-⑤`／`E40-⑥` 同款的 **fail-closed 登记制** —— 见
+     `MIDFILE_FORMAT_BASELINE` 的注释说明"为什么基线不是空集"）；`._verify` 面**只报不判**。 */
+  /** 中部格式字符的**唯一真源**（码位 → 人读名）。判据与 D22 都从它取，不许各写一份。 */
+  const MIDFILE_FORMAT = new Map([
+    [0x200B, 'U+200B ZWSP 零宽空格'],
+    [0x200C, 'U+200C ZWNJ 零宽非连接符'],
+    [0x200D, 'U+200D ZWJ 零宽连接符'],
+    [0x200E, 'U+200E LRM 从左到右标记'],
+    [0x200F, 'U+200F RLM 从右到左标记'],
+    [0x2028, 'U+2028 LS 行分隔符'],
+    [0x2029, 'U+2029 PS 段分隔符'],
+    [0x202A, 'U+202A LRE 左到右嵌入'],
+    [0x202B, 'U+202B RLE 右到左嵌入'],
+    [0x202C, 'U+202C PDF 定向格式终止'],
+    [0x202D, 'U+202D LRO 左到右覆盖'],
+    [0x202E, 'U+202E RLO 右到左覆盖'],
+    [0xFEFF, 'U+FEFF ZWNBSP 零宽不换行空格（**非首字符**）']
+  ]);
+  /* 判据正则**全部用 `\uXXXX` 转义构造**（不用原字符写字面量）⇒ 本文件自身的字节里
+     一个格式字符都不含 —— 否则"检测器把自己判红"（`E40-④` 首版踩过的同款坑）。
+     `[\u200B-\u200F]` 恰＝200B..200F；`[\u2028-\u202E]` 恰＝2028..202E；`\uFEFF` 单列。 */
+  const MIDFILE_TEST_RE = new RegExp('[\\u200B-\\u200F\\u2028-\\u202E\\uFEFF]');
+  const MIDFILE_MARK_RE = new RegExp('[\\u200B-\\u200F\\u2028-\\u202E\\uFEFF]', 'g');
+
   const HY_CAP = 200;
   /** 扫一组文件。`readOf(abs)` 提供字节 —— D22 靠它注入**内存变异体**，盘上不动。
    *  返回各判据的命中清单（逐行类截断到 `HY_CAP`）＋ **真实条数** `counts`。 */
   function scanHygiene(list, readOf = f => fs.readFileSync(f)) {
-    const out = { bom: [], bomPs1: [], fffd: [], pua: [], mixed: [], noEol: [], moji: [], unreadable: [],
-      counts: { files: list.length, bom: 0, bomPs1: 0, fffd: 0, pua: 0, mixed: 0, noEol: 0, moji: 0, unreadable: 0 } };
+    const out = { bom: [], bomPs1: [], fffd: [], pua: [], mixed: [], noEol: [], moji: [], format: [], unreadable: [],
+      counts: { files: list.length, bom: 0, bomPs1: 0, fffd: 0, pua: 0, mixed: 0, noEol: 0, moji: 0, format: 0, unreadable: 0 } };
     const add = (arr, key, item) => { out.counts[key]++; if (arr.length < HY_CAP) arr.push(item); };
     for (const abs of list) {
       const rel = relOf(abs);
@@ -568,6 +601,21 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
           if (l.includes('\uFFFD')) add(out.fffd, 'fffd', `${rel}:${i + 1}`);
           if (/[\uE000-\uF8FF]/.test(l)) add(out.pua, 'pua', `${rel}:${i + 1}`);
           if (isMojibakeLine(l)) add(out.moji, 'moji', `${rel}:${i + 1}`);
+          /* `E186`：**文件中部**的格式字符 —— **逐处指名 `文件:行:列`**。
+             列 ＝ 该行内第几个**字符**（1-based，按 Unicode 码点计；不用字节偏移、也不用
+             UTF-16 下标 —— 两种口径在含火星文的行上会不一致，故这里写死"按码点"）。
+             文件**首字符**的 `U+FEFF` 就是 BOM 本身（归 `E40-①` 管），故只在 `i === 0 &&
+             m.index === 0 && 该文件确实以 BOM 开头` 时跳过；紧随其后的第二个 `U+FEFF` 仍判红。 */
+          if (MIDFILE_TEST_RE.test(l)) {
+            MIDFILE_MARK_RE.lastIndex = 0;
+            for (let m = MIDFILE_MARK_RE.exec(l); m; m = MIDFILE_MARK_RE.exec(l)) {
+              if (i === 0 && m.index === 0 && hasBom(buf)) continue;
+              const cp = l.codePointAt(m.index);
+              const col = [...l.slice(0, m.index)].length + 1;
+              out.counts.format++;
+              out.format.push(`${rel}:${i + 1}:${col}（${MIDFILE_FORMAT.get(cp)}）`);
+            }
+          }
         }
       }
       const e = eolStat(buf);
@@ -625,6 +673,24 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
    *  ⚠ 这份名册是 **fail-closed** 的：它必须**恰好等于**盘上实存集合 ——
    *  多一个 ⇒ 红并指名"新增漂移"；少一个 ⇒ 红并报"基线陈旧"。故**补末行尾后
    *  必须同步删掉对应两行**，否则本条会因"名单陈旧"而红（这正是它该有的行为）。 */
+  /** 「**文件中部**的格式字符」（`E186`）的登记基线 —— **空集 ＝ 零容忍**，机制与 `E40-⑤`／`E40-⑥` 同款：
+   *  集合必须**恰好等于**盘上实存集合 —— **多一处 ⇒ 红并逐处指名 `文件:行:列`**（新增漂移）；
+   *  **少一处 ⇒ 红并报"名单陈旧"**（修好了要**删条目**，**不许**把判据放宽成"只认已知写法"）。
+   *  空集不是"这条判据不生效"：**任何一处新增都当场红**，且"名单只能缩小"的 fail-closed 机制
+   *  仍然保留 —— 将来若确有**正当**保留项（落在禁改面、本轮无权改的那种），处置是**显式登记**
+   *  并把理由写在旁边，**不是**把判据放宽（放宽会让判据对"下一处"失明 —— 那正是 `E186` 要防的）。
+   *  ⚠ **基线为什么是空集（改前 → 改后的实测留痕）**：
+   *    · **改前**（`T-20261005-31` 实测，2026-10-05，两法互证）：受管面 **161** 个文本文件 ⇒ **1 处**
+   *      ＝ `项目记录/审查报告-2026-09-26.md:36:133` 的 `U+200B`（一个零宽字符的笔误）。
+   *    · 该处已由**负责人**按"只动这一个字符"**定点移除并自证**（去零宽后逐字节相同），
+   *      提交 `bb09756 文档: 清除审查报告中的零宽字符` ⇒ **改后实测 0 处**。
+   *    · 故本基线取 **`[]`**（与 `EOL_MIXED_BASELINE` 从 1 缩到 `[]` 是**同一口径**：修好就删条目、
+   *      **名单只能缩小**，而不是"留个例外免得它红"）。
+   *  ⚠ `._verify` 面按既定裁定**只报不判**：实测 **1 处**
+   *  ＝ `tests/._verify/zz6-diag.js` 里的非首字符 `U+FEFF`（**历史诊断件，不动**；见 E40-⑧ 的 `t.info`）。
+   *  ⚠ 负对照（判据不误伤合法标点）：把 `，。、；：？！“”‘’（）《》【】—…·～０１２ＡＢ中文汉字`
+   *  喂进同一判据 ⇒ **0 命中**（`U+2026`／`U+2014`／`U+201C`／`U+201D`／`U+FF0C` 等都不是格式字符）。 */
+  const MIDFILE_FORMAT_BASELINE = [];
   const EOL_NO_TRAILING_NL_BASELINE = [
     '输出文件/离线部署与体检包-V1.2/README-离线部署与体检.md',        /* 交付产物区 */
     '输出文件/离线部署与体检包-V1.2/体检-双击运行.cmd',              /* 交付产物区（一次性探针 1 漏了它 —— */
@@ -665,6 +731,22 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
     (noEolDiff.added.length ? `**新增漂移** ${noEolDiff.added.length} 处：${noEolDiff.added.join('、')}；` : '')
     + (noEolDiff.removed.length ? `**基线陈旧**（已修好却仍登记着，请删对应行）${noEolDiff.removed.length} 处：${noEolDiff.removed.join('、')}；` : '')
     + `实测 ${managedScan.counts.noEol} 处：${listNames(managedScan.noEol, 8)}`);
+
+  /* ---- 九之四之②：`E186` 受管面"**文件中部**的格式字符"（零容忍，落成 fail-closed 登记制） ---- */
+  const midFmtDiff = setDiff(managedScan.format, MIDFILE_FORMAT_BASELINE);
+  t.check('E40-⑧ 受管面"**文件中部**格式字符"**零容忍**（`E186`：`U+200B`–`U+200F`／'
+    + '`U+2028`–`U+202E`／**非首字符** `U+FEFF`；基线＝**空集**）—— 多一处 ⇒ 红并**逐处指名 `文件:行:列`**；'
+    + 'fail-closed 机制保留：少一处 ⇒ 红并报"名单陈旧"（名单只能缩小，**不许**放宽判据）',
+    midFmtDiff.added.length === 0 && midFmtDiff.removed.length === 0,
+    (midFmtDiff.added.length ? `**新增漂移** ${midFmtDiff.added.length} 处（零容忍）:${midFmtDiff.added.join('、')}；` : '')
+    + (midFmtDiff.removed.length ? `**基线陈旧**（已修好却仍登记着，请删对应行）${midFmtDiff.removed.length} 处:${midFmtDiff.removed.join('、')}；` : '')
+    + `实测 ${managedScan.counts.format} 处（基线 ${MIDFILE_FORMAT_BASELINE.length} 条）:`
+    + (managedScan.format.join('、') || '（无）'));
+  t.info(`  · [\`E186\`] **文件中部格式字符**：受管面 **${managedScan.counts.format}** 处`
+    + `（基线 ${MIDFILE_FORMAT_BASELINE.length} 条；${managedScan.format.join('、') || '（无）'}）；`
+    + `\`._verify\` 面 **${verifyScan.counts.format}** 处（**只报不判**`
+    + `${verifyScan.format.length ? '：' + listNames(verifyScan.format, 6) : ''}）`
+    + `；格式字符集合＝${MIDFILE_FORMAT.size} 个码位（逐码位写死，**不含**合法全角/中文标点）`);
 
   /* ---- 九之五：`._verify` 面如实登记（按既定裁定不判红、不修，但必须可见） ---- */
   t.info('（以下 `._verify` 面只报不判 —— 它是探针/取证/临时产物区，按 ADR-0003 D16 与既定裁定保持原样）');
@@ -752,6 +834,56 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
     Buffer.concat([d22Src, Buffer.from(D22_BROKEN + '\r\n', 'utf8')]),
     `${D22_TARGET}:${d22Lines}`, r => r.moji]);
   }
+  /* `E186` 的 D22：**13 个码位逐个**在内存字节副本上植入（不是只拿 `U+200B` 当代表）——
+     单点样本只能证明"那一个码位被抓"，而本条的判据是**一个集合**（还带"非首字符 `U+FEFF`"
+     这种位置相关语义）⇒ 必须**逐个码位**给读数，否则就是 `D19` 的"看起来验过了"。
+     手法与上面同款：在受管面源码**末行后追加 1 行**，行内先写 ASCII 前缀 `D22-<HEX>-`，
+     紧跟**恰好 1 个**目标码位 ⇒ 期望**恰命中 1 处**且指名串**逐字等于** `文件:行:列（码位名）`。
+     列＝`D22-<HEX>-` 的**码点数 + 1**（前缀全 ASCII ⇒ 与前缀字符数相同），**不抄现算值**。 */
+  const mfPrefixOf = cp => `D22-${cp.toString(16).toUpperCase()}-`;
+  const mfRows = [];
+  let mfAllOk = true;
+  const mfBase = scanHygiene([d22Abs]);                       /* 负对照（现行盘上）——只读一次，13 支共用 */
+  for (const [cp, name] of MIDFILE_FORMAT) {
+    const prefix = mfPrefixOf(cp);
+    const buf = Buffer.concat([d22Src, Buffer.from(prefix + String.fromCharCode(cp) + '\r\n', 'utf8')]);
+    const expect = `${D22_TARGET}:${d22Lines}:${[...prefix].length + 1}（${name}）`;
+    const mut = scanHygiene([d22Abs], p => (p === d22Abs ? buf : fs.readFileSync(p)));
+    /* ① 判据本体（`scanHygiene` 的 `format` 桶）：恰 1 处且**逐字**等于期望的 `文件:行:列（码位名）` */
+    const namedOk = mut.format.length === 1 && mut.format[0] === expect;
+    /* ② **主断言那一件事**（`E40-⑧` 用的就是这个合取式：`setDiff(scan.format, BASELINE)`）——
+       为什么必须把这一步也算进来（`E153` 的教训）：只证明"扫描器能看见"不等于证明
+       "**主断言会红**"；两处若各写一份，D22 证明的就不是受管面那条判据了。 */
+    const d = setDiff(mut.format, MIDFILE_FORMAT_BASELINE);
+    const redOk = d.added.length === 1 && d.added[0] === expect && d.removed.length === 0;
+    const untouched = fs.readFileSync(d22Abs).equals(d22Src);
+    if (!(namedOk && redOk && untouched)) mfAllOk = false;
+    mfRows.push(`${name.split(' ')[0]}→指名[${mut.format.join('、') || '（无）'}]/主断言新增=${d.added.length}`);
+  }
+  const mfNegBaseOk = mfBase.format.length === 0;
+  if (!mfNegBaseOk) mfAllOk = false;
+  t.check('E40-⑧ D22（可证伪，**13 个码位的真值表**）：逐一在受管面源码的**内存字节副本**中部植入'
+    + '**恰好 1 个**格式字符 ⇒ ① 判据**必红** ② **指名到 `文件:行:列（码位名）`**（列按码点计）'
+    + ' ③ **主断言那一个合取式**（`setDiff(scan.format, 基线)`）**当场多出恰 1 条且逐字等于植入点**'
+    + ' ④ 未变异（现行盘上）**必绿** —— 负对照 ⑤ 盘上逐字节未变',
+    mfAllOk, `未变异命中 ${mfBase.format.length} 处（应 0）；逐码位读数：${mfRows.join('；')}`);
+
+  /* 负对照②（判据不误伤合法标点）：把**合法全角/中文标点**追加成一行 ⇒ 本判据必须 0 命中。
+     为什么这条必须有：`E186` 的判据是一个"码位集合"，集合一旦被写宽（例如把 `U+2026`／`U+2014`
+     顺手并进区间），就会把正常中文文档判红 —— 那样门禁会被人"关掉"，比漏报更坏。 */
+  const mfNegLine = 'D22-NEG：，。、；：？！“”‘’（）《》【】—…·～０１２ＡＢ中文汉字\r\n';
+  const mfNeg = (() => {
+    const buf = Buffer.concat([d22Src, Buffer.from(mfNegLine, 'utf8')]);
+    const base = scanHygiene([d22Abs]);
+    const mut = scanHygiene([d22Abs], p => (p === d22Abs ? buf : fs.readFileSync(p)));
+    return { base: base.format.length, mut: mut.format.length, untouched: fs.readFileSync(d22Abs).equals(d22Src) };
+  })();
+  t.check('E40-⑧ 负对照（**判据不把合法全角/中文标点当格式字符**）：把 `，。、；：？！“”‘’（）《》【】'
+    + '—…·～０１２ＡＢ中文汉字` 追加成一行（`U+2026`／`U+2014`／`U+201C`／`U+201D`／`U+FF0C` 都在其中）'
+    + ' ⇒ 本判据 **0 命中**；同一次调用里受管面现行读数也必须仍是 0（基线是空集、实测 0 处）',
+    mfNeg.mut === 0 && mfNeg.base === 0 && mfNeg.untouched,
+    `变异体命中 ${mfNeg.mut} 处（应 0）、未变异命中 ${mfNeg.base} 处（应 0）、盘上逐字节未变=${mfNeg.untouched}`);
+
   for (const [label, buf, expect, pick] of d22Cases) {
     const r = runD22(buf, expect, pick);
     t.check(`${label} ⇒ ① 判据必红 ② **指名到文件:行号** ③ 未变异必绿 ④ 盘上逐字节未变`, r.ok, r.detail);

@@ -4012,9 +4012,120 @@ async function main() {
     `名字新=${e44RollNewName}（mtime 回拨 10 s）｜名字旧=${e44RollOldName}（mtime 现在）；` +
     `保留=[${e44RollKept.join(', ')}]；删除=[${e44RollPruned.removed.join(', ')}]`);
 
+  /* ---- `E44-⑦`：把**并发因素注入进来**（`T-20261005-31`） ----
+     这一条守的是 `E44` **偶发红的根因本身**，而不是"再跑一遍看它红不红"。
+     根因回顾：改前是"**秒级文件名 ＋ 固定共享目录**"两件事叠在一起 ⇒ 同秒/并发互相覆盖。
+     而 `resolveBackupName()` 的冲突探测以 **`fs.existsSync` 为唯一真源** ⇒
+     "**另一个进程抢先落了盘**"与"**目录里凭空多出这几份**"在机制上**等价**。
+     故这里把那几份**别人的成品**直接造出来（逐字节已知），再连做 5 次同秒备份：
+     命名必须**让位**到下一个可用刻度，且**别人的成品一份都不许动**
+     （改前形态：直接同名覆盖 ⇒ 成品被吃掉 —— 这正是 `E47` 立案的破坏路径的同族现象）。
+     ⚠ **能力边界（如实登记）**：本判据注入的是"**已经落盘**的竞争"；真正的**同刻并行**
+     （两个调用同时通过 `existsSync`）仍有一个 TOCTOU 窗口 —— 那正是 `E44` 的稳定**同时**依赖
+     "**本轮专属目录**"这条结构前提的原因（见下一条 `E44-⑧`）。 */
+  const e44RaceDir = makeTempDir('e44-race');
+  const e44RaceForeign = [0, 1, 2].map(i => maintain.backupName(new Date(e44Same.getTime() + i)));
+  const e44RaceSrcBytes = fs.readFileSync(e44SyncOne.path);
+  for (const n of e44RaceForeign) fs.copyFileSync(e44SyncOne.path, path.join(e44RaceDir, n));
+  const e44RaceNames = [];
+  for (let i = 0; i < 5; i++) {
+    e44RaceNames.push((await maintain.backupTo(handle.db, e44RaceDir, { now: e44Same })).name);
+  }
+  const e44RaceForeignIntact = e44RaceForeign.every(n => fs.readFileSync(path.join(e44RaceDir, n)).equals(e44RaceSrcBytes));
+  const e44RaceExpected = [3, 4, 5, 6, 7].map(i => maintain.backupName(new Date(e44Same.getTime() + i)));
+  t.check('E44-⑦ **并发因素注入**（`fs.existsSync` 是命名的唯一真源 ⇒ "另一进程抢先落盘"等价于'
+    + '"目录里凭空多出这几份"）：预置 `-000`/`-001`/`-002` 三份**别人的成品**后连做 5 次同秒备份 ⇒ '
+    + '命名必须**让位**到 `-003`…`-007`、**别人的成品逐字节一份都没动**、目录内恰 8 份'
+    + '（改前形态：同名覆盖 ⇒ 别人的成品被吃掉）',
+    JSON.stringify(e44RaceNames) === JSON.stringify(e44RaceExpected) && e44RaceForeignIntact
+      && maintain.listBackups(e44RaceDir).length === 8,
+    `预置别人的成品=[${e44RaceForeign.join(', ')}]（逐字节未变=${e44RaceForeignIntact}）；`
+    + `5 次实得=[${e44RaceNames.join(', ')}]（应为 ${e44RaceExpected.join(', ')}）；`
+    + `目录内共 ${maintain.listBackups(e44RaceDir).length} 份（应 8）`);
+
+  /* ---- `E44-⑧`：**结构隔离** —— 把"读数与并发无关"从"跑的时候恰好没别人"变成**可判形式** ----
+     `E44①`…`E44⑦` 每一条的读数都只依赖两件事：**本轮专属目录的内容** ＋ **注入时钟**。
+     其前提是 `makeTempDir()` 给的是 `run-<pid>-<启动时刻>-<4 hex>` 这种**每轮不同**的目录，
+     而不是改前那种 `tempRootBase\backup-case` **固定共享名**（两个并发轮会共用它 ⇒ 同秒覆盖 ＋ 计数串台）。
+     这条断言就是那个前提本身：**目录必须落在本轮专属区、两两不同、且没有一个是固定共享名**。 */
+  const e44IsoDirs = [backupDir, e44Dir, e44SyncDir, e44EqDir, e44LegacyDir, e44PreDir, e44MixDir, e44RollDir, e44RaceDir];
+  const e44RunName = path.basename(env.paths.tempRoot);
+  const e44FixedShare = path.join(env.paths.tempRootBase, 'backup-case');
+  const e44AllUnderRun = e44IsoDirs.every(d => d.startsWith(env.paths.tempRoot + path.sep));
+  const e44NoneFixed = e44IsoDirs.every(d => d !== e44FixedShare);
+  t.check('E44-⑧ **结构隔离**（把"读数与并发无关"变成**可判形式**）：本节 9 个备份目录**全部**落在'
+    + '**本轮专属**临时区 `env.paths.tempRoot`（名形 `run-<pid>-<启动时刻>-<hex>`）之下、**两两互不相同**，'
+    + '且**没有一个**是改前那种 `tempRootBase\\backup-case` **固定共享名** ⇒ 两个并发门禁轮不可能共用目录',
+    /* 名字形状由 `tests\env.js` 定义：`run-<pid>-<YYYYMMDDTHHMMSS>-<4 hex>`（`E90` 的按轮隔离）。
+       首版写成 `^run-\d+-\d+-[0-9a-f]+$` —— 漏了时刻里的字面 `T`，本条当场把自己判红（如实留痕）。 */
+    e44RunName !== path.basename(env.paths.tempRootBase) && /^run-\d+-\d{8}T\d{6}-[0-9a-f]+$/.test(e44RunName)
+      && new Set(e44IsoDirs).size === e44IsoDirs.length && e44AllUnderRun && e44NoneFixed,
+    `本轮临时区名=${e44RunName}（公共根名=${path.basename(env.paths.tempRootBase)}）；`
+    + `9 个目录去重后 ${new Set(e44IsoDirs).size} 个（应 9）；全部在本轮区下=${e44AllUnderRun}；`
+    + `无一等于固定共享名 \`${path.relative(env.paths.root, e44FixedShare)}\`=${e44NoneFixed}`);
+
+  /* ---- `E44-⑨` D22（可证伪，**内存字节副本**）：把冲突递增探测退回"直接用传入时刻那一格" ----
+     这支变异体就是**改前形态的机制内核**（毫秒名有了、但没有探测 ⇒ 同一毫秒连做 N 次仍只剩 1 份）。
+     为什么不能只做"真并发循环跑 N 次看它红不红"（本轮实测：现行树上 **N 次全绿**，见回执）：
+     **偶发红不能用来证明判据有效** —— 它红一次要靠运气，绿 N 次也证明不了"判据抓得住"。
+     故这里做**决定性**变异：盘上只读、`Module._compile` 在内存里编译改过的源码，喂**同一个场景**。 */
+  const e44MaintainPath = require.resolve('../server/db/maintain.js');
+  const e44MaintainBytes = fs.readFileSync(e44MaintainPath);
+  const e44MaintainSha0 = require('node:crypto').createHash('sha256').update(e44MaintainBytes).digest('hex');
+  const e44MaintainSrc = e44MaintainBytes.toString('utf8');
+  const E44_MUT_FROM = 'if (!fs.existsSync(path.join(dir, name))) return { name, at, bumpedMs: i };';
+  const E44_MUT_TO = 'return { name, at, bumpedMs: 0 };   /* D22 变异：去掉冲突递增探测 */';
+  const e44MutAnchorN = e44MaintainSrc.split(E44_MUT_FROM).length - 1;
+  const e44MutSrc = e44MaintainSrc.split(E44_MUT_FROM).join(E44_MUT_TO);
+  let e44MutApi = null;
+  let e44MutLoad = '未尝试（锚点未恰 1 次）';
+  if (e44MutAnchorN === 1) {
+    try {
+      const ModuleCtor = require('node:module');
+      const mm = new ModuleCtor(e44MaintainPath, null);
+      mm.filename = e44MaintainPath;
+      mm.paths = ModuleCtor._nodeModulePaths(path.dirname(e44MaintainPath));
+      mm._compile(e44MutSrc, e44MaintainPath);
+      e44MutApi = mm.exports;
+      e44MutLoad = '成功';
+    } catch (err) { e44MutLoad = '失败（' + (err && err.constructor ? err.constructor.name : 'Error') + ': ' + (err && err.message) + '）'; }
+  }
+  const e44MutDir = makeTempDir('e44-mutant');
+  const e44MutNames = [];
+  let e44MutErr = '无';
+  if (e44MutApi) {
+    try {
+      for (let i = 0; i < 5; i++) {
+        e44MutNames.push((await e44MutApi.backupTo(handle.db, e44MutDir, { now: e44Same })).name);
+      }
+    } catch (err) { e44MutErr = err && err.message ? err.message : String(err); }
+  }
+  const e44MutDiskSame = require('node:crypto').createHash('sha256').update(fs.readFileSync(e44MaintainPath)).digest('hex') === e44MaintainSha0;
+  t.check('E44-⑨ D22（可证伪，**内存字节副本 ＋ 同一场景**）：把 `server\\db\\maintain.js` 的'
+    + '`resolveBackupName()` **冲突递增探测**退回"直接用传入时刻那一格"（＝改前形态的**机制内核**）⇒ '
+    + '同秒 5 次备份去重后**只剩 1 份**、`E44①` 的合取式（`new Set(names).size === 5`）**必红**；'
+    + '原件同场景必绿（见 `E44①`）；盘上文件**逐字节未变**',
+    e44MutAnchorN === 1 && Boolean(e44MutApi) && e44MutNames.length === 5
+      && new Set(e44MutNames).size === 1 && e44MutDiskSame,
+    `变异锚点命中 ${e44MutAnchorN} 次（须恰 1）；载入=${e44MutLoad}；异常=${e44MutErr}；`
+    + `变异体同秒 5 次 ⇒ 去重后 **${new Set(e44MutNames).size}** 份（＝1 ⇒ \`E44①\` **必红**）、`
+    + `名字=[${[...new Set(e44MutNames)].join(', ')}]；`
+    + `盘上 \`server\\db\\maintain.js\` 逐字节未变=${e44MutDiskSame}（sha256=${e44MaintainSha0.slice(0, 12)}…）`);
+
+  /* `E44` 稳定性三件的**可见读数**（runner 在 PASS 时不打印 check 的 detail ⇒ 必须另给一行，
+     否则"守了多少、读数是多少"只在红的时候才看得见 —— 与 `harness-check` 的
+     "PASS 详情不打印，故此处再给总数"是同一条纪律）。 */
+  t.info(`E44 稳定性三件（**现算读数**）：⑦并发因素注入 ⇒ 预置别人的成品 ${e44RaceForeign.length} 份、`
+    + `5 次让位结果=[${e44RaceNames.join(', ')}]（期望 ${e44RaceExpected.join(', ')}）、`
+    + `别人成品逐字节未变=${e44RaceForeignIntact}、目录内 ${maintain.listBackups(e44RaceDir).length} 份；`
+    + `⑧结构隔离 ⇒ 本轮区名=${e44RunName}、9 目录去重 ${new Set(e44IsoDirs).size} 个、全部在本轮区下=${e44AllUnderRun}、`
+    + `无一为固定共享名=${e44NoneFixed}；`
+    + `⑨D22（内存退化命名）⇒ 同秒 5 次去重后 **${new Set(e44MutNames).size}** 份（**原件**同场景去重 ${new Set(e44Names).size} 份）、`
+    + `锚点命中 ${e44MutAnchorN} 次、载入=${e44MutLoad}、盘上逐字节未变=${e44MutDiskSame}`);
+
   /* 本段收尾：自建的备份目录用完即删 —— `makeTempDir()` 只建不回收（能回收的是 `makeTempDb` 的句柄），
      不删就会在临时区里堆 e44-* 目录（与第十节"临时区与残留"的口径一致）。 */
-  const e44OwnDirs = [e44Dir, e44SyncDir, e44EqDir, e44LegacyDir, e44PreDir, e44MixDir, e44RollDir];
+  const e44OwnDirs = [e44Dir, e44SyncDir, e44EqDir, e44LegacyDir, e44PreDir, e44MixDir, e44RollDir, e44RaceDir, e44MutDir];
   for (const d of e44OwnDirs) {
     /* `E117`（2026-10-04）：`env.removeLinkSafe()` —— 非链接时与原 `rmSync(recursive)` 逐字等价；
        这些目录全部由 `makeTempDir()` 在本轮临时区里刚建（结构上不可能是链接）。 */
