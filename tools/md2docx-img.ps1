@@ -67,11 +67,37 @@ if (-not $md2docxProbeFound) {
 # ===== E14 目标占用预检（只读探测，不改动目标文件一个字节）=====
 $buildDir = $null          # 本次构建目录（打包结束后删除）
 $targetFile = $null        # 本次目标 .docx（占用时按名清理同目录 ~$ 锁文件）
+$pkgTempFile = $null       # E106 本次"临时件"（放在构建目录内；成功时被一次原子替换/改名消耗掉）
 $newTargetFile = $false         # 目标原本不存在（保留变量名：文档/自检里引用它）
-$targetExistedBeforeRun = $true # 真实判据：**写出之前**目标是否存在（见清理函数；别在写出后再判）
+$targetExistedBeforeRun = $true # **写出之前**目标是否存在 —— E106 之后只作读数，**不再据此删任何文件**
 $buildCompleted = $false        # 打包成功返回后才置位 ⇒ 正常路径不删任何东西
 $buildOwned = $false       # 构建目录由本次创建/重建 ⇒ 失败清理时才归我删
 $exitCode = 0
+
+# ===== E106 失败路径兜底（trap）：未捕获的终止性错误也不许留下半成品 =====
+#   为什么要有它：$ErrorActionPreference="Stop" 下，源文件读不了、构建目录建不出来、
+#   打包/落位中途炸掉都是**终止性错误**；这条 trap 在**本脚本作用域**统一收口：
+#   可读交代 ＋ 清掉本次的构建目录/临时件 ＋ 退 1（与既有失败路径同码）。
+#   ⚠ Ctrl-C／进程被杀**不经过** trap（那两类没有"错误"可捕，trap 拦不住）：前者由下面那层
+#   try/finally 收口（实测 finally 会跑），后者（强杀）可能残留 `._docx_build` —— `._*` 被
+#   .gitignore 与 tests\files-check.js 的扫描同时排除，由**下一次运行入口**的既有残留清理扫掉；
+#   但**旧 .docx 一样不会被碰** —— 因为那时还没有发生任何落位动作。
+trap {
+  $exTrap = $_.Exception
+  if ($exTrap -and $exTrap.InnerException) { $exTrap = $exTrap.InnerException }
+  $whereTrap = ''
+  if ($_.InvocationInfo -and $_.InvocationInfo.ScriptLineNumber) {
+    $whereTrap = ([System.IO.Path]::GetFileName($_.InvocationInfo.ScriptName) + ':' + $_.InvocationInfo.ScriptLineNumber)
+  }
+  [Console]::Error.WriteLine('')
+  [Console]::Error.WriteLine('  [FAIL] 转换未完成：' + $exTrap.GetType().Name + ' - ' + $exTrap.Message)
+  [Console]::Error.WriteLine('         at     : ' + $whereTrap)
+  [Console]::Error.WriteLine('         target : ' + $targetFile)
+  [Console]::Error.WriteLine('         note   : 本次没有产出、也没有替换任何 .docx；已存在的旧件保持原样（E106 安全写）。')
+  [Console]::Error.WriteLine('')
+  if (Test-Path Function:\Clear-Md2DocxResidue) { Clear-Md2DocxResidue }
+  exit 1
+}
 
 function Get-Md2DocxLockInfo([string]$file) {
   if (-not $file -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { return $null }
@@ -120,18 +146,24 @@ function Invoke-Md2DocxSafe([string]$what, [scriptblock]$action) {
     if ($ex.InnerException) { $ex = $ex.InnerException }
     if ($ex -is [System.IO.IOException] -or $ex -is [System.UnauthorizedAccessException]) {
       Write-Md2DocxOccupied $targetFile ($what + '：' + $ex.GetType().Name + ' - ' + $ex.Message)
+      # E106：**先报告、再清理** —— 提示里要按名列出 ~$ 锁文件，先清就看不到锁文件名了。
+      #   失败路径的清理从此不再依赖"控制流走到脚本末尾"（旧代码在 exit 1 时不会走到收尾那一段）。
+      Clear-Md2DocxResidue
       exit 1
     }
     [Console]::Error.WriteLine('')
     [Console]::Error.WriteLine("  [FAIL] $what 失败：$($ex.GetType().Name) - $($ex.Message)")
     [Console]::Error.WriteLine("         target : $targetFile")
     [Console]::Error.WriteLine('')
+    Clear-Md2DocxResidue
     exit 1
   }
 }
 
 function Clear-Md2DocxResidue {
-  if (-not $buildDir) { return }
+  # 早退条件原来只看 $buildDir；E106 起也看 $targetFile —— 因为**转换前占用预检**那条路径
+  # 还没建构建目录就要清同目录的 ~$ 锁文件（$buildDir 为 $null，但 $targetFile 已设）。
+  if (-not $buildDir -and -not $targetFile) { return }
   # 清构建目录：置空 + [System.IO.Directory]::Delete(path, true)。
   #   为什么必须先置空：Remove-Item -Recurse -Force 在遇到"外部句柄占住的文件"时会**中途 abort**
   #   （报错后不再删剩余项）；实测残留只剩被占住的那一项、其余已清干净。
@@ -149,12 +181,24 @@ function Clear-Md2DocxResidue {
       Remove-Item -LiteralPath $sib -Force -ErrorAction SilentlyContinue
     }
   }
-  # 只在**失败**路径上删除"本次新写出"的目标文件：
-  #   $targetExistedBeforeRun 在**写出之前**取（见预检段）；$buildCompleted 只在打包**成功返回**后置位。
-  #   正常路径（打包成功）什么都不删 ⇒ 与改动前行为逐字一致；失败路径才清掉半成品。
-  #   为什么不用时间戳：刚写出的文件 LastWriteTime 必然晚于运行起始时刻，拿它当判据会把正常产物删掉（实测踩到）。
-  if ($targetExistedBeforeRun -eq $false -and -not $buildCompleted -and $targetFile -and (Test-Path -LiteralPath $targetFile)) {
-    Remove-Item -LiteralPath $targetFile -Force -ErrorAction SilentlyContinue
+  # ===== E106：这里**不再**删目标文件（原来会删"本次新写出、但打包失败的半成品"）=====
+  #   为什么删掉这段逻辑而不是把它改严：安全写之后**不存在"半写出的目标"这种物** ——
+  #   新件只写进构建目录内的临时件，只有打包完整成功才做**一次**原子替换/改名落到目标。
+  #   于是失败路径上"需要删的目标文件"恒为空集；留一个"失败时删目标文件"的分支，
+  #   下一个人顺手改一行就可能把它重新变成"删掉旧件"的入口（E106 的成因正是这种分支）。
+  #   $targetExistedBeforeRun / $buildCompleted 保留作读数与诊断，但**不再**据此删任何文件。
+  if ($targetFile) {
+    # 只在"目标仍在原位"这一前提下清掉本次可能留下的 .md2docx.bak：
+    #   File::Replace 是**全有或全无**的；失败时旧字节仍在目标里，.bak 至多是旧字节的多余副本。
+    #   若目标不在了（理论上不会发生），就**不要**动 .bak —— 那可能是旧字节的唯一副本。
+    $bakResidue = $targetFile + '.md2docx.bak'
+    if ((Test-Path -LiteralPath $targetFile) -and (Test-Path -LiteralPath $bakResidue)) {
+      Remove-Item -LiteralPath $bakResidue -Force -ErrorAction SilentlyContinue
+    }
+  }
+  # 临时件（在构建目录内；若构建目录被外部句柄占住而整体清不掉，这里按名再点一次）
+  if ($pkgTempFile -and (Test-Path -LiteralPath $pkgTempFile)) {
+    Remove-Item -LiteralPath $pkgTempFile -Force -ErrorAction SilentlyContinue
   }
 }
 
@@ -276,16 +320,29 @@ $outDir = [System.IO.Path]::GetDirectoryName($outFull)
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
 # E14 预检：目标 .docx 被 Word/WPS 打开时，先给出"请先关闭 <文件名>"，而不是抛 IO 异常。
-$occupied = Get-Md2DocxLockInfo $outFull
-if ($occupied) { Write-Md2DocxOccupied $outFull $occupied; exit 1 }
+# E106：$targetFile / $targetExistedBeforeRun 都提到预检**之前**取 —— 预检失败时的清理要靠 $targetFile
+#   按名清同目录 ~$ 锁文件；$targetExistedBeforeRun 仍必须是"写出之前"的值。
 $targetFile = $outFull
-# 占位判定必须在**写出之前**取：写出后再判会恒为 true ⇒ 收尾清理把刚生成的 docx 删掉。
 $targetExistedBeforeRun = Test-Path -LiteralPath $outFull
+$occupied = Get-Md2DocxLockInfo $outFull
+if ($occupied) {
+  Write-Md2DocxOccupied $outFull $occupied   # 先报告（提示里要列出 ~$ 锁文件），再清理
+  Clear-Md2DocxResidue
+  exit 1
+}
 
 $build = Join-Path $outDir "._docx_build"
 $buildDir = $build
 $buildOwned = $true
 if (Test-Path $build) { Clear-Md2DocxResidue }
+# ===== E106：从"建构建目录"到"落位完成"这一整段，包在一个 try/finally 里 =====
+#   为什么要这一层（**实测**所得，不是猜：读数见 tests\._verify\T-20261005-02\mini-ctrlc.ps1）：
+#   真正的 Ctrl-C 打进 PowerShell 时 —— ① `trap` **不会**跑（Ctrl-C 不是"错误"）；
+#   ② 但**词法上包住被打断语句的 finally 会跑**（实测 finally 标记落盘、trap 标记没落盘）。
+#   ⇒ "Ctrl-C 也要清干净"只能靠 finally；而这一段正是"已经有过临时物躺在盘上"的窗口
+#   （本脚本尤其宽：解析与图片预处理都在建目录之后）。
+#   本层**故意不重新缩进内部代码**（改动面最小）；PowerShell 的结构不看缩进。
+try {
 New-Item -ItemType Directory -Path $build | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $build "_rels") | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $build "word") | Out-Null
@@ -502,38 +559,86 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText((Join-Path $build "docProps\core.xml"), $coreXml, $utf8)
 [System.IO.File]::WriteAllText((Join-Path $build "docProps\app.xml"), $appXml, $utf8)
 
+# ===== E106 安全写：先写临时件 ⇒ 自证完整 ⇒ 才做一次原子替换/改名 =====
+# 为什么**必须先写新件再替换/改名，而不能先删旧件**（本段的全部理由，改这段前必读）：
+#   旧逻辑在打包函数的第一句就是 `Remove-Item $target`，下一句才是 `ZipFile::Open($target, Create)`；
+#   于是"旧件已经没了"与"新件写成功"之间有一个**没有任何退路**的窗口：磁盘满、权限被拒、
+#   杀软/索引器/同步盘临时占住、写到一半 Ctrl-C 或进程被杀…… 任何一个落在窗口里，现场就从
+#   "有一个旧版可交付"变成"一个都没有" —— 这是**不可逆的内容损失**，不是格式问题。
+#   先写新件，则"旧件的命运"被推迟到**新件已经完整躺在盘上**之后，那时才做一次原子替换/改名；
+#   原子替换要么完整成功、要么什么都没发生 ⇒ 失败路径上旧件**根本没被碰过**。
+#   ⇒ "失败时旧件字节不变"靠的不是"失败后拿备份恢复"，而是"失败时压根没有可恢复的动作发生过"。
+# 临时件放**构建目录内**（`._*` 前缀被 .gitignore 与 tests\files-check.js 的扫描同时排除，
+#   且"入口先清构建目录"这条既有纪律会把上次异常留下的临时件一并扫掉）⇒ 不引入新的残留形态。
+
 # 打包为 OPC 合规的 docx：部件名必须用正斜杠。
 # 注意：.NET Framework 的 ZipFile::CreateFromDirectory 在 Windows 上会写成反斜杠（不合规），
 #       因此这里手工建条目，并把 [Content_Types].xml / _rels/.rels 放在最前面。
-function New-DocxPackage([string]$SourceDir, [string]$TargetPath) {
+# E106：本函数**不再接收目标路径**（连它长什么样都不知道）—— 结构上保证它不可能动到旧件。
+function New-DocxPackage([string]$SourceDir) {
   $root = (Resolve-Path -LiteralPath $SourceDir).Path      # 统一成绝对路径，避免相对路径截断出错
-  $target = if ([System.IO.Path]::IsPathRooted($TargetPath)) { $TargetPath }
-            else { Join-Path (Get-Location).Path $TargetPath }
-  if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
-  $zip = [System.IO.Compression.ZipFile]::Open($target, [System.IO.Compression.ZipArchiveMode]::Create)
+  $zipTemp = Join-Path $root '_md2docx_pkg.new'
+  if (Test-Path -LiteralPath $zipTemp) { Remove-Item -LiteralPath $zipTemp -Force -ErrorAction SilentlyContinue }
+  $zip = $null
   try {
-    $all = @(Get-ChildItem -Path $root -Recurse -File | ForEach-Object {
-      $_.FullName.Substring($root.Length + 1).Replace('\', '/')
-    })
-    $head = @('[Content_Types].xml', '_rels/.rels')
-    $names = @($head | Where-Object { $all -contains $_ }) + @($all | Where-Object { $head -notcontains $_ })
-    foreach ($name in $names) {
-      $entry = $zip.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
-      $stream = $entry.Open()
-      try {
-        $bytes = [System.IO.File]::ReadAllBytes((Join-Path $root $name.Replace('/', '\')))
-        $stream.Write($bytes, 0, $bytes.Length)
-      } finally { $stream.Dispose() }
-    }
-  } finally { $zip.Dispose() }
+    $zip = [System.IO.Compression.ZipFile]::Open($zipTemp, [System.IO.Compression.ZipArchiveMode]::Create)
+    try {
+      # 临时件自己也在构建目录里 ⇒ 枚举时必须把它排除掉，否则会把半成品打进包里
+      $all = @(Get-ChildItem -Path $root -Recurse -File | Where-Object { $_.FullName -ne $zipTemp } | ForEach-Object {
+        $_.FullName.Substring($root.Length + 1).Replace('\', '/')
+      })
+      $head = @('[Content_Types].xml', '_rels/.rels')
+      $names = @($head | Where-Object { $all -contains $_ }) + @($all | Where-Object { $head -notcontains $_ })
+      foreach ($name in $names) {
+        $entry = $zip.CreateEntry($name, [System.IO.Compression.CompressionLevel]::Optimal)
+        $stream = $entry.Open()
+        try {
+          $bytes = [System.IO.File]::ReadAllBytes((Join-Path $root $name.Replace('/', '\')))
+          $stream.Write($bytes, 0, $bytes.Length)
+        } finally { $stream.Dispose() }
+      }
+    } finally { $zip.Dispose(); $zip = $null }
+    # 自证：临时件必须是**能打开的 zip**且含关键部件 —— 宁可在这里失败，也不把坏件落到交付位
+    $probe = [System.IO.Compression.ZipFile]::OpenRead($zipTemp)
+    try {
+      $got = @($probe.Entries | ForEach-Object { $_.FullName })
+      if ($got -notcontains '[Content_Types].xml') { throw ('temporary package incomplete: [Content_Types].xml missing (entries=' + $got.Count + ')') }
+      if ($got -notcontains 'word/document.xml') { throw 'temporary package incomplete: word/document.xml missing' }
+    } finally { $probe.Dispose() }
+  } catch {
+    if ($zip) { $zip.Dispose(); $zip = $null }
+    if (Test-Path -LiteralPath $zipTemp) { Remove-Item -LiteralPath $zipTemp -Force -ErrorAction SilentlyContinue }
+    throw
+  }
+  return $zipTemp
 }
-Invoke-Md2DocxSafe '写出 .docx（打包为 OPC 包）' { New-DocxPackage $build $outFull }
+
+# 把**已经完整**的临时件落位到目标：这是本次运行**唯一**会碰到旧件的动作，且只做一次。
+function Set-DocxAtomically([string]$TempPath, [string]$TargetPath) {
+  $bak = $TargetPath + '.md2docx.bak'
+  if (Test-Path -LiteralPath $TargetPath) {
+    # 覆盖旧版（常路）：File::Replace ＝ 一次 OS 级原子替换（ReplaceFile），第三参＝备份名。
+    #   成功 ⇒ 旧字节进 .bak，随即删掉（成功路径不留备份件）；
+    #   失败 ⇒ 目标**未变**（ReplaceFile 全有或全无），.bak 由失败清理在"目标仍在原位"前提下删掉。
+    $item = Get-Item -LiteralPath $TargetPath -Force
+    if ($item.IsReadOnly) { $item.IsReadOnly = $false }   # 旧逻辑的 Remove-Item -Force 吃得下只读件，这里保持等价
+    if (Test-Path -LiteralPath $bak) { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue }
+    # E106-SWAP-REPLACE: 一次 OS 级原子替换（ReplaceFile）—— 下面这行是"旧件唯一一次被碰"的时刻
+    [System.IO.File]::Replace($TempPath, $TargetPath, $bak)
+    Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+  } else {
+    # 目标原本不存在：同卷改名落位（同样原子；失败时目标依旧不存在）
+    [System.IO.File]::Move($TempPath, $TargetPath)
+  }
+}
+Invoke-Md2DocxSafe '写出 .docx（打包为 OPC 包·只产出临时件）' { $script:pkgTempFile = New-DocxPackage $build }
+# E106-SWAP: 原子替换落位（临时件 ⇒ 目标）—— 走到这一行才第一次动到旧件
+Invoke-Md2DocxSafe '落位 .docx（临时件 ⇒ 目标，原子替换）' { Set-DocxAtomically $pkgTempFile $outFull }
 $buildCompleted = $true
 Remove-Item $build -Recurse -Force
 
-try {
 $fi = Get-Item $outFull
 Write-Host "OK -> $($fi.FullName)"
 Write-Host "     size: $([math]::Round($fi.Length/1MB,2)) MB   images: $($images.Count)"
-} finally { Clear-Md2DocxResidue }
+} finally { Clear-Md2DocxResidue }   # E106 外层收口：成功 / 失败 exit / Ctrl-C 三条路都经过它
 exit $exitCode
