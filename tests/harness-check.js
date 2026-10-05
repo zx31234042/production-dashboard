@@ -144,6 +144,651 @@ function managedGuardDiff(before, after) {
     .map(k => `${k}（${(before.files[k] || '缺').slice(0, 12)}… → ${(after.files[k] || '缺').slice(0, 12)}…）`);
 }
 
+/* ==========================================================================
+   **判据的"地面"：剥离器自证 ＋ 双路复核（`E160`，`T-20261005-08` 甲组）**
+   --------------------------------------------------------------------------
+   立案（`C·24` 第 1／4 组报出、本件落地）：`stripLiterals()`（单一真源＝`tests\lib\assert.js`）
+   在 `tests\harness-check.js` 上留下 **858 行连续盲区**，把整段文本剥成空白 ⇒
+   上面所有"剥字面量后判"的判据在这段区间里**在读空气**：
+     · `E103-B②`（"本门禁自身的面零未防护"）在**空转**；`E103-B①` 对该文件**全盲**；
+     · 那段里那处 `fs.rmSync(tmpRoot,{recursive:true,force:true})` 只喂局部行时才看得见。
+   ⇒ 本节给"地面"加**自证**，并把 `E103` 那一族的判据做成**双路**。
+
+   **为什么"行数 ＋ 锚点"不够、必须加结构维度（本件要求写清的那一句）**：
+     ① 锚点（行号／sha）回答的是"**这一行还在不在**"，回答不了"**判据还看不看得见这一行**" ——
+        那一行**一直在盘上、锚点一直对**，但它在剥后文本里是**空格** ⇒ 判据读它是"空气"。
+        锚点是**内容真源**，地面是**可见性真源**：两者正交，缺一维就出现"锚点全绿而判据空转"。
+     ② 纯行数阈值也不行：**合法**的多行字面量（`String.raw` 夹具、内联脚本模板）实测能长到 **147 行**
+        （`._verify\T-20261004-03\patch-tools.js` 的 `PREFLIGHT`）／109／105 行，它们**本来就该被剥掉**
+        （那是字面量内容，不是代码）；而病灶长到 **858 行**。光看长度**分不开**这两类。
+     ③ 故本节的判据是**结构配对**：`长空白段（超阈值）` **且** `该段原样文本里含 A 档删除 API`
+        ⇒ 才叫"活代码失明"。只有长度、没有"里面藏着什么"，就会把合法长模板判红（"恒红式"）；
+        只有 API、没有长度，就分不清"字面量里的一行示例"与"整段活代码失明"。**两维缺一不可。**
+
+   ⚠ **阈值是量出来的，不是猜的**（真源＝`tests\._verify\t2-e160\probe-e160-census.js` ＋
+      `probe-e160-baseline.js`，读数落 `e160-census.txt`／`baseline.txt`；面＝`tests\**\*.js ＋ tools\**\*.js`）：
+      · **最长连续 blank 段（行）**：`p50=3`、`p90=22`、`p95=35`、`p99=67`；
+        `≥100 行 7 个`、`≥150 行 3 个`、`≥200 行 3 个`、`≥900 行 0 个`；
+        **第二长 147 行**、第三长 109 行，858 与次高之间空档 **711 行**。
+        ⇒ **阈值取 `200` 行**：比"合法最大（147）"高 **36%**（不误红）、比"病灶（858）"低 **77%**（必抓）。
+      · **剥后非空白字节占比**：`p01=0.1162`、`median=0.4972`；
+        **受管面（排除 `._verify\`）实测最小 0.2091**（`tests\copy-check.js`）；
+        全场最小 **0**（`._verify\review\e97-doc.js`，整份被剥光 —— 那是历史取证件、不是缺陷）。
+        ⇒ **受管面地板取 `0.02`**：远低于实测最小合法值，又足以抓住"整份被剥光"。
+      · **两点都写进代码常量的出处注释**，并由 `E160-④` 断言"基线 ↔ 盘上实测量"逐项一致
+        （基线漂了、或有人把阈值改成能漏掉 858 行 ⇒ **当场红**）。
+   ========================================================================== */
+const GROUND_THRESHOLD_E160 = {
+  maxRunLines: 200,        /* 长空白段超过它 ⇒ 进入"结构配对"审查（实测：合法最大 147、病灶 858） */
+  minStripRatio: 0.02,     /* 剥后非空白占比地板（**受管面**判红；实测受管面最小 0.2091） */
+  /* 基线的**出处**＝`tests\._verify\t2-e160\probe-e160-census.js` ＋ `probe-e160-baseline.js`
+     在 2026-10-05 本工作区上的实测值（**不是手写的期望值**；命令与读数见回执）。
+     ⚠ **锚点只锚"受管面"（`tests\*.js` ＋ `tests\lib\**` ＋ `tools\**`，排除 `tests\._verify\`）** ——
+        这是本件**实测之后按事实收窄**的口径：`._verify\` 是 scratch 面，本仓实测里
+        "非空白占比最低的几个"**全部**来自它（`review\e97-doc.js`＝0、`eod-20261001.js`＝0.0871…），
+        而那些文件**随时会被删/被换** ⇒ 若把它们当锚点，"别人清一次 scratch"就会让本判据变红、
+        人就会去改锚点（`D21`／`D23` 的退化路径）。
+        受管面**不随 scratch 生灭**（实测最小 `tests\copy-check.js`＝0.2091），故锚点取它。
+        全场读数（含 `._verify\`）照旧**每轮打印**，只是**不参与**锚点比对。 */
+  baseline: {
+    /* —— 受管面（**锚点**：稳定、不被 scratch 面染动）—— */
+    managedMinNonBlankRatioLegit: 0.20912751677852348,  /* `tests\copy-check.js` */
+    managedMaxRunLines: 858,                           /* `tests\harness-check.js` 的 `String.raw` 夹具 */
+    managedMaxRunLinesExcludingOver: 105,              /* 受管面除超标外最长（`tests\browser-check.js`；147 那一段在 `._verify\`，不在受管面） */
+    /* ⚠ **量纲说明**（本件实测踩过）：`managedFileCount` 数的是**"受管**且被本扫描面覆盖**的 .js"** ——
+       在 `harness-check` 全跑时它＝生产（`server\`／`src\`／`platform\`，60 个）＋ 测试/工具（29 个）＝ **89**；
+       在**隔离复跑**（只跑 E160/E161 的探针，见 `tests\._verify\t2-e160\probe-isolated-e160e161.js`）时
+       它只＝测试/工具那 **29** 个 ⇒ 围栏必须把**两个量纲**都放进去，且**下界要高到"扫空了就一定红"**。 */
+    managedFileCountLo: 20, managedFileCountHi: 260,
+    /* —— 全场（**只打印、不锚定**）—— */
+    maxRunLines: 858,
+    minNonBlankRatio: 0,
+    minNonBlankRatioLegit: 0.08714724374908613,
+    fileCountLo: 700, fileCountHi: 2000,               /* 扫描面规模的**数量级**围栏 */
+    stripperSha12: '989ade2c605f'                      /* `stripLiterals.toString()` 的 sha256 前 12 位 */
+  }
+};
+
+/** 与 `e103LinkSafetyChecks` 的 `walkJsE103` **同一口径**的目录遍历（顶层版：供 `E160` 的普查复用；
+ *  两处都不跟随链接、都按 `*.js` 收面）。 */
+function walkJsTopE160(dir, out = []) {
+  let list = [];
+  try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of list) {
+    const abs = path.join(dir, e.name);
+    if (e.isSymbolicLink()) continue;
+    if (e.isDirectory()) walkJsTopE160(abs, out);
+    else if (e.isFile() && e.name.endsWith('.js')) out.push(abs);
+  }
+  return out;
+}
+
+/** 判据的"地面"分析（**纯函数**，主判据与 D22 共用 —— `E153` 的教训）：
+ *  对一段源码算出 ① 剥除率 ② 最长连续 blank 段（行数 ＋ 字节跨度 ＋ 行号区间）。
+ *  语义**逐字**（复算请照此）：`stripped = stripLiterals(src)`；"空白行"＝`/^[ \t\r]*$/`；
+ *  "段"＝**连续**空白行；`runBytes`＝该段各行长度 ＋ 每行一个换行。
+ *  @param {string} src 源码
+ *  @returns {{bytes:number,strippedBytes:number,ratio:number,nonBlank:number,nonBlankRatio:number,
+ *            changed:boolean,lenSame:boolean,nlSame:boolean,runLines:number,runBytes:number,
+ *            runStartLine:number,runEndLine:number,runRegion:string,fileLines:number,
+ *            blankRuns:Array<{start:number,end:number,lines:number,bytes:number}>}} */
+function analyzeGroundE160(src) {
+  const stripped = stripLiterals(src);
+  const lines = stripped.split('\n');
+  const isBlank = (l) => /^[ \t\r]*$/.test(l);
+  const blankRuns = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (!isBlank(lines[i])) { i++; continue; }
+    let j = i;
+    while (j + 1 < lines.length && isBlank(lines[j + 1])) j++;
+    blankRuns.push({
+      start: i + 1, end: j + 1, lines: j - i + 1,
+      bytes: lines.slice(i, j + 1).reduce((a, l) => a + l.length + 1, 0)
+    });
+    i = j + 1;
+  }
+  const run = blankRuns.reduce((a, b) => (b.lines > a.lines ? b : a), { start: 0, end: 0, lines: 0, bytes: 0 });
+  const nonBlank = (stripped.match(/[^ \t\r\n]/g) || []).length;
+  return {
+    bytes: src.length,
+    strippedBytes: stripped.length,
+    ratio: src.length ? stripped.length / src.length : 1,
+    nonBlank,
+    nonBlankRatio: src.length ? nonBlank / src.length : 1,
+    changed: stripped !== src,
+    lenSame: stripped.length === src.length,
+    nlSame: (stripped.match(/\n/g) || []).length === (src.match(/\n/g) || []).length,
+    runLines: run.lines,
+    runBytes: run.bytes,
+    runStartLine: run.start,
+    runEndLine: run.end,
+    runRegion: run.lines ? `:${run.start}-:${run.end}` : '（无空白段）',
+    fileLines: lines.length,
+    blankRuns
+  };
+}
+
+/** `E161` A 档（零容忍）删除 API 的**识别式**（单一真源；主判据与全部 D22 共用）：
+ *  输入**已经剥掉字面量的代码**，只认 API 名与调用语法，**不认注释/字符串里的文字**。
+ *  覆盖（`E161` 立案点名的 5 种"拼写出口"＋ 2 种外调 ＋ 1 种裸标识符）：
+ *    ① `fs.rmSync`／`fs.rmdirSync` 的 **`recursive:true`** 形态（**配对括号取实参** ⇒ 跨得过 `path.join(…)` 的内层 `)`）；
+ *    ② `fs.promises.rm`／`fs.promises.rmdir`／`fs.rm`／`fs.rmdir`（**任何**形态：语义上就是 rimraf 家族）；
+ *    ③ **静态解构**：`const {rmSync} = require('fs')` 一类（按被解构的名字命名；含 `fs/promises`）；
+ *    ④ **动态取用**：`fs[<表达式>]`（语法级，一律命中；`fs['rmSync']`／`fs[fn]` 都躲不过）；
+ *    ⑤ **裸标识符**：解构/别名之后**直接用名字调**且实参里带 `recursive:true`；
+ *    ⑥ **外调 shell 递归删**：`rmdir /s`、`rd /s`、robocopy 的镜像开关（**保留字符串**再判，见 `scanToolShellE161`）。
+ *  ⚠ 边界（据实登记，不写"已覆盖"的假话）：`const {rmSync: alias} = require('fs')` 后**只用别名**调用 ——
+ *    ③（解构语句本身）+ ⑤（裸标识符）已经覆盖到；"命令由两个变量拼出来"这种形态**看不见**，
+ *    由 `E103-A④/A⑥` 的窄口径如实登记为未覆盖。 */
+const RM_API_NAMES_E161 = ['rmSync', 'rmdirSync', 'rm', 'rmdir'];
+/** 取 `(` 起配对括号内的实参文本（配不上就取到 4000 字符为止 —— 宁可多读，不可漏读） */
+function argsParenE161(code, openIdx) {
+  let depth = 0;
+  const end = Math.min(code.length, openIdx + 4000);
+  for (let k = openIdx; k < end; k++) {
+    const c = code[k];
+    if (c === '(') depth++;
+    else if (c === ')') { depth--; if (depth === 0) return code.slice(openIdx + 1, k); }
+  }
+  return code.slice(openIdx + 1, end);
+}
+const lineOfE161 = (code, idx) => code.slice(0, idx).split('\n').length;
+function scanRmApiStrippedE161(code) {
+  const hits = [];
+  let m;
+  const re = /\bfs\s*\.\s*(?:(promises)\s*\.\s*)?(rmdirSync|rmSync|rmdir|rm)\s*\(/g;
+  while ((m = re.exec(code))) {
+    const name = m[2];
+    const isPromises = Boolean(m[1]);
+    const args = argsParenE161(code, m.index + m[0].length - 1);
+    const rec = /recursive\s*:\s*true/.test(args);
+    const qualified = `fs.${isPromises ? 'promises.' : ''}${name}`;
+    if (name === 'rmSync' || name === 'rmdirSync') {
+      if (rec) hits.push({ line: lineOfE161(code, m.index), rule: `${qualified}(…,{recursive:true})`, api: qualified, tier: 'A' });
+    } else {
+      hits.push({
+        line: lineOfE161(code, m.index),
+        rule: `${qualified}(…)（rimraf 家族，无 recursive 也存在）`, api: qualified, tier: 'A'
+      });
+    }
+  }
+  /* ③ 静态解构 */
+  const reD = /(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/g;
+  while ((m = reD.exec(code))) {
+    for (const nm of RM_API_NAMES_E161) {
+      if (new RegExp(`(?:^|[,{\\s])${nm}\\s*(?:[,}=\\s]|$)`).test(m[1])) {
+        hits.push({ line: lineOfE161(code, m.index), rule: `静态解构取删除 API：{${nm}} = require('fs')`, api: nm, tier: 'A' });
+      }
+    }
+  }
+  /* ④ 动态取用 */
+  const reY = /\bfs\s*\[/g;
+  while ((m = reY.exec(code))) {
+    hits.push({ line: lineOfE161(code, m.index), rule: 'fs[<表达式>] 动态取用（静态判据无法覆盖）', api: 'fs[…]', tier: 'A' });
+  }
+  /* ⑤ 裸标识符：解构/别名之后直接用名字调（只认 `recursive:true` 形态 —— 非递归那一支走 B 档登记） */
+  const reBare = /(?<![.\w$])(rmSync|rmdirSync|rmdir|rm)\s*\(/g;
+  while ((m = reBare.exec(code))) {
+    const args = argsParenE161(code, m.index + m[0].length - 1);
+    if (/recursive\s*:\s*true/.test(args)) {
+      hits.push({ line: lineOfE161(code, m.index), rule: `${m[1]}(…)（裸标识符 ＋ recursive:true ＝ 解构/别名后的调用）`, api: m[1], tier: 'A' });
+    }
+  }
+  return hits.sort((a, b) => a.line - b.line);
+}
+/** **外调 shell 递归删**（`E161` 第 6 类）：必须**保留字符串**才看得见 ⇒ 单独一个剥器（与 `E103` 的
+ *  `stripCommentsOnlyE103()` 同口径、但**独立定义**在本文件顶层，便于 D22 直接喂合成样本）。
+ *  ⚠ 目标串一律**拼接构造**（逐字写会自伤 —— `E103-A④` 实测踩过两次）。 */
+const TOOL_SHELL_PATTERNS_E161 = [
+  ['rmdir 的 ' + '/' + 's 开关（cmd 递归删目录）', new RegExp(String.raw`rmdir\s+\/s`)],
+  ['rd 的 ' + '/' + 's 开关（cmd 递归删目录）', new RegExp(String.raw`\brd\s+\/s`)],
+  ['robocopy 的镜像开关（实测唯一真穿 junction 的删法）', new RegExp(String.raw`robocopy[^\n]{0,200}\/MIR`)]
+];
+function stripCommentsKeepStringsE161(src) {
+  const out = src.split('');
+  const n = src.length;
+  const blank = (a, b) => { for (let k = a; k < b && k < n; k++) if (out[k] !== '\n') out[k] = ' '; };
+  let mode = 'code';
+  let i = 0;
+  while (i < n) {
+    const c = src[i], c2 = src[i + 1];
+    if (mode === 'code') {
+      if (c === '/' && c2 === '/') { blank(i, i + 2); mode = 'line'; i += 2; continue; }
+      if (c === '/' && c2 === '*') { blank(i, i + 2); mode = 'block'; i += 2; continue; }
+      if (c === "'") { mode = 'sq'; i++; continue; }
+      if (c === '"') { mode = 'dq'; i++; continue; }
+      if (c === '`') { mode = 'tpl'; i++; continue; }
+      i++; continue;
+    }
+    if (mode === 'line') { blank(i, i + 1); if (c === '\n') mode = 'code'; i++; continue; }
+    if (mode === 'block') {
+      if (c === '*' && c2 === '/') { blank(i, i + 2); mode = 'code'; i += 2; continue; }
+      blank(i, i + 1); i++; continue;
+    }
+    if (mode === 'sq' || mode === 'dq') {
+      const q = mode === 'sq' ? "'" : '"';
+      if (c === '\\') { i += 2; continue; }
+      if (c === q) { mode = 'code'; i++; continue; }
+      if (c === '\n') { mode = 'code'; i++; continue; }
+      i++; continue;
+    }
+    if (c === '\\') { i += 2; continue; }                 /* tpl：内容保留（宁可多报，不可漏报） */
+    if (c === '`') { mode = 'code'; i++; continue; }
+    i++; continue;
+  }
+  return out.join('');
+}
+function scanToolShellE161(source) {
+  const code = stripCommentsKeepStringsE161(source).split('\n');
+  const out = [];
+  code.forEach((l, i) => {
+    for (const [name, re] of TOOL_SHELL_PATTERNS_E161) {
+      if (re.test(l)) out.push({ line: i + 1, rule: name, api: 'child_process/shell', tier: 'A' });
+    }
+  });
+  return out;
+}
+/** `E161` B 档（**单文件删／非递归拆链**）识别式：**登记制**，不进 A 档。
+ *  语义＝"删的是**目录项**、不进去、不跟随"（`fs.rmSync(p,{force})`／`fs.rmdirSync(p)`），
+ *  实测风险低但仍是删除动作 ⇒ 按 `(文件, 出现次数)` 登记，**多一处即红**、**少一处报名单陈旧**。 */
+function scanSingleFileRmE161(code) {
+  const hits = [];
+  let m;
+  const re = /\bfs\s*\.\s*(?:(promises)\s*\.\s*)?(rmdirSync|rmSync|rmdir|rm)\s*\(/g;
+  while ((m = re.exec(code))) {
+    const args = argsParenE161(code, m.index + m[0].length - 1);
+    if (/recursive\s*:\s*true/.test(args)) continue;         /* A 档那一支不在这里 */
+    hits.push({ line: lineOfE161(code, m.index), api: `fs.${m[1] ? 'promises.' : ''}${m[2]}` });
+  }
+  return hits;
+}
+/** **双路复核**（`E160` 的交付 2）：同一个**纯谓词**分别喂 ①剥后的视图 ②**原样字节**，
+ *  返回合成读数（哪一路命中、命中在哪、以及"只在原样路上命中"的条数）。
+ *  ⚠ 为什么必须**同一个谓词**：两路若各写一份判据，D22 证明的就不是主判据那一件事
+ *    （`E153` 的教训：D22 与主断言不共用谓词 ⇒ 删掉契约合取项两条都照样绿）。
+ *  @param {string} source 源码
+ *  @param {(code:string)=>{line:number,rule:string,api?:string}} scan 纯谓词
+ *  @returns {{stripped:Array,raw:Array,onlyRaw:Array,summary:{stripped:number,raw:number,onlyRaw:number,rule:string}}} */
+function dualScanE160(source, scan) {
+  const tag = (path, hs) => hs.map(h => ({ path, ...h }));
+  const stripped = tag('stripped', scan(stripLiterals(source)));
+  const raw = tag('raw', scan(source));
+  const key = (h) => `${h.rule}@${h.line}`;
+  const onlyRaw = raw.filter(h => !stripped.some(s => key(s) === key(h)));
+  const rule = onlyRaw.length
+    ? `**只在原样路上命中** ${onlyRaw.length} 处（这类命中必须由第二路负责报告，剥离路看不见）`
+    : '两路读数一致（原样路没有多报 ⇒ 本文件没有"剥离器盲区里的形状"）';
+  return { stripped, raw, onlyRaw, summary: { stripped: stripped.length, raw: raw.length, onlyRaw: onlyRaw.length, rule } };
+}
+/** **合成样本的两路读数**（`E161` 的 D22 共用）：把同一个**纯谓词**经 `dualScanE160()`（＝两路复核）
+ *  喂给一段**内存样本**，返回两路命中。
+ *  ⚠ `hits` 取**两路的并集**：外调 shell 那两类（`rmdir /s`／robocopy 镜像开关）**只存在于字符串实参里**，
+ *    剥离路**故意**看不见它们（剥字面量是地面纪律），它们**只由原样路**负责报告；
+ *    若这里只取剥离路，就等于"新增的判据自己把第二路的功能丢了"（本件实测踩过）。 */
+function sampleDualE161(scan, source) {
+  const d = dualScanE160(source, scan);
+  return { hits: d.raw, stripped: d.stripped, raw: d.raw, onlyRaw: d.onlyRaw };
+}
+/** `E160` 的**结构配对**归属（纯函数）：对某文件里"超过阈值的连续 blank 段"，
+ *  在**原样文本**里查该段行区间内是否含 `E161` 的 A 档删除 API 形态。
+ *  ⇒ 只有"长度超标" **且** "里面藏着删除 API" 才算"活代码失明"（两维缺一不可，见上文）。
+ *  ⚠ **逐段分别归属**（不要把各段的命中并成一张表）：红条件是**按段**算的 —— 并表会把
+ *    "另一段的命中"错记到这一段头上（本文件自己就同时有 858 行（含 API）与 251 行（零 API）两段超阈值）。
+ *  ⚠ 第 2～4 个形参（`strippedSrc`／`runStartLine`／`runEndLine`）**本函数不用** —— 段区间在这里
+ *    按 `rawSrc` **重新量**一遍（口径与 `analyzeGroundE160` 同源，避免"调用方量的段"与"本函数量的段"漂移）。
+ *    保留形参是为了**调用点签名稳定**（判据与 D22 喂同一份取值对象，`E153`）。
+ *  @param {string} rawSrc 该文件**原样**字节
+ *  @param {number} thresholdLines 阈值（＝`GROUND_THRESHOLD_E160.maxRunLines`；D22 会喂别的值） */
+function attributeGroundE160(rawSrc, strippedSrc, runStartLine, runEndLine, thresholdLines) {
+  const runs = analyzeGroundE160(rawSrc).blankRuns;
+  const over = runs.filter(r => r.lines > thresholdLines);
+  const byRule = new Map();
+  const perRun = over.map(r => {
+    const codeLines = rawSrc.split('\n');
+    const windowTxt = codeLines.slice(r.start - 1, r.end).join('\n');
+    const h2 = [...scanRmApiStrippedE161(stripLiterals(windowTxt)), ...scanToolShellE161(windowTxt)];
+    const m = new Map();
+    for (const h of h2) {
+      const absLine = r.start - 1 + h.line;
+      if (!m.has(h.rule)) m.set(h.rule, []);
+      m.get(h.rule).push(absLine);
+      if (!byRule.has(h.rule)) byRule.set(h.rule, []);
+      byRule.get(h.rule).push(absLine);
+    }
+    return { start: r.start, end: r.end, lines: r.lines, hits: [...m].map(([rule, lines]) => ({ rule, lines: [...new Set(lines)].sort((a, b) => a - b) })) };
+  });
+  return {
+    overRuns: over,
+    runs: perRun,
+    /** **只有**"超阈值 **且** 段内含 A 档 API"的段（＝真正该进台账的那些；空的干净长段不算） */
+    redRuns: perRun.filter(p => p.hits.length > 0),
+    hits: [...byRule].map(([rule, lines]) => ({ rule, lines: [...new Set(lines)].sort((a, b) => a - b) }))
+  };
+}
+
+/** `E160` 的判据本体：**剥离器自证 ＋ 结构配对的盲区检测/台账 ＋ 双路复核读数**。
+ *  调用点＝`e103LinkSafetyChecks()` 开头（`E103` 那一族判据**之前** ⇒ 地面先证，再判）。
+ *  @param {object} t runner
+ *  @param {string[]} files 扫描面（与 `E103` 的 `walkJsE103` 同口径） */
+function runGroundChecksE160(t, files) {
+  const band = GROUND_THRESHOLD_E160;
+  const stripSha12 = require('node:crypto').createHash('sha256')
+    .update(stripLiterals.toString()).digest('hex').slice(0, 12);
+
+  /* ---------- 0. 纯函数自证（合成样本，**真值已知**）：长度/换行守恒 ＋ blank 段算法本身对得上 ---------- */
+  const SYN_LINES = 238;
+  const synBody = Array.from({ length: SYN_LINES }, (_, i) => (i % 17 === 0 ? '  ' : ' '.repeat(3))).join('\n');
+  const synSrc = 'const A = String.raw`\n' + synBody + '\n`;\nconst B = 1;\n';
+  const synBad = 'const A = String.raw`\n' + synBody + '\nfs.rmSync(tmpRoot, { recursive: true, force: true });\n`;\nconst B = 1;\n';
+  const synGood = 'const A = String.raw`\n' + synBody + '\n（这里是合法字面量内容，没有删除调用）\n`;\nconst B = 1;\n';
+  const gSyn = analyzeGroundE160(synSrc);
+  const synBlankRunOk = gSyn.runLines === SYN_LINES && gSyn.runStartLine === 2 && gSyn.runEndLine === SYN_LINES + 1;
+  const gBad = analyzeGroundE160(synBad);
+  const gGood = analyzeGroundE160(synGood);
+  const attrBad = attributeGroundE160(synBad, stripLiterals(synBad), gBad.runStartLine, gBad.runEndLine, band.maxRunLines);
+  const attrGood = attributeGroundE160(synGood, stripLiterals(synGood), gGood.runStartLine, gGood.runEndLine, band.maxRunLines);
+  t.check('E160-① **剥离器自证（合成样本，真值已知）**：`stripLiterals` 保持**长度守恒 ＋ 换行数守恒**'
+    + '（下标仍可当锚点），且 `analyzeGroundE160()` 量出的"最长连续 blank 段"与**样本里逐字写下的行数**一致'
+    + '（⇒ 自证与量尺本身都被证伪过，不是恒真式）',
+    gSyn.lenSame && gSyn.nlSame && synBlankRunOk
+      && gBad.lenSame && gBad.nlSame && gGood.lenSame && gGood.nlSame,
+    `样本：\`String.raw\` 里 ${SYN_LINES} 行空白（${synSrc.length} B）⇒ 量到 blank 段 ${gSyn.runLines} 行`
+      + `（应 ${SYN_LINES}）、区间 ${gSyn.runRegion}（应 :2-:${SYN_LINES + 1}）；`
+      + `长度守恒=${gSyn.lenSame}／换行守恒=${gSyn.nlSame}；`
+      + `坏样本 ${synBad.length} B（段内含 \`fs.rmSync(…recursive:true)\`）／好样本 ${synGood.length} B（纯字面量）—— 两者都守恒`);
+
+  /* ---------- 1. 全仓普查：两个量现算 ---------- */
+  const rows = files.map((abs) => {
+    const src = fs.readFileSync(abs, 'utf8');
+    const g = analyzeGroundE160(src);
+    return { abs, file: path.relative(env.paths.root, abs).split(path.sep).join('\\'), src, g };
+  });
+  const measuredMaxRun = rows.reduce((a, r) => Math.max(a, r.g.runLines), 0);
+  const overRows = rows.filter(r => r.g.runLines > band.maxRunLines);
+  const legitMaxRun = rows.filter(r => r.g.runLines <= band.maxRunLines).reduce((a, r) => Math.max(a, r.g.runLines), 0);
+  const measuredMinRatio = rows.reduce((a, r) => Math.min(a, r.g.nonBlankRatio), 1);
+  const legitMinRatio = rows.filter(r => r.g.nonBlankRatio > 0).reduce((a, r) => Math.min(a, r.g.nonBlankRatio), 1);
+  const relManagedOf = (rel) => !rel.split('\\').includes('._verify');
+  const managedRows = rows.filter(r => relManagedOf(r.file));
+  const managedMinRatio = managedRows.filter(r => r.g.nonBlankRatio > 0).reduce((a, r) => Math.min(a, r.g.nonBlankRatio), 1);
+  const lenBad = rows.filter(r => !r.g.lenSame || !r.g.nlSame);
+
+  /* ---------- 2. 判据（结构配对）：超阈值 且 段内**原样文本**含 A 档删除 API ⇒ 检出并逐段指名 ---------- */
+  const attribution = rows.map(r => ({
+    file: r.file, runLines: r.g.runLines, runRegion: r.g.runRegion, ratio: r.g.nonBlankRatio,
+    ...attributeGroundE160(r.src, stripLiterals(r.src), r.g.runStartLine, r.g.runEndLine, band.maxRunLines)
+  }));
+  const blindSpots = attribution.filter(a => a.redRuns.length > 0);
+  const longButClean = attribution.filter(a => a.runs.length > 0 && a.redRuns.length === 0);
+  const blindTxt = blindSpots.map(a => {
+    const parts = a.redRuns.map(p => `\`:${p.start}-:${p.end}\`（${p.lines} 行）—— `
+      + p.hits.map(h => `${h.rule} @ ${h.lines.slice(0, 6).map(n => ':' + n).join('、')}${h.lines.length > 6 ? ` 等 ${h.lines.length} 处` : ''}`).join('；'));
+    return `\`${a.file}\` ${parts.join(' ／ ')}`;
+  }).join(' ｜ ');
+  t.check('E160-② **结构配对的盲区检测（超 ' + band.maxRunLines + ' 行的连续 blank 段 ＋ 该段原样文本里含 A 档删除 API）**：'
+    + '两维**同时**成立 ⇒ 该段被**检出并逐段指名 `文件:行号区间` ＋ 命中的 API**；'
+    + '只有长度（合法长 `String.raw` 字面量）或只有 API（单行示例）**都不算**盲区 —— '
+    + '这正是 `E160` 立案的 858 行：长度维度抓它、API 维度把它与"合法长字面量"分开。'
+    + '⚠ **本条的判红职责在 `E160-ⓑ`（台账）**：已登记的那几段是**已知且正当**的（`String.raw` 夹具）——'
+    + '若在这里判红就等于"已知边界每轮都红" ⇒ 判据会被改成能过（`D21`／`D23`）；'
+    + '故这里只做**检出 ＋ 指名**，"**新增一处就红**"由 `E160-ⓑ` 的台账比对负责',
+    true,
+    `检出 **${blindSpots.length} 处**"超阈值且段内含删除 API"的长空白段，逐段指名：${blindTxt || '（无）'}；`
+      + `扫描 ${rows.length} 个 .js；超阈值段 ${overRows.length} 个，其中**段内含删除 API 的 ${blindSpots.length} 个**、`
+      + `**长但干净的 ${longButClean.length} 个**（后者照旧判绿 —— 见 E160-⑤ 的负对照）`);
+
+  /* ---------- 3. 剥除率地板（自证的另一半；**受管面判红**） ----------
+     ⚠ **本条不是"恒红式"，也不是"会误红合法输入"的那一档**（本件实测后按事实收窄，理由写全）：
+      ① 地板只对**受管面**（`tests\*.js` ＋ `tests\lib\**` ＋ `tools\**`，**排除 `tests\._verify\`**）判红 ——
+         `._verify\` 是 scratch 面，里面本来就有"整份被剥光"的历史取证件（实测
+         `tests\._verify\review\e97-doc.js`：非空白 0/2086 B），那是**记录**、不是缺陷；
+         把 scratch 面的取证产物当判红对象 ⇒ 判据会被别人的临时文件染红（`E145` 已经吃过这个亏）。
+      ② 受管面实测**一个都没有**低于地板（0 个；受管面最小合法占比 0.2091）⇒ 对受管面是**真零容忍**。
+      ③ `._verify\` 面**照旧报数**（`E160-③-i`）——"不判红"是**看得见的决定**，不是沉默。 */
+  const belowFloorManaged = managedRows.filter(r => r.g.nonBlankRatio < band.minStripRatio);
+  const belowFloorVerify = rows.filter(r => !relManagedOf(r.file) && r.g.nonBlankRatio < band.minStripRatio);
+  const strippedToNothing = rows.filter(r => r.g.nonBlank === 0);
+  t.check('E160-③ **剥除率地板（自证的另一半，受管面零容忍）**：受管面（`tests\\*.js` ＋ `tests\\lib\\**` ＋ `tools\\**`，'
+    + '**排除 `tests\\._verify\\`**）每个文件的"剥后**非空白**字节占比"都必须 ≥ ' + band.minStripRatio
+    + '（实测受管面最小合法 ' + managedMinRatio.toFixed(4) + '）—— 低于地板 ⇒ 判红并指名 '
+    + '（"整份被剥光"的文件会让**所有**以剥后文本为地面的判据在该文件上读空气）',
+    belowFloorManaged.length === 0,
+    belowFloorManaged.length
+      ? `判红：${belowFloorManaged.length} 个受管文件低于地板 ${band.minStripRatio} —— `
+        + belowFloorManaged.map(r => `\`${r.file}\`（${r.g.nonBlankRatio.toFixed(4)}，非空白 ${r.g.nonBlank}/${r.g.bytes} B）`).join('；')
+      : `受管面全部 ≥ ${band.minStripRatio}（${managedRows.length} 个文件，0 个低于地板；受管面最小 ${managedMinRatio.toFixed(4)}）；`
+        + `扫描面全体最低 ${measuredMinRatio.toFixed(4)}（>0 的最低＝${legitMinRatio.toFixed(4)}）`);
+  t.info(`\`E160-③-i\` **\`._verify\\\` 分面的地板读数（本批只报数、不判红 —— 取舍见 E160-③ 的注释）**：`
+    + `低于地板 ${band.minStripRatio} 的 ${belowFloorVerify.length} 个`
+    + `（${belowFloorVerify.map(r => `\`${r.file}\` ${r.g.nonBlankRatio.toFixed(4)}`).join('、') || '无'}）；`
+    + `全扫描面**非空白为 0**（＝整份被剥光，任何判据都读空气）的 ${strippedToNothing.length} 个：`
+    + `${strippedToNothing.map(r => `\`${r.file}\`（${r.g.bytes} B）`).join('、') || '无'}。`
+    + `⚠ 这几个**都在 ` + '`._verify\\`' + `（scratch 面）**，是历史取证件，不是生产/门禁文件 ⇒ `
+    + `本批据实**不把它们判红**，但也不假装它们不存在。`);
+
+  /* ---------- 4. 基线一致（**锚点取自受管面**；阈值被改成漏掉那一号／改成误红合法长字面量 ⇒ 当场红） ---------- */
+  const base = band.baseline;
+  const managedOver = managedRows.filter(r => r.g.runLines > band.maxRunLines);
+  const managedLegitMaxRun = managedRows.filter(r => r.g.runLines <= band.maxRunLines)
+    .reduce((a, r) => Math.max(a, r.g.runLines), 0);
+  const baseOk = Math.abs(managedMinRatio - base.managedMinNonBlankRatioLegit) < 1e-9
+    && managedRows.reduce((a, r) => Math.max(a, r.g.runLines), 0) === base.managedMaxRunLines
+    && managedLegitMaxRun === base.managedMaxRunLinesExcludingOver
+    && stripSha12 === base.stripperSha12
+    && managedRows.length >= base.managedFileCountLo && managedRows.length <= base.managedFileCountHi
+    && rows.length >= base.fileCountLo && rows.length <= base.fileCountHi
+    && band.maxRunLines > managedLegitMaxRun      /* 阈值必须**高于**合法最大（否则误红） */
+    && band.maxRunLines < managedOver.reduce((a, r) => Math.max(a, r.g.runLines), 0)  /* 且**低于**实测最大 */
+    && measuredMaxRun === base.maxRunLines        /* 全场最长（含 scratch）照旧比对 ⇒ 病灶消失也会红 */
+    && band.minStripRatio <= managedMinRatio;     /* 地板必须**不高于**受管面合法最小（否则误红） */
+  t.check('E160-④ **阈值与基线的自证**（`E156`／`E112` 的口径纪律：**数字必须可复算**）：'
+    + '**受管面**锚点（最低占比 ' + base.managedMinNonBlankRatioLegit + '／最长段 ' + base.managedMaxRunLines
+    + '／除超标外最长 ' + base.managedMaxRunLinesExcludingOver + '／文件数 ' + base.managedFileCountLo + '–' + base.managedFileCountHi
+    + '／剥离器摘要 ' + base.stripperSha12 + '）**逐个等于本轮现算读数**，**且**阈值落在'
+    + '"受管面合法最大 < 阈值 < 受管面实测最大"之间（' + managedLegitMaxRun + ' < ' + band.maxRunLines + ' < '
+    + managedOver.reduce((a, r) => Math.max(a, r.g.runLines), 0) + '）—— '
+    + '⇒ 把阈值改成能漏掉那一号（≥ ' + managedOver.reduce((a, r) => Math.max(a, r.g.runLines), 0) + '）、'
+    + '或改成会误红合法长字面量（≤ ' + managedLegitMaxRun + '）**都当场红**；'
+    + '剥离器源码一变（`stripLiterals.toString()` 摘要不符）也当场红。'
+    + '⚠ **锚点只取受管面**（`._verify\` 是 scratch 面，最低占比全部来自它 ⇒ 锚它会被别人的临时文件染红）',
+    baseOk,
+    `受管面现算：最低非空白占比 ${managedMinRatio.toFixed(6)}（锚点 ${base.managedMinNonBlankRatioLegit}）、`
+      + `最长段 ${managedOver.reduce((a, r) => Math.max(a, r.g.runLines), 0)}（锚点 ${base.managedMaxRunLines}）、除超标外最长 ${managedLegitMaxRun}（锚点 ${base.managedMaxRunLinesExcludingOver}）、`
+      + `文件数 ${managedRows.length}（锚点 ${base.managedFileCountLo}–${base.managedFileCountHi}）；`
+      + `阈值 ${band.maxRunLines} 落在 (${managedLegitMaxRun}, ${managedOver.reduce((a, r) => Math.max(a, r.g.runLines), 0)}) 内；`
+      + `地板 ${band.minStripRatio} ≤ 受管面最低 ${managedMinRatio.toFixed(4)}；`
+      + `全场（含 \`._verify\\\`，**只打印不锚定**）：最低占比 ${measuredMinRatio.toFixed(6)}、最长段 ${measuredMaxRun}（锚点 ${base.maxRunLines}）、`
+      + `文件数 ${rows.length}（围栏 ${base.fileCountLo}–${base.fileCountHi}）；剥离器摘要 ${stripSha12}（锚点 ${base.stripperSha12}）；`
+      + `长度／换行守恒违例 ${lenBad.length} 个（应 0）`);
+
+  /* ---------- 5. D22（可证伪）：整段 blank ＋ 阈值失效 ＋ 两条负对照 ---------- */
+  const mutThresholdMiss = ({ src, threshold }) => {         /* 同一判据、只换阈值 */
+    const g = analyzeGroundE160(src);
+    const a = attributeGroundE160(src, stripLiterals(src), g.runStartLine, g.runEndLine, threshold);
+    return a.redRuns.length > 0;                              /* 红条件＝"有段超阈值**且**段内含 API" */
+  };
+  const d22Blanked = mutThresholdMiss({ src: synBad, threshold: band.maxRunLines });     /* 人为"整段 blank＋藏 API" ⇒ 必红 */
+  const d22Clean = mutThresholdMiss({ src: synGood, threshold: band.maxRunLines });      /* 负对照 A：合法长字面量 ⇒ 必绿 */
+  const d22Miss = mutThresholdMiss({ src: synBad, threshold: 900 });                     /* 阈值改到 900 ⇒ 漏掉那一号 */
+  const d22NoApi = mutThresholdMiss({ src: synSrc, threshold: band.maxRunLines });       /* 负对照 B：整段 blank 但**无 API** ⇒ 必绿 */
+  const realTarget = rows.find(r => r.file === 'tests\\harness-check.js');
+  const realBlind = realTarget
+    ? attributeGroundE160(realTarget.src, stripLiterals(realTarget.src),
+      realTarget.g.runStartLine, realTarget.g.runEndLine, band.maxRunLines)
+    : { overRuns: [], runs: [], redRuns: [], hits: [] };
+  t.check('E160-⑤ D22（可证伪，**四支读数 ＋ 两条负对照**）：同一判据喂'
+    + '㈠"人为把整段剥成 blank、且段内留下 `fs.rmSync(…,{recursive:true})`"的合成样本 ⇒ **必红并指名区间 ＋ API**；'
+    + '㈡**同一段样本但把阈值改到 ' + 900 + '**（＝改到能漏掉那一号）⇒ **必由红转绿**（⇒ 判据不是恒红式，阈值真的在起作用）；'
+    + '㈢**负对照 A**：同样 ' + SYN_LINES + ' 行的合法 `String.raw` 字面量、**段内没有任何删除 API** ⇒ **必绿**'
+    + '（防"看到长段就判红"）；㈣**负对照 B**：**同一段空白但段内没有那行 API**（长度维度照旧超标）⇒ **必绿**'
+    + '（⇒ 红的**必要条件**是"段内真有 A 档 API"，不是"段长"）；㈤盘上真文件 `tests\\harness-check.js` 的现状一并留痕',
+    d22Blanked === true && d22Clean === false && d22Miss === false && d22NoApi === false && Boolean(realTarget),
+    `㈠整段 blank ＋ 段内藏 API ⇒ 判红=${d22Blanked}（应 true）`
+    + `（命中 ${attrBad.hits.map(h => h.rule).join('、') || '无'}）；`
+    + `㈡同一段、阈值改到 900 ⇒ 判红=${d22Miss}（应 false ＝ **阈值真的在挡**，否则判据是恒红式）；`
+    + `㈢负对照 A：${SYN_LINES} 行合法字面量、段内 API 命中 ${attrGood.hits.length} ⇒ 判红=${d22Clean}（应 false）；`
+    + `㈣负对照 B：同一段空白但段内无 API（\`synSrc\`）⇒ 超阈值段 ${analyzeGroundE160(synSrc).blankRuns.filter(r => r.lines > band.maxRunLines).length}、`
+    + `API 命中 ${attributeGroundE160(synSrc, stripLiterals(synSrc), 0, 0, band.maxRunLines).hits.length} ⇒ 判红=${d22NoApi}（应 false）；`
+    + `㈤盘上 \`tests\\harness-check.js\`：超阈值段 ${realBlind.runs.map(r => `:${r.start}-:${r.end}（${r.lines} 行、段内 API ${r.hits.reduce((a, h) => a + h.lines.length, 0)} 处）`).join('、') || '（无）'}；`
+    + `**该判据现状：进台账的段 ${realBlind.redRuns.length} 处** ⇒ 见下面 E160-ⓑ 的"已知盲区台账" `
+    + `（**如实边界**：858 行那一段是 ` + '`String.raw`' + ` 夹具字面量（它生成本文件自己的子进程脚本），`
+    + `段内每一次删除都发生在**子进程**里、不是本门禁进程在删；但判据**看不到**它 ⇒ 由 E160-⑥ 的第二路覆盖，`
+    + `并由 E160-ⓑ 的台账锁住 —— **不声称"已消除"**）`);
+
+  /* ---------- 5b. **已知盲区台账**（`E160` 交付 4 的落地：盲区"仍存在"，但必须被点名 ＋ 被锁住） ----------
+     **为什么要有这张台账（而不是让 E160-② 直接判红）**：
+       那一段 858 行**不是缺陷** —— 它是 `String.raw` 夹具字面量（`W5_FIXTURE_SSE` 等），
+       **合法语法**、内容确实是"字符串"；剥离器把它 blank 是**正确行为**。真正的缺陷是
+       "**判据以为自己看见了这个文件**" —— 故处置＝**逐条登记 ＋ 锁住 ＋ 第二路覆盖**，
+       并且**任何一处新的盲区（清单外）⇒ 判红并指名**。三条同时成立才算"如实处置"：
+         ①登记（`文件` ＋ `行数` ＋ 原因）；②锁住（条数冻结 ＋ 逐条 `sha12` 锚点 ＋ 行数逐个相符）；
+         ③清单外的新盲区 ⇒ 红（这才是"新增即红"）。
+     ⚠ 与 `E103` 的 `RM_LEGACY_E103`／`RM_RESIDUE_VERIFY_E103` **同款机制**（`E140`／`E145` 的先例）。
+     ⚠ **为什么台账记"行数"而不记"行区间"**（本件实测后按事实收窄的口径，理由写全）：
+       台账点名的是 `tests\harness-check.js` 自己 —— 而**这份文件每一轮都在被编辑**（本件落地前后
+       那一段就漂了几百行，因为文件头插了新代码）。若把**绝对行号**钉进台账，每一次正当编辑都会让
+       判据变红 ⇒ 人会去"把台账改成能过" ⇒ 正是 `D21`／`D23` 的退化路径。
+       ⇒ 钉住的是**结构与规模**（哪个文件、多少行、含 A 档删除 API），行号**每轮现算并打印**；
+         真正要抓的"**新出现一处盲区**"由"清单外的文件／条数超出"这一维负责（它对新增最敏感）。 */
+  const GROUND_BLIND_LEDGER_E160 = [
+    {
+      file: 'tests\\harness-check.js', lines: 858,
+      why: '`const W5_FIXTURE_SSE = String.raw\\`…\\`` 这个内联夹具（**生成本文件自己的子进程脚本**）：'
+        + '它是**字面量内容**、不是被门禁执行的代码 ⇒ 剥离器把它 blank 是正确行为；'
+        + '但 `E103-B①②` 在这段里读的是**空气** ⇒ 必须登记 ＋ 锁住 ＋ 由第二路覆盖（`E160-⑥`）。'
+        + '段内含 A 档删除 API（夹具自己的收尾清理：一处非递归单文件删 ＋ 一处 '
+        + '`fs.rmSync(tmpRoot,{recursive:true,force:true})` ＝ realpath 探针的收尾）'
+    },
+    {
+      file: 'tests\\._verify\\review\\old-harness-0996ed0.js', lines: 858,
+      why: '**旧版本字节副本**（从历史提交取出的 `harness-check.js`，D22／定点变异的基线，不是活动脚本）—— '
+        + '`E103` 的 `RM_RESIDUE_VERIFY_E103` 已按 `kind: oldcopy` 登记同一批文件；'
+        + '它的 blank 段与上一条**逐字同源**（同一份 `String.raw` 夹具）'
+    },
+    {
+      file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', lines: 858,
+      why: '同上（另一份 `harness-check.js` 的历史字节副本，同一份夹具）'
+    },
+    {
+      file: 'tests\\._verify\\T-20261005-09\\harness-check.seat4b-inflight.js', lines: 858,
+      why: '**别座位的在飞副本**（本门禁脚本某一轮的快照，落在 `._verify\` 这个 scratch 面）：'
+        + '它的 blank 段与第一条**逐字同源** ⇒ 同属"已知且正当"；'
+        + '⚠ 它随时会被删/被换 ⇒ 本台账按"盘上已消失**不判红**、只打印"的口径处理'
+    }
+  ];
+  /** **"长但干净"的段**（超阈值、**段内没有任何删除 API**）的台账 ——
+   *  例如 `harness-check.js` 里的 `W7_DOD_FIXTURE`（实测 251 行，段内零删除调用）。
+   *  它们**不是缺陷**，恰恰是 `E160-⑤` 负对照在盘上的真实样本；登记它们是为了让
+   *  "**冒出一处新的长但干净的段**"也能被看见（否则判据只看得见"藏了 API 的段"）。 */
+  const GROUND_CLEAN_LONG_LEDGER_E160 = [
+    { file: 'tests\\harness-check.js', lines: 251,
+      why: '`const W7_DOD_FIXTURE = String.raw\\`…\\``（另一份内联夹具）：段内**零**删除调用 ⇒ '
+        + '剥离器把它 blank 完全无害（这正是"长度维度不能单独判红"的盘上实证）' },
+    { file: 'tests\\._verify\\review\\old-harness-0996ed0.js', lines: 251, why: '同上（历史字节副本里的同一份夹具）' },
+    { file: 'tests\\._verify\\review\\s5t04-blob-harness-d9f3721.js', lines: 251, why: '同上（另一份历史字节副本）' },
+    { file: 'tests\\._verify\\T-20261005-09\\harness-check.seat4b-inflight.js', lines: 251, why: '同上（在飞快照里的同一份夹具）' }
+  ];
+  const GROUND_BLIND_ANCHOR_E160 = {
+    total: 4,
+    sha12: require('node:crypto').createHash('sha256')
+      .update(GROUND_BLIND_LEDGER_E160.map(e => `${e.file}|${e.lines}`).join('\n')).digest('hex').slice(0, 12)
+  };
+  /** 台账 ↔ 盘上实测的**双向**对账（纯函数，主断言与 D22 共用 —— `E153` 的教训）：
+   *  · `extra`   ＝盘上有、台账里没有 ⇒ **必红并指名 `文件:行号区间`**（这才是"新增即红"）；
+   *  · `mismatch`＝同名文件的**行数**与台账不符 ⇒ **必红**（规模变了必须重新登记）；
+   *  · `missing` ＝台账里有、盘上找不到 ⇒ **只打印、不判红**（`._verify\` 是 scratch 面，
+   *    快照生灭属正常 —— 把它判红会让判据被别人的临时文件染红，`E145` 已吃过这个亏）。
+   *  @returns {{missing:Array,extra:Array,mismatch:Array}} */
+  const blindAuditE160 = (ledger, disk) => {
+    const missing = ledger.filter(e => !disk.some(d => d.file === e.file));
+    const extra = disk.filter(d => !ledger.some(e => e.file === d.file));
+    const mismatch = [];
+    for (const e of ledger) {
+      const d = disk.find(x => x.file === e.file);
+      if (!d) continue;
+      if (d.lines !== e.lines) mismatch.push(`\`${e.file}\`：段行数 盘上 ${d.lines} vs 台账 ${e.lines}`);
+    }
+    return { missing, extra, mismatch };
+  };
+  const diskBlind = attribution.flatMap(a => a.redRuns.map(p => ({
+    file: a.file, start: p.start, end: p.end, lines: p.lines,
+    apiLines: [...new Set(p.hits.flatMap(h => h.lines))].sort((x, y) => x - y),
+    rules: p.hits.map(h => h.rule)
+  })));
+  const diskCleanLong = attribution.flatMap(a => a.runs.filter(p => p.hits.length === 0)
+    .map(p => ({ file: a.file, start: p.start, end: p.end, lines: p.lines })));
+  const blindAuditNow = blindAuditE160(GROUND_BLIND_LEDGER_E160, diskBlind);
+  const cleanAuditNow = blindAuditE160(GROUND_CLEAN_LONG_LEDGER_E160, diskCleanLong);
+  const blindTxtE160 = diskBlind.map(d =>
+    `\`${d.file}\`:${d.start}-:${d.end}（${d.lines} 行；段内 A 档 API ${d.apiLines.map(n => ':' + n).join('、') || '无'}）`).join(' ｜ ') || '（无）';
+  t.check('E160-ⓑ **已知盲区台账（`E160` 交付 4：盲区"仍存在"，但被登记 ＋ 被锁住 ＋ 被指名）**：'
+    + '每一处"超阈值 **且** 段内含 A 档删除 API"的长空白段都必须在册（**`文件 ＋ 行数`**，条数锚点 '
+    + GROUND_BLIND_ANCHOR_E160.total + '、逐条 `sha12` ' + GROUND_BLIND_ANCHOR_E160.sha12 + '）；'
+    + '**清单外的任何一处 ⇒ 判红并指名 `文件:行号区间` ＋ 段内 API 行**；同名文件段行数与台账不符 ⇒ 判红；'
+    + '台账里的文件在盘上消失 ⇒ **只打印、不判红**（`._verify\` 是 scratch 面）',
+    blindAuditNow.extra.length === 0 && blindAuditNow.mismatch.length === 0
+      && GROUND_BLIND_LEDGER_E160.length === GROUND_BLIND_ANCHOR_E160.total
+      && cleanAuditNow.extra.length === 0 && cleanAuditNow.mismatch.length === 0,
+    (blindAuditNow.extra.length || blindAuditNow.mismatch.length)
+      ? `判红：**盘上新盲区 ${blindAuditNow.extra.length} 处** —— `
+        + blindAuditNow.extra.map(d => `\`${d.file}\`:${d.start}-:${d.end}（${d.lines} 行；段内 A 档 API ${d.apiLines.map(n => ':' + n).join('、')}）`).join('；')
+        + `；段行数不符 ${blindAuditNow.mismatch.length} 项 —— ${blindAuditNow.mismatch.join('；')}`
+        + `；台账里盘上已消失 ${blindAuditNow.missing.length} 处（**不判红**）：`
+        + blindAuditNow.missing.map(e => `\`${e.file}\``).join('、')
+      : `台账 ↔ 盘上一致：在册 ${GROUND_BLIND_LEDGER_E160.length} 处 ＝ 盘上实测 ${diskBlind.length} 处；`
+        + `台账里盘上已消失 ${blindAuditNow.missing.length} 处（不判红）；`
+        + `实测 ${blindTxtE160}；锚点 \`sha12\` ${GROUND_BLIND_ANCHOR_E160.sha12}。`
+        + `另：**"长但干净"的段**（超阈值、段内零删除 API）台账 ${GROUND_CLEAN_LONG_LEDGER_E160.length} 处 ↔ 盘上 ${diskCleanLong.length} 处`
+        + `（新增/行数不符都会红 —— 免得"新冒出一段长字面量"无人看见）`);
+  t.info(`\`E160-ⓑ\` **已知盲区台账（每轮可见，绝不隐形；行号现算）**：`
+    + diskBlind.map(d => `\`${d.file}\`:${d.start}-:${d.end}（${d.lines} 行；段内 A 档 API ${d.apiLines.map(n => ':' + n).join('、') || '无'}）`).join(' ｜ ')
+    + `。⚠ **` + '`tests\\harness-check.js`' + ` 那一段就是 ` + '`E160`' + ` 立案的 858 行**：`
+    + GROUND_BLIND_LEDGER_E160[0].why
+    + `。⇒ 处置是 **第二路覆盖 ＋ 台账锁住 ＋ 新盲区即红**，**不是**"已消除"；`
+    + `任何**清单外**的超阈值段只要段内含 A 档删除 API，` + '`E160-ⓑ`' + ` 当场红并指名 ` + '`文件:行号区间`' + `。`
+    + ` ｜ **长但干净**的在册 ${GROUND_CLEAN_LONG_LEDGER_E160.length} 处 ↔ 盘上 ${diskCleanLong.length} 处：`
+    + diskCleanLong.map(d => `\`${d.file}\`:${d.start}-:${d.end}（${d.lines} 行）`).join('、')
+    + ` ｜ 另有**真正合法的长字面量样本**（本件负对照在盘上的实证，段内零删除 API）：`
+    + attribution.flatMap(a => a.runs.filter(pp => pp.hits.length === 0 && pp.lines > 100)
+      .map(pp => `\`${a.file}\`:${pp.start}-:${pp.end}（${pp.lines} 行）`)).slice(0, 8).join('、'));
+
+  /* ---------- 6. 双路复核（同一纯函数喂两路）：合成读数 ＋ 盘上读数 ---------- */
+  const dualExample = dualScanE160(synBad, scanRmApiStrippedE161);
+  const dualGood = dualScanE160(synGood, scanRmApiStrippedE161);
+  const dualReal = realTarget ? dualScanE160(realTarget.src, scanRmApiStrippedE161) : null;
+  t.check('E160-⑥ **双路复核（同一纯函数 `dualScanE160(源, 谓词)` 喂两路）**：'
+    + '①**剥离路**（判据现行地面）②**原样字节路**（覆盖剥离器盲区）—— 两路都给合成读数（**哪一路命中、命中在哪**）。'
+    + '要求：两路**共用同一个谓词**（`E153` 的教训），主判据与 D22 都喂同一取值对象；'
+    + '原样路多出来的命中＝"剥离器盲区里的形状"，**由第二路负责报告**（不是判红，也不是假装没看见）',
+    dualExample.stripped.length === 0 && dualExample.raw.length === 1 && dualExample.onlyRaw.length === 1
+      && dualGood.stripped.length === 0 && dualGood.raw.length === 0
+      && !!(dualReal && dualReal.raw.length >= dualReal.stripped.length),
+    `㈠合成"整段 blank ＋ 藏 API"：剥离路 ${dualExample.stripped.length} 处、原样路 ${dualExample.raw.length} 处、`
+      + `**只在原样路** ${dualExample.onlyRaw.length} 处（${dualExample.onlyRaw.map(h => `${h.path}:L${h.line}`).join('、') || '无'}）`
+      + `⇒ ${dualExample.summary.rule}；`
+      + `㈡负对照（合法字面量）：剥离路 ${dualGood.stripped.length}／原样路 ${dualGood.raw.length}（都应 0）；`
+      + `㈢盘上 \`tests\\harness-check.js\` 现状：剥离路 ${dualReal ? dualReal.stripped.length : '-'} 处、`
+      + `原样路 ${dualReal ? dualReal.raw.length : '-'} 处、只在原样路 ${dualReal ? dualReal.onlyRaw.length : '-'} 处`
+      + `（**这正是 858 行盲区的量化读数**：剥离路 **0**、原样路 **> 0** ⇒ 盲区**仍存在、但已被第二路覆盖**）`);
+
+  /* ---------- 7. 每轮可见的读数 ＋ 如实边界（`PASS` 详情不打印 ⇒ 这里必须留痕） ---------- */
+  const topRows = rows.slice().sort((a, b) => b.g.runLines - a.g.runLines).slice(0, 6);
+  t.info(`\`E160\` 地面读数（**现算**；扫描面＝\`tests\\**\\*.js\` ＋ \`tools\\**\\*.js\`，与 \`E103\` 同口径、不跟随链接）：`
+    + `${rows.length} 个 .js；**最长连续 blank 段** ${measuredMaxRun} 行（除超标外最长 ${legitMaxRun} 行；阈值 ${band.maxRunLines}）；`
+    + `**剥后非空白占比** 全场最低 ${measuredMinRatio.toFixed(4)}（>0 的最低 ${legitMinRatio.toFixed(4)}；`
+    + `**受管面**最低 ${managedMinRatio.toFixed(4)}；地板 ${band.minStripRatio}）；`
+    + `长度／换行守恒违例 ${lenBad.length} 个；剥离器摘要 ${stripSha12}。`
+    + ` TOP6：${topRows.map(r => `\`${r.file}\` ${r.g.runLines} 行 ${r.g.runRegion}`).join('；')}`);
+  t.info(`\`E160\` **如实边界（不许含糊成"已解决"）**：模板串／多行字面量是**合法语法**，`
+    + `剥离器**必然**把它们整段 blank ⇒ **盲区不可能被"彻底消灭"**。本件的处置是三条同时成立：`
+    + `①**量化**（每个文件的剥除率 ＋ 最长 blank 段，现算）；`
+    + `②**结构配对指名**（超 ${band.maxRunLines} 行 **且** 段内含 A 档删除 API ⇒ 检出并指名 \`文件:行号区间\` ＋ API，`
+    + `"清单外的新盲区"由 E160-ⓑ 的台账判红）；`
+    + `③**第二路覆盖**（\`dualScanE160\` 的原样字节路 —— 盲区里的形状由它报告）。`
+    + `⇒ 正确的说法是"**盲区仍存在，但已被第二路覆盖 ＋ 超阈值即指名**"，**不是**"已消除"。`);
+}
+
 async function main() {
 t.info(env.describe());
 
@@ -9488,6 +10133,323 @@ function e103LinkSafetyChecks(t) {
   const verifyJsE103 = allJsE103.filter(isUnderVerifyE103);
   const readOrEmpty = (abs) => { try { return fs.readFileSync(abs, 'utf8'); } catch { return ''; } };
 
+  /* ==================== 甲-零：判据的"地面"先自证（`E160`，`T-20261005-08` 甲组） ====================
+     ⚠ **顺序不可倒**：下面 `E103` 那一族的每一条都以"剥字面量后的文本"为地面 ——
+     地面若在某个文件上失真（整段活代码被 blank），**上面所有判据的读数都不可信**（`E160` 的立案句）。
+     故先把地面证一遍、并把盲区**检出并登记**（含双路复核读数），再进 `E103` 的判定。 */
+  runGroundChecksE160(t, allJsE103);
+
+  /* ---------- `E160` 的统一自查工具（**不是断言**，是"判据有没有能力"的资格闸）----------
+     为什么要有它（`E153` 的教训）：D22 要证明的是"**主判据那一件事**能被证伪" ——
+     若同一段样本在**空白基准**（什么都不干）时就已经是红，那 D22 证明的是"样本自己红"，
+     与主判据无关。故每个 D22 样本都必须**成对**喂给"空白基准"与"主判据"：
+     · `blank`（＝谓词恒返回空）⇒ 好的 D22 样本在这里**必须是 0**（否则样本自伤）；
+     · `pred`（＝真正的主判据）⇒ 必须**>0**（否则证伪不了）。
+     本工具让这两条在**同一份样本**上现算，D22 的结论才与主判据同源。 */
+  const samplesOkE160 = (samples) => samples.every(s => s.blank.length === 0 && s.pred.length > 0);
+
+  /* ==================== `E161`（`T-20261005-08` 乙组，步 1）：**禁 API，而不是禁形状** ====================
+     **为什么换靶（本件要求在回执里写清的那一句）** —— `E130`／`E144`／`E149`／`E151` 这四层都在问
+     "**这段代码长什么样**"：`fs.rmSync(<标识符>, … recursive:true)`。而"危险的删除"是一个**能力**，
+     它有无穷多种写法（换 API／换引用方式／拼路径／动态取用／外调 shell）。`E161` 的端到端实测：
+     五支**同样危险**的写法（`rmdirSync`／`fs.promises.rm`／解构 `rmSync`／`path.join` 形态／`fs['rmSync']`）
+     在旧判据下**全部零命中**，`harness-check` 照样全绿、被提及 **0 次**。
+     ⇒ **形状无穷、API 有限**：把"删除"这个能力收敛到一个出口（`tests\env.js` 的 `removeLinkSafe`），
+     其余 API 一律静态禁入 ⇒ **写法怎么变都躲不过**（换写法＝换 API，换 API 就命中）。
+     这就是"**禁形状靠不住、禁 API 才收敛**"的完整理由：前者在**无穷**的形状空间里追样本，
+     后者把判据钉在**有限**的 API 名单上。
+
+     **与既有判据的关系**：**保留** `E103-B⑥`（形状式）与其 D22 样本，**新增**本判据。
+     口径（写死在代码注释里，本件要求）：**新的 API 收敛判据是本族的主守卫；旧的形状式保留用于
+     存量登记语义与回放样本**（`E145` 的 `sha12` 锚点、`E151` 的裁定㈠读数都挂在旧式子上，
+     删掉它们会连带毁掉那两条的留痕）。⇒ 本批**不退役**旧判据；若将来要退役，须在回执里提案
+     （附"退役后哪条覆盖顶上、条数如何变"）。
+
+     **剥离器**：本判据一律走**甲（`E160`）那套"剥离 ＋ 自证"的地面** ——
+     ①剥字面量（单一真源 `stripLiterals`）②自证（长度／换行守恒 ＋ 剥除率地板 ＋ 最长 blank 段阈值）
+     ③双路复核（同一谓词喂"剥后"与"原样"两路）。⇒ **顺序不可倒**：甲先落地，乙才在它上面判。 */
+  {
+    /* ---------------- 面与口径（**显式声明**：多守一个面是指据强度变化，必须留痕） ----------------
+       面的选择依据（不是"顺手扩大"）：
+        · 生产代码 `server\`／`src\`／`platform\`：**新增** —— `E103` 那一族的扫描面是
+          `tests\**` ＋ `tools\**`，**生产码从来没被这条守过**；而"删目录"在生产码里没有任何正当理由。
+        · `tests\*.js`（含 `tests\lib\`）＋ `tools\`：与 `E103` 同面，便于逐条对账。
+        · `tests\._verify\**`：**一并扫、但按分面单独报数**（它被 gitignore，但不是法外之地 ——
+          `E46` 的真毁伤就发生在这里）；本件**不为它新增 A 档判红**（那是步 2 的范围）。 */
+    const VERIFY_FACE_SCOPE_E161 = [
+      '`server\\`／`src\\`／`platform\\`（**新增面**：`E103` 那一族从来没守过生产码）',
+      '`tests\\**\\*.js`（含 `tests\\lib\\`）／`tools\\`（与 `E103` 同面，便于逐条对账）',
+      '`tests\\._verify\\**\\*.js`（**一并扫、分面报数**；本件不为它新增 A 档判红 ⇒ 步 2 的范围）'
+    ];
+    const prodJsE161 = [...walkJsTopE160(path.join(env.paths.root, 'server')),
+      ...walkJsTopE160(path.join(env.paths.root, 'src')),
+      ...walkJsTopE160(path.join(env.paths.root, 'platform'))];
+    const managedJsE161 = [...prodJsE161, ...managedJsE103];      /* 受管面（＝生产 ＋ 测试/工具，不含 `._verify`） */
+    const readE161 = (abs) => { try { return fs.readFileSync(abs, 'utf8'); } catch { return ''; } };
+
+    /* ---------------- 甲-A：A 档（零容忍）逐处指名 ---------------- */
+    const aHitsE161 = (list) => list.flatMap((f) => {
+      const code = stripLiterals(readE161(f));
+      return scanRmApiStrippedE161(code).map(h => ({ file: relOfE103(f), ...h }));
+    });
+    const aHitsManagedNoExempt = aHitsE161(managedJsE161);
+    /* **唯一豁免**：`tests\env.js` 里那一处（`removeLinkSafe()` 自身的实现）。
+       为什么它必须是"登记一条豁免"而不是"整体放行这个文件"：`E151` 的教训 ——
+       "文件里有这个形状"不等于"这个形状在起作用"；登记粒度必须是 `文件:行号`。 */
+    const RM_API_EXEMPT_E161 = [
+      {
+        file: 'tests\\env.js', line: 241, api: 'fs.rmSync',
+        why: '**唯一出口** `removeLinkSafe()` 的实现本体：`fs.lstatSync(target)` 判"目录项自身" ⇒ '
+          + '**是链接 ⇒ 只拆链（非递归）并 return** ⇒ 走到这一句时已证明"不是链接" ⇒ '
+          + '对**真实目录**才递归删。`E103-B①` 的 `RM_LEGACY_E103` 也登记同一个 `(tests\\env.js, target)`。'
+      }
+    ];
+    const exemptMatchedE161 = RM_API_EXEMPT_E161.map(e =>
+      aHitsManagedNoExempt.filter(h => h.file === e.file && h.line === e.line && h.api.includes(e.api)));
+    const aViolationsE161 = aHitsManagedNoExempt.filter(h =>
+      !RM_API_EXEMPT_E161.some(e => e.file === h.file && e.line === h.line));
+    t.check('E161-A① **API 收敛判据（A 档·零容忍，本族主守卫）**：受管面（`server\\`／`src\\`／`platform\\`／'
+      + '`tests\\**\\*.js` 含 `tests\\lib\\`／`tools\\`）里，剥字面量后**不得出现**：'
+      + '`fs.rmSync`／`fs.rmdirSync` 的**递归形态**、`fs.rm`／`fs.rmdir`／`fs.promises.rm`／`fs.promises.rmdir`（任何形态）、'
+      + '**静态解构**（`const {rmSync} = require(\'fs\')` 一类）、**动态取用**（`fs[<表达式>]`）、'
+      + '**裸标识符**（`rmSync(x,{recursive:true})`）、**外调 shell 递归删** —— '
+      + '**唯一豁免**＝`tests\\env.js` 的那一处出口实现（逐条按 `文件:行号` 登记）；命中 ⇒ **红并逐处指名 `文件:行号`**',
+      aViolationsE161.length === 0 && exemptMatchedE161.every(x => x.length === 1),
+      aViolationsE161.length
+        ? `判红：**A 档违规 ${aViolationsE161.length} 处** —— `
+          + aViolationsE161.map(h => `\`${h.file}\`:${h.line}（${h.rule}）`).join('；')
+          + `；豁免 ${RM_API_EXEMPT_E161.length} 条（${RM_API_EXEMPT_E161.map(e => `${e.file}:${e.line}`).join('、')}）`
+        : `零违规（受管面扫 ${managedJsE161.length} 个 .js：生产 ${prodJsE161.length} ＋ 测试/工具 ${managedJsE103.length}；`
+          + `**其中生产代码 A 档实测 ＝ 0**）；唯一豁免 ${RM_API_EXEMPT_E161.length} 条`
+          + `（${RM_API_EXEMPT_E161.map(e => `${e.file}:${e.line} 命中 ${exemptMatchedE161[0] ? exemptMatchedE161[0].length : 0} 次`).join('、')}）`);
+    t.check('E161-A② **豁免只有一处**（`E161` 交付 1 的硬要求）：`tests\\env.js` 里递归删的**豁免恰好命中 1 次** —— '
+      + '**不是「这个文件被整体放行」**（把豁免写成文件名级 ⇒ 该文件里再加第 2 处递归删也照样绿，那正是 `E151` 的病）；'
+      + '且 `tests\\env.js` **只有这一处**递归形态（第 2 处 ⇒ 本条的"恰好 1 次"当场不成立）',
+      RM_API_EXEMPT_E161.length === 1
+        && exemptMatchedE161[0] && exemptMatchedE161[0].length === 1
+        && aHitsManagedNoExempt.filter(h => h.file === 'tests\\env.js').length === 1
+        && RM_API_EXEMPT_E161.filter(e => e.file === 'tests\\env.js' && e.api === 'fs.rmSync').length === 1,
+      `豁免清单 ${RM_API_EXEMPT_E161.length} 条（应 1）；\`tests\\env.js\` 盘上递归形态 A 档命中 `
+        + `${aHitsManagedNoExempt.filter(h => h.file === 'tests\\env.js').length} 处（应 1，行 `
+        + `${aHitsManagedNoExempt.filter(h => h.file === 'tests\\env.js').map(h => h.line).join('、') || '无'}）；`
+        + `豁免命中 ${exemptMatchedE161[0] ? exemptMatchedE161[0].length : 0} 次（应 1）`
+        + `（文件级放行会让"同文件第 2 处"静默通过 ⇒ 本条的粒度是 \`文件:行号\`）`);
+
+    /* ---------------- 乙-B：B 档（登记制，`E140`／`E145` 机制）----------------
+       **为什么单文件删要进 B 档而不是 A 档**：`fs.rmSync(p,{force:true})`／`fs.rmdirSync(p)` 删的是
+       **目录项本身**，不进去、不跟随链接（`E46` 实测的 10 种写法都不穿）；而它的**存量不小**
+       （受管面实测 20+ 处、`._verify` 面 45 处），全迁走 diff 巨大而安全收益很小。
+       ⇒ 沿用 `E140`／`E145` 的先例：**登记 ＋ 只减不增 ＋ 双向可证伪**（多一处 ⇒ 红"新增漂移"；
+       少一处 ⇒ 红"名单陈旧"），并给**冻结点锚点**（把"清单被悄悄改过"也变成可证伪）。 */
+    const countSingleFileE161 = (list) => {
+      const per = {};
+      for (const f of list) {
+        const n = scanSingleFileRmE161(stripLiterals(readE161(f))).length;
+        if (n) per[relOfE103(f)] = n;
+      }
+      return per;
+    };
+    const bDiskManagedE161 = countSingleFileE161(managedJsE161);
+    /** **B 档登记清单**（逐条 `文件 → 允许出现次数 max`）。语义＝"**只减不增**"：
+     *  盘上出现清单外的文件 ⇒ `added`（新增漂移 ⇒ 红）；同文件多一处 ⇒ `over`（超限 ⇒ 红）；
+     *  清单里的文件在盘上**少了/没了** ⇒ `stale`（**报"名单陈旧"** ⇒ 红）。 */
+    const B_REGISTRY_E161 = {
+      'server\\db\\maintain.js': 2,
+      'server\\index.js': 1,
+      'platform\\log.js': 1,
+      'tests\\docs-cross-check.js': 1,
+      'tests\\env.js': 4,
+      'tests\\harness-check.js': 6,
+      'tests\\lib\\harness.js': 1,
+      'tests\\platform-check.js': 1,
+      'tests\\preflight.js': 1,
+      'tests\\run-all.js': 4
+    };
+    /** **冻结点锚点**（`E140`／`E145` 的先例；这三项是**常量**，**不**从清单现算 ——
+     *  现算出来的是"同一个东西对自己的复读"，那种断言**没有证伪能力**）。 */
+    const B_ANCHOR_E161 = { total: 22, files: 10, sha12: 'aaa042207ef9' };
+    /** B 档双向对账纯函数（主断言与 D22 共用 —— `E153` 的教训）：
+     *  @returns {{added:Array,over:Array,stale:Array,changed:Array}} */
+    const bAuditE161 = (disk, registry) => {
+      const added = Object.keys(disk).filter(f => !(f in registry))
+        .map(f => ({ file: f, disk: disk[f], max: 0 }));
+      const over = Object.keys(disk).filter(f => (f in registry) && disk[f] > registry[f])
+        .map(f => ({ file: f, disk: disk[f], max: registry[f] }));
+      const stale = Object.keys(registry).filter(f => !(f in disk) || disk[f] < registry[f])
+        .map(f => ({ file: f, disk: disk[f] || 0, max: registry[f] }));
+      const changed = Object.keys(disk).filter(f => (f in registry) && disk[f] < registry[f])
+        .map(f => ({ file: f, disk: disk[f], max: registry[f] }));
+      return { added, over, stale, changed };
+    };
+    /* 清单 → `文件|次数` 摘要（`sha12` 的输入；排序固定 ⇒ 可复算）。
+       ⚠ 若清单与冻结点的**条数**不同，这里把差额显式报出来（否则"少一个文件"只会表现成 sha 不符）。 */
+    const bAnchorDiffWith = (registry) => {
+      const at = Object.entries(registry).sort((a, b) => a[0].localeCompare(b[0]));
+      const sum = at.reduce((a, [, n]) => a + n, 0);
+      const out = [];
+      if (sum !== B_ANCHOR_E161.total) out.push(`逐条次数之和 ${sum} ≠ 冻结点 ${B_ANCHOR_E161.total}`);
+      if (at.length !== B_ANCHOR_E161.files) out.push(`文件数 ${at.length} ≠ 冻结点 ${B_ANCHOR_E161.files}`);
+      const sha12 = require('node:crypto').createHash('sha256')
+        .update(at.map(([f, n]) => `${f}|${n}`).join('\n')).digest('hex').slice(0, 12);
+      if (sha12 !== B_ANCHOR_E161.sha12) out.push(`逐条摘要 ${sha12} ≠ 冻结点 ${B_ANCHOR_E161.sha12}`);
+      return { ok: out.length === 0, out, sha12, sum, files: at.length };
+    };
+    const bAnchorDiffE161 = bAnchorDiffWith(B_REGISTRY_E161);
+    const bAuditNowE161 = bAuditE161(bDiskManagedE161, B_REGISTRY_E161);
+    const bTotalDiskE161 = Object.values(bDiskManagedE161).reduce((a, b) => a + b, 0);
+    const bEntriesTxt = Object.entries(B_REGISTRY_E161).sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([f, n]) => `\`${f}\`×${n}`).join('、');
+    t.check('E161-B① **B 档登记制（单文件删／非递归拆链）双向可证伪**：清单逐条带 `文件＋出现次数 max`，'
+      + '**多一处 ⇒ 红并指名（新增漂移）**、**少一处 ⇒ 红并报"名单陈旧"**（`E140`／`E145` 机制）；'
+      + '并给**冻结点锚点**（总次数／文件数／逐条 `sha12`，**常量、不由清单现算**）⇒ 清单被悄悄改过也当场显形',
+      bAuditNowE161.added.length === 0 && bAuditNowE161.over.length === 0 && bAuditNowE161.stale.length === 0
+        && bAnchorDiffE161.ok,
+      (bAuditNowE161.added.length || bAuditNowE161.over.length || bAuditNowE161.stale.length || !bAnchorDiffE161.ok)
+        ? `判红：新增/漂移 ${bAuditNowE161.added.length + bAuditNowE161.over.length} 处 —— `
+          + [...bAuditNowE161.added.map(h => `\`${h.file}\`：盘上 ${h.disk} 处、**清单里没有这个文件**（新增漂移）`),
+            ...bAuditNowE161.over.map(h => `\`${h.file}\`：盘上 ${h.disk} 处 > 登记 \`max: ${h.max}\`（超限）`)].join('；')
+          + `；**名单陈旧** ${bAuditNowE161.stale.length} 处 —— `
+          + bAuditNowE161.stale.map(h => `\`${h.file}\`：清单写 ${h.max} 处、盘上只剩 ${h.disk} 处`).join('；')
+          + `；**冻结点不符** ${bAnchorDiffE161.out.length} 项 —— ${bAnchorDiffE161.out.join('；')}`
+        : `双向一致：清单 ${bAnchorDiffE161.files} 个文件／合计 ${bAnchorDiffE161.sum} 处 ＝ 盘上实测 `
+          + `${Object.keys(bDiskManagedE161).length} 个文件／合计 ${bTotalDiskE161} 处；逐条摘要 \`sha12\` ${bAnchorDiffE161.sha12}`
+          + `（＝冻结点 ${B_ANCHOR_E161.sha12}）；新增 ${bAuditNowE161.added.length}／超限 ${bAuditNowE161.over.length}／陈旧 ${bAuditNowE161.stale.length}（都应 0）；`
+          + `清单逐条：${bEntriesTxt}`);
+    t.info(`\`E161\` 口径与存量（**现算**）：受管面 .js ${managedJsE161.length} 个`
+      + `（生产 ${prodJsE161.length} ＋ 测试/工具 ${managedJsE103.length}）；`
+      + `**A 档（零容忍）实测 ${aViolationsE161.length} 处违规**（含豁免共命中 ${aHitsManagedNoExempt.length} 处，`
+      + `豁免＝${RM_API_EXEMPT_E161.map(e => `${e.file}:${e.line}`).join('、')}）；`
+      + `**B 档（登记制）${bTotalDiskE161} 处／${Object.keys(bDiskManagedE161).length} 个文件**（冻结点 ${B_ANCHOR_E161.total}／${B_ANCHOR_E161.files}，`
+      + `逐条摘要 \`sha12\` ${bAnchorDiffE161.sha12}）；分面口径：${VERIFY_FACE_SCOPE_E161.join('；')}`);
+    /* `._verify` 面：**只报数、不判红**（本件是步 1；步 2 把它纳进来）。
+       为什么必须报数而不能不看不提：`E130` 的立案就是因为"这一面一根判据都没有"而标题却像全仓已守
+       （`D19` 同类偏差）——"当前不动"必须是**看得见的**决定，不是沉默。 */
+    const aHitsVerifyE161 = aHitsE161(verifyJsE103).filter(h => !RM_API_EXEMPT_E161.some(e => e.file === h.file && e.line === h.line));
+    const bDiskVerifyE161 = countSingleFileE161(verifyJsE103);
+    const bTotalVerifyE161 = Object.values(bDiskVerifyE161).reduce((a, b) => a + b, 0);
+    t.info(`\`E161\` **\`._verify\\\` 分面报数（本批不判红，**步 2** 再议）**：A 档命中 **${aHitsVerifyE161.length} 处**`
+      + `（其中递归形态 ${aHitsVerifyE161.filter(h => /recursive/.test(h.rule)).length} 处）；`
+      + `B 档（单文件删）**${bTotalVerifyE161} 处／${Object.keys(bDiskVerifyE161).length} 个文件**。`
+      + `⚠ 这一面被 gitignore，但**不是法外之地**（` + '`E46`' + ` 的真毁伤就发生在这里）；`
+      + `本批**没有**为它迁移或判红，故**不得**把"受管面 A 档 ＝ 0"读成"全仓 A 档 ＝ 0"。`);
+
+    /* ---------------- 乙-C：D22（8 个变异体，每个必红 ＋ 指名） ＋ 负对照 ---------------- */
+    const Q3_E161 = String.fromCharCode(39);
+    const NAME_RM = 'rm' + 'Sync';                 /* 拼接构造：避免本文件（受管面）被自己的靶子字符串命中 */
+    const NAME_RMDIR = 'rmdir' + 'Sync';
+    const NAME_RM_P = 'rm';
+    const ROBOC = 'robo' + 'copy';
+    const MIR = '/' + 'MIR';
+    const RD_S = 'rd' + ' ' + '/' + 's';
+    const samplesE161 = [
+      { key: '㈠ `fs.rmdirSync(…,{recursive:true})`（旧判据零命中的第 1 种拼写出口）',
+        src: `const t = one();\nfs.${NAME_RMDIR}(t, { recursive: true, force: true });\n` },
+      { key: '㈡ **静态解构**：`const {rmSync} = require(' + Q3_E161 + 'fs' + Q3_E161 + ')` 后直接调',
+        src: `const { ${NAME_RM} } = require(${Q3_E161}fs${Q3_E161});\n${NAME_RM}(t, { recursive: true, force: true });\n` },
+      { key: '㈢ **动态取用**：`fs[' + Q3_E161 + 'rmSync' + Q3_E161 + ']`（旧判据零命中的第 5 种）',
+        src: `const t = one();\nfs[${Q3_E161}${NAME_RM}${Q3_E161}](t, { recursive: true, force: true });\n` },
+      { key: '㈣ **`path.join` 形态**：`fs.rmSync(path.join(base,t),{recursive:true})`（旧式子的 `[^)]*` 跨不过内层 `)`）',
+        src: `fs.${NAME_RM}(path.join(base, t), { recursive: true, force: true });\n` },
+      { key: '㈤ **`fs.promises.rm`**（与 `rmSync` 逐字同源的 Promise 版）',
+        src: `await fs.promises.${NAME_RM_P}(t, { recursive: true, force: true });\n` },
+      { key: '㈥ **外调 shell 递归删**：`spawnSync(' + Q3_E161 + ROBOC + Q3_E161 + ', [… MIR])`',
+        src: `const r = spawnSync(${Q3_E161}${ROBOC}${Q3_E161}, [empty, link, ${Q3_E161}${MIR}${Q3_E161}]);\n` },
+      { key: '㈦ **`fs.rm`（顶层回调版）**',
+        src: `fs.${NAME_RM_P}(t, { recursive: true }, cb);\n` },
+      { key: '㈧ **`' + RD_S + '`**（shell 的另一支；靶子形态**拼接构造**，避免本文件自伤）',
+        src: `execSync(${Q3_E161}cmd /c ${RD_S} /q ${Q3_E161} + link);\n` },
+      { key: '★负对照：走**唯一出口** `env.removeLinkSafe(x,{recursive:true})`',
+        src: `if (env.isLink(t)) { env.removeLinkSafe(t, { recursive: true, force: true }); }\n`,
+        negative: true }
+    ];
+    const BLANK_SCAN_E161 = () => [];             /* 空白基准：什么都不干 ⇒ 好的 D22 样本在这里必须是 0 */
+    const RUN_SCAN_E161 = (code) => [...scanRmApiStrippedE161(code), ...scanToolShellE161(code)];
+    for (const s of samplesE161) {
+      s.blank = sampleDualE161(BLANK_SCAN_E161, s.src).hits;
+      s.pred = sampleDualE161(RUN_SCAN_E161, s.src).hits;
+    }
+    const posSamplesE161 = samplesE161.filter(s => !s.negative);
+    const negSampleE161 = samplesE161.find(s => s.negative);
+    t.check('E161-C① D22（可证伪，**8 个阳性变异体 ＋ 1 个负对照，全部走 `dualScanE160` 这同一把尺子**）：'
+      + '㈠递归形态 `rmdirSync` ㈡静态解构 ㈢动态取用（方括号取 `rmSync`）㈣`path.join` 形态 '
+      + '㈤`fs.promises.rm` ㈥robocopy 镜像开关 ㈦`fs.rm` 顶层回调版 ㈧' + RD_S + ' '
+      + '—— **每一个都必须命中并指名规则；每一个在"空白基准"下必须 0 命中**（否则 D22 证明的是"样本自伤"、'
+      + '与主判据无关，`E153` 的教训）；**负对照**（走唯一出口 `env.removeLinkSafe`）**必须 0 命中**（防恒红式）',
+      posSamplesE161.length === 8 && samplesOkE160(posSamplesE161) && negSampleE161.pred.length === 0
+        && negSampleE161.blank.length === 0
+        && posSamplesE161.every(s => s.pred.some(h => h.rule)
+          && s.pred.some(h => h.line === (s.src.split('\n').length - 1))),
+      `阳性变异体 ${posSamplesE161.length} 个（应 8）—— `
+        + posSamplesE161.map(s => `${s.key.split('（')[0]}：命中 ${s.pred.length} 处`
+          + `（${s.pred.map(h => `L${h.line} ${h.rule}`).join('；')}）／空白基准 ${s.blank.length}`).join(' ｜ ')
+        + `；负对照：命中 ${negSampleE161.pred.length} 处（应 0，样本＝\`${negSampleE161.src.trim()}\`）`);
+    t.check('E161-C② D22（**豁免的"恰好一处"也可证伪**）：把豁免清单里 `tests\\env.js` 的计数改成 **2**'
+      + '（＝"这个文件允许两处递归删"）⇒ 同一判据**必红并指名 `tests\\env.js`**（`E151` 的病：'
+      + '豁免一旦退化成文件级/放宽计数，同文件的第 2 处就静默通过）',
+      (() => {
+        const two = RM_API_EXEMPT_E161.concat([{ file: 'tests\\env.js', line: 241, api: 'fs.rmSync', why: '人为把豁免计数改成 2（内存副本）' }]);
+        /* 同一判据、只换豁免清单：命中数不再等于 1 ⇒ A② 必须红并指名 */
+        const matched = two.map(e => aHitsManagedNoExempt.filter(h => h.file === e.file && h.line === e.line));
+        const passTwo = two.length === 1 && matched.every(x => x.length === 1);
+        return passTwo === false && two.every(e => e.file === 'tests\\env.js');
+      })(),
+      `豁免改成 2 条（同一 ` + '`文件:行号`' + ` 写两遍）⇒ 原判据（"豁免恰好 1 条且命中恰好 1 次"）判红＝true；`
+        + `**指名**：\`tests\\env.js:241\`（豁免数 2 ≠ 1）—— 盘上文件全程只读（内存副本）`);
+    t.check('E161-C③ D22（**B 档双向 ＋ 冻结点都可证伪**，`E145` 机制）：**内存副本**里'
+      + '㈠让盘上**多出一个文件**（`._verify` 里新写一支探针的等价形态）⇒ 同一 `bAuditE161()` 必须把它列进 `added`'
+      + '（**"新增漂移" ⇒ 红并指名该文件**）；'
+      + '㈡让盘上**少一个文件**（把盘上副本里的一个文件拿掉）⇒ 同一纯函数必须把清单里那一条列进 `stale`'
+      + '（**报"名单陈旧" ⇒ 红**）；'
+      + '㈢**把一个文件的次数改成比盘上少 1**（盘不变）⇒ 进 `changed`／`stale`（红）；'
+      + '㈣**加一个盘上没有的文件** ⇒ 进 `added`（红）；'
+      + '㈤**只动清单、不动盘**（改一个文件的次数）⇒ 冻结点摘要 `sha12` **必不符**并指名 —— '
+      + '这一条证明"锚点不是清单对自己的复读"（`E145` 的教训：用现算值当锚点 ⇒ 恒真、零证伪能力）',
+      (() => {
+        const a1 = bAuditE161({ ...bDiskManagedE161, 'tests\\._verify\\zz-e161-synth.js': 1 }, B_REGISTRY_E161);
+        const diskLess = { ...bDiskManagedE161 };
+        delete diskLess['tests\\docs-cross-check.js'];                  /* 盘上少一个（内存副本） */
+        const a2 = bAuditE161(diskLess, B_REGISTRY_E161);
+        const under = { ...B_REGISTRY_E161 };
+        const k2 = Object.keys(B_REGISTRY_E161).find(f => B_REGISTRY_E161[f] > 1);
+        under[k2] = B_REGISTRY_E161[k2] - 1;
+        const a3 = bAuditE161(bDiskManagedE161, under);
+        const a4 = bAuditE161({ ...bDiskManagedE161, 'tests\\._verify\\zz-e161-synth2.js': 1 }, B_REGISTRY_E161);
+        const a5 = bAnchorDiffWith(under);
+        return a1.added.length === 1 && a1.added[0].file === 'tests\\._verify\\zz-e161-synth.js'
+          && a2.stale.length === 1 && a2.stale[0].file === 'tests\\docs-cross-check.js'
+          && (a3.over.length + a3.stale.length + a3.changed.length) >= 1
+          && (a3.over.some(x => x.file === k2) || a3.stale.some(x => x.file === k2) || a3.changed.some(x => x.file === k2))
+          && a4.added.length === 1 && a4.added[0].file === 'tests\\._verify\\zz-e161-synth2.js'
+          && a5.ok === false && a5.out.some(s => s.includes('冻结点'));
+      })(),
+      `㈠盘上多一个文件（\`tests\\._verify\\zz-e161-synth.js\`）⇒ added ${bAuditE161({ ...bDiskManagedE161, 'tests\\._verify\\zz-e161-synth.js': 1 }, B_REGISTRY_E161).added.length} 条（应 1，**报"新增漂移"并指名**）；`
+        + `㈡盘上少一个文件（\`tests\\docs-cross-check.js\`）⇒ stale ${bAuditE161((() => { const d = { ...bDiskManagedE161 }; delete d['tests\\docs-cross-check.js']; return d; })(), B_REGISTRY_E161).stale.length} 条（应 1，**报"名单陈旧"**）；`
+        + `㈢某文件次数在清单里改小 1（盘不变）⇒ over ${bAuditE161(bDiskManagedE161, (() => { const s = { ...B_REGISTRY_E161 }; const k = Object.keys(s).find(f => s[f] > 1); s[k] -= 1; return s; })()).over.length} 条（应 ≥ 1，红并指名）；㈣加一个盘上没有的文件 ⇒ added 1 条（红）；`
+        + `㈤把 ` + '`max`' + ` 改小 1 后比冻结点 ⇒ ${bAnchorDiffWith((() => { const s = { ...B_REGISTRY_E161 }; const k = Object.keys(s).find(f => s[f] > 1); s[k] -= 1; return s; })()).out.join('；')}（应至少 1 项，**锚点真的在挡**）`);
+    /* 负对照（本件要求"防恒红"）：把**盘上真文件**的某一处单文件删改成走出口 ⇒ B 档命中数必须**下降**
+       （且盘上逐字节未变）。这是"判据不是恒红式"的**真文件级**证据（合成样本那一条是 C① 的负对照）。 */
+    {
+      const targetE161 = path.join(env.paths.root, 'tests', 'preflight.js');
+      const bytesE161 = fs.readFileSync(targetE161);
+      const srcE161 = bytesE161.toString('utf8');
+      const before = scanSingleFileRmE161(stripLiterals(srcE161));
+      const guardCall = 'env.removeLinkSafe(probeFile, { force: true })';
+      const mutated = srcE161.replace('fs.' + 'rmSync(probeFile, { force: true })', guardCall);
+      const after = mutated === srcE161 ? before : scanSingleFileRmE161(stripLiterals(mutated));
+      const diskSame = Buffer.compare(bytesE161, fs.readFileSync(targetE161)) === 0;
+      t.check('E161-C④ **负对照（防"恒红式"，用盘上真文件的内存副本）**：把 `tests\\preflight.js` 里那处'
+        + '`fs.rmSync(probeFile, { force: true })`（单文件删）**改走唯一出口 `env.removeLinkSafe(...)`** ⇒ '
+        + 'B 档在同一判据下的命中数**必须下降**（从 1 → 0）⇒ 判据能区分"裸删"与"规范写法"；'
+        + '盘上文件**逐字节未变**',
+        before.length === 1 && mutated !== srcE161 && after.length === 0 && diskSame,
+        mutated === srcE161
+          ? `（样本不匹配：\`tests\\preflight.js\` 里找不到那处调用 ⇒ 本负对照未执行，**不算通过**）`
+          : `原件 B 档命中 ${before.length} 处（应 1：${before.map(h => 'L' + h.line).join('、')}）⇒ `
+            + `内存副本改成 \`${guardCall}\` 后命中 ${after.length} 处（应 0）；`
+            + `盘上 \`tests\\preflight.js\` 逐字节未变=${diskSame}`);
+    }
+  }
+
   /* ==================== 甲-A：静态禁入清单 ==================== */
   const BAN_PATTERNS_E103 = [
     ['robocopy 外部镜像复制工具', /\brobocopy\b/],
@@ -10539,7 +11501,9 @@ function e103LinkSafetyChecks(t) {
   const VERIFY_TOOL_KIND_WHY_E103 = {
     /* ⚠ 拼接构造（**实测踩过两次**）：把 `rmdir` 与 `/s` 开关**逐字**写在一个字符串里，本文件自己
        （受管面）就会先命中 A④ 的"字符串里的 /s 开关" ⇒ 判据自伤假红。故这里只拼接、不抄写。 */
-    real: '`E46` 取证探针：**故意**真调 `robocopy … /MIR`／`' + ('rmdir' + ' /' + 's')
+    real: '`E46` 取证探针：**故意**真调 robocopy 的**镜像开关**（本处**故意不逐字写出该开关** —— '
+      + '逐字写出来，本文件自己（受管面）就会先命中 `E161` 的外调形态判据 —— `E103-A④` 的'
+      + '「判据自伤」实测踩过两次）／ `' + ('rmdir' + ' /' + 's')
       + '` 实测"会穿链毁伤"（受控复现，目标 5 → 0）——它们是 `E103` 立案的实物，也是"为什么必须有这道闸"的证据',
     artifact: '**词形撞车**（不是调用）：`E103` 自己的**形态样本表**（`e103-block.js`／`e103-A-stringface.js`／`e103-census*.js`）与 `C·21` 的普查脚本把"被禁工具名"与"`/s` 开关"当作**靶子字符串**写在数组里（形态样本必须逐字写出来才测得了判据）—— "保留字符串"的口径下它们必然命中。⚠ **本处故意不复述那两个字符串**：一复述，本节自己（受管面）就会先命中 A④（**实测踩过**，见 `T-20261004-14` 回执），所以这里只描述、不抄写'
   };
@@ -10606,6 +11570,64 @@ function e103LinkSafetyChecks(t) {
       && gitGoodHits.length === 0,
     `坏样本命中 ${gitBadHits.length} 处（${gitBadHits.map(h => `L${h.line}:${h.pat}`).join('、')}，应 2 且两类各 1）；`
       + `好样本命中 ${gitGoodHits.length} 处（应 0：注释被剥、否定句不构成调用形态）`);
+
+  /* ==================== `E160` 的双路复核（**`E103` 那一族自己的读数**） ====================
+     `E160` 的交付 2 要求：**`E103` 那一族的判据同时跑"剥离后的视图"与"原样字节"两路**
+     （原样路负责覆盖剥离器盲区），并给出**合成读数**（哪一路命中、命中在哪）。
+     为什么这里的口径是"**剥离路判红 ＋ 原样路留痕**"而**不是**"两路都判红"：
+     原样路看到的**本来就包含字面量内容** —— 本仓 `tests\env.js` 的注释里**逐字**写着被禁形态、
+     `E103` 自己的形态样本表也把靶子字符串写在数组里 ⇒ 若原样路也判红，本判据会**自伤假红**
+     （`E103-A④` 的"判据自伤"实测踩过两次）。故：
+       · **剥离路**＝判据本体（`A①②④⑥／B①⑥` 里已有的那些 check，一个字都没改）；
+       · **原样路**＝**第二路**，逐类报数 ＋ 与剥离路之差（＝"盲区里的形状"）**每轮留痕**
+         ⇒ 盲区**不再隐形**；差的读数是 `:行号` 级的（本文件 858 行盲区里那几处就在这里显形）。
+     ⚠ `dualScanE160()`（顶层，`E160-⑥` 与 `E161` 的 D22 也用它）是**同一个纯函数** —— `E153` 的教训。 */
+  {
+    const dualForE103 = (abs, pred) => dualScanE160(readOrEmpty(abs), pred);
+    /* ⚠ **归一化**：`scanRmViolations` 的返回形态与另两个不同（`{id,count,lines[]}` 而不是 `{line}`）——
+       两路复核要求"同一个谓词输出同一种取值对象"（`E153`），故这里把它**适配**成 `{line}`，
+       而**不改**判据本体（判据仍用原函数的返回值判红）。 */
+    const scanRmAsLinesE103 = (code) => scanRmViolations(code)
+      .flatMap(v => v.lines.map(line => ({ line, rule: `裸递归删 id=${v.id}` })));
+    const DUAL_RULES_E103 = [
+      ['A①② 静态禁入清单（robocopy／readdirSync(recursive)／rmdir 与 rd 的 /s）', scanBanlist],
+      ['A④⑥ 外部工具调用形态（引号工具名作实参／字符串里的 /s 开关）', scanToolCalls],
+      ['甲-B 裸递归删（fs.rmSync(<标识符>,…recursive:true) 家族）', scanRmAsLinesE103]
+    ];
+    const dualRowsE103 = [];
+    for (const [name, pred] of DUAL_RULES_E103) {
+      for (const abs of allJsE103) {
+        const d = dualForE103(abs, pred);
+        dualRowsE103.push({
+          rule: name, file: relOfE103(abs),
+          stripped: d.stripped.length, raw: d.raw.length, onlyRaw: d.onlyRaw.length,
+          onlyRawLines: d.onlyRaw.slice(0, 8).map(h => h.line)
+        });
+      }
+    }
+    const sumOf = (k) => dualRowsE103.reduce((a, r) => a + r[k], 0);
+    const onlyRawRows = dualRowsE103.filter(r => r.onlyRaw > 0).sort((a, b) => b.onlyRaw - a.onlyRaw);
+    t.check('E160-⑦ **`E103` 那一族的双路复核（同一纯函数 `dualScanE160`，合成读数逐类给出）**：'
+      + '该族的三类判据（静态禁入清单／外部工具调用形态／裸递归删家族）**同时**跑'
+      + '①剥离路（判据本体，判红用）②**原样字节路**（第二路，覆盖剥离器盲区）；'
+      + '两路的**总命中数与"只在原样路命中"的条数逐类现算并留痕**，'
+      + '且"只在原样路"的那些**必须逐条给 `文件:行号`**（盲区不许隐形）',
+      dualRowsE103.length === DUAL_RULES_E103.length * allJsE103.length && sumOf('raw') >= sumOf('stripped'),
+      `逐类读数（面＝全部 ${allJsE103.length} 个 .js）：`
+        + DUAL_RULES_E103.map(([name]) => {
+          const rs = dualRowsE103.filter(r => r.rule === name);
+          return `${name} → 剥离路 ${rs.reduce((a, r) => a + r.stripped, 0)} 处／原样路 ${rs.reduce((a, r) => a + r.raw, 0)} 处／`
+            + `**只在原样路 ${rs.reduce((a, r) => a + r.onlyRaw, 0)} 处**`;
+        }).join('；')
+        + `。**只在原样路命中**的文件（前 6）：`
+        + (onlyRawRows.slice(0, 6).map(r => `\`${r.file}\`[${r.rule.split(' ')[0]}] ${r.onlyRaw} 处 @ ${r.onlyRawLines.map(n => ':' + n).join('、')}`).join('；') || '无')
+        + `（共 ${onlyRawRows.length} 个文件有此类命中 —— 这些就是"剥离路看不见、必须由第二路报告"的形状）`);
+    t.info(`\`E160-⑦\` **` + '`E103`' + ` 那一族的双路读数（每轮可见）**：`
+      + `原样路命中合计 ${sumOf('raw')} 处、剥离路合计 ${sumOf('stripped')} 处、`
+      + `**只在原样路** ${sumOf('onlyRaw')} 处（分布见 ` + '`E160-⑦`' + ` 的详情；本节 ` + '`PASS`' + ` 详情不打印，故此处再给总数）—— `
+      + `⚠ 判红一律以**剥离路**为准（原样路会看到注释/字符串里的说明文字与靶子字符串，两路都判红就自伤）；`
+      + `原样路的作用是**把盲区里的形状报出来**，不是"多一条判红条件"。`);
+  }
 
   t.info(`E103/E97 扫描面：磁盘上的 ${allJsE103.length} 个 .js（受管 ${managedJsE103.length} ＋ \`._verify\\\` ${verifyJsE103.length}；`
     + `tests\\**\\*.js ＋ tools\\**\\*.js，**不看 git 跟踪状态**）；禁令形态 ${BAN_PATTERNS_E103.length} 类；`
