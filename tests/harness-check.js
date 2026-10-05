@@ -11447,13 +11447,30 @@ t.section('二十六、`E72①⑥⑦⑧`（开工数跨实现可证伪／`addRun
 
   const e72Tmp = harness.makeTempDb({ name: 'e72-started-qty' });
   dbApiE72.initSchema(e72Tmp.db, '2026-10-05 08:00:00');
-  /* 窗口先由**班次真源**现算（不写死时刻），再造落在窗口内的帧 —— "帧的时间戳必须落在当班窗口"
-     是这条对账的**共同前提**，两边用的是同一个窗口。 */
+  /* ⚠ **`T-20261005-28`（本条的时钟依赖修复）—— 改这里之前先读完这一段** ---------------------
+     病灶（盘上实测的假红，`T-20261005-21` 交付时是绿的）：本用例把"当班窗口"由**班次真源现算**，
+     却把**实现侧的时刻**交给了**系统时钟** —— `createStateSnapshot()` 的 `now` 选项要的是**时钟函数**
+     （`() => Date`，见 `stateSnapshot.js:571-573`：不是函数就回落 `platformClock.createClock({mode:'real'})`），
+     而 `snapshot()` **无参**（`stateSnapshot.js:865`：`const now = platformClock.toDate(nowFn())`）
+     ⇒ 旧写法 `createStateSnapshot({ …, now: '2026-10-05 10:00:00' })` 与 `snapshot('2026-10-05 10:00:00')`
+     **传进去的字符串被整个忽略**，实现侧用的是**跑门禁那一刻的真实时刻**。
+     后果：夹具的帧写死在 08:00:01~08:00:05（早班窗口），而实现侧的窗口 = `shift.at(真实时刻)` ⇒
+     **真实时刻落在早班（08:00~16:00）时，两边同窗、绿色**；一旦真实时刻越过 16:00（或早于 08:00），
+     实现侧换到中班／晚班窗口 ⇒ 该窗口内一帧都没有 ⇒ `startedQty=0` 而自写 SQL（按夹具窗口）读 3
+     ⇒ 本条与 `E72①-D22` **同刻双红**。实测：`2026-10-05 15:xx` 绿、`2026-10-05 17:26` 红。
+     修法（**只修判据、不动实现、不放宽期望**）：窗口与实现侧时刻**都由同一个固定时刻派生** ——
+     注入 `createClock({ mode:'fixed', at: E72_AT })`（`tests\lib\clock.js` 的夹具时钟，
+     与 `platform/clock.js` 的共同子集就是 `source()`，`stateSnapshot.js:571` 认这个形状），
+     帧也由**同一个窗口**的 `win.start` 推出 ⇒ **与本机系统时钟、与"跑在哪个班次"完全无关**，
+     在任何时刻、任何机器上都复现同一结论（门禁的可重复性要求；见回执"为什么不能依赖系统时钟"）。
+     期望值一个字都没放宽：仍是 `refStartedE72 === implStartedE72 && refStartedE72 === 3`
+     与 `rowsE72 === 4 && implStartedE72 === 3`。 */
+  const E72_AT = '2026-10-05 10:00:00';              /* 唯一固定时刻（班次窗口与实现侧时刻同源） */
   const rulesE72 = createShiftRules(boardConfig.shift);
-  const shiftE72 = rulesE72.at('2026-10-05 10:00:00');
+  const shiftE72 = rulesE72.at(E72_AT);
   if (!shiftE72) {
-    t.requires('E72① 前提：班次真源能给出 2026-10-05 10:00 所属班次（窗口与时刻都由它现算）',
-      false, 'createShiftRules(boardConfig).at(\'2026-10-05 10:00:00\') 返回 null');
+    t.requires('E72① 前提：班次真源能给出固定时刻所属班次（窗口与实现侧时刻都由它派生）',
+      false, `createShiftRules(boardConfig.shift).at('${E72_AT}') 返回 null`);
   }
   const winE72 = shiftE72 ? { start: shiftE72.startAt, end: shiftE72.endAt } : e72Win;
   /** 把 `win.start` 往后推 n 秒（DR-16 文本 `YYYY-MM-DD HH:MM:SS`）—— 保证帧**确实落在窗口内**。
@@ -11479,9 +11496,12 @@ t.section('二十六、`E72①⑥⑦⑧`（开工数跨实现可证伪／`addRun
   insFrameE72('T1', 2, 3);
   insFrameE72('T2', 1, 4);
   insFrameE72('T2', null, 5);     // 缺件序号帧（**不得**计入）
-  /* 实现侧读数：**与生产同一口**（`createStateSnapshot()`；不另写第二份取数） */
-  const snapshotFnE72 = snapshotSvcE72.createStateSnapshot({ db: e72Tmp.db, config: boardConfig, now: '2026-10-05 10:00:00' });
-  const snapE72 = snapshotFnE72('2026-10-05 10:00:00');
+  /* 实现侧读数：**与生产同一口**（`createStateSnapshot()`；不另写第二份取数）
+     ⚠ `now` **必须传时钟函数**（`nowFn` 形态），不能传时刻字符串 —— 传字符串会被静默忽略并回落
+     系统时钟（`T-20261005-28` 的病灶，见本段开头那一段）。这里给的是**与窗口同源**的固定夹具时钟。 */
+  const clockE72 = createClock({ mode: 'fixed', at: E72_AT });
+  const snapshotFnE72 = snapshotSvcE72.createStateSnapshot({ db: e72Tmp.db, config: boardConfig, now: clockE72.source() });
+  const snapE72 = snapshotFnE72();                    /* `snapshot()` 无参：时刻只由注入时钟给（D17） */
   const implStartedE72 = snapE72 && snapE72.stats ? snapE72.stats.startedQty : null;
   const refStartedE72 = startedSupersetE72(e72Tmp.db, winE72);
 
@@ -11489,7 +11509,9 @@ t.section('二十六、`E72①⑥⑦⑧`（开工数跨实现可证伪／`addRun
     '＝自写**超集 SQL** 现算（`COUNT(DISTINCT unit_index) WHERE unit_index IS NOT NULL AND collect_time ∈ 当班窗口`）；' +
     '②**合成序列证伪构造本身**：同一件两帧 ⇒ 只计 1 件（`COUNT(*)` 会多算 ⇒ 与去重口径**必不同**）、' +
     '缺件序号帧 ⇒ 不计入（`unit_index IS NULL` 被排除 ⇒ 与既有无件序号口径一致）、窗口半开区间 ⇒ 上沿那一帧不计；' +
-    '③读数以**当班窗口**为准（窗口由 `shift.at()` 现算，不写死时刻）',
+    '③读数以**当班窗口**为准（窗口由 `shift.at()` 现算），且**实现侧时刻走注入时钟**' +
+    '（`createClock({mode:\'fixed\', at})`）⇒ 与本机系统时钟／当前班次无关（`T-20261005-28` 修的红：' +
+    '旧写法把时刻字符串传给 `now` 会被静默忽略、回落真实时钟 ⇒ 过了 16:00 当场双红）',
     refStartedE72 === implStartedE72 && refStartedE72 === 3 &&
     e72Synth.distinctPairs === 3 && e72Synth.distinctUnits === 2 && e72Synth.rows === 4 &&
     e72Synth.distinctPairs !== e72Synth.rows && e72Synth.distinctUnits !== e72Synth.distinctPairs,
