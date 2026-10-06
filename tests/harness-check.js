@@ -7073,6 +7073,248 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       }
     })(), '变异内容：finalExitCode 只 `return verdict.exitCode ?? 0`（删掉 failed/unverified 那一支）；'
       + '变异后实测：failed=1/verdict=0 → 0 且 unverified=1 → 0（红）；恢复后实测：failed=1 → 1、干净轮 → 0（绿）');
+
+  /* ==========================================================================
+     **`E180`（`T-20261006-06`，座位 4b）：轮尾结论**三态**的真值表 ＋ 两支定点变异（D22）**
+     --------------------------------------------------------------------------
+     被测实现（`T-20261006-05` 由座位 4 落地，**本段一字不改 `run-all.js`**）：
+     `concludeVerdict({ failedSuites, unverifiedSuites, registeredDeviation, measuredDeviations })`
+     ⇒ `{ state: 'green' | 'registered-only' | 'real', line }`，与 `registeredDeviationBudget()`。
+     纪律（`E51`／`E190` 同族）：三态判据**只有一处真源**＝那个纯函数 —— 本段**不重写**任何一条判据
+     （第二份口径迟早与第一份分叉），只喂输入、读输出；期望值也**现算**：失败断言名与条数从导出的
+     `REGISTERED_DEVIATIONS` 取，不手抄（ADR-0004 D19）。
+     两条硬约束（本段逐条守）：①非全绿各句都带机器 token `门禁结论：不通过`（§14 上方已有静态断言
+     要求 ≥4 处且都带 token）；②态②的 `仅剩已登记偏差` 是稳定子串，且**退出码仍为 1**（态②不退 0）。
+     态②里"未核实集合为空"是**保留的收紧**（那句文案写着"真实缺陷 0"）—— 本段把它当成**必守的一条**
+     写进真值表，**不许**放宽（D22 变异㈡专门证明它承重）。
+     D22 两支变异都在 **`Module._compile` 的内存副本**上做（与上方变异⑤同一手法）：不写临时文件、
+     不碰仓库；盘上 `run-all.js` 逐字节未变由本段末尾自证。
+     证据（本段实跑读数）见 `tests\._verify\T-20261006-06\`。 */
+  const E180_TOKEN = '门禁结论：不通过';        /* 机器可读 token（8 字） */
+  const E180_REG_SUBSTR = '仅剩已登记偏差';      /* 态②新增稳定子串（7 字） */
+  const E180_HELD = '仍退 1';                   /* 态②文案里的退出码契约（4 字符） */
+  const sha12of = s => require('node:crypto').createHash('sha256').update(s).digest('hex').slice(0, 12);
+
+  /* 夹具一律**现算**：脚本名／失败断言名／条数全从导出的 `REGISTERED_DEVIATIONS` 取（D19）。 */
+  const regDocs = runAll6.REGISTERED_DEVIATIONS['docs-check'];
+  const docsOut = ['=== 汇总 ===', '通过 41 项，失败 2 项，跳过 0 项', '失败清单：']
+    .concat(regDocs.assertions.map((n, i) => `  ${i + 1}. ${n} —— 登记偏差`)).join('\n');
+  const docsDev = over => Object.assign({ suite: { name: 'docs-check' }, status: 'failed',
+    summary: { passed: 41, failed: regDocs.failedAssertions, skipped: 0 }, out: docsOut }, over);
+  const unregDev = { suite: { name: 'ui-check' }, status: 'failed',
+    summary: { passed: 0, failed: 5, skipped: 0 }, out: '' };
+
+  /* 打印点的**冻结措辞**（正则抽取，不手抄 —— 手抄那一份会在措辞改动后静默失效） */
+  const e180GreenLit = (runAllSrc6.match(/console\.log\('\\n(门禁全绿（无失败脚本）。)'\)/) || [])[1];
+  const e180RealLit = (runAllSrc6.match(/console\.log\('(门禁结论：不通过（有失败\/未核实脚本，见上面的明细）。)'\)/) || [])[1];
+  const e180GreenPrintHits = runAllSrc6.split("console.log('\\n门禁全绿（无失败脚本）。')").length - 1;
+  const e180RealPrintHits = runAllSrc6.split("console.log('门禁结论：不通过（有失败/未核实脚本，见上面的明细）。')").length - 1;
+
+  /* 真值表：**纯函数直调**（不起子进程、不跑 run-all 全量）。每行三件：输入 → 期望态 → 附加判据。 */
+  const E180_ROW_GREEN = {
+    id: '①失败与未核实都为空 ⇒ green（line 逐字等于「门禁全绿（无失败脚本）。」）',
+    mk: () => ({ failedSuites: [], unverifiedSuites: [] }),
+    expect: 'green',
+    extra: v => v.line === GREEN_LINE
+  };
+  const E180_ROW_REG = {
+    id: '②失败全是已登记偏差 且 实测 2 ≤ 预算 2 ⇒ registered-only',
+    mk: () => ({ failedSuites: [docsDev()], unverifiedSuites: [] }),
+    expect: 'registered-only',
+    extra: v => v.line.includes(E180_TOKEN) && v.line.includes(E180_REG_SUBSTR) && v.line.includes(E180_HELD)
+  };
+  const E180_ROW_BUDGET = {
+    id: '③承重支：同脚本 2×2 ⇒ 实测 4 > 预算 2 ⇒ real（不得被说成「已登记」）',
+    mk: () => ({ failedSuites: [docsDev(), docsDev()], unverifiedSuites: [] }),
+    expect: 'real',
+    extra: v => !v.line.includes(E180_REG_SUBSTR)
+  };
+  const E180_ROW_MEASURED = {
+    id: '③承重支（注入面）：measuredDeviations=3 > 预算 2 ⇒ real',
+    mk: () => ({ failedSuites: [docsDev()], unverifiedSuites: [], measuredDeviations: 3 }),
+    expect: 'real',
+    extra: v => !v.line.includes(E180_REG_SUBSTR)
+  };
+  const E180_ROW_UNVERIFIED = {
+    id: '③已登记失败 ＋ 未核实非空 ⇒ real（态②的「未核实为空」是保留的收紧）',
+    mk: () => ({ failedSuites: [docsDev()], unverifiedSuites: [{ suite: { name: 'browser-check' } }] }),
+    expect: 'real',
+    extra: v => !v.line.includes(E180_REG_SUBSTR)
+  };
+  const E180_ROW_UNVERIFIED_ONLY = {
+    id: '③只有未核实脚本（失败集合为空）⇒ real',
+    mk: () => ({ failedSuites: [], unverifiedSuites: [{ suite: { name: 'browser-check' } }] }),
+    expect: 'real'
+  };
+  const E180_ROW_UNREG = {
+    id: '③未登记的失败（ui-check 5 项）⇒ real',
+    mk: () => ({ failedSuites: [unregDev], unverifiedSuites: [] }),
+    expect: 'real'
+  };
+  const E180_ROW_MIXED = {
+    id: '③已登记 ＋ 未登记混合 ⇒ real',
+    mk: () => ({ failedSuites: [docsDev(), unregDev], unverifiedSuites: [] }),
+    expect: 'real'
+  };
+  const E180_ROW_ERROR = {
+    id: '③status=error 的失败 ⇒ real（「跑不起来」不许算已登记偏差）',
+    mk: () => ({ failedSuites: [docsDev({ status: 'error' })], unverifiedSuites: [] }),
+    expect: 'real'
+  };
+  const E180_ROWS = [E180_ROW_GREEN, E180_ROW_REG, E180_ROW_BUDGET, E180_ROW_MEASURED,
+    E180_ROW_UNVERIFIED, E180_ROW_UNVERIFIED_ONLY, E180_ROW_UNREG, E180_ROW_MIXED, E180_ROW_ERROR];
+  const e180RowOk = (mod, row) => {
+    const v = mod.concludeVerdict(row.mk());
+    return v.state === row.expect && (row.extra ? row.extra(v) : true);
+  };
+  const e180RowReading = (mod, row) => {
+    const v = mod.concludeVerdict(row.mk());
+    return `${v.state === row.expect ? 'OK ' : 'BAD'} state=${v.state}/期望 ${row.expect}｜line=${JSON.stringify(v.line)}`;
+  };
+
+  t.check('前置（`E180`）：`concludeVerdict`／`registeredDeviationBudget` 都是纯函数且已导出'
+    + '（真值表与 D22 都直接调它，不另写第二份三态口径）',
+    typeof runAll6.concludeVerdict === 'function' && typeof runAll6.registeredDeviationBudget === 'function',
+    `concludeVerdict=${typeof runAll6.concludeVerdict}｜registeredDeviationBudget=${typeof runAll6.registeredDeviationBudget}`);
+
+  /* 手写字面量自证（`E186` 的近距离防线）：码位数 ＋ 无不可见格式字符 ＋ 实现里找得到。 */
+  t.check('自证：本段手写的三个子串码位数正确且不含任何不可见格式字符（`E186`：看不见的字符会让"子串匹配"变成陷阱）',
+    Array.from(E180_TOKEN).length === 8 && Array.from(E180_REG_SUBSTR).length === 7
+      && Array.from(E180_HELD).length === 4
+      && ![E180_TOKEN, E180_REG_SUBSTR, E180_HELD].some(s => /[\u200B-\u200F\u2028-\u202E\uFEFF\uFFFD]/.test(s))
+      && [E180_TOKEN, E180_REG_SUBSTR, E180_HELD].every(s => runAllSrc6.includes(s)),
+    `token 码位数=${Array.from(E180_TOKEN).length}（应 8）｜登记子串=${Array.from(E180_REG_SUBSTR).length}（应 7）｜`
+      + `退出码子串=${Array.from(E180_HELD).length}（应 4）｜三个子串在 run-all.js 里均可见`);
+
+  const e180Budget = runAll6.registeredDeviationBudget();
+  const e180BudgetFromConst = Object.keys(runAll6.REGISTERED_DEVIATIONS)
+    .reduce((s, n) => s + runAll6.REGISTERED_DEVIATIONS[n].failedAssertions, 0);
+  const E180_BUDGET_CALL_ANCHOR = 'const budget = registeredDeviationBudget();';     /* ASCII */
+  const e180BudgetCallHits = runAllSrc6.split(E180_BUDGET_CALL_ANCHOR).length - 1;
+  t.check('前置（`E180` 态②的守据）：判据用的预算取自 `registeredDeviationBudget()`（同一真源、恰 1 处调用点）'
+    + '＋ 预算 > 0（否则态②不可达 ⇒ 本段②支退化成恒真）',
+    e180Budget === e180BudgetFromConst && e180Budget > 0 && e180BudgetCallHits === 1,
+    `预算=${e180Budget}（＝导出的 REGISTERED_DEVIATIONS 逐条 failedAssertions 之和 ${e180BudgetFromConst}）｜`
+      + `调用点 ${e180BudgetCallHits} 处（ASCII 锚点 ${JSON.stringify(E180_BUDGET_CALL_ANCHOR)}）`);
+
+  t.info('E180 三态真值读数（原实现，纯函数直调，不走 run-all 全量）：\n        '
+    + E180_ROWS.map((row, i) => `#${i + 1} ${e180RowReading(runAll6, row)}`).join('\n        '));
+  for (const row of E180_ROWS) {
+    t.check(`三态真值表 ${row.id}`, e180RowOk(runAll6, row), e180RowReading(runAll6, row));
+  }
+
+  const e180RegState = runAll6.concludeVerdict({ failedSuites: [docsDev()], unverifiedSuites: [] });
+  const e180RegCode = codeOf([docsDev()], [], verdictOf(0));
+  const e180CleanCode = codeOf([], [], verdictOf(0));
+  t.check('退出码：态②（`registered-only`）在 `finalExitCode({ failed, unverified, verdict: exitCode 0 })` 下**仍为 1**'
+    + ' —— 登记偏差只免"阻止对账"，不免退出码（`PROJECT_RULES` 9.5-5；态②**不退 0**）',
+    e180RegState.state === 'registered-only' && e180RegCode === 1 && e180CleanCode === 0,
+    `态② state=${e180RegState.state}｜同一轮失败集合过 finalExitCode ⇒ ${e180RegCode}（须 1）｜`
+      + `负对照 干净轮 ⇒ ${e180CleanCode}（须 0，否则"一律退 1"同样不可信）`);
+
+  const e180GreenFn = runAll6.concludeVerdict({ failedSuites: [], unverifiedSuites: [] }).line;
+  const e180RealFn = runAll6.concludeVerdict({ failedSuites: [docsDev({ status: 'error' })], unverifiedSuites: [] }).line;
+  t.check('漂移告警（`E180` 措辞的"打印点 ↔ 纯函数常量"两份同值副本）：态①／态③各一处、逐字相同、打印点唯一'
+    + '（一漂即红 —— 是否收敛成单一来源由主代理定，本段**不动实现**）',
+    e180GreenPrintHits === 1 && e180RealPrintHits === 1
+      && e180GreenLit === e180GreenFn && e180RealLit === e180RealFn,
+    `态①打印点（${e180GreenPrintHits} 处）${JSON.stringify(e180GreenLit)} vs 纯函数 ${JSON.stringify(e180GreenFn)}`
+      + `｜同值=${e180GreenLit === e180GreenFn}；态③打印点（${e180RealPrintHits} 处）${JSON.stringify(e180RealLit)}`
+      + ` vs 纯函数 ${JSON.stringify(e180RealFn)}｜同值=${e180RealLit === e180RealFn}`);
+
+  /* ---------------- D22 定点变异㈠：`registeredDeviationBudget()` 改成恒大值 ----------------
+     承重对象＝真值表那条 **③承重支**（`E180_ROW_BUDGET`）：实测 4 条 > 预算 2 条必须落 `real`。
+     变异一旦生效，"多出来的失败"就能被说成"已登记偏差" —— 正是"把真失败伪装成已登记"的口子。
+     变异锚点＝ASCII 的 `function registeredDeviationBudget() {`（自证恰 1 次；裸函数名在注释里出现多次，
+     故锚点必须带 `function` 与 `() {` 才唯一）。 */
+  const E180_BUDGET_FN_ANCHOR = 'function registeredDeviationBudget() {';
+  const e180BudgetFnSrc = runAllSrc6.match(/function registeredDeviationBudget\(\) \{[\s\S]*?\n\}/);
+  const e180BudgetFnHits = runAllSrc6.split(E180_BUDGET_FN_ANCHOR).length - 1;
+  const E180_MUT_BUDGET = 'function registeredDeviationBudget() {\n  return Number.MAX_SAFE_INTEGER;\n}';
+  const e180BytesBefore = REAL_READ.call(fs, path.join(__dirname, 'run-all.js'));
+  let e180MutA = null;
+  let e180MutAErr = '';
+  try {
+    if (!e180BudgetFnSrc || e180BudgetFnHits !== 1) {
+      throw new Error(`变异㈠锚点未命中或不唯一（hits=${e180BudgetFnHits}）`);
+    }
+    e180MutA = loadSourceVariant(runAllSrc6.replace(e180BudgetFnSrc[0], E180_MUT_BUDGET), path.join(__dirname, 'run-all.js'));
+  } catch (err) { e180MutAErr = (err && err.message) || String(err); }
+  let e180MutAReading = '';
+  t.check(`D22 变异㈠：把 \`registeredDeviationBudget()\` 改成恒大值（**内存副本**）⇒ 真值表「${E180_ROW_BUDGET.id}」**必红**`
+    + '（负对照＝原实现同一切面为绿）',
+    (() => {
+      if (!e180MutA) { t.info('变异㈠未执行：' + e180MutAErr); return false; }
+      const mutBudget = e180MutA.registeredDeviationBudget();
+      const mutRowOk = e180RowOk(e180MutA, E180_ROW_BUDGET);
+      const curRowOk = e180RowOk(runAll6, E180_ROW_BUDGET);
+      const mutGreenOk = e180RowOk(e180MutA, E180_ROW_GREEN);        /* 变异不得把一切都判红 */
+      const mutUnregOk = e180RowOk(e180MutA, E180_ROW_UNREG);
+      const mutState = e180MutA.concludeVerdict(E180_ROW_BUDGET.mk()).state;
+      e180MutAReading = `预算 ${e180Budget} → ${mutBudget}｜承重支 state：原 real → 变异 ${mutState}`
+        + `（该断言行 ${curRowOk ? '绿' : '红'} → ${mutRowOk ? '绿' : '**红**'}）`
+        + `｜同变异体下 态①=${mutGreenOk ? '仍绿' : '误红'}、未登记支=${mutUnregOk ? '仍 real' : '误判'}`;
+      return mutBudget > 1000000 && !mutRowOk && curRowOk && mutGreenOk && mutUnregOk;
+    })(),
+    `锚点 ${JSON.stringify(E180_BUDGET_FN_ANCHOR)}（ASCII）命中 ${e180BudgetFnHits} 处、切出 ${e180BudgetFnSrc ? e180BudgetFnSrc[0].length : -1} 字节；`
+      + `变异体＝内存副本（\`Module._compile\`，未落盘）｜${e180MutAReading || ('变异体未载入：' + e180MutAErr)}`);
+  /* `t.check` 的 detail 默认**只在 verbose 模式**打印（`lib\assert.js`）⇒ D22 的读数必须另外用 `t.info`
+     落进输出（本文件 §15 的既有口径），否则"可证伪"只存在于源码里、复核者看不见。 */
+  t.info(`D22 变异㈠ 读数（\`E180\`，承重对象＝「${E180_ROW_BUDGET.id}」）：`
+    + `锚点 ${JSON.stringify(E180_BUDGET_FN_ANCHOR)} 命中 ${e180BudgetFnHits} 处、切出 `
+    + `${e180BudgetFnSrc ? e180BudgetFnSrc[0].length : -1} 字节｜${e180MutAReading || ('变异体未载入：' + e180MutAErr)}`);
+
+  /* ---------------- D22 定点变异㈡：去掉态②定义里的"未核实集合为空" ----------------
+     承重对象＝真值表那条 **③已登记失败 ＋ 未核实非空**（`E180_ROW_UNVERIFIED`）。
+     去掉那一条之后，一个"拿不出证据"的轮次会被说成"仅剩已登记偏差、真实缺陷 0" —— 文案当场变假话。
+     变异锚点＝态②合取式的 **ASCII** 全文（自证恰 1 次）。 */
+  const E180_COND_ANCHOR = 'failed.length > 0 && unverified.length === 0 && accepted.length === failed.length && measured <= budget';
+  const E180_COND_MUT = 'failed.length > 0 && accepted.length === failed.length && measured <= budget';
+  const e180CondHits = runAllSrc6.split(E180_COND_ANCHOR).length - 1;
+  let e180MutB = null;
+  let e180MutBErr = '';
+  try {
+    if (e180CondHits !== 1) throw new Error(`变异㈡锚点未命中或不唯一（hits=${e180CondHits}）`);
+    e180MutB = loadSourceVariant(runAllSrc6.replace(E180_COND_ANCHOR, E180_COND_MUT), path.join(__dirname, 'run-all.js'));
+  } catch (err) { e180MutBErr = (err && err.message) || String(err); }
+  let e180MutBReading = '';
+  t.check(`D22 变异㈡：去掉态②定义里「未核实集合为空」那一条（**内存副本**）⇒ 真值表「${E180_ROW_UNVERIFIED.id}」**必红**`
+    + '（负对照＝原实现同一切面为绿）',
+    (() => {
+      if (!e180MutB) { t.info('变异㈡未执行：' + e180MutBErr); return false; }
+      const mutRowOk = e180RowOk(e180MutB, E180_ROW_UNVERIFIED);
+      const curRowOk = e180RowOk(runAll6, E180_ROW_UNVERIFIED);
+      const mutGreenOk = e180RowOk(e180MutB, E180_ROW_GREEN);        /* 变异不得把一切都判红 */
+      const mutRegOk = e180RowOk(e180MutB, E180_ROW_REG);            /* 态②本身不该被这次变异影响 */
+      const mutBudgetOk = e180RowOk(e180MutB, E180_ROW_BUDGET);      /* 承重支也不该被这次变异影响 */
+      const mutState = e180MutB.concludeVerdict(E180_ROW_UNVERIFIED.mk()).state;
+      e180MutBReading = `未核实支 state：原 real → 变异 ${mutState}`
+        + `（该断言行 ${curRowOk ? '绿' : '红'} → ${mutRowOk ? '绿' : '**红**'}）`
+        + `｜同变异体下 态①=${mutGreenOk ? '仍绿' : '误红'}、态②=${mutRegOk ? '仍 registered-only' : '误判'}、`
+        + `承重支=${mutBudgetOk ? '仍 real' : '误判'}`;
+      return !mutRowOk && curRowOk && mutGreenOk && mutRegOk && mutBudgetOk;
+    })(),
+    `锚点 ${JSON.stringify(E180_COND_ANCHOR)}（ASCII）命中 ${e180CondHits} 处；`
+      + `变异体＝内存副本（\`Module._compile\`，未落盘）｜${e180MutBReading || ('变异体未载入：' + e180MutBErr)}`);
+  t.info(`D22 变异㈡ 读数（\`E180\`，承重对象＝「${E180_ROW_UNVERIFIED.id}」）：`
+    + `锚点 ${JSON.stringify(E180_COND_ANCHOR)} 命中 ${e180CondHits} 处｜`
+    + `${e180MutBReading || ('变异体未载入：' + e180MutBErr)}`);
+
+  /* 未落盘自证：两支变异之后，盘上 `run-all.js` 的字节必须与本节开头那份**完全相同**。 */
+  const e180BytesAfter = REAL_READ.call(fs, path.join(__dirname, 'run-all.js'));
+  const e180AfterText = String(e180BytesAfter);
+  const e180MutStains = [E180_MUT_BUDGET, 'Number.MAX_SAFE_INTEGER', E180_COND_MUT];
+  t.check('自证（`E180` 两支 D22 的内存副本未落盘）：`tests\\run-all.js` 全程 sha256 未变、盘上内容 ≡ 本节源码副本、'
+    + '且盘上找不到任一变异体特征串',
+    sha12of(e180BytesBefore) === sha12of(e180BytesAfter)
+      && e180AfterText === runAllSrc6
+      && !e180MutStains.some(s => e180AfterText.includes(s)),
+    `sha12 ${sha12of(e180BytesBefore)} → ${sha12of(e180BytesAfter)}｜盘上 ≡ 本节源码副本=${e180AfterText === runAllSrc6}｜`
+      + `盘上含变异体特征串=${e180MutStains.filter(s => e180AfterText.includes(s)).length} 处（须 0）`);
+  t.info('E180 未落盘自证读数：`tests\\run-all.js` sha12 '
+    + `${sha12of(e180BytesBefore)} → ${sha12of(e180BytesAfter)}（未变=${sha12of(e180BytesBefore) === sha12of(e180BytesAfter)}）｜`
+    + `盘上内容 ≡ 本节源码副本=${e180AfterText === runAllSrc6}｜盘上含变异体特征串 `
+    + `${e180MutStains.filter(s => e180AfterText.includes(s)).length} 处（须 0）`);
 }
 
 /* ---------------- 十五、并行 runner 的调度契约（2026-09-29 新增） ----------------

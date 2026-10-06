@@ -1516,6 +1516,12 @@ async function main() {
     }
   };
 
+  /* `E180`：轮尾结论的**三态**判定（纯函数 `concludeVerdict`，判据与文案同处一地）。
+     只算一次、两个收尾分支共用：提前退出分支按它选"仅剩已登记偏差"还是既有措辞；
+     全绿分支**不看它**（态①的判据就是下面那个"失败与未核实都为空"，一个字都不许放宽）。
+     ⚠ 传入的是**本轮真实**的 `failed` / `unverified` 两个集合（含 `error` 状态 ⇒ 必落态③）。 */
+  const conclusion = concludeVerdict({ failedSuites: failed, unverifiedSuites: unverified });
+
   if (finalCode !== 0) {
     /* 不稳定轮：`authLine` 为空串，故这里不会打印对账行（T2 的冻结行为，由静态断言守着）。 */
     if (failedNote) console.log(failedNote);
@@ -1534,6 +1540,12 @@ async function main() {
          `console.log` 被 `process.exit` 截断（见上方 `authLine` 那段直写说明），而是**措辞分支不统一**。
          语义一字未减：仍写明"本轮结论不可作为证据"与"工作区在运行期间被改写"。 */
       console.log('门禁结论：不通过（**本轮结论不可作为证据**：工作区在运行期间被改写）。');
+    } else if (conclusion.state === 'registered-only') {
+      /* `E180` 态②：失败**全部**是 6.4 已登记偏差、且实测条数没超登记名单 ⇒ 打纯函数给出的那行
+         （含机器可读 token `门禁结论：不通过` 与稳定子串 `仅剩已登记偏差`）。放在 `verdict.exitCode`
+         那一支**之前**：态②的定义本身就要求 `verdict.exitCode === 0`，故先后不影响判定，只让分支意图更直白。
+         退出码不变 —— 下面照样 `process.exit(finalCode)`（有失败即 1，规范 9.5-5）。 */
+      console.log(conclusion.line);
     } else if (verdict.exitCode !== 0) {
       console.log('门禁结论：不通过（详见上面的失败原因）。');
     } else {
@@ -1602,6 +1614,102 @@ async function main() {
 
 /* 被 require 时**不执行**：`harness-check` 要直接引用 classify/parseSummary/authorityBlockers/
    REGISTERED_DEVIATIONS 做规则回归，不能因为 require 一下就把全部门禁跑一遍。 */
+/* ==========================================================================
+   **`E180`（2026-10-06）：轮尾结论的三态判定（`green` / `registered-only` / `real`）**
+   --------------------------------------------------------------------------
+   立案（技术债 `E180`，2026-10-05 主代理跑全量轮时实测）：权威对账**本来就**把 `docs-check`
+   那 2 条 `PROJECT_RULES` 6.4 **已登记偏差**当可接受（`authorityBlockers()` 放行；账本
+   `docs-check 41/2/0` 与权威区逐项相符），但**轮尾那一句**过去只有两种写法 —— 全绿，或
+   "不通过（有失败/未核实脚本，见上面的明细）" ⇒ **只差已登记偏差**的轮次（本仓的**常态**）
+   被读成"树坏了"。本函数把轮尾结论分成**三态**（判据与文案**同处一地**，本文件不另写第二份）：
+     · ① `green`：失败集合与未核实集合**都为空** ⇒ 现措辞"门禁全绿（无失败脚本）。"；
+     · ② `registered-only`：失败**全部**落入 `isRegisteredDeviation()`（6.4 登记偏差的**唯一**
+       判据），且**实测已登记偏差条数 ≤ 登记名单条数**（`registeredDeviationBudget()`）
+       ⇒ "仅剩已登记偏差 N 条…非待修缺陷、真实缺陷 0、按 9.5-5 仍退 1"；
+     · ③ `real`：其余一切 —— 含**承重**情形"实测条数 > 登记名单条数"（**超出登记口径**的失败，
+       绝不许被说成"已登记"；这是本条防"把真失败伪装成已登记"的那一支）、任何未登记的失败、
+       任何 `unverified`（未核实＝拿不出证据，与"没通过"同档；**态②的文案里写着"真实缺陷 0"**，
+       故 `unverified` 非空时必须落 ③，否则那句话本身就成了假话）。
+   **不许动的两件事**（本文件别处已在守，改动即撞门禁）：
+     · `门禁结论：不通过` 是机器可读 token（`tests\harness-check.js` 第十四节的端到端断言按它取
+       结论；态①以外的**每一句**轮尾结论都必须带它，**不许**改成"通过"——那会与退出码 1 自相矛盾，
+       并撞 `PROJECT_RULES` 9.5-5"没有证据不等于通过"）；
+     · 退出码**不变**：态②**仍退 1**（`finalExitCode()` 的"有 failed/unverified 一律 1"；登记偏差
+       只免"阻止对账"，不免退出码）。
+   @param {{failedSuites?:Array, unverifiedSuites?:Array, registeredDeviation?:Function, measuredDeviations?:number}} entry
+     `registeredDeviation`＝"这条失败算不算 6.4 已登记偏差"的判据（默认＝`isRegisteredDeviation`；
+     留注入面是给真值表造"承重"用例用的）；`measuredDeviations`＝实测已登记偏差条数（缺省则现算：
+     对每条通过的失败取 `summary.failed`，无汇总行时按登记表的 `failedAssertions` 计）。
+   @returns {{state:'green'|'registered-only'|'real', line:string}} `line` **不带**前导换行（打印点自己加）
+   */
+
+/** 登记名单条数（`PROJECT_RULES` 6.4 允许的失败断言总数）——态②的"≤ 名单条数"守据的前半。 */
+function registeredDeviationBudget() {
+  let total = 0;
+  for (const name of Object.keys(REGISTERED_DEVIATIONS)) {
+    const reg = REGISTERED_DEVIATIONS[name];
+    total += reg && Number.isFinite(reg.failedAssertions) ? reg.failedAssertions : 0;
+  }
+  return total;
+}
+
+/** 实测已登记偏差条数（＝被判据认可的那些失败**各自的失败断言数**之和）。 */
+function measuredRegisteredDeviations(failedSuites, registeredDeviation) {
+  let total = 0;
+  for (const r of failedSuites) {
+    if (!registeredDeviation(r)) continue;
+    const name = r.suite && r.suite.name;
+    const reg = name ? REGISTERED_DEVIATIONS[name] : null;
+    const fromSummary = r.summary && Number.isFinite(r.summary.failed) ? r.summary.failed : null;
+    total += fromSummary !== null
+      ? fromSummary
+      : (reg && Number.isFinite(reg.failedAssertions) ? reg.failedAssertions : 1);
+  }
+  return total;
+}
+
+/* 态①的**冻结措辞**：与主流程那处 `console.log` 逐字相同（`harness-check` 第十四节按完整字面量搜它，
+   且要求**唯一一处**）——这里只是同一句话的第二份**值**（供真值表读），不改打印点。
+   态③的**冻结措辞**：与主流程 `else` 支的打印点逐字相同 —— 打印点**故意**保留字面量（验收要求
+   "与上一轮相比只差态②这一处"），本常量供三态真值表比对；两处必须同值，改一处即两处一起改。 */
+const VERDICT_GREEN_LINE = '门禁全绿（无失败脚本）。';
+const VERDICT_REAL_LINE = '门禁结论：不通过（有失败/未核实脚本，见上面的明细）。';
+
+/**
+ * `E180` 的三态判定（**纯函数**：不打印、不写盘、不起子进程）。判据与文案同处一地。
+ * ——细节与"不许动的两件事"见上方长注释。
+ * @param {{failedSuites?:Array, unverifiedSuites?:Array, registeredDeviation?:Function, measuredDeviations?:number}} entry
+ * @returns {{state:'green'|'registered-only'|'real', line:string}}
+ */
+function concludeVerdict(entry) {
+  const e = entry || {};
+  const failed = Array.isArray(e.failedSuites) ? e.failedSuites : [];
+  const unverified = Array.isArray(e.unverifiedSuites) ? e.unverifiedSuites : [];
+  const registeredDeviation = typeof e.registeredDeviation === 'function'
+    ? e.registeredDeviation
+    : isRegisteredDeviation;
+  if (failed.length === 0 && unverified.length === 0) {
+    return { state: 'green', line: VERDICT_GREEN_LINE };
+  }
+  const accepted = failed.filter(r => registeredDeviation(r));
+  const budget = registeredDeviationBudget();
+  const measured = Number.isFinite(e.measuredDeviations)
+    ? e.measuredDeviations
+    : measuredRegisteredDeviations(failed, registeredDeviation);
+  const names = accepted.map(r => (r.suite && r.suite.name) || '（无名脚本）');
+  /* 三条一起成立才是态②：①有失败（全空那是态①）；②没有未核实脚本（否则"真实缺陷 0"是假话）；
+     ③每条失败都被登记判据认可**且**实测条数没超出登记名单 —— 后者就是 `E173` 同族的"计数守据"，
+     少了它，"多出来的失败"可以混在已登记偏差里被一起说成"长期保留、非待修缺陷"。 */
+  if (failed.length > 0 && unverified.length === 0 && accepted.length === failed.length && measured <= budget) {
+    return {
+      state: 'registered-only',
+      line: '门禁结论：不通过（**仅剩已登记偏差 ' + measured + ' 条**：' + names.join('、')
+        + ' —— 依 PROJECT_RULES 6.4 长期保留、**非待修缺陷**；**真实缺陷 0**；按规范 9.5-5 仍退 1）。'
+    };
+  }
+  return { state: 'real', line: VERDICT_REAL_LINE };
+}
+
 module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTotals, authorityBlockers,
   REGISTERED_DEVIATIONS, failedAssertionNames, resolveGateOutcome, finalExitCode,
   /* `E88⒝` 的明细选取是纯函数 ⇒ 一并导出，供定点回归直接调用（判据见该函数注释） */
@@ -1612,7 +1720,11 @@ module.exports = { classify, parseSummary, isEnvSkip, SUITES, verifyAuthorityTot
   /* `E108`／`E114`（`T-20261004-04`）的收尾判据是纯函数 ⇒ 一并导出，供定点回归（含 D22 变异）直接调用：
      · `failureNote`：失败戳文案（登记/未登记分道）；· `failureNoteSelfCheck`／`sweepCountSelfCheck`：
      两条自检的真值表（`main` 每次收尾都会跑）；· `runAllSelfCheck`：两者的合并入口。 */
-  failureNote, failureNoteSelfCheck, sweepCountSelfCheck, runAllSelfCheck };
+  failureNote, failureNoteSelfCheck, sweepCountSelfCheck, runAllSelfCheck,
+  /* `E180`（`T-20261006-05`）的轮尾三态判定是纯函数 ⇒ 一并导出：
+     `concludeVerdict` 给 `{ state, line }`（`harness-check` 下一包的真值表直接调它，不另写口径）；
+     `registeredDeviationBudget` 给"登记名单条数"这一半守据（实测条数 > 它 ⇒ 落态③）。 */
+  concludeVerdict, registeredDeviationBudget };
 
 if (require.main === module) {
   main().catch(err => {
