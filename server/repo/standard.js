@@ -30,8 +30,8 @@
      const now = '2026-09-22 09:00:00';                     // 当前时刻（第 4 实参，必填；由调用方注入的时钟给出）
      const added = repo.addVersion(db, {
        productCode: 'P-1001', processCode: '30', createdBy: '张伟', teamCode: '检验一班',
-       depthUpperDev: 0.20, depthLowerDev: -0.20, depthTypical: 12.60,
-       speedUpperDev: 0.30, speedLowerDev: -0.30, speedTypical: 4.90
+       depthUpperDev: 0.30, depthLowerDev: -0.20, depthTypical: 5.00,    // 六值取自 board.config.js 的 standards.default
+       speedUpperDev: 0.20, speedLowerDev: -0.20, speedTypical: 5.00    // 量程＝board.config.js 的 standards.range（深度 [4, 6] m／速度 [3, 8] m/s）：导出上/下限越界即抛 RangeError
      }, '2026-09-22 08:00:00', now);                       // 第 3 实参＝生效时间（可省，省＝now）；第 4 实参＝now
      repo.addVersion(db, {...}, undefined, now, { bus });   // 第 5 实参的 bus：新增成功后发布 `standard` 事件（W5-①）
      repo.getEffective(db, { productCode: 'P-1001', processCode: '30', at: '2026-09-22 09:00:00' });

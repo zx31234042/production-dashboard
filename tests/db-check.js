@@ -933,12 +933,12 @@ async function main() {
     for (const bad of badCaps) {
       try { standardRepo.deleteVersion(handle.db, { id: delTarget.id, maxDelete: bad }); } catch { capThrew++; }
     }
-    t.check('DR-03：deleteVersion 的纠错纪律 —— 非法 id（null/0/负数/小数/字符串/NaN）与非法 maxDelete 一律抛错，' +
-      'dryRun 只报数不删，行数一行未变',
+    t.check('DR-03：deleteVersion 的纠错纪律 —— 非法 id（null/0/负数/小数/字符串/NaN）与已移除的选项键 maxDelete 一律拒收' +
+      '（后者按“未知选项键”抛错并指名该键），dryRun 只报数不删，行数一行未变',
       dryDel.deleted === 1 && dryDel.dryRun === true &&
       idThrew === badIds.length && capThrew === badCaps.length &&
       standardRepo.count(handle.db) === beforeDel,
-      `dryRun=${JSON.stringify(dryDel)}，id 抛错 ${idThrew}/${badIds.length}，maxDelete 抛错 ${capThrew}/${badCaps.length}，` +
+      `dryRun=${JSON.stringify(dryDel)}，id 抛错 ${idThrew}/${badIds.length}，已移除的选项键 maxDelete 拒收 ${capThrew}/${badCaps.length}（未知选项键），` +
       `行数 ${beforeDel} → ${standardRepo.count(handle.db)}`);
     const realDel = standardRepo.deleteVersion(handle.db, { id: delTarget.id });
     t.check('DR-03：deleteVersion 真删只删目标一行（不误伤同产品的其它版本行）',
