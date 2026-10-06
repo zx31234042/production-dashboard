@@ -463,6 +463,7 @@ t.check('每个 tests\\*.js 入口脚本都调用 env.assertRuntime()（D16 的 
    今天（2026-10-05）的实例：`项目记录\工作日志.md` 的混行尾被规整没了
    （实测 `CRLF 1095 ／ 裸 LF 840` → **0 处混行尾**）⇒ 混行尾基线 **2 → 1**。
    **这是该勘误的第二个实例**（第一个＝`db28fbc` 之后三个文件的哈希漂移）。
+   ⚠ **收尾（2026-10-06 由 `T-20261006-07` 核清并更正）**：同一机制随后把**最后一条** `项目记录/ADR/README.md` 也规整成纯 CRLF ⇒ 链条是 **2 → 1 → 0**（详见 `EOL_MIXED_BASELINE` 的注释，那儿是它的归属地）。
    分辨口径：**"提交规整了行尾"＝正常（删名单条目）**；**"有人把文件又改回混行尾"＝真漂移（多一个分支，判红）**。
    ========================================================================== */
 t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞多字节字符）');
@@ -541,6 +542,45 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
     return { crlf, bareLf, endsNl: buf.length > 0 && buf[buf.length - 1] === 10 };
   }
 
+  /* ==================== `E192` ②（★★）：`项目记录/ADR/` 的「必须纯 CRLF」 ====================
+     立案事实（`E192`，2026-10-06）：`项目记录\ADR\README.md` 的**维护规则句**逐字要求"**编码：
+     UTF-8（无 BOM），换行 CRLF**，与 `项目记录\` 其余文档一致"，而实测 `ADR-0005`（CRLF=0／LF=82）
+     与 `ADR-0009`（CRLF=0／LF=88）是**纯 LF** ⇒ **目录自订的行尾规则与实情分叉，且没有任何机器判据
+     看着它**（`E40` 家族只查"混行尾／缺末行尾"，这两条对"纯 LF"**恰好都不响**）。
+     本条把那条**声明**变成判据，口径＝ `CRLF > 0 ∧ 裸 LF == 0 ∧ 无 BOM`：
+       · **不写"无混行尾"这种更弱的说法** —— "无混行尾"对**纯 LF** 恰好为真，而纯 LF 正是立案事实本身；
+       · 判据面只认这个目录的 `.md`（目录规则第 10 行"本目录**只放 `.md`**"），违规时**逐处指名
+         `文件（行尾形态：纯 LF／混行尾／带 BOM／无行尾）`**；
+       · **防装饰性守护**（`E174` 同族）：光有"违规桶为空"可以被"把目录改名／移出扫描面"变成**恒真**
+         ⇒ 另记 `crlfDirFiles`（该目录**被扫到**几个 `.md`），判据要求它**恰等于盘上实有 `.md` 数**
+         （**动态取**，不写死常量 —— `ADR-0004` D21）。
+     ⚠ **不许另开第二份 EOL 判据脚本**（规范 9.5-7 唯一入口／单一真源；`E57` 的刹车）：就地扩 E40 家族。
+     ⚠ 本条的"规则真源"（那句声明）由下面 **`E40-⑨·声明锚点`** 一并守着：规则句被改动 ⇒ 判红。
+     ⚠⚠ **本条的说明故意写在这里、不写进"第九节头部注释块"**：那一整段在 `stripLiterals()` 之后是
+       一条**连续的空白段**，而 `harness-check` 的 **`E160-④`** 把"受管面除超标外最长空白段"**锚死**
+       在 **105 行**（`managedMaxRunLinesExcludingOver`，属**别的脚本的冻结锚点**、本包无权改）——
+       2026-10-06 本包首版往里加了 9 行 ⇒ 实测 **116 行** ⇒ `E160-④` 当场红（真红、非抖动）。
+       要补说明**请写在这一段里**（或判据旁边），**别再往第九节头部注释块里加行**。 */
+  /** 受判目录（相对路径，正斜杠 —— 与 `relOf` 同口径）。**唯一真源**：判据、D22、自证都从这里取。 */
+  const ADR_CRLF_DIR = '项目记录/ADR';
+  /** 该目录下的**受判成员**：**直属** `.md`（只认直属 ⇒ 与 `readdirSync` 同层，两个计数才可比）。 */
+  function isAdrCrlfMember(rel, abs) {
+    if (path.extname(abs).toLowerCase() !== '.md') return false;
+    if (!rel.startsWith(ADR_CRLF_DIR + '/')) return false;
+    return rel.slice(ADR_CRLF_DIR.length + 1).indexOf('/') < 0;
+  }
+  /** 「必须纯 CRLF」的判定：合规 ⇔ `CRLF > 0 ∧ 裸 LF == 0 ∧ 无 BOM`。
+   *  合规 ⇒ `null`；不合规 ⇒ 返回**逐处指名**用的 `文件（行尾形态：…）`（形态口径写死，见上）。 */
+  function crlfRequiredViolation(rel, buf) {
+    const e = eolStat(buf);
+    const bom = hasBom(buf);
+    if (e.crlf > 0 && e.bareLf === 0 && !bom) return null;
+    const form = e.crlf > 0
+      ? (e.bareLf > 0 ? `混行尾 CRLF=${e.crlf}／裸LF=${e.bareLf}` : `纯CRLF CRLF=${e.crlf}`)
+      : (e.bareLf > 0 ? `纯LF CRLF=0／裸LF=${e.bareLf}` : '无行尾（既无 CRLF 也无裸 LF）');
+    return `${rel}（行尾形态：${form}${bom ? '；且带 BOM' : ''}）`;
+  }
+
   /** 逐行类命中最多收这么多条（真值另记 `counts`）—— 防"一个 80545 行的日志把内存吃掉" */
   /* ==================== `E186`（★★）：**文件中部**的格式字符 ====================
      立案原因：源码注释里混着**零宽字符**（`U+200B` 等）⇒ 把它当"锚点"会"命中 0 次"或
@@ -579,8 +619,8 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
   /** 扫一组文件。`readOf(abs)` 提供字节 —— D22 靠它注入**内存变异体**，盘上不动。
    *  返回各判据的命中清单（逐行类截断到 `HY_CAP`）＋ **真实条数** `counts`。 */
   function scanHygiene(list, readOf = f => fs.readFileSync(f)) {
-    const out = { bom: [], bomPs1: [], fffd: [], pua: [], mixed: [], noEol: [], moji: [], format: [], unreadable: [],
-      counts: { files: list.length, bom: 0, bomPs1: 0, fffd: 0, pua: 0, mixed: 0, noEol: 0, moji: 0, format: 0, unreadable: 0 } };
+    const out = { bom: [], bomPs1: [], fffd: [], pua: [], mixed: [], noEol: [], moji: [], format: [], crlfDir: [], unreadable: [],
+      counts: { files: list.length, bom: 0, bomPs1: 0, fffd: 0, pua: 0, mixed: 0, noEol: 0, moji: 0, format: 0, crlfDir: 0, crlfDirFiles: 0, unreadable: 0 } };
     const add = (arr, key, item) => { out.counts[key]++; if (arr.length < HY_CAP) arr.push(item); };
     for (const abs of list) {
       const rel = relOf(abs);
@@ -624,6 +664,14 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
         out.mixed.push({ rel, crlf: e.crlf, bareLf: e.bareLf });   /* 行尾类不截断：集合要比对 */
       }
       if (!e.endsNl) { out.counts.noEol++; out.noEol.push(rel); }
+      /* `E192` ②：`项目记录\ADR\` 下**每个 `.md`** 必须**纯 CRLF**。`crlfDirFiles` 同时记下
+         "该目录被扫到几个 `.md`" —— 它是这条判据的**正向自证**（见本节头部：空基线下
+         `removed` 分支不可达，没有这个计数就只剩"恒空 ⇒ 恒绿"的装饰性守护）。 */
+      if (isAdrCrlfMember(rel, abs)) {
+        out.counts.crlfDirFiles++;
+        const v = crlfRequiredViolation(rel, buf);
+        if (v) add(out.crlfDir, 'crlfDir', v);
+      }
     }
     return out;
   }
@@ -655,19 +703,33 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
     + `\`._verify\` 面 ${verifyScan.counts.files} 个（只报不判；读不到 ${verifyScan.counts.unreadable} 个）`);
 
   /* ---- 九之二：行尾惯例的**登记基线**（依据见本节头部注释） ---- */
-  /** 混行尾（同一文件既 CRLF 又裸 LF）的既存偏差 —— **1 处**，在 `项目记录\ADR\*`（禁改面）
-   *  ⚠ **为什么从 2 条变成 1 条（`T-20261005-03`，2026-10-05 实测；这不是缺陷，是"提交把工作区字节规整了"）**：
+  /** 混行尾（同一文件既 CRLF 又裸 LF）的既存偏差 —— **现为 0 处**（基线＝**空集**）。
+   *  ⚠ **2026-10-06 更正（`T-20261006-07`）：本条注释此前写的是"**1 处**，在 `项目记录\ADR\*`（禁改面）"，
+   *  那描述的是**已被取代的中间状态**，与同一段下方的 `= []` **自相矛盾**；按 `E174`／ADR-0004 D23 的
+   *  同族口径（**不许留一个"看起来在守"的空基线**）如实更正如下。**
+   *  **逐版溯源（`git show <rev>:tests/files-check.js` 实测，权威）**：
+   *   · `c534616`（`E40` 落地首版）＝ **2 处**：`项目记录/ADR/README.md` ＋ `项目记录/工作日志.md`；
+   *   · `d152f01` 后＝ **1 处**：`项目记录/工作日志.md` 被提交规整掉（口径见下面那段 9.5-5 v1.34 勘误）；
+   *   · `dc433b8` 起＝ **`EOL_MIXED_BASELINE = []`**：最后一条 `项目记录/ADR/README.md`
+   *     **也归零**（同一个机制：`git add`／提交按 `core.autocrlf` 规整工作区行尾），条目随之**删除**；
+   *   · `7b01ef9`／`HEAD` 沿用 `[]`（**但上面的注释一直停在"1 处"那一版 ⇒ 就是这次更正的对象**）。
+   *  ⇒ **它指的是哪个文件/哪种形态**：指 `项目记录/ADR/README.md`（ADR **目录自己的 README**，
+   *  即本批 `E192` 要守的那个目录）**在 2026-10-05 前后曾是"同一文件既有 CRLF 又有裸 LF"**；
+   *  **不是**别的目录，**也不是** `ADR-0005`／`ADR-0009`（那两份从头到尾是**纯 LF**，从不"混行尾"）。
+   *  **2026-10-06 复测（本包，逐文件扫受管面 162 个文本文件）**：混行尾 **0 处**（`[]`，与盘上实存集合
+   *  逐项相同）⇒ 该条目**已不存在**，故不加回、不改判据、只把注释改准。
+   *  证据＝`tests\._verify\T-20261006-07\recon.out.txt`（⑤ 全量清单）＋ `git ls-files --eol 项目记录/ADR/`
+   *  的 12 行全部 `w/crlf`（**没有** `w/mixed`，git 自己的行尾判据独立佐证）。
+   *  ⚠ **下面这条"基线陈旧＝预期形态"的口径仍然有效**，是 `9.5-5` 的 **v1.34 勘误**的落地形态：
    *  规范升版落盘时主代理对几个受管文件做了 `git add`/提交，而 **`git add`／提交会按 `core.autocrlf`
-   *  规整工作区文件的行尾** ⇒ `项目记录\工作日志.md` 的混行尾被**规整没了**（实测由
-   *  `CRLF 1095 / 裸 LF 840` 变成 0 处混行尾）⇒ 本基线出现"**基线陈旧**"分支并**正确判红**。
-   *  **这是预期的、按 9.5-5 的 v1.34 勘误处理**（比对前先归一化／"某处不再偏差"不等于"结论作废"，
-   *  而是**名单只能缩小**的正当形态）⇒ 处置＝把该条从名单里**删掉**，**不是**把它塞回去。
-   *  **今天这件事是那条勘误的第二个实例**（第一个是 `db28fbc` 之后三个文件的哈希漂移）——
-   *  故这条留痕必须留在判据旁边：下一个看到"基线陈旧"的人要能立刻分辨
-   *  "**是提交规整了行尾**（正常）"与"**是有人把文件改回混行尾**（真漂移）"。
-   *  ⚠ 若哪天有**别的文件**变成混行尾，本条仍按 fail-closed 判红并指名 —— **不要**为了让它变绿就往名单里添行
-   *  （名单只能缩小：**修好要从名单里删**，不是"添一行让它过去"）。 */
-  const EOL_MIXED_BASELINE = [];  /* 2026-10-05：受管面混行尾已归零（最后两处在 ADR 侧修掉）⇒ 基线清空；本机制"名单只能缩小"，缩小到 0 即等于"零容忍" */
+   *  规整工作区文件的行尾** ⇒ 原登记为"混行尾"的文件可能在**没有任何人手工编辑它**的情况下变成正常
+   *  ⇒ 本基线出现"**基线陈旧**"分支并**正确判红**。处置永远是**把该条从名单里删掉**（名单只能缩小），
+   *  **不是**把它塞回去、**更不是**把判据放宽。分辨口径：**"提交规整了行尾"＝正常（删名单条目）**；
+   *  **"有人把文件又改回混行尾"＝真漂移（多一个分支，判红并指名）**。
+   *  （第一个实例＝`db28fbc` 之后三个文件的哈希漂移；第二个实例＝`项目记录\工作日志.md`；
+   *   第三个实例＝`项目记录/ADR/README.md` —— 本条基线就是这样一路缩到 0 的。）
+   *  ⚠ 若哪天有**别的文件**变成混行尾，本条仍按 fail-closed 判红并指名 —— **不要**为了让它变绿就往名单里添行。 */
+  const EOL_MIXED_BASELINE = [];  /* 2026-10-05 起为空集（最后一条 `项目记录/ADR/README.md` 被提交规整掉）；2026-10-06 复测仍 0 处 ⇒ "名单只能缩小"缩到 0 即等于"零容忍" */
   /** 末尾缺行尾的既存偏差 —— **6 → 4 处**（`T-20261005-03` 甲补齐两处后）；
    *  余 **4 处全部落在明令禁改的面**（历史记录与已交付件不改字节）。
    *  ⚠ 这份名册是 **fail-closed** 的：它必须**恰好等于**盘上实存集合 ——
@@ -702,6 +764,19 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
        · `tests/lib/assert.js`（`T-20261005-03` 甲：正文逐字节未变，仅补末行尾 `\r\n`）
        · `tests/logic-check.js`（同上） */
   ];
+  /** `E192` ②：`项目记录/ADR/` 的「**必须纯 CRLF**」登记基线 —— **空集 ＝ 零容忍**，机制与
+   *  `E40-⑤`／`E40-⑥`／`E40-⑧` 同款（`setDiff` 双向：多一处 ⇒ 红并**逐处指名
+   *  `文件（行尾形态：…）`**；"名单只能缩小"）。
+   *  **为什么是空集**：2026-10-06 主代理已把最后两份**纯 LF**（`ADR-0005`／`ADR-0009`）归一到 CRLF
+   *  （`E192` 第①步，逐份自证"去 CR 后逐字节相同"），本包实测**全目录 12 份均为纯 CRLF**
+   *  （逐文件读数＝`tests\._verify\T-20261006-07\recon.out.txt`）⇒ 取空集，**不是**"留两个例外免得它红"。
+   *  ⚠ **空集本身不构成"这条判据在守"**（`E174`／ADR-0004 D23 同族：静态防空洞）：空基线下
+   *  `removed` 分支**结构性不可达** ⇒ 本条**另加**一条**正向自证**："该目录被扫到的 `.md` 数
+   *  **恰等于**盘上实有 `.md` 数"（`readdirSync` 独立枚举，**动态取**、不写死 12 —— `ADR-0004` D21）。
+   *  目录被改名／被移出扫描面 ⇒ 该合取式当场红，而不是"恒空 ⇒ 恒绿"。
+   *  ⚠ 规则真源（`项目记录/ADR/README.md` 的维护规则句）由紧邻的 **`E40-⑨·声明锚点`** 守着：
+   *  那句被改动 ⇒ 判红并提示"**规则文本变了，判据要跟**"。 */
+  const ADR_CRLF_BASELINE = [];
 
   /* ---- 九之三：受管面四类损坏特征（零容忍，逐条指名 `文件:行号`） ---- */
   t.check('E40-① 受管面无 BOM（`tools\\*.ps1` 除外 —— 第七章要求它带 BOM，由第二节守）',
@@ -747,6 +822,90 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
     + `\`._verify\` 面 **${verifyScan.counts.format}** 处（**只报不判**`
     + `${verifyScan.format.length ? '：' + listNames(verifyScan.format, 6) : ''}）`
     + `；格式字符集合＝${MIDFILE_FORMAT.size} 个码位（逐码位写死，**不含**合法全角/中文标点）`);
+
+  /* ---- 九之四之③：`E192` ② 受管面「`项目记录\ADR\` 的每个 `.md` 必须纯 CRLF」（零容忍，fail-closed） ---- */
+  /** 该目录 `.md` 成员数 —— **独立枚举**（`readdirSync`，不经扫描器）⇒ 它才能当"扫描面没漏成员"的正向自证。
+   *  读不到目录 ⇒ `-1`（下面判据必红并报出这一点，**不**让异常把门禁打成退 2）。 */
+  const adrDirAbs = path.join(ROOT, ...ADR_CRLF_DIR.split('/'));
+  const adrDirMdCount = (() => {
+    try { return fs.readdirSync(adrDirAbs).filter(n => n.toLowerCase().endsWith('.md')).length; } catch { return -1; }
+  })();
+  const crlfDirDiff = setDiff(managedScan.crlfDir, ADR_CRLF_BASELINE);
+  t.check('E40-⑨ `项目记录/ADR/` 下**每个 `.md` 必须纯 CRLF**（`E192` ②；口径＝`CRLF>0 ∧ 裸LF==0 ∧ 无 BOM`）'
+    + ' —— **不是**"无混行尾"这种更弱的说法（纯 LF 恰好"无混行尾"，而纯 LF 正是 `E192` 的立案事实）；'
+    + '基线＝**空集**（零容忍）：多一处 ⇒ 红并**逐处指名 `文件（行尾形态：…）`**；'
+    + 'fail-closed 双向（"名单只能缩小"）；另以"**该目录被扫到的 `.md` 数 ＝ 盘上实有数**"防装饰性守护',
+    crlfDirDiff.added.length === 0 && crlfDirDiff.removed.length === 0
+    && adrDirMdCount > 0 && managedScan.counts.crlfDirFiles === adrDirMdCount,
+    (crlfDirDiff.added.length ? `**新增漂移** ${crlfDirDiff.added.length} 处：${crlfDirDiff.added.join('、')}；` : '')
+    + (crlfDirDiff.removed.length ? `**基线陈旧**（已修好却仍登记着，请删对应行）${crlfDirDiff.removed.length} 处：${crlfDirDiff.removed.join('、')}；` : '')
+    + `受判面 ${managedScan.counts.crlfDirFiles} 个 \`.md\`／盘上实有 ${adrDirMdCount} 个（**必须相等且 >0** `
+    + `—— 不等即"扫描面漏成员／目录被改名搬走"）；实测违规 ${managedScan.counts.crlfDir} 处（基线 ${ADR_CRLF_BASELINE.length} 条）：`
+    + listNames(managedScan.crlfDir, 5));
+
+  /* ---- 九之四之④：`E192` ② 的「声明 ↔ 判据」绑定（`E186` 锚点纪律：**锚点只许 ASCII**） ----
+     判据要守的那句声明来自 `项目记录/ADR/README.md` 的维护规则：**"换行 CRLF"**。它是**中文夹 ASCII**
+     的句子 ⇒ 按 `E186`"锚点只许 ASCII"的纪律，取句中三个 ASCII 记号做锚：`UTF-8`／`BOM`／`CRLF`。
+     ⚠ **为什么锚点必须落在"声明面"（`>` 开头的引用块）而不是全文**（2026-10-06 实测，见 `anchor.out.txt`）：
+       · 单锚 `CRLF` 在**全文**出现 **9 次**、命中 **2 行**（`10` 与 `29`），`UTF-8`／`BOM` 同样命中 `{10,29}`
+         —— 因为**勘误行 `:29` 逐字引用了那句规则** ⇒ 全文面**做不到"恰命中 1 次"**，只能退化成
+         "至少 1 次"（那正是 `E186` 要防的"锚点漂了还能绿"）；
+       · 在**声明面**（`>` 引用块，实测 10 行）里，三个锚**逐锚点各恰命中 1 行**、三锚**同行合取恰 1 行**
+         且＝行 `10` ⇒ 既能自证"恰 1 次"，又把"这句规则被搬走/改写"变成可判红的形态。
+     ⚠ 若哪天有人改了那句规则文本（或把它移出引用块）⇒ 本条判红；**提示语在 detail 里逐字给出**。 */
+  const ADR_RULE_TARGET = `${ADR_CRLF_DIR}/README.md`;
+  const ADR_RULE_ANCHORS = ['UTF-8', 'BOM', 'CRLF'];      /* 全 ASCII ⇒ 零宽字符/编码损伤改不动它们 */
+  /** 锚点判定（**纯函数**：文本 ⇒ 读数）—— 主断言与它的"可证伪"负对照**共用同一把尺子**
+   *  （`E153` 的教训：各写一份的话，D22 证明的就不是主判据了）。 */
+  function adrRuleAnchorProbe(text) {
+    const quote = text.split('\n').map((l, i) => [i + 1, l]).filter(([, l]) => l.startsWith('>'));
+    return {
+      quote,
+      asciiOk: ADR_RULE_ANCHORS.every(a => /^[\x20-\x7E]+$/.test(a)),
+      perAnchor: ADR_RULE_ANCHORS.map(a => [a, quote.filter(([, l]) => l.includes(a)).map(([i]) => i)]),
+      lines: quote.filter(([, l]) => ADR_RULE_ANCHORS.every(a => l.includes(a))).map(([i]) => i)
+    };
+  }
+  /** **主断言的那一个合取式**（主判据与负对照都只调它） */
+  const adrAnchorOk = (p) => p.asciiOk && p.lines.length === 1 && p.perAnchor.every(([, ls]) => ls.length === 1);
+  const adrRuleAbs = path.join(ROOT, ...ADR_RULE_TARGET.split('/'));
+  const adrRuleText = fs.readFileSync(adrRuleAbs, 'utf8');
+  const adrRuleProbe = adrRuleAnchorProbe(adrRuleText);
+  const { quote: adrRuleQuote, perAnchor: adrAnchorHits, lines: adrRuleLineNos } = adrRuleProbe;
+  t.check('E40-⑨·声明锚点（`E192` ②的"声明↔判据"绑定）：`项目记录/ADR/README.md` 的**声明面**（`>` 引用块）里，'
+    + 'ASCII 锚 `UTF-8`／`BOM`／`CRLF` **逐锚点各恰命中 1 行**、三锚**同行合取恰 1 行**；'
+    + '锚点一失配即说明**规则文本变了，判据要跟**（`E186` 锚点纪律：锚点只许 ASCII）',
+    adrAnchorOk(adrRuleProbe),
+    `锚点纯 ASCII=${adrRuleProbe.asciiOk}；逐锚点在声明面的命中行＝`
+    + `${adrAnchorHits.map(([a, ls]) => `${a}→[${ls.join(',')}]`).join('；')}（各应恰 1 行）；`
+    + `三锚同行合取命中行=[${adrRuleLineNos.join(',')}]（应恰 1 行，实测＝行 ${adrRuleLineNos[0] || '（未命中）'}）；`
+    + `声明面共 ${adrRuleQuote.length} 行。⚠ **规则文本变了，判据要跟**：若你改了那句`
+    + `"编码：UTF-8（无 BOM），换行 CRLF"，请同步核 \`E40-⑨\` 的判据面与它的基线说明`);
+  /* 负对照（**定点变异，内存**）：模拟"有人把这句规则放宽成 LF"（把**声明面**里的 `CRLF` 换成 `LF`）
+     ⇒ 同一个合取式**必须为假**。没有这一条，"锚点断言"只是"每次都绿的一串字"（`E174` 同族）。
+     ⚠ 只改**内存字符串**；末尾再回读盘上文件，证明它逐字节未动。 */
+  const adrRuleMutText = adrRuleText.split('\n')
+    .map(l => (l.startsWith('>') ? l.split('CRLF').join('LF') : l)).join('\n');
+  const adrRuleMutProbe = adrRuleAnchorProbe(adrRuleMutText);
+  const adrRuleDiskSame = fs.readFileSync(adrRuleAbs, 'utf8') === adrRuleText;
+  t.check('E40-⑨·声明锚点 负对照（**可证伪**）：把声明面里的 `CRLF` 换成 `LF`（＝"有人把规则放宽成 LF"'
+    + '的真实形态，**内存副本**、盘上不动）⇒ 同一合取式**当场为假**；未变异时必真、盘上逐字节未变',
+    adrAnchorOk(adrRuleProbe) && !adrAnchorOk(adrRuleMutProbe) && adrRuleDiskSame,
+    `未变异 ok=${adrAnchorOk(adrRuleProbe)}（应 true）；变异后 ok=${adrAnchorOk(adrRuleMutProbe)}（应 false）；`
+    + `变异后逐锚点命中行＝${adrRuleMutProbe.perAnchor.map(([a, ls]) => `${a}→[${ls.join(',')}]`).join('；')}；`
+    + `盘上逐字节未变=${adrRuleDiskSame}`);
+
+  /* 每轮**可见**的读数（`check` 的 PASS 详情默认不打印 ⇒ 判据的"实测值"必须另用 `t.info` 说出来，
+     否则读者只能看到"绿"而看不到"守的是哪 12 个文件、各是什么形态"）。
+     这里逐文件列形态，是为了让"**全目录纯 CRLF**"这个事实每轮都自证一次、而不是只写在注释里。 */
+  const adrFormList = MANAGED.filter(f => isAdrCrlfMember(relOf(f), f))
+    .map(f => `${path.basename(f)}→${crlfRequiredViolation(relOf(f), fs.readFileSync(f)) ? '**违规**' : '纯CRLF'}`);
+  t.info(`  · [\`E192\`②（\`E40-⑨\`）] **ADR 目录行尾**：受判 ${managedScan.counts.crlfDirFiles} 个 \`.md\``
+    + `（\`readdirSync\` 独立枚举 ${adrDirMdCount} 个）、违规 **${managedScan.counts.crlfDir}** 处、基线 ${ADR_CRLF_BASELINE.length} 条；`
+    + `逐文件形态：${adrFormList.join('、')}`);
+  t.info(`  · [\`E192\`②（\`E40-⑨\`·声明锚点）] 规则真源＝\`${ADR_RULE_TARGET}\` 的 \`>\` 声明面（${adrRuleQuote.length} 行）：`
+    + `${adrAnchorHits.map(([a, ls]) => `\`${a}\` 恰 ${ls.length} 行[${ls.join(',')}]`).join('；')}；`
+    + `三锚**同行合取**恰 ${adrRuleLineNos.length} 行＝[${adrRuleLineNos.join(',')}]（规则句原样在：${adrRuleLineNos.length === 1}）`);
 
   /* ---- 九之五：`._verify` 面如实登记（按既定裁定不判红、不修，但必须可见） ---- */
   t.info('（以下 `._verify` 面只报不判 —— 它是探针/取证/临时产物区，按 ADR-0003 D16 与既定裁定保持原样）');
@@ -898,6 +1057,47 @@ t.section('九、受管面编码卫生（E40：文本命令改文件会静默吞
     GBK_REVERSE ? (gbkReverse(D22_BROKEN) === D22_PLAIN
       && !/[\uFFFD\uE000-\uF8FF]/.test(D22_BROKEN)) : true,
     'cp936 逆推表不可用或样本已失效 —— 请重取样本并同步本行注释');
+
+  /* ---- 九之六之②：`E40-⑨`（`E192` ②）的 D22 ----
+     与上面同款（**内存字节副本**，盘上全程只读），但**多两件**：①变异体是 `项目记录\ADR\` 的
+     **真实成员**（不是 `src\` 里的替身）⇒ "目录归属"这一步也被验到；②除"判据桶"外还要
+     **主断言那一个合取式**（`setDiff(scan.crlfDir, ADR_CRLF_BASELINE)`）当场红 —— `E153` 的教训：
+     只证明"扫描器看见了"不等于证明"两条主断言会红"。
+     ⚠ 与"真文件字节变异→还原"的关系：本段证明的是**判据逻辑**可证伪（盘上零残留）；**真文件**
+     那一轮读数由 `tests\._verify\T-20261006-07\d22-real.out.txt` 留痕（本仓惯例：防回潮判据
+     要对**真文件**起过作用）。 */
+  const ADR_D22_TARGET = `${ADR_CRLF_DIR}/ADR-0005-统计口径真源形态.md`;
+  const adrD22Abs = path.join(ROOT, ...ADR_D22_TARGET.split('/'));
+  const adrD22Src = fs.readFileSync(adrD22Abs);
+  /** 变异体：去掉**所有** `0x0D` ⇒ 纯 LF */
+  const adrD22Lf = Buffer.from(adrD22Src.filter(b => b !== 0x0D));
+  /** 独立计数（**不用被测函数**算期望值 —— ADR-0004 D21/D23） */
+  const adrD22LfCount = adrD22Lf.reduce((n, b) => n + (b === 10 ? 1 : 0), 0);
+  /** 期望串：形态**逐字写死**，只有 `裸LF=N` 的 N 来自上面那次独立计数 */
+  const adrD22Expect = `${ADR_D22_TARGET}（行尾形态：纯LF CRLF=0／裸LF=${adrD22LfCount}）`;
+  /** "去掉所有 `0x0D`"与"把 CRLF 换成 LF"必须逐字节同结果（否则该文件混着孤立 CR ⇒ 前提不成立） */
+  const adrD22Stripped = Buffer.from(adrD22Src.toString('latin1').replace(/\r\n/g, '\n'), 'latin1');
+  const adrD22Base = scanHygiene([adrD22Abs]);                       /* 负对照：现行盘上必 0 */
+  const adrD22Mut = scanHygiene([adrD22Abs], p => (p === adrD22Abs ? adrD22Lf : fs.readFileSync(p)));
+  const adrD22Diff = setDiff(adrD22Mut.crlfDir, ADR_CRLF_BASELINE);
+  const adrD22Untouched = fs.readFileSync(adrD22Abs).equals(adrD22Src);
+  t.requires('`E40-⑨` 的 D22 前提：目标文件现行是**纯 CRLF**，且"去掉所有 `0x0D`"与'
+    + '"把 CRLF 换成 LF"逐字节相同（否则"⇒ 纯 LF"这一步不成立，D22 就证明不了判据）',
+    adrD22Base.crlfDir.length === 0 && adrD22Stripped.equals(adrD22Lf)
+    && adrD22Src.length > 0 && adrD22Lf.length > 0 && adrD22LfCount > 0,
+    `现行违规 ${adrD22Base.crlfDir.length} 处（应 0）；去 CR 后逐字节相同=${adrD22Stripped.equals(adrD22Lf)}；`
+    + `${adrD22Src.length} B → ${adrD22Lf.length} B（裸 LF ${adrD22LfCount}）`);
+  t.check('E40-⑨ D22（可证伪）：把 `项目记录/ADR/ADR-0005` 的**内存字节副本**改成**纯 LF**'
+    + '（去掉所有 `0x0D`）⇒ ① 判据**必红** ② **逐字指名** `文件（行尾形态：纯LF CRLF=0／裸LF=N）`'
+    + ' ③ **主断言**（`setDiff(scan.crlfDir, 基线)`）**当场多出恰 1 条且逐字等于植入串**'
+    + ' ④ 未变异（现行盘上）**必绿** ⑤ 盘上逐字节未变',
+    adrD22Mut.crlfDir.length === 1 && adrD22Mut.crlfDir[0] === adrD22Expect
+    && adrD22Diff.added.length === 1 && adrD22Diff.added[0] === adrD22Expect && adrD22Diff.removed.length === 0
+    && adrD22Base.crlfDir.length === 0 && adrD22Untouched,
+    `植入点=${adrD22Expect}；未变异命中 ${adrD22Base.crlfDir.length} 处（应 0）；`
+    + `变异命中 [${adrD22Mut.crlfDir.join('、')}]（应恰 1 处且＝植入点）；`
+    + `主断言新增 ${adrD22Diff.added.length} 条／"基线陈旧" ${adrD22Diff.removed.length} 条（应 1／0）；`
+    + `盘上逐字节未变=${adrD22Untouched}`);
 }
 
   t.finish();
