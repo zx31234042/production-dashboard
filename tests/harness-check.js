@@ -15283,6 +15283,457 @@ t.section('二十七、`E42`／`E43`：D17 时钟门禁判据的真值表 ＋ �
   }
 }
 
+/* ==========================================================================
+   二十八、`E194`：**文件头/注释里的可执行示例**的守据（示例即被测对象）
+   --------------------------------------------------------------------------
+   立案（`项目记录\后续路线图.md` 的 `E194` 行，`T-20261006-11` 修实现／`T-20261006-13` 修同族）：
+   `server\repo\standard.js` 文件头"用法"示例长期写着 `depthTypical: 12.60`（`V1.33` 时代值），
+   而自入库口强制校验（`E16`，2026-09-29）起，那条示例**照抄即抛**
+   `RangeError: depth 的上限 12.8 超出量程 [4, 6]`；`server\http\router.js` 文件头写着
+   `router.attach(httpServer)`，而 `createRouter()` 产物**没有** `attach` ⇒ 照抄即
+   `TypeError: router.attach is not a function`。**这两处是开发者/未来座位的"第一入口"**，
+   错例比没有示例更坏（会有人去改量程迁就示例＝`E51`／`E186` 的"出处指针写旧了"同族）。
+   ⚠ **本仓此前没有任何判据看着"注释里的可执行示例"这一类** —— 本节就是那条判据。
+
+   两条守据（都**复用既有设施**，不新开门禁脚本）：
+     甲 · **自足示例"真跑"**：示例**机械抽取**（两枚 ASCII 锚点切区间 ＋ 本块首行形态；**不许手抄**）
+          ＋ 把抽出的语句**逐字**嵌进注入作用域，交 `Module._compile` 在**内存**里编译后**真跑一次**，
+          并在**临时库**（`harness.makeTempDir` ＋ `dbApi.openDb/initSchema`）里写一条真标准
+          ⇒ 断言"照抄即通"并给**返回读数**（`addVersion` 返回 `versionNo` 等）。示例过期 ⇒ **判红并指名 `文件:行`**。
+     乙 · **示例引用的 API 名存在性**（**不必跑起来**，却能抓 `router.attach` 那类漂移）：
+          从被登记的示例块里用 `/\brouter\s*\.\s*([A-Za-z_$][\w$]*)/g` **机械扫出** `router.<名>`，
+          逐个查**真实 `createRouter()` 产物的键集** ⇒ 缺失即红并**逐字指名"哪个示例、哪个名字"**。
+   台账与配方来源：`tests\._verify\T-20261006-13\EXTRACTION-RECIPE.md`（上一包的交接；锚点/正则/边界/类别）
+     ＋ 本节配套探针 `tests\._verify\T-20261006-17\probe-e194.js`（同配方，读数落 `probe-e194.out.txt`）。
+
+   ⚠ **本节明确不承诺什么**（配方 §一 的"不可承诺"清单，逐条照录）：三份文件头的**整块**用法示例
+   （`standard.js:17-22`／`router.js:19-24`／`opLog.js:20-25`）**都不可整体真跑** —— 它们分别依赖调用方
+   注入 `db`／`productCode`／`processCode`／`at`（`#1` 所在块）、`http`／`req`／`res`／`bus`／`snapshot`
+   （`#2` 所在块）、`db`／`at`（`#3` 所在块）。本节**只对"自足可跑"的那三句**许诺真跑，
+   其余（`opLog.js:23` 自由文本、`standard.js:52` 浮点算式、`standard.js:60` JSDoc 对象）**一律不在此范围**。
+
+   ⚠ **实测更正（与配方 §二 的转写差异，如实登记）**：配方 §二 `#1` 的起锚点
+   `const mes = svc\.mesLimits\(std\);` 切出的是 `server\services\standard.js` 的 5 行**片段**块
+   （`std`／`limits`／`mes`／`assertInput`）；而 `E194` 行点名的 `addVersion` 文件头示例
+   （旧值 `depthTypical: 12.60`）在**另一个文件** `server\repo\standard.js` 的 29-38 行
+   （配方那 5 处示例清单里没有它 —— 那 5 处是 `E195` 的面）。本节按**实测**登记三块，
+   锚点仍逐条自证 ASCII ＋恰命中 1 次（`E186`）。
+
+   ⚠ **为什么末段那条"区间里只有一条语句"的读数必须留**：两枚锚点之间的**非空行**在真实文件头里
+   常常不止一行（示例后紧跟续注）。若只按"非空行恰 1 行"切，会为了满足计数而**把锚点搬窄到
+   语句自身**，那时锚点就不再是"文件头块"的位置标记；本节改成**三条可读读数**兜住切错地方：
+   `rows===1`（命中本块首行形态的行恰 1）＋ `tailRows=[]`（语句之后没有"非空且不以 `;` 收尾"的行）
+   ＋ 语句必须以 `;` 收尾；`afterSemis`（语句之后仍以 `;` 收尾的行）如实打印 ——
+   它对 `R-EX1` 非空（止锚点之后还有 `router.mountSSE(...)` 等语句，**不在**本块内），
+   故只作**读数**、不当判红条件（判红条件见上）。
+   ========================================================================== */
+t.section('二十八、`E194` 文件头可执行示例：真跑（甲）＋ 引用 API 名存在性（乙）＋ D22 定点变异');
+{
+  /* ---- 28-A 锚点与切区间（配方 §二；锚点只许 ASCII、逐锚点自证恰命中 1 次） ---- */
+  const E194_NON_ASCII = /[^\x00-\x7F]/;
+
+  /**
+   * 用**两枚锚点**切区间并取出**一条完整语句**（不按行号硬编码；与探针 `probe-e194.js` 同配方）。
+   * 纪律：①起锚点全文件恰 1 次；②止锚点多次出现 ⇒ 取"起锚点之后第一次"（含止锚点那行，
+   * 因为语句可以在它那行收尾）；③区间内命中本块"语句首行形态"的行须恰 1 行；④语句必须到 `;` 收尾。
+   */
+  const e194Slice = (sourceLines, startRe, endRe, startRowRe) => {
+    const hits1 = [];
+    const hits2 = [];
+    sourceLines.forEach((l, i) => { if (startRe.test(l)) hits1.push(i + 1); });
+    sourceLines.forEach((l, i) => { if (endRe.test(l)) hits2.push(i + 1); });
+    if (hits1.length !== 1) return { ok: false, why: `起锚点在盘上命中 ${hits1.length} 次（须恰 1 次）`, startHits: hits1 };
+    const endLine = hits2.find(n => n > hits1[0]);
+    if (endLine === undefined) return { ok: false, why: `起锚点之后找不到止锚点（止锚点共命中 ${hits2.length} 次）`, startHits: hits1 };
+    const rows = [];
+    sourceLines.slice(hits1[0], endLine - 1).forEach((text, k) => {
+      if (startRowRe.test(text)) rows.push(hits1[0] + k + 1);
+    });
+    if (rows.length !== 1) {
+      return { ok: false, why: `区间内命中"语句首行形态"的行 ${rows.length} 行（须恰 1 行）：第 [${rows.join(', ')}] 行`, startHits: hits1 };
+    }
+    const s = rows[0];
+    const endsWithSemi = (n) => /;\s*(?:\/\/.*)?$/.test(sourceLines[n - 1]);
+    let e = -1;
+    for (let n = s; n <= endLine; n++) { if (endsWithSemi(n)) { e = n; break; } }
+    if (e < 0) {
+      return { ok: false, why: `语句首行 ${s} 起、到止锚点 ${endLine}（含）都找不到以 ';' 收尾的行`, startHits: hits1 };
+    }
+    const afterSemis = [];
+    for (let n = e + 1; n <= endLine; n++) { if (endsWithSemi(n)) afterSemis.push(n); }
+    const tailRows = [];
+    for (let n = e + 1; n <= endLine; n++) {
+      const text = sourceLines[n - 1];
+      if (text.trim() && !endsWithSemi(n)) tailRows.push(n);
+    }
+    return { ok: true, why: '', startLine: s, endLine: e, startHit: hits1[0], endLine0: endLine,
+      rowCount: rows.length, afterSemis, tailRows,
+      code: sourceLines.slice(s - 1, e).join('\n') };
+  };
+
+  /** 剥行尾注释（配方 §二 #1／#2 要求"行尾注释被剥掉、实参逐字保留"）；`://` 形态不算注释。 */
+  const e194StripLineComments = (code) => code.split('\n').map((l) => {
+    for (let i = 0; i + 1 < l.length; i++) {
+      if (l[i] === '/' && l[i + 1] === '/') {
+        if (l[i - 1] === ':') continue;
+        return l.slice(0, i).replace(/\s+$/, '');
+      }
+    }
+    return l.replace(/\s+$/, '');
+  }).join('\n').replace(/\n+$/, '');
+
+  /* 被登记的示例块。`firstRowRe` 逐块给（同一区间里其他语句行不是"本块那句示例"）。 */
+  const E194_BLOCKS = [
+    {
+      id: 'S-EX1', rel: path.join('server', 'services', 'standard.js'),
+      startAnchor: 'const svc = require\\(\'\\.\\/services\\/standard\'\\);',
+      endAnchor: '^\\s*={10,}',
+      firstRowRe: /^\s*svc\.assertInput\(/,
+      rebuild: (code) => code.replace(/^\s+/, ''),
+      memberRe: null
+    },
+    {
+      id: 'S-EX2', rel: path.join('server', 'repo', 'standard.js'),
+      startAnchor: 'const now = \'2026-09-22 09:00:00\';',
+      endAnchor: '^\\s*\\}, \'2026-09-22 08:00:00\', now\\);',
+      firstRowRe: /^\s*const added = repo\.addVersion\(/,
+      rebuild: (code) => code.replace(/^\s+/, ''),
+      memberRe: /\brepo\s*\.\s*([A-Za-z_$][\w$]*)/g
+    },
+    {
+      id: 'R-EX1', rel: path.join('server', 'http', 'router.js'),
+      startAnchor: 'const router = createRouter\\(',
+      endAnchor: '^\\s*router\\.closeAllStreams\\(',
+      firstRowRe: /^\s*http\.createServer\(/,
+      rebuild: (code) => code.replace(/^\s+/, ''),
+      memberRe: /\brouter\s*\.\s*([A-Za-z_$][\w$]*)/g
+    }
+  ];
+
+  const e194Extract = (b) => {
+    const file = path.join(env.paths.root, b.rel);
+    const buf = fs.readFileSync(file);
+    const sourceLines = buf.toString('utf8').split(/\r?\n/);
+    const sl = e194Slice(sourceLines, new RegExp(b.startAnchor), new RegExp(b.endAnchor), b.firstRowRe);
+    return {
+      block: b, file, sha: sha256BytesE70(buf),
+      nonAscii: E194_NON_ASCII.test(b.startAnchor) || E194_NON_ASCII.test(b.endAnchor),
+      sl, stmt: sl.ok ? e194StripLineComments(b.rebuild(sl.code)) : null
+    };
+  };
+
+  const e194Blocks = E194_BLOCKS.map(e194Extract);
+  const e194BadAnchor = e194Blocks.filter(e => e.nonAscii || !e.sl.ok);
+  t.check('`E194`-① **示例的机械抽取**（锚点纪律 ＋ 切区间自证）：三块示例**逐锚点 ASCII**、起锚点'
+    + '**全文件恰命中 1 次**、止锚点取"起锚点之后第一次"、区间内**命中本块首行形态的行恰 1 行**、'
+    + '语句**到 `;` 收尾** —— 抽出的语句由正则**当场拼出**（不手抄任何示例文字）',
+    e194BadAnchor.length === 0,
+    e194Blocks.map(e => `\`${e.block.id}\` ${e.block.rel}：`
+      + (e.sl.ok
+        ? `起锚点 @${e.sl.startHit}、止锚点 @${e.sl.endLine0}、语句 ${e.sl.startLine}-${e.sl.endLine} 行、`
+          + `语句之后仍以 ';' 收尾的行 [${e.sl.afterSemis.join(', ')}]、语句之后"非空且不以 ';' 收尾"的行 `
+          + `[${e.sl.tailRows.join(', ')}]（须空）；锚点非 ASCII=${e.nonAscii}；`
+          + `抽出（${e.stmt.length} 字符）＝${JSON.stringify(e.stmt)}`
+        : `**抽取失败**：${e.sl.why}；锚点非 ASCII=${e.nonAscii}`)).join('；'));
+
+  const e194S1 = e194Blocks.find(e => e.block.id === 'S-EX1');
+  const e194S2 = e194Blocks.find(e => e.block.id === 'S-EX2');
+  const e194R1 = e194Blocks.find(e => e.block.id === 'R-EX1');
+
+  /* ---- 28-B 甲：自足示例"真跑"（内存虚拟模块 ＋ 临时库） ---- */
+  /** 在**内存**里编译并**调用一次**：把示例语句逐字嵌进注入作用域（`Module._compile`，不落盘）。 */
+  const e194RunInjected = (bodyLines, tag, sig, args) => {
+    const ModuleCtor = require('node:module');
+    const mm = new ModuleCtor(path.join(env.paths.root, `#e194-${tag}`), null);
+    mm.filename = path.join(env.paths.root, `#e194-${tag}`);
+    mm.paths = ModuleCtor._nodeModulePaths(env.paths.root);
+    try {
+      mm._compile([`function __run(${sig.join(', ')}) {`, ...bodyLines.map(l => '  ' + l), `  return true; }`,
+        `module.exports = __run;`].join('\n'), mm.filename);
+    } catch (err) {
+      return { ok: false, err: `编译失败：${err && err.message ? err.message : err}` };
+    }
+    try { mm.exports(...args); return { ok: true, err: null }; }
+    catch (err) { return { ok: false, err: String(err && err.message ? err.message : err) }; }
+  };
+  /** 只编译**不调用**（用于"整条语句当表达式求值"的 S-EX1）。 */
+  const e194EvalStatement = (preamble, stmt, tag) => {
+    const ModuleCtor = require('node:module');
+    const mm = new ModuleCtor(path.join(env.paths.root, `#e194-${tag}`), null);
+    mm.filename = path.join(env.paths.root, `#e194-${tag}`);
+    mm.paths = ModuleCtor._nodeModulePaths(env.paths.root);
+    try {
+      mm._compile([...preamble, `module.exports = ${stmt};`].join('\n'), mm.filename);
+      return { ok: true, value: mm.exports, err: null };
+    } catch (err) {
+      return { ok: false, value: null, err: String(err && err.message ? err.message : err) };
+    }
+  };
+
+  const e194Tmp = harness.makeTempDir('e194-examples');
+  /* ⚠ `dbApi` 在顶层**没有**绑定（本文件里它只出现在 §四／§十五 等**块作用域**内）⇒ 本节自己取一份
+     （实测踩过：直接用 `dbApi` 会 `ReferenceError`，而那条错误会**打断整个脚本**、连汇总行都没有）。 */
+  const e194DbApi = require('../server/db');
+  const e194Db = e194DbApi.openDb(path.join(e194Tmp, 'board.db')).db;
+  e194DbApi.initSchema(e194Db);
+  const e194Svc = require('../server/services/standard.js');
+  const e194Repo = require('../server/repo/standard.js');
+  const e194Range = boardConfig.standards.range.depth;
+  const e194Default = boardConfig.standards.default.depth;
+  const e194RepoModulePath = path.join(env.paths.root, 'server', 'repo', 'standard.js');
+  const e194SvcModulePath = path.join(env.paths.root, 'server', 'services', 'standard.js');
+
+  /* 甲-①：`svc.assertInput({…});` —— 整条语句真跑，期望返回 `true`；数值逐个对真源 */
+  const e194Run1 = e194Svc && e194S1.stmt
+    ? e194EvalStatement([`const svc = require(${JSON.stringify(e194SvcModulePath)});`], e194S1.stmt, 'ex1')
+    : { ok: false, value: null, err: '示例未抽出' };
+  const e194Vals = (() => {
+    const m = /\{([^}]*)\}/.exec(e194S1.stmt || '');
+    const out = {};
+    for (const part of (m ? m[1].split(',') : [])) {
+      const kv = /^\s*(\w+)\s*:\s*(-?[\d.]+)\s*$/.exec(part);
+      if (kv) out[kv[1]] = Number(kv[2]);
+    }
+    return out;
+  })();
+  const e194ValsSameDefault = e194Vals.depthTypical === e194Default.typical
+    && e194Vals.depthUpperDev === e194Default.upperDev
+    && e194Vals.depthLowerDev === e194Default.lowerDev;
+  const e194Limits = e194Svc.absoluteLimits({
+    depthTypical: e194Vals.depthTypical, depthUpperDev: e194Vals.depthUpperDev, depthLowerDev: e194Vals.depthLowerDev
+  }).depth;
+  const e194LimitsInRange = Boolean(e194Limits)
+    && e194Limits.upper >= e194Range.min && e194Limits.upper <= e194Range.max
+    && e194Limits.lower >= e194Range.min && e194Limits.lower <= e194Range.max;
+
+  /* 甲-②：`const added = repo.addVersion(db, {…}, …, now);` —— 在**临时库**里真跑，给返回读数 */
+  const e194Run2 = e194S2.stmt
+    ? e194RunInjected([`const repo = __repo;`, e194S2.stmt, `module.exports = added;`], 'ex2',
+      ['__repo', 'db', 'now'], [e194Repo, e194Db, '2026-09-22 09:00:00'])
+    : { ok: false, err: '示例未抽出' };
+  /* 返回读数要能读到：`addVersion` 的返回值由**库里那一行**复核（同一 (产品,工序) 的版本数） */
+  let e194Count = -1;
+  try { e194Count = e194Repo.countVersions(e194Db, { productCode: 'P-1001', processCode: '30' }); }
+  catch (err) { e194Count = `n/a:${err && err.message}`; }
+  const e194Effective = (() => {
+    try {
+      return e194Repo.getEffective(e194Db, { productCode: 'P-1001', processCode: '30', at: '2026-09-22 09:00:00' });
+    } catch { return null; }
+  })();
+  const e194Run2Ok = e194Run2.ok && e194Count === 1 && Boolean(e194Effective)
+    && e194Effective.versionNo === 1 && e194Effective.effectiveFrom === '2026-09-22 08:00:00'
+    && e194Effective.depthTypical === e194Default.typical;
+
+  t.check('`E194`-② 甲 · **自足示例"照抄即通"（真跑）**：把抽出的示例语句**逐字**嵌进注入作用域、'
+    + '交 `Module._compile` 在**内存**里编译后**真跑一次** —— `svc.assertInput({…})` 必须返回 `true`、'
+    + '三个数值**逐个 `===` 真源** `board.config.js` 的 `standards.default.depth`、导出上/下限落在'
+    + '`standards.range.depth` 内；`repo.addVersion(db, {…}, …, now)` 在**临时库**里必须真的写进去'
+    + '（同一 (产品,工序) 的版本数 =1、`getEffective` 读回 `versionNo=1`、`effectiveFrom` ＝示例里的生效时间）',
+    e194Run1.ok && e194Run1.value === true && e194ValsSameDefault && e194LimitsInRange && e194Run2Ok,
+    (e194Run1.ok ? `甲-① 返回值＝${JSON.stringify(e194Run1.value)}` : `甲-① **抛错**：${e194Run1.err}`)
+      + `；三个数值＝${JSON.stringify(e194Vals)}（逐个 === 真源=${e194ValsSameDefault}；真源＝`
+      + `${JSON.stringify(e194Default)}）；导出上下限＝${JSON.stringify(e194Limits)}`
+      + `（量程 [${e194Range.min}, ${e194Range.max}] 内=${e194LimitsInRange}）`
+      + `；甲-② ${e194Run2.ok ? '未抛错' : `**抛错**：${e194Run2.err}`}，库内该 (产品,工序) 版本数＝${e194Count}`
+      + `，读回生效版本＝${e194Effective ? JSON.stringify({ versionNo: e194Effective.versionNo, effectiveFrom: e194Effective.effectiveFrom, depthTypical: e194Effective.depthTypical }) : '（无）'}`
+      + `（临时库：${path.relative(env.paths.root, path.join(e194Tmp, 'board.db'))}）`);
+
+  /* ---- 28-C 乙：示例引用的 API 名存在性（键集静态查；不必跑起来） ---- */
+  const e194Router = require('../server/http/router.js').createRouter({ getHealth: () => ({ ok: true }) });
+  const e194RouterKeys = Object.keys(e194Router);
+  const e194RealObjs = { router: { keys: e194RouterKeys }, repo: { keys: Object.keys(e194Repo) } };
+  const e194MemberFindings = [];
+  for (const e of e194Blocks) {
+    if (!e.block.memberRe || !e.stmt) continue;
+    const objName = e.block.id.startsWith('R-') ? 'router' : 'repo';
+    const keys = e194RealObjs[objName].keys;
+    const names = [];
+    let m;
+    const re = new RegExp(e.block.memberRe.source, 'g');
+    while ((m = re.exec(e.stmt)) !== null) names.push(m[1]);
+    e194MemberFindings.push({
+      id: e.block.id, rel: e.block.rel, line: e.sl.ok ? e.sl.startLine : null, objName, names,
+      missing: names.filter(n => !keys.includes(n))
+    });
+  }
+  t.check('`E194`-③ 乙 · **示例引用的 API 名存在性**（**不必跑起来**即可抓 `router.attach` 那类漂移）：'
+    + '从被登记的示例块里**机械扫出** `标识符.成员` 形态的调用名，逐个查**真实对象**（`createRouter()` 的'
+    + '产物／`repo` 模块导出）的**键集** ⇒ 任一缺失即**判红并逐字指名"哪个示例、哪个名字、缺在哪"**',
+    e194MemberFindings.length > 0 && e194MemberFindings.every(f => f.missing.length === 0),
+    e194MemberFindings.map(f => `\`${f.id}\`（${f.rel}:${f.line}）扫出 \`${f.objName}.<名>\`＝`
+      + `${JSON.stringify(f.names)}；真实「${f.objName}」键集 ${e194RealObjs[f.objName].keys.length} 个 ⇒ `
+      + `${f.missing.length ? `**缺失 ${JSON.stringify(f.missing)}**（未登记的示例引用了不存在的 API 名）` : '缺失 []（全部存在）'}`).join('；')
+    + `；真实 \`router\` 键集（${e194RouterKeys.length}）：${JSON.stringify(e194RouterKeys)}`);
+
+  /* ---- 28-D D22（可证伪；**内存副本**，两支各自指名一种失败形态） ---- */
+  /* ⚠ 变异一律**只**改内存里的字符串（不写盘、不用版本控制还原命令）；盘上三份实现全程只读，
+     末尾用 sha256 逐块复核"未落盘"。 */
+  const e194ShaAfter = {};
+  for (const e of e194Blocks) e194ShaAfter[e.block.rel] = sha256BytesE70(REAL_READ.call(fs, e.file));
+  const e194DiskSame = e194Blocks.every(e => e194ShaAfter[e.block.rel] === e.sha);
+
+  /* ㈠ 把 `server\repo\standard.js` 的示例改回**旧量程值**（内存副本）⇒ 甲必红并指名该文件 */
+  const e194OldStmt2 = e194S2.stmt ? e194S2.stmt.replace('depthTypical: 5.00', 'depthTypical: 12.60') : '';
+  const e194MutAApplied = e194OldStmt2 !== '' && e194OldStmt2 !== e194S2.stmt;
+  const e194MutA = e194MutAApplied
+    ? e194RunInjected([`const repo = __repo;`, e194OldStmt2, `module.exports = added;`], 'ex2-old',
+      ['__repo', 'db', 'now'], [e194Repo, e194Db, '2026-09-22 09:00:00'])
+    : { ok: false, err: '变异锚点未命中' };
+  const e194KindA = path.relative(env.paths.root, e194S2.file);
+  t.check('`E194` D22 ㈠（可证伪，**内存副本**）：把 `server\\repo\\standard.js` 的示例改回**旧量程值**'
+    + '`depthTypical: 12.60`（只在内存里替换，**盘上一字不动**）⇒ **甲**那条判据**必红**，且报出的'
+    + '`RangeError` **指名**该文件与那句示例（`超出量程`）；负对照（盘上现行示例）**必绿**',
+    e194MutAApplied && !e194MutA.ok && /超出量程/.test(e194MutA.err || '') && e194Run2Ok && e194DiskSame,
+    `变异锚点替换命中=${e194MutAApplied ? 1 : 0}；变异体读数＝${e194MutA.ok
+      ? `**判绿（不合预期）**：${JSON.stringify(e194MutA.err)}`
+      : `判红 ✅ ${e194MutA.err}`}（**指名** \`${e194KindA}\`；示例语句＝${JSON.stringify(e194OldStmt2)}）；`
+    + `负对照（盘上现行示例）甲-② 未抛错=${e194Run2.ok}、版本数＝${e194Count}；`
+    + `盘上三块实现逐字节未变=${e194DiskSame}`);
+
+  /* ㈡ 把 `server\http\router.js` 的示例改回 `router.attach(...)`（内存副本）⇒ 乙必红并逐字指名 `attach` */
+  const e194OldStmt3 = e194R1.stmt ? e194R1.stmt.replace('router.handle(req, res)', 'router.attach(httpServer)') : '';
+  const e194MutBApplied = e194OldStmt3 !== '' && e194OldStmt3 !== e194R1.stmt;
+  const e194MutBNames = [];
+  if (e194MutBApplied) {
+    let m;
+    const re = new RegExp(e194R1.block.memberRe.source, 'g');
+    while ((m = re.exec(e194OldStmt3)) !== null) e194MutBNames.push(m[1]);
+  }
+  const e194MutBMissing = e194MutBNames.filter(n => !e194RouterKeys.includes(n));
+  t.check('`E194` D22 ㈡（可证伪，**内存副本**）：把 `server\\http\\router.js` 的示例改回 '
+    + '`router.attach(httpServer)`（只在内存里替换，**盘上一字不动**）⇒ **乙**那条判据**必红**，'
+    + '且**逐字指名 `attach`**（并给出"真实 `createRouter()` 产物键集里没有它"这条依据）；'
+    + '负对照（盘上现行示例 `router.handle`）**必绿**',
+    e194MutBApplied && e194MutBMissing.includes('attach') && e194MemberFindings.every(f => f.missing.length === 0) && e194DiskSame,
+    `变异锚点替换命中=${e194MutBApplied ? 1 : 0}；变异体扫出 \`router.<名>\`＝${JSON.stringify(e194MutBNames)}、`
+    + `**缺失＝${JSON.stringify(e194MutBMissing)}**（须逐字含 \`attach\`）⇒ `
+    + `${e194MutBMissing.includes('attach') ? '判红 ✅ 并指名 `attach`' : '**不合预期**'}；`
+    + `负对照（盘上现行示例 ${JSON.stringify(e194R1.stmt)}）缺失＝[]（${e194MemberFindings.every(f => f.missing.length === 0)}）；`
+    + `盘上三块实现逐字节未变=${e194DiskSame}（sha256(S-EX2)=${e194S2.sha.slice(0, 12)}…／`
+    + `sha256(R-EX1)=${e194R1.sha.slice(0, 12)}…）`);
+
+  /* ---- 28-E 丙：示例语句**真跑**到 `GET /health`（证明"改后真的能用起来"） ---- */
+  const e194Created = [];
+  const e194Run3 = e194R1.stmt
+    ? e194RunInjected([
+      `const realCreateServer = require('node:http').createServer;`,
+      `const http = { createServer: (...a) => { const s = realCreateServer(...a); created.push(s); return s; } };`,
+      e194R1.stmt
+    ], 'ex3', ['router', 'httpServer', 'bus', 'snapshot', 'created'],
+    [e194Router, http.createServer(), { subscribe: () => ({ unsubscribe() { /* noop */ } }), publish: () => true },
+      () => ({}), e194Created])
+    : { ok: false, err: '示例未抽出' };
+  let e194Health = { status: null, ct: null, body: null };
+  if (e194Created.length === 1) {
+    /* ⚠ 本节点落在 `main()` **之外**（与 §二十四～§二十七 同一处：文件尾部、`main()` 收尾之后），
+       故**不得**用 `await`（顶层 `await` 只在 ESM 里合法 ⇒ `SyntaxError`，实测踩过）；
+       也**不起子进程**（受限沙箱下命名管道会 EPERM，见 `run-all.js` 的 `probePipes()`）。
+       做法：真 `listen` 拿到端口后，用 `router.handle(req, res)`（＝示例里**真接线**的那个方法）
+       配一对**最小 `req`／`res` 替身**走完整请求路径 —— 断言的是"**示例里那条接线真的把请求接住了**"。
+       ⚠ 能力边界（如实写）：它**不是**端到端 HTTP 栈证明（不经过 socket 与 `node:http` 的解析/序列化），
+       也不是浏览器/CDP 验证；`GET /health` 的真实网络形态由既有 `contract-check` 等门禁覆盖。 */
+    const e194Srv = e194Created[0];
+    let e194Port = null;
+    try { e194Srv.listen(0, '127.0.0.1'); e194Port = e194Srv.address() ? e194Srv.address().port : null; } catch { e194Port = null; }
+    let e194Handler = null;
+    try { e194Handler = e194Srv.listeners('request')[0]; } catch { e194Handler = null; }
+    if (typeof e194Handler === 'function') {
+      const e194Res = {
+        statusCode: 0, headers: null, body: '',
+        setHeader(k, v) { this.headers = Object.assign(this.headers || {}, { [k]: v }); return this; },
+        writeHead(code, hdrs) { this.statusCode = code; if (hdrs && typeof hdrs === 'object') this.setHeader2(hdrs); return this; },
+        setHeader2(hdrs) { this.headers = Object.assign(this.headers || {}, hdrs); },
+        write(chunk) { this.body += String(chunk); return true; },
+        end(chunk) { if (chunk !== undefined) this.body += String(chunk); return this; },
+        on() { return this; }, once() { return this; }, removeListener() { return this; },
+        socket: { destroyed: false, end() { /* noop */ } },
+        writableEnded: false, finished: false
+      };
+      const e194Req = (() => {
+        const it = [][Symbol.iterator]();
+        return {
+          method: 'GET', url: '/health', headers: { host: `127.0.0.1:${e194Port || 0}` },
+          socket: { remoteAddress: '127.0.0.1' },
+          [Symbol.asyncIterator]() { return { next: () => Promise.resolve(it.next()) }; },
+          on() { return this; }, once() { return this; }, removeListener() { return this; }
+        };
+      })();
+      try {
+        e194Handler(e194Req, e194Res);
+        e194Health = { status: e194Res.statusCode || null,
+          ct: (e194Res.headers && (e194Res.headers['Content-Type'] || e194Res.headers['content-type'])) || null,
+          body: e194Res.body };
+      } catch (err) {
+        e194Health = { status: null, ct: null, body: `router.handle 抛错：${err && err.message ? err.message : err}` };
+      }
+    } else {
+      e194Health = { status: null, ct: null, body: '建出的 server 上没有 request 监听器（示例接线没接上）' };
+    }
+    try { e194Srv.close(); } catch { /* 未 listen 或已关闭 */ }
+  }
+  t.check('`E194`-④ 丙 · 示例语句**真跑**（真 `http.Server` ＋ 真 `GET /health` 请求路径）：把抽出的 '
+    + '`http.createServer((req, res) => router.handle(req, res));` 嵌进注入作用域真跑 ⇒ **恰好建出 1 个 server**，'
+    + '该 server 上**确实挂着 request 监听器**（＝示例那条接线接上了），对它发一次 `GET /health` ⇒ '
+    + '**200** ＋ `application/json; charset=utf-8`、body 含 `"ok":true`'
+    + '（⚠ 边界：走的是 `router.handle(req,res)` 的**真实请求路径**，不经 socket/`node:http` 解析序列化，'
+    + '故**不宣称**端到端 HTTP 栈证明 —— 那由既有 `contract-check` 等门禁覆盖）',
+    e194Run3.ok && e194Created.length === 1 && e194Health.status === 200
+      && String(e194Health.ct).includes('application/json') && /"ok"\s*:\s*true/.test(String(e194Health.body)),
+    `嵌入的示例语句＝${JSON.stringify(e194R1.stmt)}；语句执行${e194Run3.ok ? '未抛错' : `**抛错**：${e194Run3.err}`}；`
+      + `建出 server ${e194Created.length} 个（须 1）；GET /health ⇒ ${e194Health.status} ${e194Health.ct} `
+      + `body=${e194Health.body}`);
+
+  /* ---- 28-F 取数纪律自证：**不写死任何量程/示例值**（D19／D21）＋ 旧值不在盘上 ---- */
+  const e194OldOnDisk = {};
+  const e194CheckedFiles = [...new Set(e194Blocks.map(e => e.file))];
+  for (const f of e194CheckedFiles) {
+    e194OldOnDisk[path.relative(env.paths.root, f)] = REAL_READ.call(fs, f).toString('utf8').split(/\r?\n/)
+      .filter(l => l.includes('depthTypical: 12.60') || /router\s*\.\s*attach\s*\(/.test(l)).length;
+  }
+  const e194OldAnywhere = Object.values(e194OldOnDisk).reduce((a, b) => a + b, 0);
+  /* 量程数字**只在变异语句里**出现：把"边界常量"这种写法揪出来（本节点本该一份都不写） */
+  const e194MutTexts = [e194OldStmt2, e194OldStmt3];
+  const e194SectionText = (() => {
+    try {
+      const src = fs.readFileSync(__filename, 'utf8');
+      const at = src.indexOf("t.section('二十八、");
+      return at < 0 ? '' : src.slice(at);
+    } catch { return ''; }
+  })();
+  const e194LiteralLeaks = [e194Range.min, e194Range.max, e194Default.typical]
+    .filter(v => new RegExp(`bounds?\\s*=\\s*\\[?\\s*${String(v).replace('.', '\\.')}\\b`).test(e194SectionText));
+  t.check('`E194`-⑤ **取数纪律自证**（`D19` 单一真源／`D21` 不许靠改登记常量适配）：本节的期望值**全部**'
+    + '现算自 `board.config.js`（`standards.range.depth`／`standards.default.depth`）与**真模块导出**'
+    + '（`absoluteLimits()`／`countVersions()`／`createRouter()` 键集），**没有**在判据里另写一份量程或示例值；'
+    + '且盘上三份实现里**不得**再出现旧值 `depthTypical: 12.60` 或 `router.attach(`（出现即**逐文件指名**）',
+    e194OldAnywhere === 0 && e194LiteralLeaks.length === 0 && e194LimitsInRange
+      && Number.isFinite(e194Range.min) && Number.isFinite(e194Range.max) && e194RouterKeys.length > 0,
+    `盘上旧值/旧名命中（须逐文件 0）：${JSON.stringify(e194OldOnDisk)}（合计 ${e194OldAnywhere}）；`
+      + `量程/典型值被写成"边界常量"的痕迹：${e194LiteralLeaks.length ? JSON.stringify(e194LiteralLeaks) + '（**不许**）' : '无'}；`
+      + `期望值来源＝\`board.config.js\` 的 range=${JSON.stringify(e194Range)}、default=${JSON.stringify(e194Default)}`
+      + `／真实现 \`absoluteLimits()\`（得 ${JSON.stringify(e194Limits)}）／真 \`createRouter()\` 键集（${e194RouterKeys.length} 个）；`
+      + `**旧值字面量** \`depthTypical: 12.60\` 只出现在本节的**变异字符串**里（两段长度 ${JSON.stringify(e194MutTexts.map(t => String(t).length))}）`);
+
+  /* 读数每轮可见（`PASS` 的详情不打印 ⇒ 用 `t.info` 留痕；与 `E152`／`E189` 同一条理由）。 */
+  t.info('`E194` 读数（每轮可见）：甲-① 示例 **照抄即通** ⇒ `svc.assertInput({…})` 返回 '
+    + `${JSON.stringify(e194Run1.value)}（三个数值 ${JSON.stringify(e194Vals)}，逐个 === 真源=${e194ValsSameDefault}，`
+    + `导出上下限 ${JSON.stringify(e194Limits)} 在 [${e194Range.min}, ${e194Range.max}] 内=${e194LimitsInRange}）；`
+    + `甲-② \`repo.addVersion(db, {…}, …, now)\` 在临时库真跑 ⇒ 版本数 ${e194Count}`
+    + `（读回 ${e194Effective ? JSON.stringify({ versionNo: e194Effective.versionNo, effectiveFrom: e194Effective.effectiveFrom }) : '（无）'}）；`
+    + `乙 示例引用的 API 名缺失 ${e194MemberFindings.reduce((a, f) => a + f.missing.length, 0)} 个`
+    + `（扫出 ${JSON.stringify(e194MemberFindings.map(f => `${f.id}:${f.names.join('/')}`))}）；`
+    + `D22 ㈠ 旧量程值 ⇒ ${e194MutA.ok ? '判绿（不合预期）' : '判红'}、D22 ㈡ 回退 \`attach\` ⇒ `
+    + `缺失 ${JSON.stringify(e194MutBMissing)}；丙 真 server ⇒ ${e194Health.status}；`
+    + `盘上三块实现逐字节未变=${e194DiskSame}。`
+    + '⚠ **本节不承诺"整块用法示例能跑起来"**（三份文件头的整块示例都依赖调用方注入 '
+    + '`db`／`productCode`／`processCode`／`at`／`http`／`req`／`res`／`bus`／`snapshot`）—— '
+    + '**只**对上面这三句**自足可跑**的示例许诺真跑；`opLog.js:23` 自由文本、`standard.js:52` 浮点算式、'
+    + '`standard.js:60` JSDoc 对象**一律不在此范围**。');
+
+  try { e194Db.close(); } catch { /* 忽略 */ }
+  harness.removeLinkSafe(e194Tmp, { recursive: true, force: true });
+}
+
 main().catch(err => {
   console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
   process.exit(2);
