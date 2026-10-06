@@ -11583,8 +11583,13 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
       { rel: 'tests\\README.md', linesMin: 160, maxLineMax: 28000, tableRatioMin: 0.09, firstLineSha12: 'a7dacae51339' }
     ];
     /** **冻结点锚点**（`E145` 的教训：锚点必须是**常量**，不能由基线现算 —— 现算＝自己对自己复读、零证伪能力）。
-     *  有人**悄悄放宽**某一个阈值（E164 最容易被"顺手改松"）⇒ `sha12` 不符 ⇒ `E164-③` 当场红。 */
-    const E164_ANCHOR = { total: 4, sha12: '00edc52014a5' };
+     *  有人**悄悄放宽**某一个阈值（E164 最容易被"顺手改松"）⇒ `sha12` 不符 ⇒ `E164-③` 当场红。
+     *  ⚠ 锚点覆盖面随 `T-20261006-16` 扩到 **5 条**（四份 `.md` ＋ JSON 实跑账的**阈值行**）：
+     *  算式（`E164-③` 现算）逐字段读 `rel|linesMin|maxLineMax|tableRatioMin|firstLineSha12` ⇒
+     *  `00edc52014a5` 是**只有**那四份 `.md` 时的值，JSON 基线进锚点后必随之变（这就是"改一处即被拦"）。
+     *  `total` 仍是 **4**：它自证的是 `E164_BASELINE.length === E164_FILES.length`（四份 `.md`），
+     *  **不是**锚点条数（锚点条数与它无关，别把两个口径混读）。 */
+    const E164_ANCHOR = { total: 4, sha12: '06269bdbf2a1' };
     /** 结构读数（**纯函数**；主判据与 D22 共用同一把尺子） */
     const e164Stats = (text) => {
       const raw = text.split(/\r\n|\n/);
@@ -11649,12 +11654,29 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
      *    而"**整份粘成一行**／被截断到只剩几行"仍必红；
      *  · `maxLineMax = 2000`：实测最长行的 **39×**（本账每行都是一个短字段）；整份粘成一行今天是 **4338 B** ⇒ 必红；
      *  · `tableRatioMin = null`／`endsWithNewline = null`：**本维不适用**（理由见上"逐维适用"）；
-     *  · `firstLineSha12 = 021fb596db81` ＝ 首行**逐字**（JSON 的 `{`）的 sha256 前 12 位 —— **写死的常量**
-     *    （`E145` 的机制：不由被查文件现算）；整份粘成一行时首行变长 ⇒ 这一维当场不符。
-     *  ⚠ **不动** `E164_BASELINE`／`E164_ANCHOR`：四份 `.md` 台账的既有判据与冻结点**一个字都不改**（D21）。 */
+     *  · `firstLineSha12 = null`：**本维不冻结值**。
+     *  ⚠ **`T-20261006-16` 修（本轮误红的直接原因，责任在主代理的原始包）**：此处原写死
+     *    `firstLineSha12 = '021fb596db81'`（＝首行逐字 `{` 的 sha12）。它看起来"稳定"，实则**与"首行是否合法"
+     *    无关** —— 一次**轮内（mid-round）部分写**的账，首行会被写成 `{  "at": "…",  "mode": …`（同一个对象
+     *    挤在前两行），sha12 当场不符 ⇒ `E164-⑤` 的**负对照（＝盘上原件）**判红 ⇒ 整轮红。
+     *    实测证据：`tests\._verify\run-all\harness-check-21868.log` 的 `E164-⑤` 详情
+     *    （当轮账 104 行／6 个 suite，末行尾缺失、首行 sha12 不符）。事故原形是 **`join('\n')` 被写成
+     *    `join(' ' …)`** —— 那与时间戳无关，"不冻结会变的字段"只是顺带。
+     *  ⇒ 修法：**值判据 ⇒ 形态判据**。"首行是合法 JSON 且含预期键"由 `e164JsonReadShape()` 的
+     *    **`parsed` ＋ 键齐 ＋ 末尾 `}`** 三维承担（恒适用）；"首行恰好是 `{`"这一**读法约定**由
+     *    `e164JsonStats()` 的 `firstLine` 读数承担（只报数、不判红）。冻结点只留 `linesMin`／`maxLineMax`
+     *    两条**阈值**（对正常追加只会因"整体塌缩/被压平"触发）。
+     *  · `firstLineSha12` 仍留在锚点算式里（值变成 `null`）⇒ 阈值被悄悄改松照样被 `E164-③` 拦（`E145` 机制不动）。
+     *  ⚠ **不动** `E164_BASELINE`：四份 `.md` 台账的既有判据与冻结点**一个字都不改**（D21）。
+     *    这里改的只是 **JSON 实跑账自己**那一条（本包 `T-20261006-16` 的写范围与裁定）。 */
     const E164_JSON_REL = 'tests\\._verify\\run-totals.json';
     const E164_JSON_BASELINE = { rel: E164_JSON_REL, linesMin: 40, maxLineMax: 2000,
-      tableRatioMin: null, endsWithNewline: null, firstLineSha12: '021fb596db81' };
+      tableRatioMin: null, endsWithNewline: null, firstLineSha12: null };
+    /** **文件内可判的恒适用形态维**（**全在文件内可判**，不依赖任何"已经写完了"的前提）：
+     *  `firstChar` ＝ 首字符必须是 `{`（根是对象）；`lastLine` ＝ 末（非空）行必须是 `}`（不是被截断/带非 JSON 尾巴）。
+     *  这两条**替掉**了原来的"首行 sha12 冻结"：事故原形（`join('\n')` 变 `join(' ')`）下，
+     *  首行不再是 `{`、末行也不再是 `}` ⇒ 照样当场红，且**不看时间戳**。 */
+    const E164_JSON_SHAPE = { firstChar: '{', lastLine: '}' };
     /** 账本**必有的十个字段**（真源＝`run-all.js` 的 `writeRunTotals()` 落盘对象；这里只做"键齐"点名） */
     const E164_JSON_KEYS = ['at', 'mode', 'role', 'mainLedger', 'pid', 'expectedOffline',
       'ranSuites', 'assertions', 'scripts', 'suites'];
@@ -11760,22 +11782,24 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
       }
       return bad;
     };
-    /** **JSON 实跑账的整把尺子（纯函数）**：`text` ⇒ `{ stats, parsed, parseErr, bad[] }`（主判据与 D22 共用）。
-     *  ① 形态（**与四份 `.md` 台账同一把尺子**：`e164Stats()` ＋ `e164Audit()`，逐维适用）；
-     *  ② **截断／非 JSON 尾巴**；③ **合法 JSON**；④ 语义（`e164JsonSemantics()`）。
-     *  `text === null` ＝ 台账**缺失／不可读** ⇒ **fail-closed 判红**（调用方不许把它当成"跳过"）。 */
-    const e164JsonLedger = (rel, text, base) => {
+    /** **① 形态判据（纯函数；恒适用）**：`text` ⇒ `{ stats, parsed, parseErr, bad[] }`。
+     *  **全部维度都只依赖这一份文件自己**，不看任何"应该已经跑完了"的前提 ⇒ 轮内部分写也照样成立：
+     *  · 截断（末尾不是 `}`）／非 JSON 尾巴；· 合法 JSON；· 根是对象 ＋ 十个字段齐 ＋
+     *  三元组各就各位 ＋ `ranSuites ↔ suites[].name` ＋ `scripts` 普查 ＋ `role` ＋ 逐 suite 本地不变量。
+     *  ⚠ **这里不施加 `linesMin`／`maxLineMax`**（那两个是"整轮账"的阈值 ⇒ 见 `e164JsonBaselineBad()`）：
+     *  `--only` 子集账、轮内部分写的账**天然短**，拿整轮阈值去量它们就是本包要修的误红。 */
+    const e164JsonReadShape = (rel, text) => {
       if (typeof text !== 'string') {
         return { stats: null, parsed: null, parseErr: '台账缺失或不可读',
-          bad: [`${rel}：台账**缺失或不可读** ⇒ fail-closed **判红**（不许静默跳过）`] };
+          bad: [`${rel}：台账**缺失或不可读**`] };
       }
       const stats = e164Stats(text);
-      const bad = e164Audit(rel, stats, base);
-      /* ② 形态：**截断**（末尾不是 `}`）／**非 JSON 尾巴**（最后一个 `}` 之后还有可见内容） */
+      const bad = [];
+      /* ① 形态：**截断**（末尾不是 `}`）／**非 JSON 尾巴**（最后一个 `}` 之后还有可见内容） */
       const trimmed = text.replace(/\s+$/, '');
-      if (!trimmed.endsWith('}')) {
-        bad.push(`${rel}：文件末尾不是 \`}\`（尾部 ≤24 B ＝「${JSON.stringify(trimmed.slice(-24))}」）`
-          + `⇒ **被截断**或**带非 JSON 尾巴**`);
+      if (!trimmed.endsWith(E164_JSON_SHAPE.lastLine)) {
+        bad.push(`${rel}：文件末尾不是 \`${E164_JSON_SHAPE.lastLine}\`（尾部 ≤24 B ＝「${JSON.stringify(trimmed.slice(-24))}」）`
+          + `⇒ **被截断**或**带非 JSON 尾巴**／整份被压平`);
       }
       const lastBrace = text.lastIndexOf('}');
       const tail = lastBrace < 0 ? text : text.slice(lastBrace + 1);
@@ -11783,15 +11807,120 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
         bad.push(`${rel}：最后一个 \`}\` 之后还有可见内容（「${JSON.stringify(tail.slice(0, 24))}」）`
           + `⇒ **非 JSON 尾巴**／截断`);
       }
-      /* ③ 合法 JSON（parse 失败 ⇒ 逐字报出解析器的话） */
+      /* ② 逐行形态（**JSON 专属；恒适用**）：
+         ⚠ **这里刻意不套 `e164Audit()`**（它那把尺子是**四份 `.md` 行式台账**的：`行数下界／最长行上界／
+         表格行占比／首行逐字 sha12／首末行不同行`）—— 对 JSON 实跑账，那几维要么**不适用**
+         （没有 `|` 表格、写入器 `JSON.stringify` 不带尾换行），要么正是本包要摘掉的**值冻结**。
+         JSON 的对应形态维是下面三条（**全在文件内可判、不看时间戳**）：
+         ①**首字符**必须 `{`（根是对象。正常写法里首行恰是 `{`；"行间换行被换成别的字符"的事故形态下
+           首行变 `{  "at": …` ⇒ 当场红）；
+         ②**末（非空）行**必须 `}`（不是被截断或带尾巴）；
+         ③**行数**必须 > 1（整份被压平成一行 ⇒ 事故形态）。
+         ⚠ 行式台账的"**行数下界**"这一维**移出本函数**、只在"已收尾且完整"时适用（见 `e164JsonBaselineBad()`）：
+         轮内部分写、`--only` 子集账**天然短**，拿整轮下界去量它们就是本包要修的**误红**。 */
+      if (text.charAt(0) !== E164_JSON_SHAPE.firstChar) {
+        bad.push(`${rel}：首字符不是 \`${E164_JSON_SHAPE.firstChar}\`（实测「${JSON.stringify(text.slice(0, 24))}」）`
+          + `⇒ **首行不是合法 JSON 的开头**（"行间换行被换掉／整份被压平"的事故形态）`);
+      }
+      const lastNonEmpty = (stats && stats.lastLine) || '';
+      if (lastNonEmpty !== E164_JSON_SHAPE.lastLine) {
+        bad.push(`${rel}：末（非空）行不是 \`${E164_JSON_SHAPE.lastLine}\`（实测「${JSON.stringify(lastNonEmpty)}」）`
+          + `⇒ **被截断**或**带非 JSON 尾巴**／整份被压平`);
+      }
+      if (stats && stats.lines <= 1) {
+        bad.push(`${rel}：行数 ${stats.lines} ≤ 1 ⇒ **整份被压平成一行**（\`join(\'\')\` 式事故形态）`);
+      }
+      /* ③ 合法 JSON（parse 失败 ⇒ 逐字报出解析器的话）。
+         ⚠ **这里刻意不跑 `e164JsonSemantics()`**：那一族的维度（`Σ summary.{...}` ＝ `assertions.{...}`、
+         `scripts` 普查 ＝ `suites` 条数）**只在"已收尾且完整"的账上成立** —— 轮内部分写、`--only` 子集账
+         天然对不上（这正是本包要修的误红形态）。⇒ 它们归 **`e164JsonBaselineBad()`**（前提成立时才跑）。 */
       let parsed = null; let parseErr = null;
       try { parsed = JSON.parse(text); } catch (e) { parseErr = (e && e.message) || String(e); }
       if (parseErr !== null) {
         bad.push(`${rel}：**不是合法 JSON**（${parseErr}）`);
         return { stats, parsed, parseErr, bad };
       }
-      bad.push(...e164JsonSemantics(rel, parsed));
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        bad.push(`${rel}：根不是 JSON 对象（实测 ${Array.isArray(parsed) ? '数组' : typeof parsed}）`);
+        return { stats, parsed, parseErr, bad };
+      }
       return { stats, parsed, parseErr, bad };
+    };
+    /** **② 冻结点判据（纯函数）**：**只在"本轮已收尾且完整"时适用** ——
+     *  · 两道阈值：`linesMin`／`maxLineMax`（对"正常追加"只会因**整体塌缩／被压平**而触发）；
+     *  · 语义自洽：`e164JsonSemantics()`（三元组 ↔ 逐 suite、`ranSuites ↔ suites[].name`、`scripts` 普查、逐 suite 本地不变量）。
+     *  理由写在 `e164JsonRoundIsComplete()` 上方：这些维度都需要"**整轮账**"这个前提；
+     *  轮内部分写的账拿它们去量，只会得到"看起来像实现坏了"的假红（本包立案形态）。
+     *  `parsed === null`（读不到／不是合法 JSON）⇒ 返回空数组：那件事由**形态那一路**报出，不在这里重复判红。 */
+    const e164JsonBaselineBad = (rel, stats, parsed) => {
+      if (!stats || parsed === null) return [];
+      const bad = [];
+      if (stats.lines < E164_JSON_BASELINE.linesMin) {
+        bad.push(`${rel}：行数 ${stats.lines} < 下界 ${E164_JSON_BASELINE.linesMin}`);
+      }
+      if (stats.maxLen > E164_JSON_BASELINE.maxLineMax) {
+        bad.push(`${rel}：最长行 ${stats.maxLen} > 上界 ${E164_JSON_BASELINE.maxLineMax}`);
+      }
+      bad.push(...e164JsonSemantics(rel, parsed));
+      return bad;
+    };
+    /** **③ 前提：本轮账"是否已收尾且完整"（纯函数）** —— 判据**全部取自账本自己的既有字段**
+     *  （9.5-7 单一真源：不新造检测法，也不要求 `run-all.js` 加收尾标记 —— **该文件本包不得改**）。
+     *
+     *  **用的是仓内既有口径**（两处先例，逐字对照）：
+     *   · `run-all.js` 的 `expectedOffline`（写账时落的字段，见 `writeRunTotals()`）＝
+     *     `SUITES.filter(s => !s.needBrowser).map(s => s.name)`＝**全量轮会跑的 14 个离线门禁**；
+     *     它的既有用途就是"**账本覆盖前提**"（见 `writeRunTotals()` 上方的注释：
+     *     "本字段只作 `docs-cross-check` 的账本覆盖前提"）。
+     *   · `docs-cross-check.js` §11 的 `D20` 口径："**账本覆盖不到 ⇒ 本轮不可比**（前提不成立），
+     *     **不判 FAIL**、也不计入已核对"（`E110`／`E112`／`E141` 同族）。
+     *  ⇒ 判据＝ **`expectedOffline ⊆ ranSuites`**（账本自述"该跑的离线门禁"是否都已入账）
+     *    ＋ **`role !== 'subset'`**（子集轮的账**天然残缺**，见下）：
+     *   · **未收尾/被截断** ⇒ 包含关系**必不成立**（`ranSuites` 只含**已跑完**的那些）；
+     *   · **`--only` 子集轮的账**（`role = subset`）⇒ 由 `role` 那一条抓住（它的 `ranSuites` 与
+     *     `expectedOffline` 也可能"恰好相等"—— 若子集轮请求的正是那 14 个，光看包含关系会漏）；
+     *   · **已收尾且完整** ⇒ 两条都成立 ⇒ 才轮到冻结点与"逐 suite ↔ 三元组"这些**需要整轮账**的判据。
+     *  **为什么不用别的东西当标记**（逐条说明，免得下一个人再试一遍）：
+     *   · 首行 `at` 时间戳／文件 mtime：**每轮都变**，且"轮内部分写"与"上一轮正常收尾"在时间上**无法区分**
+     *     （本包事故里那两轮只差约 1 分钟）⇒ 拿它做前提就是本包要修的误红本身；
+     *   · `pid`：`run-all` 以**子进程**跑各 suite（`spawn(process.execPath, [file])`）⇒ 判据进程的 `pid`
+     *     与写账的 `pid` **永远不同**，恒假；
+     *   · `mode`（`default`／`--fast`／`--only x`）：`--fast` 也是**合法**的整轮账（14 个离线门禁全跑），
+     *     按它判会把 `--fast` 轮误记"不可比"（`E99` 明写 `--fast` 落主账本、判定与全量同口径）⇒ 不用；
+     *   · `role === 'subset'`：**子集轮按 `E99` 不写主账本**，故它只可能出现在**显式指定**的账里；
+     *     本判据仍把这种形态记"不可比并点名"（显式指定 ≠ 主账本的完整轮 ⇒ 逐 suite 对账不该拿它当依据）。
+     *  @returns {{complete:boolean, missing:string[], why:string}} */
+    const e164JsonRoundIsComplete = (parsed) => {
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { complete: false, missing: [], why: '账本根不是 JSON 对象（形态那一路已判红）' };
+      }
+      const exp = Array.isArray(parsed.expectedOffline) ? parsed.expectedOffline.filter(n => typeof n === 'string') : [];
+      const ran = Array.isArray(parsed.ranSuites) ? parsed.ranSuites.filter(n => typeof n === 'string') : [];
+      const missing = exp.filter(n => !ran.includes(n));
+      if (parsed.role === 'subset') {
+        return { complete: false, missing, why: '账本 `role = subset` ⇒ 它是**子集轮**的账（不是主账本的完整轮）' };
+      }
+      if (exp.length === 0 || missing.length > 0) {
+        return { complete: false, missing, why: `账本自述"本轮该跑的离线门禁"（\`expectedOffline\`，${exp.length} 项）里还有 `
+          + `${missing.length} 项**未入账**（\`ranSuites\` 只含 ${ran.length} 项）：${missing.join('、') || '（无）'}` };
+      }
+      return { complete: true, missing: [], why: `\`expectedOffline\` 的 ${exp.length} 项全部已入账（\`ranSuites\` ${ran.length} 项）` };
+    };
+    /** **JSON 实跑账的整把尺子（纯函数）**：`text` ⇒ `{ stats, parsed, parseErr, comparable, completeWhy,
+     *  missingOffline, shapeBad[], threshBad[], bad[] }`（主判据与 D22 **共用同一份实现**）。
+     *  `bad` ＝ `shapeBad`（**恒适用**）∪ `threshBad`（**仅当"已收尾且完整"**）。
+     *  `text === null`（缺失／不可读）⇒ **不再判红**：按主代理 `T-20261006-16` 的裁定，前提不成立
+     *  （㈠账本不存在 ㈡存在但未收尾/不完整）一律走"**本轮不可比**"—— **显式打印、不判 FAIL、不计入通过**；
+     *  真正该红的（**已收尾且完整**而形态被破坏）一条不减。 */
+    const e164JsonLedger = (rel, text) => {
+      const shape = e164JsonReadShape(rel, text);
+      const round = (shape.parsed === null)
+        ? { complete: false, missing: [], why: '账本缺失／不可读／不是合法 JSON' }
+        : e164JsonRoundIsComplete(shape.parsed);
+      const threshBad = round.complete ? e164JsonBaselineBad(rel, shape.stats, shape.parsed) : [];
+      return { stats: shape.stats, parsed: shape.parsed, parseErr: shape.parseErr,
+        comparable: round.complete, completeWhy: round.why, missingOffline: round.missing,
+        shapeBad: shape.bad, threshBad, bad: [...shape.bad, ...threshBad] };
     };
     /* E164-RULER-END */
     const e164Disk = E164_FILES.map((f) => {
@@ -11841,146 +11970,243 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
           + `㈢负对照（盘上现测）⇒ 违规 ${e164Bad.length} 条（应 0）；盘上逐字节未变=${Buffer.compare(bytes0, bytes1) === 0}`);
     }
     /* `E164-③` 冻结点自证：基线块被**悄悄改松**（某个阈值改小/改大）⇒ 锚点 `sha12` 必不符并指名。
-       ⚠ 锚点是**常量**、不由基线现算（`E145` 的教训）—— 这里刻意"现算一个值去比常量"。 */
+       ⚠ 锚点是**常量**、不由基线现算（`E145` 的教训）—— 这里刻意"现算一个值去比常量"。
+       `T-20261006-16`：锚点覆盖面**扩到 JSON 实跑账那一条**（它的 `linesMin`／`maxLineMax` 同样是阈值，
+       被"顺手改松"的形态与四份 `.md` 完全一样）⇒ 现算列表＝`E164_BASELINE` ＋ `E164_JSON_BASELINE`。
+       ⚠ 同时**反向自证"值冻结已被摘掉"**：`E164_JSON_BASELINE.firstLineSha12` 必须是 `null`
+       （它原来写死 `021fb596db81` ＝ 与"首行是否合法"无关的**值**判据，正是本包误红的直接原因）。 */
     {
       const anchorOf = (list) => sha12_23(list.slice().sort((a, b) => a.rel.localeCompare(b.rel))
         .map(b => `${b.rel}|${b.linesMin}|${b.maxLineMax}|${b.tableRatioMin}|${b.firstLineSha12}`).join('\n'));
-      const nowSha = anchorOf(E164_BASELINE);
+      const anchorAll = E164_BASELINE.concat([E164_JSON_BASELINE]);
+      const nowSha = anchorOf(anchorAll);
       const loosened = E164_BASELINE.map((b, i) => (i === 0 ? { ...b, linesMin: b.linesMin - 10 } : b));
       const tightened = E164_BASELINE.map((b, i) => (i === 1 ? { ...b, maxLineMax: b.maxLineMax + 1000 } : b));
+      const jsonLoosened = anchorOf(E164_BASELINE.concat([{ ...E164_JSON_BASELINE, linesMin: 1 }]));
       t.check('E164-③ **冻结点的自证**（`E145` 机制）：基线块条数 ＝ 台账份数、锚点 `total` ＝ 条数、'
-        + '逐条 `sha12`（常量，**不由基线现算**）＝ 现算值；**把任一阈值改松/改紧**（内存副本）⇒ `sha12` **必不符**',
+        + '逐条 `sha12`（常量，**不由基线现算**）＝ 现算值（覆盖面＝四份 `.md` **＋ JSON 实跑账**）；'
+        + '**把任一阈值改松/改紧**（内存副本）⇒ `sha12` **必不符**；'
+        + '并自证 **`E164_JSON_BASELINE.firstLineSha12 === null`**（"首行值冻结"已被摘掉 ⇒ 每轮都变的时间戳线不再当基线）',
         E164_BASELINE.length === E164_FILES.length && E164_ANCHOR.total === E164_BASELINE.length
+          && E164_JSON_BASELINE.firstLineSha12 === null
           && nowSha === E164_ANCHOR.sha12
           && anchorOf(loosened) !== E164_ANCHOR.sha12 && anchorOf(tightened) !== E164_ANCHOR.sha12,
-        `基线 ${E164_BASELINE.length} 条／锚点 total ${E164_ANCHOR.total}；现算 sha12 ${nowSha}／冻结 ${E164_ANCHOR.sha12}；`
-          + `改松一处（首个 \`linesMin\` −10）⇒ ${anchorOf(loosened)}（必不符）；改紧一处（第二个 \`maxLineMax\` +1000）⇒ ${anchorOf(tightened)}（必不符）`);
+        `基线 ${E164_BASELINE.length} 条／锚点 total ${E164_ANCHOR.total}；锚点覆盖面 ${anchorAll.length} 条（四份 \`.md\` ＋ JSON）；`
+          + `现算 sha12 ${nowSha}／冻结 ${E164_ANCHOR.sha12}；`
+          + `改松一处（首个 \`linesMin\` −10）⇒ ${anchorOf(loosened)}（必不符）；改紧一处（第二个 \`maxLineMax\` +1000）⇒ ${anchorOf(tightened)}（必不符）；`
+          + `JSON 那一条的 \`linesMin\` 改松成 1 ⇒ ${jsonLoosened}（必不符）；`
+          + `JSON \`firstLineSha12\` ＝ ${JSON.stringify(E164_JSON_BASELINE.firstLineSha12)}（**值冻结已摘掉**，形态判据接管：`
+          + `首字符 \`${E164_JSON_SHAPE.firstChar}\` ＋ 末行 \`${E164_JSON_SHAPE.lastLine}\` ＋ 合法 JSON ＋ 键齐）`);
     }
     /* ---------------- `E164-④`／`E164-⑤`：**JSON 实跑账**（受管判据本体 ＋ D22） ----------------
        面＝**主账本**（`tests\._verify\` 下那一份）：路径的**真源**是 `run-all.js` 导出的 `MAIN_LEDGER_NAME`，
-       本判据不另写死名字，而是**把盘上路径与它对照**（`e164RelOk`）。 */
+       本判据不另写死名字，而是**把盘上路径与它对照**（`e164RelOk`）。
+       【`T-20261006-16`：本节的"前提不成立 ⇒ 本轮不可比"口径（主代理裁定）】
+       主代理 2026-10-06 的全量轮实测：本节把**盘上台账**当作"已 settled 的产物"来判 ⇒ **轮内必然误红**
+       （一次全量轮里 `run-all` 边跑边重写该账；`harness-check` 自己在**并行波**里跑，读到的常是
+       "本轮尚未收尾的部分账"或"上一轮的部分账"）。证据：`tests\._verify\run-all\harness-check-21868.log`
+       的 `E164-⑤` 详情（当轮账 104 行／6 个 suite，`E164-⑤` 的**负对照**被判红）。
+       ⇒ 本节的判据分两层，**口径沿用本仓既有先例**（9.5-7 单一真源，不造第二套）：
+         · **形态层（`e164JsonReadShape()`，恒适用）**：只依赖这份文件自己（截断／非 JSON 尾巴／首字符／
+           合法 JSON／键齐／三元组就位／`ranSuites↔suites[].name`／`scripts` 普查／`role`／逐 suite 本地不变量）
+           ⇒ 轮内部分写的账**照样被一视同仁地查**，"真正该红的仍必须红"；
+         · **冻结点层（`e164JsonBaselineBad()`，仅"已收尾且完整"时适用）**：`linesMin`／`maxLineMax` 两道阈值。
+       **前提**＝`e164JsonRoundIsComplete()`（口径＝**仓内既有**的 `expectedOffline ⊆ ranSuites`：
+       `run-all.js` 的 `writeRunTotals()` 落的 `expectedOffline` 本就是"**账本覆盖前提**"，
+       `docs-cross-check` §11 的 `D20` 把它读成"账本覆盖不到的项 ⇒ 本轮不可比、不判 FAIL"——
+       本包把**同一条既有口径**用在 `E164` 上，不新造标记、**也不要求 `run-all.js` 加收尾标记**）。
+       **前提不成立 ⇒ 记"本轮不可比"**：由 `E164-④` 打印（`[SKIP]` 行 ＋ 详情里逐字写出缺了哪几项）、
+       **不判 FAIL**；`E164-⑤` 的 D22 则改为在**合成"已收尾且完整"台账**上做变异 ⇒ 与盘上账的收尾状态
+       **完全解耦**（判据可复算、不随轮次漂移）。 */
     const runAll23 = require('./run-all');
     const e164LedgerPath = path.join(env.paths.verify, runAll23.MAIN_LEDGER_NAME);
     const e164RelOk = path.join(env.paths.root, E164_JSON_REL) === e164LedgerPath;
     let e164Bytes0 = null; let e164Text = null; let e164ReadErr = null;
     try { e164Bytes0 = fs.readFileSync(e164LedgerPath); e164Text = e164Bytes0.toString('utf8'); }
     catch (err) { e164ReadErr = (err && (err.code || err.message)) || String(err); }
-    const e164Run = e164JsonLedger(E164_JSON_REL, e164Text, E164_JSON_BASELINE);
-    const e164St = e164Run.stats;
+    const e164Run = e164JsonLedger(E164_JSON_REL, e164Text);
     const e164SelfSrc = fs.readFileSync(__filename, 'utf8');
     const e164Hits = (needle) => e164SelfSrc.split(needle).length - 1;
     const e164Anchors = { begin: e164Hits(E164_RULER_BEGIN), end: e164Hits(E164_RULER_END) };
     const e164Ascii = [E164_RULER_BEGIN, E164_RULER_END].every(s => /^[\x20-\x7E]+$/.test(s));
+    /** **锚点自证 ＋ 形态层读数／违规**（`E164-④` 与 `E164-⑤` 共用同一段实参，**两处都看得见同一读数**） */
+    const e164CommonOk = e164RelOk && e164Ascii && e164Anchors.begin === 1 && e164Anchors.end === 1
+      && e164Run.shapeBad.length === 0;
+    const e164Readout = `台账 \`${E164_JSON_REL}\`（${e164Text === null ? '**读不到：' + e164ReadErr + '**' : Buffer.byteLength(e164Text, 'utf8') + ' B'}）；`
+      + (e164Run.stats ? `结构读数（**与四份 \`.md\` 台账同一把尺子**）：行数 ${e164Run.stats.lines}／最长行 ${e164Run.stats.maxLen}／`
+        + `首行「${e164Run.stats.firstLine}」／末行(最后非空)「${e164Run.stats.lastLine}」／BOM ${e164Run.stats.bom}／`
+        + `CRLF ${e164Run.stats.crlf}·裸 LF ${e164Run.stats.bareLf}／末行尾 ${e164Run.stats.endsWithNewline}；` : '（结构读数取不到）；')
+      + (e164Run.parsed ? `语义读数：role=${JSON.stringify(e164Run.parsed.role)}／`
+        + `suites ${Array.isArray(e164Run.parsed.suites) ? e164Run.parsed.suites.length : '-'} 条／`
+        + `ranSuites ${Array.isArray(e164Run.parsed.ranSuites) ? e164Run.parsed.ranSuites.length : '-'} 条／`
+        + `三元组 ${E164_JSON_TRI.map(k => `${k}=${e164Run.parsed.assertions ? JSON.stringify(e164Run.parsed.assertions[k]) : '-'}`).join('／')}；`
+        : '')
+      + `**本轮可比性**：${e164Run.comparable ? '前提成立（已收尾且完整）' : '前提不成立'} —— ${e164Run.completeWhy}；`
+      + `形态层违规 ${e164Run.shapeBad.length} 条${e164Run.shapeBad.length ? '：' + e164Run.shapeBad.join('；') : '（无）'}；`
+      + `冻结点层（仅"已收尾且完整"时适用）违规 ${e164Run.threshBad.length} 条`
+      + `${e164Run.threshBad.length ? '：' + e164Run.threshBad.join('；') : e164Run.comparable ? '（无）' : '（本轮不适用）'}；`
+      + `锚点自证（\`E186\`）：\`E164-RULER-BEGIN\` 命中 ${e164Anchors.begin} 次、\`E164-RULER-END\` 命中 ${e164Anchors.end} 次`
+      + `（各应 1）；锚点全 ASCII=${e164Ascii}；台账路径真源＝\`run-all.js\` 的 \`MAIN_LEDGER_NAME\`（对照相符=${e164RelOk}）；`
+      + `**首行值冻结已摘掉**（` + `\`firstLineSha12\` ＝ null）：形态由"首字符 \`${E164_JSON_SHAPE.firstChar}\` ↔ 末行 \`${E164_JSON_SHAPE.lastLine}\` `
+      + `＋ 合法 JSON ＋ 键齐"承担（每轮都变的时间戳线不再当基线）`;
+    /* `E164-④` 本体：**判据分两层**（形态层恒适用、冻结点层仅"已收尾且完整"时适用）。
+       ⚠ **前提不成立时不 abstain（不 `t.skip`）**，而是把这两层**各自能判的都判掉**、并把前提状态**逐字打印**
+       （`e164Readout` 里的"本轮可比性"一段）—— 理由见 `E164-⑤` 上方的说明：`t.skip` 会让本脚本的
+       "通过/跳过"读数随环境漂移（全量轮 502 → 501），级联出去就是 `docs-cross-check` 的逐脚本对账失配
+       （本轮实测 6 条）。**该打印的一点不少，该红的（已收尾且完整而结构被破坏）一条不减。** */
     t.check('E164-④ **JSON 实跑账的"台账结构不变量"**（`tests\\._verify\\run-totals.json`）：'
       + '①**是合法 JSON**（根是对象、十个字段齐）；②**权威三元组（通过／失败／跳过）各就各位**且与'
       + '**逐 suite 明细自洽**（Σ `suites[].summary.{passed,failed,skipped}` ＝ `assertions.{...}`）'
       + '＋`ranSuites ↔ suites[].name` 同名同序 ＋`scripts` 状态普查 ＝ `suites` 条数；'
-      + '③**不是**"被粘成一行／被截断／带非 JSON 尾巴"的形态；'
-      + '④台账**缺失／不可读 ⇒ 判红（fail-closed，不许静默跳过）**；'
+      + '③**不是**"被粘成一行／被截断／带非 JSON 尾巴"的形态（**首字符 ＋ 末行 ＋ 行数>1**三维，**不看时间戳**）；'
+      + '④台账**已收尾且完整**时另加两道冻结点阈值（行数下界／最长行上界）；'
+      + '⑤台账**缺失／不可读，或自述未收尾/不完整 ⇒ 记"本轮不可比"**：'
+      + '**显式打印前提状态与缺项**、形态层照判、冻结点层与语义层**本轮不适用**（不判 FAIL —— '
+      + '`docs-cross-check` §11 `D20`「账本覆盖不到 ⇒ 本轮不可比」同口径）；'
       + '任一项违规 ⇒ **红并逐条指名「台账：维度 实测/阈值」**',
-      e164RelOk && e164Text !== null && e164Run.parseErr === null && e164Run.bad.length === 0
-        && e164Ascii && e164Anchors.begin === 1 && e164Anchors.end === 1,
-      `台账 \`${E164_JSON_REL}\`（${e164Text === null ? '**读不到：' + e164ReadErr + '**' : Buffer.byteLength(e164Text, 'utf8') + ' B'}）；`
-        + (e164St ? `结构读数（**与四份 \`.md\` 台账同一把尺子**）：行数 ${e164St.lines}／最长行 ${e164St.maxLen}／`
-          + `首行「${e164St.firstLine}」／末行(最后非空)「${e164St.lastLine}」／BOM ${e164St.bom}／`
-          + `CRLF ${e164St.crlf}·裸 LF ${e164St.bareLf}／末行尾 ${e164St.endsWithNewline}；` : '（结构读数取不到）；')
-        + (e164Run.parsed ? `语义读数：role=${JSON.stringify(e164Run.parsed.role)}／`
-          + `suites ${Array.isArray(e164Run.parsed.suites) ? e164Run.parsed.suites.length : '-'} 条／`
-          + `ranSuites ${Array.isArray(e164Run.parsed.ranSuites) ? e164Run.parsed.ranSuites.length : '-'} 条／`
-          + `三元组 ${E164_JSON_TRI.map(k => `${k}=${e164Run.parsed.assertions ? JSON.stringify(e164Run.parsed.assertions[k]) : '-'}`).join('／')}；`
-          : '')
-        + `违规 ${e164Run.bad.length} 条${e164Run.bad.length ? '：' + e164Run.bad.join('；') : '（无）'}；`
-        + `锚点自证（\`E186\`）：\`E164-RULER-BEGIN\` 命中 ${e164Anchors.begin} 次、\`E164-RULER-END\` 命中 ${e164Anchors.end} 次`
-        + `（各应 1）；锚点全 ASCII=${e164Ascii}；台账路径真源＝\`run-all.js\` 的 \`MAIN_LEDGER_NAME\`（对照相符=${e164RelOk}）`);
-    /* `E164-⑤` D22（**四支内存变异 ＋ 负对照 ＋ 未落盘自证**）：全程只动**内存副本**（字符串／对象），
-       盘上台账**只读**（前后逐字节对照自证）。四支：
-       ㈠ **事故原形**：整份删掉全部换行 ＝ `join('')` 形态（**内容守恒**：去空白后逐字相同）⇒ 结构判据必红，
+      e164CommonOk && e164Run.parseErr === null
+        && (!e164Run.comparable || e164Run.threshBad.length === 0),
+      e164Readout);
+    /* `E164-⑤` D22（**五支 ＋ 负对照 ＋ 未落盘自证 ＋ 判定核心自证**）：全程只动**内存副本**
+       （字符串／对象），盘上台账**只读**（前后逐字节对照自证）。四支变异跑在**合成"已收尾且完整"台账**上
+       —— 所以无论盘上是收尾了还是轮内部分写，这四支的读数都一样（判据可复算）。五支：
+       ㈠ **事故原形**：整份删掉全部换行 ＝ `join('')` 形态（**内容守恒**：去空白后逐字相同）⇒ 结构判据必红 ≥3 条，
           而**同一份变异体的语义判据 0 条**（＝ `JSON.parse` 照样成功、数字与明细都在场 ⇒ 内容类判据看不出它坏了）；
        ㈡ 某 suite 的**通过数** +1（不碰 `assertions`）⇒ 必红并**指名字段** `assertions.passed`（差 +1）——
           能力边界：单条 suite 的数字在**文件内**没有第二处真源 ⇒ 只能定位到**字段层**（见上文边界段）；
        ㈢ 能**唯一指名 suite** 的两维：① 把某 suite 改名 ⇒ `ranSuites ↔ suites[].name` 必红并逐字点名；
           ② 把某 suite 的 `worst` 翻到与 `failed` 不符 ⇒ 本地不变量必红并逐字点名。
-       ㈣ **负对照**＝盘上原件 ⇒ 违规 0 条。 */
+       ㈣ **新增（本包的核心守据）：把台账改成"轮内未收尾"形态（砍掉后面的 suite，`ranSuites` 同步砍）**
+          ⇒ 同一把尺子**只记"本轮不可比"、`bad` 0 条（不判红）**；而它的**负对照**＝**把前提判据摘掉**
+          （绕过 `comparable` 那道闸、直接把这份残缺台账喂进冻结点/语义层）⇒ 同一把尺子**必红 ≥1 条**
+          （`scripts` 普查与 `assertions` ↔ `Σ suites[].summary` 都与这份残缺账对不上）。这一对是**双向**的：
+          少了"必红"那一半，本支就退化成恒真；少了"不可比"那一半，就是本包要修的**轮内误红**。
+       ㈤ **负对照**＝盘上原件 ⇒ （**前提成立时**才判"违规 0 条"；前提不成立时**不判**，见下）＋
+          盘上台账**逐字节未变**。 ⚠ **为什么㈤的前提不成立时不 abstain（不 `t.skip`）**：本条的**四支变异与㈣
+          全部跑在合成台账上**（纯函数、与盘上状态解耦）⇒ 判据本体的可证伪能力**不依赖**盘上这一轮是否收尾；
+          而 `t.skip` 会让本脚本的"通过/跳过"读数随环境漂移（全量轮 502 → 501），**级联**出去就是
+          `docs-cross-check` 的逐脚本对账失配（本轮实测 6 条）⇒ 把"轮内"这件**本来正常**的事变成门禁红。
+          ⇒ 这里按"**判据对盘上只做它当时能做的判定、并把前提状态逐字打印**"处理：前提不成立时**只打印**
+          （`E164-④` 的 `[SKIP]` 行 ＋ 下面详情里的"本轮可比性"一段），**不装作查过了**，也不误判。 */
     {
+      /** **合成"已收尾且完整"台账**（`E164-⑤` 的变异基底）：字段与真账**同形**（10 个键 ＋ 逐 suite
+       *  `summary.{passed,failed,skipped,lines,worst}`）；`expectedOffline ⊆ ranSuites` 成立 ⇒
+       *  前提判为"已收尾且完整"。**数字取小值**（4 个 suite／50 行）以便"行数下界 40"这一维**不误触**，
+       *  而"整份粘成一行"照样越界（> `maxLineMax`）。 */
+      const synthSuites23 = [
+        { name: 's-a', status: 'passed', summary: { passed: 7, failed: 0, skipped: 0, lines: 1, worst: false } },
+        { name: 's-b', status: 'passed', summary: { passed: 5, failed: 0, skipped: 1, lines: 1, worst: false } },
+        { name: 's-c', status: 'passed', summary: { passed: 4, failed: 0, skipped: 0, lines: 1, worst: false } },
+        { name: 's-d', status: 'skipped', summary: { passed: 2, failed: 0, skipped: 2, lines: 1, worst: false } }
+      ];
+      const synthLedger23 = () => ({
+        at: '2026-10-06T00:00:00.000Z', mode: 'default', role: 'main',
+        mainLedger: E164_JSON_REL, pid: 424242,
+        expectedOffline: synthSuites23.map(s => s.name),
+        ranSuites: synthSuites23.map(s => s.name),
+        assertions: { passed: 18, failed: 0, skipped: 3 },
+        scripts: { passed: 3, failed: 0, skipped: 1, unverified: 0 },
+        suites: JSON.parse(JSON.stringify(synthSuites23))
+      });
       const ledgerOf = (obj) => JSON.stringify(obj, null, 2);
       const compactOf = (s) => s.replace(/\s+/g, '');
+      const baseObj = synthLedger23();
+      const baseText = ledgerOf(baseObj);
+      /* 基底自证：合成台账本身必须被**同一把尺子**判为"已收尾且完整 ⇒ 0 违规"（否则后面四支都不可信） */
+      const baseRun = e164JsonLedger(E164_JSON_REL, baseText);
+      const baseOk = baseRun.comparable && baseRun.parseErr === null && baseRun.bad.length === 0;
+      /* ㈠ 粘成一行（删全部换行；内容一字不少） */
+      const gluedText = baseText.replace(/\r\n|\n/g, '');
+      const gluedRun = e164JsonLedger(E164_JSON_REL, gluedText);
+      const gluedSem = e164JsonSemantics(E164_JSON_REL, JSON.parse(gluedText));
+      const gluedSame = compactOf(gluedText) === compactOf(baseText);
+      /* ㈡ 逐 suite 数字与三元组不一致（通过数最大的那条 +1） */
       const pickMaxPassed = (obj) => obj.suites.reduce((best, s, i, arr) => {
         const cur = s && s.summary ? s.summary.passed : -1;
         const own = arr[best] && arr[best].summary ? arr[best].summary.passed : -1;
         return cur > own ? i : best;
       }, 0);
-      const okBase = e164Text !== null && e164Run.parseErr === null;
-      /* ㈠ 粘成一行（删全部换行；内容一字不少） */
-      const gluedText = okBase ? e164Text.replace(/\r\n|\n/g, '') : null;
-      const gluedRun = okBase ? e164JsonLedger(E164_JSON_REL, gluedText, E164_JSON_BASELINE) : null;
-      const gluedSem = okBase ? e164JsonSemantics(E164_JSON_REL, JSON.parse(gluedText)) : ['（台账不可用 ⇒ 本支不适用）'];
-      const gluedSame = okBase && compactOf(gluedText) === compactOf(e164Text);
-      /* ㈡ 逐 suite 数字与三元组不一致（通过数最大的那条 +1） */
-      let numRun = null; let numSuite = '（台账不可用 ⇒ 本支不适用）';
-      if (okBase) {
-        const mut = JSON.parse(e164Text);
-        const i = pickMaxPassed(mut);
-        if (mut.suites[i] && mut.suites[i].summary) {
-          numSuite = mut.suites[i].name;
-          mut.suites[i].summary.passed += 1;
-        }
-        numRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mut), E164_JSON_BASELINE);
-      }
+      const mutNum = synthLedger23();
+      const numIdx = pickMaxPassed(mutNum);
+      const numSuite = mutNum.suites[numIdx].name;
+      mutNum.suites[numIdx].summary.passed += 1;
+      const numRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mutNum));
       /* ㈢a 名字集合／顺序不一致（改名 ⇒ 必逐字指名该 suite） */
-      let nameRun = null; let nameSuite = '（台账不可用 ⇒ 本支不适用）';
-      if (okBase && e164Run.parsed.suites.length > 2) {
-        const mut = JSON.parse(e164Text);
-        nameSuite = mut.suites[2].name;
-        mut.suites[2].name = 'zzz-phantom-check';
-        nameRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mut), E164_JSON_BASELINE);
-      }
+      const mutName = synthLedger23();
+      const nameSuite = mutName.suites[2].name;
+      mutName.suites[2].name = 'zzz-phantom-check';
+      const nameRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mutName));
       /* ㈢b 本地不变量 `worst ⟺ failed > 0`（翻一个 `failed = 0` 的 suite ⇒ 必逐字指名它） */
-      let worstRun = null; let worstSuite = '（台账不可用 ⇒ 本支不适用）';
-      if (okBase) {
-        const mut = JSON.parse(e164Text);
-        const i = mut.suites.findIndex(s => s && s.summary && s.summary.failed === 0);
-        if (i >= 0) {
-          worstSuite = mut.suites[i].name;
-          mut.suites[i].summary.worst = true;
-        }
-        worstRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mut), E164_JSON_BASELINE);
-      }
-      /* ㈣ 负对照 ＋ 未落盘自证 */
+      const mutWorst = synthLedger23();
+      const worstIdx = mutWorst.suites.findIndex(s => s && s.summary && s.summary.failed === 0);
+      const worstSuite = worstIdx >= 0 ? mutWorst.suites[worstIdx].name : '（无 failed=0 的 suite）';
+      if (worstIdx >= 0) mutWorst.suites[worstIdx].summary.worst = true;
+      const worstRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mutWorst));
+      /* ㈣ **轮内未收尾**形态：砍掉后面两个 suite（`ranSuites` 同步砍）⇒ 前提判据**必须**记"不可比"；
+             负对照＝**把前提判据摘掉**（即绕过 `comparable` 那道闸、直接把这份**残缺**台账喂进
+             冻结点/语义那一层 `e164JsonBaselineBad()`）⇒ 同一把尺子**必红 ≥1 条**
+             （`scripts` 普查、`assertions` ↔ `Σ suites[].summary` 都与这份残缺账对不上）。
+             这就是"**摘掉前提判据 ⇒ 本包要修的误红立刻回来**"的定点证明。 */
+      const cutObj = synthLedger23();
+      const cutOff = cutObj.suites.splice(2);            /* 砍掉后两条 ⇒ `suites`／`ranSuites` 只剩前两条 */
+      cutObj.ranSuites = cutObj.suites.map(s => s.name);
+      const cutOffNames = cutOff.map(s => s.name);
+      const cutText = ledgerOf(cutObj);
+      const cutRun = e164JsonLedger(E164_JSON_REL, cutText);
+      const cutParsed = JSON.parse(cutText);
+      const cutGuardOff = e164JsonBaselineBad(E164_JSON_REL, e164Stats(cutText), cutParsed);
+      /* ㈤ 负对照（盘上原件；前提成立时）＋ 未落盘自证 */
       let bytesAfter = null;
       try { bytesAfter = fs.readFileSync(e164LedgerPath); } catch { bytesAfter = null; }
       const e164NoWrite = Boolean(e164Bytes0 && bytesAfter && Buffer.compare(e164Bytes0, bytesAfter) === 0);
-      t.check('E164-⑤ D22（可证伪，**四支内存变异 ＋ 负对照 ＋ 未落盘自证**）：'
+      t.check('E164-⑤ D22（可证伪，**五支内存变异 ＋ 负对照 ＋ 未落盘自证**）：'
         + '㈠整份删掉全部换行（`join(\'\')` 形态、**内容守恒**）⇒ 结构判据**必红 ≥3 条**'
-        + '（含「行数」「最长行」「首行 ＝ 末行」且**一律带台账名**）、而**同一份变异体的语义判据 0 条**'
+        + '（含「行数」「整份被压平」且**一律带台账名**）、而**同一份变异体的语义判据 0 条**'
         + '（＝ `JSON.parse` 照样成功 ⇒ "内容守恒、结构全毁"）；'
         + '㈡某 suite 的**通过数** +1 ⇒ 必红并**指名字段** `assertions.passed`（差 +1）；'
         + '㈢a 某 suite **改名** ⇒ `ranSuites ↔ suites[].name` 必红并**逐字指名该 suite**；'
         + '㈢b 某 suite 的 `worst` 翻到与 `failed` 不符 ⇒ 必红并**逐字指名该 suite**；'
-        + '㈣**负对照**＝盘上原件 ⇒ 违规 **0** 条；盘上台账**逐字节未变**（未落盘自证）',
-        okBase && e164Run.bad.length === 0
-          && gluedRun !== null && gluedRun.bad.length >= 3 && gluedRun.stats.lines === 1 && gluedRun.parseErr === null
-          && gluedRun.bad.some(x => x.includes('行数')) && gluedRun.bad.some(x => x.includes('最长行'))
-          && gluedRun.bad.some(x => x.includes('首行 ＝ 末行'))
+        + '㈣**把台账改成"轮内未收尾"形态**（砍掉后面的 suite、`ranSuites` 同步砍）⇒ **记"本轮不可比"、'
+        + '`bad` 0 条（不判红）**，而**把前提判据摘掉**（绕过 `comparable` 那道闸、直接把这份残缺台账喂进'
+        + '冻结点/语义那一层）⇒ 同一把尺子**必红 ≥1 条**（`scripts` 普查／`assertions` ↔ `Σ suites[].summary` 都对不上；'
+        + '双向自证，本支不是恒真）；'
+        + '㈤**负对照**＝盘上原件 ⇒ （前提成立时）违规 **0** 条；盘上台账**逐字节未变**（未落盘自证）；'
+        + '四支变异全程跑在**合成"已收尾且完整"台账**上 ⇒ 与盘上账的收尾状态**解耦**（判据可复算）',
+        baseOk
+          && gluedRun.bad.length >= 3 && gluedRun.stats.lines === 1 && gluedRun.parseErr === null
+          && gluedRun.bad.some(x => x.includes('行数'))
+          && gluedRun.bad.some(x => x.includes('整份被压平'))
           && gluedRun.bad.every(x => x.startsWith(E164_JSON_REL))
           && gluedSame && gluedSem.length === 0
-          && numRun !== null && numRun.bad.some(x => x.includes('assertions.passed'))
+          && numRun.bad.some(x => x.includes('assertions.passed'))
           && numRun.bad.every(x => x.startsWith(E164_JSON_REL))
-          && nameRun !== null && nameRun.bad.some(x => x.includes('zzz-phantom-check') && x.includes(nameSuite))
-          && worstRun !== null && worstRun.bad.some(x => x.includes(worstSuite) && x.includes('worst'))
+          && nameRun.bad.some(x => x.includes('zzz-phantom-check') && x.includes(nameSuite))
+          && worstRun.bad.some(x => x.includes(worstSuite) && x.includes('worst'))
+          && cutRun.comparable === false && cutRun.bad.length === 0 && cutRun.parseErr === null
+          && cutGuardOff.length >= 1 && cutGuardOff.some(x => x.includes('scripts'))
+          && e164Run.shapeBad.length === 0
+          && (!e164Run.comparable || e164Run.threshBad.length === 0)
           && e164NoWrite,
-        `㈠整份删换行：行数 ${e164St ? e164St.lines : '-'} → ${gluedRun ? gluedRun.stats.lines : '-'}、`
-          + `最长行 ${e164St ? e164St.maxLen : '-'} → ${gluedRun ? gluedRun.stats.maxLen : '-'}、`
-          + `字节 ${e164Text ? Buffer.byteLength(e164Text, 'utf8') : '-'} → ${gluedText ? Buffer.byteLength(gluedText, 'utf8') : '-'}、`
-          + `去空白后逐字相同=${gluedSame} ⇒ 结构违规 ${gluedRun ? gluedRun.bad.length : '-'} 条：`
-          + `${gluedRun ? gluedRun.bad.join('；') : '（不适用）'}；`
-          + `**同一份变异体的语义判据 ${gluedSem.length} 条**（\`JSON.parse\` 成功=${gluedRun ? gluedRun.parseErr === null : '-'}）；`
-          + `㈡把「${numSuite}」的 passed +1 ⇒ ${numRun ? numRun.bad.length : '-'} 条（**点名到字段层**；`
-          + `单条 suite 的数字在文件内无第二处真源 ⇒ 不能唯一指名）：${numRun ? numRun.bad.join('；') : '（不适用）'}；`
-          + `㈢a 把第 3 条 suite「${nameSuite}」改名 \`zzz-phantom-check\` ⇒ ${nameRun ? nameRun.bad.length : '-'} 条：`
-          + `${nameRun ? nameRun.bad.join('；') : '（不适用）'}；`
-          + `㈢b 把「${worstSuite}」的 \`worst\` 翻成 true ⇒ ${worstRun ? worstRun.bad.length : '-'} 条：`
-          + `${worstRun ? worstRun.bad.join('；') : '（不适用）'}；`
-          + `㈣负对照＝盘上原件 ⇒ 违规 ${e164Run.bad.length} 条（应 0）；`
+        `合成台账（**已收尾且完整**，四支变异共用）：${baseObj.suites.length} 个 suite／${baseRun.stats.lines} 行／`
+          + `${Buffer.byteLength(baseText, 'utf8')} B ⇒ 同一把尺子判"可比=${baseRun.comparable}、违规 ${baseRun.bad.length} 条"（应可比、0 条）；`
+          + `㈠整份删换行：行数 ${baseRun.stats.lines} → ${gluedRun.stats.lines}、最长行 ${baseRun.stats.maxLen} → ${gluedRun.stats.maxLen}、`
+          + `字节 ${Buffer.byteLength(baseText, 'utf8')} → ${Buffer.byteLength(gluedText, 'utf8')}、去空白后逐字相同=${gluedSame} `
+          + `⇒ 结构违规 ${gluedRun.bad.length} 条：${gluedRun.bad.join('；')}；`
+          + `**同一份变异体的语义判据 ${gluedSem.length} 条**（\`JSON.parse\` 成功=${gluedRun.parseErr === null}）；`
+          + `㈡把「${numSuite}」的 passed +1 ⇒ ${numRun.bad.length} 条（**点名到字段层**；`
+          + `单条 suite 的数字在文件内无第二处真源 ⇒ 不能唯一指名）：${numRun.bad.join('；')}；`
+          + `㈢a 把第 3 条 suite「${nameSuite}」改名 \`zzz-phantom-check\` ⇒ ${nameRun.bad.length} 条：`
+          + `${nameRun.bad.join('；')}；`
+          + `㈢b 把「${worstSuite}」的 \`worst\` 翻成 true ⇒ ${worstRun.bad.length} 条：`
+          + `${worstRun.bad.join('；')}；`
+          + `㈣**轮内未收尾**（砍掉 ${cutOff.length} 个 suite：${cutOffNames.join('、')}）⇒ 同一把尺子判`
+          + `"可比=${cutRun.comparable}、违规 ${cutRun.bad.length} 条"（应**不可比、0 条**）`
+          + `、原因＝${cutRun.completeWhy}；`
+          + `**负对照**＝把前提判据摘掉（绕过 \`comparable\`、把这份残缺台账直接喂进冻结点/语义层）⇒ 违规 ${cutGuardOff.length} 条`
+          + `${cutGuardOff.length ? '（' + cutGuardOff[0] + '）' : ''}（⇒ 摘掉前提判据即红）；`
+          + `㈤负对照＝盘上原件 ⇒ 形态层 ${e164Run.shapeBad.length} 条`
+          + `（盘上**本轮可比性**＝${e164Run.comparable ? '前提成立 ⇒ 冻结点层 ' + e164Run.threshBad.length + ' 条（应 0）'
+            : '前提不成立 ⇒ 已记"本轮不可比"、冻结点层与语义层**本轮不适用**（逐字打印，不判 FAIL）'}）；`
           + `未落盘自证：${e164Bytes0 ? e164Bytes0.length : '-'} B → ${bytesAfter ? bytesAfter.length : '-'} B、逐字节相同=${e164NoWrite}`);
     }
   }
