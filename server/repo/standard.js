@@ -354,33 +354,49 @@ function count(db) {
  *
  * ⚠ 纪律（沿用本仓既有铁律）：
  *   · 入参非法一律**抛错且一行不删**；
- *   · 单次删除有**上限**（默认 1 行）——"删一个版本"就只该删一行，防止参数口径错误时连删；
+ *   · 选项键**白名单恰 `id` / `dryRun`**：多传任何键一律抛错并**指名该键**（不许静默忽略）；
  *   · `dryRun` 只报数不删。
  * 正常"改标准"请用 `addVersion()` 追加新版本；删除会让引用该版本的历史判定失去依据。
  *
+ * **E17（2026-10-06，座位 3）**：本函数原有第三个可选参数 `maxDelete`（默认 1 行）"单次删除上限"，
+ * 但它**永远不可能触发**：`id` 是主键（`schema.sql`：`id INTEGER PRIMARY KEY AUTOINCREMENT`）⇒
+ * `SELECT COUNT(*) WHERE id = ?` 恒 ≤ 1，而 `maxDelete` 又被强制 ≥ 1 ⇒ `if (hit > maxDelete)`
+ * 是**死分支**。死分支的害处不是"多几行代码"，而是**让人误以为有批量删除护栏**（实测 28 例全形态
+ * 触发 0 次，物证见 `tests\._verify\T-20261006-09\`）。故**删掉该参数与其 `RangeError` 分支**
+ * （按主键单删本就至多一行，不需要上限），并把它的入参形态**改为"未知选项键"拒收**：传了就抛错、
+ * **指名键名**，不静默忽略 —— 静默忽略是同一个"虚假安全感"的另一副面孔。
+ * 因此原先"**11 种非法入参抛错**"的口径**原样成立**，只是来源变了：
+ *   · **6 种非法 `id`**（null/0/负数/小数/字符串/NaN）—— 仍按 `id` 校验抛 `TypeError`；
+ *   · **5 种非法 `maxDelete`**（null/0/-1/1.5/'abc'）—— 现按**未知选项键**抛 `TypeError`。
+ *
  * @param {object} db
- * @param {{id:number, maxDelete?:number, dryRun?:boolean}} options
+ * @param {{id:number, dryRun?:boolean}} options **只接受 `id` 与 `dryRun`**；其他键（含已移除的 `maxDelete`）一律抛错
  * @returns {{deleted:number, dryRun:boolean}}
+ * @throws {TypeError} `options` 非对象、含**未知选项键**（含已移除的 `maxDelete`）、或 `id` 不是 ≥ 1 的整数
  */
 function deleteVersion(db, options) {
   if (!options || typeof options !== 'object') {
     throw new TypeError('standard.deleteVersion: 入参必须是对象');
   }
+  /* 选项键白名单（E17）：允许集**恰** `{id, dryRun}` —— 即全仓普查到的**全部**真实用法
+     （`{id}` / `{id, dryRun}`）。`maxDelete` 已随 E17 移除 ⇒ 多传的键一律**指名拒收**，
+     不静默忽略（静默忽略＝"传了也不生效"，与死分支同族）。 */
+  for (const key of Object.keys(options)) {
+    if (key !== 'id' && key !== 'dryRun') {
+      const why = key === 'maxDelete'
+        ? '该参数已于 E17 移除：`id` 是主键 ⇒ 单删至多一行，"上限"分支永远不可达'
+        : '本函数只接受 id 与 dryRun';
+      throw new TypeError(
+        `standard.deleteVersion: 不认识的选项 ${JSON.stringify(key)}（${why}；本函数只做按主键单删）`);
+    }
+  }
   const id = Number(options.id);
   if (!Number.isInteger(id) || id < 1) {
     throw new TypeError(`standard.deleteVersion: id 必须是 ≥ 1 的整数（收到 ${JSON.stringify(options.id)}）`);
   }
-  const maxDelete = options.maxDelete === undefined ? 1 : Number(options.maxDelete);
-  if (!Number.isInteger(maxDelete) || maxDelete < 1) {
-    throw new TypeError(`standard.deleteVersion: maxDelete 必须是 ≥ 1 的整数（收到 ${JSON.stringify(options.maxDelete)}）`);
-  }
   const dryRun = options.dryRun === true;
   const hit = db.prepare('SELECT COUNT(*) AS c FROM standard WHERE id = ?').get(id).c;
   if (hit === 0) return { deleted: 0, dryRun };
-  if (hit > maxDelete) {
-    throw new RangeError(
-      `standard.deleteVersion: 本次将删除 ${hit} 行，超过上限 ${maxDelete}（id=${id}）—— 已中止，请核对入参`);
-  }
   if (dryRun) return { deleted: hit, dryRun: true };
   const r = db.prepare('DELETE FROM standard WHERE id = ?').run(id);
   return { deleted: r.changes, dryRun: false };

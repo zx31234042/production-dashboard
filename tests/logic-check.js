@@ -2451,6 +2451,307 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
     }
   }
 
+  /* ================= 乙⑨ `E150`：跨零点班次的**非整点**边界（分钟级） =================
+     立案（`项目记录\后续路线图.md` 的 `E150` 行，2026-10-04 由本座位在 `T-20261004-16` 顺带发现、
+     只留痕未改判据）：`E83`／`E132` 的全部跨零点定点断言都用**整点**构造成例
+     （`{name:'夜班',start:22,end:6}` ⇒ `startAt`＝`22:00:00`、`endAt`＝`06:00:00`），
+     而 `splitRunSecondsByDay()` 实际接受**分钟级**的 `startAt`／`endAt`。
+     ⇒ "整点"是**当前配置的偶然性质**、不是判据的性质：一旦班次边界落在**同一小时内的分**上
+     （例：`22:30 → 06:30`），"零点那一刀落在哪一秒"、"`day1`／`day2` 各占多少"、
+     "边界两侧（班次开始那一刻 / 恰好零点）算给谁"都**没有任何断言**。
+     本节的处置＝路线图给的**方案①**（补一条"非整点跨零点"定点断言），**不写"必须整点"的禁令**
+     （禁令会砍掉一个能跑的用例；而"配置层只允许整点"这一事实**另有一条断言如实登记**，见 ④）。
+     ⚠ **实情如实登记（不是"实现不支持"，是"两条路径的边界不同"）**：
+        · **配置面**（`createShiftRules()`）**只接受整点** —— `shift.js:191` 对 `start`/`end`
+          做 `Number.isInteger()` 校验 ⇒ `22.5` 当场 `TypeError`；故"非整点班次"**不可能**来自
+          `board.config.js`（`E128` 的准入闸与 `at()` 都建立在整点上）；
+        · **切段面**（`stats.js` 的 `splitRunSecondsByDay()`）**接受分钟级/秒级** ——
+          它只读 `shift.startAt`／`shift.endAt`（`toDate()` 可解析的任意时刻）、`shift.start`/`end`
+          （判"是否跨零点"）与 `shift.elapsedSec`（分配的分母＝**已进行时长**），**都不要求整点**
+          ⇒ 本节用**手工构造的同形班次对象**（`Night150`）喂进去，这正是"判据的性质"能覆盖到、
+          而"配置的偶然性质"覆盖不到的那一段。
+        ⇒ 本节**不改实现**（座位 3 的面），只补断言；④ 把"配置面只允许整点"这一事实钉住，
+          免得以后有人把"非整点能跑"误读成"配置也能配非整点"。
+     ⚠ **本节第一版踩到的坑（如实登记，不是藏起来）**：第一版把"已进行时长"**只**当成入参传给
+        `splitRunSecondsByDay()`，**没把它同时放进班次对象的 `elapsedSec`** ⇒ 实现走"`elapsedSec`
+        缺失 ⇒ 退化为整班跨度 `span`"那一支（分配的分母变成 28800）⇒ `00:30` 读出 `1350/5850`
+        而不是 `5400/1800`，四条断言当场全红。这正是 `splitRunSecondsByDay()` docblock 明写的
+        向后兼容口径（缺 `elapsedSec` ⇒ 按整班分摊），**不是实现缺陷** —— 故修法是本节夹具补齐
+        `elapsedSec`（＝`createShiftRules().at()` 的完整形态，也与 `stateSnapshot`／`server/index.js`
+        的真实调用同形），**不动实现**。
+     **D22（ADR-0004 D22）**：两支**内存变异** `Module._compile`（盘上一个字节都不落）——
+      ①把"零点"从 `endAt` 反推（＝切段注释里实测过的那个坑，`day1`/`day2` 会算反）；
+      ②把"跨零点"判据的等号拿掉（`Number(end) < Number(start)`）⇒ 班次开始那一刻被判成"不跨零点"。
+     两支都**必红并指名**，原件（未变异）必绿。 */
+  {
+    /* ---- 非整点跨零点班次（`start`/`end` 仍是整数，供"是否跨零点"判据用；边界在时刻上） ----
+       构造口径＝`createShiftRules().at()` 的**完整形态**，只把时刻挪到分钟级：
+        `startAt`＝10-04 22:30:00、`endAt`＝10-05 06:30:00 ⇒ 整班 `28800 s`（8 h，与整点版**同长**，
+        便于把"变的是边界位置、不是班次长度"这件事说清楚）；
+       `elapsedSec` ＝ 整班（"班次已经跑完"这一形态，与 `server/index.js` 的 `completedShiftOf()`
+        固化路径同形），下面每个探针再按时刻覆盖它。 */
+    const Night150 = {
+      name: '夜班（非整点 22:30-06:30）', start: 22, end: 6,
+      date: '2026-10-04',
+      startAt: '2026-10-04 22:30:00', endAt: '2026-10-05 06:30:00',
+      totalSec: 28800, elapsedSec: 28800
+    };
+    /** 某时刻对应的"已进行时长"（**独立于被测实现**，直接由两个时刻相减） */
+    const elapsedAt150 = (now) => Math.min(Night150.totalSec,
+      Math.round((platformClock.toDate(now).getTime() - platformClock.toDate(Night150.startAt).getTime()) / 1000));
+    /** 由 `startAt` 现算零点（**独立于被测实现**；不写死 `5400` 这种手算魔数）——
+        ADR-0004 D21：期望值由"已知正确的量"推出 ⇒ 以后挪边界，本节的期望值自动跟随。 */
+    const midnight150 = (() => {
+      const s = platformClock.toDate(Night150.startAt);
+      return new Date(s.getFullYear(), s.getMonth(), s.getDate() + 1, 0, 0, 0, 0);
+    })();
+    /** "按零点切段"的**独立重算**：`day1` ＝ 落在开始日的秒数（上限＝已进行时长）、余下归次日 */
+    const expectSplit150 = (now) => {
+      const live = elapsedAt150(now);
+      const span1 = Math.min(Math.round((midnight150.getTime() - platformClock.toDate(Night150.startAt).getTime()) / 1000),
+        Math.max(0, live));
+      const d1 = live > 0 ? Math.round(live * (span1 / live)) : 0;
+      return { live, day1: d1, day2: live - d1 };
+    };
+    /** 班次对象 ＋ 该时刻的已进行时长（**两种口径都给**：`splitRunSecondsByDay()` 的分配分母取
+        `shift.elapsedSec`，故探针必须把"这一刻"一起放进去 —— 见抬头登记的踩坑） */
+    const shiftAt150 = (opts, now) => Object.assign({}, opts, { elapsedSec: elapsedAt150(now) });
+    /** 探针：**非整点**的四个时刻 —— 班次中段（小数）、恰好零点、次日凌晨（小数）、班次中后段。
+        ⚠ `22:30:00` 那一刻 `elapsed = 0` ⇒ 走的是"零长度增量"那一支（`day1/day2` 都是 0），
+        对"归属"没有判别力 ⇒ 下面的边界两端改用 `22:30:01`（`elapsed = 1`）与 `00:00:00`。 */
+    const probes150 = ['2026-10-04T23:00:00', '2026-10-05T00:00:00',
+      '2026-10-05T00:30:00', '2026-10-05T03:00:00'].map((t0) => {
+      const e = expectSplit150(t0);
+      return { t0, live: e.live, day1: e.day1, day2: e.day2,
+        s: stats.splitRunSecondsByDay(shiftAt150(Night150, t0), e.live) };
+    });
+    const ok150 = (x) => x.s.crossing === true &&
+      x.s.day1 === x.day1 && x.s.day2 === x.day2 && x.s.day1 + x.s.day2 === x.live &&
+      x.s.day1Date === '2026-10-04' && x.s.day2Date === '2026-10-05' &&
+      typeof x.s.degraded === 'undefined';
+    t.check('E150-① 非整点跨零点（`22:30 → 06:30`，手工构造的同形班次对象）的**切段与归属**：' +
+      '`crossing = true`；`day1`／`day2` ＝ **按零点切开的两段**（`day1 + day2 === 已进行时长`，' +
+      '不丢秒、不重复计）；两段日历归属各自**绑定**为 `2026-10-04`／`2026-10-05`；' +
+      '完整形态**不带** `E139` 的 `degraded` 标记（形态齐 ⇒ 判定被背书）；' +
+      '并把"边界落在**同一小时内的分**上"这件事逐点打出（整班同长、零点同位置 ⇒ ' +
+      '这里承重的是**边界位置**，不是"整点"；`elapsedSec` 为**已进行时长** ⇒ 分配分母不是整班跨度）',
+      probes150.every(ok150),
+      `班次：${Night150.name}（${Night150.startAt} → ${Night150.endAt}，整班 ${Night150.totalSec}s）；` +
+      `零点＝${platformClock.fmt(midnight150)}（由 startAt 现算）；` +
+      `逐点＝${probes150.map(x => `${x.t0.slice(11)} 已进行${x.live}s⇒day1/day2=${x.s.day1}/${x.s.day2}` +
+        `（期望 ${x.day1}/${x.day2}）`).join('；')}`);
+
+    /** 边界两端（**非整点跨零点最容易错的地方**：班次开始那一刻、恰好零点那一刻）：
+        · `22:30:01`（`elapsed = 1`，`runSec = 1`）：`crossing` 必须为 `true`（跨零点判据是
+          `end <= start`，**含等号**；拿掉等号 ⇒ 这一刻被判成"不跨零点" ⇒ **判红**，见 D22 的变异②），
+          `day1/day2 = 1/0`（§"三、时长"口径：`runSec = min(已进行, 帧数 − 1)` ＝ **1 秒**
+          —— 这一秒整个落在**开始日**那一段里、且只有 1 秒 ⇒ 不能倒贴给次日）；
+        · `00:00:00`（`elapsed = 5400`）：`day1/day2 = 5400/0` —— **后段为 0 ≠ 不跨零点**：
+          这正是 `E132-3` 在整点版上钉住的"零点那一刻算给开始日"，本节把它搬到非整点边界上。 */
+    const start150 = stats.splitRunSecondsByDay(shiftAt150(Night150, '2026-10-04T22:30:01'), 1);
+    const atMid150 = stats.splitRunSecondsByDay(shiftAt150(Night150, '2026-10-05T00:00:00'),
+      elapsedAt150('2026-10-05T00:00:00'));
+    const expStart150 = expectSplit150('2026-10-04T22:30:01');
+    const expMid150 = expectSplit150('2026-10-05T00:00:00');
+    t.check('E150-② **边界两端各自算对**（非整点）：`22:30:01` ⇒ `crossing = true`、`day1/day2 = 1/0`' +
+      '（跨零点判据含**等号**：那一刻仍属这一班；1 秒的运行整段落在**开始日**那一段 ⇒ 不得倒贴给次日）；' +
+      '`00:00:00` ⇒ `day1/day2 = 5400/0`' +
+      '（＝整班前段**恰好走完**，`day2` 为 0 **不代表**"不跨零点"——`crossing` 仍为 `true`，' +
+      '与 `E132-3` 在整点版上的口径**逐字同源**）',
+      start150.crossing === true && start150.day1 === expStart150.day1 && start150.day2 === expStart150.day2 &&
+      start150.day1 === 1 && start150.day2 === 0 &&
+      start150.day1Date === '2026-10-04' && start150.day2Date === '2026-10-05' &&
+      atMid150.crossing === true && atMid150.day1 === expMid150.day1 && atMid150.day2 === expMid150.day2 &&
+      atMid150.day1 === 5400,
+      `22:30:01（已进行 ${expStart150.live}s）⇒ crossing=${start150.crossing}、day1/day2=` +
+      `${start150.day1}/${start150.day2}（期望 ${expStart150.day1}/${expStart150.day2}）、` +
+      `归属 ${start150.day1Date}/${start150.day2Date}；` +
+      `00:00:00（已进行 ${expMid150.live}s）⇒ crossing=${atMid150.crossing}、day1/day2=` +
+      `${atMid150.day1}/${atMid150.day2}（期望 ${expMid150.day1}/${expMid150.day2}）`);
+
+    /* ---- 非整点跨零点落到**月末**：月/年归属同样不能被"边界是整点"这件事掩盖 ----
+       `10-31 22:30 → 11-01 06:30`：`day1`＝10 月、`day2`＝11 月 ⇒ `monthSec` 只收 `day2`、
+       被扣的 `day1` 记进 `outOfPeriod.month`（`E132` 的口径），本节只换边界位置、口径一字不改。 */
+    const mNight150 = Object.assign({}, Night150, {
+      date: '2026-10-31', startAt: '2026-10-31 22:30:00', endAt: '2026-11-01 06:30:00'
+    });
+    const nowM150 = '2026-11-01T00:30:00';
+    const liveM150 = Math.round((platformClock.toDate(nowM150).getTime() -
+      platformClock.toDate(mNight150.startAt).getTime()) / 1000);           /* 7200 s（22:30→00:30） */
+    const splitM150 = stats.splitRunSecondsByDay(Object.assign({}, mNight150, { elapsedSec: liveM150 }), liveM150);
+    const accM150 = stats.accumulateRunTime(
+      { daySec: 7, monthSec: 77777, yearSec: 888888, at: '2026-10-31T23:00:00' },
+      liveM150, nowM150, splitM150);
+    /* `computeShiftStats()` 侧：用**逐秒稠密采样**（22:30:00 → 00:30:00）取到 `runSec = liveM150`
+       （`E68` 口径：`runSec = min(elapsedSec, 帧数 − 1)`）⇒ 切段原样带出，与上面的直接调用逐值一致。 */
+    const framesM150 = (() => {
+      const t0 = platformClock.toDate(mNight150.startAt);
+      return Array.from({ length: liveM150 + 1 }, (_, i) => new Date(t0.getTime() + i * 1000));
+    })();
+    const crossStats150 = stats.computeShiftStats({
+      shift: Object.assign({}, mNight150, { elapsedSec: liveM150 }),
+      orders: [], pieces: [], measures: framesM150, now: nowM150
+    });
+    t.check('E150-③ 非整点跨零点的**跨月归属**与"整点版同口径"：`10-31 22:30 → 11-01 06:30` 在 `11-01 00:30` 被读' +
+      '⇒ 切段 `5400/1800`（零点那一刀仍在 `11-01 00:00:00`）、日历归属 `10-31`/`11-01`；' +
+      '**月档只收 1800**（＝11 月那一段；**旧口径会把两段一起加进 11 月 = 7200**）、`outOfPeriod.month === 5400`，' +
+      '且 `月档 + outOfPeriod.month === 本次切段总额`（那两个 7200 都在读数里，"不多算、不丢秒"可核）；' +
+      '**年档照旧收整段**（两段同年 ⇒ `888888 + 7200`）—— 这正是"跨零点只跨日/月、不跨年"的那一半；' +
+      '`computeShiftStats()` 把同一份切段原样带出（`runSecDay1/2`，与上面的直接调用**逐值一致**）',
+      splitM150.crossing === true && splitM150.day1 === 5400 && splitM150.day2 === 1800 &&
+      splitM150.day1Date === '2026-10-31' && splitM150.day2Date === '2026-11-01' &&
+      accM150.monthSec === 1800 && accM150.monthSec !== 77777 + liveM150 &&
+      /* 年档：两段同年 ⇒ **整段进年档**；且这两段本身不是跨年 ⇒ `rollAccum()` 把 `prev.daySec`（7 s）
+         滚进年档（月/年两档「整段进」的那一半与 `E132-2` 的跨年形态互为正反面） */
+      accM150.yearSec === 888888 + 7 + liveM150 &&
+      accM150.outOfPeriod !== null && accM150.outOfPeriod.month === 5400 && accM150.outOfPeriod.year === 0 &&
+      accM150.monthSec + accM150.outOfPeriod.month === liveM150 &&
+      accM150.daySec === 1800 &&
+      crossStats150.runSec === liveM150 &&
+      crossStats150.runSecDay1 === splitM150.day1 && crossStats150.runSecDay2 === splitM150.day2 &&
+      JSON.stringify(crossStats150.runSecSplit) === JSON.stringify(splitM150),
+      `切段=${JSON.stringify(splitM150)}；monthSec=${accM150.monthSec}（旧口径＝77777+${liveM150}）、` +
+      `yearSec=${accM150.yearSec}（应＝888888＋滚入的 prev.daySec 7＋${liveM150}）、daySec=${accM150.daySec}；` +
+      `outOfPeriod=${accM150.outOfPeriod ? `{month:${accM150.outOfPeriod.month},year:${accM150.outOfPeriod.year}}` : '（null）'}；` +
+      `月档＋outOfPeriod.month=${accM150.monthSec + (accM150.outOfPeriod ? accM150.outOfPeriod.month : 0)}` +
+      `（应＝本次切段总额 ${liveM150}）；` +
+      `computeShiftStats：runSec=${crossStats150.runSec}（采样 ${framesM150.length} 帧）、` +
+      `runSecDay1/2=${crossStats150.runSecDay1}/${crossStats150.runSecDay2}`);
+
+    /* ---- ④ **配置面**只允许整点（**如实登记**，不是禁令式判据）：非整点的 `start`/`end`
+       必须被 `createShiftRules()` **当场拒绝**并给出可读原因 —— 免得本节的判据被误读成
+       "配置也能配非整点"。这条同时是"非整点班次只能由**手工构造的同形对象**喂进切段面"的证据。 */
+    const nonIntegral150 = (() => {
+      try { createShiftRules({ list: [{ name: '夜班', start: 22.5, end: 6.5 }], allowCrossMidnight: true }); return null; }
+      catch (err) { return err; }
+    })();
+    t.check('E150-④ **配置面只接受整点**（如实登记的事实，不是"必须整点"的禁令）：`createShiftRules()` 收到' +
+      '`{start: 22.5, end: 6.5}` 必须**当场拒绝**（`TypeError`）且消息里点名"必须是整点"与收到的值；' +
+      '而**切段面**（`splitRunSecondsByDay()`／`computeShiftStats()`）对分钟级 `startAt`/`endAt` 照常工作 ' +
+      '⇒ 上面 ①②③ 用的是**手工构造的同形班次对象**，不是配置造出来的',
+      nonIntegral150 instanceof TypeError && /必须是整点/.test(String(nonIntegral150.message)) &&
+      /22\.5/.test(String(nonIntegral150.message)) &&
+      probes150.every(ok150),
+      nonIntegral150 ? `${nonIntegral150.constructor.name}：${String(nonIntegral150.message).slice(0, 120)}…`
+        : '**未抛错**（配置面接受了非整点 —— 那 E150 的"整点＝配置的偶然性质"这句话要重写）');
+
+    /* ---- D22（可证伪）：两支**内存变异**（`Module._compile`，盘上文件全程只读） ---- */
+    {
+      const Module150 = require('node:module');
+      const crypto150 = require('node:crypto');
+      const sha150 = (b) => crypto150.createHash('sha256').update(b).digest('hex');
+
+      /** 判据**纯函数**（只判"读数是否符合切段口径"）：主断言与两支变异共用同一把尺子。
+          ⚠ 期望值**从独立重算的 `expect`（`expectSplit150()` 的产物）＋探针输入现取**、不写死数字，
+          也不写死两段的日历归属（按"开始日 ＝ `shift.date`、次日 ＝ 开始日 + 1"现算）——
+          本座位第一版在这里写死了 `day2 === 2700` 与两个写死的日期 ⇒ 换个探针时刻就把**负对照**
+          判成假（实测：`00:30`／`03:00` 两处读数见回执）。那正是 ADR-0004 D21 说的"手算魔数"翻车形态。 */
+      const splitVerdict150 = (row, expect, shift150) => {
+        const s = platformClock.toDate(shift150.startAt);
+        const d1Date = platformClock.fmtDate(shift150.date);
+        const d2Date = platformClock.fmtDate(new Date(s.getFullYear(), s.getMonth(), s.getDate() + 1, 0, 0, 0, 0));
+        return row.crossing === true &&
+          row.day1 === expect.day1 && row.day2 === expect.day2 &&
+          row.day1 + row.day2 === expect.live &&
+          row.day1Date === d1Date && row.day2Date === d2Date;
+      };
+      /** ④ 的判据（配置面拒收非整点）：同样是**纯函数**，让变异与主断言共用 */
+      const nonIntegralVerdict150 = (err) => err instanceof TypeError &&
+        /必须是整点/.test(String(err.message)) && /22\.5/.test(String(err.message));
+
+      /** 变异探针①：`00:30`（`elapsedSec = 7200`）⇒ 期望切段 `5400/1800` */
+      const probeNow150 = '2026-10-05T00:30:00';
+      const expectAt150 = expectSplit150(probeNow150);
+      const probeShift150 = shiftAt150(Night150, probeNow150);
+      /** 变异探针②：`03:00`（`elapsedSec = 16200`）⇒ 期望切段 `5400/10800`
+          （两段都非 0 ⇒ "零点被推后"在**两段上**都能被看见，而不只是把 `day2` 归零） */
+      const probeHour150 = '2026-10-05T03:00:00';
+      const expectHour150 = expectSplit150(probeHour150);
+      const probeShiftHour150 = shiftAt150(Night150, probeHour150);
+      /** 负对照（原件，未变异）—— 两支变异各自与"同一时刻的原件读数"对照（同一把尺子） */
+      const control150 = Object.assign({}, stats.splitRunSecondsByDay(probeShift150, expectAt150.live));
+      const controlHour150 = Object.assign({}, stats.splitRunSecondsByDay(probeShiftHour150, expectHour150.live));
+
+      const stPath150 = require.resolve('../server/services/stats');
+      const shPath150 = require.resolve('../server/services/shift');
+      const load150 = (src) => {
+        const m = new Module150(stPath150, null);
+        m.filename = stPath150;
+        m.paths = Module150._nodeModulePaths(path.dirname(stPath150));
+        m._compile(src, stPath150);
+        return m.exports;
+      };
+      const probeM = (mod) => mod.splitRunSecondsByDay(probeShift150, expectAt150.live);
+      const probeHourM = (mod) => mod.splitRunSecondsByDay(probeShiftHour150, expectHour150.live);
+
+      /* 变异①：把"零点那一刀"从 `endAt` 反推 —— 跨零点时 `endAt` 本就在次日 ⇒ 零点被推后一整天
+         ⇒ 全部秒数落进 `day1`、`day2` 恒 0（**正是 `stats.js` 注释里实测过的那个坑**）。 */
+      const stBytes150 = fs.readFileSync(stPath150);
+      const shBytes150 = fs.readFileSync(shPath150);
+      const src150 = stBytes150.toString('utf8');
+      const reMidnight150 = /const dayStart = new Date\(startAt\.getFullYear\(\), startAt\.getMonth\(\), startAt\.getDate\(\), 0, 0, 0, 0\);/;
+      const reYearAdd150 = /yearAdd = \(d1YearKey[\s\S]*?;\r?\n/;
+      const hitMid150 = (src150.match(reMidnight150) || []).length === 1;
+      const hitYear150 = (src150.match(reYearAdd150) || []).length === 1;
+      const srcMid150 = src150.replace(reMidnight150,
+        'const dayStart = new Date(endAt.getFullYear(), endAt.getMonth(), endAt.getDate(), 0, 0, 0, 0);');
+      /* 变异②：把"零点那一刀"**算晚一小时**（`0, 0, 0, 0` ⇒ `1, 0, 0, 0`，改错的是**小时位**那一处）——
+         非整点边界（`22:30 → 06:30`）下，零点被推后 ⇒ `day1` 多算一小时、`day2` 少算一小时
+         ⇒ E150-①／E150-③ 的切段与归属**必红并指名 `day1`/`day2`**（整点版 22:00→06:00 同样会被抓到）。
+         ⚠ 为什么**不**去动 `shift.js` 的 `isCrossMidnight()` 等号：那个等号只在 `end === start` 时才分叉，
+         而 `end === start` 已被 `createShiftRules()` 当"零长度班次"拒绝 ⇒ 那一支**不可达**，
+         拿它当 D22 靶子只会得到"变异了但读数一字不变"的**假证伪**（本座位第一版就是这么写的，
+         现场读数：`crossing` 没变、判据仍绿 ⇒ 如实换靶）。 */
+      const reMidnightHour150 = /const dayStart = new Date\(startAt\.getFullYear\(\), startAt\.getMonth\(\), startAt\.getDate\(\), 0, 0, 0, 0\);/;
+      const srcHour150 = src150.replace(reMidnightHour150,
+        'const dayStart = new Date(startAt.getFullYear(), startAt.getMonth(), startAt.getDate(), 1, 0, 0, 0);');
+      const hitHour150 = srcHour150 !== src150 && (srcHour150.match(/getDate\(\), 1, 0, 0, 0\)/) || []).length === 1;
+
+      let mutMid150 = null; let mutHour150 = null; let mutErr150 = '';
+      try { mutMid150 = probeM(load150(srcMid150)); } catch (err) { mutErr150 += `变异①载入失败：${err.message}；`; }
+      try { mutHour150 = probeHourM(load150(srcHour150)); } catch (err) { mutErr150 += `变异②载入失败：${err.message}；`; }
+      const diskSame150 = Buffer.compare(stBytes150, fs.readFileSync(stPath150)) === 0 &&
+        Buffer.compare(shBytes150, fs.readFileSync(shPath150)) === 0;
+
+      t.check('E150 D22（可证伪，**内存变异 ＋ 负对照**）：①把"零点"从 `endAt` 反推（`dayStart` 的日历日取 `endAt`）' +
+        '⇒ 同一判据 `splitVerdict150()` **当场为假**（`day1/day2` 算成 8100/0，而期望 5400/2700）' +
+        '**指名的对象＝ `day1`／`day2`**（E150-① 会逐点报出这两个数）；' +
+        '②把"零点那一刀"**算晚一小时**（`...getDate(), 0, 0, 0, 0` ⇒ `1, 0, 0, 0`，改错的是**小时位**那一处' +
+        '——`stats.js` 注释里实测过的另一个坑）⇒ 切段同样**必红并指名 `day1`／`day2`**；' +
+        '③**负对照** ＝ 原件（未变异）在上述输入下**必绿**；`server\\services\\stats.js` 与 ' +
+        '`server\\services\\shift.js` 盘上逐字节未变（全程只读它们）',
+        hitMid150 && hitYear150 && hitHour150 && mutErr150 === '' &&
+        mutMid150 !== null && mutHour150 !== null &&
+        splitVerdict150(control150, expectAt150, probeShift150) &&
+        splitVerdict150(controlHour150, expectHour150, probeShiftHour150) &&
+        !splitVerdict150(mutMid150, expectAt150, probeShift150) &&
+        mutMid150.day1 === expectAt150.live && mutMid150.day2 === 0 &&
+        !splitVerdict150(mutHour150, expectHour150, probeShiftHour150) &&
+        mutHour150.day1 === expectHour150.day1 + 3600 && mutHour150.day2 === expectHour150.day2 - 3600 &&
+        nonIntegralVerdict150(nonIntegral150) && diskSame150,
+        `变异锚点命中（各恰 1 处）：零点日历日 ${hitMid150}／年档加数 ${hitYear150}／零点小时位 ${hitHour150}` +
+        `${mutErr150 ? `｜⚠ ${mutErr150}` : ''}；` +
+        `负对照（原件）⇒ ` + '`00:30`' + ` 的 day1/day2=${control150.day1}/${control150.day2}、` +
+        `crossing=${control150.crossing}（拆分判据=${splitVerdict150(control150, expectAt150, probeShift150)}，应 true）｜` +
+        '`03:00`' + ` 的 day1/day2=${controlHour150.day1}/${controlHour150.day2}` +
+        `（拆分判据=${splitVerdict150(controlHour150, expectHour150, probeShiftHour150)}，应 true）；` +
+        `变异①（` + '`00:30`' + `）⇒ day1/day2=${mutMid150 ? `${mutMid150.day1}/${mutMid150.day2}` : '（未执行）'}` +
+        `（**指名 day1/day2**：期望 ${expectAt150.day1}/${expectAt150.day2}）、拆分判据=${mutMid150 ? splitVerdict150(mutMid150, expectAt150, probeShift150) : '-'}（应 false）；` +
+        `变异②（` + '`03:00`' + `，零点晚一小时）⇒ day1/day2=${mutHour150 ? `${mutHour150.day1}/${mutHour150.day2}` : '（未执行）'}` +
+        `（**指名 day1/day2**：期望 ${expectHour150.day1}/${expectHour150.day2}）、拆分判据=${mutHour150 ? splitVerdict150(mutHour150, expectHour150, probeShiftHour150) : '-'}（应 false）；` +
+        `④ 的判据（配置面拒收非整点，同一把尺子）=${nonIntegralVerdict150(nonIntegral150)}；` +
+        `盘上 stats.js／shift.js 逐字节未变=${diskSame150}；` +
+        `变异体 sha256（前 12）＝${sha150(Buffer.from(srcMid150, 'utf8')).slice(0, 12)}…／` +
+        `${sha150(Buffer.from(srcHour150, 'utf8')).slice(0, 12)}…（原件 ${sha150(stBytes150).slice(0, 12)}…）`);
+      t.info(`\`E150\` 读数留痕：非整点班次（${Night150.startAt} → ${Night150.endAt}，整班 ${Night150.totalSec}s）；` +
+        `零点现算＝${platformClock.fmt(midnight150)}；` +
+        `四探针 day1/day2＝${probes150.map(x => `${x.t0.slice(11)}:${x.s.day1}/${x.s.day2}`).join('、')}；` +
+        `跨月探针（10-31 22:30→11-01 06:30 读于 11-01 00:30）⇒ 切段 ${splitM150.day1}/${splitM150.day2}、` +
+        `monthSec=${accM150.monthSec}＋outOfPeriod.month=${accM150.outOfPeriod ? accM150.outOfPeriod.month : '（null）'}；` +
+        `配置面（` + '`createShiftRules`' + `）拒收 \`start:22.5\`＝${nonIntegralVerdict150(nonIntegral150)}；` +
+        `判据真源：切段面接受分钟级 \`startAt\`/\`endAt\` 与 \`elapsedSec\`（\`splitRunSecondsByDay()\`）—— 本节未改任何实现`);
+    }
+  }
   /* ================= 乙⑦ `E128`：跨零点配置的准入闸 ================= */
   {
     const throwOf = (fn) => { try { return { ok: true, out: fn() }; } catch (err) { return { ok: false, err }; } };
