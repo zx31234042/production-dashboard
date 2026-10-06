@@ -11562,6 +11562,7 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
        而"粘成一行／被压平／被换编码"必红并**逐条指名 `文件：维度 实测/阈值`**。 */
   t.section('二十三、`E164` 受管侧"台账结构不变量"（四份台账 × 五维）');
   {
+    /* E164-RULER-BEGIN */
     const crypto23 = require('node:crypto');
     const sha12_23 = (s) => crypto23.createHash('sha256').update(s).digest('hex').slice(0, 12);
     const E164_FILES = [
@@ -11612,7 +11613,10 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
       const bad = [];
       if (stats.lines < b.linesMin) bad.push(`行数 ${stats.lines} < 下界 ${b.linesMin}`);
       if (stats.maxLen > b.maxLineMax) bad.push(`最长行 ${stats.maxLen} > 上界 ${b.maxLineMax}`);
-      if (stats.tableRatio < b.tableRatioMin) {
+      /* 逐维"适用性"（`null` ＝ **本维对该台账不适用**）：JSON 实跑账没有 `|` 表格、其写入器 `JSON.stringify`
+         也不带尾换行 ⇒ 那两维对它取 `null`；四份 `.md` 台账的基线**不设**这两个字段
+         （`undefined !== null`）⇒ 它们的行为**逐字不变**。仍是**同一把尺子按台账类型逐维适用**，不是第二把尺子。 */
+      if (b.tableRatioMin !== null && stats.tableRatio < b.tableRatioMin) {
         bad.push(`表格行占比 ${(stats.tableRatio * 100).toFixed(1)}% < 下界 ${(b.tableRatioMin * 100).toFixed(0)}%`);
       }
       if (sha12_23(stats.firstLine) !== b.firstLineSha12) {
@@ -11623,9 +11627,173 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
       }
       if (stats.bom) bad.push('带 BOM');
       if (stats.crlf > 0 && stats.bareLf > 0) bad.push(`行尾混用（CRLF ${stats.crlf}／裸 LF ${stats.bareLf}）`);
-      if (!stats.endsWithNewline) bad.push('缺末行尾');
+      if (b.endsWithNewline !== null && !stats.endsWithNewline) bad.push('缺末行尾');
       return bad.map(x => `${rel}：${x}`);
     };
+    /* ---------------- `E164-④`／`E164-⑤`：**JSON 实跑账**（`tests\._verify\run-totals.json`）的结构不变量 ----------------
+       【缺口（`T-20261006-15`）】本节 `E164-①③` 守的是**四份 `.md` 台账**；`run-all.js` 每轮写的**实跑账 JSON**
+       （`writeRunTotals()`）此前**一条结构判据都没有** —— 而它同时是 `docs-cross-check` 的取数面。
+       `ce0af30` 那种"**粘成一行**、内容守恒、结构全毁"的形态若落在它身上：`JSON.parse` **仍成功**、
+       逐 suite 明细与权威三元组**都还在场** ⇒ 只读数字／只读子串的判据**照样绿**（`E164` 立案句原样）。
+       【复用（9.5-7 单一真源）】**同一把尺子**：结构读数＝`e164Stats()`、逐维判据＝`e164Audit()`
+       （按台账类型**逐维适用**）；JSON 专属的"语义自洽"＝下面的 `e164JsonSemantics()`，两者由
+       `e164JsonLedger()` 合成**同一份**实现，供主判据与 D22 **共用**。
+       【fail-closed】台账**缺失／不可读／不是合法 JSON／形态异常** ⇒ **判红**（没有"静默跳过"这条路）。
+       【锚点（`E186`）】`E164-RULER-BEGIN`／`E164-RULER-END` 两个锚点**只许 ASCII**，并自证**各恰命中 1 次**。
+       【依赖（`E163` 同类，如实写明）】`tests\._verify\` **不在 git 里** ⇒ 换机器／清了 scratch 后本判据会因
+       "台账缺失"**判红** —— 那是**有意的 fail-closed**（不是"不可比就放行"）。 */
+    /** **JSON 实跑账的冻结点**（**实测 2026-10-06**：248 行／最长行 51 B／4586 B／首行 `{`／无 BOM／纯 LF／
+     *  **无尾换行**；逐 suite `summary.passed` 求和 ＝ 1745 ＝ `assertions.passed`）。推导规则（与 `E164_BASELINE`
+     *  同款，写清以便复核）：
+     *  · `linesMin = 40`：实测 248 行的**下取整余量**（`--fast`／小轮子集也写得下少量 suite），
+     *    而"**整份粘成一行**／被截断到只剩几行"仍必红；
+     *  · `maxLineMax = 2000`：实测最长行的 **39×**（本账每行都是一个短字段）；整份粘成一行今天是 **4338 B** ⇒ 必红；
+     *  · `tableRatioMin = null`／`endsWithNewline = null`：**本维不适用**（理由见上"逐维适用"）；
+     *  · `firstLineSha12 = 021fb596db81` ＝ 首行**逐字**（JSON 的 `{`）的 sha256 前 12 位 —— **写死的常量**
+     *    （`E145` 的机制：不由被查文件现算）；整份粘成一行时首行变长 ⇒ 这一维当场不符。
+     *  ⚠ **不动** `E164_BASELINE`／`E164_ANCHOR`：四份 `.md` 台账的既有判据与冻结点**一个字都不改**（D21）。 */
+    const E164_JSON_REL = 'tests\\._verify\\run-totals.json';
+    const E164_JSON_BASELINE = { rel: E164_JSON_REL, linesMin: 40, maxLineMax: 2000,
+      tableRatioMin: null, endsWithNewline: null, firstLineSha12: '021fb596db81' };
+    /** 账本**必有的十个字段**（真源＝`run-all.js` 的 `writeRunTotals()` 落盘对象；这里只做"键齐"点名） */
+    const E164_JSON_KEYS = ['at', 'mode', 'role', 'mainLedger', 'pid', 'expectedOffline',
+      'ranSuites', 'assertions', 'scripts', 'suites'];
+    /** **权威三元组**（通过／失败／跳过）—— 与逐 suite 明细求和比对的那三个字段 */
+    const E164_JSON_TRI = ['passed', 'failed', 'skipped'];
+    /** 锚点（`E186`：**只许 ASCII**）—— 由**拼接**构造：否则它们会以字面量形式在本文件里多命中一次。 */
+    const E164_RULER_BEGIN = '/* ' + 'E164-RULER-BEGIN' + ' */';
+    const E164_RULER_END = '/* ' + 'E164-RULER-END' + ' */';
+    /** **JSON 实跑账的语义不变量（纯函数）**：`parsed` ⇒ 违规串数组（**一律以台账名开头** ⇒ "逐条指名"是结构性的）。
+     *  ① 根是对象 ＋ 十个字段齐；② 三元组三字段都是**非负整数**；
+     *  ③ **逐 suite 明细与三元组自洽**：`Σ suites[].summary.{passed,failed,skipped}` ＝ `assertions.{...}`
+     *     （`summary: null` 的 suite 不计入 —— 与 `run-all.js` 的 `agg` 同口径）；
+     *  ④ `ranSuites` ↔ `suites[].name` **逐位同名同序**（同一份 `results` 派生）；
+     *  ⑤ `scripts` 状态普查之和 ＝ `suites` 条数；⑥ `role` ∈ {main, explicit}（`subset` ⇒ 主账本被非全量轮覆写）；
+     *  ⑦ 每个 suite 的**本地**不变量 `summary.worst ⟺ summary.failed > 0`（`run-all.js` 的 `parseSummary()` 口径）。
+     *  ⚠ **能力边界（如实登记，不是豁免）**：单个 suite 的 `passed` 在**文件内没有第二处真源** ⇒ 数字漂移
+     *    只能定位到**字段层**（`assertions.passed` ↔ `Σ summary.passed`），**不能唯一指名是哪个 suite**；
+     *    要唯一指名就得引**外部真源**（权威区声明数／`docs-cross-check` 的登记数）—— 那会与 `docs-cross-check`
+     *    重复（9.5-7 单一真源），故**不做**。能唯一指名 suite 的是 ④ 与 ⑦ 两维（见 `E164-⑤` ㈢）。 */
+    const e164JsonSemantics = (rel, parsed) => {
+      const bad = [];
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return [`${rel}：根不是 JSON 对象（实测 ${Array.isArray(parsed) ? '数组' : typeof parsed}）`];
+      }
+      const missing = E164_JSON_KEYS.filter(k => !Object.prototype.hasOwnProperty.call(parsed, k));
+      if (missing.length) bad.push(`${rel}：缺字段 ${missing.join('、')}（应有 ${E164_JSON_KEYS.join('、')}）`);
+      const a = parsed.assertions;
+      if (a === null || typeof a !== 'object' || Array.isArray(a)) {
+        bad.push(`${rel}：字段 assertions 缺失或不是对象`);
+        return bad;
+      }
+      for (const k of E164_JSON_TRI) {
+        if (!Number.isInteger(a[k]) || a[k] < 0) {
+          bad.push(`${rel}：权威三元组字段 assertions.${k} 不是非负整数（${JSON.stringify(a[k])}）`);
+        }
+      }
+      const suites = parsed.suites;
+      if (!Array.isArray(suites)) {
+        bad.push(`${rel}：字段 suites 不是数组`);
+        return bad;
+      }
+      /* ④ `ranSuites` ↔ `suites[].name`：逐位同名同序（能**唯一指名** suite 的那一维） */
+      const names = suites.map((s, i) => (s && typeof s.name === 'string')
+        ? s.name : `（第 ${i + 1} 项 name 非法：${JSON.stringify(s && s.name)}）`);
+      if (!Array.isArray(parsed.ranSuites)) {
+        bad.push(`${rel}：字段 ranSuites 不是数组`);
+      } else {
+        const ran = parsed.ranSuites;
+        const at = names.findIndex((n, i) => ran[i] !== n);
+        if (ran.length !== names.length || at >= 0) {
+          const extra = ran.filter(n => !names.includes(n));
+          const gone = names.filter(n => !ran.includes(n));
+          bad.push(`${rel}：\`ranSuites\` 与 \`suites[].name\` **不同名同序**（长度 ${ran.length} vs ${names.length}`
+            + (at >= 0 ? `；第 ${at + 1} 位：ranSuites=「${ran[at]}」≠ suites.name=「${names[at]}」` : '')
+            + `；只在 ranSuites 里：${extra.length ? extra.join('、') : '（无）'}`
+            + `；只在 suites 里：${gone.length ? gone.join('、') : '（无）'}`);
+        }
+      }
+      /* ⑤ `scripts` 状态普查（`run-all.js` 的 `byStatus()` 口径：逐状态计数，和 ＝ suite 条数） */
+      const sc = parsed.scripts;
+      const SC_KEYS = ['passed', 'failed', 'skipped', 'unverified'];
+      if (sc === null || typeof sc !== 'object' || Array.isArray(sc)) {
+        bad.push(`${rel}：字段 scripts 缺失或不是对象`);
+      } else {
+        const census = SC_KEYS.reduce((s, k) => s + (Number.isInteger(sc[k]) ? sc[k] : 0), 0);
+        if (census !== suites.length) {
+          bad.push(`${rel}：\`scripts\` 状态普查之和 ${census} ≠ \`suites\` 条数 ${suites.length}`
+            + `（字段 scripts.* ↔ suites；逐状态 ${SC_KEYS.map(k => `${k}=${JSON.stringify(sc[k])}`).join('／')}）`);
+        }
+      }
+      /* ⑥ `role`：主账本只可能由全量/`--fast`（main）或显式 `--ledger`（explicit）写 */
+      if (parsed.role !== 'main' && parsed.role !== 'explicit') {
+        bad.push(`${rel}：字段 role=${JSON.stringify(parsed.role)} 不是 main／explicit`
+          + `（\`subset\` ⇒ 主账本被**非全量轮**覆写）`);
+      }
+      /* ⑦ 逐 suite 明细 ↔ 权威三元组（**求和相等**）＋ 每条的本地不变量 */
+      const sum = { passed: 0, failed: 0, skipped: 0 };
+      const per = [];
+      const worstBad = [];
+      suites.forEach((s, i) => {
+        const nm = (s && typeof s.name === 'string') ? s.name : `（第 ${i + 1} 项）`;
+        const sm = s && s.summary;
+        if (sm === null || sm === undefined) {
+          per.push(`${nm}=（summary null ⇒ 按 run-all.js 的 agg 不计入）`);
+          return;
+        }
+        for (const k of E164_JSON_TRI) if (Number.isInteger(sm[k])) sum[k] += sm[k];
+        per.push(`${nm}=${JSON.stringify(sm.passed)}/${JSON.stringify(sm.failed)}/${JSON.stringify(sm.skipped)}`);
+        if (sm.worst !== (sm.failed > 0)) {
+          worstBad.push(`${nm}（worst=${JSON.stringify(sm.worst)} 而 failed=${JSON.stringify(sm.failed)}）`);
+        }
+      });
+      const drift = E164_JSON_TRI.filter(k => Number.isInteger(a[k]) && sum[k] !== a[k]);
+      if (drift.length) {
+        bad.push(`${rel}：**逐 suite 明细与权威三元组不自洽** —— ` + drift.map(k =>
+          `字段 assertions.${k}=${a[k]} ≠ Σ suites[].summary.${k}=${sum[k]}`
+          + `（差 ${sum[k] - a[k] > 0 ? '+' : ''}${sum[k] - a[k]}）`).join('；')
+          + `；逐 suite（passed/failed/skipped）：${per.join('、')}`);
+      }
+      if (worstBad.length) {
+        bad.push(`${rel}：\`summary.worst\` 必须 ⟺ \`summary.failed > 0\`（\`run-all.js\` 的 \`parseSummary()\`：`
+          + `\`worst: bad.length > 0\`）—— 不符：${worstBad.join('、')}`);
+      }
+      return bad;
+    };
+    /** **JSON 实跑账的整把尺子（纯函数）**：`text` ⇒ `{ stats, parsed, parseErr, bad[] }`（主判据与 D22 共用）。
+     *  ① 形态（**与四份 `.md` 台账同一把尺子**：`e164Stats()` ＋ `e164Audit()`，逐维适用）；
+     *  ② **截断／非 JSON 尾巴**；③ **合法 JSON**；④ 语义（`e164JsonSemantics()`）。
+     *  `text === null` ＝ 台账**缺失／不可读** ⇒ **fail-closed 判红**（调用方不许把它当成"跳过"）。 */
+    const e164JsonLedger = (rel, text, base) => {
+      if (typeof text !== 'string') {
+        return { stats: null, parsed: null, parseErr: '台账缺失或不可读',
+          bad: [`${rel}：台账**缺失或不可读** ⇒ fail-closed **判红**（不许静默跳过）`] };
+      }
+      const stats = e164Stats(text);
+      const bad = e164Audit(rel, stats, base);
+      /* ② 形态：**截断**（末尾不是 `}`）／**非 JSON 尾巴**（最后一个 `}` 之后还有可见内容） */
+      const trimmed = text.replace(/\s+$/, '');
+      if (!trimmed.endsWith('}')) {
+        bad.push(`${rel}：文件末尾不是 \`}\`（尾部 ≤24 B ＝「${JSON.stringify(trimmed.slice(-24))}」）`
+          + `⇒ **被截断**或**带非 JSON 尾巴**`);
+      }
+      const lastBrace = text.lastIndexOf('}');
+      const tail = lastBrace < 0 ? text : text.slice(lastBrace + 1);
+      if (tail.trim() !== '') {
+        bad.push(`${rel}：最后一个 \`}\` 之后还有可见内容（「${JSON.stringify(tail.slice(0, 24))}」）`
+          + `⇒ **非 JSON 尾巴**／截断`);
+      }
+      /* ③ 合法 JSON（parse 失败 ⇒ 逐字报出解析器的话） */
+      let parsed = null; let parseErr = null;
+      try { parsed = JSON.parse(text); } catch (e) { parseErr = (e && e.message) || String(e); }
+      if (parseErr !== null) {
+        bad.push(`${rel}：**不是合法 JSON**（${parseErr}）`);
+        return { stats, parsed, parseErr, bad };
+      }
+      bad.push(...e164JsonSemantics(rel, parsed));
+      return { stats, parsed, parseErr, bad };
+    };
+    /* E164-RULER-END */
     const e164Disk = E164_FILES.map((f) => {
       const text = fs.readFileSync(path.join(env.paths.root, f.rel), 'utf8');
       const b = E164_BASELINE.find(x => x.rel === f.rel);
@@ -11687,6 +11855,133 @@ t.section('二十二、`E129` 取数上限／`E170` 索引计划／`E167` 告警
           && anchorOf(loosened) !== E164_ANCHOR.sha12 && anchorOf(tightened) !== E164_ANCHOR.sha12,
         `基线 ${E164_BASELINE.length} 条／锚点 total ${E164_ANCHOR.total}；现算 sha12 ${nowSha}／冻结 ${E164_ANCHOR.sha12}；`
           + `改松一处（首个 \`linesMin\` −10）⇒ ${anchorOf(loosened)}（必不符）；改紧一处（第二个 \`maxLineMax\` +1000）⇒ ${anchorOf(tightened)}（必不符）`);
+    }
+    /* ---------------- `E164-④`／`E164-⑤`：**JSON 实跑账**（受管判据本体 ＋ D22） ----------------
+       面＝**主账本**（`tests\._verify\` 下那一份）：路径的**真源**是 `run-all.js` 导出的 `MAIN_LEDGER_NAME`，
+       本判据不另写死名字，而是**把盘上路径与它对照**（`e164RelOk`）。 */
+    const runAll23 = require('./run-all');
+    const e164LedgerPath = path.join(env.paths.verify, runAll23.MAIN_LEDGER_NAME);
+    const e164RelOk = path.join(env.paths.root, E164_JSON_REL) === e164LedgerPath;
+    let e164Bytes0 = null; let e164Text = null; let e164ReadErr = null;
+    try { e164Bytes0 = fs.readFileSync(e164LedgerPath); e164Text = e164Bytes0.toString('utf8'); }
+    catch (err) { e164ReadErr = (err && (err.code || err.message)) || String(err); }
+    const e164Run = e164JsonLedger(E164_JSON_REL, e164Text, E164_JSON_BASELINE);
+    const e164St = e164Run.stats;
+    const e164SelfSrc = fs.readFileSync(__filename, 'utf8');
+    const e164Hits = (needle) => e164SelfSrc.split(needle).length - 1;
+    const e164Anchors = { begin: e164Hits(E164_RULER_BEGIN), end: e164Hits(E164_RULER_END) };
+    const e164Ascii = [E164_RULER_BEGIN, E164_RULER_END].every(s => /^[\x20-\x7E]+$/.test(s));
+    t.check('E164-④ **JSON 实跑账的"台账结构不变量"**（`tests\\._verify\\run-totals.json`）：'
+      + '①**是合法 JSON**（根是对象、十个字段齐）；②**权威三元组（通过／失败／跳过）各就各位**且与'
+      + '**逐 suite 明细自洽**（Σ `suites[].summary.{passed,failed,skipped}` ＝ `assertions.{...}`）'
+      + '＋`ranSuites ↔ suites[].name` 同名同序 ＋`scripts` 状态普查 ＝ `suites` 条数；'
+      + '③**不是**"被粘成一行／被截断／带非 JSON 尾巴"的形态；'
+      + '④台账**缺失／不可读 ⇒ 判红（fail-closed，不许静默跳过）**；'
+      + '任一项违规 ⇒ **红并逐条指名「台账：维度 实测/阈值」**',
+      e164RelOk && e164Text !== null && e164Run.parseErr === null && e164Run.bad.length === 0
+        && e164Ascii && e164Anchors.begin === 1 && e164Anchors.end === 1,
+      `台账 \`${E164_JSON_REL}\`（${e164Text === null ? '**读不到：' + e164ReadErr + '**' : Buffer.byteLength(e164Text, 'utf8') + ' B'}）；`
+        + (e164St ? `结构读数（**与四份 \`.md\` 台账同一把尺子**）：行数 ${e164St.lines}／最长行 ${e164St.maxLen}／`
+          + `首行「${e164St.firstLine}」／末行(最后非空)「${e164St.lastLine}」／BOM ${e164St.bom}／`
+          + `CRLF ${e164St.crlf}·裸 LF ${e164St.bareLf}／末行尾 ${e164St.endsWithNewline}；` : '（结构读数取不到）；')
+        + (e164Run.parsed ? `语义读数：role=${JSON.stringify(e164Run.parsed.role)}／`
+          + `suites ${Array.isArray(e164Run.parsed.suites) ? e164Run.parsed.suites.length : '-'} 条／`
+          + `ranSuites ${Array.isArray(e164Run.parsed.ranSuites) ? e164Run.parsed.ranSuites.length : '-'} 条／`
+          + `三元组 ${E164_JSON_TRI.map(k => `${k}=${e164Run.parsed.assertions ? JSON.stringify(e164Run.parsed.assertions[k]) : '-'}`).join('／')}；`
+          : '')
+        + `违规 ${e164Run.bad.length} 条${e164Run.bad.length ? '：' + e164Run.bad.join('；') : '（无）'}；`
+        + `锚点自证（\`E186\`）：\`E164-RULER-BEGIN\` 命中 ${e164Anchors.begin} 次、\`E164-RULER-END\` 命中 ${e164Anchors.end} 次`
+        + `（各应 1）；锚点全 ASCII=${e164Ascii}；台账路径真源＝\`run-all.js\` 的 \`MAIN_LEDGER_NAME\`（对照相符=${e164RelOk}）`);
+    /* `E164-⑤` D22（**四支内存变异 ＋ 负对照 ＋ 未落盘自证**）：全程只动**内存副本**（字符串／对象），
+       盘上台账**只读**（前后逐字节对照自证）。四支：
+       ㈠ **事故原形**：整份删掉全部换行 ＝ `join('')` 形态（**内容守恒**：去空白后逐字相同）⇒ 结构判据必红，
+          而**同一份变异体的语义判据 0 条**（＝ `JSON.parse` 照样成功、数字与明细都在场 ⇒ 内容类判据看不出它坏了）；
+       ㈡ 某 suite 的**通过数** +1（不碰 `assertions`）⇒ 必红并**指名字段** `assertions.passed`（差 +1）——
+          能力边界：单条 suite 的数字在**文件内**没有第二处真源 ⇒ 只能定位到**字段层**（见上文边界段）；
+       ㈢ 能**唯一指名 suite** 的两维：① 把某 suite 改名 ⇒ `ranSuites ↔ suites[].name` 必红并逐字点名；
+          ② 把某 suite 的 `worst` 翻到与 `failed` 不符 ⇒ 本地不变量必红并逐字点名。
+       ㈣ **负对照**＝盘上原件 ⇒ 违规 0 条。 */
+    {
+      const ledgerOf = (obj) => JSON.stringify(obj, null, 2);
+      const compactOf = (s) => s.replace(/\s+/g, '');
+      const pickMaxPassed = (obj) => obj.suites.reduce((best, s, i, arr) => {
+        const cur = s && s.summary ? s.summary.passed : -1;
+        const own = arr[best] && arr[best].summary ? arr[best].summary.passed : -1;
+        return cur > own ? i : best;
+      }, 0);
+      const okBase = e164Text !== null && e164Run.parseErr === null;
+      /* ㈠ 粘成一行（删全部换行；内容一字不少） */
+      const gluedText = okBase ? e164Text.replace(/\r\n|\n/g, '') : null;
+      const gluedRun = okBase ? e164JsonLedger(E164_JSON_REL, gluedText, E164_JSON_BASELINE) : null;
+      const gluedSem = okBase ? e164JsonSemantics(E164_JSON_REL, JSON.parse(gluedText)) : ['（台账不可用 ⇒ 本支不适用）'];
+      const gluedSame = okBase && compactOf(gluedText) === compactOf(e164Text);
+      /* ㈡ 逐 suite 数字与三元组不一致（通过数最大的那条 +1） */
+      let numRun = null; let numSuite = '（台账不可用 ⇒ 本支不适用）';
+      if (okBase) {
+        const mut = JSON.parse(e164Text);
+        const i = pickMaxPassed(mut);
+        if (mut.suites[i] && mut.suites[i].summary) {
+          numSuite = mut.suites[i].name;
+          mut.suites[i].summary.passed += 1;
+        }
+        numRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mut), E164_JSON_BASELINE);
+      }
+      /* ㈢a 名字集合／顺序不一致（改名 ⇒ 必逐字指名该 suite） */
+      let nameRun = null; let nameSuite = '（台账不可用 ⇒ 本支不适用）';
+      if (okBase && e164Run.parsed.suites.length > 2) {
+        const mut = JSON.parse(e164Text);
+        nameSuite = mut.suites[2].name;
+        mut.suites[2].name = 'zzz-phantom-check';
+        nameRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mut), E164_JSON_BASELINE);
+      }
+      /* ㈢b 本地不变量 `worst ⟺ failed > 0`（翻一个 `failed = 0` 的 suite ⇒ 必逐字指名它） */
+      let worstRun = null; let worstSuite = '（台账不可用 ⇒ 本支不适用）';
+      if (okBase) {
+        const mut = JSON.parse(e164Text);
+        const i = mut.suites.findIndex(s => s && s.summary && s.summary.failed === 0);
+        if (i >= 0) {
+          worstSuite = mut.suites[i].name;
+          mut.suites[i].summary.worst = true;
+        }
+        worstRun = e164JsonLedger(E164_JSON_REL, ledgerOf(mut), E164_JSON_BASELINE);
+      }
+      /* ㈣ 负对照 ＋ 未落盘自证 */
+      let bytesAfter = null;
+      try { bytesAfter = fs.readFileSync(e164LedgerPath); } catch { bytesAfter = null; }
+      const e164NoWrite = Boolean(e164Bytes0 && bytesAfter && Buffer.compare(e164Bytes0, bytesAfter) === 0);
+      t.check('E164-⑤ D22（可证伪，**四支内存变异 ＋ 负对照 ＋ 未落盘自证**）：'
+        + '㈠整份删掉全部换行（`join(\'\')` 形态、**内容守恒**）⇒ 结构判据**必红 ≥3 条**'
+        + '（含「行数」「最长行」「首行 ＝ 末行」且**一律带台账名**）、而**同一份变异体的语义判据 0 条**'
+        + '（＝ `JSON.parse` 照样成功 ⇒ "内容守恒、结构全毁"）；'
+        + '㈡某 suite 的**通过数** +1 ⇒ 必红并**指名字段** `assertions.passed`（差 +1）；'
+        + '㈢a 某 suite **改名** ⇒ `ranSuites ↔ suites[].name` 必红并**逐字指名该 suite**；'
+        + '㈢b 某 suite 的 `worst` 翻到与 `failed` 不符 ⇒ 必红并**逐字指名该 suite**；'
+        + '㈣**负对照**＝盘上原件 ⇒ 违规 **0** 条；盘上台账**逐字节未变**（未落盘自证）',
+        okBase && e164Run.bad.length === 0
+          && gluedRun !== null && gluedRun.bad.length >= 3 && gluedRun.stats.lines === 1 && gluedRun.parseErr === null
+          && gluedRun.bad.some(x => x.includes('行数')) && gluedRun.bad.some(x => x.includes('最长行'))
+          && gluedRun.bad.some(x => x.includes('首行 ＝ 末行'))
+          && gluedRun.bad.every(x => x.startsWith(E164_JSON_REL))
+          && gluedSame && gluedSem.length === 0
+          && numRun !== null && numRun.bad.some(x => x.includes('assertions.passed'))
+          && numRun.bad.every(x => x.startsWith(E164_JSON_REL))
+          && nameRun !== null && nameRun.bad.some(x => x.includes('zzz-phantom-check') && x.includes(nameSuite))
+          && worstRun !== null && worstRun.bad.some(x => x.includes(worstSuite) && x.includes('worst'))
+          && e164NoWrite,
+        `㈠整份删换行：行数 ${e164St ? e164St.lines : '-'} → ${gluedRun ? gluedRun.stats.lines : '-'}、`
+          + `最长行 ${e164St ? e164St.maxLen : '-'} → ${gluedRun ? gluedRun.stats.maxLen : '-'}、`
+          + `字节 ${e164Text ? Buffer.byteLength(e164Text, 'utf8') : '-'} → ${gluedText ? Buffer.byteLength(gluedText, 'utf8') : '-'}、`
+          + `去空白后逐字相同=${gluedSame} ⇒ 结构违规 ${gluedRun ? gluedRun.bad.length : '-'} 条：`
+          + `${gluedRun ? gluedRun.bad.join('；') : '（不适用）'}；`
+          + `**同一份变异体的语义判据 ${gluedSem.length} 条**（\`JSON.parse\` 成功=${gluedRun ? gluedRun.parseErr === null : '-'}）；`
+          + `㈡把「${numSuite}」的 passed +1 ⇒ ${numRun ? numRun.bad.length : '-'} 条（**点名到字段层**；`
+          + `单条 suite 的数字在文件内无第二处真源 ⇒ 不能唯一指名）：${numRun ? numRun.bad.join('；') : '（不适用）'}；`
+          + `㈢a 把第 3 条 suite「${nameSuite}」改名 \`zzz-phantom-check\` ⇒ ${nameRun ? nameRun.bad.length : '-'} 条：`
+          + `${nameRun ? nameRun.bad.join('；') : '（不适用）'}；`
+          + `㈢b 把「${worstSuite}」的 \`worst\` 翻成 true ⇒ ${worstRun ? worstRun.bad.length : '-'} 条：`
+          + `${worstRun ? worstRun.bad.join('；') : '（不适用）'}；`
+          + `㈣负对照＝盘上原件 ⇒ 违规 ${e164Run.bad.length} 条（应 0）；`
+          + `未落盘自证：${e164Bytes0 ? e164Bytes0.length : '-'} B → ${bytesAfter ? bytesAfter.length : '-'} B、逐字节相同=${e164NoWrite}`);
     }
   }
 t.finish();

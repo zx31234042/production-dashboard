@@ -20,7 +20,7 @@
    用法：
      const repo = require('./repo/opLog');
      repo.append(db, { opTime: at, operator: '张伟', opType: '标准录入',
-                       content: '深度上下限 12.40～12.80', result: '成功',
+                       content: '深度上下限 4.80～5.30', result: '成功',   // 数字取真源：board.config.js:244-247 `standards.default.depth`（5.00±0.30/−0.20 ⇒ 4.80～5.30）
                        teamCode: '检验一班' }, at);
      repo.list(db, { opType: '标准录入', atFrom: '2026-09-22 00:00:00' }, { limit: 20 });
    ========================================================================== */

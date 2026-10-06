@@ -14,12 +14,12 @@
        本文件**不修改**前端文件，只在注释里点明对应关系。
    单位与精度：深度 **m**、速度 **m/s**；**库内与上报传数值**，两位小数由显示层格式化
      （`Math.round(v * 100) / 100`，与 `src/utils/format.js` 的 `round2` 同口径）。
-   用法：
+   用法（**片段**：`db`／`productCode`／`processCode`／`at` 由调用方注入；末行 `assertInput` 可整行抽出真跑）：
      const svc = require('./services/standard');
      const std = svc.getEffectiveStandard(db, { productCode, processCode, at });
      const limits = svc.absoluteLimits(std);         // { depth:{upper,lower}|null, speed:...|null }
      const mes = svc.mesLimits(std);                 // { uclValue, lclValue, IsPass } —— 缺失即占位
-     svc.assertInput({ depthTypical: 12.6, depthUpperDev: 0.2, depthLowerDev: -0.2, ... });
+     svc.assertInput({ depthTypical: 5.00, depthUpperDev: 0.30, depthLowerDev: -0.20 });   // 量程真源＝board.config.js:233-236 `standards.range.depth`=[4,6]（越界即抛 RangeError）；本行可整行抽出真跑
    ========================================================================== */
 'use strict';
 
@@ -49,7 +49,7 @@ function isNum(v) {
 }
 
 /** 保留两位小数（口径：深度 m、速度 m/s 均**保留两位小数**；与 `src/utils/format.js` 的 round2 同式）。
- *  为什么这里必须圆整而不是直接相加：`12.6 + 0.2 = 12.799999999999999`（二进制浮点），
+ *  为什么这里必须圆整而不是直接相加：`4.4 + 0.2 = 4.6000000000000005`（二进制浮点；组合取自真源量程 board.config.js:233-236 的 [4,6] 内），
  *  直接把该值报给 MES 会带一串尾数。**库内存的是数值真值（未圆整）**，圆整只发生在换算出口。 */
 function round2(v) {
   return Math.round(v * 100) / 100;
@@ -57,7 +57,7 @@ function round2(v) {
 
 /**
  * 单个指标的上下限**绝对值**。
- * @param {{typical?:number, upperDev?:number, lowerDev?:number}} row 如 { typical:12.6, upperDev:0.2, lowerDev:-0.2 }
+ * @param {{typical?:number, upperDev?:number, lowerDev?:number}} row 如 { typical:5.00, upperDev:0.30, lowerDev:-0.20 }（真源 `standards.default.depth`，board.config.js:244-247）
  * @returns {{upper:number, lower:number, typical:number}|null} 必要项缺一 → null（＝"未设定"）
  */
 function metricLimits(row) {

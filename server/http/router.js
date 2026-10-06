@@ -16,10 +16,10 @@
         + `services/eventBus.js` 的 `normalizeSince`（**同一个** since 解析口径，不写第二份）。
          取时间一律走注入出口（ADR-0003 D17）：SSE 注释帧的 ready/ping/bye 与 openedAt 都经 `options.now`，
          缺省＝真实时钟 —— **本文件不出现裸 `new Date()`**。
-   用法：
+   用法（**片段**：`http`＝`node:http`，`req`／`res` 为服务回调实参，由调用方注入）：
      const { createRouter, errorBody, MAX_JSON_BODY_BYTES } = require('./http/router');
      const router = createRouter({ getHealth: () => ({ ok: true }) });
-     router.attach(httpServer);            // 绑定到 server/index.js 创建的 http.Server
+     http.createServer((req, res) => router.handle(req, res));   // **没有 `router.attach`**（`createRouter()` 产物里不存在该方法，照抄旧写法即 TypeError）—— 用 `router.handle`；真实接线见 server/index.js:1855-1863
      router.mountSSE({ bus, snapshot });   // W5：真实挂载（注册 GET /state，/events 转入真实推送）
      router.closeAllStreams();             // 优雅退出时先收掉在途 SSE
    ========================================================================== */
