@@ -851,7 +851,7 @@ async function start(options = {}) {
     /* `E48③`（2026-10-05；补修②改注释）：`config` 是**必填**，此处必须传**已解析的业务配置**
        `boardCfg`（`options.boardConfig` 优先、否则读配置文件；见 `:617`）。
        **为什么必填**：上报器（`services/uploadReporter.js:193-197`／`:219-224`／`:272`／`:277`／
-       `:548`）与队列（`services/uploadQueue.js:48-49`／`:52-55`）都从 `config` 读键；若这里不传，
+       `:548`）与队列（`services/uploadQueue.js:48-49`／`:59-69`）都从 `config` 读键；若这里不传，
        它会**静默回落到磁盘上那份 `board.config.js`** ⇒ "注入了别的业务配置"的进程里上报打到
        **旧地址**／旧阈值，且**不报错**（`E48` 的立案症状；与同一文件里 `createStateSnapshot({…})`
        那处装配点**同一机理**，那里已由 `T-20261004-13` 坐实 —— 两处都**不写行号**，免得注释先烂）。

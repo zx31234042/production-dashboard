@@ -535,6 +535,18 @@ function assertOptionTypes(deps) {
       throw new TypeError('mountUpload/resolveReporter: `timeoutMs` 必须 **> 0**，收到 ' + describeValue(v) +
         '（否则 `createUploadReporter` 会静默回落到 `mes.timeoutMs`/3000）');
     }
+    /* `E176①`（2026-10-06，主代理裁定「入口层同口径收窄」）：`warnThreshold` **只认正有限数**。
+       为什么不与 `timeoutMs` 合成一句：两者的**症状不同**（`timeoutMs` 是"传了却被静默回落"，
+       这里是"`0`／负数让 `pending >= threshold` **恒真**＝永远告警"），各自指名才不互相淹没；
+       口径相同：`0`／负数一律拒，且**不动** `capacity`（它的下界归 `services/uploadQueue.js`
+       的 `normalizeCapacity()`，不在这里重复判 —— 两处都判会让"谁是权威"变含糊）。
+       为什么必须在**装配期**拒：`repo/uploadQueue.stats()` 也已收窄为"只接受正有限数"，
+       但那条闸在**首次 `status()`（请求路径上）** 才触发 ⇒ 只靠它＝症状晚一步（`E176` 立案形态）。 */
+    if (k === 'warnThreshold' && !(v > 0)) {
+      throw new TypeError('mountUpload/resolveReporter: `warnThreshold` 必须 **> 0**，收到 ' + describeValue(v) +
+        '（`E176①`：队列告警阈值只接受**正**有限数 —— `0`／负数会让"待补传条数 ≥ 阈值"**恒真**＝' +
+        '永远告警却看不出原因；要表示"不传"请**省略该键**）');
+    }
   }
   for (const k of STRING_OPTIONS) {
     const v = deps[k];

@@ -48,10 +48,24 @@ const DEFAULT_WARN_THRESHOLD =
   (boardConfig.mes && boardConfig.mes.queueWarnThreshold !== undefined)
     ? boardConfig.mes.queueWarnThreshold : 1;
 
-/** 运行期读取告警阈值真源（配置缺项/非法时回落到与真源同值的兜底 1） */
+/** 运行期读取告警阈值真源（`E176①` 追加收窄，2026-10-06）：**只返回正有限数**。
+ *  · 键**缺失**（`undefined`）⇒ 仍是历史兜底 `DEFAULT_WARN_THRESHOLD`（装载期快照，值＝真源同值 1）；
+ *  · 键**在场** ⇒ 必须 `typeof number ∧ Number.isFinite ∧ > 0`，**否则当场抛并指名真源**
+ *    （"真源本身配错"要在**读取/装配期**可见，而不是等到某个请求的 `repo.stats()`）。
+ *  为什么不再"非法就静默回落"：回落值 `DEFAULT_WARN_THRESHOLD` 在"键在场"时**抄的就是那个非法值**
+ *  （它只在键缺失时才取 1）⇒ 回落＝把错值原样带到底；而 NaN／数字串／`null` 过去会被**悄悄换成 1**
+ *  ⇒ 现场看到的是"配置改了但不生效"，症状指向错方向。
+ *  文案与 `repo/uploadQueue.stats()` 同款自证：`String(v)` ＋ `typeof v`，**不经 `JSON.stringify`**。 */
 function configWarnThreshold() {
   const v = boardConfig.mes && boardConfig.mes.queueWarnThreshold;
-  return (typeof v === 'number' && Number.isFinite(v)) ? v : DEFAULT_WARN_THRESHOLD;
+  const raw = v === undefined ? DEFAULT_WARN_THRESHOLD : v;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || !(raw > 0)) {
+    throw new TypeError('uploadQueue: 告警阈值真源非法 —— 配置真源（磁盘那份 board 配置）的 `mes` 段 ' +
+      '`queueWarnThreshold` 键必须是**正有限数**（E176①：数字字符串／布尔／null／0／负数一律不接受），' +
+      '收到 ' + String(raw) + '（类型 ' + typeof raw + '）' +
+      (v === undefined ? '（该键缺失，兜底值 DEFAULT_WARN_THRESHOLD 亦非法 ⇒ 一并拒收）' : ''));
+  }
+  return raw;
 }
 
 /**

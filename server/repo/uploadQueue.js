@@ -351,7 +351,10 @@ function latest(db, query = {}) {
  *     两个时刻各读一次 ⇒ 又制造两判，正是 `E33` 要防的形态；
  *   · "忘了传"若被静默当成"传了真源"，缺陷永远看不见 —— 显式失败让调用点当场可见。
  * @param {{capacity?:number, warnThreshold:number}} options
- *   `warnThreshold` **必填**且须为有限数：待补传条数 ≥ 它即 `warn`；缺参/非有限数 ⇒ `TypeError`。
+ *   `warnThreshold` **必填**且须为**正**有限数（`E176①`：`typeof === 'number'` ∧ `Number.isFinite`
+ *   ∧ `> 0`）：数字字符串／布尔／`null`／`0`／负数**一律拒收**（**不做 `Number()` 归一** ——
+ *   归一恰好会把 `null`／`''` 变成 `0`，于是 `pending >= 0` **恒告警**）；
+ *   待补传条数 ≥ 它即 `warn`；缺参／非法 ⇒ `TypeError`。
  */
 function stats(db, options = {}) {
   const pendingOnly = countPending(db);
@@ -366,9 +369,20 @@ function stats(db, options = {}) {
     throw new TypeError('uploadQueueRepo.stats: 必须显式传 warnThreshold（E33①：本层不做业务判断、不设缺省；' +
       '真源＝board.config.js 的 mes.queueWarnThreshold，由 services/uploadQueue.js 读取后传入）');
   }
-  const threshold = Number(options.warnThreshold);
-  if (!Number.isFinite(threshold)) {
-    throw new TypeError(`uploadQueueRepo.stats: warnThreshold 必须是有限数，收到 ${JSON.stringify(options.warnThreshold)}`);
+  /* `E176①`（2026-10-06）：**只接受正有限数**。原写法 `Number(options.warnThreshold)` 会把
+     `null`／`''` 折算成 `0`（⇒ `pending >= 0` **恒告警**）、`true` 折成 `1`、`'5'` 静默收成 `5`，
+     这些**全都通过** `Number.isFinite` ⇒ "传了个错值，却拿到一个**看似正常**的 `warn`"，
+     正是 `E33①` 要防的形态。⇒ 本层**不做任何数值归一**：`typeof` 不是 `number` 的一律拒
+     （**数字字符串也拒** —— 静默转换正是"症状晚一步"的来源：调用方以为传的是数，本层替它猜）。 */
+  const threshold = options.warnThreshold;
+  if (typeof threshold !== 'number' || !Number.isFinite(threshold) || !(threshold > 0)) {
+    /* `E176②`：文案**不经 `JSON.stringify`** —— 它把 `NaN`／`Infinity` 印成 `null`
+       （`JSON.stringify(NaN) === 'null'`）⇒ 现场会去查"配置是不是读成了 null"，而真值是 `NaN`
+       （症状指向错方向，`E135` 同族）。改为**直接打印原值的 `String(v)` 与 `typeof v`**
+       （与 `http/routes/upload.js` 的 `describeValue()` 同款自证），并**指明键名** `warnThreshold`。 */
+    throw new TypeError('uploadQueueRepo.stats: warnThreshold 必须是**正有限数**' +
+      '（数字字符串／布尔／null 一律拒收：不归一、不转换），收到 ' +
+      String(options.warnThreshold) + '（类型 ' + typeof options.warnThreshold + '）');
   }
   return {
     pending,
