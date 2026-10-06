@@ -1645,12 +1645,20 @@ function main() {
     };
     /** 判据本体（**纯函数**：D22 复用 ⇒ "留痕比声明"这件事能被合成输入证伪）。
      *  @returns {{findings:string[], viaTrail:string[], noTrail:string[], guardedByLedger:string[]}} */
-    const trailDriftE155 = (declOf, gates, sumOfName, trail) => {
+    const trailDriftE155 = (declOf, gates, sumOfName, trail, writeRes) => {
       const findings = []; const viaTrail = []; const noTrail = []; const guardedByLedger = [];
+      /* `E162`（2026-10-05）：**独立的不可比桶** —— 写票不是"显式成功"时，手里那份留痕可能是陈旧的，
+         "留痕比声明"这条路径**不再可比** ⇒ 记这里、**不报失配**（报失配 ＝ 把正确声明误诊成"声明漂移"）。 */
+      const incomparable = [];
+      const writeGuardE155 = trailWriteGuardE162(writeRes, gates);
+      const writeBlockedE155 = writeGuardE155.blocked;   /* `E162`：写票不是"显式成功" ⇒ 只影响"比声明"这一类 */
       for (const nm of gates) {
         const d = declOf(nm);
         if (!d) { findings.push(`${nm}：权威区里解析不出 \`通过/失败\` 声明`); continue; }
         if (sumOfName(nm)) { guardedByLedger.push(nm); continue; }        /* 账本里有 ⇒ 由 `E136` 逐值守 */
+        /* `E162`：写票不是"显式成功" ⇒ 手里这份留痕**可能是陈旧的**（正是它读出来与声明不符的那一刻）
+           ⇒ 记"不可比"、**不报失配**（报失配 ＝ 把正确声明误诊成"声明漂移"）。 */
+        if (writeBlockedE155) { incomparable.push(nm); continue; }
         const rec = trail.entries[nm];
         if (!rec || !Number.isFinite(rec.passed)) { noTrail.push(nm); continue; }
         if (d.declared !== rec.passed) {
@@ -1659,10 +1667,36 @@ function main() {
             + `权威区现在写 **${d.declared} 通过** ⇒ **声明漂移，而别的判据不会报它**（\`E155\` 立案的正是这一形态）`);
         } else viaTrail.push(nm);
       }
-      return { findings, viaTrail, noTrail, guardedByLedger };
+      return { findings, viaTrail, noTrail, guardedByLedger, incomparable };
+    };
+    /* ==================== `E162`（2026-10-05 登记）：留痕写入的 **fail-open** ====================
+       立案（`项目记录\后续路线图.md` 的 `E162` 行；座位 5 在 `C·24` 第 4 组报出）：原来的
+       `trailWriteE155` **只在定义处与一条 `t.info` 出现，不进任何 `t.check`** ⇒
+       **写失败只印一行 info、当轮照绿**。危害**不是"少写一个文件"**，而是**症状指向错方向**：
+       留痕悄悄陈旧 ⇒ 下一次"账本不含它"的轮（`--fast`／子集轮／`run-all` 中途）里，
+       `trailDriftE155()` 会拿**陈旧的留痕**去比**现在（正确）的声明** ⇒ 把**正确声明**误诊成
+       "**声明漂移**"（`E110`／`E135`／`E152` 同族：报出来的名字指向**另一个**问题）。
+       修法（两选一，本件**两条都做**，与 `E116`"工具自报成功但无产物 ⇒ FAIL"同一条纪律）：
+         ① **写失败进判据**（`E162-①`）：`trailWriteE155.ok === false` ⇒ **当轮判红**并**指名留痕文件**；
+         ② **显式"不可比"**（本段的 `incomparable` 桶）：写失败时"留痕比声明"这条路径不再可比 ⇒
+            那些项**逐条点名**记"不可比"，而不是报失配（既不装绿、也不把正确声明误诊成漂移）。
+       ⚠ **fail-closed**：**不给票**（旧调用点／忘了接线）也记不可比 ——"没有证据"不许当成"写成功了"。
+       ⚠ **注入时仍然照写**（只改返回值）：写失败只意味着"这一次没写成功"，下一次仍要试；
+         若因为"上一轮注入过失败"就停写，会把注入变成"永久静默"，那比 fail-open 更坏。 */
+    const trailWriteFailInjectedE162 = process.env.DSH_E162_TRAIL_WRITE_FAIL === '1';
+    /** **写票守卫**（**纯函数**：`E162-②` 的 D22 复用它）：写票不是"显式成功" ⇒ **不可比**。
+     *  @returns {{blocked:boolean, why:string, blockedSubjects:string[]}} */
+    const trailWriteGuardE162 = (writeRes, gates) => {
+      if (writeRes && writeRes.ok === true) return { blocked: false, why: '', blockedSubjects: [] };
+      return {
+        blocked: true,
+        why: '**留痕写入失败** ⇒ 本轮"留痕与声明对账"这条路径**不可比**（陈旧的留痕会把**正确声明**误诊成'
+          + '"声明漂移"，`E110`／`E135`／`E152` 同族「症状指向错方向」）—— 写失败本身由 `E162-①` 判红并指名，'
+          + '**不许**按失配报',
+        blockedSubjects: (gates || []).slice()
+      };
     };
     const trailBeforeE155 = readTrailE155();
-    const trailAuditE155 = trailDriftE155(browserDeclOfE136, browserGatesE136, nm => ledgerSummary[nm], trailBeforeE155);
     /** 留痕的**唯一写入点**：账本里有这条 ⇒ 记下"这一次全量轮的真读数"；写失败**显式报出来**（不静默）。 */
     const trailWriteE155 = (() => {
       const ledgerShaE155 = totals.ok ? require('node:crypto').createHash('sha256')
@@ -1676,10 +1710,17 @@ function main() {
           ledgerSha12: ledgerShaE155, at: new Date().toISOString().slice(0, 19) + 'Z' };
         written++;
       }
+      if (trailWriteFailInjectedE162) {
+        /* `E162` 的**受控注入点**：只把本次写入的**返回值**改成失败，**不碰盘、不抛错** ⇒
+           "写失败必进判据"这条能被证伪；生产路径不设这个环境变量 ⇒ 行为逐字不变。 */
+        return { ok: false, written: 0, why: '`E162` D22 **受控注入**（`DSH_E162_TRAIL_WRITE_FAIL=1`）：'
+          + '把这一次写入的结果改成失败（**不碰盘**）—— 用来证伪"写失败必进判据"这一条' };
+      }
       if (!written) return { ok: true, written: 0, why: '账本里没有这三条 ⇒ 本轮**不写**（留痕保持原样，供下次不可比时用）' };
       try {
         fs.writeFileSync(TRAIL_E155, JSON.stringify({
-          note: 'E155 持久留痕：三只浏览器/长跑脚本"上一次全量轮"的通过数（判据与写入点都在 tests/docs-cross-check.js 的 §11 E136/E155 段）',
+          note: 'E155 持久留痕：三只浏览器/长跑脚本"上一次全量轮"的通过数（判据与写入点都在 tests/docs-cross-check.js 的 §11 E136/E155/E162 段；'
+            + '写入失败由 `E162-①` 判红并指名 ⇒ 这一处**不再是静默的 fail-open**）',
           at: new Date().toISOString().slice(0, 19) + 'Z',
           ledger: path.relative(env.paths.root, totals.file),
           entries
@@ -1687,18 +1728,29 @@ function main() {
         return { ok: true, written, why: '' };
       } catch (e) { return { ok: false, written: 0, why: `留痕**写失败**：${e.message}` }; }
     })();
+    /* `E162`：审计调用**移到写入点之后**（原顺序里它在写入点之前 ⇒ 块级 `const` TDZ）——
+       只动位置、不动字节：原样四行 ＋"写票"这一参。 */
+    const trailAuditE155 = trailDriftE155(browserDeclOfE136, browserGatesE136, nm => ledgerSummary[nm],
+      trailBeforeE155, trailWriteE155);
     t.check('E136 三只**浏览器/长跑**脚本的**通过数**逐脚本对账（**只读账本**，不实跑）：权威区声明的通过数 = ' +
       '`run-totals.json` 里该脚本的 `passed`；**账本覆盖不到 ⇒ 按 `D20` 报"本轮不可比"并点名**' +
       '（不判 FAIL、也不计入已核对）；`已核对 ＋ 不可比 ＋ **上轮有这轮没了** === 应有值`（**一只都不许消失**）；' +
       '**`E142`：账本自述"上一轮跑过"而本轮条目消失 ⇒ 判红并指名**（"本轮没轮到"与"上轮有这轮没了"必须分得开）；' +
       '**`E155`：账本不含它时退回持久留痕 —— 留痕的通过数 ≠ 现在的权威区声明 ⇒ 判红并指名**（`--fast` 之后无人守的那件事）',
       browserGatesE136.length > 0 && brAudit.findings.length === 0 && trailAuditE155.findings.length === 0
-        && brAudit.covered.length + brAudit.unmet.length + brAudit.disappeared.length === browserGatesE136.length,
-      (brAudit.findings.length ? `**失配 ${brAudit.findings.length} 条**：${brAudit.findings.join('；')}`
+        && brAudit.covered.length + brAudit.unmet.length + brAudit.disappeared.length === browserGatesE136.length
+        /* `E162-①`：**留痕写入结果当第 5 票**接进主判据 —— 写失败 ⇒ 当轮判红（写进判据才算收口）。 */
+        && trailWriteE155.ok === true,
+      (trailWriteE155.ok ? ''
+        : `**留痕写失败（\`E162-①\` 判红并指名）**：文件＝${path.relative(env.paths.root, TRAIL_E155)}`
+          + `｜原因＝${trailWriteE155.why}｜本轮"留痕与声明对账"**不可比 ${trailAuditE155.incomparable.length} 项**`
+          + `（${trailAuditE155.incomparable.join('、') || '（无）'}）｜`) +
+        (brAudit.findings.length ? `**失配 ${brAudit.findings.length} 条**：${brAudit.findings.join('；')}`
         : `逐脚本一致（${brAudit.covered.map(n => `${n}=${ledgerSummary[n].passed}/${ledgerSummary[n].failed}/${ledgerSummary[n].skipped}`).join('、') || '（无可比项）'}）`) +
       (trailAuditE155.findings.length ? `｜**\`E155\` 留痕失配 ${trailAuditE155.findings.length} 条**：${trailAuditE155.findings.join('；')}` : '') +
       `｜**已核对 ${brAudit.covered.length}／${browserGatesE136.length} 个**` +
       `｜**本轮不可比 ${brAudit.unmet.length} 个**：${brAudit.unmet.join('、') || '（无）'}` +
+      `｜**\`E162\` 写失败⇒不可比 ${trailAuditE155.incomparable.length} 个**：${trailAuditE155.incomparable.join('、') || '（无）'}` +
       `｜**\`E155\` 由留痕守住 ${trailAuditE155.viaTrail.length} 个**：${trailAuditE155.viaTrail.join('、') || '（无）'}` +
       `｜**\`E155\` 无留痕（显式不可比，不判红）${trailAuditE155.noTrail.length} 个**：${trailAuditE155.noTrail.join('、') || '（无）'}` +
       `｜**\`E142\` 上轮有这轮没了 ${brAudit.disappeared.length} 个**：${brAudit.disappeared.join('、') || '（无）'}` +
@@ -1710,7 +1762,9 @@ function main() {
       + `本轮写入＝${trailWriteE155.written} 条${trailWriteE155.why ? `（${trailWriteE155.why}）` : ''}${trailWriteE155.ok ? '' : ' ⚠ **写失败**'}` +
       `｜判据分工：账本有 ⇒ \`E136\` 逐值守（${trailAuditE155.guardedByLedger.length} 个）＋ 记入留痕；`
       + `账本没有 ⇒ 留痕比声明（守住 ${trailAuditE155.viaTrail.length} 个、失配 ${trailAuditE155.findings.length} 个、`
-      + `无留痕 ${trailAuditE155.noTrail.length} 个**显式不可比、不静默**）`);
+      + `无留痕 ${trailAuditE155.noTrail.length} 个**显式不可比、不静默**）` +
+      `｜\`E162\`：留痕**写入**这一票进判据（写失败 ⇒ 当轮判红、并把这些项记"不可比"）—— ` +
+      `本轮写入 ok=${trailWriteE155.ok}、不可比 ${trailAuditE155.incomparable.length} 项`);
     if (brAudit.unmet.length) {
       t.info(`§11「E136 浏览器/长跑脚本通过数」**本轮不可比 ${brAudit.unmet.length} 个**（账本不含该脚本条目 ⇒ ` +
         '不判 FAIL、**也不计入已核对**）：' + brAudit.unmet.join('、') +
@@ -1720,6 +1774,54 @@ function main() {
     /* `E136` 的 D22：**内存变异账本副本**（不改盘上 `run-totals.json`）——
        ㈠把某只脚本的 `passed` 改错 ⇒ **必红并指名它**；㈡把它置空 ⇒ **从"已核对"移到"不可比"**
        （两侧各变 1、总数不变）⇒ 证明"覆盖不足"既不判 FAIL、也不装绿。**两种账本语境都成立**。 */
+    /* ==================== `E162-①`／`E162-②`（2026-10-05）：留痕写入进判据 ＋ 不可比桶 ====================
+       ① `E162-①`：**已合进上面那条 `E136` 主判据**（`&& trailWriteE155.ok === true`）—— 写失败 ⇒ 当轮判红，
+          并**指名留痕文件与写入失败原因**；"留痕比声明"那些项同时进 `incomparable` 桶（显式"不可比"）。
+       ② `E162-②`：D22 —— 同一纯函数 `trailDriftE155()` 喂**合成"写入失败"** ⇒ 不可比桶**逐条点名三只脚本**、
+          失配 0 条；喂**负对照（写入成功）** ⇒ 不可比空、留痕守住三只、失配 0 条；写票守卫是 fail-closed
+          （不给票 ⇒ 不可比）。⚠ 合成输入**不依赖盘上留痕的当前状态** ⇒ 基线一定干净、读数可复算。 */
+    const synthTrailE162 = { ok: true, entries: {} };
+    for (const nm of browserGatesE136) {
+      synthTrailE162.entries[nm] = { passed: 33, declared: 33,
+        at: '2026-10-04T00:00:00Z', ledgerSha12: 'deadbeef0000' };
+    }
+    const synthDeclE162 = (nm) => ({ declared: 33, failed: 0, skipDeclared: 0, from: '（合成三元组）' });
+    const noLedgerE162 = () => undefined;
+    const synthWriteFailE162 = { ok: false, written: 0, why: '（合成：留痕写失败）' };
+    const synthWriteOkE162 = { ok: true, written: browserGatesE136.length, why: '' };
+    const selfAuditE162 = {
+      failed: trailDriftE155(synthDeclE162, browserGatesE136, noLedgerE162, synthTrailE162, synthWriteFailE162),
+      control: trailDriftE155(synthDeclE162, browserGatesE136, noLedgerE162, synthTrailE162, synthWriteOkE162),
+      writeFailBlocked: trailWriteGuardE162(synthWriteFailE162, browserGatesE136).blocked,
+      writeOkBlocked: trailWriteGuardE162(synthWriteOkE162, browserGatesE136).blocked
+    };
+    t.check('E162-② D22（可证伪）：同一纯函数 `trailDriftE155()` 喂**合成"写入失败"** ⇒ ' +
+      '**不可比桶逐条点名**（三只浏览器/长跑脚本）、**失配 0 条**（绝不把正确声明误诊成"声明漂移"）；' +
+      '喂**负对照（写入成功）** ⇒ `incomparable` 空、`viaTrail` 守住三只、同样失配 0 条；' +
+      '两次用的是**同一个函数**（`E153` 同一把尺子）；写票守卫是 fail-closed（不给票 ⇒ 不可比）',
+      selfAuditE162.failed.incomparable.length === browserGatesE136.length &&
+        selfAuditE162.failed.findings.length === 0 && selfAuditE162.failed.viaTrail.length === 0 &&
+        selfAuditE162.failed.incomparable.every(nm => browserGatesE136.includes(nm)) &&
+        selfAuditE162.control.incomparable.length === 0 &&
+        selfAuditE162.control.viaTrail.length === browserGatesE136.length &&
+        selfAuditE162.control.findings.length === 0 &&
+        selfAuditE162.writeFailBlocked === true && selfAuditE162.writeOkBlocked === false &&
+        trailWriteGuardE162(undefined, browserGatesE136).blocked === true,
+      `①注入写失败 ⇒ 不可比 ${selfAuditE162.failed.incomparable.length} 项`
+        + `（${selfAuditE162.failed.incomparable.join('、') || '（无）'}）、失配 ${selfAuditE162.failed.findings.length} 条`
+        + `（应 0）、留痕守住 ${selfAuditE162.failed.viaTrail.length}（应 0）；`
+        + `②负对照（写成功）⇒ 不可比 ${selfAuditE162.control.incomparable.length}（应 0）、`
+        + `留痕守住 ${selfAuditE162.control.viaTrail.length}（应 ${browserGatesE136.length}）、`
+        + `失配 ${selfAuditE162.control.findings.length}（应 0）；`
+        + `③写票守卫（fail-closed）⇒ 失败票 blocked=${selfAuditE162.writeFailBlocked}、成功票 blocked=${selfAuditE162.writeOkBlocked}、`
+        + `不给票 blocked=${trailWriteGuardE162(undefined, browserGatesE136).blocked}（都应"失败/成功/不给 ⇒ true/false/true"）`);
+    t.info(`\`E162\` 判据链：①留痕文件＝${path.relative(env.paths.root, TRAIL_E155)}`
+      + `（本轮写入点：ok=${trailWriteE155.ok}、written=${trailWriteE155.written}）；`
+      + `②"留痕与声明对账"本轮记不可比 ${trailAuditE155.incomparable.length} 项`
+      + `（${trailAuditE155.incomparable.join('、') || '（无）'}）而**不**报失配（失配 ${trailAuditE155.findings.length} 条）；`
+      + `③负对照（合成写成功）⇒ 留痕守住 ${selfAuditE162.control.viaTrail.length} 项、失配 `
+      + `${selfAuditE162.control.findings.length} 条；④D22 注入点＝环境变量 \`DSH_E162_TRAIL_WRITE_FAIL=1\``
+      + `（只改返回值、不碰盘；生产路径不设它 ⇒ 行为逐字不变）`);
     /* `E136` 的 D22：用**完全受控的合成三元组**（**不依赖盘上账本的当前状态** ⇒ 基线一定干净），
        复用**同一个纯函数** `browserLedgerAuditE136()` ⇒ "变异后变红并指名"能证伪这条断言。
        ⚠ 为什么不用"改盘上账本的那一个数"当判据（**实测踩过**）：若账本本身已经被外部改脏（或有真漂移），
@@ -1769,12 +1871,15 @@ function main() {
        ㈢ 账本里没有它 ＋ **没有留痕** ⇒ 显式"不可比：无持久留痕"（不判红、**但绝不静默**）；
        ㈣ 账本里有它 ⇒ 交回 `E136` 逐值守（留痕不抢判据的活）。 */
     const noLedgerE155 = () => undefined;
+    /* `E162`：给既有四支**显式**补上"写入成功"那一票（fail-closed 下不给票会全体变"不可比"，
+       那会把 `E155` 原来的四组读数改坏 —— 这是本座位上一轮实测踩过的坑，此处按"只增不改"处理）。 */
+    const synthWriteOkE155 = { ok: true, written: 1, why: '' };
     const synthTrailE155 = { ok: true, entries: { [targetE136]: { passed: 33, declared: 33, at: '2026-10-04T00:00:00Z', ledgerSha12: 'deadbeef0000' } } };
     const trail155 = {
-      held: trailDriftE155(synthDeclE136, browserGatesE136, noLedgerE155, synthTrailE155),
-      drifted: trailDriftE155((nm) => (nm === targetE136 ? { declared: 34 } : synthDeclE136(nm)), browserGatesE136, noLedgerE155, synthTrailE155),
-      noTrail: trailDriftE155(synthDeclE136, browserGatesE136, noLedgerE155, { ok: false, why: '（合成：没有留痕）', entries: {} }),
-      ledgerWins: trailDriftE155(synthDeclE136, browserGatesE136, synthSumE136, synthTrailE155)
+      held: trailDriftE155(synthDeclE136, browserGatesE136, noLedgerE155, synthTrailE155, synthWriteOkE155),
+      drifted: trailDriftE155((nm) => (nm === targetE136 ? { declared: 34 } : synthDeclE136(nm)), browserGatesE136, noLedgerE155, synthTrailE155, synthWriteOkE155),
+      noTrail: trailDriftE155(synthDeclE136, browserGatesE136, noLedgerE155, { ok: false, why: '（合成：没有留痕）', entries: {} }, synthWriteOkE155),
+      ledgerWins: trailDriftE155(synthDeclE136, browserGatesE136, synthSumE136, synthTrailE155, synthWriteOkE155)
     };
     t.check('E136 D22（可证伪）：用**受控合成三元组**（不依赖盘上账本的当前状态）把某只浏览器/长跑脚本的' +
       '通过数改错（`33 ⇒ 99`）⇒ 本判据**必红并指名它**（恰 1 条）；把它置空 ⇒ 该项**从"已核对"移到"不可比"**' +
