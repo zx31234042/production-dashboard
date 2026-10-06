@@ -2129,6 +2129,149 @@ async function main() {
   }
   cutDb.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
 
+  /* ---------------- 八之三之②、`E176①` 告警阈值边界收窄（**仓储层**：只接受正有限数） ----------------
+     立案（`E176`，`C·26` 第③面）：`E33①` 把 `options.warnThreshold === undefined ? <字面量> : …` 删掉后
+     留下两条边界 ——
+       ① `Number(v)` 归一形态把 `null`／`''` 收成 **0** ⇒ `pending >= 0` **恒告警**（`true`→1、`'5'`→5、负数照收）；
+       ② `NaN`／`Infinity` 的报错文案经 `JSON.stringify` **印成 "收到 null"** ⇒ 症状指向错方向（`E135` 同族）。
+     实现已落（`typeof !== 'number' || !Number.isFinite || !(> 0)` ⇒ `TypeError`，文案走 `String(v)` ＋
+     `typeof v`、**不经 `JSON.stringify`**）；本节**只写断言、不改实现**，钉住三件事：
+       · 非法逐例（`null`／`''`／`'5'`／`0`／`-1`／`true`／`false`／`NaN`／`Infinity`／`{}`）⇒ `TypeError`，
+         文案**同时**含键名 `warnThreshold` ＋ `String(v)` ＋ `typeof v`；
+       · 合法逐例（`1`／`5`／`5000`／`0.5`）⇒ 不抛，且 `warn` 判定＝`pending >= threshold`
+         （用**自造的待补传条数**把阈值两侧都构造出来）；
+       · 边界两侧：`pending = 3` 时阈值 `3` ⇒ `warn=true`、阈值 `4` ⇒ `warn=false`（是 `>=` 不是 `>`）。
+     可证伪（ADR-0004 D22 ㈠，靶子在本节内、判据共用同一个谓词）：把守卫**退回 `Number()` 归一形态**
+       （`server/repo/uploadQueue.js` 的**内存字节副本**，`Module._compile`；盘上文件全程只读）
+       ⇒ `null`／`''` 两条用例**当场变红**并指名该文件与 `warnThreshold`。
+     ⚠ 入口层（`mountUpload({warnThreshold: 0})` 的**装配期**闸）与真源读取层（`configWarnThreshold()`）
+       的同口径断言在 `tests/contract-check.js` 的 `O` 段（同一批；本文件只管**仓储层**）。 */
+  t.section('八之三之②、E176① 告警阈值边界收窄（仓储层只接受正有限数）');
+  {
+    const Module = require('node:module');
+    const e176Db = makeTempDb({ name: 'e176-warn-threshold' });
+    db.initSchema(e176Db.db, NOW);
+    /** 造恰好 `n` 条**待补传**（`state` 词形取自仓储导出的 `STATE`，不写死中文）。
+     *  夹具侧的批量插入走**一条事务**（否则逐条提交在 WAL 上要几秒，白白拖长门禁墙钟）。 */
+    const e176Seed = (n) => {
+      e176Db.db.prepare('DELETE FROM upload_log').run();
+      const ins = e176Db.db.prepare(
+        `INSERT INTO upload_log(upload_id, interface, request_body, elapsed_ms, retry_count, state, created_at, updated_at)
+         VALUES(?, 'report/receiveReport', '{"probe":"E176"}', NULL, 0, ?, ?, ?)`);
+      e176Db.db.exec('BEGIN');
+      try {
+        for (let i = 1; i <= n; i++) ins.run('UP-E176-' + String(i).padStart(4, '0'), uploadQueueRepo.STATE.PENDING, NOW, NOW);
+        e176Db.db.exec('COMMIT');
+      } catch (err) {
+        e176Db.db.exec('ROLLBACK');
+        throw err;
+      }
+      return uploadQueueRepo.countAll(e176Db.db);
+    };
+    const E176_ILLEGAL = [
+      ['null', null], ["''", ''], ["'5'", '5'], ['0', 0], ['-1', -1], ['true', true], ['false', false],
+      ['NaN', NaN], ['Infinity', Infinity], ['{}', {}]
+    ];
+    const E176_LEGAL = [['1', 1], ['5', 5], ['5000', 5000], ['0.5', 0.5]];
+    /** 判据本体（供负对照与 D22 共用）：非法 ⇒ `TypeError` ＋ 文案含「`warnThreshold` ＋ String(v) ＋ typeof v」 */
+    const e176GuardRead = (statsFn, v) => {
+      e176Seed(1);
+      let err = null;
+      try { statsFn(e176Db.db, { warnThreshold: v }); } catch (e) { err = e; }
+      const want = String(v) + '（类型 ' + typeof v + '）';
+      return {
+        name: err ? err.name : '',
+        msg: err ? String(err.message) : '',
+        ok: Boolean(err && err instanceof TypeError && err.message.includes('warnThreshold') && err.message.includes(want)),
+        read: err ? '' : '**未抛**'
+      };
+    };
+    if (t.requires('八之三之②前提：独占临时库已建表、`upload_log` 可写（造待补传条数的基准）',
+      e176Seed(1) === 1 && uploadQueueRepo.countPending(e176Db.db) === 1,
+      `插入 1 条后 countAll=${uploadQueueRepo.countAll(e176Db.db)}`)) {
+      const e176Bad = [];
+      for (const [label, v] of E176_ILLEGAL) {
+        const r = e176GuardRead(uploadQueueRepo.stats, v);
+        if (!r.ok) e176Bad.push(`warnThreshold=${label} ⇒ ${r.name ? r.name + '：' + r.msg.slice(0, 60) : r.read}`);
+      }
+      t.check('E176① 仓储层非法逐例（null／\'\'／\'5\'／0／-1／true／false／NaN／Infinity／{}）⇒ 抛 `TypeError`，' +
+        '文案**同时**含 `warnThreshold` ＋ `String(v)` ＋ `typeof v`（**不做 `Number()` 归一**）',
+        e176Bad.length === 0 && E176_ILLEGAL.length === 10,
+        e176Bad.length ? e176Bad.join('；') : `${E176_ILLEGAL.length} 例逐例命中`);
+      const e176NanMsg = e176GuardRead(uploadQueueRepo.stats, NaN).msg;
+      const e176InfMsg = e176GuardRead(uploadQueueRepo.stats, Infinity).msg;
+      t.check('E176② 症状面：`NaN`／`Infinity` 的文案说的是 `NaN`／`Infinity`（类型 number），' +
+        '**不是** `null` —— `JSON.stringify(NaN) === \'null\'` 的"收到 null"误指已消除',
+        e176NanMsg.includes('收到 NaN（类型 number）') && !e176NanMsg.includes('收到 null')
+        && e176InfMsg.includes('收到 Infinity（类型 number）') && !e176InfMsg.includes('收到 null'),
+        `NaN ⇒ ${JSON.stringify(e176NanMsg.slice(e176NanMsg.indexOf('收到'), e176NanMsg.indexOf('收到') + 22))}；` +
+        `Infinity ⇒ 命中=${e176InfMsg.includes('收到 Infinity（类型 number）')}`);
+      const e176LegalBad = [];
+      const e176LegalReads = [];
+      for (const [label, thr] of E176_LEGAL) {
+        /* **每例两侧**：`pending = ⌈threshold⌉ − 1`（不告警）与 `⌈threshold⌉`（告警）—— 阈值线本身在告警侧 */
+        const at = Math.max(1, Math.ceil(thr));
+        const below = Math.max(0, at - 1);
+        const reads = [below, at].map(pending => {
+          const seeded = e176Seed(pending);
+          let res = null;
+          let err = '';
+          try { res = uploadQueueRepo.stats(e176Db.db, { warnThreshold: thr }); } catch (e) { err = String(e.message); }
+          return { pending, seeded, res, err };
+        });
+        const ok = reads.every(r => !r.err && r.res && r.res.pending === r.pending
+          && r.res.warn === (r.res.pending >= thr));
+        e176LegalReads.push(`${label}: pending=${below}/${at} ⇒ warn=${reads[0].res && reads[0].res.warn}/`
+          + `${reads[1].res && reads[1].res.warn}`);
+        if (!ok) {
+          e176LegalBad.push(`warnThreshold=${label} ⇒ ` + reads.map(r => r.err
+            || JSON.stringify({ pending: r.res && r.res.pending, warn: r.res && r.res.warn })).join(' / '));
+        }
+      }
+      t.check('E176① 仓储层合法逐例（1／5／5000／0.5）⇒ 不抛，且 `warn` 判定＝`pending >= threshold`' +
+        '（**每例都把阈值两侧造出来**：`pending = ⌈阈值⌉ − 1` ⇒ 不告警、`⌈阈值⌉` ⇒ 告警）',
+        e176LegalBad.length === 0, e176LegalBad.length ? e176LegalBad.join('；') : e176LegalReads.join('；'));
+      e176Seed(3);
+      const e176At = uploadQueueRepo.stats(e176Db.db, { warnThreshold: 3 });
+      const e176Below = uploadQueueRepo.stats(e176Db.db, { warnThreshold: 4 });
+      t.check('E176① 边界两侧（pending = 3）：阈值 3 ⇒ `warn=true`、阈值 4 ⇒ `warn=false`' +
+        '（判据是 `>=` 而不是 `>` —— 阈值线本身就在告警侧）',
+        e176At.warn === true && e176Below.warn === false && e176At.pending === 3 && e176Below.pending === 3,
+        `阈值 3 ⇒ ${e176At.warn}；阈值 4 ⇒ ${e176Below.warn}（pending=${e176At.pending}）`);
+      /* ---- D22 ㈠：守卫退回 `Number()` 归一形态（内存副本，锚点只取 ASCII、逐条自证恰 1 次）---- */
+      const e176Path = path.join(__dirname, '..', 'server', 'repo', 'uploadQueue.js');
+      const e176Src = fs.readFileSync(e176Path, 'utf8');
+      const E176_A1 = 'const threshold = options.warnThreshold;';
+      const E176_A2 = "if (typeof threshold !== 'number' || !Number.isFinite(threshold) || !(threshold > 0)) {";
+      const e176Hits = [e176Src.split(E176_A1).length - 1, e176Src.split(E176_A2).length - 1];
+      let e176MutStats = null;
+      if (e176Hits[0] === 1 && e176Hits[1] === 1) {
+        const m = new Module(e176Path + '#e176-mut', null);
+        m.filename = e176Path;
+        m.paths = Module._nodeModulePaths(path.dirname(e176Path));
+        m._compile(e176Src.replace(E176_A1, 'const threshold = Number(options.warnThreshold);')
+          .replace(E176_A2, 'if (!Number.isFinite(threshold)) {'), m.filename);
+        e176MutStats = m.exports.stats;
+      }
+      const e176MutNull = e176MutStats ? e176GuardRead(e176MutStats, null) : null;
+      const e176MutEmpty = e176MutStats ? e176GuardRead(e176MutStats, '') : null;
+      t.check('E176① D22 ㈠ 可证伪：把仓储层守卫**退回 `Number()` 归一形态**' +
+        '（`server\\repo\\uploadQueue.js` 的**内存字节副本**，`Module._compile`；盘上零字节改动）⇒ ' +
+        '`null`／`\'\'` 两条用例**必红**：它们**不再被 `TypeError` 拒收**（`Number(null)=0` ⇒ `pending >= 0` 恒告警）',
+        e176Hits[0] === 1 && e176Hits[1] === 1 && Boolean(e176MutStats)
+        && e176MutNull && e176MutNull.ok === false && e176MutEmpty && e176MutEmpty.ok === false
+        && e176MutNull.name === '' && e176MutEmpty.name === '',
+        e176Hits[0] !== 1 || e176Hits[1] !== 1
+          ? `锚点命中（${e176Hits.join('／')}，应恰 1／1）⇒ 判红，不许静默放过`
+          : `变异体 null ⇒ ${e176MutNull.read}（应"未抛"）、\'\' ⇒ ${e176MutEmpty.read}（应"未抛"）`);
+      t.check('E176① D22 ㈠ 负对照：**原件**同两条用例（同一谓词、同一夹具）都被 `TypeError` 拒收',
+        e176GuardRead(uploadQueueRepo.stats, null).ok && e176GuardRead(uploadQueueRepo.stats, '').ok,
+        '原件 null／\'\' 逐例命中');
+      t.check('E176① D22 ㈠ 内存副本未落盘：`server/repo/uploadQueue.js` 逐字节未变',
+        fs.readFileSync(e176Path, 'utf8') === e176Src, `${e176Src.length} 字符相同`);
+    }
+    e176Db.close();   // 夹具自有连接：不关会在 Windows 上锁住临时目录（ADR-0003 D17）
+  }
   /* ---------------- 八之四、IF-D 采集接入（W1：校验拒收 / 频率口径 / 幂等 / 退路口径 / 断连 / HTTP） ----------------
      被测对象＝`server/services/ingest.js` + `server/http/routes/ifD.js`（W1 新增）：
        ①脏帧拒收（缺字段/类型错/时间非法含毫秒与秒级/超量程）⇒ 拒收 + 可读原因 + **一行未落库**；

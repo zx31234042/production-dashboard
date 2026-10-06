@@ -3,6 +3,7 @@
    作用：把 tests/README.md 第 6.1～6.7 项里**可离线执行**的部分脚本化，覆盖：
          A. 附录 2 契约（13 字段）↔ config/fieldMap.js 的 boardToReport
          B. 上位机报文契约：fieldMap.upperToBoard ↔ samplePayload ↔ mockUpperSource ↔ tools/mock-upper
+         B2b. 相机侧设定值**四处对账**（工具侧运行期产出 ＋ fieldMap.samplePayload ＋ browser-check 夹具 ↔ mockUpperSource；E20，2026-10-06）
          B3. testStatus 口径（V1.37 / C-98）：附录 2 代码语义（0=待机/1=测试中/2=测试完成/3=设备异常）
              ↔ 显示模式四态（2 显示为「正常停机」）↔ 上报 MES 反查表（**维保检修→0**，本次修正点）
          C. services/api.js 的 IF-D 行为（缺字段容错 / 冻结判定 / 配置化生效）
@@ -19,6 +20,10 @@
          M. 跨实现一致性：前端演示实现 mockData.js ↔ 服务端权威实现 stats.js
             （同一组输入下 一次性合格率/产能达成率/稼动率/平均测试时长 必须一致，
               ADR-0005 第三节建议第 2 条；配 ADR-0004 D22 定点变异反证）
+         M2. 跨实现一致性（**累计运行时长**）：前端 accumulateRun ↔ 服务端 accumulateRunTime（E32；
+             跨班次/跨零点（E83 切段）/跨月/跨年/空序列/负增量夹零 逐值相等 ＋ D22 定点变异反证）
+         N. 补传队列告警阈值单一真源（R26-P3-4 / E10 / IF-B.9）
+         O. E176① 告警阈值边界收窄：入口层（装配期）＋ 真源读取层（E176）
    依赖：仅 Node 内置模块；不联网（只连本机回环端口）、不启动浏览器。
    运行：node tests/contract-check.js
    退出码：0 = 全部通过；1 = 有断言失败（失败项即待修缺陷）。
@@ -450,6 +455,115 @@ async function main() {
     );
   }
 
+  /* ---- B2b. 相机侧设定值的**工具侧**对账（`E20`，2026-10-06 落地；本包新增） ----
+     立案（`E20`）：B2 只比 `mockUpperSource` ↔ `mockData`，而相机侧设定值在仓库里**四处各有一份**：
+       · `tools/mock-upper/mock-upper.js` 的 `std{Depth,Gain,Fps,Shutter}`（工具侧**运行期产出**）
+       · `src/services/mockUpperSource.js` 的 `std{Depth,Gain,Fps,Shutter}`（前端内置模拟上位机）
+       · `src/config/fieldMap.js` 的 `samplePayload.std*`（样例报文）
+       · `tests/browser-check.js` 注入的"固定报文"夹具
+     ⇒ 把**工具侧**的 `stdDepth` 改成 `5.00`（＝把"相机设定深度"当成"航行器深度标准"的量级，
+     上游真犯过这一类错）此前**无人拦**：`tools-check` 只比字段键集合/存在性。
+     本段的判据（两件事分开说，不互相代替）：
+       ① **工具读数必须是运行期产出**：`tools/mock-upper/mock-upper.js` 是**独立进程** ⇒ 跑 `--once`，
+          stdout 经 **fd 承接**（不用管道，适配受限沙箱）后 `JSON.parse` —— **不以 grep 源码文本当行为证据**；
+       ② **四源 × 四值逐值对账**（基准＝`mockUpperSource.sample()`，即前端内置上位机的运行期帧）。
+          `fieldMap.samplePayload` 与 `browser-check` 的夹具是**数据字面量/测试内注入帧**，
+          源码读法就是它们的存在形态（本段并列给出，且**分别**断言，避免把两类证据混成一条）。
+     可证伪（ADR-0004 D22，靶子在本段内、判据共用同一个纯函数 `cameraStdProblems()`）：
+       把工具源码的 `stdDepth` 改成 `5.00`（**内存副本**写成临时文件、**以真进程跑** `--once`）
+       ⇒ 判据**当场变红**并**指名** `tools/mock-upper/mock-upper.js`；临时副本用 `env.removeLinkSafe()` 回收，
+       盘上原件逐字节未变。 */
+  {
+    const CAM_KINDS = ['depth', 'gain', 'fps', 'shutter'];
+    const CAM_WIRE = { depth: 'stdDepth', gain: 'stdGain', fps: 'stdFps', shutter: 'stdShutter' };
+    const TOOL_UPPER = path.join(ROOT, 'tools', 'mock-upper', 'mock-upper.js');
+    const camSrc = UpperSource.sample();
+    const camPayload = MAP.samplePayload;
+    /** 跑一个**真进程**取一帧（`--once`，stdout 经 fd 承接 —— 与上面 `mockUpperCliFrame()` 同款做法） */
+    function toolFrameOf(script, tag) {
+      const outFile = path.join(os.tmpdir(), `contract-check-e20-${tag}-${process.pid}.json`);
+      let fd;
+      let err = '';
+      try {
+        fd = fs.openSync(outFile, 'w');
+        execFileSync(process.execPath, [script, '--once'], { stdio: ['ignore', fd, 'ignore'] });
+      } catch (e) {
+        err = 'spawn: ' + String(e && (e.code || e.message));
+      } finally {
+        if (fd !== undefined) fs.closeSync(fd);
+      }
+      let frame = null;
+      try {
+        if (!err) frame = JSON.parse(fs.readFileSync(outFile, 'utf8'));
+      } catch (e) {
+        err = err || ('parse: ' + e.message);
+      } finally {
+        env.removeLinkSafe(outFile);
+      }
+      return { frame, err };
+    }
+    const toolRun = toolFrameOf(TOOL_UPPER, 'real');
+    /* `browser-check` 的夹具（测试内注入帧）：源码里那**一行**字面量，锚点只取 ASCII */
+    const bcCamMatch = readText('tests/browser-check.js')
+      .match(/stdDepth:\s*([\d.]+),\s*stdGain:\s*([\d.]+),\s*stdFps:\s*([\d.]+),\s*stdShutter:\s*([\d.]+)/);
+    const bcCam = bcCamMatch
+      ? { stdDepth: Number(bcCamMatch[1]), stdGain: Number(bcCamMatch[2]),
+        stdFps: Number(bcCamMatch[3]), stdShutter: Number(bcCamMatch[4]) }
+      : null;
+    const camRows = [
+      { label: 'src/services/mockUpperSource.js（运行期 sample()）', get: k => camSrc[CAM_WIRE[k]], runtime: true },
+      { label: 'tools/mock-upper/mock-upper.js（真进程 --once 产出）', get: k => toolRun.frame && toolRun.frame[CAM_WIRE[k]], runtime: true },
+      { label: 'src/config/fieldMap.js 的 samplePayload', get: k => camPayload[CAM_WIRE[k]], runtime: false },
+      { label: 'tests/browser-check.js 的固定报文夹具（源码）', get: k => bcCam && bcCam[CAM_WIRE[k]], runtime: false }
+    ];
+    /** 判据本体（纯函数）：以第一行为基准，逐源逐值比对；问题串里**点名来源** */
+    function cameraStdProblems(rowsIn) {
+      const base = rowsIn[0];
+      const problems = [];
+      for (const r of rowsIn.slice(1)) {
+        for (const k of CAM_KINDS) {
+          const a = base.get(k);
+          const b = r.get(k);
+          if (!(typeof a === 'number' && typeof b === 'number' && a === b)) {
+            problems.push(`${r.label} 的 ${CAM_WIRE[k]}=${b} ≠ 基准 ${CAM_WIRE[k]}=${a}`);
+          }
+        }
+      }
+      return problems;
+    }
+    const camProblems = cameraStdProblems(camRows);
+    const camTable = camRows.map(r => r.label + '：' + CAM_KINDS.map(k => `${CAM_WIRE[k]}=${r.get(k)}`).join('、')).join('；');
+    check('E20 工具侧读数是**运行期产出**（真进程 `--once` 的 JSON 帧），不是源码 grep：' +
+      '帧里四个相机侧设定值都是有限数值',
+      Boolean(toolRun.frame) && CAM_KINDS.every(k => Number.isFinite(toolRun.frame[CAM_WIRE[k]])),
+      `进程读数 err=${JSON.stringify(toolRun.err)}；stdDepth=${toolRun.frame && toolRun.frame.stdDepth}`);
+    check('E20 相机侧设定值**四处对账**（工具运行期产出 ＋ `fieldMap.samplePayload` ＋ `browser-check` 夹具 ' +
+      '↔ 基准 `mockUpperSource`）四值逐值一致 —— 工具侧改值即被拦（原先只有 B2 的"前端两处"对账）',
+      camProblems.length === 0, camProblems.join('；') || camTable);
+    /* D22：把工具源码的 stdDepth 改成 5.00（内存副本 → 临时文件 → **真进程**跑） */
+    const CAM_ANCHOR = 'stdDepth: 12.50, stdGain: 2.5, stdFps: 400, stdShutter: 500,';
+    const toolSrc = readText('tools/mock-upper/mock-upper.js');
+    const camAnchorHits = toolSrc.split(CAM_ANCHOR).length - 1;
+    let camMutProblems = null;
+    if (camAnchorHits === 1) {
+      const mutFile = path.join(os.tmpdir(), `contract-check-e20-mut-${process.pid}.js`);
+      fs.writeFileSync(mutFile, toolSrc.replace(CAM_ANCHOR,
+        'stdDepth: 5.00, stdGain: 2.5, stdFps: 400, stdShutter: 500,'), 'utf8');
+      const mutRun = toolFrameOf(mutFile, 'mut');
+      env.removeLinkSafe(mutFile);
+      camMutProblems = cameraStdProblems(camRows.map((r, i) => (i === 1
+        ? { label: r.label, get: k => mutRun.frame && mutRun.frame[CAM_WIRE[k]] } : r)));
+    }
+    check('E20 D22 可证伪：把工具侧 `stdDepth` 改成 `5.00`（源码**内存副本** → 临时文件 → **真进程**跑 `--once`；' +
+      '盘上原件零字节改动）⇒ 本判据**必红**并**指名** `tools/mock-upper/mock-upper.js`（`stdDepth` 那一项）',
+      camAnchorHits === 1 && Boolean(camMutProblems) && camMutProblems.length > 0
+      && camMutProblems.some(p => p.includes('tools/mock-upper/mock-upper.js'))
+      && camMutProblems.some(p => p.includes('stdDepth')),
+      camAnchorHits !== 1 ? `锚点命中 ${camAnchorHits} 次（应恰 1）⇒ 判红，不许静默放过`
+        : `变异后违规 ${camMutProblems.length} 条：${camMutProblems.join('；')}`);
+    check('E20 D22 内存副本未落盘：`tools/mock-upper/mock-upper.js` 逐字节未变',
+      readText('tools/mock-upper/mock-upper.js') === toolSrc, `${toolSrc.length} 字符相同`);
+  }
   /* ---- B3. testStatus 口径（V1.37 / C-98）：附录 2 代码语义、上报反查表、显示模式四态 ----
      立案（2026-09-24 负责人裁定）：C-98 把 `testStatus` 的取值语义统一到**附录 2**
      （`0=待机`／`1=测试中`／`2=测试完成`／`3=设备异常`），并连带修正两处口径。本段把三件事
@@ -1512,6 +1626,319 @@ async function main() {
     }
   }
 
+  /* ===== M2. 跨实现一致性（**累计运行时长**：前端 `accumulateRun` ↔ 服务端 `accumulateRunTime`，`E32`）=====
+     立案（`E32`）：`src/services/mockData.js` 的 `accumulateRun(now, runRate)`（日/月/年累计运行时长）
+     与 `server/services/stats.js` 的 `accumulateRunTime(prev, addSec, now, addSplit, alloc)` 是**第二份实现**，
+     **没有任何跨实现比对**（同文件里 `computeStats()` ↔ `stats` 已有上面 M 段的跨实现对账）。
+     本段照 M 段的**口径与写法**补上这一组（同一组输入序列 ⇒ 日/月/年累计**逐值相等**）。
+
+     两侧各自的**在产形态**（这一点决定了本段怎么喂输入）：
+       · 前端：`accumulateRun()` **未导出**（`MockData` 的返回对象里没有它）⇒ 走它的**在产可观测口**
+         `MockData.tick(now)` 写出的 `state.maint.{todayRun,monthRun,yearRun}`，即维保页显示的那三个数
+         （`mockData.js` 里 `accumulateRun()` 的**唯一**调用点，三个字段直接赋值、未经加工）；
+       · 服务端：调用形态＝`server/services/stateSnapshot.js` 的 `statsOf()` —— `prev` ＝
+         `shift_stat` 按周期求和（读口 `sumRunSec()`）＋ **`prev.at = now`**（同一时刻）。
+         ⚠ 由此有一条**已知边界**（如实登记，不冒领）：`rollAccum()` 的跨日/跨月**滚动支**在本判据里
+         **不会触发**（在产口径就是"归零靠周期过滤、不靠 rollAccum"，见 `tests/logic-check.js` 的
+         `A1/D4-2`）⇒ 本段考的是**归属（E83 切段）/周期过滤/夹零**与两实现的一致性，**不覆盖**滚动支。
+
+     输入序列怎么构造（**两边同一组输入**，且期望值**构成性给出**，不写死魔数）：
+       · 账本 ＝ `Map<'yyyy-MM-dd', 秒>`，等价于 `shift_stat` 里按 `shift_date` 归集后的 `run_sec` 求和
+         （`sumRunSec()` 的三档就是按日期前缀过滤这张账本）；
+       · 每个拍点：`addSec` ＝ 上一拍到这一拍的时长 × `runRate`（这就是 `runRate`＝有效运行占比的定义），
+         跨零点的拍点带 **`E83` 的自然日切段**（`day1/day2` 按零点切开、各带 `day1Date/day2Date`）；
+         每拍算完后把上一拍的"未固化增量"按段固化进账本（＝班次结束时落 `shift_stat` 那一行）；
+       · 初始条件（**归纳起点**，不是被测结论）：`t0` 之前系统按 `runRate` 均匀累积 ⇒ 账本与前端读数一致；
+         断言只覆盖 `t0` 之后的每一步。
+       · 期望值＝"自周期起点起算的时长 × `runRate`"（前端那份实现的**定义**，独立于两个实现的代码算出来）。
+       · **精度**：时间点全部取整点，配置 `runRate=0.79` 下"整点时长×runRate"是**精确整数**
+         （本段另立一条**构造成立性**断言把它钉住）⇒ 逐值比较用**严格 `===`**，**不放任何容差**。
+
+     覆盖：跨班次（08:00→16:00 早班整班、16:00→24:00 中班）／跨零点＋`E83` 切段（含 `day2=0` 的零点整）／
+     跨月（`E132` 的现场形态 `10-31 22:00→11-01 00:30`）／跨年（`12-31 22:00→次年 01-01 00:30`）／
+     空序列零增量／缺测（`addSec`＝0 或缺失）／负增量夹零（`addSec=-600` 与"两段皆负的切段"）。
+     两侧口径差异**用构成性断言锁定并写明是已知边界**（两处，各自独立断言，不靠放宽相等性凑绿）：
+       ① **缺测**：服务端三档**停在账本值、不伪造增量**（`E38`「不得伪造数据」），前端按时刻外推 ⇒
+          差额**恰等于**自账本一致点起的已过时长 × `runRate`；
+       ② **跨月/跨年**：`monthSec`／`yearSec` **只收落在 `now` 所在周期的那一段**，另一段由 `outOfPeriod`
+          报出（归**上一个**周期、不是丢失）—— 切段总额 − 进本周期档的额 ＝ `outOfPeriod` 报出的额。
+
+     可证伪（ADR-0004 D22，靶子在本段内、判据共用同一个纯函数 `e32ParityProblems()`）：
+       把前端 `accumulateRun()` 的**日档**算式改错一位（`/1000` → `/10000`，`src/services/mockData.js` 的
+       **内存副本**，盘上零字节改动）⇒ 本判据**必红**并**指名** `src/services/mockData.js`（偏离方）与
+       当日档（`today`/`daySec`）。 */
+  section('M2. 跨实现一致性（累计运行时长：前端 accumulateRun ↔ 服务端 accumulateRunTime，E32）');
+  {
+    const e32Stats = require('../server/services/stats');
+    const e32Conf = require('../src/config/board.config.js');
+    const E32_RATE_CFG = e32Conf.production.runRate;
+    const E32_LOAD_ORDER = [
+      'src/config/board.config.js', 'src/config/fieldMap.js', 'src/utils/dom.js',
+      'src/utils/format.js', 'src/services/api.js', 'src/services/mockData.js',
+      'src/services/mockUpperSource.js'
+    ];
+    /** 按 index.html 的顺序加载 `src/`（与 `createIsolatedHarness()` 同一口径；多一个"源码覆盖"出口，
+     *  只为 D22 的**内存副本**——盘上文件全程只读） */
+    function e32Harness(overrides) {
+      const sandbox = { console, fetch, AbortSignal, setTimeout, clearTimeout };
+      sandbox.window = sandbox;
+      vm.createContext(sandbox);
+      const run = rel => vm.runInContext(
+        (overrides && overrides[rel] !== undefined) ? overrides[rel] : readText(rel), sandbox,
+        { filename: path.join(ROOT, rel) });
+      E32_LOAD_ORDER.forEach(run);
+      return sandbox;
+    }
+    const e32StartOfDay = d => new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+    const e32StartOfMonth = d => new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);
+    const e32StartOfYear = d => new Date(d.getFullYear(), 0, 1, 0, 0, 0, 0);
+    const e32Pad = n => String(n).padStart(2, '0');
+    const e32FmtDate = d => `${d.getFullYear()}-${e32Pad(d.getMonth() + 1)}-${e32Pad(d.getDate())}`;
+    const e32Fmt = d => `${e32FmtDate(d)} ${e32Pad(d.getHours())}:${e32Pad(d.getMinutes())}:${e32Pad(d.getSeconds())}`;
+    const e32D = (y, m, d, h, mi, s) => new Date(y, m - 1, d, h || 0, mi || 0, s || 0);
+    const e32Want = (t, rate) => ({
+      today: ((t - e32StartOfDay(t)) / 1000) * rate,
+      month: ((t - e32StartOfMonth(t)) / 1000) * rate,
+      year: ((t - e32StartOfYear(t)) / 1000) * rate
+    });
+    /* 前端读数缓存**按沙箱分桶**（同一个沙箱里同一时刻的读数可复用；原件与 D22 变异体各一份） */
+    const e32FeCaches = new WeakMap();
+    function e32Fe(h, t) {
+      const key = t.getTime();
+      let cache = e32FeCaches.get(h);
+      if (!cache) { cache = new Map(); e32FeCaches.set(h, cache); }
+      if (cache.has(key)) return cache.get(key);
+      const MD = h.window.MockData;
+      MD.tick(new Date(key));
+      const v = { today: MD.state.maint.todayRun, month: MD.state.maint.monthRun, year: MD.state.maint.yearRun };
+      cache.set(key, v);
+      return v;
+    }
+    const E32_PAIRS = [['daySec', 'today', '当日'], ['monthSec', 'month', '本月'], ['yearSec', 'year', '本年']];
+    /** 判据本体（纯函数）：两实现逐值比对；偏离方按"与期望值的关系"**点名** */
+    function e32ParityProblems(outv, fev, want, label) {
+      const problems = [];
+      for (const [sk, fk, cn] of E32_PAIRS) {
+        const a = outv[sk];
+        const b = fev[fk];
+        const w = want ? want[fk] : undefined;
+        if (a !== b) {
+          const who = (want && b === w) ? '**server/services/stats.js**（服务端 stats.accumulateRunTime）'
+            : (want && a === w) ? '**src/services/mockData.js**（前端 accumulateRun）' : '两侧';
+          problems.push(`${label} ${cn}档跨实现不一致，偏离方＝${who}：服务端 ${sk}=${a}、前端 ${fk}=${b}`
+            + (want ? `、期望（自周期起点时长×runRate）=${w}` : ''));
+        } else if (want && a !== w) {
+          problems.push(`${label} ${cn}档两侧一致但与期望不符：两侧=${a}、期望=${w}`);
+        }
+      }
+      return problems;
+    }
+    function e32LedgerSums(ledger, t) {
+      const day = e32FmtDate(t);
+      const month = day.slice(0, 7);
+      const year = day.slice(0, 4);
+      let d = 0; let m = 0; let y = 0;
+      for (const [date, sec] of ledger) {
+        if (date === day) d += sec;
+        if (date.slice(0, 7) === month) m += sec;
+        if (date.slice(0, 4) === year) y += sec;
+      }
+      return { daySec: d, monthSec: m, yearSec: y };
+    }
+    function e32AutoSplit(prevTick, t, rate) {
+      const mid = e32StartOfDay(t);
+      if (e32StartOfDay(prevTick).getTime() === mid.getTime()) return undefined;
+      return {
+        crossing: true,
+        day1: ((mid - prevTick) / 1000) * rate,
+        day2: ((t - mid) / 1000) * rate,
+        day1Date: e32FmtDate(prevTick),
+        day2Date: e32FmtDate(t)
+      };
+    }
+    function e32RunCase(spec) {
+      const h = spec.h;
+      const rate = spec.rate;
+      const ledger = new Map();
+      const addTo = (date, sec) => ledger.set(date, (ledger.get(date) || 0) + sec);
+      const w0 = e32Want(spec.t0, rate);
+      addTo(e32FmtDate(spec.t0), w0.today);
+      if (w0.month - w0.today !== 0) addTo(e32FmtDate(new Date(spec.t0.getTime() - 86400000)), w0.month - w0.today);
+      if (w0.year - w0.month !== 0) {
+        addTo(e32FmtDate(new Date(spec.t0.getFullYear(), spec.t0.getMonth() - 1, 15)), w0.year - w0.month);
+      }
+      const rows = [];
+      let prevTick = spec.t0;
+      let prevAdd = null;
+      let prevSplit;
+      const base = { daySec: w0.today, monthSec: w0.month, yearSec: w0.year };
+      rows.push({ label: '起点 ' + e32Fmt(spec.t0), t: spec.t0, add: null, out: base, prev: base,
+        fe: e32Fe(h, spec.t0), want: w0, sinceT0: 0, problems: [] });
+      for (const st of spec.steps) {
+        if (prevAdd !== null) {
+          if (prevSplit && prevSplit.crossing === true) {
+            addTo(prevSplit.day1Date, Math.max(0, Math.round(prevSplit.day1)));
+            addTo(prevSplit.day2Date, Math.max(0, Math.round(prevSplit.day2)));
+          } else {
+            addTo(e32FmtDate(prevTick), Math.max(0, Math.round(prevAdd)));
+          }
+        }
+        const t = st.t;
+        const add = st.undef ? undefined : (st.add !== undefined ? st.add : ((t - prevTick) / 1000) * rate);
+        const split = st.split === 'auto' ? e32AutoSplit(prevTick, t, rate) : st.split;
+        const sums = e32LedgerSums(ledger, t);
+        const prev = { daySec: sums.daySec, monthSec: sums.monthSec, yearSec: sums.yearSec, at: t };
+        const outv = e32Stats.accumulateRunTime(prev, add, t, split);
+        const fev = e32Fe(h, t);
+        const want = st.missing ? null : e32Want(t, rate);
+        const label = `${st.kind || '步'} ${e32Fmt(t)}`;
+        rows.push({
+          label, t, add, split, prev, out: outv, fe: fev, want, missing: Boolean(st.missing),
+          sinceT0: ((t - spec.t0) / 1000) * rate,
+          problems: st.missing ? [] : e32ParityProblems(outv, fev, want, label)
+        });
+        prevTick = t; prevAdd = add; prevSplit = split;
+      }
+      return { spec, rows };
+    }
+    function e32BuildCases(h) {
+      const rate = h.window.MockData.CFG.runRate;
+      return [
+        { name: '①跨班次＋跨零点（现配置 0-8／8-16／16-24；E83 切段 day2=0）', h, rate,
+          t0: e32D(2026, 10, 6, 8, 0, 0),
+          steps: [
+            { kind: '跨班次（08:00→16:00 早班整班）', t: e32D(2026, 10, 6, 16, 0, 0) },
+            { kind: '跨零点（16:00→次日 00:00 中班）', t: e32D(2026, 10, 7, 0, 0, 0), split: 'auto' },
+            { kind: '零点后（00:00→00:30）', t: e32D(2026, 10, 7, 0, 30, 0) }
+          ] },
+        { name: '②跨零点且跨月（E132 现场形态：10-31 22:00→11-01 00:30）', h, rate,
+          t0: e32D(2026, 10, 31, 22, 0, 0),
+          steps: [{ kind: '跨月＋跨零点', t: e32D(2026, 11, 1, 0, 30, 0), split: 'auto' }] },
+        { name: '③跨零点且跨年（12-31 22:00→次年 01-01 00:30）', h, rate,
+          t0: e32D(2026, 12, 31, 22, 0, 0),
+          steps: [{ kind: '跨年＋跨零点', t: e32D(2027, 1, 1, 0, 30, 0), split: 'auto' }] },
+        { name: '④跨零点在零点整＋同日多步', h, rate,
+          t0: e32D(2026, 5, 20, 20, 0, 0),
+          steps: [
+            { kind: '（20:00→次日 00:00）', t: e32D(2026, 5, 21, 0, 0, 0), split: 'auto' },
+            { kind: '（00:00→06:00）', t: e32D(2026, 5, 21, 6, 0, 0) }
+          ] },
+        { name: '⑤空序列／零增量（addSec 恒 0、时刻不动）', h, rate,
+          t0: e32D(2026, 6, 15, 9, 0, 0),
+          steps: [
+            { kind: '零增量（同时刻）', t: e32D(2026, 6, 15, 9, 0, 0), add: 0 },
+            { kind: '零增量（同时刻，再一拍）', t: e32D(2026, 6, 15, 9, 0, 0), add: 0 }
+          ] },
+        { name: '⑥缺测（addSec=0／undefined ⇒ 不伪造增量）', h, rate,
+          t0: e32D(2026, 10, 8, 8, 0, 0),
+          steps: [
+            { kind: '缺测（addSec=0）', t: e32D(2026, 10, 8, 16, 0, 0), add: 0, missing: true },
+            { kind: '缺测（addSec=undefined）', t: e32D(2026, 10, 8, 20, 0, 0), undef: true, missing: true }
+          ] },
+        { name: '⑦负增量夹零（addSec=-600；切段两段为负）', h, rate,
+          t0: e32D(2026, 10, 9, 8, 0, 0),
+          steps: [
+            { kind: '负增量（同时刻）', t: e32D(2026, 10, 9, 8, 0, 0), add: -600 },
+            { kind: '负切段（同时刻，day1/day2 均负）', t: e32D(2026, 10, 9, 8, 0, 0), add: 0,
+              split: { crossing: true, day1: -100, day2: -50, day1Date: '2026-10-08', day2Date: '2026-10-09' } }
+          ] }
+      ];
+    }
+    const e32H = e32Harness();
+    const e32Runs = e32BuildCases(e32H).map(e32RunCase);
+    const e32Problems = [];
+    let e32Exact = true;
+    for (const r of e32Runs) {
+      for (const row of r.rows) {
+        if (row.want) {
+          for (const k of ['today', 'month', 'year']) if (!Number.isInteger(row.want[k])) e32Exact = false;
+        }
+        for (const p of row.problems) e32Problems.push(p);
+      }
+    }
+    const e32Ticks = e32Runs.reduce((n, r) => n + r.rows.length, 0);
+    check('E32 跨实现对账：后端 `accumulateRunTime`（`daySec/monthSec/yearSec`，在产形态 `prev.at=now`）' +
+      '↔ 前端 `accumulateRun`（`state.maint.{todayRun,monthRun,yearRun}`）' +
+      '在**同一组输入序列**上**逐值相等**（严格 `===`，无容差；' +
+      `${e32Ticks} 个拍点 × 3 档）—— 覆盖跨班次／跨零点＋E83 切段（含零点整）／跨月／跨年／空序列／负增量夹零`,
+      e32Problems.length === 0,
+      e32Problems.length ? e32Problems.slice(0, 4).join('；') + `（共 ${e32Problems.length} 条）`
+        : `${e32Ticks} 拍逐值相等；序列=${e32Runs.map(r => r.spec.name.slice(0, 2)).join('')}`);
+    check('E32 精度前提（构造成立性）：序列的期望值与增量**全为整数**（配置 `runRate=' + E32_RATE_CFG + '` 下' +
+      '「整点时长×runRate」是精确整数）⇒ 上面的严格相等不受 IEEE754 表示误差干扰',
+      e32Exact, `全为整数=${e32Exact}，runRate=${E32_RATE_CFG}`);
+    {
+      const r0 = e32Runs[0];
+      const mono = r0.rows.every((row, i) => i === 0 || (row.out.monthSec >= r0.rows[i - 1].out.monthSec
+        && row.out.yearSec >= r0.rows[i - 1].out.yearSec));
+      const cross = r0.rows[2];
+      check('E32 同月/同年内**逐拍单调不减**（月/年档不倒退）；跨零点那一刻**当日档归零、只收当日段**' +
+        '（`daySec` 由 45504 变 0 ＝周期过滤，不是丢秒）',
+        mono && cross.out.daySec === 0 && cross.out.daySec === cross.split.day2,
+        `月/年单调=${mono}；跨零点 daySec=${cross.out.daySec}（day2=${cross.split.day2}）`);
+    }
+    {
+      const r5 = e32Runs[5];
+      const rows = r5.rows.slice(1);
+      const gaps = rows.map(row => row.fe.today - row.out.daySec);
+      const wantGaps = rows.map(row => row.sinceT0);
+      const stopped = rows.every(row => row.out.daySec === r5.rows[0].out.daySec
+        && row.out.monthSec === r5.rows[0].out.monthSec && row.out.yearSec === r5.rows[0].out.yearSec);
+      check('E32 **已知边界①（缺测）**——构成性锁定，不是放宽相等：`addSec` 为 0／缺失时服务端三档' +
+        '**停在账本值、不伪造增量**（E38「不得伪造数据」），与前端的差额**恰等于自账本一致点起的' +
+        '已过时长 × runRate**',
+        stopped && gaps.every((g, i) => g === wantGaps[i]),
+        `服务端停在原值=${stopped}；差额=${gaps.join(' / ')}，期望=${wantGaps.join(' / ')}`);
+    }
+    {
+      const r6 = e32Runs[6];
+      const base = r6.rows[0];
+      const neg = r6.rows.slice(1);
+      check('E32 负增量夹零（构成性锁定）：`addSec = -600` 与"两段皆负的切段" ⇒ 三档**逐值停在原值**' +
+        '（不倒退、不出负数/NaN），且与前端在同一时刻的读数相等',
+        neg.every(x => x.out.daySec === base.out.daySec && x.out.monthSec === base.out.monthSec
+          && x.out.yearSec === base.out.yearSec) && neg.every(x => x.problems.length === 0),
+        neg.map(x => `${x.label} ⇒ ${x.out.daySec}/${x.out.monthSec}/${x.out.yearSec}`).join('；'));
+    }
+    {
+      const accs = [e32Runs[1], e32Runs[2]].map(r => {
+        const last = r.rows[r.rows.length - 1];
+        const total = last.split.day1 + last.split.day2;
+        return { name: r.spec.name, total, mAdd: last.out.monthSec - last.prev.monthSec,
+          yAdd: last.out.yearSec - last.prev.yearSec, op: last.out.outOfPeriod,
+          daySec: last.out.daySec, day2: last.split.day2, monthSec: last.out.monthSec, yearSec: last.out.yearSec };
+      });
+      check('E32 **已知边界②（跨月/跨年）**——构成性锁定，不是放宽相等：`monthSec`／`yearSec` **只收落在 ' +
+        '`now` 所在周期的那一段**（另一段由 `outOfPeriod` 报出、归**上一个**周期，不是丢失），' +
+        '且「切段总额 − 进本周期档的额 ＝ `outOfPeriod` 报出的额」是**记账恒等式**',
+        accs.every(c => c.op && c.op.month === c.total - c.mAdd && c.op.year === c.total - c.yAdd
+          && c.daySec === c.day2 && c.monthSec === c.day2),
+        accs.map(c => `${c.name.slice(0, 2)}：total=${c.total}、进本月=${c.mAdd}、进本年=${c.yAdd}、`
+          + `outOfPeriod=${JSON.stringify(c.op && { month: c.op.month, year: c.op.year })}、daySec=${c.daySec}`).join('；'));
+    }
+    /* D22：前端日档算式改错一位（1000 → 10000）——内存副本 */
+    const E32_ANCHOR = '      today: secSince(dayStart),';
+    const e32MdSrc = readText('src/services/mockData.js');
+    const e32AnchorHits = e32MdSrc.split(E32_ANCHOR).length - 1;
+    let e32MutProblems = null;
+    if (e32AnchorHits === 1) {
+      const hMut = e32Harness({ 'src/services/mockData.js': e32MdSrc.replace(E32_ANCHOR,
+        '      today: Math.max(0, (now - dayStart) / 10000) * runRate,') });
+      e32MutProblems = [];
+      for (const c of e32BuildCases(hMut)) for (const row of e32RunCase(c).rows) e32MutProblems.push(...row.problems);
+    }
+    check('E32 D22 可证伪：把前端 `accumulateRun()` 的**日档**算式改错一位（`/1000` → `/10000`，' +
+      '`src/services/mockData.js` 的**内存副本**、盘上零字节改动）⇒ 本判据**必红**且问题串**指名**' +
+      '`src/services/mockData.js`（偏离方）与当日档 —— 而月/年两档同时**保持绿**（说明判别力落在日档上）',
+      e32AnchorHits === 1 && Boolean(e32MutProblems) && e32MutProblems.length > 0
+      && e32MutProblems.some(p => p.includes('src/services/mockData.js'))
+      && e32MutProblems.some(p => p.includes('当日档'))
+      && !e32MutProblems.some(p => p.includes('本月档') || p.includes('本年档')),
+      e32AnchorHits !== 1 ? `锚点命中 ${e32AnchorHits} 次（应恰 1）⇒ 判红，不许静默放过`
+        : `变异后违规 ${e32MutProblems.length} 条（首条：${e32MutProblems[0]}）`);
+    check('E32 D22 内存副本未落盘：`src/services/mockData.js` 逐字节未变',
+      readText('src/services/mockData.js') === e32MdSrc, `${e32MdSrc.length} 字符相同`);
+  }
   /* ===== N. 补传队列告警阈值：单一真源、两端同判（R26-P3-4 / E10 / IF-B.9） =====
      立案：同一「补传队列告警」概念在两侧**语义相反** —— 前端 `src/services/api.js` 按
      `max(1, floor(queueCap × 90%))` 算（容量 5000 ⇒ 要积压 **4500 条**才亮），
@@ -1692,6 +2119,211 @@ async function main() {
     }
   }
 
+  /* ===== O. `E176①` 告警阈值边界收窄：**入口层（装配期）** 与 **真源读取层** =====
+     背景（`E33①` 显式失败化留下的两条边界）：`Number()` 把 `null`／`''` 收成 `0` ⇒ `pending >= 0`
+     **恒告警**；`NaN`／`Infinity` 经 `JSON.stringify` **印成 "null"** ⇒ 症状指向错方向（`E135` 同族）。
+     上一节（`N`）钉的是"真源单一 ＋ 两端同判"；本节钉**收窄之后**两层的形态（实现已落，本节只写断言）：
+       ① **入口层** `mountUpload(router, deps)` 的 `assertOptionTypes()`：`warnThreshold` 非法 ⇒
+          **装配期**抛 `TypeError`，文案同时含键名 ＋ `String(v)` ＋ `typeof v`；且**实例未建**
+          （结构取证：**同一个库**紧接着用合法值再挂载 ⇒ `reporterSource='created'`，不是 `'reused'`）；
+       ② **真源读取层** `services/uploadQueue.js` 的 `configWarnThreshold()`：真源键**在场**但非法 ⇒
+          **读取期**抛并**指名真源键** `mes.queueWarnThreshold`；键**缺失** ⇒ 仍走历史兜底 `1`
+          （**主代理确认保留的取舍**，不是"缺失也要抛"），且 `DEFAULT_WARN_THRESHOLD` 与真源现值同值
+          （＝"缺省＝真源"）；
+       ③ **缺省由读取期决定**：真源改成 7 ⇒ 不显式传 `warnThreshold` 的实例就是 7（不是导入期快照）。
+     ⚠ 仓储层（`repo/uploadQueue.stats()`）的同款断言在 `tests/db-check.js` 的
+       「八之三之②、E176①」一节 —— 同一批、同口径，落点按层分（那里还有 D22 ㈠：守卫退回 `Number()`）。
+     可证伪（ADR-0004 D22 ㈡，靶子在本节内）：把入口层那条 `> 0` 摘掉（`server/http/routes/upload.js` 的
+     **内存副本**，`Module._compile`；盘上零字节改动）⇒ `mountUpload({warnThreshold: 0})` 那条断言
+     **必红**：它**不再"装配期抛"**（装配通过、实例已建＝症状晚到首次 `status()`）。 */
+  section('O. E176① 告警阈值边界收窄（入口期／真源读取期）');
+  {
+    const Module = require('node:module');
+    const { DatabaseSync } = require('node:sqlite');
+    const oDbApi = require('../server/db');
+    const oRepo = require('../server/repo/uploadQueue.js');
+    const oSvc = require('../server/services/uploadQueue.js');
+    const oConfig = require('../src/config/board.config.js');
+    const { createRouter } = require('../server/http/router.js');
+    const { mountUpload } = require('../server/http/routes/upload.js');
+    const O_REAL_THR = oConfig.mes.queueWarnThreshold;
+    const O_ILLEGAL = [
+      ['null', null], ["''", ''], ["'5'", '5'], ['0', 0], ['-1', -1], ['true', true], ['false', false],
+      ['NaN', NaN], ['Infinity', Infinity], ['{}', {}]
+    ];
+    const O_LEGAL = [['1', 1], ['5', 5], ['5000', 5000], ['0.5', 0.5]];
+    const oFreshDb = pending => {
+      const d = new DatabaseSync(':memory:');
+      oDbApi.initSchema(d);
+      for (let i = 1; i <= (pending || 0); i++) {
+        oRepo.enqueueFailed(d, {
+          uploadId: 'UP-E176-' + String(i).padStart(3, '0'),
+          interface: 'report/receiveReport', requestBody: { i }, failReason: 'contract-check O 段：造待补传'
+        }, '2026-10-06 10:00:00');
+      }
+      return d;
+    };
+    const oFixedNow = () => new Date('2026-10-06T02:00:00Z');
+    const oFetch = async () => ({ ok: true, status: 200, text: async () => '{}' });
+    const oCfg = () => ({
+      dataSource: 'mock', device: { equipCode: 'E176-EQ' },
+      mes: {
+        baseUrl: '', token: '', pathTemplate: '/service/{serviceName}/{methodName}',
+        responseStyle: 'status', reportPlaceholder: 65535, queueCap: 5000, queueWarnThreshold: 1
+      }
+    });
+    /** 入口层一次试探：装配 ⇒ status() ⇒ **同一个库**再用合法值挂载（结构取证） */
+    function oEntryTrial(mountFn, v, withSecond) {
+      const db = oFreshDb(1);
+      const errs = [];
+      const router = createRouter({ getHealth: () => ({ ok: true }), onError: e => errs.push(String(e && e.message)) });
+      const deps = { db, logger: null, now: oFixedNow, config: oCfg(), fetch: oFetch };
+      if (v !== undefined) deps.warnThreshold = v;
+      let mounted = null;
+      let mountThrew = '';
+      try { mounted = mountFn(router, deps); } catch (e) { mountThrew = e.name + ': ' + e.message; }
+      let st = null;
+      let statusThrew = '';
+      try { st = mounted && mounted.status(); } catch (e) { statusThrew = e.name + ': ' + e.message; }
+      let secondSource = null;
+      let secondThrew = '';
+      if (withSecond) {
+        const router2 = createRouter({ getHealth: () => ({ ok: true }), onError: () => {} });
+        try {
+          const m2 = mountFn(router2, {
+            db, logger: null, now: oFixedNow, config: oCfg(), fetch: oFetch, warnThreshold: 5
+          });
+          secondSource = m2 && m2.reporterSource;
+        } catch (e) { secondThrew = e.name + ': ' + e.message; }
+      }
+      db.close();
+      return { mountThrew, mountDone: Boolean(mounted), st, statusThrew, secondSource, secondThrew, errs };
+    }
+    const oBad = [];
+    for (const [label, v] of O_ILLEGAL) {
+      const r = oEntryTrial(mountUpload, v, true);
+      const want = String(v) + '（类型 ' + typeof v + '）';
+      const ok = r.mountThrew.startsWith('TypeError') && r.mountThrew.includes('warnThreshold')
+        && r.mountThrew.includes(want) && r.mountDone === false && r.statusThrew === ''
+        && r.secondSource === 'created' && r.secondThrew === '';
+      if (!ok) {
+        oBad.push(`${label}：装配=${JSON.stringify(r.mountThrew.slice(0, 60))}、同库再挂=${r.secondSource}`
+          + `${r.secondThrew ? '（抛 ' + r.secondThrew.slice(0, 50) + '）' : ''}`);
+      }
+    }
+    check('E176① 入口层非法逐例（null／\'\'／\'5\'／0／-1／true／false／NaN／Infinity／{}）⇒ **装配期**抛 ' +
+      '`TypeError`（文案含 `warnThreshold` ＋ `String(v)` ＋ `typeof v`）、`status()` 根本没被调到、' +
+      '**实例未建**（结构取证：同库紧接着用合法值 `5` 挂载 ⇒ `reporterSource=created`，不是 `reused`）',
+      oBad.length === 0, oBad.join('；') || `${O_ILLEGAL.length} 例逐例命中`);
+    {
+      const zero = oEntryTrial(mountUpload, 0, false);
+      check('E176① 症状面：`mountUpload({warnThreshold: 0})` ⇒ **装配期即抛**（改前是"过装配、首次 ' +
+        '`status()` 才炸"＝症状晚一步），且抛点就在入口层（`> 0` 那一条）',
+        zero.mountThrew.startsWith('TypeError') && zero.mountThrew.includes('> 0')
+        && zero.mountDone === false && zero.statusThrew === '',
+        `装配=${zero.mountThrew.slice(0, 90) || '**未抛**'}`);
+    }
+    {
+      /* 合法逐例（1／5／5000／0.5）：**每例都把阈值两侧造出来**（pending = 2 ⇒ `1`／`0.5` 告警、`5`／`5000` 不告警）
+         —— 既证"不是一律拒收"，也证 `status().alert.warn` 真的由该阈值决定（而非恰好等于缺省值）。 */
+      const oLegalRows = O_LEGAL.map(([label, v]) => {
+        const db = oFreshDb(2);
+        const router = createRouter({ getHealth: () => ({ ok: true }), onError: () => {} });
+        let m = null;
+        let err = '';
+        try {
+          m = mountUpload(router, { db, logger: null, now: oFixedNow, config: oCfg(), fetch: oFetch, warnThreshold: v });
+        } catch (e) { err = e.name + ': ' + e.message; }
+        let st = null;
+        let stErr = '';
+        try { st = m && m.status(); } catch (e) { stErr = e.name + ': ' + e.message; }
+        db.close();
+        return { label, v, err, stErr, thr: st && st.warnThreshold, warn: st && st.alert && st.alert.warn,
+          pending: st && st.alert && st.alert.pendingCount };
+      });
+      check('E176① 入口层合法逐例（1／5／5000／0.5）⇒ 装配通过、`status()` 可用，且 `warn` 判定＝' +
+        '`pending >= threshold`（pending = 2 造**两侧**：`1`／`0.5` 告警、`5`／`5000` 不告警）—— 不是"一律拒收"',
+        oLegalRows.every(r => r.err === '' && r.stErr === '' && r.thr === r.v && r.pending === 2
+          && r.warn === (2 >= r.v)),
+        oLegalRows.map(r => `${r.label}: warnThreshold=${r.thr}、pending=${r.pending}、warn=${r.warn}`
+          + `${r.err || r.stErr ? '（抛 ' + (r.err || r.stErr) + '）' : ''}`).join('；'));
+    }
+    /* ---- 真源读取层：`configWarnThreshold()`（真源对象是 require 缓存的同一实例 ⇒ 内存改、finally 还原）---- */
+    const oWithThr = (v, fn) => {
+      const had = Object.prototype.hasOwnProperty.call(oConfig.mes, 'queueWarnThreshold');
+      const prev = oConfig.mes.queueWarnThreshold;
+      try {
+        if (v === '__DELETE__') delete oConfig.mes.queueWarnThreshold;
+        else oConfig.mes.queueWarnThreshold = v;
+        return fn();
+      } finally {
+        if (had) oConfig.mes.queueWarnThreshold = prev;
+        else delete oConfig.mes.queueWarnThreshold;
+      }
+    };
+    const oSrcBad = [];
+    for (const [label, v] of O_ILLEGAL) {
+      const r = oWithThr(v, () => {
+        try { return { v: oSvc.configWarnThreshold(), err: '' }; } catch (e) { return { v: null, err: e.name + ': ' + e.message }; }
+      });
+      const want = String(v) + '（类型 ' + typeof v + '）';
+      if (!(r.err.startsWith('TypeError') && r.err.includes('queueWarnThreshold') && r.err.includes(want))) {
+        oSrcBad.push(`${label}：${r.err || '**未抛**（读到 ' + r.v + '）'}`);
+      }
+    }
+    check('E176① 真源读取层：真源键**在场**但非法（逐例）⇒ **读取期**抛 `TypeError` 并**指名真源键** ' +
+      '`mes.queueWarnThreshold`（文案含 `String(v)` ＋ `typeof v`，不经 `JSON.stringify`）',
+      oSrcBad.length === 0, oSrcBad.join('；') || `${O_ILLEGAL.length} 例逐例命中`);
+    {
+      const missing = oWithThr('__DELETE__', () => {
+        try { return { v: oSvc.configWarnThreshold(), err: '' }; } catch (e) { return { v: null, err: e.message }; }
+      });
+      check('E176① **缺省＝真源**（历史口径保留，主代理确认的取舍）：真源键**缺失** ⇒ 仍走兜底 1' +
+        '（不是"缺失也要抛"），且 `DEFAULT_WARN_THRESHOLD` 与真源现值同值',
+        missing.err === '' && missing.v === 1 && oSvc.DEFAULT_WARN_THRESHOLD === 1
+        && oConfig.mes.queueWarnThreshold === O_REAL_THR,
+        `缺失 ⇒ ${missing.err ? '抛 ' + missing.err : '返回 ' + missing.v}；DEFAULT_WARN_THRESHOLD=` +
+        `${oSvc.DEFAULT_WARN_THRESHOLD}；真源现值=${JSON.stringify(O_REAL_THR)}（已还原）`);
+    }
+    {
+      const oLegalBad = [];
+      for (const [label, v] of O_LEGAL) {
+        const r = oWithThr(v, () => {
+          try { return { v: oSvc.configWarnThreshold(), err: '' }; } catch (e) { return { v: null, err: e.message }; }
+        });
+        if (r.err || r.v !== v) oLegalBad.push(`${label} ⇒ ${r.err || r.v}`);
+      }
+      const dyn = oWithThr(7, () => oSvc.createUploadQueue({ db: oFreshDb(0), now: oFixedNow }).warnThreshold);
+      check('E176① 真源合法值（1／5／5000／0.5）原样读出（读取期不归一、不回落）；且服务层缺省＝**读取期' +
+        '读真源**（真源改 7 ⇒ 不显式传参的实例 `warnThreshold=7`，不是导入期快照 1）',
+        oLegalBad.length === 0 && dyn === 7,
+        oLegalBad.join('；') + `；真源=7 ⇒ 实例 warnThreshold=${dyn}`);
+    }
+    /* ---- D22 ㈡：入口层 `> 0` 支摘掉（内存副本） ---- */
+    const oEntryPath = path.join(ROOT, 'server', 'http', 'routes', 'upload.js');
+    const oEntrySrc = fs.readFileSync(oEntryPath, 'utf8');
+    const O_ANCHOR = "if (k === 'warnThreshold' && !(v > 0)) {";
+    const oAnchorHits = oEntrySrc.split(O_ANCHOR).length - 1;
+    let oMutMount = null;
+    if (oAnchorHits === 1) {
+      const m = new Module(oEntryPath + '#e176-mut', null);
+      m.filename = oEntryPath;
+      m.paths = Module._nodeModulePaths(path.dirname(oEntryPath));
+      m._compile(oEntrySrc.replace(O_ANCHOR, 'if (false) {'), m.filename);
+      oMutMount = m.exports.mountUpload;
+    }
+    const oMutZero = oMutMount ? oEntryTrial(oMutMount, 0, false) : null;
+    check('E176① D22 可证伪：把入口层那条 `> 0` 摘掉（`server/http/routes/upload.js` 的**内存副本**，' +
+      '盘上零字节改动）⇒ `mountUpload({warnThreshold: 0})` 那条断言**必红**：它**不再"装配期抛"**' +
+      '（装配通过、实例已建；症状晚到首次 `status()`）',
+      oAnchorHits === 1 && Boolean(oMutZero) && oMutZero.mountThrew === '' && oMutZero.mountDone === true
+      && oMutZero.statusThrew.startsWith('TypeError') && oMutZero.statusThrew.includes('warnThreshold'),
+      oAnchorHits !== 1 ? `锚点命中 ${oAnchorHits} 次（应恰 1）⇒ 判红，不许静默放过`
+        : (oMutZero ? `变异体：装配未抛=${oMutZero.mountThrew === ''}、实例已建=${oMutZero.mountDone}、`
+          + `首次 status() ⇒ ${oMutZero.statusThrew.slice(0, 80)}` : '（未变异）'));
+    check('E176① D22 内存副本未落盘：`server/http/routes/upload.js` 逐字节未变',
+      fs.readFileSync(oEntryPath, 'utf8') === oEntrySrc, `${oEntrySrc.length} 字符相同`);
+  }
   /* ---------------- 汇总 ---------------- */
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failed0()} 项，跳过 ${skipped} 项`);
