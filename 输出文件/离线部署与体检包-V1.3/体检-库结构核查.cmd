@@ -23,8 +23,16 @@ rem  its own report .txt inside the "._env-report" subfolder.
 rem
 rem  USAGE: double-click, or drag a folder onto this file, or run:
 rem     the .cmd sitting next to db-schema-check.js  "D:\path\to\dashboard-app"
-rem  Exit code: 0 = no missing columns; 1 = at least one database needs one
-rem  service start; 2 = usage or environment error.
+rem  It checks COLUMNS and INDEXES separately - they are NOT the same
+rem  severity: a missing column breaks writing, a missing index only makes
+rem  one query scan the whole table.
+rem
+rem  Exit code: 0 = no missing columns and no missing index;
+rem             1 = at least one database misses a COLUMN - start the
+rem                 dashboard service once, then re-check and it must be 0;
+rem             2 = usage or environment error;
+rem             4 = columns are complete, only the INDEX face differs
+rem                 (correctness is fine - performance only).
 rem ==========================================================================
 setlocal
 set "NODE_EXE="
@@ -50,10 +58,13 @@ echo.
 set "RC=%ERRORLEVEL%"
 echo.
 if "%RC%"=="0" echo Result : OK - no database is missing the checked columns.
-if "%RC%"=="1" echo Result : some database is missing columns. Start the dashboard
+if "%RC%"=="1" echo Result : some database is missing COLUMNS. Start the dashboard
 if "%RC%"=="1" echo          service once on that machine, then run this check
-if "%RC%"=="1" echo          again and it must report 0.
+if "%RC%"=="1" echo          again and the column face must report 0.
 if "%RC%"=="2" echo Result : usage or environment error - see the message above.
+if "%RC%"=="4" echo Result : columns OK - only INDEX differences were found.
+if "%RC%"=="4" echo          A missing index does NOT affect correctness; it only
+if "%RC%"=="4" echo          makes one range query scan the whole table.
 echo.
 echo Done. Please send back the report .txt from the "._env-report" subfolder.
 pause

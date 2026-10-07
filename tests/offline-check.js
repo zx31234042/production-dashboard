@@ -5,7 +5,7 @@
    **为什么要有它**（`E9` 原文）：零依赖是本项目的**核心决策**（`ADR-0002` D9/D13、
    `NFR-25` 前端资源本地化不依赖任何外网资源、`AC-09` 无外网访问、需求 §12 网络为隔离局域网），
    但此前**只有 `docs-cross-check` 的静态扫描** —— 它扫的是**源码/文档里的外链与依赖**，
-   属于"**仓库**这一层"；**"交付包形态"这一层（`输出文件\离线部署与体检包-V1.2\`）无人断言**。
+   属于"**仓库**这一层"；**"交付包形态"这一层（`输出文件\离线部署与体检包-V1.3\`）无人断言**。
    于是存在一条静默通道：源码全绿，但**打包时**把某个依赖、某个外链、某个自带 node_modules 的
    便携运行时塞进了包 ⇒ 到了无网现场才发现。本脚本把"零依赖"从**约定**变成**可验证**。
    --------------------------------------------------------------------------
@@ -57,13 +57,13 @@ const ROOT = env.paths.root;
 /* ==========================================================================
    包根定位
    --------------------------------------------------------------------------
-   `E9` 盯的是"**交付包形态**"。包根＝`输出文件\离线部署与体检包-V1.2\`
+   `E9` 盯的是"**交付包形态**"。包根＝`输出文件\离线部署与体检包-V1.3\`
    （含便携 Node、`.cmd` 双击入口、体检脚本、说明文档）。
    `DSH_OFFLINE_PKG` 可覆盖（供外层探针指向别的包，例如下一版 `V1.3`）。
    **包不存在 ⇒ 显式跳过**（退 3），绝不静默通过：包还没打出来时本门禁"没证据"，
    而"没证据"不得写成"通过"（规范 9.5-5 第 6 条、`ADR-0004` D20）。
    ========================================================================== */
-const PKG_DIR_NAME = '离线部署与体检包-V1.2';
+const PKG_DIR_NAME = '离线部署与体检包-V1.3';
 const PKG_ROOT = process.env.DSH_OFFLINE_PKG
   ? path.resolve(process.env.DSH_OFFLINE_PKG)
   : path.join(ROOT, '输出文件', PKG_DIR_NAME);
@@ -281,14 +281,14 @@ const urlAllowCount = () => URL_ALLOWLIST.reduce((n, a) => n + a.urls.length, 0)
  */
 const URL_ALLOWLIST = [
   {
-    file: 'README-离线部署与体检.md', line: 126,
+    file: 'README-离线部署与体检.md', line: 129,
     urls: ['https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/78f7562d-5160-419f-b64b-b9dc3da74bd7/MicrosoftEdgeEnterpriseX64.msi'],
     reason: '离线升级件的**官方直链**，出自原文「供复核/重下：直链 …」。该 MSI 已随包分发'
       + '（`._edge\\MicrosoftEdgeEnterpriseX64-154.0.4258.37.msi`），故现场无网也能装，不构成运行时外链；'
       + '留着的价值＝出包后人工复核"包里那个 MSI 是不是这一版"。依据＝`E54`（2026-09-29 负责人裁定走离线升级）。'
   },
   {
-    file: 'README-离线部署与体检.md', line: 127,
+    file: 'README-离线部署与体检.md', line: 130,
     urls: [
       'https://www.microsoft.com/edge/business/download',
       'https://edgeupdates.microsoft.com/api/products?view=enterprise'
@@ -390,6 +390,14 @@ const ENTRY_REFS = [
   { file: 'README-离线部署与体检.md', ref: '跑现场门禁.cmd', kind: 'internal', note: '§4.3 点名双击它' },
   { file: 'README-离线部署与体检.md', ref: '体检-双击运行.cmd', kind: 'internal', note: '§4.1 点名双击它' },
   { file: 'README-离线部署与体检.md', ref: '._edge\\MicrosoftEdgeEnterpriseX64-154.0.4258.37.msi', kind: 'internal', note: '§4.2 离线 Edge 升级件' },
+  { file: '跑7日压测.cmd', ref: '%~dp0*.ps1', kind: 'internal', note: '新入口（E200）：用**通配**找同目录的 `部署环境体检.ps1`（不写字面中文名 —— E49 的教训）' },
+  { file: '跑7日压测.cmd', ref: 'tests\\', kind: 'external', note: '新入口（E200）：它跑的 `tests\\stress-check.js` 在**仓库**里（包内不含），入口会自动找仓库' },
+  { file: '核验7日台账.cmd', ref: '%~dp0*.ps1', kind: 'internal', note: '新入口（E200）：同上（`-VerifySoak` 模式）' },
+  { file: '核验7日台账.cmd', ref: 'tests\\._verify\\soak', kind: 'external', note: '新入口（E200）：自动取 `<仓库>\\tests\\._verify\\soak\\*.jsonl` 里最近一份台账' },
+  { file: 'README-离线部署与体检.md', ref: '跑7日压测.cmd', kind: 'internal', note: 'README §0／§4.4 点名双击它（AC-07 的 7 日压测入口）' },
+  { file: 'README-离线部署与体检.md', ref: '核验7日台账.cmd', kind: 'internal', note: 'README §0／§4.4 点名双击它（台账核验入口）' },
+  { file: '部署环境体检.ps1', ref: 'tests\\stress-check.js', kind: 'external', note: '新开关 `-RunSoak7Day`／`-VerifySoak` 调仓库侧 `tests\\stress-check.js`（包内不含）' },
+  { file: '部署环境体检.ps1', ref: 'tests\\._verify\\soak', kind: 'external', note: '新开关的默认台账落点：`<仓库>\\tests\\._verify\\soak\\soak-7day-<时间戳>.jsonl`' },
   /* ---- 包外引用：包内**故意不含**仓库（`tests\` 与 `server\` 要整套拷到目标机）---- */
   { file: '跑现场门禁.cmd', ref: 'tests\\', kind: 'external', note: '浏览器/视觉类门禁脚本在**仓库**里（包内不含），入口会自动找仓库' },
   { file: '部署环境体检.ps1', ref: 'tests\\preflight.js', kind: 'external', note: '仓库定位的**唯一**锚点：找到含 tests\\preflight.js 的目录才算仓库' }

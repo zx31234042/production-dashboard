@@ -246,7 +246,7 @@ const SUITES = [
   { name: 'screenshot-diff', desc: '界面视觉回归', needBrowser: false, slow: false },
   /* `E9`（★★，验收前必做；ADR-0002 待办 3）：**交付包形态**的零依赖/零外网断言。
      它与 `docs-cross-check` 是两个层次：后者扫的是**源码/文档**里的依赖与外链，
-     本脚本扫的是**打包产物**（`输出文件\离线部署与体检包-V1.2\`）：包内有没有 node_modules、
+     本脚本扫的是**打包产物**（`输出文件\离线部署与体检包-V1.3\`）：包内有没有 node_modules、
      有没有带 dependencies 的 package.json、有没有未登记的外链、便携 Node 版本是否满足 D10。
      放在**离线门禁的靠后位置**（`docs-cross-check` 之前）：它是"整包扫描 ＋ 真端口冲突实测"，
      耗时与包体积相关，不该挡在其它脚本前面；且不依赖其它脚本的产物（可独立跑）。

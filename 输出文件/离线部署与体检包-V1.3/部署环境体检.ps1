@@ -7,9 +7,14 @@
 #  编码：本文件必须保存为 UTF-8 **带 BOM**（PS 5.1 按 ANSI 读无 BOM 的 UTF-8 会把中文读崩）。
 #  注意：只读采集、不改系统，除自身报告文件外不写任何东西；唯第六节在仓库就位时会跑
 #        仓库自带门禁，那一步只写 <仓库>\tests\._verify\ 下的日志/账本（不写系统、不装东西）。
+#        后加的两个入口（-RunSoak7Day / -VerifySoak，技术债 E200）同样只写 <仓库>\tests\._verify\
+#        下的台账/CSV/日志 ＋ 本包 ._env-report\ 的报告 —— 仍不改系统、不装东西。
 # ==========================================================================
-#  三个入口（都是双击式）：① 体检-双击运行.cmd ⇒ 只读体检；② 配置-DEP04.cmd ⇒ 写配置（自动提权）；③ 跑现场门禁.cmd ⇒ 逐个跑浏览器/视觉类门禁
-param([switch]$ConfigureDep04, [switch]$RunFieldGates, [string]$Only = '')
+#  五个入口（都是双击式）：① 体检-双击运行.cmd ⇒ 只读体检；② 配置-DEP04.cmd ⇒ 写配置（自动提权）；
+#        ③ 跑现场门禁.cmd ⇒ 逐个跑浏览器/视觉类门禁；④ 跑7日压测.cmd ⇒ AC-07 的 7×24 h 压测（--hours 168，留证据日台账）；
+#        ⑤ 核验7日台账.cmd ⇒ 台账核验（--verify-soak，AC-07 的 5 条判据逐条打印）
+param([switch]$ConfigureDep04, [switch]$RunFieldGates, [string]$Only = '',
+      [switch]$RunSoak7Day, [switch]$VerifySoak, [string]$SoakLedger = '', [string]$Hours = '')
 
 $ErrorActionPreference = 'Continue'
 
@@ -147,7 +152,7 @@ if ($RunFieldGates) {
     @{ n = 'screenshot-diff';  why = '视觉回归（基线为 1920×1080）' },
     @{ n = 'browser-check';    why = '真实浏览器（无头 Edge ＋ CDP）' },
     @{ n = 'overlap-check';    why = '元素重叠检测' },
-    @{ n = 'stress-check';     why = '长跑稳定性（默认 5 分钟；--soak 为整班次）' }
+    @{ n = 'stress-check';     why = '长跑稳定性（**默认 2 分钟**；--soak ＝整班次 8 h；**7 日档走 跑7日压测.cmd** —— AC-07 的 168 h 是另一档）' }
   )
   if ($Only -ne '') {
     $want = @($Only -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
@@ -175,6 +180,163 @@ if ($RunFieldGates) {
   [System.IO.File]::WriteAllText($repG, ($G -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
   Write-Output ('完成。报告：' + $repG)
   exit 0
+}
+
+# ---------------------------------------------------------------- 仓库定位（新增入口共用）
+#  刻意**不改**上面 -RunFieldGates 与第六节里既有的定位逻辑：那两处已现场验收过（2026-09-29），
+#  本函数只给本次新增的两个模式用（少动已验收路径 = 少一次回归风险）。
+function Get-RepoDir {
+  $c = @()
+  if ($PSScriptRoot) {
+    $p = Split-Path $PSScriptRoot -Parent
+    $g = $null
+    if ($p) { $g = Split-Path $p -Parent }
+    if ($p) { $c += $p; $c += (Join-Path $p 'production-dashboard') }
+    if ($g) { $c += $g }
+  }
+  $c += 'D:\production-dashboard'
+  foreach ($d in $c) { if ($d -and (Test-Path (Join-Path $d 'tests\preflight.js'))) { return $d } }
+  return $null
+}
+
+# ==========================================================================
+#  -RunSoak7Day：AC-07「连续 ≥7 天」压测入口（7×24 h ＝ --hours 168）
+#  为什么单列：这是**唯一可作证真值档**（压缩时钟只作机制自检、不作 AC-07 证据）；它的产物是
+#  "证据日台账"（JSONL，**逐行 fsync** 落盘）—— 7 天里进程随时可能被杀，台账是唯一能证明
+#  "这 7 天真的连着跑过"的东西。
+#  用法：-RunSoak7Day [-Hours 168] [-SoakLedger <台账.jsonl 路径>]
+#  现场须知：①先跑 配置-DEP04.cmd（睡眠/休眠/关屏＝从不）—— 本模式**不**替你改电源策略；
+#            ②**别关机、别锁屏、别让 Windows 自动重启**；中断/重启 ⇒ 该轮**整段作废**
+#              （台账会留下 runComplete=false / exitReason=signal:* 的行），必须**新开一份台账**重跑；
+#            ③**不要**加 --day-seconds（压缩时钟不作 AC-07 证据）；
+#            ④跑完后用 核验7日台账.cmd 判 AC-07 的 5 条判据（本脚本会把命令一并打印）。
+# ==========================================================================
+if ($RunSoak7Day) {
+  $stampS = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $dirS = Join-Path $PSScriptRoot '._env-report'
+  if (-not (Test-Path $dirS)) { New-Item -ItemType Directory -Path $dirS | Out-Null }
+  $repS = Join-Path $dirS ('7日压测报告-' + $env:COMPUTERNAME + '-' + $stampS + '.txt')
+  $S = New-Object System.Collections.Generic.List[string]
+  function WS($s) { $script:S.Add([string]$s) }
+  $hoursS = '168'
+  if ($Hours -ne '') { $hoursS = $Hours }
+  $repoS = Get-RepoDir
+  $nodeFromS = '系统 PATH'
+  if ($NodeDir) { $nodeFromS = $NodeDir }
+  WS '7 日压测报告（AC-07：连续 ≥7 天无重启 —— 本轮由现场机执行）'
+  WS ('生成时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '    主机：' + $env:COMPUTERNAME)
+  if ($repoS) { WS ('仓库    ：' + $repoS) } else { WS '仓库    ：**未找到**' }
+  WS ('Node    ：' + $nodeFromS)
+  WS ('计划时长：--hours ' + $hoursS + '（**168 ＝ 7×24 h 才是 AC-07 的时长前提**；8 h 不等于 7 天）')
+  WS '现场须知：别关机、别锁屏、别让 Windows 自动重启（DEP-04 已配）；中断/重启 ⇒ 该轮整段作废，必须新开台账重跑。'
+  WS '现场须知：采样默认每分钟一行（CSV＋日志合计约 3～5 MB/天量级）；台账只有 1 行 meta ＋ 每日 1 行。'
+  WS '现场须知：泡机期间**冻结仓库**（台账 meta 里记着 stress-check.js 的 sha256，改了就对不上）。'
+  WS ''
+  if (-not $repoS) {
+    WS '未找到仓库（期望含 tests\preflight.js）⇒ 请把整个仓库目录拷到本机后重跑本入口。'
+    [System.IO.File]::WriteAllText($repS, ($S -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Output ('未找到仓库。报告：' + $repS)
+    exit 1
+  }
+  $ledgerS = $SoakLedger
+  if ($ledgerS -eq '') { $ledgerS = Join-Path $repoS ('tests\._verify\soak\soak-7day-' + $stampS + '.jsonl') }
+  WS ('证据日台账：' + $ledgerS)
+  WS '（台账是 JSONL、**逐行 fsync** 落盘；它就是「这 7 天连着跑过」的唯一证据，请连同 CSV/日志一并回传）'
+  try {
+    $qS = Split-Path $repoS -Qualifier
+    $freeS = (Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='" + $qS + "'")).FreeSpace
+    WS ('磁盘剩余：' + [math]::Round($freeS / 1MB, 1) + ' MB（所在盘 ' + $qS + '）；7 日档预计只需数十 MB')
+    if ($freeS -lt 200MB) { WS '⚠ 剩余空间偏低：请先清理磁盘再开跑（CSV/日志按分钟一行）。' }
+  } catch { WS '磁盘剩余：读取失败（不影响开跑；请自行确认空间充足）' }
+  [System.IO.File]::WriteAllText($repS, ($S -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+  Write-Output ''
+  Write-Output '==== 7 日压测（AC-07：连续 ≥7 天）===='
+  Write-Output '!! 跑起来别关机、别锁屏（DEP-04 已配）；中断/重启 ⇒ 该轮整段作废，必须新开台账重跑 !!'
+  Write-Output ('计划：--hours ' + $hoursS + '    台账：' + $ledgerS)
+  Write-Output ('跑完后核验：双击 核验7日台账.cmd（或 -VerifySoak -SoakLedger "' + $ledgerS + '"）')
+  Write-Output '开始……（7×24 h 期间本窗口不要关；进度实时打印，另有 tests\._verify\stress-*.log 落盘）'
+  Write-Output ''
+  Push-Location $repoS
+  try { & node 'tests\stress-check.js' '--hours' $hoursS '--soak-ledger' $ledgerS }
+  finally { Pop-Location }
+  $codeS = $LASTEXITCODE
+  if ($null -eq $codeS) { $codeS = 2 }
+  Write-Output ''
+  Write-Output ('压测结束：退出码 ' + $codeS + '（0 = 判据通过；1 = 有判据不通过；2 = 脚本异常；3 = 环境不满足）')
+  Write-Output ('台账：' + $ledgerS)
+  Write-Output ('下一步：双击 核验7日台账.cmd（自动取最近一份台账）或 -VerifySoak -SoakLedger "' + $ledgerS + '"')
+  Write-Output ('报告：' + $repS)
+  exit $codeS
+}
+
+# ==========================================================================
+#  -VerifySoak：AC-07 的**台账核验**入口（--verify-soak；5 条判据逐条打印，不起浏览器）
+#  用法：-VerifySoak [-SoakLedger <台账.jsonl>]   # 不给台账 ⇒ 自动取 tests\._verify\soak\ 下**最近一份**
+#  判据（由 tests\stress-check.js 打印，逐条 [PASS]/[FAIL]/[N/A]）：
+#    ① 连续 ≥7 天无重启  ② 无崩溃  ③ 无内存泄漏  ④ 采样连续性  ⑤ 可作证性（真时钟才作证据）
+#  ⚠ 这个模式**不打标准汇总行**（它不是门禁轮）—— 别把它读成"门禁全绿"。
+# ==========================================================================
+if ($VerifySoak) {
+  $stampV = Get-Date -Format 'yyyyMMdd-HHmmss'
+  $dirV = Join-Path $PSScriptRoot '._env-report'
+  if (-not (Test-Path $dirV)) { New-Item -ItemType Directory -Path $dirV | Out-Null }
+  $repV = Join-Path $dirV ('7日台账核验报告-' + $env:COMPUTERNAME + '-' + $stampV + '.txt')
+  $V = New-Object System.Collections.Generic.List[string]
+  function WV($s) { $script:V.Add([string]$s) }
+  $repoV = Get-RepoDir
+  $nodeFromV = '系统 PATH'
+  if ($NodeDir) { $nodeFromV = $NodeDir }
+  WV '7 日台账核验报告（AC-07 的 5 条判据；--verify-soak）'
+  WV ('生成时间：' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '    主机：' + $env:COMPUTERNAME)
+  if ($repoV) { WV ('仓库    ：' + $repoV) } else { WV '仓库    ：**未找到**' }
+  WV ('Node    ：' + $nodeFromV)
+  WV ''
+  if (-not $repoV) {
+    WV '未找到仓库（期望含 tests\preflight.js）⇒ 请把整个仓库目录拷到本机后重跑本入口。'
+    [System.IO.File]::WriteAllText($repV, ($V -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Output ('未找到仓库。报告：' + $repV)
+    exit 1
+  }
+  $ledgerV = $SoakLedger
+  if ($ledgerV -eq '') {
+    $soakDirV = Join-Path $repoV 'tests\._verify\soak'
+    $candV = @()
+    if (Test-Path $soakDirV) { $candV = @(Get-ChildItem -Path $soakDirV -Filter '*.jsonl' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending) }
+    if ($candV.Count -gt 0) {
+      $ledgerV = $candV[0].FullName
+      WV '台账选择：**自动**取 tests\._verify\soak\ 下最近一份（要指定就把 .jsonl 拖到 核验7日台账.cmd 上）'
+    }
+  }
+  if ($ledgerV -eq '') {
+    WV '没找到任何台账（tests\._verify\soak\*.jsonl）⇒ 先跑 跑7日压测.cmd，或把台账文件拖到本入口上。'
+    [System.IO.File]::WriteAllText($repV, ($V -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Output ('没有可用台账。报告：' + $repV)
+    exit 2
+  }
+  if (-not (Test-Path $ledgerV)) {
+    WV ('台账不存在：' + $ledgerV)
+    [System.IO.File]::WriteAllText($repV, ($V -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Output ('台账不存在：' + $ledgerV + '（报告：' + $repV + '）')
+    exit 2
+  }
+  WV ('台账    ：' + $ledgerV + '（' + (Get-Item $ledgerV).Length + ' B）')
+  WV ''
+  Push-Location $repoV
+  try { $outV = & node 'tests\stress-check.js' '--verify-soak' $ledgerV 2>&1 | Out-String }
+  finally { Pop-Location }
+  $codeV = $LASTEXITCODE
+  if ($null -eq $codeV) { $codeV = 2 }
+  if ($null -eq $outV) { $outV = '' }
+  WV $outV.Trim()
+  WV ''
+  WV ('判据结论：退出码 ' + $codeV + '（0 = 5 条判据全过；1 = 有判据不通过；2 = 脚本异常）')
+  WV '提醒：本模式**不打标准汇总行**（它不是门禁轮）；要作 AC-07 证据，台账必须是**真时钟 ≥7 天**（判据⑤）。'
+  [System.IO.File]::WriteAllText($repV, ($V -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+  Write-Output $outV.Trim()
+  Write-Output ''
+  Write-Output ('核验完成（退出码 ' + $codeV + '）。报告：' + $repV)
+  Write-Output '请把这份报告 ＋ 台账 .jsonl 原样回传（台账是 AC-07 的证据本体）。'
+  exit $codeV
 }
 
 $Lines = New-Object System.Collections.Generic.List[string]
@@ -274,7 +436,7 @@ $repo = $repoCandidates | Where-Object { $_ -and (Test-Path (Join-Path $_ 'tests
 if (-not $repo) {
   W '未找到仓库（期望含 tests\preflight.js）。请把整个仓库目录拷到本机后重跑本脚本，或手工执行：'
   W '    node tests\preflight.js'
-  W '    node tests\run-all.js            （完整；含浏览器与 5 分钟长跑）'
+  W '    node tests\run-all.js            （完整；含浏览器与 2 分钟长跑）'
   W '    node tests\run-all.js --fast      （快跑；跳过耗时/浏览器类）'
 } else {
   W ('仓库位置：' + $repo)
@@ -289,7 +451,7 @@ if (-not $repo) {
     W 'Node ≥ 24 已就位 ⇒ 开始跑 preflight 与门禁（输出同时打印在本报告里）'
     Try-Run 'preflight' { Push-Location $repo; try { & node 'tests\preflight.js' 2>&1 | Out-String } finally { Pop-Location } }
     Try-Run 'run-all --fast' { Push-Location $repo; try { & node 'tests\run-all.js' '--fast' 2>&1 | Out-String } finally { Pop-Location } }
-    W '（完整门禁请另跑：node tests\run-all.js —— 含浏览器类与 5 分钟长跑）'
+    W '（完整门禁请另跑：node tests\run-all.js —— 含浏览器类与 2 分钟长跑）'
   }
 }
 
