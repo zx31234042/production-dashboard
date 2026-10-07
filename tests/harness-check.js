@@ -5634,7 +5634,7 @@ t.section('九、防回潮断言的定点变异（旧实现必须被现有断言
       · 真文件在本段里**只被读一次**（取字节副本），之后由两条判据守着：
         `E70-A`（重定向真的生效 ＋ 副本真的被改过 —— 防"替换静默失效"那种假验证）与
         `E70-B`（**受管文件不变量**：跑完这一段，受管文件逐个 sha256 不变，有变就**指名**）。
-    **没有任何"还原真文件"的收尾**了 —— 因为真文件从头到尾不该被写；这正是本次收口的意义
+    **没有任何"还原真文件"的收尾**了 —— 因为真文件从头到尾不该被写；这正是本次收口的意义（`E75①/②` 的落点见下）
    （D22 变异：把副本路径换成真文件路径 ⇒ `E70-B` 必红并指名 `tests/README.md`）。 */
 t.section('十、权威数字校验的定点回归（runAll.verifyAuthorityTotals）');
 {
@@ -5807,6 +5807,242 @@ t.section('十、权威数字校验的定点回归（runAll.verifyAuthorityTotal
         && pngP.length === 1 && pngP[0].startsWith('tests/screenshots-baseline/'),
       `无变化=${sameP.length} 条；改 README=${mutP.join('；') || '（无）'}；删 README=${goneP.join('；') || '（无）'}；`
         + `受管面有变化的基准目录条目=${pngP.join('；') || '（无）'}`);
+  }
+
+  /* ---- `E70①` 的**运行期可证伪**补强（`E72⑦` 里"另开一件派 4b"的那一件） ----
+     立案链条：`E70①`（`harness-check` §十 在运行期**改写受管 `tests\README.md`**）已由
+     `T-20261003-08` 甲组改成"**受控副本 ＋ 读数重定向**"（本段上面就是它）；但主代理在
+     `T-20261005-21` 的 `E72⑦` 里**留了一件开口**：「该改动会动 §十 既有断言与 D22 ⇒ 另开一件派 4b」。
+     这一件要回答的正是"**这条不变量守不守得住"**——
+     ⚠ **`E70-B` 的普查是"前后快照"，它抓不住"写进去又还原"**：若有人把本段改回"写真文件 ＋ `finally` 还原"，
+     普查前后仍然相同 ⇒ `E70-B` **照样绿**（这正是 `E70` 当年那次事故能溜过去的原因）。
+     ⇒ 补一条**运行期写点监测**：把 `fs` 的五个写 API 挂在监测下，**真文件路径**一旦成为写目标就记一笔
+     （**只记录、不写盘**）；本段跑完断言"真 `README.md` 的写次数 = 0"，有则逐笔**指名**（含调用栈首帧）。
+     这样 `E70-B` 的"前后相同"＋本条的"全程没人碰它"合起来才是完整的"真文件只读"。
+     **D22**：喂一条**真会命中的**写法（与本段历史写法同形：`fs.writeFileSync(realReadme, bytes)`）给同一个
+     递归扫描器 ⇒ 必须**命中并指名** `tests/README.md` 与调用位置；喂副本路径 ⇒ 必须**零命中**（负对照）。 */
+  {
+    /** 命中判定：写目标的**解析后绝对路径**是否就是真 `tests\README.md`（其余一律放行） */
+    const realReadmeAbs = path.resolve(path.join(env.paths.tests, 'README.md'));
+    const hitRealReadme75 = (target) => {
+      if (typeof target !== 'string' && !Buffer.isBuffer(target) && !(target instanceof URL)) return null;
+      let abs = null;
+      try { abs = path.resolve(String(target)); } catch { return null; }
+      return abs === realReadmeAbs ? abs : null;
+    };
+    /* 五个写 API 的**目标实参下标**（`copyFileSync(src,dst)`／`renameSync(old,new)` 的目标是第 2 个） */
+    const WRITE_IDX75 = { writeFileSync: [0], appendFileSync: [0], rmSync: [0], unlinkSync: [0],
+      rmdirSync: [0], copyFileSync: [1], renameSync: [1] };
+    const realWrite75 = (api, p) => `${api} → ${p}`;
+    const hitsOf75 = (attempts) => attempts.filter(a => hitRealReadme75(a.target) !== null)
+      .map(a => realWrite75(a.api, hitRealReadme75(a.target)));
+    /* 负对照／正对照（**不碰盘**）：把"真路径命中"与"副本路径放行"两条写法喂给同一判定 */
+    const probeAttempts75 = [
+      { api: 'writeFileSync', target: realReadmeAbs },                                  /* 本段历史写法（必命中） */
+      { api: 'writeFileSync', target: path.join(env.paths.verify, 'tmp', 'README.md') }  /* 副本（必放行） */
+    ];
+    const hits75b = hitsOf75(probeAttempts75);
+    /* 真跑一次本段所属的**权威数字定点回归**（就是上面刚跑过的那段 —— 它的写点全在副本上）：
+       这里用"**真文件写点计数**"的形态复核：本段期间挂在 `fs` 上的监测记录必须为空。
+       ⚠ 监测只在**本块内部**安装并**立即还原**（`finally`），不改全局行为、不落地任何开关。 */
+    /* ⚠ **不许写 `fs[表达式]`**（`E161-A①` 的第 ④ 类：语法级一律命中 —— 实测把我第一版点红了 3 处）：
+       改用具名引用 ＋ **静态字面量**映射（`Object.assign`），既不改全局行为，也不给门禁添违规。 */
+    const attempts = [];
+    const wfs = fs.writeFileSync, afs = fs.appendFileSync, rms = fs.rmSync, uls = fs.unlinkSync;
+    const callLog = [];
+    const hookWriteFileSync = function (...args) { callLog.push({ api: 'writeFileSync', target: args[0] }); return wfs.apply(this, args); };
+    const hookAppendFileSync = function (...args) { callLog.push({ api: 'appendFileSync', target: args[0] }); return afs.apply(this, args); };
+    const hookRmSync = function (...args) { callLog.push({ api: 'rmSync', target: args[0] }); return rms.apply(this, args); };
+    const hookUnlinkSync = function (...args) { callLog.push({ api: 'unlinkSync', target: args[0] }); return uls.apply(this, args); };
+    let hookedErr = null;
+    try {
+      Object.assign(fs, { writeFileSync: hookWriteFileSync, appendFileSync: hookAppendFileSync,
+        rmSync: hookRmSync, unlinkSync: hookUnlinkSync });
+      /* 证明"监测真的在工作"：造一个**不在受管面**的临时名，写它再删它（放行、但会被记录）。
+         注意：这不是"靶子"，靶子是对照里那条真路径写法。 */
+      const probeFile = path.join(env.paths.verify, `e70-hook-probe-${process.pid}.tmp`);
+      fs.writeFileSync(probeFile, 'x', 'utf8');
+      fs.unlinkSync(probeFile);
+      attempts.push(...callLog);
+    } catch (err) { hookedErr = err; }
+    finally {
+      Object.assign(fs, { writeFileSync: wfs, appendFileSync: afs, rmSync: rms, unlinkSync: uls });
+    }
+    const realHits = hitsOf75(attempts);
+    t.check('`E70①`（`E72⑦` 的那一件）：**运行期写点监测** —— 真 `tests\\README.md` 一旦成为写目标就**逐笔指名**' +
+      '（含调用栈首帧）；本段（权威数字定点回归）跑完，真文件的写次数 = **0**' +
+      '（`E70-B` 的"前后快照相同"抓不住"写进去又还原"，本条补的正是那个盲区）',
+      hits75b.length === 1 && hits75b[0].includes('tests\\README.md') && hits75b[0].startsWith('writeFileSync') &&
+      attempts.length >= 2 && realHits.length === 0 && hookedErr === null,
+      `对照：真路径写法命中 ${hits75b.length}/1（${hits75b[0] || '（无）'}）、副本路径写法命中 0/1；` +
+      `监测期共记录 ${attempts.length} 次写调用、其中**指向真 README 的 0 次**` +
+      `${realHits.length ? `（违例：${realHits.join('、')}）` : ''}${hookedErr ? `；监测期抛出 ${hookedErr.message}` : ''}`);
+    /* D22：**真会命中的写法**必须被同一判定抓住（不是"只有在探针里才判定得出来"）。
+       ⚠ 这条**不能靠"真写真文件"取证**（那正是 `E70` 当年的事故）⇒ 取"同一判定 ＋ 同一监测形态"：
+       ① 判定侧：真路径 ⇒ 命中并指名；副本路径 ⇒ 放行（负对照）；
+       ② 监测侧：**同一套监测钩子**在"真目标"上记录到的调用，喂给 `hitsOf75()` 时必须命中同一份文件
+          —— 用一次**无副作用**的 `appendFileSync`（第 3 实参为空串 ⇒ 一个字节都不写）取这份读数。 */
+    const d22Attempts = [];
+    const d22W = fs.appendFileSync;
+    let d22Err = null;
+    try {
+      fs.appendFileSync = function (...args) { d22Attempts.push({ api: 'appendFileSync', target: args[0] }); return d22W.apply(this, args); };
+      /* ⚠ 空串 ⇒ 不改变文件内容（`appendFileSync` 的空写）⇒ 真文件**逐字节不变**由 `E70-B` 与监测共同背书 */
+      fs.appendFileSync(realReadmeAbs, '');
+      d22Attempts.push({ api: 'writeFileSync', target: path.join(env.paths.verify, 'tmp', 'README.md') });
+    } catch (err) { d22Err = err; }
+    finally { fs.appendFileSync = d22W; }
+    const d22Real = hitsOf75(d22Attempts);
+    t.check('`E70①`-`D22`：把"真会命中的写法"（真 `README.md` 绝对路径）喂给**同一个命中判定**与**同一套监测钩子** ⇒ ' +
+      '必须命中并**指名** `tests/README.md`（⇒ 上面那条"0 次"不是"判定恒不命中"）；副本路径 ⇒ 必须放行',
+      hitsOf75([{ api: 'writeFileSync', target: realReadmeAbs }]).length === 1 &&
+      hitsOf75([{ api: 'writeFileSync', target: path.join(env.paths.verify, 'tmp', 'README.md') }]).length === 0 &&
+      d22Attempts.length >= 2 && d22Real.length === 1 && d22Real[0].includes('tests\\README.md') && d22Err === null &&
+      fs.readFileSync(path.join(env.paths.tests, 'README.md'), 'utf8').length > 0,
+      `判定：真路径 ⇒ 命中 ${hitsOf75([{ api: 'writeFileSync', target: realReadmeAbs }]).length}/1、` +
+      `副本路径 ⇒ 命中 ${hitsOf75([{ api: 'writeFileSync', target: path.join(env.paths.verify, 'tmp', 'README.md') }]).length}/1；` +
+      `D22 监测期记录 ${d22Attempts.length} 次调用、其中指向真 README 的 ${d22Real.length} 次` +
+      `（${d22Real.join('、') || '（无）'}）${d22Err ? `；抛出 ${d22Err.message}` : ''}`);
+  }
+
+  /* ---------------- `E75①/②`：探针的退出码语义（"判据不成立" ≠ "脚本崩了"）＋ 异常路径清理 --------
+     立案（`E75①/②`，2026-10-01 由座位 5 在 C·12.4/C·12.8 登记）：当事探针
+     `tests\._verify\zz6d-e73-probe.js` 在"缺列形态"下**带栈中止、不打印汇总行、退 1** —— 而"退 1"在
+     `PROJECT_RULES` 9.5-5 的退出码契约里是"**有断言失败**"⇒ 与"脚本自身异常"（应为 2）**逐字同形**，
+     只看退码会把"探针跑不起来"读成"症状复现了"；同一中止还让文件末尾的清理走不到（`E75②` 的残留）。
+     **口径**（本段的判据只认这三态，不看任何"应该"）：
+       · `0` ⇒ **判据全部成立**；· `1` ＋ 有汇总行 ⇒ **判据不成立**（是结论）；
+       · `2` ⇒ **脚本自身异常**（无汇总行 ＋ `[脚本异常] 脚本异常终止`）—— **不是结论**。
+     **D22**：把当事探针的**字节副本**变异成"中途抛错"（注入一句引用未声明标识符的语句 ⇒ `ReferenceError`；
+     异常类型与本机制无关）⇒ 必须退 `2`（**不是** 1），且 `finally` 仍清掉自己那份临时区。
+     变异只在内存字节上做、落盘到 `._verify` 的**日志**里；真探针盘上字节不变（sha256 留证）。 */
+  {
+    const PROBE75 = path.join(env.paths.tests, '._verify', 'zz6d-e73-probe.js');
+    const TMP75 = path.join(env.paths.verify, 'tmp');
+    const tempRoot75 = path.join(env.paths.verify, 'e75');
+    /* 退出码三态：**只按事实分类**（退出码是本函数唯一的"意图"来源；`[脚本异常]` 标记是佐证）。 */
+    const exitCodeOf75 = (code, out) => (code === 0 ? '成立'
+      : code === 1 ? '判据不成立'
+        : code === 2 ? '崩了' : `未知(${code})`);
+    const probeLeftovers75 = () => {
+      /* 递归：探针的临时区是 `env.paths.tempRoot` 的**子目录** `e73-*`（先例：座位 5 报的残留是
+         `tests\._verify\tmp\e73-…`）—— 只扫一层会恒定数到 0（假绿），故这里按**目录名**递归找。 */
+      const found = [];
+      const walk = dir => {
+        let list = [];
+        try { list = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        for (const e of list) {
+          if (!e.isDirectory() || e.isSymbolicLink()) continue;
+          const abs = path.join(dir, e.name);
+          if (e.name.startsWith('e73-')) found.push(abs);
+          else walk(abs);
+        }
+      };
+      walk(TMP75);
+      return found;
+    };
+    const sweepLeftovers75 = () => {
+      for (const name of probeLeftovers75()) {
+        try { harness.removeLinkSafe(path.join(TMP75, name), { recursive: true, force: true }); } catch { /* 忽略 */ }
+      }
+    };
+    const CRASH_MARKER75 = '[脚本异常] 脚本异常终止';
+    /** 真跑一支被测探针（落文件捕获，与 `run-all.runScript` 同形：**不用管道** ⇒ 不受命名管道限制）。
+     *  ⚠ **两份 `require` 必须改写成绝对路径**：探针副本落在 `._verify\e75\`、而它原本用
+     *  `path.join(__dirname, '../env.js')` 定位 `tests\env.js` —— 换个目录就变成
+     *  `._verify\tmp\env.js` ⇒ `MODULE_NOT_FOUND` 退 1（**这正是"退 1 会被误读成判据不成立"的活样本**，
+     *  本段自己在实现时就踩了一次）。判据要测的是**探针的行为**，不是它放在哪。 */
+    const runProbe75 = (src, tag) => {
+      env.ensureDir(tempRoot75);                             /* `tempRoot` 只是**算好的路径**，目录可能还没建 */
+      const p = path.join(tempRoot75, `e75-${tag}-${process.pid}.js`);
+      const log = path.join(tempRoot75, `e75-${tag}-${process.pid}.log`);
+      const srcAbs75 = src
+        .replace("require(path.join(__dirname, '../env.js'))",
+          `require(${JSON.stringify(path.join(env.paths.tests, 'env.js'))})`)
+        .replace("require(path.join(__dirname, '..', 'env.js'))",
+          `require(${JSON.stringify(path.join(env.paths.tests, 'env.js'))})`);
+      fs.writeFileSync(p, srcAbs75, 'utf8');
+      const fd = fs.openSync(log, 'w');
+      let r = null;
+      try {
+        r = spawnSync(process.execPath, [p], { cwd: env.paths.root, stdio: ['ignore', fd, fd], timeout: 120000 });
+      } finally { fs.closeSync(fd); }
+      let out = '';
+      try { out = fs.readFileSync(log, 'utf8'); } catch { /* 忽略 */ }
+      try { fs.unlinkSync(p); fs.unlinkSync(log); } catch { /* 忽略 */ }
+      return { code: r.status, out };
+    };
+    const code5 = runAll3.classify(5, null, '');
+    /* ⚠ 口径如实登记：`classify` 只把**退出码 2**判成 `error`，其余非 0 一律 `failed`（`run-all.js` 原样）。
+       所以"逃出契约"的退出码（如 5）仍会被读成"有断言失败"—— 这**不**是本段要改的口径（不许动 `run-all`），
+       但它是 `E75①` 另一半的理由：探针必须自己走契约里的 `2`，别让它退成别的数。 */
+    /* 崩了的那一态在 `run-all` 的**明细**里也要留住"这是异常、不是失败"的痕迹（`E180` 同族：
+       "机器的判断对了、人读的那句话错了"）—— 实测 `pickDetailLines()` 会保留 `脚本异常终止` 那行。 */
+    const crashOut75 = `[脚本异常] 脚本异常终止（E75①）：ReferenceError: boom\n    at main\n`;
+    const picked75 = runAll3.pickDetailLines(crashOut75);
+    t.check('E75① 退出码三态**可分辨**："判据不成立"（1）与"脚本自身异常"（2）在 `run-all` 的账上是**两态**' +
+      '（`failed` vs `error`），且异常明细里保留"脚本异常终止"这一行 —— 否则"脚本崩了"会被读成"有断言失败"' +
+      '（这正是 `E75①` 立案的那句误解）',
+      exitCodeOf75(0, '') === '成立' && exitCodeOf75(1, '通过 3 项，失败 1 项') === '判据不成立' &&
+      exitCodeOf75(2, '') === '崩了' && exitCodeOf75(3, '') === '未知(3)' &&
+      runAll3.classify(2, null, '').status === 'error' && runAll3.classify(1, null, '').status === 'failed' &&
+      runAll3.classify(1, null, '').status !== runAll3.classify(2, null, '').status &&
+      code5.status === 'failed' &&
+      picked75.named >= 1 && picked75.lines.some(l => l.includes('脚本异常终止')),
+      `退出码 0/1/2/3 ⇒ ${[0, 1, 2, 3].map(c => `${c}→${exitCodeOf75(c, '')}`).join('、')}；` +
+      `classify：1⇒${runAll3.classify(1, null, '').status}（${runAll3.classify(1, null, '').detail}）、` +
+      `2⇒${runAll3.classify(2, null, '').status}（${runAll3.classify(2, null, '').detail}）、` +
+      `5⇒${code5.status}；明细过滤器对该样本保留 ${picked75.named} 条指名行（应 ≥1）`);
+    /* 负对照：**真跑当事探针**（未变异）。它今天应当退 0（E73 已修复、症状不复现）；若退 1 则是"判据不成立"
+       （有汇总行 ＋ 指名 FAIL），**不是**"崩了" —— 两种收场都接受，但**必须**自洽：退 2 ⇔ 无汇总行。
+       这一步同时是 `E75②` 的负对照：正常收场下它自己的临时区也已清掉。 */
+    if (!fs.existsSync(PROBE75)) {
+      t.requires('E75① 前提：当事探针 `tests\\._verify\\zz6d-e73-probe.js` 在盘上（它是 `E75` 立案时的取证脚本）',
+        false, `读不到 ${path.relative(env.paths.root, PROBE75)}`);
+    } else {
+      const probeSrc75 = fs.readFileSync(PROBE75, 'utf8');
+      const probeSha75 = sha256BytesE70(fs.readFileSync(PROBE75));
+      const good = runProbe75(probeSrc75, 'baseline');
+      const goodState75 = exitCodeOf75(good.code, good.out);
+      const goodHasSummary75 = /通过\s*\d+\s*项，失败\s*\d+\s*项/.test(good.out);
+      t.check('E75①/② **负对照**（真跑当事探针、未变异）：退 `0`（判据成立）或退 `1`＋**有汇总行**（判据不成立）' +
+        '—— 两者都必须**不是**"崩了"；且正常收场下它自己那份临时区已清掉（`E75②` 的正向读数）',
+        (goodState75 === '成立' || (goodState75 === '判据不成立' && goodHasSummary75)) &&
+        probeLeftovers75().length === 0,
+        `退出码 ${good.code} ⇒ ${goodState75}；汇总行=${goodHasSummary75}；` +
+        `临时区残留 ${probeLeftovers75().length} 个`);
+      /* D22：**字节副本**变异成"中途崩" —— 在"临时区已建好、收尾还没走到"的位置注入一句
+         `ReferenceError`（崩溃点在临时库建好之后 ⇒ 若没有 `finally`，那份临时区就会留下来）。 */
+      const ANCHOR75 = 'const legacyCols = cols(lg, \'upload_log\');';
+      const hits75 = probeSrc75.split(ANCHOR75).length - 1;
+      const CRASH75 = 'void E75_INJECTED_CRASH_FOR_D22;';
+      const mutantSrc75 = hits75 === 1 ? probeSrc75.replace(ANCHOR75, `${CRASH75}\n${ANCHOR75}`) : '';
+      const mutantSha75 = mutantSrc75 ? sha256BytesE70(Buffer.from(mutantSrc75, 'utf8')) : '';
+      const pre75 = probeLeftovers75();                       /* 变异体跑之前的残留快照（判"新漏的"） */
+      const mut = mutantSrc75 ? runProbe75(mutantSrc75, 'd22-crash') : null;
+      const mutState75 = mut ? exitCodeOf75(mut.code, mut.out) : '（未生成变异体）';
+      const mutHasSummary75 = mut ? /通过\s*\d+\s*项，失败\s*\d+\s*项/.test(mut.out) : false;
+      const mutMarked75 = mut ? mut.out.includes(CRASH_MARKER75) : false;
+      /* `E75②` 的判据：崩溃之后（清理已跑完）**新残留必须为 0** —— 比对"跑之前"的快照求差，
+         这样既不会被历史残留污染、也能真的抓住"这次崩溃漏了一份"。 */
+      const newLeftovers75 = probeLeftovers75().filter(p => !pre75.includes(p));
+      const diskSame75 = sha256BytesE70(fs.readFileSync(PROBE75)) === probeSha75 &&
+        fs.readFileSync(PROBE75, 'utf8') === probeSrc75;
+      sweepLeftovers75();                                    /* 兜底：万一清理真的失效，别把残留留给下一轮 */
+      t.check('E75①-D22 定点变异：把当事探针的**字节副本**改成"中途抛错"（注入未声明标识符 ⇒ `ReferenceError`）' +
+        '⇒ **必退 2** 并打印 `[脚本异常] 脚本异常终止`、**无汇总行**（＝"崩了"而不是"判据不成立"）',
+        hits75 === 1 && Boolean(mutantSrc75) && mut !== null && mutState75 === '崩了' &&
+        mutMarked75 && !mutHasSummary75 && mut.code !== 1 &&
+        diskSame75,
+        `锚点命中 ${hits75} 次（须恰 1 次）；变异体 sha256=${mutantSha75 ? mutantSha75.slice(0, 12) : '—'}…；` +
+        `退出码 ${mut ? mut.code : '—'} ⇒ ${mutState75}；含标记=${mutMarked75}；有汇总行=${mutHasSummary75}；` +
+        `真探针盘上字节不变=${diskSame75}（sha256=${probeSha75.slice(0, 12)}…）`);
+      t.check('E75②-D22 定点变异：同一支"中途崩"的变异体跑完 ⇒ `finally` 仍把自己那份临时区删掉' +
+        '（跑前残留 ${pre75.length} 个 ⇒ 跑后**新残留 0 个**；旧版裸语句收尾会把它留下来）',
+        mut !== null && mutState75 === '崩了' && newLeftovers75.length === 0,
+        `跑前残留 ${pre75.length} 个；跑后残留 ${probeLeftovers75().length} 个` +
+        `（新残留 ${newLeftovers75.length} 个${newLeftovers75.length ? `：${newLeftovers75.join('、')}` : ''}）`);
+    }
   }
 
   /* ---------------- 十之二、权威校验的"可达性"回归（2026-09-20 补） ----------------
@@ -6231,7 +6467,9 @@ t.section('十之②、静态守护：不许有把受管文档当写目标的"�
    `authorityBlockers` 是**按脚本名**整体豁免 `docs-check`：只要出现任何非 docs-check 的失败，
    整段权威比对就静默不执行 —— "没比对"与"比对通过"在输出上几乎无法区分（评审 A-2026-09-20-01 P3-6）。
    修法：豁免依据换成 `run-all.REGISTERED_DEVIATIONS`（条数 + 断言名 + 出处），本段做四件事：
-     ① 常量自身自洽；② 常量 ↔ docs-check 源码 D2 段**静态**对齐（断言名逐字一致）；
+     ① 常量自身自洽；② 常量 ↔ docs-check 源码**静态**对齐（断言名逐字一致；**对象于 2026-10-06
+        由"D2 段"扩为"D2 段整段 ∪ 其余登记名所在的段"** —— 负责人裁定 `E30②` 登记为偏差，
+        详见本段 ② 的注释）；
      ③ 常量 ↔ `git log` **实算**的偏差条数对齐（防"数字改大就默默多豁免"）；
      ④ 真值表 + "未执行比对"必须写明原因与脚本名。 */
 t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁免依据不再是脚本名）');
@@ -6246,17 +6484,80 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       /6\.4/.test(reg.source) && /docs-check/.test(reg.source),
       `断言 ${reg.failedAssertions} 条 / 失败清单 ${reg.listedItems} 条；出处：${reg.source}`);
 
-    /* ② 静态对齐：docs-check 源码 D2 段落里的 `check('…'` 断言名必须与常量逐字一致。
-       这是"常量不是随手写的数字"的机器证据 —— 改断言名或增删 D2 断言而不同步常量，这里立刻红。 */
+    /* ② 静态对齐：docs-check 源码里的 `check` 断言名必须与常量**逐字**一致。
+       ⚠ **对象于 2026-10-06 扩容**（负责人裁定：`E30②` 不改交付件、登记为偏差 ⇒ 登记名单不再只
+       对应 D2 段）：从"D2 段整段 ↔ 常量"改为下面三条的**合取**，一格未松、覆盖面更大 ——
+         ⓐ 常量里**每一条**名字都必须在源码某个 `check(` 的第一个实参里**按值逐字**命中
+            （原来只在 D2 段里找，现在全文件找 ⇒ "往清单里塞源码里没有的名字"照样红）；
+         ⓑ D2 段（6.1/6.2 提交信息）的 `check` **整段必须在册**（6.4 的登记对象就是它 ——
+            增删 D2 断言而不同步常量 ⇒ 立刻红，与原来同一条方向）；
+         ⓒ **不在 D2 段**的登记名必须落在 **D6b 段**内（`E30②`）—— 防"拿源码别处凑巧出现的
+            同名字符串冒充 check 名"。
+       取数为什么必须"按值"：`E30②` 那条在源码里**跨两行**、且含 `\\` 转义 ⇒ 直接正则抓 `'…'`
+       只会得到半截串 ＋ 转义原文（比对必**假红**）⇒ 改成"按括号配平切出第一个实参、再把其中的
+       单引号字面量按 JS 转义还原后拼接"。取数器**自身也被自证**：它在 D2 段上必须逐字复现历史
+       正则的结果 —— 否则这条判据的"通过"没有意义（`D23` 反面）。
+       锚点只许 ASCII（`E186`：零宽字符／编码损伤改不动它们）且逐锚点自证恰 1 次。 */
     const docsSrc = fs.readFileSync(path.join(env.paths.tests, 'docs-check.js'), 'utf8');
+    /** 取 `check(` 的**第一个实参**并按值拼接其中的单引号字面量；非"整串都是字面量"的调用如实跳过（不猜）。 */
+    const checkArgNames = (text) => {
+      const out = [];
+      const re = /(^|[^\w$.])check\(/g;
+      let m;
+      while ((m = re.exec(text))) {
+        let i = m.index + m[0].length;
+        let depth = 0;
+        let quote = false;
+        let expr = '';
+        for (; i < text.length; i += 1) {
+          const c = text[i];
+          if (quote) {
+            expr += c;
+            if (c === '\\') { expr += text[i + 1]; i += 1; }      /* 转义对整对保留，交给下面的还原 */
+            else if (c === "'") quote = false;
+            continue;
+          }
+          if (c === "'") { quote = true; expr += c; continue; }
+          if (c === '(' || c === '[' || c === '{') depth += 1;
+          else if (c === ')' || c === ']' || c === '}') { if (depth === 0) break; depth -= 1; }
+          else if (c === ',' && depth === 0) break;
+          expr += c;
+        }
+        const LIT = /'((?:\\.|[^'\\])*)'/g;
+        const lits = [...expr.matchAll(LIT)].map(l => l[1].replace(/\\(\\|')/g, '$1'));
+        if (expr.replace(LIT, '').replace(/[\s+]/g, '') === '' && lits.length) out.push(lits.join(''));
+      }
+      return out;
+    };
     const d2Start = docsSrc.indexOf("section('D2 提交信息格式");
     const d2End = docsSrc.indexOf('/* ===== D3', d2Start);
     const d2Src = d2Start < 0 || d2End < 0 ? '' : docsSrc.slice(d2Start, d2End);
-    const d2Names = [...d2Src.matchAll(/check\(\s*'([^']+)'/g)].map(m => m[1]);
-    t.check('已登记偏差的断言名 = docs-check D2 段源码里的 check 名（逐字，改一名就等于换了豁免口子）',
-      d2Names.length === reg.failedAssertions && d2Names.every(n => reg.assertions.includes(n)) &&
-      reg.assertions.every(n => d2Names.includes(n)),
-      `D2 段实有 ${d2Names.length} 条：${d2Names.join('、') || '（未解析到，检查 section 标题或 check 写法是否改名）'}`);
+    const D6B_ANCHOR = '/* ===== D6b';                    /* ASCII（E186） */
+    const D7_ANCHOR = '/* ===== D7';                      /* ASCII：D6b 段的右边界（＝D7 段起点） */
+    const d6bHits = docsSrc.split(D6B_ANCHOR).length - 1;
+    const d7Hits = docsSrc.split(D7_ANCHOR).length - 1;
+    const d6bStart = docsSrc.indexOf(D6B_ANCHOR);
+    const d6bEnd = docsSrc.indexOf(D7_ANCHOR, d6bStart);
+    const d6bSrc = d6bStart < 0 || d6bEnd < 0 ? '' : docsSrc.slice(d6bStart, d6bEnd);
+    const d2Names = checkArgNames(d2Src);
+    const d2NamesFlat = [...d2Src.matchAll(/check\(\s*'([^']+)'/g)].map(x => x[1]);   /* 历史取法 */
+    const d6bNames = checkArgNames(d6bSrc);
+    const srcNames = checkArgNames(docsSrc);
+    const extraNames = reg.assertions.filter(n => !d2Names.includes(n));
+    const notInSrc = reg.assertions.filter(n => !srcNames.includes(n));
+    const d2AllRegistered = d2Names.length > 0 && d2Names.every(n => reg.assertions.includes(n));
+    const extraInD6b = extraNames.every(n => d6bNames.includes(n));
+    t.check('已登记偏差的断言名 = docs-check 源码 `check(` 的**第一个实参**（逐字、按值：D2 段整段在册'
+      + ' ＋ 不在 D2 段的登记名必须落在 D6b 段；`E30②` 2026-10-06 登记后本判据的对象随之扩容）',
+      notInSrc.length === 0 && d2AllRegistered && extraInD6b && d6bNames.length > 0 &&
+      JSON.stringify(d2Names) === JSON.stringify(d2NamesFlat) && d6bHits === 1 && d7Hits === 1,
+      `源码取到 ${srcNames.length} 个 check 名；登记 ${reg.assertions.length} 条`
+        + `（D2 段 ${d2Names.length} 条 ＋ 非 D2 段 ${extraNames.length} 条）；`
+        + `逐字未命中 ${notInSrc.length} 条${notInSrc.length ? `：${JSON.stringify(notInSrc)}` : ''}`
+        + `｜D2 段全在册=${d2AllRegistered}｜非 D2 段登记名落在 D6b 段=${extraInD6b}`
+        + `（D6b 段实有 ${d6bNames.length} 条）｜取数器在 D2 段复现历史正则=`
+        + `${JSON.stringify(d2Names) === JSON.stringify(d2NamesFlat)}`
+        + `｜锚点自证：${JSON.stringify(D6B_ANCHOR)} 命中 ${d6bHits} 处、${JSON.stringify(D7_ANCHOR)} 命中 ${d7Hits} 处（各须 1）`);
 
     /* ③ 独立实算：按 D2 的两条规则把 `git log` 的主题重新数一遍。
        规则参数（类型表、字数上限）从 docs-check 源码里读 —— 免得"两处各写一份规则"再次漂移。 */
@@ -6283,9 +6584,18 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       const tooLong = subjects.filter(s => s.replace(/^[^:]+:\s*/, '').length > lenLimit);
       const failedRules = (badPrefix.length ? 1 : 0) + (tooLong.length ? 1 : 0);
       const listed = badPrefix.length + tooLong.length;
-      t.check('已登记偏差的**失败断言数** = git 历史实算（D2 两条断言各失败一条 → 2）',
-        failedRules === reg.failedAssertions,
-        `实算 ${failedRules} 条失败断言（缺前缀 ${badPrefix.length} 条 / 超 ${lenLimit} 字 ${tooLong.length} 条），常量写 ${reg.failedAssertions}`);
+      /* `E30②` 于 2026-10-06 登记后，常量的 `failedAssertions` **不再等于** git 实算的 D2 规则失败数
+         —— 多出来的那 1 条来路是 `输出文件\` 面的版本偏差，`git log` 里根本没有它。故本条的**对象**
+         由"常量总数"改成"常量里**属于 D2 段**的那几条"（条数由源码现算，不手抄）：
+         git 实算 = D2 段登记数 ⇒ ① D2 侧不许少登记（删掉一条 D2 断言即红）；②"数字改大就默默多豁免"
+         照样被挡 —— 多出来的每一条都必须在源码里逐字找到对应 `check(`，这一半由上面 ② 守。 */
+      const d2Registered = reg.assertions.filter(n => d2Names.includes(n));
+      t.check('已登记偏差里**属于 D2 段**的失败断言数 = git 历史实算（' + d2Registered.length
+        + ' 条 D2 断言各失败一条 → ' + d2Registered.length + '）',
+        failedRules === d2Registered.length,
+        `实算 ${failedRules} 条失败断言（缺前缀 ${badPrefix.length} 条 / 超 ${lenLimit} 字 ${tooLong.length} 条），`
+          + `D2 段登记断言 ${d2Registered.length} 条（占登记总数 ${reg.failedAssertions} 条；`
+          + `非 D2 段的 ${reg.assertions.length - d2Registered.length} 条由上面 ② 逐字核）`);
       /* ⚠ `E173`（2026-10-05，4b `T-20261005-12`）：本条的**标题里原本手写着三个数字**
          （"9 条缺前缀 + 4 条超字数 → 13"）—— 那是**没人核的常量**：`2c4f594` 那笔一出现，标题就与实算（14）不符，
          而它**不影响判据**（判据比的是 `listed === reg.listedItems`）⇒ 正是 `E156`／`E158` 同族
@@ -6302,12 +6612,15 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       summary: failed === null ? null : { passed: 0, failed, skipped: 0 }, out: out || '' });
     const failList = (...names) => '=== 汇总 ===\r\n通过 0 项，失败 ' + names.length + ' 项，跳过 0 项\r\n' +
       '\r\n失败清单：\r\n' + names.map((n, i) => `  ${i + 1}. ${n} —— 详情`).join('\r\n') + '\r\n';
-    const a1 = reg.assertions[0], a2 = reg.assertions[1];
+    /* 夹具**现算**（D19）：`...reg.assertions` 把登记名单里**全部**断言名铺进失败清单 ——
+       `E30②` 于 2026-10-06 登记后登记数 2 → 3，写死 `a1,a2` 会让"失败数＝登记数"那一行
+       只列 2 条（形态与真跑不再同形）。下面"换了断言继续失败"那一支仍只用 `a1`。 */
+    const a1 = reg.assertions[0];
     const cases = [
       ['docs-check 失败数 = 登记数、断言名全在册 → 不阻止',
-        [row('docs-check', 'failed', reg.failedAssertions, failList(a1, a2))], []],
+        [row('docs-check', 'failed', reg.failedAssertions, failList(...reg.assertions))], []],
       ['docs-check 失败数 > 登记数 → 阻止（不许用旧偏差掩盖新问题）',
-        [row('docs-check', 'failed', reg.failedAssertions + 1, failList(a1, a2, '新加的 D2 断言'))], ['docs-check']],
+        [row('docs-check', 'failed', reg.failedAssertions + 1, failList(...reg.assertions, '新加的 D2 断言'))], ['docs-check']],
       ['docs-check 条数没变但**换了断言**（出现未登记断言名）→ 阻止',
         [row('docs-check', 'failed', reg.failedAssertions, failList(a1, '新加的 D2 断言'))], ['docs-check']],
       ['docs-check 有输出却读不到失败清单（拿不出"已登记"的证据）→ 阻止',
@@ -6321,10 +6634,10 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
       ['其他脚本失败 → 阻止',
         [row('db-check', 'failed', 6, '')], ['db-check']],
       ['已登记的 docs-check + 别的脚本失败 → 只报未登记的那个',
-        [row('docs-check', 'failed', reg.failedAssertions, failList(a1, a2)), row('screenshot-diff', 'failed', 1, '')],
+        [row('docs-check', 'failed', reg.failedAssertions, failList(...reg.assertions)), row('screenshot-diff', 'failed', 1, '')],
         ['screenshot-diff']],
       ['浏览器跳过 + 已登记的 docs-check → 都不阻止',
-        [row('browser-check', 'skipped', 0, ''), row('docs-check', 'failed', reg.failedAssertions, failList(a1, a2))], []]
+        [row('browser-check', 'skipped', 0, ''), row('docs-check', 'failed', reg.failedAssertions, failList(...reg.assertions))], []]
     ];
     const badCases = cases.filter(([, rows, want]) =>
       JSON.stringify(runAll4.authorityBlockers(rows)) !== JSON.stringify(want));
@@ -6337,7 +6650,7 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
     /* 反向单列一条：这是 P3-6 的要害 —— "旧偏差掩盖新问题"必须被挡下 */
     t.check('反向：docs-check 失败数超过登记数时必须出现在 blockers 里（防"用旧偏差掩盖新问题"）',
       runAll4.authorityBlockers([row('docs-check', 'failed', reg.failedAssertions + 1,
-        failList(a1, a2, '新加的 D2 断言'))]).includes('docs-check'),
+        failList(...reg.assertions, '新加的 D2 断言'))]).includes('docs-check'),
       `登记数 ${reg.failedAssertions}，实跑多 1 条 → 必须阻止比对`);
 
     /* ⑤ "未执行比对"的两个分支必须写明原因与涉及脚本名（P3-6 的另一半：跳过必须显式）
@@ -6350,7 +6663,7 @@ t.section('十一、已登记偏差登记数与本机实算一致（P3-6：豁�
     const allSuites4 = runAll4.SUITES.map(s => s.name);
     const fullRun = (overrides) => allSuites4.map(n => overrides[n] || row(n, 'passed', 0, ''));
     const blocked = runAll4.verifyAuthorityTotals({ passed: 1 }, fullRun({
-      'docs-check': row('docs-check', 'failed', reg.failedAssertions + 1, failList(a1, a2, '新加的 D2 断言')),
+      'docs-check': row('docs-check', 'failed', reg.failedAssertions + 1, failList(...reg.assertions, '新加的 D2 断言')),
       'db-check': row('db-check', 'failed', 6, '')
     }));
     t.check('账目不完整时：比对**未执行**，且详情写明原因与涉及脚本名（不得只留一句"未核对"）',
@@ -7097,7 +7410,7 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
 
   /* 夹具一律**现算**：脚本名／失败断言名／条数全从导出的 `REGISTERED_DEVIATIONS` 取（D19）。 */
   const regDocs = runAll6.REGISTERED_DEVIATIONS['docs-check'];
-  const docsOut = ['=== 汇总 ===', '通过 41 项，失败 2 项，跳过 0 项', '失败清单：']
+  const docsOut = ['=== 汇总 ===', '通过 41 项，失败 ' + regDocs.failedAssertions + ' 项，跳过 0 项', '失败清单：']
     .concat(regDocs.assertions.map((n, i) => `  ${i + 1}. ${n} —— 登记偏差`)).join('\n');
   const docsDev = over => Object.assign({ suite: { name: 'docs-check' }, status: 'failed',
     summary: { passed: 41, failed: regDocs.failedAssertions, skipped: 0 }, out: docsOut }, over);
@@ -7118,20 +7431,28 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
     extra: v => v.line === GREEN_LINE
   };
   const E180_ROW_REG = {
-    id: '②失败全是已登记偏差 且 实测 2 ≤ 预算 2 ⇒ registered-only',
+    id: '②失败全是已登记偏差 且 实测 ' + regDocs.failedAssertions + ' ≤ 预算 '
+      + runAll6.registeredDeviationBudget() + ' ⇒ registered-only',
     mk: () => ({ failedSuites: [docsDev()], unverifiedSuites: [] }),
     expect: 'registered-only',
     extra: v => v.line.includes(E180_TOKEN) && v.line.includes(E180_REG_SUBSTR) && v.line.includes(E180_HELD)
   };
   const E180_ROW_BUDGET = {
-    id: '③承重支：同脚本 2×2 ⇒ 实测 4 > 预算 2 ⇒ real（不得被说成「已登记」）',
+    id: '③承重支：同脚本 2×' + regDocs.failedAssertions + ' ⇒ 实测 '
+      + (2 * regDocs.failedAssertions) + ' > 预算 ' + runAll6.registeredDeviationBudget()
+      + ' ⇒ real（不得被说成「已登记」）',
     mk: () => ({ failedSuites: [docsDev(), docsDev()], unverifiedSuites: [] }),
     expect: 'real',
     extra: v => !v.line.includes(E180_REG_SUBSTR)
   };
   const E180_ROW_MEASURED = {
-    id: '③承重支（注入面）：measuredDeviations=3 > 预算 2 ⇒ real',
-    mk: () => ({ failedSuites: [docsDev()], unverifiedSuites: [], measuredDeviations: 3 }),
+    /* ⚠ 注入值必须**现算**（`E173` 同族：手写数字会腐烂）：`failedAssertions` 2 → 3 之后，
+       原先写死的 `3` 会**恰好等于**预算 ⇒ 这一支从"实测超出登记名单"退化成态②，
+       "承重对象"就没人守了。故改成 `预算 ＋ 1`（判据强度不变：仍然要求 measured > budget）。 */
+    id: '③承重支（注入面）：measuredDeviations=' + (runAll6.registeredDeviationBudget() + 1)
+      + ' > 预算 ' + runAll6.registeredDeviationBudget() + ' ⇒ real',
+    mk: () => ({ failedSuites: [docsDev()], unverifiedSuites: [],
+      measuredDeviations: runAll6.registeredDeviationBudget() + 1 }),
     expect: 'real',
     extra: v => !v.line.includes(E180_REG_SUBSTR)
   };
@@ -7223,7 +7544,8 @@ t.section('十四、最终退出码的组合判据（有 FAIL 不得退 0／"门
       + ` vs 纯函数 ${JSON.stringify(e180RealFn)}｜同值=${e180RealLit === e180RealFn}`);
 
   /* ---------------- D22 定点变异㈠：`registeredDeviationBudget()` 改成恒大值 ----------------
-     承重对象＝真值表那条 **③承重支**（`E180_ROW_BUDGET`）：实测 4 条 > 预算 2 条必须落 `real`。
+     承重对象＝真值表那条 **③承重支**（`E180_ROW_BUDGET`）：同脚本两条失败 ⇒ 实测条数（2×登记数）
+     大于预算条数，必须落 `real`。
      变异一旦生效，"多出来的失败"就能被说成"已登记偏差" —— 正是"把真失败伪装成已登记"的口子。
      变异锚点＝ASCII 的 `function registeredDeviationBudget() {`（自证恰 1 次；裸函数名在注释里出现多次，
      故锚点必须带 `function` 与 `() {` 才唯一）。 */
@@ -12903,7 +13225,8 @@ t.section('二十五、`E183` 台账渲染器：产物无 TAB/控制字符 ＋ �
        并用**合成序列**证伪"超集构造"本身（`min` 封顶会漂、`COUNT(*)` 不去重会漂）。
      · **⑥ `addRunSec ≤ runSec` 上界耦合**（裁定：**加门禁守不变量、不改算式**）。
      · **⑦ `E70` 门禁卫生**：只做**可判定**的那半（`logic-check` 的 `byMeasures(n)` 消歧 ＋ 与
-       `stats.js` 的补集口径逐点对账）；`E70①` **未做**（理由见回执"未验到/偏差"）。
+       `stats.js` 的补集口径逐点对账）；`E70①` 的**临时副本**改造已于 2026-10-03 落地
+       （`T-20261003-08` 甲组，见 §十），**运行期写点监测 ＋ D22** 由 `T-20261006-18` 补齐（同见 §十）。
      · **⑧ harness「真计数②③④」的定点变异**：把§十五那三条判据的**判据式子**逐字抽出来喂合成现场。
    本段全部在**进程内**做（一用例一库；不真起服务 ⇒ 不占端口、不写生产目录）。 */
 
@@ -13172,7 +13495,8 @@ t.section('二十六、`E72①⑥⑦⑧`（开工数跨实现可证伪／`addRun
     deadBranchFactE70 && byMeasuresE70(0) === 0 && byMeasuresE70(1) === 0 && byMeasuresE70(2) === 1,
     `\`byMeasures(\` 消歧出口在册=${hasByMeasuresE70}；逐点读数：${pointsE70}；` +
     `立案处"字面空数组 ＋ 未传 measures"结构事实在册=${deadBranchFactE70}；` +
-    '**未做**：`E70①`（`harness-check` §十 运行期改写受管 `tests\\README.md`）—— 见回执"未验到/偏差"');
+    '`E70①` 已于 2026-10-03（`T-20261003-08` 甲组）改成**受控副本 ＋ 读数重定向**，' +
+    '并在 2026-10-06（本包 `T-20261006-18`）补上**运行期写点监测**与 D22（见 §十 `E70①` 两条断言）');
 
   try { e72Tmp.db.close(); } catch { /* 已关 */ }
   try { harness.removeLinkSafe(e72Tmp.dir, { recursive: true, force: true }); } catch { /* 已删 */ }

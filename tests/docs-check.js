@@ -677,6 +677,242 @@ async function main() {
       : dateRow === '' ? `找不到「| 编制日期 |」行（${reqListRel}）`
         : `最新登记 V${latestDated || '（无）'} ≠ 文件名 V${reqListVer}${curBold ? '' : `；且当前版本未写成「**V${reqListVer} 修订于 …**」`}（行内登记：${datedVers.join('、') || '无'}）`);
 
+
+  /* ===== D6b 对外函件／设计说明书的**版本一致性**（`E30`） =====
+     立案（`E30`，2026-09-27 由 T5 补 D6 时一并报出、主代理复核）：需求清单**自身**的"改名必修项"已有 5 条断言
+     （上面 D6），但**对外交付文档**这一层仍有两处空洞：①设计说明书的「文档版本」行与**文件名版本**无绑定；
+     ②各收件方**最新一批函件**的「依据文件」行写的是**哪个需求版本**没有任何机器判据
+     （`E30` 立案时的实测：`需求确认函`／`接口需求函`／`MES 澄清函` 写 V1.27、设计说明书依据 V1.30、
+     `MES 澄清函（第二批）`写 V1.31、上位机第二批函件写 V1.37 —— 而当前基线是 V1.44）。
+     ③已发出的**历史函件不宜断言**（属历史件，只能人工核对）⇒ 本段只断「**最新一批**」。
+     **口径**（与 6.1「提交信息不写易变数字」同精神：不钉死版本串，版本号从需求清单**文件名**现取）：
+       · 对每个收件方目录，取「最后修改时间最新」的那份**函件**（＝最新一批；与文件内容里的日期无关）；
+       · 两条可机器判定的事实：⒜ 它**声明了**需求基线版本（「依据文件」行里有 `V<主>.<次>`）；
+         ⒝ 各收件方**最新一批互相一致**（同一批交付引用同一条基线 —— 不一致就是"这批里有的函件
+         拿旧基线编的"，正是 `E30` 要防的漂移，而且它**不依赖**"输出文件\ 今天是否已随基线升版"）。
+       · **与"当前基线"是否相等**单独作为**读数**打印并如实注明，**不作断言** —— 详见 `E30-GAP` 那一段。
+     ⚠ `输出文件\` 是**交付物面**：本段**只读**（含 D22 变异，全部走 `._verify` 下的副本）—— `E30③`。 */
+
+  /** `[INFO]` 读数行（本文件既有形态；`check()` 只打 PASS/FAIL） */
+  const infoE30 = msg => console.log('  [INFO] ' + msg);
+
+  /* ① 设计说明书：「文档版本」行 ＝ **文件名版本**（与 D6 的"改名必修项"同域，对象换成对外说明书） */
+  const designRel = '输出文件/甲方/水池高速摄像生产管理看板-系统设计说明书-V1.0.md';
+  const designText = readText(designRel);
+  const designFileVer = (designRel.match(/-V(\d+\.\d+)\.md$/) || [])[1];
+  const designVerRowM = designText.match(/^\|\s*文档版本\s*\|([^\n]*)\|\s*$/m);
+  const designVerRow = designVerRowM ? designVerRowM[1] : '';
+  const designRowVer = (designVerRow.match(/V(\d+\.\d+)/) || [])[1];      /* 该格里的**第一个**版本次号 */
+  check('对外：`输出文件\\甲方\\…-系统设计说明书-V<版本>.md` 的「文档版本」行 ＝ **文件名版本**' +
+    '（`E30①`；只断"两处一致"，不钉死某个版本串 ⇒ 以后升版只需这两处相符）',
+    designFileVer !== undefined && designRowVer !== undefined && designRowVer === designFileVer,
+    designFileVer === undefined ? `文件名里找不到「-V<主>.<次>.md」版本（${designRel}）`
+      : designVerRowM === null ? `找不到「| 文档版本 |」行（${designRel}）`
+        : `「文档版本」写 V${designRowVer} ≠ 文件名 V${designFileVer}（${designRel}）—— 改名升版本时这一处漏改`);
+
+  /* ② 最新一批对外函件：「依据文件」行的需求基线版本「有声明 ＋ 本批内一致」 */
+  const extBaseEnv = process.env.DSH_DC_EXT_BASE_OVERRIDE;    /* 仅 D22 用：把 `输出文件` 换成本地副本 */
+  const extBase = extBaseEnv || path.join(ROOT, '输出文件');
+  /* **函件**的判据：按**文件名**认函件（`函`／`确认书`），其余 `.md`（提纲、附件、设计说明书等）
+     不算"致某方的函件"，但要作为**读数**列出来 —— 否则"某目录最新那份不是函件"会被静默跳过。 */
+  const LETTER_NAME_RE = /函|确认书/;
+  const EXCLUDE_EXT_DIR = /^(离线部署与体检包-|交付物提纲-)/;
+  /* ⚠ **绝对路径与相对路径都要能当 `base`**（D22 的副本是绝对路径）：
+     `path.join(ROOT, '/abs/path')` 会拼成 `ROOT/abs/path`（**不是**取绝对路径）—— 实测踩过：
+     副本扫描因此恒空、变异"看起来没生效"。故这里统一走 `absOf()`。 */
+  const absOf = p => (path.isAbsolute(p) ? p : path.join(ROOT, p));
+  const relOf = abs => path.relative(ROOT, abs).split(path.sep).join('/');
+  const listDirAbs = abs => {
+    try { return fs.readdirSync(abs, { withFileTypes: true }); } catch { return []; }
+  };
+  const readAbs = abs => {
+    try { return fs.readFileSync(abs, 'utf8'); } catch { return null; }
+  };
+  /* ⚠ 取"最新"时用**绝对路径**消解同毫秒并列（`E113` 同族：不让"取哪一份"随文件系统抖动） */
+  const newestIn = (dirAbs, filter) => {
+    const cand = listDirAbs(dirAbs)
+      .filter(e => e.isFile() && filter(e.name))
+      .map(e => {
+        const abs = path.join(dirAbs, e.name);
+        let mtimeMs = 0;
+        try { mtimeMs = fs.statSync(abs).mtimeMs; } catch { mtimeMs = 0; }
+        return { abs, rel: relOf(abs), mtimeMs };
+      })
+      .sort((a, b) => (a.mtimeMs - b.mtimeMs) || a.abs.localeCompare(b.abs));
+    return cand.length ? cand[cand.length - 1] : null;
+  };
+  /** 单份函件的判据（**纯函数**，供 D22 复用）：`{rel, declared, vers, ok, detail}` */
+  const letterVersionVerdict = (rel, text, currentVer) => {
+    const line = String(text || '').split('\n').find(l => /^\|\s*依据文件\s*\|/.test(l)) || '';
+    const vers = [...line.matchAll(/V(\d+\.\d+)/g)].map(m => m[1]);
+    const declares = vers.length > 0;
+    const hasCurrent = currentVer !== undefined && vers.includes(currentVer);
+    return { rel, declared: declares, hasCurrent, vers,
+      ok: line !== '' && hasCurrent,
+      detail: line === '' ? '没有「依据文件」行'
+        : !declares ? '「依据文件」行里没有 `V<主>.<次>` 版本号'
+          : hasCurrent ? `依据文件行含当前基线 V${currentVer}`
+            : `依据文件行写的是 V${vers.join('/')} ≠ 当前需求基线 V${currentVer}` };
+  };
+  /** 扫一遍（`baseAbs` 可被 D22 覆盖）——**判据与读数同源**，不另立第二份取数。 */
+  const scanNewestLetters = (baseAbs) => {
+    const dirs = listDirAbs(baseAbs).filter(e => e.isDirectory() && !EXCLUDE_EXT_DIR.test(e.name))
+      .map(e => e.name).sort();
+    const rows = [];
+    for (const d of dirs) {
+      const dirAbs = path.join(baseAbs, d);
+      const newestAny = newestIn(dirAbs, n => n.endsWith('.md'));
+      const newestLetter = newestIn(dirAbs, n => n.endsWith('.md') && LETTER_NAME_RE.test(n));
+      const text = newestLetter ? readAbs(newestLetter.abs) : null;
+      rows.push({ dir: d, newestAny: newestAny ? newestAny.rel : null,
+        newestLetter: newestLetter ? newestLetter.rel : null,
+        verdict: newestLetter ? letterVersionVerdict(newestLetter.rel, text, reqListVer) : null,
+        isLetter: newestAny !== null && newestLetter !== null && newestAny.abs === newestLetter.abs });
+    }
+    const verdicts = rows.filter(r => r.verdict).map(r => r.verdict);
+    const declared = verdicts.filter(v => v.declared);
+    const distinct = [...new Set(declared.flatMap(v => v.vers))].sort();
+    return { base: relOf(baseAbs), dirs, rows, verdicts, declared, distinct,
+      consistent: distinct.length === 1,
+      notLetterRows: rows.filter(r => !r.isLetter) };
+  };
+  const e30Scan = scanNewestLetters(absOf(extBase));
+  const NO_EXT_MD = `收件方目录里找不到任何 .md（扫描面=${e30Scan.base}\\；目录=${e30Scan.dirs.join('、') || '无'}）`;
+  const notLetterNote = e30Scan.notLetterRows.length
+    ? `；⚠ 这些目录里"最新那份不是函件"（该目录最新 .md=${e30Scan.notLetterRows.map(r => r.newestAny).join('、')}，` +
+      `本段按函件口径取的是 ${e30Scan.notLetterRows.map(r => r.newestLetter || '（该目录无函件）').join('、')}）`
+    : '';
+  check('对外：`输出文件\\` 下**各收件方目录**里"最后修改时间最新"的那份**函件**，其「依据文件」行含**当前需求基线版本号**' +
+    '（`E30②`：基线从需求清单**文件名**现取 ⇒ 升版后本条自动跟随，不钉死版本串；`E30③` 历史函件不改）',
+    reqListM !== null && e30Scan.verdicts.length > 0 && e30Scan.verdicts.every(v => v.ok) &&
+    e30Scan.declared.length === e30Scan.verdicts.length,
+    reqListM === null ? NO_REQ_MD
+      : e30Scan.verdicts.length === 0 ? NO_EXT_MD
+        : e30Scan.verdicts.filter(v => !v.ok).map(v => `${v.rel}：${v.detail}`).join('；') + notLetterNote);
+
+  /* `E30-GAP`（**读数**，与上面的断言**同源**、不另立取数）：最新一批引用的基线 vs 当前需求基线。
+     ⚠ **本段当前的预期状态就是"红"**（如实登记，别把它读成"判据写坏了"）：
+     盘上最新一批函件**确实**是旧的 —— MES 第二批 V1.31、上位机第二批 V1.37，而当前基线是 **V1.44**
+     ⇒ 断言按 `E30` 的口径判红，并**逐文件指名**。修它要改 `输出文件\**`（**交付物面**，本包无写权限、
+     也不许把交付件改绿来迎合判据）⇒ 这是**交付面的待升版事项**，不是判据缺陷。
+     升版之后本读数与断言都会自然变绿（**没有**需要改判据的动作）。 */
+  {
+    const gapVers = e30Scan.distinct.filter(v => v !== reqListVer);
+    infoE30(`E30-GAP 读数：最新一批函件引用的需求基线=${e30Scan.distinct.join('、') || '（无）'}；` +
+      `当前需求基线 **V${reqListVer}**（取自 ${reqListRel}）；` +
+      (gapVers.length ? `⇒ 差异 ${gapVers.map(v => 'V' + v).join('、')} ≠ V${reqListVer}（**交付面待升版**）`
+        : '⇒ 两边一致'));
+  }
+
+  /* ③ 判据自身**可假**（`D23` 反面）：好样本与坏样本在**同一函数**上必须给出不同判定方向
+     （否则"零命中"可能只是判据没工作）。 */
+  const gfGood = letterVersionVerdict('（合成：含当前基线）', '| 依据文件 | 《详细需求清单 V1.44》；贵方《接口定义》 |', '1.44');
+  const gfNoVer = letterVersionVerdict('（合成：无版本号）', '| 依据文件 | 《详细需求清单》；贵方《接口定义》 |', '1.44');
+  const gfNoRow = letterVersionVerdict('（合成：无该行）', '（本函没有那一行）', '1.44');
+  const gfOldVer = letterVersionVerdict('（合成：旧版本号）', '| 依据文件 | 《详细需求清单 V1.27》 |', '1.44');
+  check('`E30` 判据自证（`D23` 反面）：同一判据对"依据文件行含**当前基线**"判绿、对"写旧版本号"／"没有版本号"／' +
+    '"压根没有这一行"三种形态判红并**指名**（防"零命中"其实来自判据根本没在工作）',
+    gfGood.ok === true && gfOldVer.ok === false && gfNoVer.ok === false && gfNoRow.ok === false &&
+    gfOldVer.detail.includes('1.27') && gfNoVer.detail.includes('没有') && gfNoRow.detail.includes('没有'),
+    `含当前基线 ok=${gfGood.ok}；旧版本号 ok=${gfOldVer.ok}（${gfOldVer.detail}）；` +
+    `无版本号 ok=${gfNoVer.ok}（${gfNoVer.detail}）；无该行 ok=${gfNoRow.ok}（${gfNoRow.detail}）`);
+
+  /** `输出文件\` 全部 .md 的字节指纹（用于"变异没动真文件"的自证；逐文件 sha12 拼接） */
+  const extDirsSig = () => {
+    const crypto = require('node:crypto');
+    const parts = [];
+    for (const r of e30Scan.rows) {
+      const dirAbs = path.join(absOf(extBaseEnv || '输出文件'), r.dir);
+      let names = [];
+      try { names = fs.readdirSync(dirAbs).sort(); } catch { continue; }
+      for (const n of names) {
+        if (!n.endsWith('.md')) continue;
+        try {
+          parts.push(`${r.dir}/${n}@`
+            + crypto.createHash('sha256').update(fs.readFileSync(path.join(dirAbs, n))).digest('hex').slice(0, 12));
+        } catch { /* 忽略 */ }
+      }
+    }
+    return parts.join('|');
+  };
+
+  /* `D22` 变异①：把**最新那份函件**里的 `V<主>.<次>` 全换成另一个值 ⇒ **"本批一致"必红并指名它**
+     （读数重定向到 `._verify` 下的副本；`输出文件\` 一个字节都不动 —— 由下面的字节指纹自证）。 */
+  const E30_MUT_VER = 'V9.9';
+  const withExtOverride = (muts, tag) => {
+    const copyBase = path.join(TMP, `e30-ext-${tag}-${process.pid}`);
+    /* ⚠ 递归删**必须**走 `env.removeLinkSafe`（`E161-A①`／`E103-B①`：`fs.rmSync(…,{recursive:true})`
+       在受管面里是 A 档违规 —— 实测把我第一版点红了 2 处）。副本是自己刚建的普通目录，走它零风险。 */
+    env.removeLinkSafe(copyBase, { recursive: true, force: true });
+    for (const r of e30Scan.rows) {
+      const srcDir = path.join(absOf(extBaseEnv || '输出文件'), r.dir);
+      const dstDir = path.join(copyBase, r.dir);
+      fs.mkdirSync(dstDir, { recursive: true });
+      for (const e of fs.readdirSync(srcDir, { withFileTypes: true })) {
+        if (!e.isFile()) continue;
+        const key = `${r.dir}/${e.name}`;
+        const mut = muts[key];
+        fs.writeFileSync(path.join(dstDir, e.name),
+          mut === undefined ? fs.readFileSync(path.join(srcDir, e.name)) : Buffer.from(mut, 'utf8'));
+      }
+    }
+    process.env.DSH_DC_EXT_BASE_OVERRIDE = copyBase;
+    let scan = null, threw = null;
+    try { scan = scanNewestLetters(copyBase); } catch (err) { threw = err; }
+    delete process.env.DSH_DC_EXT_BASE_OVERRIDE;
+    env.removeLinkSafe(copyBase, { recursive: true, force: true });
+    return { scan, threw };
+  };
+  {
+    /* 变异对象＝**最新那份函件**（跨全部收件方取 mtime 最新；与 `E30②` 的"每个目录各取一份"同源事实） */
+    const newestOverall = e30Scan.rows.filter(r => r.newestLetter)
+      .map(r => r.newestLetter)
+      .map(rel => ({
+        rel,
+        m: (() => { try { return fs.statSync(path.join(ROOT, ...rel.split('/'))).mtimeMs; } catch { return 0; } })()
+      }))
+      .sort((a, b) => (a.m - b.m) || a.rel.localeCompare(b.rel)).pop();
+    /* 变异键＝**目录/文件名**（与 `withExtOverride` 的 key 同形，两边不共用 `输出文件/` 前缀） */
+    const mutKey = newestOverall ? newestOverall.rel.split('/').slice(1).join('/') : null;
+    const mutText = newestOverall ? String(readAbs(path.join(ROOT, ...newestOverall.rel.split('/'))))
+      .replace(/V\d+\.\d+/g, E30_MUT_VER) : '';
+    const sigBefore = extDirsSig();
+    const mm = mutKey ? withExtOverride({ [mutKey]: mutText }, 'd22-a') : { scan: null, threw: null };
+    const sigAfter = extDirsSig();
+    const bad = mm.scan ? mm.scan.verdicts.filter(v => !v.ok).map(v => v.rel) : [];
+    /* 变异体**真的生效**的读数（**不靠路径匹配**：`split('/').slice(1).join('/')` 与扫描侧的
+       `path.relative` 在 Windows 上未必逐字同形 —— 直接看"突变值是否出现在任何一份 verdict 里"）。 */
+    const mutEffective = Boolean(mm.scan && mm.scan.distinct.includes(E30_MUT_VER.slice(1)) &&
+      !mm.scan.verdicts.some(v => v.hasCurrent));
+    check('`E30`-`D22` 变异①（**读数重定向到副本**）：把最新那份函件里所有 `V<主>.<次>` 换成 `' + E30_MUT_VER + '` ⇒ ' +
+      '② 的判据**必红并指名该文件**（＝这条对账真的在读函件、且在比版本号，不是恒真式）；' +
+      '`输出文件\\**` 与需求清单**逐字节不变**',
+      newestOverall !== null && mm.threw === null && mm.scan !== null && mutEffective &&
+      bad.length > 0 && sigBefore === sigAfter,
+      newestOverall === null ? '没找到任何"最新一批函件"（② 已在逐目录指名）'
+        : `变异对象=${newestOverall.rel}；变异已生效=${mutEffective}（突变值 ${E30_MUT_VER} 出现在各函件版本=${JSON.stringify(mm.scan ? mm.scan.distinct : null)} 里）；` +
+          `判红文件=[${bad.join('、') || '（无）'}]；` +
+          `本批一致=${mm.scan ? mm.scan.consistent : '—'}；` +
+          `输出文件\\** 字节指纹不变=${sigBefore === sigAfter}${mm.threw ? `；抛出 ${mm.threw.message}` : ''}`);
+  }
+
+  /* `D22` 变异②：把设计说明书的「文档版本」格改成另一个版本串 ⇒ ① 必红并**指名该文件**（副本变异）。 */
+  const designCopy = path.join(TMP, `e30-design-${process.pid}`, '系统设计说明书-V1.0.md');
+  fs.mkdirSync(path.dirname(designCopy), { recursive: true });
+  fs.writeFileSync(designCopy, designText.replace(/^(\|\s*文档版本\s*\|)([^\n]*)\|/m,
+    (_m, a) => `${a} **V9.9（变异）** |`), 'utf8');
+  {
+    const mutText = fs.readFileSync(designCopy, 'utf8');
+    const mutRowVer = (mutText.match(/^\|\s*文档版本\s*\|([^\n]*)\|\s*$/m) || [, ''])[1].match(/V(\d+\.\d+)/);
+    const diskSame = fs.readFileSync(path.join(ROOT, designRel), 'utf8') === designText;
+    check('`E30`-`D22` 变异②（**副本变异**）：把设计说明书的「文档版本」改成 `V9.9`（≠ 文件名 `V' +
+      (designFileVer || '?') + '`）⇒ ① 的判据必红并**指名该文件**；盘上真文件逐字节不变',
+      mutRowVer !== null && mutRowVer[1] === '9.9' && mutRowVer[1] !== designFileVer && diskSame,
+      `变异后「文档版本」=V${mutRowVer ? mutRowVer[1] : '（取不到）'}、文件名=V${designFileVer}；` +
+      `盘上真文件未变=${diskSame}（${designRel}）`);
+    env.removeLinkSafe(path.dirname(designCopy), { recursive: true, force: true });
+  }
+
   /* ===== D7 提交信息偏差登记名单（`E173`：偏差**计数**也是断言） =====
      【为什么"容许失败"的机制必须有计数守据（本段立案句）】
      D2 的两条断言判的是"**当前每一条提交都合规**"，于是它们对**已登记的历史偏差**永久失败。

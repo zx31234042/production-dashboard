@@ -1317,6 +1317,129 @@ async function main() {
     legacyUid.close();
   }
 
+
+/* ---------------- `E75④`：**缺列形态**的**运行期**覆盖（静态正方向的补集） ----------------
+   立案（`E75④`，2026-10-01 由座位 5 在 C·12.4/C·12.8 登记）：下面那节（`六之九`）只看**静态正方向** ——
+   "`schema.sql` 里基线之外的列 ⇒ 必须能在 `STRUCTURE_UPGRADES` 里找到步骤"。
+   它**判不出**下面这类**已经分化**的库：正本与步骤都在，而**库里的列集**少了一列
+   （`E71`／`E73`／`E74` 三例的第 3 型失败：老库升级"成功"，但某一列从没补上）——
+   这种库在 `verifySchemaConsistency()` 眼里仍是 `ok:true`（它只比**指纹与版本**、**不比列集**），
+   于是"门禁全绿、第一次真实写入才炸"。故本条补**运行期**判据：真临时库 ＋ 真 `initSchema()` ＋
+   **真生产写入口**，并配 `D22`（缺列的变异 ⇒ 写入必抛 `no such column` 并**指名列名**）。
+   选题：`op_log.team_code`（`DR-12`，有 `ADD COLUMN` 步骤 ⇒ 两步法干净可回退；`measure_rt.unit_index`
+   受 `ux_measure_rt` 索引牵连，`DROP COLUMN` 前要先删索引、噪声更大）。 */
+t.section('六之八之②、`E75④` 缺列形态的**运行期**覆盖（真库分化的第 3 型失败）');
+{
+  const missing = makeTempDb({ name: 'e75-missing-column' });
+  db.initSchema(missing.db, NOW);
+  /* 造"缺列形态"：跑完 `initSchema()` 之后再删掉一列 —— 这正是"现场老库从没补上那一列"的库内形态 */
+  missing.db.exec('DROP INDEX IF EXISTS ix_op_log_team');
+  missing.db.exec('ALTER TABLE op_log DROP COLUMN team_code');
+  const colsMissing = db.listColumns(missing.db, 'op_log');
+  const consist = db.verifySchemaConsistency(missing.db);
+  if (t.requires('`E75④` 前提：库内确实回到"缺 `op_log.team_code`"的形态，且库内版本已是当前版本',
+    !colsMissing.includes('team_code') && db.getSchemaVersion(missing.db) === SCHEMA_VERSION,
+    `列=[${colsMissing.join(', ')}]；库内版本=${db.getSchemaVersion(missing.db)}（当前 ${SCHEMA_VERSION}）`)) {
+    /* ① 证伪"版本/指纹能兜住"：这张库在一致性判据眼里**仍然是 ok**（所以缺列必须由别的判据兜） */
+    t.check('`E75④`：缺列形态的库在 `verifySchemaConsistency()` 眼里**仍是 `ok:true`**' +
+      '（它只比指纹与版本、**不比列集**）—— 这就是"门禁全绿、第一次写入才炸"的机制，' +
+      '也正是"静态正方向"兜不住的那一半（如实登记，不冒领）',
+      consist.ok === true && !colsMissing.includes('team_code'),
+      `verifySchemaConsistency=${JSON.stringify(consist)}；op_log 列=[${colsMissing.join(', ')}]`);
+    /* ② **运行期**判据：真生产写入口 `opLogRepo.append()` 在这张库上**必须失败且指名列名** */
+    let writeErr = null, wrote = null;
+    try {
+      wrote = opLogRepo.append(missing.db, { opTime: NOW, operator: '探针', opType: 'E75④',
+        content: '缺列形态', result: '成功', teamCode: 'B1' }, NOW);
+    } catch (err) { writeErr = err; }
+    t.check('`E75④`：缺列形态下**真生产写入口** `opLogRepo.append()` **必抛**，且错误文案**指名 `team_code`**' +
+      '（＝"运行期能证伪"，而不是只靠静态读正本；这条同时是 `E73`／`E74` 同族症状的可复跑复现）',
+      writeErr !== null && /team_code/.test(String(writeErr.message)) &&
+      /no such column|has no column named/i.test(String(writeErr.message)),
+      writeErr ? `抛出 ${writeErr.name}: ${writeErr.message}（写入返回=${JSON.stringify(wrote)}）`
+        : `**没有抛错**（写入返回=${JSON.stringify(wrote)}）—— 缺列形态没被抓住`);
+    /* ③ 反向补证：**把那一列补回去**（幂等步骤：同一条 `ADD COLUMN`）⇒ 同一写入口**必须成功**
+       （这一半证明②的红确实来自"缺列"，而不是"这条写入本来就不通"） */
+    missing.db.exec('ALTER TABLE op_log ADD COLUMN team_code TEXT');
+    missing.db.exec('CREATE INDEX IF NOT EXISTS ix_op_log_team ON op_log(team_code, op_time)');
+    let okErr = null, okWrote = null;
+    try {
+      okWrote = opLogRepo.append(missing.db, { opTime: NOW, operator: '探针', opType: 'E75④-补',
+        content: '补列后', result: '成功', teamCode: 'B1' }, NOW);
+    } catch (err) { okErr = err; }
+    t.check('`E75④` 反证：同一条 `ADD COLUMN team_code`（幂等补列步骤）补回该列 ⇒ **同一写入口成功**' +
+      '（⇒ 上面那条红确实来自"缺列"，不是"这条入口本来就不通"）',
+      okErr === null && Boolean(okWrote) && db.listColumns(missing.db, 'op_log').includes('team_code'),
+      okErr ? `补列后仍抛 ${okErr.name}: ${okErr.message}` : `补列后写入返回=${JSON.stringify(okWrote)}`);
+    /* ④ `D22`：**把"缺步骤"这条机制链整条跑一遍** —— 用 `server\db\index.js` 的**内存字节副本**
+       （`Module._compile`，先例 `E176①` D22 ㈠：锚点只取 ASCII、逐条自证恰 1 次、**盘上零字节改动**），
+       在副本里删掉 `op_log.team_code` 的 `ADD COLUMN` 那一步。
+       ⚠ **实测到的两种收场都要认**（本段第一版只写了"静默"，实测被自己的靶子纠正）：
+         · 该列**还有别的步骤依赖它**（这里是紧随其后的 `CREATE INDEX … ON op_log(team_code, …)`）
+           ⇒ `initSchema()` 在**建索引那一步**抛 `no such column: team_code` 并**整体回滚**（**响的**失败）；
+         · 若该列没有任何后续步骤依赖它 ⇒ `initSchema()` **静默成功**（版本升到当前、指纹一致、
+           `verifySchemaConsistency()` 仍 `ok:true`），列**永远补不上**（**静默**失败 —— 这才是 `E73`／`E74`
+           最危险的那一态，`E73` 当年的现场正是如此：`upload_log` 两列没有任何依赖步骤）。
+       两者的**共同点**（也正是本 D22 要钉的）＝**库最终都缺那一列，且第一次真实写入必炸并指名列名**。 */
+    const odbPath = path.join(__dirname, '..', 'server', 'db', 'index.js');
+    const odbSrc = fs.readFileSync(odbPath, 'utf8');
+    const E75D_ANCHOR = "  'ALTER TABLE op_log ADD COLUMN team_code TEXT',";
+    const e75dHits = odbSrc.split(E75D_ANCHOR).length - 1;
+    let odbMut = null;
+    if (e75dHits === 1) {
+      const ModuleCtorE75D = require('node:module');
+      const m = new ModuleCtorE75D(odbPath + '#e75d-mut', null);
+      m.filename = odbPath;
+      m.paths = ModuleCtorE75D._nodeModulePaths(path.dirname(odbPath));
+      m._compile(odbSrc.replace(E75D_ANCHOR, '  /* D22：该步骤被删（缺步骤形态） */'), m.filename);
+      odbMut = m.exports;
+    }
+    if (t.requires('`E75④`-`D22` 前提：能在 `server\\db\\index.js` 的内存副本里删掉 `team_code` 的补列步骤' +
+      '（锚点逐条自证恰 1 次）',
+      e75dHits === 1 && Boolean(odbMut) && typeof odbMut.initSchema === 'function' &&
+      odbMut.STRUCTURE_UPGRADES.length === db.STRUCTURE_UPGRADES.length - 1,
+      `锚点命中 ${e75dHits} 次（应 1）；原件步骤 ${db.STRUCTURE_UPGRADES.length} 条` +
+      `${odbMut ? ` ⇒ 副本 ${odbMut.STRUCTURE_UPGRADES.length} 条` : ''}`)) {
+      const d22Tmp = makeTempDb({ name: 'e75-missing-column-d22' });
+      db.initSchema(d22Tmp.db, NOW);                       /* 真 `db` 建"当前形态" */
+      d22Tmp.db.exec('DROP INDEX IF EXISTS ix_op_log_team');
+      d22Tmp.db.exec('ALTER TABLE op_log DROP COLUMN team_code');
+      let initErr = null, initRes = null;
+      try {
+        initRes = odbMut.initSchema(d22Tmp.db, NOW);        /* **副本**跑"缺步骤升级" */
+      } catch (err) { initErr = err; }
+      const d22Cols = db.listColumns(d22Tmp.db, 'op_log');
+      const d22Consist = db.verifySchemaConsistency(d22Tmp.db);
+      let d22WriteErr = null;
+      try {
+        opLogRepo.append(d22Tmp.db, { opTime: NOW, operator: '探针', opType: 'E75④-D22',
+          content: '缺步骤', result: '成功', teamCode: 'B1' }, NOW);
+      } catch (err) { d22WriteErr = err; }
+      /* 判据只钉**共同点**（不预设哪一种收场）：升级要么抛（且指名该列）、要么"成功"；
+         而**库最终必缺该列**、**写入必炸并指名列名**。 */
+      const initLedger = initErr === null
+        ? `升级静默"成功"（版本=${db.getSchemaVersion(d22Tmp.db)}、一致性=${d22Consist.ok === true ? 'ok:true' : 'ok:false'}）`
+        : `升级抛 ${initErr.name}: ${initErr.message}`;
+      t.check('`E75④`-`D22` 定点变异（**内存字节副本 ＋ `Module._compile`**，盘上零字节改动）：把 `team_code` 的' +
+        '`ADD COLUMN` 步骤从升级清单里去掉 ⇒ 无论升级是**抛错**（有后续步骤依赖该列 ⇒ 整体回滚）还是' +
+        '**静默"成功"**（没有依赖步骤的那一态，＝`E73` 现场），**库最终都缺那一列**，' +
+        '且真生产写入口**必抛并指名 `team_code`** ⇒ "门禁全绿、第一次写入才炸"这条链在本节内有可复跑靶子',
+        e75dHits === 1 && (initErr !== null || initRes !== null) && d22Consist.ok === true &&
+        !d22Cols.includes('team_code') &&
+        d22WriteErr !== null && /team_code/.test(String(d22WriteErr.message)) &&
+        /no such column|has no column named/i.test(String(d22WriteErr.message)) &&
+        db.STRUCTURE_UPGRADES.length === odbMut.STRUCTURE_UPGRADES.length + 1 &&
+        fs.readFileSync(odbPath, 'utf8') === odbSrc,
+        `锚点命中 ${e75dHits}/1；副本步骤 ${odbMut.STRUCTURE_UPGRADES.length} 条（原件 ${db.STRUCTURE_UPGRADES.length}）；` +
+        `${initLedger}；一致性判据=${JSON.stringify(d22Consist)}；` +
+        `op_log 列=[${d22Cols.join(', ')}]；写入=${d22WriteErr ? `抛出 ${d22WriteErr.name}: ${d22WriteErr.message}` : '**没有抛错**'}；` +
+        `盘上 index.js 逐字节未变=${fs.readFileSync(odbPath, 'utf8') === odbSrc}`);
+      d22Tmp.close();
+    }
+  }
+  missing.close();
+}
+
 /* ---------------- 六之九、9.5 第 6 条（数据结构变更约束）的**静态**配套门禁 ----------------
    立案：规范 v1.34 的 **9.5 第 6 条**（2026-10-01 新增）要求"改 `schema.sql`（增/删/改列或表）
    必须**同批**做两件事 ①升 `SCHEMA_VERSION` ②在 `STRUCTURE_UPGRADES` 加对应的幂等迁移步骤"，
