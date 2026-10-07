@@ -82,7 +82,13 @@ function loadFrontEnd(list, options) {
   if (typeof opts.outputRatio === 'number') sandbox.window.BoardConfig.production.outputRatio = opts.outputRatio;
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
-  run('src/services/mockData.js');
+  /* `E203`（`T-20261007-11`）：允许注入 `mockData.js` 的**内存副本**（ADR-0004 D22 定点变异用）。
+     不传 `mockDataSrc` 时与既有用例**完全同路径**（逐字节读盘上源码、同一个 `filename`）。 */
+  if (opts.mockDataSrc) {
+    vm.runInContext(opts.mockDataSrc, sandbox, { filename: path.join(ROOT, 'src/services/mockData.js') });
+  } else {
+    run('src/services/mockData.js');
+  }
   const M = sandbox.window.MockData;
   const ctxMath = vm.runInContext('Math', sandbox);   // 上下文内 `Math` 的**同一份**对象（冻结随机游走用）
   return {
@@ -3220,6 +3226,396 @@ t.section('十三、`E83` 的两个投影（自然日按零点切段）与 `E128
         + `两处**指名**都能从违规串里读到（㈠指名 \`day1\`/\`day2\`、㈡指名"这一支必须仍按零点切段"）。`);
     }
   }
+
+
+/* ---------------- 十四、`E203` 节拍边界曲线固化（FR-3.15） ----------------
+   立案：`项目记录\后续路线图.md` 的 `E203` 行（★★，A 组）。实现改动落在 `src\services\mockData.js`：
+   `CURVE_FREEZE_MIN_SAMPLES`（`:108`）与节拍边界固化判据（`:751-765`）。
+   **新口径（两条同时成立才固化）**：① `buf.unitIndex === t.unitIndex - 1`（缓冲属于**紧邻的上一件**）；
+   ② `buf.depth.length >= CURVE_FREEZE_MIN_SAMPLES`（近似完整观察）。两条不同时成立 ⇒ **保留上一件曲线原样**
+   （不覆盖、不写 0／占位值）。本节把它写成可证伪断言：
+     · 残缓冲（2～3 帧）**不固化**（曲线逐值原样）；
+     · 负对照：整件全观察**仍固化**（证明功能没有被整体关闭）；
+     · 阈值两侧：`阈值-1` 不固化、`阈值` 固化；
+     · 缓冲**不是**紧邻上一件（时钟跳变跨过多件）⇒ 不固化；
+     · `?curve=none` 相位全扫：任何 load 相位下第一道节拍边界都不再出现「2～3 采样点标整件号」的曲线。
+   **阈值真源**：断言里的阈值**不是**在断言里另写一个数字（那会与源码脱钩），而是从 `mockData.js` 源码抓
+   `const CURVE_FREEZE_MIN_SAMPLES = <表达式>;` 的**表达式**，代入 `CURVE_SAMPLES` 的真源链
+   （`board.config.js` 的 `curve.samples`，缺省回落 `CFG.cycleSec`，见 `mockData.js:100`）**现算**；
+   `E203-⑥` 另有一条构成性断言证明该表达式**确实随 `CURVE_SAMPLES` 变化**（与源码脱钩即红）。
+   **D22**：四支定点变异（**内存副本**，绝不落盘、不用 `git checkout`），每支都要求"**必红并指名**"，
+   并与本节判据**共用同一份纯函数**（不许为变异另写第二份判据 —— D21）。
+   **未验到（如实）**：本节读的是**数据层**（`MockData.state.curve`），不是浏览器里 `CurveChart`
+   画出的 polyline；`browser-check` 的 B2 相位守据处置见回执（D21 判定）。 */
+t.section('十四、`E203` 节拍边界曲线固化（FR-3.15）：残缓冲不固化／完整观察仍固化／阈值两侧／相位全扫');
+{
+  const cryptoE203 = require('node:crypto');
+  const shaE203 = b => cryptoE203.createHash('sha256').update(b).digest('hex');
+  const E203_MOCK_REL = 'src/services/mockData.js';
+  const e203MockAbs = path.join(ROOT, ...E203_MOCK_REL.split('/'));
+  /* 变异基数＝**盘上字节**读出的源码；D22 的"内存副本"就是它的一份字符串拷贝（不改盘上文件） */
+  const e203Src0 = fs.readFileSync(e203MockAbs).toString('utf8');
+  const e203Sha0 = shaE203(Buffer.from(e203Src0, 'utf8'));
+
+  /* ---- 本节自用的小件（不导出、不进夹具层） ---- */
+  const E203_DATE = '2026-10-07';   // 晚班 0-8（board.config 的班次表）⇒ 班次起点 00:00，elapsed ＝ 当日秒数
+  /** elapsed 秒 → 沙箱内 `new Date(iso)` 能解析的**本地**时刻（时钟注入，与 mockData 的 elapsed 同口径） */
+  function e203Iso(elapsedSec) {
+    const tot = Math.floor(elapsedSec);
+    const ms = Math.round((elapsedSec - tot) * 1000);
+    const p2 = n => String(n).padStart(2, '0');
+    return `${E203_DATE}T${p2(Math.floor(tot / 3600))}:${p2(Math.floor((tot % 3600) / 60))}:`
+      + `${p2(tot % 60)}.${String(ms).padStart(3, '0')}`;
+  }
+  /** 载入一份 mockData（`src` 为空 ⇒ 盘上真源码；非空 ⇒ **内存变异副本**），可选立刻 `clearCurve()` */
+  function e203Open(src, clearCurve) {
+    const V = loadFrontEnd(cfg.shift.list, src ? { mockDataSrc: src } : undefined);
+    if (clearCurve) V.mockData.clearCurve();       // ＝ `src/main.js:116` 的 `?curve=none` 那一句
+    return V;
+  }
+  /** `CURVE_SAMPLES` 的真源链（`mockData.js:100`）：`BoardConfig.curve.samples || CFG.cycleSec` */
+  function e203Samples(V) {
+    const BC = V.config;
+    return (BC.curve && BC.curve.samples) || V.mockData.CFG.cycleSec;
+  }
+  /** 曲线现场快照；`values` 逐值拷出来，供"不写 0／占位值"的判据用 */
+  function e203Snap(V) {
+    const M = V.mockData;
+    const c = M.state.curve.depth;
+    return {
+      taskUnit: M.state.task.unitIndex,
+      bufUnit: M.state.curveTick.unitIndex,
+      bufLen: M.state.curveTick.depth.length,
+      curveUnit: c ? c.unitIndex : null,
+      sampleCount: c ? c.sampleCount : null,
+      durationSec: c ? c.durationSec : null,
+      values: c ? c.values.slice() : null,
+      text: c ? `第 ${c.unitIndex} 件 · ${c.sampleCount} 采样点 · ${c.durationSec} s` : 'null（空态）'
+    };
+  }
+  /** 场景用的"节拍边界"：取 27680 s 附近那道**整节拍**边界（落在晚班 0-8 之内，由下面的前提守着） */
+  function e203Boundary(cycle) {
+    const b = Math.floor(27680 / cycle) * cycle;
+    return b >= cycle ? b : cycle;
+  }
+  /** 判据①（残缓冲／非邻接）：边界后曲线必须**逐值原样** —— 返回违规串（空 ⇒ 合规） */
+  function e203KeepProblems(pre, post) {
+    const bad = [];
+    if (post.sampleCount === null) bad.push(`曲线被清成空态（应保留上一件「${pre.text}」原样）`);
+    if (post.curveUnit !== pre.curveUnit) bad.push(`曲线被替换成「${post.text}」（应保留上一件「${pre.text}」）`);
+    if (post.sampleCount !== pre.sampleCount) {
+      bad.push(`采样点数被改写：${pre.sampleCount} → ${post.sampleCount}（应保留上一件）`);
+    }
+    if (post.durationSec !== pre.durationSec) bad.push(`时长被改写：${pre.durationSec} → ${post.durationSec}`);
+    if (JSON.stringify(post.values) !== JSON.stringify(pre.values)) bad.push('曲线逐值被改写（写入 0／占位值同属此违规）');
+    return bad;
+  }
+  /** 判据②（应固化）：件号＝被观察的那一件、采样点数＝观察到的帧数、时长＝采样数 × 节拍/整件采样数（构成性） */
+  function e203FreezeProblems(post, wantUnit, wantCount, cycle, samples) {
+    const bad = [];
+    if (post.curveUnit !== wantUnit) bad.push(`应固化成「第 ${wantUnit} 件」，实测曲线＝${post.text}`);
+    if (post.sampleCount !== wantCount) bad.push(`采样点数应为 ${wantCount}，实测 ${post.sampleCount}`);
+    const wantDur = wantCount * (cycle / samples);
+    if (post.durationSec !== wantDur) {
+      bad.push(`时长应为 ${wantDur} s（＝${wantCount} × ${cycle}/${samples}），实测 ${post.durationSec} s`);
+    }
+    return bad;
+  }
+  /** 阈值真源：抓 `const CURVE_FREEZE_MIN_SAMPLES = <表达式>;` 的**表达式**，再代入 samples 现算 */
+  function e203ThresholdExpr(src) {
+    const m = /const\s+CURVE_FREEZE_MIN_SAMPLES\s*=\s*([^;]+);/.exec(src);
+    return m ? m[1].trim() : '';
+  }
+  function e203Eval(expr, samples) {
+    try {
+      return { ok: true, value: vm.runInNewContext(
+        `(() => { const CURVE_SAMPLES = ${samples}; return (${expr}); })()`, {}) };
+    } catch (e) { return { ok: false, value: null, err: `${e.name}: ${e.message}` }; }
+  }
+  /** 定点变异：在**内存字符串副本**上按锚点替换（函数式替换，9.5-7④）；锚点必须**恰命中 1 次** */
+  function e203Mutate(from, to) {
+    const hits = e203Src0.split(from).length - 1;
+    return { hits, anchorOk: hits === 1, src: hits === 1 ? e203Src0.replace(from, () => to) : e203Src0 };
+  }
+  /** 场景 A：边界前 n 帧残缓冲（这 n 帧全落在**紧邻的上一件**内），然后打边界那一帧 */
+  function e203Residual(src, n) {
+    const V = e203Open(src);
+    const cycle = V.mockData.CFG.cycleSec;
+    const b = e203Boundary(cycle);
+    for (let k = n; k >= 1; k--) V.tickAt(e203Iso(b - k));
+    const pre = e203Snap(V);
+    V.tickAt(e203Iso(b));
+    return { cycle, b, piece: b / cycle, n, pre, post: e203Snap(V) };
+  }
+  /** 场景 B：**整件全观察**（一件内逐秒 1 帧、共 cycle 帧）后打边界帧 */
+  function e203FullObservation(src) {
+    const V = e203Open(src);
+    const cycle = V.mockData.CFG.cycleSec;
+    const b = e203Boundary(cycle);
+    for (let k = 0; k < cycle; k++) V.tickAt(e203Iso(b - cycle + k));
+    const pre = e203Snap(V);
+    V.tickAt(e203Iso(b));
+    return { cycle, b, piece: b / cycle, pre, post: e203Snap(V) };
+  }
+  /** 场景 C：缓冲长度**恰为 n**、且属于紧邻的上一件（先走一帧真路径，再注入缓冲，最后打边界帧） */
+  function e203ThresholdCase(src, n) {
+    const V = e203Open(src);
+    const cycle = V.mockData.CFG.cycleSec;
+    const b = e203Boundary(cycle);
+    const piece = b / cycle;
+    V.tickAt(e203Iso(b - 2));                     // 首帧走真路径：把预置曲线对齐为"上一件"
+    V.mockData.state.curveTick = {
+      unitIndex: piece,
+      depth: Array.from({ length: n }, (_, i) => 5 + i / 1000),
+      speed: Array.from({ length: n }, (_, i) => 5 + i / 1000)
+    };
+    const pre = e203Snap(V);
+    V.tickAt(e203Iso(b));
+    return { cycle, b, piece, n, pre, post: e203Snap(V) };
+  }
+  /** 场景 D：缓冲**不是**紧邻的上一件（时钟跳变跨过多件），但长度已够 —— 应仍不固化 */
+  function e203NonAdjacent(src, gap) {
+    const V = e203Open(src);
+    const cycle = V.mockData.CFG.cycleSec;
+    const b = e203Boundary(cycle);
+    const piece = b / cycle;
+    V.tickAt(e203Iso(b - 2));
+    V.mockData.state.curveTick = {
+      unitIndex: piece - gap,
+      depth: Array.from({ length: cycle }, (_, i) => 5 + i / 1000),
+      speed: Array.from({ length: cycle }, (_, i) => 5 + i / 1000)
+    };
+    const pre = e203Snap(V);
+    V.tickAt(e203Iso(b));
+    return { cycle, b, piece, gap, pre, post: e203Snap(V) };
+  }
+  /** 场景 E：`?curve=none` 相位全扫 —— 每个 load 相位逐秒 tick 到**第一道节拍边界**＋1 帧 */
+  function e203PhaseScan(src) {
+    const V0 = e203Open(src);
+    const cycle = V0.mockData.CFG.cycleSec;
+    const base = Math.floor(20000 / cycle) * cycle;   // 整节拍 ⇒ 相位 p ＝ base + p
+    const pieceAtLoad = base / cycle + 1;             // 装载时正在测的那一件
+    let tinyPhases = 0, frozenPhases = 0, minFrozen = null;
+    const tinyDetail = [];
+    for (let p = 0; p < cycle; p++) {
+      const V = e203Open(src, true);                  // 每个相位都从"清空曲线"这一句开始（＝?curve=none）
+      const start = base + p;
+      const remain = cycle - p;                       // 距第一道边界的秒数
+      let tiny = false, frozen = false;
+      for (let k = 0; k <= remain + 1; k++) {
+        V.tickAt(e203Iso(start + k));
+        if (k < remain) continue;                     // 只看第一道边界那一帧及其后一帧
+        const s = e203Snap(V);
+        if (s.sampleCount !== null && s.sampleCount >= 2 && s.sampleCount <= 3) tiny = true;
+        if (s.curveUnit === pieceAtLoad) {
+          frozen = true;
+          if (minFrozen === null || s.sampleCount < minFrozen) minFrozen = s.sampleCount;
+        }
+      }
+      if (tiny) { tinyPhases++; if (tinyDetail.length < 3) tinyDetail.push(`相位 ${p}（距边界 ${remain} s）`); }
+      if (frozen) frozenPhases++;
+    }
+    return { cycle, base, pieceAtLoad, tinyPhases, frozenPhases, minFrozen, tinyDetail };
+  }
+  /** 一次算好全部现场读数（断言与 D22 **共用**同一批读数与同一批判据函数） */
+  function e203ReadAll(th, samples) {
+    const A2 = e203Residual(null, 2);
+    const A3 = e203Residual(null, 3);
+    const B = e203FullObservation(null);
+    const C_lo = e203ThresholdCase(null, th - 1);
+    const C_hi = e203ThresholdCase(null, th);
+    const D = e203NonAdjacent(null, 3);
+    const E = e203PhaseScan(null);
+    return {
+      A2, A3, B, C_lo, C_hi, D, E,
+      A2bad: e203KeepProblems(A2.pre, A2.post),
+      A3bad: e203KeepProblems(A3.pre, A3.post),
+      Bbad: e203FreezeProblems(B.post, B.piece, B.pre.bufLen, B.cycle, samples),
+      CloBad: e203KeepProblems(C_lo.pre, C_lo.post),
+      ChiBad: e203FreezeProblems(C_hi.post, C_hi.piece, th, C_hi.cycle, samples),
+      Dbad: e203KeepProblems(D.pre, D.post)
+    };
+  }
+
+  /* ---- 前提①（ADR-0004 D20）：阈值真源可定位、可求值 ---- */
+  const e203V0 = e203Open();
+  const e203SamplesN = e203Samples(e203V0);
+  const e203Cycle = e203V0.mockData.CFG.cycleSec;
+  const e203Expr = e203ThresholdExpr(e203Src0);
+  const e203Ev = e203Expr ? e203Eval(e203Expr, e203SamplesN) : { ok: false, value: null, err: '表达式未定位到' };
+  const e203Th = e203Ev.ok ? e203Ev.value : null;
+  const e203Req1 = t.requires('`E203` 真源前提：`mockData.js` 里 `const CURVE_FREEZE_MIN_SAMPLES = <表达式>;` 可定位，'
+    + '且该表达式代入 `CURVE_SAMPLES`（＝`board.config.js` 的 `curve.samples`）后求值为正整数',
+    e203Expr.length > 0 && e203Ev.ok && Number.isInteger(e203Th) && e203Th > 0,
+    `表达式＝\`${e203Expr}\`；samples=${e203SamplesN}；求值＝${JSON.stringify(e203Ev)}`);
+  if (e203Req1) {
+    /* ---- 前提②：时钟注入口径与三个场景的注入读数与设计一致 ---- */
+    const e203ClockElapsed = (() => { const V = e203Open(); V.tickAt(e203Iso(10)); return V.mockData.state.shift.elapsed; })();
+    const R = e203ReadAll(e203Th, e203SamplesN);
+    const e203SceneOk = e203ClockElapsed === 10 && e203Boundary(e203Cycle) > e203Cycle
+      && R.A2.pre.bufLen === 2 && R.A2.pre.bufUnit === R.A2.piece
+      && R.A3.pre.bufLen === 3 && R.A3.pre.bufUnit === R.A3.piece
+      && R.B.pre.bufLen === R.B.cycle && R.B.pre.bufUnit === R.B.piece
+      && R.C_lo.n === e203Th - 1 && R.C_hi.n === e203Th && R.C_hi.pre.bufUnit === R.C_hi.piece
+      && R.D.pre.bufLen === R.D.cycle && R.D.pre.bufUnit === R.D.piece - R.D.gap;
+    if (t.requires('`E203` 场景前提：注入 00:00:10 ⇒ `state.shift.elapsed === 10`（时钟口径）；'
+      + '且 A（2／3 帧残缓冲）、B（整件帧数）、C（阈值两侧的合成缓冲）、D（非邻接整件帧数）的缓冲帧数／所属件号与设计一致',
+      e203SceneOk,
+      `elapsed(10 s 注入)=${e203ClockElapsed}；边界=${e203Boundary(e203Cycle)} s（节拍 ${e203Cycle} s）；`
+      + `A2 缓冲(${R.A2.pre.bufUnit},${R.A2.pre.bufLen})／A3(${R.A3.pre.bufUnit},${R.A3.pre.bufLen})／`
+      + `B(${R.B.pre.bufUnit},${R.B.pre.bufLen})／C_hi(${R.C_hi.pre.bufUnit},${R.C_hi.pre.bufLen})／`
+      + `D(${R.D.pre.bufUnit},${R.D.pre.bufLen})`)) {
+      t.info(`\`E203\` 基线读数（\`PASS\` 详情不打印 ⇒ 这里留痕）：阈值＝${e203Th}`
+        + `（源码表达式 \`${e203Expr}\` 代入 CURVE_SAMPLES=${e203SamplesN}）；节拍=${e203Cycle} s；边界=${R.B.b} s（上一件＝第 ${R.B.piece} 件）；`
+        + `残缓冲 2 帧 ⇒ ${R.A2.post.text}／3 帧 ⇒ ${R.A3.post.text}；整件 ${R.B.pre.bufLen} 帧 ⇒ ${R.B.post.text}；`
+        + `阈值-1（${e203Th - 1}）帧 ⇒ ${R.C_lo.post.text}；阈值（${e203Th}）帧 ⇒ ${R.C_hi.post.text}；`
+        + `非邻接 ${R.D.pre.bufLen} 帧（缓冲件号 ${R.D.pre.bufUnit}，边界件号 ${R.D.piece + 1}）⇒ ${R.D.post.text}；`
+        + `相位全扫：2～3 点相位数=${R.E.tinyPhases}、固化相位数=${R.E.frozenPhases}（最小样本 ${R.E.minFrozen}）`);
+
+      t.check('`E203-①` 残缓冲不固化（2 帧）：边界处缓冲仅 2 帧（属于**紧邻的上一件**）⇒ 曲线**不被替换**'
+        + '（且不写 0／占位值；保留上一件原样）',
+        R.A2bad.length === 0,
+        `边界前曲线＝${R.A2.pre.text}（缓冲(${R.A2.pre.bufUnit},${R.A2.pre.bufLen})）；边界后＝${R.A2.post.text}`
+        + `（缓冲(${R.A2.post.bufUnit},${R.A2.post.bufLen})）`
+        + `${R.A2bad.length ? '；违规：' + R.A2bad.join('；') : ''}`);
+      t.check('`E203-①` 残缓冲不固化（3 帧）：同一判据在 3 帧残缓冲下同样成立',
+        R.A3bad.length === 0,
+        `边界前曲线＝${R.A3.pre.text}（缓冲(${R.A3.pre.bufUnit},${R.A3.pre.bufLen})）；边界后＝${R.A3.post.text}`
+        + `${R.A3bad.length ? '；违规：' + R.A3bad.join('；') : ''}`);
+      t.check(`\`E203-②\` 负对照：整件 ${R.B.pre.bufLen} 帧全观察 ⇒ **仍固化**（证明"残缓冲不固化"不是把功能整体关掉）`
+        + `（应固化成「第 ${R.B.piece} 件 · ${R.B.pre.bufLen} 采样点 · ${R.B.pre.bufLen * (R.B.cycle / e203SamplesN)} s」）`,
+        R.Bbad.length === 0,
+        `件内最后一帧＝${R.B.pre.text}（缓冲(${R.B.pre.bufUnit},${R.B.pre.bufLen})）；边界后＝${R.B.post.text}`
+        + `${R.Bbad.length ? '；违规：' + R.Bbad.join('；') : ''}`);
+      t.check(`\`E203-③\` 阈值下侧：缓冲恰为 \`CURVE_FREEZE_MIN_SAMPLES - 1\`（＝${e203Th - 1} 帧，阈值 ${e203Th}`
+        + ` 由源码表达式现算）⇒ **不固化**`,
+        R.CloBad.length === 0,
+        `注入缓冲(${R.C_lo.pre.bufUnit},${R.C_lo.pre.bufLen})；边界后＝${R.C_lo.post.text}`
+        + `${R.CloBad.length ? '；违规：' + R.CloBad.join('；') : ''}`);
+      t.check(`\`E203-③\` 阈值：缓冲恰为 \`CURVE_FREEZE_MIN_SAMPLES\`（＝${e203Th} 帧）⇒ **固化**`
+        + `（采样点数＝${e203Th}、时长＝${e203Th * (R.C_hi.cycle / e203SamplesN)} s）`,
+        R.ChiBad.length === 0,
+        `注入缓冲(${R.C_hi.pre.bufUnit},${R.C_hi.pre.bufLen})；边界后＝${R.C_hi.post.text}`
+        + `${R.ChiBad.length ? '；违规：' + R.ChiBad.join('；') : ''}`);
+      t.check('`E203-④` 缓冲**不是**紧邻的上一件（时钟跳变跨过多件、长度已达整件帧数）⇒ **不固化**'
+        + '（否则就会把"另一件"的稀疏缓冲当成本件的 1 s 均匀曲线）',
+        R.Dbad.length === 0,
+        `边界前曲线＝${R.D.pre.text}（缓冲(${R.D.pre.bufUnit},${R.D.pre.bufLen})，本件＝第 ${R.D.piece} 件）；`
+        + `边界后＝${R.D.post.text}${R.Dbad.length ? '；违规：' + R.Dbad.join('；') : ''}`);
+      t.check(`\`E203-⑤\` \`?curve=none\` 相位全扫（${R.E.cycle} 个 load 相位，每个相位先 \`clearCurve()\`、再逐秒 tick 到`
+        + `第一道节拍边界＋1 帧）：出现「2～3 采样点标整件号」曲线的**相位数 ＝ 0**`,
+        R.E.tinyPhases === 0,
+        `2～3 点相位数＝${R.E.tinyPhases}／${R.E.cycle}`
+        + `${R.E.tinyDetail.length ? '（' + R.E.tinyDetail.join('；') + '）' : ''}`);
+      t.check('`E203-⑤` 相位全扫的**强化不变量**：凡在第一道边界处固化（曲线件号＝装载时那一件）的相位，'
+        + `其采样点数一律 ≥ 阈值 ${e203Th}；且固化过的相位**非空集**（防"判据只在空集上成立"）`,
+        R.E.frozenPhases > 0 && R.E.minFrozen !== null && R.E.minFrozen >= e203Th,
+        `固化相位数＝${R.E.frozenPhases}／${R.E.cycle}；样本数最小 ${R.E.minFrozen}（阈值 ${e203Th}）`);
+      const e203EvPlus = e203Eval(e203Expr, e203SamplesN + 8);
+      t.check('`E203-⑥` 阈值真源构成性：断言用的阈值由 `mockData.js` 的常量**表达式**代入 `CURVE_SAMPLES` 现算'
+        + `（不是在断言里另写的数字）；且该表达式**确实随 \`CURVE_SAMPLES\` 变化**`
+        + `（samples ${e203SamplesN} → ${e203SamplesN + 8} ⇒ 阈值 ${e203Th} → ${e203EvPlus.value}）`
+        + ' —— 若有人把常量写成与 `CURVE_SAMPLES` 脱钩的字面量，本条必红',
+        e203EvPlus.ok && e203EvPlus.value > e203Th,
+        `表达式＝\`${e203Expr}\`；samples=${e203SamplesN} ⇒ ${e203Th}；samples=${e203SamplesN + 8} ⇒ ${JSON.stringify(e203EvPlus)}`);
+
+      /* ---------------- D22：四支定点变异（内存副本；每支都要求"必红并指名"） ---------------- */
+      const e203BytesBefore = fs.readFileSync(e203MockAbs);
+      const e203SrcIsDisk = Buffer.compare(e203BytesBefore, Buffer.from(e203Src0, 'utf8')) === 0;
+      const e203VarReadings = [];
+
+      const E203_M1_FROM = 'const CURVE_FREEZE_MIN_SAMPLES = Math.ceil(CURVE_SAMPLES * 0.9);';
+      const M1 = e203Mutate(E203_M1_FROM, 'const CURVE_FREEZE_MIN_SAMPLES = 1;');
+      const M1Th = M1.anchorOk ? e203Eval(e203ThresholdExpr(M1.src), e203SamplesN).value : null;
+      const M1Keep = n => { const r = e203Residual(M1.src, n); return { r, bad: e203KeepProblems(r.pre, r.post) }; };
+      const m1a = M1.anchorOk ? M1Keep(2) : null;
+      const m1b = M1.anchorOk ? M1Keep(3) : null;
+      const m1e = M1.anchorOk ? e203PhaseScan(M1.src) : null;
+      e203VarReadings.push(`M1 阈值→1：阈值=${M1Th}；残缓冲 2 帧 ⇒ ${m1a ? m1a.r.post.text : '—'}`
+        + `（违规 ${m1a ? m1a.bad.length : '—'} 条）；3 帧 ⇒ ${m1b ? m1b.r.post.text : '—'}`
+        + `（违规 ${m1b ? m1b.bad.length : '—'} 条）；相位全扫 2～3 点相位数=${m1e ? m1e.tinyPhases : '—'}（基线 0）`);
+      t.check('`E203-D22①` 定点变异（**内存副本**，不碰 `src\\services\\mockData.js`）：把阈值退化为 `1`'
+        + '（＝旧行为"缓冲非空即固化"）⇒ `E203-①` 两条**必红并指名**（曲线被替换成"紧邻上一件 ＋ 2／3 采样点"），'
+        + '且 `?curve=none` 相位全扫出现 2～3 采样点曲线；未变异时同一判据为绿',
+        M1.anchorOk && R.A2bad.length === 0 && R.A3bad.length === 0
+          && m1a.bad.length > 0 && m1a.bad.some(x => x.indexOf('曲线被替换') >= 0)
+          && m1b.bad.length > 0 && m1b.bad.some(x => x.indexOf('曲线被替换') >= 0)
+          && m1e.tinyPhases > 0,
+        M1.anchorOk
+          ? `锚点命中 ${M1.hits} 次（须恰 1）；阈值=${M1Th}；变异体残缓冲 2 帧 ⇒ ${m1a.r.post.text}`
+            + `（违规 ${m1a.bad.length} 条：${m1a.bad.join('；')}）；3 帧 ⇒ ${m1b.r.post.text}（违规 ${m1b.bad.length} 条）；`
+            + `相位全扫 2～3 点相位数=${m1e.tinyPhases}（基线 0）`
+          : `**锚点未命中**（命中 ${M1.hits} 次）⇒ 判红，不许静默放过`);
+
+      const M2 = e203Mutate('const isAdjacentPiece = buf.unitIndex === t.unitIndex - 1;',
+        'const isAdjacentPiece = true;');
+      const m2 = M2.anchorOk ? (() => {
+        const r = e203NonAdjacent(M2.src, 3);
+        return { r, bad: e203KeepProblems(r.pre, r.post) };
+      })() : null;
+      e203VarReadings.push(`M2 去掉邻接条件：非邻接整件帧数（缓冲件号 ${m2 ? m2.r.pre.bufUnit : '—'}）⇒ `
+        + `${m2 ? m2.r.post.text : '—'}（违规 ${m2 ? m2.bad.length : '—'} 条）`);
+      t.check('`E203-D22②` 定点变异（**内存副本**）：去掉"同一件邻接"条件（`isAdjacentPiece` 恒 `true`）⇒ '
+        + '`E203-④` **必红并指名**（曲线被替换成"跨过多件的那一件"的曲线）；未变异时为绿',
+        M2.anchorOk && R.Dbad.length === 0 && m2.bad.length > 0
+          && m2.bad.some(x => x.indexOf(`第 ${m2.r.piece - m2.r.gap} 件`) >= 0),
+        M2.anchorOk
+          ? `锚点命中 ${M2.hits} 次；变异体非邻接缓冲(${m2.r.pre.bufUnit},${m2.r.pre.bufLen}) ⇒ ${m2.r.post.text}`
+            + `（违规 ${m2.bad.length} 条：${m2.bad.join('；')}）`
+          : `**锚点未命中**（命中 ${M2.hits} 次）⇒ 判红，不许静默放过`);
+
+      const M3 = e203Mutate('Math.ceil(CURVE_SAMPLES * 0.9)', 'Math.ceil(CURVE_SAMPLES * 1.05)');
+      const M3Th = M3.anchorOk ? e203Eval(e203ThresholdExpr(M3.src), e203SamplesN).value : null;
+      const m3b = M3.anchorOk ? (() => {
+        const r = e203FullObservation(M3.src);
+        return { r, bad: e203FreezeProblems(r.post, r.piece, r.pre.bufLen, r.cycle, e203SamplesN) };
+      })() : null;
+      const m3e = M3.anchorOk ? e203PhaseScan(M3.src) : null;
+      e203VarReadings.push(`M3 比例→1.05：阈值=${M3Th}；整件 ${m3b ? m3b.r.pre.bufLen : '—'} 帧 ⇒ `
+        + `${m3b ? m3b.r.post.text : '—'}（违规 ${m3b ? m3b.bad.length : '—'} 条）；相位全扫固化相位数=`
+        + `${m3e ? m3e.frozenPhases : '—'}（基线 ${R.E.frozenPhases}）`);
+      t.check('`E203-D22③` 定点变异（**内存副本**）：阈值比例 `0.9 → 1.05`（阈值超出整件样本数）⇒ '
+        + '`E203-②` 负对照**必红并指名**（整件全观察不再固化），且 `E203-⑤` 的"固化相位非空集"**必红**；'
+        + '未变异时为绿',
+        M3.anchorOk && R.Bbad.length === 0 && R.E.frozenPhases > 0
+          && m3b.bad.length > 0 && m3b.bad.some(x => x.indexOf(`第 ${m3b.r.piece} 件`) >= 0)
+          && m3e.frozenPhases === 0,
+        M3.anchorOk
+          ? `锚点命中 ${M3.hits} 次；阈值=${M3Th}；变异体整件 ${m3b.r.pre.bufLen} 帧 ⇒ ${m3b.r.post.text}`
+            + `（违规 ${m3b.bad.length} 条：${m3b.bad.join('；')}）；相位全扫固化相位数=${m3e.frozenPhases}`
+            + `（基线 ${R.E.frozenPhases}）⇒ "固化非空集"这条当场被违反`
+          : `**锚点未命中**（命中 ${M3.hits} 次）⇒ 判红，不许静默放过`);
+
+      const M4 = e203Mutate('const observedEnough = buf.depth.length >= CURVE_FREEZE_MIN_SAMPLES;',
+        'const observedEnough = buf.depth.length > CURVE_FREEZE_MIN_SAMPLES;');
+      const M4Th = M4.anchorOk ? e203Eval(e203ThresholdExpr(M4.src), e203SamplesN).value : null;
+      const m4 = M4.anchorOk ? (() => {
+        const r = e203ThresholdCase(M4.src, M4Th);
+        return { r, bad: e203FreezeProblems(r.post, r.piece, M4Th, r.cycle, e203SamplesN) };
+      })() : null;
+      e203VarReadings.push(`M4 >= → >：阈值=${M4Th}；阈值帧（${M4Th}）⇒ ${m4 ? m4.r.post.text : '—'}`
+        + `（违规 ${m4 ? m4.bad.length : '—'} 条）`);
+      t.check('`E203-D22④` 定点变异（**内存副本**）：把判据的 `>=` 改成 `>` ⇒ `E203-③` 的"阈值那一侧"'
+        + `**必红并指名**（恰在阈值 ${M4Th} 这一帧上少固化一条）；未变异时为绿`,
+        M4.anchorOk && R.ChiBad.length === 0
+          && m4.bad.length > 0 && m4.bad.some(x => x.indexOf(`第 ${m4.r.piece} 件`) >= 0),
+        M4.anchorOk
+          ? `锚点命中 ${M4.hits} 次；阈值=${M4Th}；变异体阈值帧（${M4Th}）⇒ ${m4.r.post.text}`
+            + `（违规 ${m4.bad.length} 条：${m4.bad.join('；')}）`
+          : `**锚点未命中**（命中 ${M4.hits} 次）⇒ 判红，不许静默放过`);
+
+      const e203BytesAfter = fs.readFileSync(e203MockAbs);
+      const e203ShaAfter = shaE203(e203BytesAfter);
+      t.check('`E203-D22⑤` 四支变异全程**不落地**：变异基数字节 ＝ 盘上字节；变异前后 `mockData.js` 的 '
+        + '`sha256` 相同且 `Buffer.compare` ＝ 0（**不用** `git checkout`／`git restore`）',
+        e203SrcIsDisk && Buffer.compare(e203BytesBefore, e203BytesAfter) === 0 && e203Sha0 === e203ShaAfter,
+        `变异基数字节＝盘上字节：${e203SrcIsDisk}；sha256(前)=${e203Sha0.slice(0, 16)}… `
+        + `sha256(后)=${e203ShaAfter.slice(0, 16)}…；Buffer.compare(前,后)=${Buffer.compare(e203BytesBefore, e203BytesAfter)}`);
+      t.info(`\`E203-D22\` 变异后读数（\`PASS\` 详情不打印 ⇒ 这里留痕）：${e203VarReadings.join('｜')}；`
+        + `盘上 mockData.js 逐字节未变（sha256 前 16＝${e203Sha0.slice(0, 16)}…）`);
+    }
+  }
+}
 
   t.finish();
 }
