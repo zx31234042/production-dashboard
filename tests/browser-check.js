@@ -301,37 +301,28 @@ async function main() {
   check('?tab=3 直接打开「生产统计」', tabState.id === 'panel-stats' && tabState.idx === 3,
     `active=${tabState.id} 标签序号=${tabState.idx}`);
 
-  /* ---- ?curve=none：观测窗必须先落在**一个节拍之内**（P3-13 已登记的设计约束） ----
+  /* ---- ?curve=none：**任何 load 相位**都要求空态（`E203` 收紧后重述，2026-10-07） ----
      `?curve=none` 的语义是"**初始**空态"（README.md §三、需求清单 V1.44 §…、甲方 Demo 说明同一措辞）：
-     `src/main.js:116` 在 `start()` 里执行一次 `M.clearCurve()`，**只清预置曲线**；
-     其后每秒 `M.tick()` 在**节拍边界**处用 `state.curveTick` 缓冲**重新固化**一条曲线
-     （`src/services/mockData.js:723-726`，判据只有"缓冲长度 > 1"）。
-     项目已把"空态最多维持到下一道节拍边界"登记为**设计约束**：
-     `项目记录\审查报告-2026-09-19.md` 第 13 条 / `项目记录\当前状态快照.md` 的「P3-13 曲线空态窗口」。
-     ⇒ 若 load 恰好落在边界前 1～2 s，边界那一帧就会固化出"第 N 件 · 2 采样点 · 2 s"的曲线，
-       本用例随之**随机变红**（2026-10-07 15:41:20 / 第 173 件；先例 2026-10-06 23:52:00 / 第 177 件；
-       相位全扫实测：160 个 load 相位中命中 1～2 个 ≈ 0.6%～1.25%/轮）。
-     ⇒ 本用例的**前提**是"观测窗（2.5 s）落在一个节拍之内"，故先用**被测实现自己的**相位量做守据：
-       距下一道节拍边界 > 6 s 才观测；否则越过该边界、在新的节拍里重测（至多 3 次）。 */
+     `src/main.js:116` 在 `start()` 里执行一次 `M.clearCurve()`，**只清预置曲线**。
+     · **改前**：`src/services/mockData.js` 的节拍边界固化判据只有"缓冲长度 > 1" ⇒ load 恰落在边界前
+       1～2 s 时，边界那一帧会把 2～3 帧残缓冲固化并**覆盖**空态 ⇒ 本用例随机变红（相位全扫 1～2/160）；
+       当时的**相位守据**（"观测窗须落在一个节拍之内、余量 > 6 s"）就是为了绕开这些相位。
+     · **改后（`E203`，`mockData.js:751-765`）**：两条同时成立才固化 —— ①缓冲属于**紧邻的上一件**
+       ②缓冲 ≥ `CURVE_FREEZE_MIN_SAMPLES`（整件采样数的 90%，现配置 144 帧）。本用例的缓冲**在装载后
+       才开始累积**（`mockData.js:254` 装载时为空），2.5 s 观测窗内至多 3～4 帧 ⇒ **任何相位都达不到
+       阈值** ⇒ 空态与 load 相位**无关**，守据不必再拦（留着它反而让本用例对"边界前 1～2 s 装载"
+       这一相位**永远失明**）。
+     · 相位只作**留痕**记进详情，便于失败时判断"窗内是否跨了节拍边界"；"160 个相位都不出现
+       2～3 采样点曲线"的**确定性覆盖**由 `tests/logic-check.js` 第十四节 `E203-⑤` 承担。 */
   async function curveCyclePhase() {
     return evaluate(`(() => {
       const M = window.MockData;
       return { into: M.state.shift.elapsed % M.CFG.cycleSec, cycleSec: M.CFG.cycleSec };
     })()`);
   }
-  async function openCurveNoneWithinCycle() {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      await openPage('?curve=none', 900);                 // 先取到帧，才有 shift.elapsed
-      const p = await curveCyclePhase();
-      if (p.cycleSec - p.into > 6) {                      // 余量 > 观测窗 2.5 s ⇒ 窗内不会跨边界
-        await sleep(2500);
-        return { into: p.into, cycleSec: p.cycleSec, remain: p.cycleSec - p.into, attempt };
-      }
-      await sleep((p.cycleSec - p.into + 1.5) * 1000);    // 越过本道边界，换一个新节拍再观测
-    }
-    return null;
-  }
-  const curvePhaseUsed = await openCurveNoneWithinCycle();
+  await openPage('?curve=none', 900);                    // 先取到帧，才有 shift.elapsed
+  const curvePhaseUsed = await curveCyclePhase();         // 相位＝**留痕**（不再是前提）
+  await sleep(2500);                                      // 观测窗 2.5 s（装载后才累积 ⇒ ≤3～4 帧）
   const curveState = await evaluate(`(() => {
     const wrap = document.getElementById('stDepthChart').parentElement;
     const empty = wrap.querySelector('.chart-empty');
@@ -342,12 +333,13 @@ async function main() {
       taskText: (document.getElementById('stDepthTask')||{}).textContent || ''
     };
   })()`);
-  check('?curve=none 显示空态且不画曲线（观测窗落在一个节拍之内）',
+  check('?curve=none 显示空态且不画曲线（**任何 load 相位**；`E203` 收紧后残缓冲不再固化）',
     curveState.emptyVisible === true && curveState.polylines === 0,
     `空态可见=${curveState.emptyVisible}，polyline=${curveState.polylines} 条，图下文案=${curveState.taskText}` +
-    `；相位＝节拍内已进行 ${curvePhaseUsed ? curvePhaseUsed.into.toFixed(1) : '未取到'} s / 节拍 ` +
+    `；装载相位＝节拍内已进行 ${curvePhaseUsed ? curvePhaseUsed.into.toFixed(1) : '未取到'} s / 节拍 ` +
     `${curvePhaseUsed ? curvePhaseUsed.cycleSec : '未取到'} s（距下一道边界 ` +
-    `${curvePhaseUsed ? curvePhaseUsed.remain.toFixed(1) : '未取到'} s，第 ${curvePhaseUsed ? curvePhaseUsed.attempt : '—'} 次尝试）`);
+    `${curvePhaseUsed ? (curvePhaseUsed.cycleSec - curvePhaseUsed.into).toFixed(1) : '未取到'} s；` +
+    '相位**不再是前提** —— 见上方重述与 `logic-check` 第十四节 `E203-⑤`）');
 
 
   await openPage('?link=off', 2500);

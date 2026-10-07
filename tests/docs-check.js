@@ -62,6 +62,90 @@ function exists(rel) {
   return fs.existsSync(path.join(ROOT, rel));
 }
 
+/* ---------------- `E205` 取数面：**命令行上下文**与**仓库现取的开关集合**（纯函数，供定点回归直接调用） ----------------
+   立案（座位 9 在 `T-20261007-14` 实测、主代理 2026-10-07 定为 `E205`）：旧判据把 Demo 说明里
+   **所有** `--[a-z][a-z-]*` token 都当成"工具开关"，且只认 `mock-upper`／`mock-mes` 的开关
+   ⇒ 26 处误判：①真开关（`tests\capture-baseline.js` 的 `--size/--out/--update`）
+   ②**CSS 变量名**（`--bg`…`--gap-tile`）。**后果**：交付文档被迫写成"绕开判据"的样子
+   （命令行改成"指向权威文件的指引"、CSS 变量只写名字主体）⇒ **甲方文档里不再有真实可复制的命令**，
+   判据把交付质量改坏了（不是文档有问题，是判据看错了对象）。
+   **改法（`D21` 由主代理裁定：改判据、不改文档）**，两手并用、缺一不可：
+     · ㈠**允许集合从仓库现取**：扫 `tests\*.js`（直下）＋ `tools\**\*.{js,ps1,cmd}` 里的 `--xxx` 字面量
+       ⇒ 真开关**自动跟随**（新加开关不必回来改本脚本；符合"真源现取、不钉死"的既有口径）；
+     · ㈡**扫描面限定到"命令上下文"**：围栏代码块（块内任一行是命令行）／行内代码段（段内含命令行）
+       ⇒ CSS 变量名在**正文/表格/纯变量代码段**里**结构上**不进扫描面 —— 不是靠"恰好被允许集合收录"。
+   为什么是纯函数：`E205` 必须可证伪（ADR-0004 D22）—— 负对照／正对照／CSS 三类**内存样本**要喂给
+   **同一个** `unknownSwitches()`，不许为变异另写第二份判据（D21）。 */
+
+/** 一段文本是否是"命令行"（含命令名，或含脚本／可执行文件路径的调用） */
+function looksLikeCommand(text) {
+  const CMD = /(?:^|[\s(`|>])(?:node|npm|npx|pnpm|powershell|pwsh|cmd|git|bash|sh)\s/i;
+  const SCRIPT = /(?:^|[\s(`|>])(?:\.\\|\.\/|tools[\\/]|tests[\\/]|[A-Za-z]:\\)[^\s`]*\.(?:js|ps1|cmd)\b/i;
+  return CMD.test(text) || SCRIPT.test(text);
+}
+
+/** 把文档切成"命令上下文"片段：①围栏代码块（块内任一行是命令行）②行内代码段（段内含命令行）。
+ *  @returns {Array<{where:string,text:string}>} `where` 供失败详情指名"在哪儿看到的"。 */
+function commandContexts(docText) {
+  const out = [];
+  const lines = docText.split(/\r?\n/);
+  let inFence = false, start = 0, buf = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*```/.test(lines[i])) {
+      if (!inFence) { inFence = true; start = i + 2; buf = []; }      // 内容自下一行起
+      else {
+        inFence = false;
+        if (buf.some(looksLikeCommand)) out.push({ where: `围栏代码块 :${start}-${i}`, text: buf.join('\n') });
+      }
+      continue;
+    }
+    if (inFence) buf.push(lines[i]);
+  }
+  for (const m of docText.matchAll(/`([^`\n]+)`/g)) {
+    if (looksLikeCommand(m[1])) out.push({ where: '行内代码段', text: m[1] });
+  }
+  return out;
+}
+
+/** 命令上下文里的 `--xxx` token ⇒ token → 出现位置（去重、每 token 最多留 4 处） */
+function switchesInDoc(docText) {
+  const hits = new Map();
+  for (const ctx of commandContexts(docText)) {
+    for (const m of ctx.text.matchAll(/--[a-z][a-z-]*/g)) {
+      if (!hits.has(m[0])) hits.set(m[0], []);
+      const at = hits.get(m[0]);
+      if (at.indexOf(ctx.where) < 0 && at.length < 4) at.push(ctx.where);
+    }
+  }
+  return hits;
+}
+
+/** 仓库现取的"真开关"集合：`tests\*.js`（直下）＋ `tools\**\*.{js,ps1,cmd}` 的 `--xxx` 字面量；
+ *  另加两个**通用约定**开关（旧判据本就豁免 `--help`）。 */
+function repoSwitchTokens() {
+  const files = fs.readdirSync(path.join(ROOT, 'tests')).filter(n => n.endsWith('.js')).map(n => 'tests/' + n);
+  const walk = d => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (/\.(js|ps1|cmd)$/.test(e.name)) files.push(path.relative(ROOT, full).split(path.sep).join('/'));
+    }
+  };
+  walk(path.join(ROOT, 'tools'));
+  const set = new Set(['--help', '--version']);
+  for (const f of files) {
+    for (const m of fs.readFileSync(path.join(ROOT, f), 'utf8').matchAll(/--[a-z][a-z-]*/g)) set.add(m[0]);
+  }
+  return { set, files };
+}
+
+/** 判定本体（纯函数）：返回"文档命令段里有、仓库里没有"的开关（逐条指名"在哪儿看到的"） */
+function unknownSwitches(docText, allowed) {
+  const hits = switchesInDoc(docText);
+  return [...hits.keys()].filter(t => !allowed.has(t)).sort()
+    .map(t => `${t}（出现在 ${hits.get(t).join('、')}）`);
+}
+
 /* ---------------- 可见文字归一化（`E13` 的判据本体；纯函数，供定点回归直接调用） ----------------
    **为什么剥的是「行内标记」而不是把比对改宽松（回执里也复述了这一段）**：
      ① 同源断言要判的是"**md 与 docx 的可见文字**是否同源"，而不是"markdown 源码是否同源"。
@@ -530,12 +614,110 @@ async function main() {
   check('甲方 Demo 说明覆盖 8 个页面名称', missingPage.length === 0,
     missingPage.length ? `说明里没有：${missingPage.join('、')}` : tabs.join('、'));
 
-  const docFlags = new Set([...demoDoc.matchAll(/(--[a-z][a-z-]*)/g)].map(m => m[1]));
-  const upperSrcFlags = new Set([...readText('tools/mock-upper/mock-upper.js').matchAll(/'(--[a-z-]+)'/g)].map(m => m[1]));
-  const mesSrcFlags = new Set([...readText('tools/mock-mes/mock-mes.js').matchAll(/'(--[a-z-]+)'/g)].map(m => m[1]));
-  const unknownFlags = [...docFlags].filter(f => !upperSrcFlags.has(f) && !mesSrcFlags.has(f) && f !== '--help');
-  check('Demo 说明里出现的命令行参数都真实存在', unknownFlags.length === 0,
-    unknownFlags.length ? `文档里有但工具没有：${unknownFlags.join('、')}` : `文档提到 ${docFlags.size} 个参数`);
+  /* ===== `E205` Demo 说明里的命令行参数（取数面 2026-10-07 收窄；详见文件头 `commandContexts()` 上方的立案） =====
+     改前：`demoDoc.matchAll(/(--[a-z][a-z-]*)/g)` 扫**全文**，且允许集合只有 mock-upper／mock-mes 两份白名单。
+     改后：扫描面＝**命令上下文**（围栏代码块／行内代码段），允许集合＝**从仓库现取**。 */
+  const docSwitchHits = switchesInDoc(demoDoc);
+  const repoSwitches = repoSwitchTokens();
+  const unknownFlags = unknownSwitches(demoDoc, repoSwitches.set);
+  check('Demo 说明的**命令行示例段**里出现的参数都真实存在（允许集合＝从仓库现取的开关字面量；'
+    + 'CSS 变量名不进扫描面，`E205`）', unknownFlags.length === 0,
+    unknownFlags.length ? `文档里有但仓库里没有：${unknownFlags.join('、')}`
+      : `命令行段内 ${docSwitchHits.size} 个参数；命令上下文 ${commandContexts(demoDoc).length} 处；`
+        + `允许集合 ${repoSwitches.set.size} 个（取自 ${repoSwitches.files.length} 个文件）`);
+  /* 反装饰（`E174`/`D23` 同族）：上面那条"0 违规"只有在**取数面真的在工作**时才算证据 ⇒
+     把两件事一起判死：允许集合非空、仓库文件集非空；再如实报出"本轮扫到几个 token"。 */
+  check('`E205` 取数面自证：仓库现取的开关集合与文件集**都非空**（否则"0 违规"可能是取数面塌了），'
+    + '且如实报出本轮扫描到的 token 数',
+    repoSwitches.set.size > 0 && repoSwitches.files.length > 0,
+    `允许集合 ${repoSwitches.set.size} 个；扫描文件 ${repoSwitches.files.length} 个；`
+    + `Demo 说明命令段内 token ${docSwitchHits.size} 个（0 ＝ 该文档当前没有命令行示例段，见下一行 INFO）`);
+  console.log(`  [INFO] \`E205\` 读数：Demo 说明里命令段 token＝${docSwitchHits.size} 个、命令上下文＝`
+    + `${commandContexts(demoDoc).length} 处；允许集合＝${repoSwitches.set.size} 个（扫 ${repoSwitches.files.length} 个文件）`
+    + `${docSwitchHits.size === 0 ? '；⚠ 当前文档**没有**命令行示例段（`T-20261007-14` 座位 9 的绕法形态）—— 取数面已不再逼它绕行，真实命令可以安全写回' : ''}`);
+  /* `E205` 的可证伪反证（`D22`）：三组**内存样本**（都以**真文档文本**为基底插入，不落盘），
+     走**同一个** `unknownSwitches()`；外加"盘上字节未变"。
+     ⚠ **负对照的样本名在源码里拼出来**（`['--','definitely-not-a-switch'].join('')`）：允许集合＝
+     "扫仓库源码里的 `--xxx` 字面量" ⇒ 若把整串写成脚本里的字面量，它会被**自己的取数面收编**
+     （首轮实测：`它在允许集合里=true`、违规 0 条 ⇒ 负对照永远变绿 —— 判据被夹具自我污染）。
+     拼接后：**源码里没有该 token，样本文本里有** —— 这正是"仓库里不存在的开关"该有的样子。 */
+  const e205Docs = ['tests/docs-check.js', '输出文件/甲方/水池高速摄像生产管理看板-前端界面Demo说明.md'];
+  const e205Before = e205Docs.map(f => fs.readFileSync(path.join(ROOT, f)));
+  /* **旧取数面**（照抄改前那一版判定：全文 `--xxx` ＋ 只认 mock-upper／mock-mes 两份白名单）——
+     D22 要求"按旧实现跑必须失败"（ADR-0004 D22 的"旧实现片段**内联**、不依赖外部文件"）：
+     下面的 ②③ 用同一个样本喂**新旧两份判据**，读数是"旧红新绿"。**只为反证用，判据本体一律走新的。**
+     ⚠ `T-20261007-17`（座位 9 实测报出、主代理裁定"改判据侧"）：旧面是**全文扫**，而 ②③ 的样本是
+     `demoDoc ＋ 插入片段` ⇒ 若**拿整篇去喂旧面**，读数＝"基底文档自带的 token 数 ＋ 片段贡献"。
+     `T-20261007-14` 的绕法下基底恰好 0 个 token（当时 `--[a-z]` 去重 ＝ 0）⇒ "红 3／4 条"成立，
+     但**那不是不变量**：真命令回填文档后基底自带 20 个 token（17 CSS 变量 ＋ `--size/--out/--update`）
+     ⇒ 写死的期望当场落空（旧面报 20）。**改法**：旧面**只喂"插入的样本片段"**（与基底解耦）；
+     新判据仍喂**整篇 `demoDoc ＋ 片段`**（那才是真实场景）；整篇口径的旧面读数**只打进 INFO、不作期望**。 */
+  const e205OldFace = text => {
+    const docFlags = new Set([...text.matchAll(/(--[a-z][a-z-]*)/g)].map(m => m[1]));
+    const upper = new Set([...readText('tools/mock-upper/mock-upper.js').matchAll(/'(--[a-z-]+)'/g)].map(m => m[1]));
+    const mes = new Set([...readText('tools/mock-mes/mock-mes.js').matchAll(/'(--[a-z-]+)'/g)].map(m => m[1]));
+    return [...docFlags].filter(f => !upper.has(f) && !mes.has(f) && f !== '--help');
+  };
+  const E205_BOGUS = ['--', 'definitely-not-a-switch'].join('');   // ⚠ 见下方说明：源码里**不出现整串**
+  const e205Neg = demoDoc + '\n```\nnode tests/capture-baseline.js ' + E205_BOGUS + '\n```\n';
+  const e205NegBad = unknownSwitches(e205Neg, repoSwitches.set);
+  check('`E205`-`D22①` 负对照（**内存副本**，基底＝真文档文本）：命令行示例段里塞一个仓库里不存在的开关'
+    + '（`' + E205_BOGUS + '`）⇒ 判据**必红并指名**它',
+    e205Neg.indexOf(E205_BOGUS) >= 0 && !repoSwitches.set.has(E205_BOGUS)
+      && e205NegBad.length === 1 && e205NegBad[0].indexOf(E205_BOGUS) >= 0,
+    `样本含该开关=${e205Neg.indexOf(E205_BOGUS) >= 0}、它在允许集合里=${repoSwitches.set.has(E205_BOGUS)}；`
+    + `违规 ${e205NegBad.length} 条＝${e205NegBad.join('、') || '（空，异常）'}`);
+  const E205_REAL = ['--size', '--out', '--update'];
+  /* 插入片段与"整篇样本"分开命名：**旧面只喂片段**（对照纯净、与基底解耦），新面喂整篇（真实场景） */
+  const e205PosSample = '```\nnode tests/capture-baseline.js --size 3840x2160 --out 输出文件/甲方\n'
+    + 'node tests/capture-baseline.js --update\n```\n';
+  const e205Pos = demoDoc + '\n' + e205PosSample;
+  const e205PosBad = unknownSwitches(e205Pos, repoSwitches.set);
+  check('`E205`-`D22②` 正对照（**内存副本**）：写入 `tests\\capture-baseline.js` 的**真开关**'
+    + '（`--size/--out/--update` —— 正是本轮被误判的三处）⇒ 新判据（喂**整篇文档＋片段**）必须**绿**，'
+    + '且这三个 token 确实进了扫描面；**同一片段单独**喂旧取数面（内联旧实现片段）必须**红 3 条**',
+    e205PosBad.length === 0 && E205_REAL.every(t => repoSwitches.set.has(t))
+      && E205_REAL.every(t => switchesInDoc(e205PosSample).has(t))
+      && e205OldFace(e205PosSample).length === 3,
+    `三个真开关都在允许集合里=${E205_REAL.every(t => repoSwitches.set.has(t))}；`
+    + `新判据（整篇＋片段）扫到 ${[...switchesInDoc(e205Pos).keys()].join('、') || '（空，异常）'}、违规 ${e205PosBad.length} 条；`
+    + `旧取数面（**只喂片段**）违规 ${e205OldFace(e205PosSample).length} 条＝${e205OldFace(e205PosSample).join('、') || '（空）'}；`
+    + `旧取数面（喂整篇＋片段，**仅读数、不作期望**）＝${e205OldFace(e205Pos).length} 条`);
+  const E205_CSS = ['--bg', '--gap-tile', '--accent', '--line-soft'];
+  const e205CssSample = '| 变量 | 值 |\n| --- | --- |\n| `--bg` | #0b1220 |\n| `--gap-tile` | 12px |\n'
+    + '正文里也提到 --accent 与 --line-soft（不带反引号）。\n`--gap-tile`\n'
+    + '```css\n:root {\n  --bg: #0b1220;\n  --gap-tile: 12px;\n}\n```\n';   // 非命令围栏块：同样不进扫描面
+  const e205Css = demoDoc + '\n' + e205CssSample;
+  const e205CssBad = unknownSwitches(e205Css, repoSwitches.set);
+  check('`E205`-`D22③` 反面（**内存副本**）：CSS 变量名出现在**正文／表格／行内代码段**⇒ **不进扫描面**、必须**绿**'
+    + '（这正是本条的立案症状：旧判据把 `--bg`…`--gap-tile` 当成命令行参数）；且该片段**不改变**整篇的扫描面'
+    + '（`switchesInDoc(整篇＋片段).size === switchesInDoc(整篇).size`）；**同一片段单独**喂旧取数面必须**红 4 条**',
+    E205_CSS.every(t => e205CssSample.indexOf(t) >= 0)
+      && switchesInDoc(e205CssSample).size === 0 && e205CssBad.length === 0
+      && switchesInDoc(e205Css).size === switchesInDoc(demoDoc).size
+      && e205OldFace(e205CssSample).length === 4,
+    `片段含 4 个 CSS 变量名=${E205_CSS.every(t => e205CssSample.indexOf(t) >= 0)}；`
+    + `新判据：片段扫到 ${switchesInDoc(e205CssSample).size} 个 token、整篇＋片段扫到 ${switchesInDoc(e205Css).size} 个`
+    + `（整篇单独 ${switchesInDoc(demoDoc).size} 个）、违规 ${e205CssBad.length} 条；`
+    + `旧取数面（**只喂片段**）违规 ${e205OldFace(e205CssSample).length} 条＝${e205OldFace(e205CssSample).join('、') || '（空）'}；`
+    + `旧取数面（喂整篇＋片段，**仅读数、不作期望**）＝${e205OldFace(e205Css).length} 条`);
+  const e205After = e205Docs.map(f => fs.readFileSync(path.join(ROOT, f)));
+  const e205ByteSame = e205Before.every((b, i) => Buffer.compare(b, e205After[i]) === 0);
+  check('`E205`-`D22④` 三组样本全部是**内存字符串**（基底＝真文档文本，副本上插样本、不落盘）：变异前后'
+    + '`tests\\docs-check.js` 与甲方 Demo 说明**逐字节未变**（`Buffer.compare`＝0；**不用** `git checkout`／`git restore`）',
+    e205ByteSame,
+    e205Docs.map((f, i) => `${f}: ${e205Before[i].length} B → ${e205After[i].length} B（cmp=${Buffer.compare(e205Before[i], e205After[i])}）`).join('；'));
+  console.log(`  [INFO] \`E205\`-D22 读数（\`T-20261007-17\` 口径：**旧面只喂插入片段**，整篇口径只作读数）：`
+    + `负对照样本含 "${E205_BOGUS}"（在允许集合里=${repoSwitches.set.has(E205_BOGUS)}）`
+    + `⇒ 新判据违规 ${e205NegBad.length} 条＝${e205NegBad.join('、') || '（空，异常）'}；`
+    + `正对照（--size/--out/--update）⇒ 新判据（整篇＋片段）${e205PosBad.length} 条／旧面（**只喂片段**）`
+    + `${e205OldFace(e205PosSample).length} 条（${e205OldFace(e205PosSample).join('、') || '（空）'}）`
+    + `／旧面（整篇＋片段）${e205OldFace(e205Pos).length} 条；`
+    + `CSS 样本（--bg/--gap-tile/--accent/--line-soft）⇒ 新判据：片段 ${switchesInDoc(e205CssSample).size} 个 token、`
+    + `整篇＋片段 ${switchesInDoc(e205Css).size} 个（整篇单独 ${switchesInDoc(demoDoc).size} 个）、违规 ${e205CssBad.length} 条／`
+    + `旧面（**只喂片段**）${e205OldFace(e205CssSample).length} 条（${e205OldFace(e205CssSample).join('、') || '（空）'}）`
+    + `／旧面（整篇＋片段）${e205OldFace(e205Css).length} 条；`
+    + `盘上字节未变=${e205ByteSame}`);
 
   const pwd = (readText('src/services/mockData.js').match(/unlockPassword:\s*'([^']+)'/) || [])[1];
   check('文档中提到的演示密码与实现一致', pwd !== undefined && demoDoc.includes(pwd), `实现为 ${pwd}`);

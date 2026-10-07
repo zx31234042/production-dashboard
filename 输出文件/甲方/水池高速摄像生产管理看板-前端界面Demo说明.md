@@ -209,8 +209,8 @@
 
 | 口径 | 目录 | 张数 | 尺寸／格式 | 生成方式 | 用途 |
 | --- | --- | --- | --- | --- | --- |
-| 交付图（本册图源） | `src\assets\screenshots\` | 10 | 3840×2160／PNG（8 位、RGB、非隔行） | `tests\capture-baseline.js`：视口 3840×2160、输出到交付图目录（完整命令行见 `tests\screenshots-baseline\README.md` §五） | 本册逐页插图 |
-| 视觉基准图 | `tests\screenshots-baseline\` | 10 | 1920×1080／PNG（同格式） | `tests\capture-baseline.js`：覆盖基准目录（人工看图确认后；完整命令行见同 README §四） | `tests\screenshot-diff.js` 的逐像素回归基准；**不用于本册插图** |
+| 交付图（本册图源） | `src\assets\screenshots\` | 10 | 3840×2160／PNG（8 位、RGB、非隔行） | `node tests\capture-baseline.js --size 3840x2160 --out src\assets\screenshots` | 本册逐页插图 |
+| 视觉基准图 | `tests\screenshots-baseline\` | 10 | 1920×1080／PNG（同格式） | `node tests\capture-baseline.js --update`（人工看图确认后覆盖基准目录） | `tests\screenshot-diff.js` 的逐像素回归基准；**不用于本册插图** |
 
 两者**同源同口径**（同一确定性注入脚本、同一 URL 参数表），只差视口尺寸；**改界面时两者都要重拍**，顺序见 §十七。
 
@@ -259,19 +259,19 @@
 
 ### 13.2 色彩变量（真源：`src\styles\variables.css`）
 
-> 下表「变量」一栏只写**名字主体**：真源里它们的完整写法＝**CSS 自定义属性前缀（两个 ASCII 连字符）＋ 名字主体**（例：`bg` 在真源里带该前缀）。
+> 下表变量均为 **CSS 自定义属性（CSS 变量）**，在 `src\styles\variables.css` 的 `:root` 中声明，名字以两个连字符起首。
 
 | 变量 | 值 | 用途 |
 | --- | --- | --- |
-| `bg` / `bg-deep` | `#0B1A2B` / `#050E18` | 页面底色／舞台外底色 |
-| `panel` / `panel-2` | `#122740` / `#0F2136` | 卡片面／次级面 |
-| `line` / `line-soft` | `#1E3A5C` / `#17304C` | 边框／弱分隔 |
-| `grid` | `#2E5A8C` | 曲线网格线（对比度高于 `line`，保证远距离可见） |
-| `text` / `muted` | `#E8F1FA` / `#8FA9C4` | 主文字／次要文字 |
-| `accent` | `#38A3E0` | 强调色（当前页高亮、进度条） |
-| `ok` / `warn` / `err` / `idle` | `#00B050` / `#FFC000` / `#FF0000` / `#808080` | 正常／临近／超范围与故障／未开始 |
-| `font` / `mono` | 微软雅黑族／Consolas 族 | 正文字体／等宽数字（`tabular-nums`） |
-| `gap-tile` | `24px` | 指标卡格距（与 `.tab-panel` 的 24px、`#stage` 的 20px 同源，见 `E184`） |
+| `--bg` / `--bg-deep` | `#0B1A2B` / `#050E18` | 页面底色／舞台外底色 |
+| `--panel` / `--panel-2` | `#122740` / `#0F2136` | 卡片面／次级面 |
+| `--line` / `--line-soft` | `#1E3A5C` / `#17304C` | 边框／弱分隔 |
+| `--grid` | `#2E5A8C` | 曲线网格线（对比度高于 `--line`，保证远距离可见） |
+| `--text` / `--muted` | `#E8F1FA` / `#8FA9C4` | 主文字／次要文字 |
+| `--accent` | `#38A3E0` | 强调色（当前页高亮、进度条） |
+| `--ok` / `--warn` / `--err` / `--idle` | `#00B050` / `#FFC000` / `#FF0000` / `#808080` | 正常／临近／超范围与故障／未开始 |
+| `--font` / `--mono` | 微软雅黑族／Consolas 族 | 正文字体／等宽数字（`tabular-nums`） |
+| `--gap-tile` | `24px` | 指标卡格距（与 `.tab-panel` 的 24px、`#stage` 的 20px 同源，见 `E184`） |
 
 ### 13.3 字号与字重规范（真源：`src\styles\global.css`）
 
@@ -308,8 +308,8 @@
 | 层级 | 形态 | 落点 |
 | --- | --- | --- |
 | 主参数 | 大号数值（104 px / 700）＋ 亮色文字，必要时用 `.hero`（140 px） | 设备状态页「航行器深度／航行速度」、任务数据页「实测数据」 |
-| 次要参数 | 次级字号（44～72 px）＋ `muted`，或以虚线次要条呈现 | 相机侧参数（实际帧率／相机增益／快门速度／相机水下深度） |
-| 说明与提示 | 36～40 px、`muted` | 指标提示行、空态说明、图下件号与量程、留痕与提示文案 |
+| 次要参数 | 次级字号（44～72 px）＋ `--muted`，或以虚线次要条呈现 | 相机侧参数（实际帧率／相机增益／快门速度／相机水下深度） |
+| 说明与提示 | 36～40 px、`--muted` | 指标提示行、空态说明、图下件号与量程、留痕与提示文案 |
 
 ### 13.6 无滚动条与防烧屏约束
 
@@ -413,11 +413,16 @@
 
 ### 17.3 重拍触发与顺序
 
-| 步骤 | 脚本与口径（**完整命令行见** `tests\screenshots-baseline\README.md` §四／§五 与 `输出文件\交付物提纲-2026-10-03\④-UI设计稿成册-提纲.md` §二） |
-| --- | --- |
-| 1）重拍 1080p 视觉基准图 | `tests\capture-baseline.js`：输出到候选目录（默认 `tests\._verify\captures`）——**改界面之后、看门禁之前** |
-| 2）重拍 4K 交付截图 | `tests\capture-baseline.js`：视口 3840×2160、输出到 `src\assets\screenshots\`（供本册与 `.docx` 引用） |
-| 3）视觉回归比对 | `tests\screenshot-diff.js`：默认拿基准与候选目录逐张比对 |
+```bat
+:: 1) 重拍 1080p 视觉基准图（改界面之后、看门禁之前）
+node tests\capture-baseline.js --out tests\._verify\captures
+
+:: 2) 重拍 4K 交付截图（供本册与 .docx 引用）
+node tests\capture-baseline.js --size 3840x2160 --out src\assets\screenshots
+
+:: 3) 视觉回归比对（默认拿基准与 ._verify\captures 比对）
+node tests\screenshot-diff.js
+```
 
 > **顺序要求**：**先重拍交付截图，再重新生成引用这些图片的 `.docx`**（本册用 `tools\md2docx-img.ps1` 嵌图，图换了不重生成 Word 就还是旧图）。
 > 一条截图管线**同一时刻只允许一个所有者**（避免与本册重拍互相覆盖）。
