@@ -99,6 +99,14 @@ window.MockData = (function () {
   /* 任务曲线：按任务完成更新，每个任务按 1 s 采样，采样点数与节拍一致 */
   const CURVE_SAMPLES = (BC.curve && BC.curve.samples) || CFG.cycleSec || 160;
 
+  /* `E203`（2026-10-07 收紧）：**"本件被完整观察到"的下界** —— 节拍边界处缓冲至少要有这么多采样点才允许固化。
+     比例取值依据：① 采样 1 s/点、节拍 `CFG.cycleSec`（160 s）⇒ 完整观察一件恰好得 `CURVE_SAMPLES`（160）个点；
+     ② 浏览器 `setInterval(1000)` 的真实周期略大于 1 s（定时器/重绘抖动，实测常见 1.00～1.01 s）⇒ 一件内可能少 1～5 帧，
+     故不能要求"恰好 160 点"；③ 取 **90%**（160 s ⇒ 144 点／≥144 s）：它挡掉"刚打开页面的 2～3 帧"（占比 1.25%～1.9%）
+     与"从节拍中点起看"（≤50%）这类**残缓冲**，同时给定时器抖动留 ~16 帧余量。
+     ⚠ 口径是"**近似完整**观察"，不是逐字"首帧观察到"（比例值由座位 3 定；`E203` 行授权的正是"合理比例"）。 */
+  const CURVE_FREEZE_MIN_SAMPLES = Math.ceil(CURVE_SAMPLES * 0.9);
+
   /* 单任务判定结果（FR-3.13 五态：待测试 / 测试中 / 合格 / 不合格 / 待复检）
      演示口径：绝大多数合格，每 31 件出现 1 件不合格、每 23 件出现 1 件待复检 */
   function verdictOf(unitIndex) {
@@ -719,11 +727,34 @@ window.MockData = (function () {
       state.status.online = '在线正常';
     }
 
-    /* ---- 任务曲线：任务进行中按 1 s 采样；任务完成时固化为完整曲线（不做秒级刷新） ---- */
+    /* ---- 任务曲线：任务进行中按 1 s 采样；任务完成时固化为完整曲线（不做秒级刷新） ----
+       `E203`（★★，A 组）—— **"节拍边界固化"的判据 2026-10-07 收紧**（**裁定人＝项目负责人；裁定日期＝2026-10-07**；**依据＝**
+       `项目记录\后续路线图.md` 的 `E203` 行）。
+       · **为什么收紧（改前的病灶）**：改前本分支的判据只有"本轮缓冲长度 > 1" ⇒ 页面恰在节拍边界前 1～2 s 打开时，
+         边界那一帧就把**这 2 个采样点**固化成一条曲线、并**覆盖**预置的完整曲线，屏上于是出现
+         「第 N 件 · 2 采样点 · 2 s」这种**标着整件号却没有整件数据**的曲线（`T-20261007-07` 用例 B/D 实测：
+         真机与 vm 均复现；**不带** `?curve=none` 时同样覆盖预置曲线）。它与 `E38`（"算不出来"不得显示成 0）**同族**：
+         把"页面刚打开看到的两帧"当成了"整件任务的完整曲线"；对 `?curve=none` 则意味着空态窗口可短至 ~1 s
+         （`E202`／`B2` 那条判据相位抖动的根因）。
+       · **改后（本处即本包全部实现改动）**：**本件未被完整观察到就不固化** —— 两条同时成立才固化：
+         ① `buf.unitIndex === t.unitIndex - 1`：缓冲所属的件就是**紧邻的上一件** ⇒ 缓冲里的点属于**同一件**，且这一道
+            边界是**真实边界**（时钟跳变／标签页被节流跨过整件时，稀疏缓冲不再被当成 1 s 均匀曲线）；
+         ② `buf.depth.length >= CURVE_FREEZE_MIN_SAMPLES`：缓冲达到 `board.config.js` 的 `curve.samples`（经
+            `CURVE_SAMPLES` 读入）的**合理比例**（**90%**）—— 比例取值的依据写在 `CURVE_FREEZE_MIN_SAMPLES` 的注释里。
+         两条不同时成立时**保留上一件曲线原样**：既不覆盖、也不写 0 或任何占位值（**不许**用 `DEFAULT`／假值把
+         "没观察到"写成"观察到了" —— `E38` 既定口径）。
+       · **未改什么**：`?curve=none` 仍是"**启动时清一次**"的语义（`src\main.js:116` 的调用点一字未动；变的只是
+         "清掉之后多久会被重新固化"＝由"下一道边界"变为"观察到一整件之后"，即空态窗口 ≤2 个节拍 —— 该窗口口径的
+         更新由主代理落在 `P3-13`）；生产侧固化路径（`server\repo\curve.js` 的 `saveCurve()`，由 DR-05／DR-19 驱动）
+         **一字未动**；`FR-3.15` 的正式口径（"任务完成时固化为**该任务的完整曲线**"）**一字未动** —— 本处只是让
+         演示侧不再在"没观察到整件"时冒充实测。 */
     if (state.curveTick.unitIndex !== t.unitIndex) {
-      if (state.curveTick.depth.length > 1) {
-        state.curve.depth = makeCurve(state.curveTick.depth, state.curveTick.unitIndex);
-        state.curve.speed = makeCurve(state.curveTick.speed, state.curveTick.unitIndex);
+      const buf = state.curveTick;                                         // 上一件（或首帧之前）的采样缓冲
+      const isAdjacentPiece = buf.unitIndex === t.unitIndex - 1;           // ① 缓冲属于紧邻的上一件
+      const observedEnough = buf.depth.length >= CURVE_FREEZE_MIN_SAMPLES; // ② 近似完整观察（≥90%）
+      if (isAdjacentPiece && observedEnough) {
+        state.curve.depth = makeCurve(buf.depth, buf.unitIndex);
+        state.curve.speed = makeCurve(buf.speed, buf.unitIndex);
       } else if (state.curve.depth && state.curve.depth.unitIndex === 0) {
         /* 首次 tick：把演示预置曲线对齐为"上一件" */
         const prev = Math.max(1, t.unitIndex - 1);
