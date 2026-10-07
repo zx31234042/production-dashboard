@@ -27,6 +27,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const vm = require('node:vm');
 const { spawn } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const env = require('./env');
@@ -180,10 +181,12 @@ async function evaluate(expression) {
   return r.result.value;
 }
 
-/** 打开页面并等待首个渲染周期（DOMContentLoaded + 两次 1 秒 tick） */
-async function openPage(query, waitMs) {
+/** 打开一个**绝对 URL** 并等待首个渲染周期（DOMContentLoaded + 指定等待）
+ *  与 `openPage()` 同一口径，只是不拼 `PAGE` 前缀 —— `B5e`（`E206`）要打开**真服务端**托管的
+ *  同源页面（`http://127.0.0.1:<port>/?source=server`），不是 `file://` 的 `index.html`。 */
+async function openUrl(url, waitMs) {
   consoleErrors.length = 0;
-  await cdp.send('Page.navigate', { url: PAGE + (query || '') });
+  await cdp.send('Page.navigate', { url });
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     const ready = await evaluate('document.readyState').catch(() => null);
@@ -191,6 +194,11 @@ async function openPage(query, waitMs) {
     await sleep(150);
   }
   await sleep(waitMs === undefined ? 2200 : waitMs);
+}
+
+/** 打开页面并等待首个渲染周期（DOMContentLoaded + 两次 1 秒 tick） */
+async function openPage(query, waitMs) {
+  return openUrl(PAGE + (query || ''), waitMs);
 }
 
 async function clickTab(index) {
@@ -886,7 +894,27 @@ async function main() {
         visibleText,
         overflow: { sw: cell.scrollWidth, cw: cell.clientWidth, sh: cell.scrollHeight, ch: cell.clientHeight,
           dw: cell.scrollWidth - cell.clientWidth, dh: cell.scrollHeight - cell.clientHeight },
-        childVisibility
+        childVisibility,
+        /* ---- 以下四项为 B5e（E206，服务端档真机判据）追加：**同一把尺子**再读四处 ----
+           （对 B5d 的三条断言完全无影响：只多读，不改任何既有字段的分寸。
+             ⚠ 本注释在模板串内 ⇒ 一律不用反引号。） */
+        startedText: (() => { const el = document.getElementById('sStarted'); return el ? String(el.textContent || '') : null; })(),
+        serverMode: !!(window.MockData && window.MockData.state && window.MockData.state.serverMode === true),
+        dataSource: (window.BoardConfig || {}).dataSource === undefined ? null : window.BoardConfig.dataSource,
+        noteRect: (() => { const b = note.getBoundingClientRect();
+          return { t: b.top, b: b.bottom, l: b.left, r: b.right, h: b.height }; })(),
+        sibling: (() => {
+          const parent = cell.parentElement;
+          const tiles = parent ? [].slice.call(parent.children) : [];
+          const i = tiles.indexOf(cell);
+          const rc = el => { if (!el) return null; const b = el.getBoundingClientRect();
+            return { t: b.top, b: b.bottom, l: b.left, r: b.right, w: b.width, h: b.height }; };
+          const card = cell.closest('.card');
+          let cardBottom = null;
+          if (card) { const cs = getComputedStyle(card); const b = card.getBoundingClientRect();
+            cardBottom = b.bottom - parseFloat(cs.paddingBottom || '0') - parseFloat(cs.borderBottomWidth || '0'); }
+          return { self: rc(cell), prev: rc(tiles[i - 1]), next: rc(tiles[i + 1]), count: tiles.length, cardBottom };
+        })()
       };
     })()`);
 
@@ -1099,6 +1127,316 @@ async function main() {
       `摘关闭时 ${(probe && probe.duringDemoContributors || []).length} 个` +
       `（${(probe && probe.duringDemoContributors || []).map(c => c.cls || c.id).join('、') || '（无）'}）、` +
       `后缀位仍在可见集合=${probe && probe.duringSrcSeen}；还原=${probe && probe.restored}`);
+    /* ===== B5e `E206`：`E197`／`E198` 的**服务端档**真机判据 =====
+       立案（`E206`，2026-10-07 由主代理在收口 `E197`／`E198` 时**如实分立**）：`tests\ui-check.js` 的
+       **U11** 已用假 DOM 把四态文案与 `data-note-lv` 逐字钉死（含服务端 `err`／`warn` 两档），而
+       `tests\browser-check.js` 的 **B5d** 只在**演示档**（`file://`）真机读数 ⇒
+       **服务端模式下的真实版面（提示行是否真的可见、是否挤压邻格、`data-note-lv` 在真机上的取值）
+       在门禁里没有真机证据**（`file://` 下取不到 `/health`）。
+
+       **本段在 `E206` 的二选一里选 ①**：补一组"**起本地服务端 ⇒ 真机读服务端档 `data-note-lv` 与版面**"
+       的真机判据。**归属选 `browser-check` 的理由**（不是"顺手"）：
+         · 要证的是**真机渲染结果**（真 computed style、真排版、真 `dataset`），只有 CDP 面能证；
+           `platform-check` 是**纯文本/进程内**的平台适配层判据（它的整脚本定位就是"不起浏览器"），
+           把真机判据塞进去会破坏它自己的分层；
+         · B5d 已经在这里把"服务端档不在真机可构造范围内、只断言 `demo`"**明文登记**过（见上一条断言的
+           注释与 `why`）⇒ 缺口就落在本文件的这一处，补在这里才是**闭合**而不是新开一处。
+       **复用而非新造**：起服务端走 `tests\lib\harness.js` 的 `startService`／`makeTempDir`
+       （`harness-check` 的端到端与 `T-20261005-21` 用的是同一条设施，见 `harness-check` §W7／§二十六），
+       **不另写启动器、不占固定端口**（`allocPort` 随机）；灌帧走**既有接口** `POST /ifd/frame`，
+       载荷字段取自 `src\config\fieldMap.js` 的 `samplePayload`（**单一真源**，不手抄字段名）。
+
+       三档怎么造（**都在真服务端上造，不碰 `src\`**）：
+         · **`err` 档**：灌 1 帧带合法 `unitIndex` ＋ 1 帧**不带** `unitIndex` ⇒
+           `/health.frameUnitIndex.withoutIndex > 0` ⇒ 提示行应**可见**且红字点名"件序号"；
+         · **`ok` 档**：另起一个干净库、只灌带 `unitIndex` 的帧 ⇒ `withoutIndex === 0` ⇒ 提示行**不可见、
+           文本为空**，但 `data-note-lv` 必须是 `ok` —— 这正是 `E198` 要分开的"两种『没有』"
+           （演示 `demo` ≠ 服务端读到 0 `ok`）在**真机**上的证据。
+         · ⚠ **未覆盖（如实登记）**：`warn` 档（`/health` 读数未取得）在**健康服务端上不可达**
+           （要构造它得让 `/health` 失败或让 IF-D 未接线）⇒ 该档真机证据**仍然缺**，
+           现由 `ui-check` U11 的假 DOM 面承担。`demo` 档由 B5d 承担。**不得据本段全绿宣称"四态均已真机验证"**
+           （ADR-0004 D19）。
+
+       "挤压邻格"怎么量（**可判定**的形态，不靠观感）：①本格 `scrollWidth/Height ≤ client/Height + 1`
+       （未撑破）②提示行的 `getBoundingClientRect()` **完整落在本格矩形内**（不许越出格子）
+       ③本格与同容器相邻格的两两矩形**不相交**。三者都只用**同域**的量（元素自身 scroll/client ＋
+       rect 对 rect）—— **刻意不比"本格底 vs 卡片内容盒底"**：那是"视觉坐标 vs 未缩放布局值"的混算，
+       在 1920×1080/1366×768（舞台按 0.5 缩放）下会凭空多出 ~15.5 px（首版实测 534 vs 518.5 ⇒ 假红），
+       与 `tests\README.md` 的 B5b 注记同源；该读数只打印、不作判据。
+       ⚠ 只断言"结构上没坏"，**不**断言"提示行占了多少行高" —— 行高由 `.tile` 的布局决定，
+       写死行高会在正当的样式调整后落空（`E205` 的教训）。
+
+       真机取数链（**渲染层不发请求**）：同源托管页（`GET /` 由 `server/http/site.js` 提供）＋
+       `?source=server` ⇒ `state.serverMode === true`；`/health` 读数由**既有**的
+       `services/selfCheckProbe.js`（5 s 节流）经 `SettingPanel.render()` 触发 ⇒ **不新造取数通道**
+       （PROJECT_RULES 9.6 单一真源）。故本段每档都**先落生产统计页、再切设置页触发探测、再切回来量版面**。
+       ⚠ 本段依赖浏览器权限 **＋** 能起 Node 子进程：无 Edge / 沙箱禁命名管道时整脚本已在前文
+       `skipSuite`（退 3，跳过 ≠ 通过）。 */
+    section('B5e `E206` 服务端档真机判据（起真服务端 ⇒ 真机读 `#c114FrameUnitNote` 的 `data-note-lv` 与版面）');
+    {
+      /* 帧载荷取自配置真源（`fieldMap.samplePayload`）：字段名不手抄，改契约时本段自动跟随 */
+      const sampleFrame = (() => {
+        const sb = { console };
+        sb.window = sb;
+        vm.createContext(sb);
+        const rel = path.join('src', 'config', 'fieldMap.js');
+        vm.runInContext(fs.readFileSync(path.join(ROOT, rel), 'utf8'), sb, { filename: path.join(ROOT, rel) });
+        return Object.assign({}, sb.window.FieldMap.samplePayload);
+      })();
+      const pad2 = n => String(n).padStart(2, '0');
+      /** DR-16 的本地时刻文本（**不经 `toISOString()`** —— 那会转 UTC、帧落到班次窗口之外） */
+      const stampOf = (d, off) => {
+        const t = new Date(d.getTime() + off * 1000);
+        return t.getFullYear() + '-' + pad2(t.getMonth() + 1) + '-' + pad2(t.getDate()) + ' ' +
+          pad2(t.getHours()) + ':' + pad2(t.getMinutes()) + ':' + pad2(t.getSeconds());
+      };
+      /** 起一个**真服务端**并灌帧：`unitIndexes` 里的 `null` ＝ **缺件序号**帧（`unit_index` 写 NULL）。
+       *  夹具**延迟加载**（放在函数内）：万一 `tests\lib\harness.js` 在本环境载入即抛
+       *  （临时区语义校验不过等），它会被上面的 try 收成"环境不满足 ⇒ 显式跳过"，而不是把
+       *  整脚本打成异常退出（规范 9.5-5：跑不了要说跑不了，跳过 ≠ 通过）。 */
+      async function serveWith(unitIndexes) {
+        const harnessLib = require('./lib/harness');
+        const svc = await harnessLib.startService({
+          script: 'server/index.js', args: ['--data-dir', harnessLib.makeTempDir('b5e-data')],
+          readyPath: '/health', timeoutMs: 30000
+        });
+        const base = 'http://127.0.0.1:' + svc.port;
+        const now = new Date();
+        const n = unitIndexes.length;
+        const posted = [];
+        for (let i = 0; i < n; i++) {
+          const f = Object.assign({}, sampleFrame, { collectTime: stampOf(now, -2 * (n - i)) });
+          if (unitIndexes[i] === null) delete f.unitIndex; else f.unitIndex = unitIndexes[i];
+          const r = await fetch(base + '/ifd/frame', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json;charset=UTF-8' },
+            body: JSON.stringify(f)
+          });
+          const body = await r.json();
+          posted.push({ status: r.status, outcome: body.outcome });
+        }
+        const health = await (await fetch(base + '/health')).json();
+        const snap = await (await fetch(base + '/state')).json();
+        return { svc, base, health, snap, posted };
+      }
+      const startedQtyOf = snap =>
+        (snap && snap.snapshot && snap.snapshot.stats) ? snap.snapshot.stats.startedQty : null;
+      /** 真机取数：同源服务端页（`?source=server&tab=3`）⇒ 切设置页触发**既有**探测 ⇒ 切回量版面 */
+      async function readServerCellAt(base, w, h) {
+        await setViewport(w, h);
+        await openUrl(base + '/?source=server&tab=3', 2600);
+        await clickTab(7);
+        await sleep(2600);
+        await clickTab(3);
+        await sleep(1600);
+        return await readCell();
+      }
+      const briefOf = m => '视口=' + m.viewport[0] + '×' + m.viewport[1] + '；serverMode=' + m.serverMode +
+        '、dataSource=' + JSON.stringify(m.dataSource) + '；格=' + m.cellTag +
+        '；#c114StartedSource 文本=' + JSON.stringify(m.srcText) + '／display=' + m.srcDisplay +
+        '；#c114FrameUnitNote 文本=' + JSON.stringify(m.noteText) + '／display=' + m.noteDisplay +
+        '／hidden 属性=' + m.noteHiddenAttr + '／dataset.noteLv=' + JSON.stringify(m.noteLv);
+      /* **同一把尺子**（纯函数）：原件读数与 D22 变异读数都喂给这三个判据 —— 不另写一份期望 */
+      const SVERD = {
+        prodFacts: (m, wantStarted) => ({
+          /* ⚠ 判据取**可见文本投影里没有「（演示派生）」**（与 B5d 同一投影口径），
+             **不**取"后缀位 `display:none`"：`E197` 的实现口径是 `setText(..., '')` ——
+             **清空文本**，不是隐藏元素（真机实测 `srcText=""` 且 `srcDisplay="inline"`）。
+             首版我把期望写成 `srcVisible === false` ⇒ 三条断言全红；按 ADR-0004 D21 判定：
+             **实际值是对的**（`ui-check` U11 的 `E197-②` 逐字断言的就是"该位文本为空串"，
+             从不涉及可见性）⇒ 改**期望**，并把这条判定留在此处（不改成"隐藏元素"那种实现，
+             那会同时打红 U11）。 */
+          ok: m.srcText === '' && m.visibleText.indexOf('（演示派生）') < 0 &&
+            m.startedText === String(wantStarted),
+          why: '#c114StartedSource 文本=' + JSON.stringify(m.srcText) + '（服务端档应**逐字为空串**；' +
+            '该位是**空的内联元素**，computed display=' + m.srcDisplay + ' ⇒ 元素本身仍"可见"，' +
+            '故判据看**可见文本投影**）、可见文本含「（演示派生）」=' +
+            (m.visibleText.indexOf('（演示派生）') >= 0) + '（应为 false）；#sStarted 真机文本=' +
+            JSON.stringify(m.startedText) + '（应 ＝ 服务端 `/state` 的 `startedQty` ' +
+            JSON.stringify(String(wantStarted)) + '）；' + m.brief
+        }),
+        noteVisibleErr: (m, withoutIndex) => ({
+          ok: m.noteLv === 'err' && m.noteHiddenAttr === false && m.noteDisplay !== 'none' &&
+            m.noteVisibility !== 'hidden' && m.noteText.indexOf('帧未带件序号') >= 0 &&
+            m.noteText.indexOf('本班 ' + withoutIndex + ' 帧') >= 0,
+          why: 'dataset.noteLv=' + JSON.stringify(m.noteLv) + "（应 'err'）、hidden 属性=" + m.noteHiddenAttr +
+            '（应 false）、computed display=' + m.noteDisplay + '／visibility=' + m.noteVisibility +
+            '（应可见）、DOM 文本=' + JSON.stringify(m.noteText) + '（应含"帧未带件序号"与"本班 ' +
+            withoutIndex + ' 帧" —— 该数取自服务端 `/health` 真值）；' + m.brief
+        }),
+        noteHiddenOk: m => ({
+          ok: m.noteLv === 'ok' && m.noteHiddenAttr === true && m.noteDisplay === 'none' &&
+            String(m.noteText) === '',
+          why: 'dataset.noteLv=' + JSON.stringify(m.noteLv) + "（应 'ok'；演示档是 'demo' ⇒ 两种『没有』" +
+            '不得混同）、hidden 属性=' + m.noteHiddenAttr + '（应 true）、computed display=' + m.noteDisplay +
+            '（应 none）、DOM 文本=' + JSON.stringify(m.noteText) + '（应空串）；' + m.brief
+        }),
+        layout: m => {
+          const s = m.sibling || {};
+          const hit = (a, b) => Boolean(a && b) && a.l < b.r - 1 && b.l < a.r - 1 && a.t < b.b - 1 && b.t < a.b - 1;
+          const inTile = Boolean(s.self) && m.noteRect.t >= s.self.t - 1 && m.noteRect.b <= s.self.b + 1;
+          const noOverlap = !hit(s.self, s.prev) && !hit(s.self, s.next);
+          /* ⚠ **刻意不比"本格底 vs 卡片内容盒底"**：`getBoundingClientRect()` 是**舞台缩放后**的视觉
+             坐标（`UI-02 4K 舞台`在 1920×1080/1366×768 下按 0.5 缩放），而 `computed paddingBottom`
+             是**未缩放**的布局值 —— 两者相减会凭空多出 ~15.5 px（首版实测：1920×1080 下 534 vs 518.5）。
+             这正是 `tests\README.md` 的 B5b 注记里那句"在 0.5 缩放舞台下须按缩放归一"的同类口径陷阱。
+             故本判据只用**同域**的量：元素自身的 `scroll*` vs `client*`（都不受缩放影响）
+             与 rect 对 rect 的比较（同为视觉坐标）。 */
+          return {
+            ok: m.overflow.sw <= m.overflow.cw + 1 && m.overflow.sh <= m.overflow.ch + 1 &&
+              inTile && noOverlap,
+            why: '本格 scrollWidth/clientWidth=' + m.overflow.sw + '/' + m.overflow.cw +
+              '、scrollHeight/clientHeight=' + m.overflow.sh + '/' + m.overflow.ch +
+              '（差值 ' + m.overflow.dw + ',' + m.overflow.dh + '，均需 ≤ +1）；提示行 rect=[' +
+              m.noteRect.t + ',' + m.noteRect.b + ']（高 ' + m.noteRect.h + '）完整落在本格 [' +
+              (s.self ? s.self.t : '?') + ',' + (s.self ? s.self.b : '?') + '] 内=' + inTile +
+              '；与同容器相邻格（共 ' + s.count + ' 格，上一格 ' + JSON.stringify(s.prev) +
+              '、下一格 ' + JSON.stringify(s.next) + '）矩形不相交=' + noOverlap +
+              '；【读数·不作断言】本格底 vs 卡片内容盒底 = ' + (s.self ? s.self.b : '?') + ' vs ' +
+              s.cardBottom + '（含舞台缩放与布局值混算，**不作判据**，见本函数注释）；' + m.brief
+          };
+        }
+      };
+
+      let errSvc = null;
+      let okSvc = null;
+      let b5eInfra = null;
+      try {
+        errSvc = await serveWith([7, null]);
+        okSvc = await serveWith([7, 8]);
+      } catch (e) {
+        /* 服务端起不来 ⇒ **环境不满足**，按规范 9.5-5 的口径"跳过 ≠ 通过"显式记跳过并写出原因
+           （`server/index.js` 自身的启动回归由 `harness-check` 的 §W6/§W7 硬判，
+             本脚本不替它判；这里只保证"跑不了就说跑不了"）。 */
+        b5eInfra = e;
+      }
+      try {
+        if (b5eInfra) {
+          skip('B5e 服务端档真机判据（起本地服务端 ⇒ 真机读 `data-note-lv` 与版面）',
+            '本地服务端起不来 ⇒ 本用例环境不满足（**跳过 ≠ 通过**；服务端自身的启动回归由 harness-check 判）：' +
+            b5eInfra.message);
+        } else {
+          await runB5eChecks(errSvc, okSvc);
+        }
+      } finally {
+        /* 服务端子进程与临时目录一律收尾（失败也不留进程/端口） */
+        if (errSvc) await errSvc.svc.stop();
+        if (okSvc) await okSvc.svc.stop();
+      }
+
+      /** B5e 的断言主体（服务端已就绪时调用）。**函数声明在块内提升** ⇒ 可写在调用点之后，
+       *  这样"服务端起不来就显式跳过"的分支不会把整段断言体再缩进一层（规范第五章：缩进 2 空格）。 */
+      async function runB5eChecks(errSvc, okSvc) {
+        const errFi = (errSvc.health && errSvc.health.frameUnitIndex) || {};
+        const okFi = (okSvc.health && okSvc.health.frameUnitIndex) || {};
+        const errStarted = startedQtyOf(errSvc.snap);
+        const okStarted = startedQtyOf(okSvc.snap);
+        check('B5e 前提：两档真服务端的 `/health.frameUnitIndex` 与 `/state.stats.startedQty` 都取得到，' +
+          '且两档在"缺件序号"这一位上**确实不同**（否则本段的分档没有意义）',
+          typeof errFi.withoutIndex === 'number' && errFi.withoutIndex > 0 && errFi.withIndex > 0 &&
+          okFi.withoutIndex === 0 && okFi.withIndex > 0 &&
+          typeof errStarted === 'number' && typeof okStarted === 'number',
+          'err 现场：/health.frameUnitIndex=' + JSON.stringify(errFi) + '、startedQty=' + errStarted +
+          '；ok 现场：/health.frameUnitIndex=' + JSON.stringify(okFi) + '、startedQty=' + okStarted +
+          '；灌帧结果=' + JSON.stringify(errSvc.posted) + '／' + JSON.stringify(okSvc.posted));
+
+        /* ---- `err` 档：三档分辨率（**提示行可见** —— 版面风险就在这一档） ---- */
+        let errBase = null;
+        for (const [w, h] of B5D_RESOLUTIONS) {
+          const m = await readServerCellAt(errSvc.base, w, h);
+          if (!m || m.fatal || m.startedText === null) {
+            check('B5e ' + w + '×' + h + ' 服务端 `err` 档「实际开工总数」格可在真机量测' +
+              '（?source=server&tab=3、#c114FrameUnitNote／#sStarted／.tile 齐备）',
+              false, (m && m.fatal) || (m && m.startedText === null ? '未找到 #sStarted' : 'evaluate 未返回结果'));
+            continue;
+          }
+          m.brief = briefOf(m);
+          if (!errBase) errBase = m;
+          check('B5e ' + w + '×' + h + ' 服务端 `err` 档**可在真机量测**且确实是服务端模式' +
+            '（`state.serverMode === true`；同源托管页 ⇒ `resolveBaseUrl()` 走相对路径）',
+            m.serverMode === true,
+            m.brief + '（serverMode 必须为 true —— 否则本页其实是回退后的演示档，下面几条会连带判红）');
+          const pf = SVERD.prodFacts(m, errStarted);
+          check('B5e ' + w + '×' + h + ' 服务端档**生产口径**（真机）：`#c114StartedSource` 文本**逐字为空串**' +
+            '（不标「（演示派生）」）且 `#sStarted` 数值**＝服务端 `/state` 的 `startedQty`**（真机端到端对账）',
+            pf.ok, pf.why);
+          const nv = SVERD.noteVisibleErr(m, errFi.withoutIndex);
+          check('B5e ' + w + '×' + h + ' 服务端 `err` 档：`withoutIndex > 0` ⇒ 提示行**真的可见**' +
+            '（`hidden` 属性 false ＋ computed `display`/`visibility` 均可见）且文案逐字含"帧未带件序号"' +
+            '与"本班 N 帧"（N 取自 `/health` 真值）',
+            nv.ok, nv.why);
+          const ly = SVERD.layout(m);
+          check('B5e ' + w + '×' + h + ' 服务端 `err` 档版面：**未撑破**（scroll ≤ client + 1）＋ 提示行' +
+            '**完整落在本格内** ＋ 与相邻格矩形**不相交**（"不挤压邻格"的可判定形态；只用同域的量，' +
+            '不混算舞台缩放，见 `layout` 判据注释）',
+            ly.ok, ly.why);
+        }
+
+        /* ---- D22（ADR-0004）：内存读数副本 ＋ 真机 DOM 变异，两支都要"必红并指名" ---- */
+        let d22 = null;
+        if (errBase) {
+          const lvMut = Object.assign({}, errBase, { noteLv: 'ok' });
+          const hiddenMut = Object.assign({}, errBase, { noteHiddenAttr: true, noteDisplay: 'none' });
+          const domMut = await evaluate(`(() => {
+            const n = document.getElementById('c114FrameUnitNote');
+            if (!n) return { fatal: '未找到 #c114FrameUnitNote' };
+            const before = { lv: n.dataset.noteLv, attr: n.getAttribute('data-note-lv'), hidden: n.hidden,
+              display: getComputedStyle(n).display, style: n.getAttribute('style'), text: n.textContent };
+            n.dataset.noteLv = 'ok';                       /* ① 写成"服务端读到 0" => 判据应红 */
+            const lvMut = { lv: n.dataset.noteLv, attr: n.getAttribute('data-note-lv') };
+            n.dataset.noteLv = before.lv;                  /* 逐字还原（同一同步任务内，渲染循环插不进来） */
+            n.hidden = true; n.style.display = 'none';     /* ② 藏起来 => 判据应红 */
+            const hidMut = { hidden: n.hidden, display: getComputedStyle(n).display };
+            n.hidden = before.hidden;
+            if (before.style === null) n.removeAttribute('style'); else n.setAttribute('style', before.style);
+            return { before, lvMut, hidMut,
+              restored: { lv: n.dataset.noteLv, attr: n.getAttribute('data-note-lv'), hidden: n.hidden,
+                display: getComputedStyle(n).display, text: n.textContent } };
+          })()`);
+          d22 = { base: SVERD.noteVisibleErr(errBase, errFi.withoutIndex),
+            lv: SVERD.noteVisibleErr(lvMut, errFi.withoutIndex),
+            hidden: SVERD.noteVisibleErr(hiddenMut, errFi.withoutIndex), domMut };
+        }
+        check('B5e-D22 可证伪（ADR-0004 D22）：①把**读数副本**的 `dataset.noteLv` 改成 `ok`（＝"两种没有混同"）' +
+          '②把**读数副本**改成"隐藏"（＝"提示行没显示"的错实现）⇒ **同一条 `noteVisibleErr` 判据必红**' +
+          '并在 `why` 里分别指名 `noteLv`／`hidden`；③真机 DOM 上把这两处临时改掉再**逐字还原并回读核实**' +
+          '（证明读的是活 DOM，且本段对盘上文件零写入）',
+          Boolean(d22) && d22.base.ok === true &&
+          d22.lv.ok === false && d22.lv.why.indexOf('noteLv') >= 0 &&
+          d22.hidden.ok === false && d22.hidden.why.indexOf('hidden') >= 0 &&
+          Boolean(d22.domMut) && d22.domMut.fatal === undefined &&
+          d22.domMut.lvMut.lv === 'ok' && d22.domMut.hidMut.hidden === true &&
+          d22.domMut.hidMut.display === 'none' &&
+          d22.domMut.restored.lv === d22.domMut.before.lv &&
+          d22.domMut.restored.attr === d22.domMut.before.attr &&
+          d22.domMut.restored.hidden === d22.domMut.before.hidden &&
+          d22.domMut.restored.display === d22.domMut.before.display &&
+          d22.domMut.restored.text === d22.domMut.before.text,
+          '基线读数判绿=' + Boolean(d22 && d22.base.ok) + '（' + (d22 ? d22.base.why : '（未跑）') + '）；' +
+          '变异①`noteLv` → `ok` 判红=' + Boolean(d22 && d22.lv.ok === false) + '、指名=' +
+          JSON.stringify(String(d22 ? d22.lv.why : '').slice(0, 150)) + '；' +
+          '变异②隐藏判红=' + Boolean(d22 && d22.hidden.ok === false) + '、指名=' +
+          JSON.stringify(String(d22 ? d22.hidden.why : '').slice(0, 150)) + '；' +
+          '真机 DOM 变异并还原=' + JSON.stringify(d22 && d22.domMut) + '（`restored` 四项须与 `before` 逐字相等）');
+
+        /* ---- `ok` 档（`withoutIndex === 0`）：提示行不可见，但 `data-note-lv` 必须是 `ok` ---- */
+        const okM = await readServerCellAt(okSvc.base, 1920, 1080);
+        if (!okM || okM.fatal || okM.startedText === null) {
+          check('B5e 1920×1080 服务端 `ok` 档（`withoutIndex === 0`）可在真机量测',
+            false, (okM && okM.fatal) || 'evaluate 未返回结果');
+        } else {
+          okM.brief = briefOf(okM);
+          const nh = SVERD.noteHiddenOk(okM);
+          check('B5e 1920×1080 服务端 `ok` 档（`withoutIndex === 0`）：提示行**不可见、文本为空**，' +
+            '但 `data-note-lv` **必须是 `ok`** —— 与演示档的 `demo` 在**真机**上分得开' +
+            '（两种"没有"不得混同；判据与 B5d 的演示档 `demo` 同源、同一把尺子）',
+            okM.serverMode === true && nh.ok, nh.why);
+          const pf2 = SVERD.prodFacts(okM, okStarted);
+          check('B5e 1920×1080 服务端 `ok` 档的生产口径（真机）：不标「（演示派生）」＋ `#sStarted` ＝ ' +
+            '服务端 `startedQty`', pf2.ok, pf2.why);
+        }
+      }
+    }
     await cdp.send('Emulation.clearDeviceMetricsOverride');
   }
 

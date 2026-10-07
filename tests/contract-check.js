@@ -1939,6 +1939,269 @@ async function main() {
     check('E32 D22 内存副本未落盘：`src/services/mockData.js` 逐字节未变',
       readText('src/services/mockData.js') === e32MdSrc, `${e32MdSrc.length} 字符相同`);
   }
+
+  /* ===== M3. `E199`（＝`E72①` 的**前端一侧**）：开工数两侧口径的**登记判据** =====
+     立案（`E199`，2026-10-07 由负责人裁定"各自立号"、自 `E72①` 转出）：
+       `E72①` 的**服务端**一侧已由 4b 的 `T-20261005-21` 落地（`tests\harness-check.js` 第二十六节：
+       服务端读数 `createStateSnapshot().stats.startedQty` ↔ **自写超集 SQL** 现算 ＋ **合成序列**，
+       把 `COUNT(*)` 与 `COUNT(DISTINCT unit_index)` 两种错口径都抓住，并配 `E72①-D22`）；
+       而**前端一侧** —— `src\services\mockData.js` 的**演示派生**与 `src\services\stateAdapter.js`
+       映射的**生产读数** —— **没有任何对账断言** ⇒ 两侧漂移无人拦（与 `contract-check` M／M2 段
+       已有的跨实现对账**不同域**：M 段比的是统计公式、M2 段比的是累计运行时长）。
+
+     **本段在 `E199` 的二选一里选 ②「显式登记"演示派生不做跨实现对账"」**（判定与理由见下），
+     并把这条登记做成**机器可判**的三条 —— 登记不能只是散文，否则下一个人只读到"有人写过一句话"：
+
+       · **M3-①（侧内构成性等式·演示侧）** `state.stats.started ≡ min(计划, 完成 + 在测 + 待复检)`、
+         `notStarted ≡ 计划 − started`。**为什么是"构成性"而不是写死数字**（ADR-0004 D21）：
+         期望值由**同一帧**的其它实测字段（`done`/`testing`/`recheck`/`plan`）算出，不写手算魔数
+         ⇒ 改 `planQty`／`cycleSec`／`firstPassRate`（Q-11）后期望自动跟随。
+         样本**必须含"封顶生效"的那一类**：实测本班末（`elapsedSec=28799`）
+         `done 179 + testing 1 + recheck 7 = 187 > 计划 180` ⇒ 封顶把 187 压到 180；
+         若只取班中样本（实测班中三者和 ＝ 计划封顶**不生效**）⇒ 判据对"封顶被摘掉"是**盲的**。
+         样本时刻**由班次真源现算**（班首＋2 h、班末 −1 s），不写"15:59:59"这类魔数。
+
+       · **M3-②（生产侧映射＝纯改名，不派生）** `STATS_KEY_MAP.startedQty === 'started'`，且对一组
+         刻意值（含 `0`／计划数／**实测的超计划值**（＝上面那一格的未封顶和）／`null`／非数值）
+         映射结果**逐值等于入参**：数值原样（**不封顶、不重算**）、非有限数一律 `null`。
+         **为什么要有这一条**："两侧不许逐值相等"的**反向**风险是"有人把生产侧改成演示口径"
+         （例如顺手在映射里加一道 `Math.min(计划, …)`）—— 那也会让两侧"看起来一致"，
+         而**任何跨实现相等判据都发现不了**（它比的是被改坏的那一侧）。本判据按"映射是不是纯改名"
+         判断，与两侧是否相等无关。
+
+       · **M3-③（"不做逐值对账"本身可证伪）** 把**同一班次、同一时刻**分别喂两侧，读数**刻意不同**：
+         演示侧只吃 `elapsed`，生产侧只吃 `startedPieces`（同一时刻 `startedPieces=0 ⇒ 0`、
+         `计划+1 ⇒ 计划+1`，**不封顶**）。两侧**没有共同入参** —— 演示侧源码里
+         `startedPieces`／`unit_index`／`measure_rt` **零命中**（否定性事实：正则 `g` 计数，期望 0）
+         ⇒ "前端根本拿不到件级去重入参"。故"同一组入参逐值相等"这个构造在这里**不存在**；
+         而"不可比"这一结论**可被证伪**：若有人把两侧绑成同一真源（生产侧改按 `elapsed` 现算、
+         或演示侧去读件级入参）⇒ 本条的"两侧读数不同"塌掉 ⇒ **必红**。
+
+     **登记（判定＋可核理由）—— 为什么不做 `E199` 的 ①（前端 ↔ 服务端同口径逐值对账）**：
+       ① **语义差别（两侧各自的取数出口，可核）**
+          · 演示侧（`mockData.js` 的 `computeStats()`）：`started = min(计划, 完成＋在测＋待复检)` ——
+            **时间派生量**，唯一入参是班次已进行时长（＋Q-11 配置），**无窗口、无去重**，封顶于计划数；
+            它是"演示现场看起来自洽"的量，不是任何实测。
+          · 生产侧（`server\services\stateSnapshot.js` 的 `statsOf()` → `startedPieces` →
+            `server\services\stats.js` 的 `startedQty` → `stateAdapter.js` 的 `STATS_KEY_MAP`）：
+            **件级去重计数** —— `measure_rt` 里按 `(proc_order_no, unit_index)` **去重**、
+            **限定在当班 `collect_time` 窗口**、`unit_index` 缺失/非法的帧**不计入**（`FR-4.2`），
+            且**不封顶于计划数**（件数允许超过计划）。
+          ⇒ 单位相同（件，C-111）但**真源、窗口、去重口径全不同**，"同一组入参"不存在。
+       ② **为什么**不该**逐值相等**：要让它们相等，只能**由演示侧的派生值反推** `startedPieces`
+          喂给服务端（或反之）。那正是 `E67`／`E69`／`T-20260930-18`（B3-5 改法①）在**同一文件的 M 段**
+          里已经**明确否掉**的"输入等价性／构造出一致"形态 —— 两侧共用一个真源，**掩盖分叉**
+          （实测记录在案：旧写法下把前端 `avgTest` 改回 `runSec / done`，M 段三条谓词**全绿**）
+          ⇒ 选 ① 等于把该反模式请回来，**劣于登记**。
+       ③ **漂移如何被别的判据拦住（逐条给脚本名＋断言名；没拦住的照实说，不写"不会漂移"）**
+          · 生产侧**取数口径（窗口＋去重）**：`harness-check` 第二十六节
+            「`E72①` **开工数的跨实现可证伪构造**」＋「`E72①-D22`」（自写超集 SQL ＋ 合成序列）。
+          · 生产侧**键映射（服务端键 → 前端键）**：本段 **M3-②**（纯改名、含"不得封顶"）。
+          · 演示侧**封顶与同帧一致性**：本段 **M3-①**；另有 `ui-check`
+            「FR-4.2/4.3 实际开工数不得超过计划总数（未开工 = 计划 − 开工）」（**不等式**，非等式）。
+          · **没有拦住的（如实登记）**：演示侧 `started` 的**非封顶项**（例如把 `recheck` 从和里去掉）
+            在 M3-① 之前**没有任何判据** —— 旧门禁只有"≤ 计划"这条不等式，去掉若干件待复检后
+            `started` 仍 ≤ 计划（实测 187→180 这一类）⇒ **全绿**。**M3-① 是本仓第一条钉住该算式的判据。**
+            另：同一个 `#sStarted` 在两种模式下**含义不同**这件事由 `E197` 的口径标注承担
+            （`ui-check` U11 ／ `browser-check` B5d）—— 那是**告知**，不是**对账**。
+
+     可证伪（ADR-0004 D22，两组；靶子都在本段内、盘上**零字节改动**）：
+       (a) 摘掉演示派生的封顶（`src\services\mockData.js` 的**内存副本**，
+           `Math.min(P, done + testing + recheck)` → `done + testing + recheck` ——
+           **这正是"把前端 `started` 改成服务端口径"（服务端不封顶）的最小形态**）
+           ⇒ M3-① **必红**并指名 `src/services/mockData.js` 与**封顶生效**的那一格
+           （班中那一格同时保持绿 ⇒ 判别力确实落在封顶生效的样本上）；
+       (b) 给 `stateAdapter` 的映射加一道封顶（`src\services\stateAdapter.js` 的**内存副本**）
+           ⇒ M3-② **必红**并指名 `started` 这一档（超计划那一格被压回计划数）。 */
+  section('M3. `E199`：开工数（`#sStarted`）两侧口径 —— 演示派生 vs 生产映射（登记"不做逐值对账"）');
+  {
+    /* 本段没有 runner 对象，沿用 M 段／N 段的局部包装（前提塌掉 ⇒ 记一条失败并单列原因，
+       不是"环境不满足就跳过"） */
+    function requires(name, ok, detail) {
+      if (!ok) {
+        console.log(`  [UNMET] 前提不成立：${name} —— ${detail}`);
+        check(name, false, `${detail}（前提不成立，本段用例不成立、不计入通过）`);
+      }
+      return Boolean(ok);
+    }
+    const m3Conf = require('../src/config/board.config.js');
+    const m3Prod = m3Conf.production;
+    /* 班次真源：与 M／M2 段同一个模块（`server/services/shift.js`），不另写一份班次判定 */
+    const { createShiftRules } = require('../server/services/shift');
+    const m3Rules = createShiftRules(m3Conf.shift.list);
+    const m3Stats = require('../server/services/stats');
+    const m3Crypto = require('node:crypto');
+    /** 文件的事实截止点（9.5-5 第 9 条：读数类结论必须记 SHA-256，写法 `<相对路径>@<前 12 位>`） */
+    const m3Hash = rel => m3Crypto.createHash('sha256')
+      .update(fs.readFileSync(path.join(ROOT, rel))).digest('hex').slice(0, 12);
+    const M3_LOAD_ORDER = [
+      'src/config/board.config.js', 'src/config/fieldMap.js', 'src/utils/dom.js',
+      'src/utils/format.js', 'src/services/api.js', 'src/services/mockData.js',
+      'src/services/mockUpperSource.js', 'src/services/stateAdapter.js'
+    ];
+    /** 按 index.html 的顺序加载 `src/`（多一个 `stateAdapter.js` —— 本段的"生产映射"那一侧）。
+     *  `overrides` 只为 D22 的**内存副本**而设；盘上文件全程只读。 */
+    function m3Harness(overrides) {
+      const sandbox = { console, fetch, AbortSignal, setTimeout, clearTimeout };
+      sandbox.window = sandbox;
+      vm.createContext(sandbox);
+      const run = rel => vm.runInContext(
+        (overrides && overrides[rel] !== undefined) ? overrides[rel] : readText(rel), sandbox,
+        { filename: path.join(ROOT, rel) });
+      M3_LOAD_ORDER.forEach(run);
+      return sandbox;
+    }
+    /* 样本时刻**由班次真源现算**（班首 ＋2 h、班末 −1 s），不写魔数 ⇒ 改 Q-10 班次后自动跟随 */
+    const m3Shift = m3Rules.at(new Date('2026-09-18T10:00:00'));
+    const m3ToDate = s => new Date(String(s).replace(' ', 'T'));
+    const m3Samples = m3Shift ? [
+      { label: '班中', at: new Date(m3ToDate(m3Shift.startAt).getTime() + 2 * 3600 * 1000) },
+      { label: '班末', at: new Date(m3ToDate(m3Shift.endAt).getTime() - 1000) }
+    ] : [];
+
+    /** 判据本体（**纯函数**，原件与 D22 变异体共用同一把尺子）：
+     *  演示侧 = `state.stats.started ≡ min(计划, 完成＋在测＋待复检)`（期望值由同帧其它字段算出，
+     *  不写手算魔数，ADR-0004 D21）。 */
+    function m3DemoVerdict(h) {
+      return m3Samples.map(s => {
+        h.window.MockData.tick(s.at);
+        const st = h.window.MockData.state.stats;
+        const sum = st.done + st.testing + st.recheck;
+        const expectStarted = Math.min(st.plan, sum);
+        const expectNotStarted = st.plan - expectStarted;
+        return {
+          label: s.label, at: s.at, st, sum, expectStarted, expectNotStarted,
+          capBites: sum > st.plan,
+          ok: st.started === expectStarted && st.notStarted === expectNotStarted
+        };
+      });
+    }
+    /** 判据本体（**纯函数**）：生产侧映射＝**纯改名**（数值原样、不封顶；非有限数一律 null） */
+    function m3MapVerdict(SA, overPlan) {
+      const cases = [0, 1, m3Prod.planQty, overPlan, null, 'x', undefined, NaN];
+      const rows = cases.map(v => {
+        const state = { stats: {} };
+        const out = SA.applyServerStats(state, {
+          startedQty: v, planQty: m3Prod.planQty, shift: { name: m3Shift ? m3Shift.name : null }
+        });
+        const want = (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+        return { given: v, got: out.started, want, ok: out.started === want };
+      });
+      const keyOk = SA.STATS_KEY_MAP.startedQty === 'started';
+      return { keyOk, rows, overRow: rows.find(r => r.given === overPlan),
+        ok: keyOk && rows.every(r => r.ok) };
+    }
+    /** 生产侧在**指定时刻**的真读数（走生产同一口：`stats.computeShiftStats()` ＋ 真映射层） */
+    function m3BeAt(at, startedPieces) {
+      const measures = [];
+      for (let i = 0; i < 3; i++) measures.push(new Date(at.getTime() - i * 1000));
+      const be = m3Stats.computeShiftStats({
+        shift: m3Rules.at(at), orders: [{ planQty: m3Prod.planQty }], startedPieces,
+        pieces: [], measures,
+        accum: { daySec: 0, monthSec: 0, yearSec: 0, at }, addRunSec: 0, now: at
+      });
+      const state = { stats: {} };
+      m3Harness().window.StateAdapter.applyServerStats(state, be);
+      return state.stats.started;
+    }
+
+    const m3H = m3Harness();
+    const m3Fe = m3DemoVerdict(m3H);
+    const m3OverPlan = (m3Fe.find(r => r.capBites) || {}).sum;
+    const m3MapV = m3MapVerdict(m3H.window.StateAdapter, m3OverPlan);
+    const m3Late = m3Fe.find(r => r.capBites) || m3Fe[m3Fe.length - 1] || null;
+
+    if (requires('M3 前提：班次真源能给出样本时刻所属班次（样本由班首/班末现算）',
+      Boolean(m3Shift) && m3Samples.length === 2 && m3Fe.length === 2,
+      `createShiftRules(boardConfig.shift).at('2026-09-18T10:00:00') ⇒ ` +
+      `${m3Shift ? m3Shift.name + ' [' + m3Shift.startAt + ',' + m3Shift.endAt + ')' : 'null'}；` +
+      `样本数=${m3Samples.length}`)) {
+      check('M3-① `E199` 演示派生的**侧内构成性等式**：`#sStarted` 的值 ≡ min(计划, 完成 ＋ 在测 ＋ 待复检)、' +
+        '`notStarted` ≡ 计划 − started（期望值由**同一帧**的其它实测字段算出、不写魔数；' +
+        '样本含"封顶生效"一格 —— 否则本判据对"封顶被摘掉"是**盲的**）',
+        m3Fe.every(r => r.ok) && m3Fe.some(r => r.capBites),
+        m3Fe.map(r => `${r.label}：started=${r.st.started}（现算 min(${r.st.plan}, ` +
+          `${r.st.done}+${r.st.testing}+${r.st.recheck}=${r.sum})＝${r.expectStarted}；封顶${r.capBites ? '**生效**' : '未生效'}）、` +
+          `notStarted=${r.st.notStarted}（期望 ${r.expectNotStarted}）`).join('；') +
+        `；盘上事实截止点：src/services/mockData.js@${m3Hash('src/services/mockData.js')}`);
+
+      check('M3-② `E199` 生产侧映射＝**纯改名、不派生**：`STATS_KEY_MAP.startedQty === \'started\'`，' +
+        '且 `applyServerStats()` 对刻意值（0／1／计划数／**实测超计划值**／null／字符串／undefined／NaN）' +
+        '**逐值等于入参**（数值原样、**不封顶**；非有限数一律 null）—— 防"把生产侧改成演示口径"',
+        m3MapV.ok,
+        `STATS_KEY_MAP.startedQty=${JSON.stringify(m3H.window.StateAdapter.STATS_KEY_MAP.startedQty)}；` +
+        m3MapV.rows.map(r => `${JSON.stringify(r.given)}→${JSON.stringify(r.got)}（期望 ${JSON.stringify(r.want)}）`).join('、') +
+        `；超计划那一格 given=${JSON.stringify(m3OverPlan)}（计划 ${m3Prod.planQty}）⇒ 映射后 ${JSON.stringify(m3MapV.overRow && m3MapV.overRow.got)}` +
+        `（若被压回 ${m3Prod.planQty} ⇒ 本条必红）；盘上事实截止点：src/services/stateAdapter.js@${m3Hash('src/services/stateAdapter.js')}`);
+
+      /* M3-③：同班同刻两侧读数**刻意不同**＋两侧各自跟随各自真源 ＋ 演示侧对件级入参零命中 */
+      const m3Pairs = m3Late ? [0, m3Prod.planQty + 1].map(sp => ({ sp, be: m3BeAt(m3Late.at, sp) })) : [];
+      const m3MockSrc = readText('src/services/mockData.js');
+      const m3Hits = {
+        startedPieces: (m3MockSrc.match(/startedPieces/g) || []).length,
+        unit_index: (m3MockSrc.match(/unit_index/g) || []).length,
+        measure_rt: (m3MockSrc.match(/measure_rt/g) || []).length
+      };
+      check('M3-③ `E199` 登记"不做逐值对账"**本身可证伪**：同班次同时刻下两侧读数**刻意不同**、且各自' +
+        '跟随各自真源（演示侧只吃 elapsed、生产侧只吃 `startedPieces`）—— 若有人把两侧绑成同一真源 ⇒ 本条必红；' +
+        '**否定性事实**：演示侧源码对件级去重入参零命中（`grep -c` 口径，期望 0/0/0）',
+        Boolean(m3Late) && m3Pairs.length === 2 &&
+        m3Pairs.every(p => p.be === p.sp && p.be !== m3Late.st.started) &&
+        m3Hits.startedPieces === 0 && m3Hits.unit_index === 0 && m3Hits.measure_rt === 0,
+        `时刻 ${m3Late ? m3Late.at.toISOString() : '(无)'}（${m3Late ? m3Late.label : ''}，班次 ${m3Shift ? m3Shift.name : '?'}）：` +
+        `演示侧 started=${m3Late ? m3Late.st.started : '(无)'}（＝min(计划, ${m3Late ? m3Late.sum : '?'} 未封顶和)）；` +
+        `生产侧 ${m3Pairs.map(p => `startedPieces=${p.sp} ⇒ ${p.be}`).join('、')}` +
+        `⇒ 两侧读数 ${m3Pairs.every(p => p.be !== (m3Late && m3Late.st.started)) ? '**全不相等**（不可比量：无共同入参）' : '出现相等（不可比量登记失效，须查）'}；` +
+        `src/services/mockData.js 命中数 startedPieces=${m3Hits.startedPieces}／unit_index=${m3Hits.unit_index}／` +
+        `measure_rt=${m3Hits.measure_rt}（命令：对盘上该文件跑这三个正则，期望各 0 命中）`);
+
+      /* ---- D22(a)：摘掉演示派生的封顶（`Math.min(P, done + testing + recheck)` 的最小形态
+             就是"服务端口径"：服务端 `startedQty` **不封顶**） ---- */
+      const M3_ANCHOR_FE = '    const started = Math.min(P, done + testing + recheck);';
+      const m3MdSrc = readText('src/services/mockData.js');
+      const m3FeHits = m3MdSrc.split(M3_ANCHOR_FE).length - 1;
+      const m3MutFe = m3FeHits === 1
+        ? m3DemoVerdict(m3Harness({
+          'src/services/mockData.js': m3MdSrc.replace(M3_ANCHOR_FE, '    const started = done + testing + recheck;')
+        })) : null;
+      check('M3-D22(a) 可证伪（**内存变异**）：把演示派生的**封顶**摘掉（`src\\services\\mockData.js` 的' +
+        '内存副本 —— 这正是"把前端 `started` 改成服务端口径"的最小形态，服务端 `startedQty` 不封顶）' +
+        '⇒ M3-① **必红**并指名该文件与**封顶生效**的那一格（班中那一格保持绿 ⇒ 判别力落在封顶样本上）',
+        m3FeHits === 1 && Boolean(m3MutFe) &&
+        m3MutFe.every(r => r.capBites ? !r.ok : r.ok) && m3MutFe.some(r => r.capBites && !r.ok),
+        m3FeHits !== 1 ? `锚点命中 ${m3FeHits} 次（应恰 1）⇒ 判红，不许静默放过（指名 src/services/mockData.js）`
+          : m3MutFe.map(r => `${r.label}：变异后 started=${r.st.started}（期望 ${r.expectStarted}）⇒ ${r.ok ? '绿' : '**红**'}`)
+            .join('；') + `；盘上逐字节未变=${readText('src/services/mockData.js') === m3MdSrc}`);
+
+      /* ---- D22(b)：给生产侧映射加一道封顶（模仿演示口径） ---- */
+      const M3_ANCHOR_MAP = '      out[STATS_KEY_MAP[serverKey]] = numOrNull(s[serverKey]);';
+      const m3SaSrc = readText('src/services/stateAdapter.js');
+      const m3SaHits = m3SaSrc.split(M3_ANCHOR_MAP).length - 1;
+      const m3MutMap = m3SaHits === 1
+        ? m3MapVerdict(m3Harness({
+          'src/services/stateAdapter.js': m3SaSrc.replace(M3_ANCHOR_MAP, M3_ANCHOR_MAP +
+            "\n      if (STATS_KEY_MAP[serverKey] === 'started') { const p = numOrNull(s.planQty);" +
+            " if (typeof out.started === 'number' && typeof p === 'number') out.started = Math.min(p, out.started); }")
+        }).window.StateAdapter, m3OverPlan) : null;
+      check('M3-D22(b) 可证伪（**内存变异**）：给 `stateAdapter` 的映射加一道封顶（`src\\services\\stateAdapter.js`' +
+        ' 的内存副本，模仿演示口径 —— 反向漂移：把生产侧改成演示派生）⇒ M3-② **必红**并指名 `started` 档' +
+        '（实测超计划那一格被压回计划数）',
+        m3SaHits === 1 && Boolean(m3MutMap) && m3MutMap.ok === false &&
+        Boolean(m3MutMap.overRow) && m3MutMap.overRow.ok === false,
+        m3SaHits !== 1 ? `锚点命中 ${m3SaHits} 次（应恰 1）⇒ 判红，不许静默放过（指名 src/services/stateAdapter.js）`
+          : `变异后超计划格 given=${JSON.stringify(m3OverPlan)} ⇒ got=${JSON.stringify(m3MutMap.overRow && m3MutMap.overRow.got)}` +
+            `（期望原样 ${JSON.stringify(m3OverPlan)}）⇒ 判红=${m3MutMap.ok === false}；` +
+            `盘上逐字节未变=${readText('src/services/stateAdapter.js') === m3SaSrc}`);
+
+      check('M3-D22 内存副本未落盘：`src\\services\\mockData.js` 与 `src\\services\\stateAdapter.js` 逐字节未变' +
+        '（本段只用 `vm` 里的源码字符串覆盖，禁用 `git checkout/restore`）',
+        readText('src/services/mockData.js') === m3MdSrc &&
+        readText('src/services/stateAdapter.js') === m3SaSrc,
+        `mockData.js ${m3MdSrc.length} 字符相同=${readText('src/services/mockData.js') === m3MdSrc}；` +
+        `stateAdapter.js ${m3SaSrc.length} 字符相同=${readText('src/services/stateAdapter.js') === m3SaSrc}；` +
+        `sha256 前 12 位 mockData.js@${m3Hash('src/services/mockData.js')}／stateAdapter.js@${m3Hash('src/services/stateAdapter.js')}`);
+    }
+  }
   /* ===== N. 补传队列告警阈值：单一真源、两端同判（R26-P3-4 / E10 / IF-B.9） =====
      立案：同一「补传队列告警」概念在两侧**语义相反** —— 前端 `src/services/api.js` 按
      `max(1, floor(queueCap × 90%))` 算（容量 5000 ⇒ 要积压 **4500 条**才亮），
