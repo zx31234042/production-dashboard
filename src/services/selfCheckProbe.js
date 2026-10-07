@@ -23,6 +23,13 @@
        `ensure()`，内部按 `REFRESH_MS` 节流 + `inFlight` 去重；
      · **不影响演示模式**：`isServerMode()` 为假时 `ensure()` 立即返回，演示仍走
        `mockData.buildSelfCheck()`（成对断言见 `tests/ui-check.js` 的 W7-B-c）。
+     · **`E198`（2026-10-07 追加）**：`probe()` 顺手把**同一轮** `/health` 里的"帧件序号"计数
+       投影进模块变量 `lastHealth`，`ensure()` 再把它搬到 `state.health`
+       （形状 `{frameUnitIndex:{withIndex,withoutIndex,stored,note}|null, at}`）。
+       生产统计页的提示位（`StatsPanel` 的 `#c114FrameUnitNote`）**只读 `state`** 渲染，
+       **不自己发请求** —— 这是"渲染函数不得取数"的落点，也是 vm 夹具能构造三种读数的前提。
+       IF-D 未接线时服务端给 `frameUnitIndex:null` ⇒ 本投影如实保留 `null`，
+       **不得**折算成 `{withoutIndex:0}`（"没有这个数"≠"这个数是 0"，W4/ADR-0008 D3）。
    依赖：`services/api.js` 的只读取数函数（新增的 `fetchHealth`/`fetchIfdStatus`/`fetchIfaStatus`
         ＋既有 `fetchUploadStatus`）。**不引第三方依赖。**
    ========================================================================== */
@@ -40,6 +47,9 @@ window.SelfCheckProbe = (function () {
   let lastAt = 0;
   let lastRows = null;
   let probeCount = 0;
+  /* `E198`：最近一轮 `/health` 读数的"帧件序号"投影（`{frameUnitIndex, at}`）。
+     在 `probe()` 里**每次取完就写**（含失败与能力缺失那两条早退路径）⇒ 不会留上一轮的值。 */
+  let lastHealth = null;
 
   /** 是否服务端模式（`state.serverMode` 优先，退 `BoardConfig.dataSource`） */
   function isServerMode(state) {
@@ -51,6 +61,34 @@ window.SelfCheckProbe = (function () {
   /** 数值取整（`null`/非有限数一律 `null`，不写 0 —— 与 W4/ADR-0008 D3 的缺值口径一致） */
   function numOrNull(v) {
     return typeof v === 'number' && Number.isFinite(v) ? v : null;
+  }
+
+  /**
+   * `E198`（★★，A 组）：从**已经取回**的 `/health` 读数里取出"帧件序号"计数，
+   * 供生产统计页的提示位（`StatsPanel` 的 `#c114FrameUnitNote`）**只读 `state`** 消费。
+   *
+   * 为什么接在这里、而不是让渲染层自己发请求：
+   *   · 需求（`FR-4.2`）的开工数按 `unit_index` 去重 ⇒ **缺件序号的帧不计入开工数**，
+   *     现场只看 75″ 屏会把"帧没带件序号"读成"真没开工"（与 `E38` 同族）；
+   *   · 而 `/health` **本文件已经在取**（下面 `probe()` 的 `fetchHealthWithDate()`，5 s 节流 ＋
+   *     在途去重 ＋ 仅服务端模式）⇒ 再接一条取数通道就会**同屏两个 `/health` 周期**，
+   *     读数还会互相漂移（`PROJECT_RULES` 9.6 单一真源、ADR-0008 D3）。
+   *
+   * 形状（服务端 `server/index.js` 的 `/health` 顶层键，与 `GET /ifd/status` 同源）：
+   *   `frameUnitIndex: { withIndex, withoutIndex, stored, note }`；**IF-D 未接线时为 `null`**。
+   * 返回 `{ frameUnitIndex, at }`：`frameUnitIndex` **不是对象时一律 `null`**
+   *   —— "没有这个数"（`null`）与"这个数是 0"（`{withoutIndex:0,…}`）必须分得开（W4 口径）。
+   * @param {{ok:boolean, health?:object}} health 本文件 `probe()` 的 `/health` 结论
+   * @param {number} at 探测时刻（ms，来自注入时钟）
+   * @returns {{frameUnitIndex:object|null, at:number}}
+   */
+  function frameUnitIndexOf(health, at) {
+    const h = (health && health.health) || null;
+    const f = h && h.frameUnitIndex;
+    return {
+      frameUnitIndex: f && typeof f === 'object' ? Object.assign({}, f) : null,
+      at: at
+    };
   }
 
   /**
@@ -272,11 +310,18 @@ window.SelfCheckProbe = (function () {
   function probe(now) {
     const at = (now || new Date()).getTime();
     probeCount++;
+    /* 本轮的 `/health` 投影（`E198`）在一次 `probe()` 里只算一次，且**三条出口都经它**上屏：
+       能力缺失（下面第一支）、正常取回、以及 `.then()` 里两条异步分支 —— 否则某条路径会
+       留上一轮的值（"读数过期而不自知"）。 */
+    const toRows = (ctx) => {
+      lastHealth = frameUnitIndexOf(ctx.health, at);
+      return buildRows(ctx);
+    };
     const api = window.Api;
     if (!api || typeof api.fetchHealth !== 'function') {
       /* 适配层未加载/裁剪环境：七行一律显式 err + 原因（**不抛、不 console.error**） */
       const why = '适配层未加载 fetchHealth()（服务端自检不可用）';
-      return Promise.resolve(buildRows({
+      return Promise.resolve(toRows({
         health: { ok: false, failReason: why, url: '' },
         ifd: { ok: false, failReason: why, url: '' },
         upload: { ok: false, failReason: why, url: '' },
@@ -290,7 +335,7 @@ window.SelfCheckProbe = (function () {
       api.fetchIfaStatus().catch(err => ({ ok: false, failReason: '探测异常：' + ((err && err.message) || String(err)), url: '' })),
       api.fetchUploadStatus().catch(err => ({ ok: false, failReason: '探测异常：' + ((err && err.message) || String(err)), url: '' }))
     ]).then(([health, ifd, ifa, upload]) => {
-      const rows = buildRows({ health, ifd, ifa, upload, at });
+      const rows = toRows({ health, ifd, ifa, upload, at });
       /* 「磁盘空间」行的浏览器侧配额是**异步**的：这里补一次，拿到就换成真实配额文本，
          拿不到就保留"尚未接入"（**绝不编造余量数值**）。失败只 warn，不影响其余六行。 */
       const diskRow = rows[5];
@@ -311,10 +356,27 @@ window.SelfCheckProbe = (function () {
   }
 
   /**
+   * `E198`：把"最近一轮 `/health` 的帧件序号投影"搬到 `state.health`（**只搬运、不判定**）。
+   * ⚠ **必须在 `probe()` 解析之后调用**：`lastHealth` 是在 `probe()` 的 `.then()` 里写的
+   *   ⇒ 若在调用 `probe()` 之后、`await` 之前就读它，会读到**上一轮**的值
+   *   （本包实测踩过：`ensure()` 首轮写入 `{frameUnitIndex:null}` —— 那是 `reset()` 的清零值，
+   *    而同一轮 `/health` 明明回了 `withoutIndex:3`）。故这里把它抽成一个纯赋值口，
+   *   `ensure()` 在 `probe()` 解析后调它，谁都不会早读。
+   * @param {object} state 看板状态
+   * @returns {object|null} 写进 `state.health` 的值
+   */
+  function writeHealthState(state) {
+    if (!state || typeof state !== 'object') return null;
+    state.health = lastHealth;
+    return state.health;
+  }
+
+  /**
    * 按既有渲染节拍调用：**服务端模式**下按 `REFRESH_MS` 节流刷新 `state.selfCheck`。
    * · 演示模式 ⇒ 立即返回 `false`（一行都不写，演示仍走 `mockData.buildSelfCheck()`）；
    * · 节流窗口内 / 已有请求在途 ⇒ 不重复发起（**不新起定时器**，调用方是渲染循环）；
-   * · 结果写入 `state.selfCheck`（渲染层零改动即可显示）＋ `state.selfCheckAt`（探测时刻）。
+   * · 结果写入 `state.selfCheck`（渲染层零改动即可显示）＋ `state.selfCheckAt`（探测时刻）
+   *   ＋ `state.health`（`E198` 的帧件序号投影，见 `writeHealthState()`）。
    * @param {object} state 看板状态
    * @param {Date}   [now] 当前时刻
    * @returns {boolean} 本次是否**发起了**探测
@@ -332,6 +394,10 @@ window.SelfCheckProbe = (function () {
       state.selfCheck = rows;
       state.selfCheckAt = new Date(t).toISOString();
       state.selfCheckSource = 'server-probe';
+      /* `E198`：把**本轮** `/health` 读数里的"帧件序号"计数搬到 state（口径见 `writeHealthState()`），
+         供生产统计页的提示位只读消费（渲染层不发请求）。"该不该提示"的判定在
+         `StatsPanel.frameUnitIndexNote()` 一处（避免同一判据两处实现）。 */
+      writeHealthState(state);
     }).catch(err => {
       /* `probe()` 自己已经把每项失败收敛成行结论；走到这里说明连 Promise.all 都炸了 —— 兜底成显式 err */
       inFlight = false;
@@ -346,7 +412,12 @@ window.SelfCheckProbe = (function () {
 
   /** 只读状态（自检/回执用） */
   function status() {
-    return { refreshMs: REFRESH_MS, inFlight, lastAt: lastAt || null, probeCount, rows: lastRows ? lastRows.length : 0 };
+    return {
+      refreshMs: REFRESH_MS, inFlight, lastAt: lastAt || null, probeCount,
+      rows: lastRows ? lastRows.length : 0,
+      /* `E198`：最近一轮 `/health` 读数的"帧件序号"投影（`{frameUnitIndex, at}`；未探测过 ⇒ null） */
+      lastHealth: lastHealth
+    };
   }
 
   /** 复位节流与在途标志（**仅供自检注入用**；不改变线上口径） */
@@ -355,7 +426,12 @@ window.SelfCheckProbe = (function () {
     lastAt = 0;
     lastRows = null;
     probeCount = 0;
+    lastHealth = null;
   }
 
-  return { probe, ensure, status, reset, isServerMode, REFRESH_MS, NTP_WARN_MS };
+  return {
+    probe, ensure, status, reset, isServerMode, REFRESH_MS, NTP_WARN_MS,
+    /* `E198`：纯函数出口（`/health` → `state.health` 的形状投影）—— 供自检直接构造三种读数 */
+    frameUnitIndexOf
+  };
 })();

@@ -301,7 +301,37 @@ async function main() {
   check('?tab=3 直接打开「生产统计」', tabState.id === 'panel-stats' && tabState.idx === 3,
     `active=${tabState.id} 标签序号=${tabState.idx}`);
 
-  await openPage('?curve=none', 2500);
+  /* ---- ?curve=none：观测窗必须先落在**一个节拍之内**（P3-13 已登记的设计约束） ----
+     `?curve=none` 的语义是"**初始**空态"（README.md §三、需求清单 V1.44 §…、甲方 Demo 说明同一措辞）：
+     `src/main.js:116` 在 `start()` 里执行一次 `M.clearCurve()`，**只清预置曲线**；
+     其后每秒 `M.tick()` 在**节拍边界**处用 `state.curveTick` 缓冲**重新固化**一条曲线
+     （`src/services/mockData.js:723-726`，判据只有"缓冲长度 > 1"）。
+     项目已把"空态最多维持到下一道节拍边界"登记为**设计约束**：
+     `项目记录\审查报告-2026-09-19.md` 第 13 条 / `项目记录\当前状态快照.md` 的「P3-13 曲线空态窗口」。
+     ⇒ 若 load 恰好落在边界前 1～2 s，边界那一帧就会固化出"第 N 件 · 2 采样点 · 2 s"的曲线，
+       本用例随之**随机变红**（2026-10-07 15:41:20 / 第 173 件；先例 2026-10-06 23:52:00 / 第 177 件；
+       相位全扫实测：160 个 load 相位中命中 1～2 个 ≈ 0.6%～1.25%/轮）。
+     ⇒ 本用例的**前提**是"观测窗（2.5 s）落在一个节拍之内"，故先用**被测实现自己的**相位量做守据：
+       距下一道节拍边界 > 6 s 才观测；否则越过该边界、在新的节拍里重测（至多 3 次）。 */
+  async function curveCyclePhase() {
+    return evaluate(`(() => {
+      const M = window.MockData;
+      return { into: M.state.shift.elapsed % M.CFG.cycleSec, cycleSec: M.CFG.cycleSec };
+    })()`);
+  }
+  async function openCurveNoneWithinCycle() {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await openPage('?curve=none', 900);                 // 先取到帧，才有 shift.elapsed
+      const p = await curveCyclePhase();
+      if (p.cycleSec - p.into > 6) {                      // 余量 > 观测窗 2.5 s ⇒ 窗内不会跨边界
+        await sleep(2500);
+        return { into: p.into, cycleSec: p.cycleSec, remain: p.cycleSec - p.into, attempt };
+      }
+      await sleep((p.cycleSec - p.into + 1.5) * 1000);    // 越过本道边界，换一个新节拍再观测
+    }
+    return null;
+  }
+  const curvePhaseUsed = await openCurveNoneWithinCycle();
   const curveState = await evaluate(`(() => {
     const wrap = document.getElementById('stDepthChart').parentElement;
     const empty = wrap.querySelector('.chart-empty');
@@ -312,9 +342,13 @@ async function main() {
       taskText: (document.getElementById('stDepthTask')||{}).textContent || ''
     };
   })()`);
-  check('?curve=none 显示空态且不画曲线',
+  check('?curve=none 显示空态且不画曲线（观测窗落在一个节拍之内）',
     curveState.emptyVisible === true && curveState.polylines === 0,
-    `空态可见=${curveState.emptyVisible}，polyline=${curveState.polylines} 条，图下文案=${curveState.taskText}`);
+    `空态可见=${curveState.emptyVisible}，polyline=${curveState.polylines} 条，图下文案=${curveState.taskText}` +
+    `；相位＝节拍内已进行 ${curvePhaseUsed ? curvePhaseUsed.into.toFixed(1) : '未取到'} s / 节拍 ` +
+    `${curvePhaseUsed ? curvePhaseUsed.cycleSec : '未取到'} s（距下一道边界 ` +
+    `${curvePhaseUsed ? curvePhaseUsed.remain.toFixed(1) : '未取到'} s，第 ${curvePhaseUsed ? curvePhaseUsed.attempt : '—'} 次尝试）`);
+
 
   await openPage('?link=off', 2500);
   const linkState = await evaluate(`({
@@ -770,6 +804,311 @@ async function main() {
       `表高复测=${u1.tableH_restored} ＝ 正常态 ${u1.tableH_normal}`);
   }
   await cdp.send('Emulation.clearDeviceMetricsOverride');
+
+  /* ===== B5d `E197`（`#sStarted` 口径标注）＋ `E198`（帧缺件序号提示位）的**真机**判据 =====
+     座位 4b（`T-20261007-03`）：把"当班任务统计"卡第 2 格（`#sStarted` 那一格）的三件事放到
+     **file:// 的真页面**上量 —— 静态声明层与假 DOM 层的判据在 `ui-check` 的 U11 段，
+     本段要证的是**真机渲染结果**（真 computed style、真排版）：
+       ① 演示模式下该格**可见文本**里含「（演示派生）」；
+       ② 该格可见文本里**不含**"帧缺件序号"（`E198` 的提示行在演示模式**不显示**；
+          负责人 2026-10-07 裁定：该格已由 `E197` 声明为演示派生）；
+       ③ 该格**未撑破指标块**：`scrollWidth ≤ clientWidth + 1` 且 `scrollHeight ≤ clientHeight + 1`。
+     ⚠️ 判据口径（**不许**把"临时摘 `hidden` 再量"的读数当断言）：
+        · 「可见文本」＝**只收可见的文本节点**：`TreeWalker(SHOW_TEXT)` 逐个文本节点走，
+          该节点自身及其**全部祖先**都满足 `display !== 'none'` ∧ `visibility !== 'hidden'` 才收。
+          **不能**用 `textContent`（把隐藏后代的文本一起算进来），也**不能**用"可见元素的
+          `textContent` 拼起来"—— 后者会被**祖先元素**顶上来：复核实测（本段首跑即踩到）
+          `#c114StartedSource` 已经 `display:none`、`childVisibility` 也判它不可见，
+          但它的父元素 `.tile-label` 可见，于是可见文本里**仍有**「（演示派生）」
+          ⇒ 那种口径对"隐藏"根本分辨不出来，是一条**防空洞**（ADR-0004 D23）。
+          改用文本节点口径后：隐藏谁、谁的文本就真的从投影里消失（由本段探测面自证反证）；
+        · 「未撑破」＝量**该格自身**（`.tile`）的 `scrollWidth/Height` vs `clientWidth/Height`，
+          不临时改 DOM、不改 `hidden`、不改 `display` ⇒ 与页面的真实状态一致；
+        · 另配**探测面自证**（同一次 evaluate 内，且**当场逐字还原**）：给提示位注入一个临时可见文本、
+          再摘掉它的两道关闭 ⇒ 投影里它变"可见"、"帧缺件序号"能读出来；把后缀位藏起来 ⇒
+          「（演示派生）」从可见文本里消失。两处都跟着变，才说明这个投影**分得出隐藏**；
+          否则"不含帧缺件序号"可能只是探测器失灵（那正是 D23 要防的空洞形态）。
+          该临时改动**在量完 ①②③ 之后**单独做一次，**不作为** ①②③ 的读数。
+     ⚠️ 本段依赖浏览器权限：无 Edge / 沙箱禁命名管道时整脚本已在前文 `skipSuite`（退 3，跳过 ≠ 通过）。 */
+  section('B5d `E197`/`E198` 真机判据（生产统计页「实际开工总数」格：演示派生标注 / 提示行不显示 / 未撑破）');
+  {
+    const B5D_RESOLUTIONS = [[3840, 2160], [1920, 1080], [1366, 768]];
+    /* **同一把尺子**：三档分辨率的三条判据 + 探针自证的反证都用这三个函数（避免两处判据漂移）。 */
+    const verdict = {
+      demo: m => ({ ok: typeof m.visibleText === 'string' && m.visibleText.indexOf('（演示派生）') >= 0 &&
+          m.srcText === '（演示派生）' && m.srcVisible === true && m.noteLv === 'demo',
+        why: `可见文本=${JSON.stringify(String(m.visibleText).slice(0, 60))}；` +
+          `#c114FrameUnitNote 的 dataset.noteLv=${JSON.stringify(m.noteLv)}（演示档应为 'demo'）` +
+          `（本判据的读数是普通对象、可喂内存副本 —— 见下方 D22 那段）；` + m.brief }),
+      noFrameText: m => ({ ok: typeof m.visibleText === 'string' && m.visibleText.indexOf('帧缺件序号') < 0 &&
+          m.noteDisplay === 'none' &&
+          m.childVisibility.some(c => c.id === 'c114FrameUnitNote' && c.visible === false),
+        why: `可见文本含"帧缺件序号"=${String(m.visibleText).includes('帧缺件序号')}；` +
+          `#c114FrameUnitNote 的 computed display=${m.noteDisplay}（应 none）、hidden 属性=${m.noteHiddenAttr}、` +
+          `DOM 文本=${JSON.stringify(m.noteText)}（演示模式应为空串）；` + m.brief }),
+      notBroken: m => ({ ok: m.overflow.sw <= m.overflow.cw + 1 && m.overflow.sh <= m.overflow.ch + 1,
+        why: `scrollWidth=${m.overflow.sw} / clientWidth=${m.overflow.cw}（差 ${m.overflow.dw}）；` +
+          `scrollHeight=${m.overflow.sh} / clientHeight=${m.overflow.ch}（差 ${m.overflow.dh}）；` + m.brief })
+    };
+    const readCell = () => evaluate(`(() => {
+      const note = document.getElementById('c114FrameUnitNote');
+      const tile = note ? note.closest('.tile') : null;
+      const cell = tile || (document.getElementById('c114StartedSource') || {}).parentElement;
+      if (!cell || !note) return { fatal: '未找到 #c114FrameUnitNote 或其 .tile 容器（生产统计页未渲染？）' };
+      const vis = el => {
+        const cs = getComputedStyle(el);
+        return cs.display !== 'none' && cs.visibility !== 'hidden';
+      };
+      /* 只收**可见的文本节点**（自身与全部祖先都可见）—— 见段首 ⚠️ 的口径说明与实测反证 */
+      const textOf = root => {
+        const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+        let out = '';
+        for (let n = w.nextNode(); n; n = w.nextNode()) {
+          let p = n.parentElement, ok = true;
+          while (p) { if (!vis(p)) { ok = false; break; } p = p.parentElement; }
+          if (ok) out += n.textContent || '';
+        }
+        return out;
+      };
+      const kids = [].slice.call(cell.querySelectorAll('*'));
+      const childVisibility = kids.map(el => ({ id: el.id || null, cls: String(el.className || ''),
+        text: (el.textContent || '').trim().slice(0, 24), visible: vis(el) }));
+      const visibleText = vis(cell) ? textOf(cell) : '';
+      const noteCs = getComputedStyle(note);
+      const src = document.getElementById('c114StartedSource');
+      return {
+        viewport: [window.innerWidth, window.innerHeight],
+        cellTag: cell.tagName + (cell.id ? '#' + cell.id : '') + '.' + String(cell.className || ''),
+        srcText: src ? String(src.textContent || '') : null,
+        srcDisplay: src ? getComputedStyle(src).display : null,
+        srcVisible: src ? vis(src) : null,
+        noteText: String(note.textContent || ''),
+        noteDisplay: noteCs.display, noteVisibility: noteCs.visibility, noteHiddenAttr: note.hidden === true,
+        /* E197/E198 的**机器可读标记**：StatsPanel.js:159 把 frameUnitIndexNote().mark 写进
+           noteEl.dataset.noteLv（真 DOM 上 ≡ data-note-lv），四个字面值 demo|warn|err|ok；
+           **与可见性解耦**（隐藏时照样写）⇒ 演示档的"没有这个读数"与服务端读到 0 的 ok 分得开。
+           本段读的是**真机上真的那份 dataset**，不是另行推断出来的值（故本注释不用反引号：它在模板串里）。 */
+        noteLv: (note.dataset && note.dataset.noteLv !== undefined) ? note.dataset.noteLv : null,
+        noteLvAttr: note.getAttribute('data-note-lv'),
+        tileText: String(cell.textContent || ''),
+        visibleText,
+        overflow: { sw: cell.scrollWidth, cw: cell.clientWidth, sh: cell.scrollHeight, ch: cell.clientHeight,
+          dw: cell.scrollWidth - cell.clientWidth, dh: cell.scrollHeight - cell.clientHeight },
+        childVisibility
+      };
+    })()`);
+
+    /* A-7④：真机三档各读一次 `dataset.noteLv`（下面 `noteLvReadings` 收齐后**一条**断言）；
+       `verdict.demo` 也已把 `m.noteLv === 'demo'` 并进"该格可见文本含「（演示派生）」"那条。 */
+    const noteLvReadings = [];
+    for (const [w, h] of B5D_RESOLUTIONS) {
+      await setViewport(w, h);
+      await openPage('?tab=3', 2500);            /* 生产统计页：这一格只在该页可见 */
+      const m = await readCell();
+      if (!m || m.fatal) {
+        check(`B5d ${w}×${h} 「实际开工总数」格可在真机量测（?tab=3、#c114FrameUnitNote 与 .tile 容器齐备）`,
+          false, (m && m.fatal) || 'evaluate 未返回结果');
+        await cdp.send('Emulation.clearDeviceMetricsOverride');
+        continue;
+      }
+      const brief = `视口=${m.viewport[0]}×${m.viewport[1]}；格=${m.cellTag}；` +
+        `#c114StartedSource: 文本=${JSON.stringify(m.srcText)}、display=${m.srcDisplay}、可见=${m.srcVisible}；` +
+        `#c114FrameUnitNote: 文本=${JSON.stringify(m.noteText)}、display=${m.noteDisplay}、hidden 属性=${m.noteHiddenAttr}、` +
+        `dataset.noteLv=${JSON.stringify(m.noteLv)}/@data-note-lv=${JSON.stringify(m.noteLvAttr)}`;
+      m.brief = brief;                                 /* 供下面三个 `verdict.*` 共用 */
+      noteLvReadings.push({ w, h, lv: m.noteLv, attr: m.noteLvAttr, m });
+
+      /* 三档分辨率用**同一把尺子**（`verdict`）：探针自证那一节也复用它来反证"按变异态跑必红"。 */
+      check(`B5d ${w}×${h} 该格可见文本含「（演示派生）」（真实渲染：后缀位 computed display=${m.srcDisplay}，非 none/不可见）`,
+        verdict.demo(m).ok,
+        verdict.demo(m).why);
+
+      check(`B5d ${w}×${h} 该格可见文本**不含**"帧缺件序号"（演示模式下提示行不显示：` +
+        '`#c114FrameUnitNote` 的 computed `display` 为 `none`、且它在"逐节点可见性"投影里判为不可见。' +
+        '⚠ **不**要求它的 DOM 文本非空 —— 演示模式下渲染写的就是**空串**（服务端两档才有字），' +
+        '拿"文本非空"当判据会把正确实现判红（复核实测踩到）；' +
+        '"可见文本"这条投影本身是否分得出隐藏，由本段的探测面自证单独证明）',
+        verdict.noFrameText(m).ok,
+        verdict.noFrameText(m).why);
+
+      check(`B5d ${w}×${h} 该格未撑破指标块（` +
+        '`scrollWidth ≤ clientWidth + 1` ∧ `scrollHeight ≤ clientHeight + 1`；真机读数，不临时摘 hidden）',
+        verdict.notBroken(m).ok,
+        verdict.notBroken(m).why);
+    }
+
+    /* A-7④（`T-20261007-09`）：**顺手在真机上读一次** `dataset.noteLv` 并断言演示档 `=== 'demo'`。
+       为什么要这条：`E198` 那两种"没有"（演示 `demo` / 服务端读到 0 `ok`）在**可见性与文本上都一样**
+       （都不可见、文本都空）⇒ 上面三条断言**分辨不出**是哪一种；而这个标记正是实现里用来分开它们的那一位
+       （`StatsPanel.js:159` 写、`frameUnitIndexNote()` 的 `mark` 给）。**服务端档不在真机可构造范围内**
+       （本用例只跑演示档；服务端两档由 `ui-check` 的 vm 夹具构造），故**只断言 `demo`**。
+       D22（内存变异 ⇒ 必红并指名；未变异 ⇒ 绿；`StatsPanel.js` 盘上字节全程未变）：把 **①真机实时读到的**
+       读数留底，再把**该读数的内存副本**改成 `ok`（＝"两种没有混成同一个空"的错实现）跑**同一条 `verdict.demo`**
+       ⇒ 必红且 `why` 里指名 `dataset.noteLv`；随后连同 `data-note-lv` 属性一起逐字还原并**回读核实**。
+       ⚠ 第 ① 项是**当场现读**（不是用循环里那份快照）—— 否则"读到的就是 demo"可能只是拿了旧值。 */
+    const noteLvNow = await evaluate(`(() => {
+      const n = document.getElementById('c114FrameUnitNote');
+      if (!n) return { fatal: '未找到 #c114FrameUnitNote' };
+      return { lv: (n.dataset && n.dataset.noteLv !== undefined) ? n.dataset.noteLv : null,
+        attr: n.getAttribute('data-note-lv') };
+    })()`);
+    const liveLv = noteLvNow && !noteLvNow.fatal ? noteLvNow.lv : null;
+    const liveOk = Boolean(noteLvNow) && noteLvNow.fatal === undefined && liveLv === 'demo';
+    let d22NoteLv = null;
+    if (liveOk) {
+      const base = noteLvReadings.map(r => r.m).filter(Boolean).sort((a, b) => a.viewport[0] - b.viewport[0])[0];
+      const mutated = Object.assign({}, base, { noteLv: 'ok' });
+      d22NoteLv = { base: base ? verdict.demo(base) : { ok: null, why: '（无基线读数）' },
+        mut: verdict.demo(mutated),
+        baseLv: base ? base.noteLv : null };
+      const restore = await evaluate(`(() => {
+        const n = document.getElementById('c114FrameUnitNote');
+        if (!n) return { ok: false, lv: null };
+        n.dataset.noteLv = 'demo';                      /* 逐字还原成实现写的那一位 */
+        return { ok: n.dataset.noteLv === 'demo' && n.getAttribute('data-note-lv') === 'demo',
+          lv: n.dataset.noteLv, attr: n.getAttribute('data-note-lv') };
+      })()`);
+      d22NoteLv.restored = restore;
+    }
+    check('B5d-A7④ 真机 `#c114FrameUnitNote` 的 `dataset.noteLv` 演示档 `=== \'demo\'`（三档分辨率读数；' +
+      '服务端档不在真机可构造范围内、**只断言 demo**）＋ D22：把**该读数的内存副本**改成 `ok` ⇒ ' +
+      '同一条 `verdict.demo` 必红并在 `why` 里指名 `dataset.noteLv`，还原后回绿',
+      liveOk && noteLvReadings.length === 3 && noteLvReadings.every(r => r.lv === 'demo') &&
+      noteLvReadings.every(r => r.attr === 'demo') &&
+      d22NoteLv !== null && d22NoteLv.base.ok === true && d22NoteLv.mut.ok === false &&
+      String(d22NoteLv.mut.why).indexOf('dataset.noteLv') >= 0 &&
+      Boolean(d22NoteLv.restored) && d22NoteLv.restored.ok === true,
+      `真机现读：\`dataset.noteLv\`=${JSON.stringify(liveLv)}、\`@data-note-lv\`=` +
+      `${JSON.stringify(noteLvNow ? noteLvNow.attr : null)}（取不到即 FAIL）；` +
+      `三档读数=[${noteLvReadings.map(r => `${r.w}×${r.h}: ${JSON.stringify(r.lv)}/@${JSON.stringify(r.attr)}`).join('、')}]（应三档全 'demo'）；` +
+      `**D22 内存变异**：基线读数（内存副本，不改盘）判绿=${d22NoteLv && d22NoteLv.base.ok}、` +
+      `\`dataset.noteLv\` ${JSON.stringify(d22NoteLv && d22NoteLv.baseLv)} → 'ok' 后同一条判据判红=` +
+      `${Boolean(d22NoteLv) && d22NoteLv.mut.ok === false}、` +
+      `红时指名=${JSON.stringify(String(d22NoteLv ? d22NoteLv.mut.why : '（未跑）').slice(0, 160))}；` +
+      `还原并回读=${JSON.stringify(d22NoteLv && d22NoteLv.restored)}（应 lv/attr 都回 'demo'）`);
+
+    /* 探测面自证（**只作读数**，且当场逐字还原）：若"隐藏"根本分辨不出来，上面那条"不含帧缺件序号"
+       就可能是碰巧（真机 `textContent` 里那句话只要存在就永远在）。这一段证明探测器**确实**按
+       computed display 分辨，并在同一次 evaluate 内还原全部临时改动；任何断言都**不**引用
+       这里量到的几何，只用"探测器在这两处是否跟着变"。
+       ⚠ 演示模式下 `#c114FrameUnitNote` 的文本**本来就是空串** ⇒ 自证时给它注入一个临时可见文本
+       （`TMP_FRAME_TEXT` 含"帧缺件序号"），否则"摘掉隐藏后也读不出字"会把自证自己判红。 */
+    await setViewport(3840, 2160);
+    await openPage('?tab=3', 2500);
+    const probe = await evaluate(`(() => {
+      const TMP = '帧缺件序号：自证用临时文本';
+      const cell = document.getElementById('c114FrameUnitNote').closest('.tile');
+      const vis = el => { const cs = getComputedStyle(el); return cs.display !== 'none' && cs.visibility !== 'hidden'; };
+      const snap = () => {
+        const kids = [].slice.call(cell.querySelectorAll('*'));
+        /* 与上面 readCell 的投影**逐字同口径**：只收可见的文本节点（自身与全部祖先都可见） */
+        const textOf = root => {
+          const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+          let out = '';
+          for (let n = w.nextNode(); n; n = w.nextNode()) {
+            let p = n.parentElement, ok = true;
+            while (p) { if (!vis(p)) { ok = false; break; } p = p.parentElement; }
+            if (ok) out += n.textContent || '';
+          }
+          return out;
+        };
+        const contributors = kids.filter(vis).map(el => ({ id: el.id || null, cls: String(el.className || ''),
+          hitDemo: (el.textContent || '').indexOf('（演示派生）') >= 0,
+          hitFrame: (el.textContent || '').indexOf('帧缺件序号') >= 0 }));
+        return {
+          visibleText: textOf(cell),
+          childVisibility: kids.map(el => ({ id: el.id || null, visible: vis(el) })),
+          contributors,
+          srcText: document.getElementById('c114StartedSource').textContent,
+          srcVisible: (() => { const s = document.getElementById('c114StartedSource'); return vis(s); })(),
+          noteDisplay: getComputedStyle(document.getElementById('c114FrameUnitNote')).display,
+          noteText: document.getElementById('c114FrameUnitNote').textContent,
+          overflow: (() => { const t = cell; return { sw: t.scrollWidth, cw: t.clientWidth, sh: t.scrollHeight, ch: t.clientHeight,
+            dw: t.scrollWidth - t.clientWidth, dh: t.scrollHeight - t.clientHeight }; })()
+        };
+      };
+      const note = document.getElementById('c114FrameUnitNote');
+      const src = document.getElementById('c114StartedSource');
+      const noteStyle = note.getAttribute('style');   /* 逐字留底 */
+      const srcStyle = src.getAttribute('style');
+      const noteTextBackup = note.textContent;
+      const srcTextBackup = src.textContent;
+      const before = snap();
+      /* ⚠ 必须**先冻结这两个位的按帧重写**（'?tab=3' 页每秒 tick 会调 Dom.setText 把演示后缀写回来）：
+         否则"藏起来"的临时改动会被下一帧冲掉，量到的仍是"有后缀" ⇒ 自证自己判红（复核实测踩到）。 */
+      const FREEZE = ['c114StartedSource', 'c114FrameUnitNote'];
+      const realSetText = window.Dom.setText;
+      window.Dom.setText = function (id, v) {
+        const r = realSetText.apply(this, arguments);
+        if (FREEZE.indexOf(id) >= 0) { if (id === 'c114StartedSource') src.textContent = srcTextBackup; else note.textContent = noteTextBackup; }
+        return r;
+      };
+      note.textContent = TMP;                         /* 临时可见文本（含"帧缺件序号"） */
+      note.style.display = '';
+      note.hidden = false;                            /* 两道关闭都摘掉 ⇒ 它应当"可见" */
+      src.style.display = 'none';                     /* 后缀位藏起来 ⇒ 它应当从可见文本里消失 */
+      const during = snap();
+      /* ---- 逐字还原（按帧重写 + 属性 + 文本），随后复测 ---- */
+      window.Dom.setText = realSetText;
+      note.textContent = noteTextBackup;
+      if (noteStyle === null) note.removeAttribute('style'); else note.setAttribute('style', noteStyle);
+      note.hidden = true;
+      if (srcStyle === null) src.removeAttribute('style'); else src.setAttribute('style', srcStyle);
+      src.textContent = srcTextBackup;
+      const after = snap();
+      return {
+        beforeDemoContributors: before.contributors.filter(c => c.hitDemo),
+        duringHasFrameText: during.visibleText.indexOf('帧缺件序号') >= 0,
+        duringNoteVisible: during.childVisibility.some(c => c.id === 'c114FrameUnitNote' && c.visible === true),
+        duringHasDemoNote: during.visibleText.indexOf('（演示派生）') >= 0,
+        duringDemoContributors: during.contributors.filter(c => c.hitDemo),
+        duringSrcSeen: during.contributors.some(c => c.id === 'c114StartedSource'),
+        afterVisibleText: after.visibleText,
+        /* mutation 态（＝"该格可见文本含帧缺件序号"的错实现）与 baseline 态各一份**原始读数**，
+           交给 Node 侧用**同一个** verdict 判 ⇒ 反证的是**这三条断言本身**，不是另写一段判据。
+           （标签在 Node 侧补，避免在 evaluate 体里嵌模板字面量。） */
+        mut: during,
+        base: after,
+        restored: window.Dom.setText === realSetText &&
+          String(note.getAttribute('style') || '') === String(noteStyle || '') &&
+          note.hidden === true && getComputedStyle(note).display === 'none' &&
+          note.textContent === noteTextBackup &&
+          String(src.getAttribute('style') || '') === String(srcStyle || '') &&
+          src.textContent === srcTextBackup
+      };
+    })()`);
+    /* D22（`E198` 那一组）：**按变异态跑同一条判据 ⇒ 必红并指名到具体元素**；
+       未变异（刚还原的页面）⇒ 同一条判据必绿。这是"可证伪"的直接证据，不是推理。 */
+    const probeBrief = o => `可见文本=${JSON.stringify(String(o.visibleText).slice(0, 60))}、` +
+      `#c114StartedSource 文本=${JSON.stringify(o.srcText)}/可见=${o.srcVisible}、` +
+      `#c114FrameUnitNote display=${o.noteDisplay}/DOM 文本=${JSON.stringify(o.noteText)}`;
+    if (probe) {
+      probe.mut = Object.assign({}, probe.mut, { brief: probeBrief(probe.mut), cellTag: 'probe-mutation' });
+      probe.base = Object.assign({}, probe.base, { brief: probeBrief(probe.base), cellTag: 'probe-restored' });
+    }
+    const mutVerdict = probe ? verdict.noFrameText(probe.mut) : { ok: null, why: '（探针未返回）' };
+    const baseVerdict = probe ? verdict.noFrameText(probe.base) : { ok: null, why: '（探针未返回）' };
+    check('B5d 探测器面自证 ＋ `E198` D22（只作读数、当场逐字还原）：摘掉 `#c114FrameUnitNote` 的' +
+      '两道关闭并给它一个含"帧缺件序号"的临时文本（＝"提示行本该不可见却可见"的**变异态**）⇒ ' +
+      '同一条 `noFrameText` 判据**必红并指名 `#c114FrameUnitNote`**；把 `#c114StartedSource` 藏起来 ⇒ ' +
+      '「（演示派生）」从可见文本消失（证明投影分得出隐藏）；随后逐字还原 ⇒ 同一条判据回到绿',
+      probe && probe.duringHasFrameText === true && probe.duringNoteVisible === true &&
+      probe.duringHasDemoNote === false && probe.restored === true &&
+      baseVerdict.ok === true && mutVerdict.ok === false &&
+      mutVerdict.why.indexOf('c114FrameUnitNote') >= 0 &&
+      typeof probe.afterVisibleText === 'string' && probe.afterVisibleText.indexOf('（演示派生）') >= 0 &&
+      probe.afterVisibleText.indexOf('帧缺件序号') < 0,
+      `摘关闭后：可见文本含"帧缺件序号"=${probe && probe.duringHasFrameText}、` +
+      `#c114FrameUnitNote 判为可见=${probe && probe.duringNoteVisible}、` +
+      `可见文本含「（演示派生）」=${probe && probe.duringHasDemoNote}（应 false ⇒ 证明后缀位被藏后确实消失）；` +
+      `**D22 反证**：变异态跑 noFrameText 判据 ⇒ 判红=${mutVerdict.ok === false}、指名内容=${JSON.stringify(String(mutVerdict.why).slice(0, 160))}；` +
+      `还原态跑同一条 ⇒ 判绿=${baseVerdict.ok === true}；` +
+      `探针读数：摘关闭前"（演示派生）"的贡献者 ${(probe && probe.beforeDemoContributors || []).length} 个，` +
+      `摘关闭时 ${(probe && probe.duringDemoContributors || []).length} 个` +
+      `（${(probe && probe.duringDemoContributors || []).map(c => c.cls || c.id).join('、') || '（无）'}）、` +
+      `后缀位仍在可见集合=${probe && probe.duringSrcSeen}；还原=${probe && probe.restored}`);
+    await cdp.send('Emulation.clearDeviceMetricsOverride');
+  }
 
   section('B6 无操作 5 分 10 秒自动返回首页（FR-9.4）');
   try {

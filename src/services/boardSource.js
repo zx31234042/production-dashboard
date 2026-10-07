@@ -163,6 +163,19 @@ window.BoardSource = (function () {
     closeStream();
     const cfg = window.BoardConfig;
     if (cfg) cfg.dataSource = 'mock';
+    /* ⚠ **前提钉住（`A-2` 复核结论，2026-10-07；本注记不改任何逻辑）**：本函数**只有 4 个调用点，
+       且全部在首帧快照之前** —— `main.js`（`BoardSource` 未加载）＋ 本文件 `startServerSource()` 里的
+       三处（"适配层未加载 `fetchSnapshot()`"／"快照接口未返回可用数据"／"快照请求失败"）；
+       **SSE 断线明确不回退**（`openStream()` 的 `src.onerror` 只把 `state.device.link` 置 `'offline'`
+       并给断开提示，绝不调本函数）。
+       ⇒ `E197`（`StatsPanel` 的「（演示派生）」标注，判据＝`state.serverMode` 优先、退配置）所担心的
+       "**回退后标注消失**"**当前不可达**：`state.serverMode` 只在全量快照里被置 true，而"先连上、
+       后回退"这条路径今天构造不出来（首帧窗口实测显示的是 `—`／`stats.noData`，不是演示派生值）。
+       ⚠ **若将来把回退挪到首帧之后**（例如加一条"建流失败 ⇒ 回退演示源"，这是很自然的下一版）：
+       `E197` 的判据**必须**同批加上 `state.sourceFallback !== true`，否则板面已是演示派生值、
+       标注却是空串；并须**同批核**另外几处"服务端模式"判据用**同一把尺子**（`UploadPanel`／
+       `SettingPanel`／`NoticePanel`／`SelfCheckProbe`；现状＝`UploadPanel.js` 用真值 `||`、
+       其余三处用严格 `=== true` —— 无差别，但不是逐字同一份实现）。 */
     if (state) {
       state.sourceMode = 'mock';
       state.sourceFallback = true;

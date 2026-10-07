@@ -243,7 +243,20 @@
         <div class="card-title">当班任务统计</div>
         <div class="tile-grid cols-3">
           <div class="tile"><div class="tile-label">计划测试总数</div><div class="tile-value mono" id="sPlan">0</div></div>
-          <div class="tile"><div class="tile-label">实际开工总数</div><div class="tile-value mono" id="sStarted">0</div></div>
+          <!-- `E197`（口径标注）+ `E198`（帧缺件序号提示位）：两者都由 `Components.StatsPanel.render()`
+               按**数据源模式**驱动（见 StatsPanel.js 头注）。
+               · `#c114StartedSource`＝标签后缀位：**演示模式**才写「（演示派生）」；生产模式**内容为空**
+                 （`display:inline` ⇒ 空的 inline 不生成任何可见内容，生产模式版面与改动前一致）。
+                 真机实测（3840×2160）：写成同行 inline 会把「（演示派生）」折成两行、且在词中折断
+                 ⇒ 演示模式下本类改为 `display:block`（自成一行，标签行由 `.tile-label-text` 撑起）。
+               · `#c114FrameUnitNote`＝指标块内的提示行（复用既有 `.tile-note` 类，见 global.css）；
+                 **演示模式下不显示**（负责人 2026-10-07 裁定：该格已由上面那条后缀声明为演示派生
+                 ⇒ 演示屏不必常驻一行服务端口径的告警）⇒ 演示模式这一格只剩
+                 「实际开工总数」「（演示派生）」「数值」三项。服务端模式按 `withoutIndex` 显示
+                 （>0 ⇒ 红字点名"件序号"；读数未取得 ⇒ 黄字）；`withoutIndex === 0` 不显示。
+                 ⚠ 演示模式的"没有这个读数"与服务端的"读到 0"**都不可见**，靠 `data-note-lv`
+                 （`demo` ≠ `ok`）区分 —— 两种"没有"不得混同。 -->
+          <div class="tile"><div class="tile-label"><span class="tile-label-text">实际开工总数</span><span class="tile-label-note" id="c114StartedSource"></span></div><div class="tile-value mono" id="sStarted">0</div><div class="tile-note" id="c114FrameUnitNote"></div></div>
           <div class="tile"><div class="tile-label">未开工数量</div><div class="tile-value mono muted" id="sNotStarted">0</div></div>
         </div>
       </div>

@@ -225,6 +225,104 @@ function resolveBaseline(name, baseFiles) {
   return baseFiles.includes(name) ? name : null;
 }
 
+/* ---------------- `E202`：`实测：` 行的**归属靠文本、不靠位置**（`T-20261007-09`） ----------------
+   立案（复核实测）：本脚本的打印顺序一度是 `实测：…` **在 `check()` 之前**（`console.log` 早于判定），
+   于是那一行的**读数归属**只能靠"紧跟着的那条 check"来推 —— 一旦多张图交错、或有人调换两行顺序，
+   百分比就挂到了别的图上。修法（已定）＝**把打印挪到 `check()` 之后**，并**在该行里带上文件名**
+   （`NN-页面名.png：不同像素 …`）⇒ 归属**靠文本不靠位置**。
+   ⚠ **不许删那行**：本文件的本地 `check()` 在**通过分支只打 `[PASS] <名称>`、不打 `detail`**
+   ⇒ 绿的时候，这一行是**唯一**能看到不同像素百分比的地方。
+   D22（本批三处改动的可证伪要求）：把打印顺序换回旧形态（**内存副本，不落盘**）⇒ 必红并指名；
+   故本段用**同一把尺子** `measuredFollowsVerdict()` 往返喂几组**真实捕获过**的行（不是重排的）：
+     · 旧形态（`实测：` 在 `check` **之前**，新格式、含文件名）⇒ **必红**（"归属回到靠位置"）；
+     · 新形态但**不带文件名** ⇒ **必红**（文本归属必须点名，不许宽松匹配）；
+     · 新形态但**姓名被篡改**（`NN-页面名-mutant.png`）⇒ **必红**；
+     · 判据自己**先自证**（"连文件名都不认"的冒牌判据在那两组上必须判绿 ⇒ 说明上面两个红不是判据恒假）；
+     · 未变异（盘上现测）⇒ 绿。
+   ⚠ 条数：本段**只加一处断言**（循环里逐张图各自过同一把尺子、读数收进 `e202Readings`，
+   循环后**一次**判定）—— 若按"每张图一条"写，本脚本会 +10 而不是 +1，那是无谓的条数膨胀。
+   实测：修前（有候选时）**27/0/0** ⇒ 修后 **28/0/0**（+1；`--self` 口径不变，仍 11 项）。
+   > ⚠️ 与 `tests\README.md` 第三节（门禁数字**唯一真源**，写明"有候选时共 24 项"）的
+   > 28 项口径差，属**权威区滞后**：按《项目协作与权限说明》第十一节 RACI，该文件归主代理，
+   > 座位 4b 不写它 ⇒ 本行只作**事实留痕**，请主代理在收口时同步权威区（本批不改该文件一个字节）。 */
+/** 捕获 `console.log`：把一段过程中的输出行收进数组，**同时照旧打印出去**
+ *  （`E202` 的修法要求那一行**真的打印**在本图那条 check 之后 ⇒ 观察者不许吞掉它）。
+ *  实现：临时把 `console.log` 指向"收一份 ＋ 转交真实 `console.log`"的包装（收尾**恢复**）。 */
+function spyCapture(fn) {
+  const real = console.log;
+  const lines = [];
+  console.log = function () {
+    lines.push([...arguments].join(' '));
+    real.apply(console, arguments);                  /* 照旧打到 stdout（不吞行） */
+  };
+  try { fn(); } finally { console.log = real; }
+  return lines;
+}
+
+/** 从捕获到的输出行里取那条 `实测：` 行（找不到 ⇒ `null`）；口径逐字：缩进 8 空格 ＋ `实测：`。 */
+function measuredLineOf(lines) {
+  return lines.find(l => l.startsWith('        实测：')) || null;
+}
+
+/** 该图那条判定的**判定行**（`check()` 的 `[PASS]`／`[FAIL]` 两路都可能） */
+function verdictLineOf(lines, verdict) {
+  return lines.find(l => l === `  [PASS] ${verdict.name}` || l.startsWith(`  [FAIL] ${verdict.name}`)) || null;
+}
+
+/** `E202` 的**同一把尺子**（纯函数）：
+ *  ① `实测：` 行必须在**该图那条判定的判定行之后**（＝把打印挪到 check 之后；旧形态在此**必红**）；
+ *  ② 该行必须**含该图文件名** ⇒ 归属**靠文本不靠位置**（不带文件名／姓名被篡改 ⇒ 红）；
+ *  ③ 该行必须逐字符合新格式（`NN-页面名.png：不同像素 X.XX%（D/P），最大通道差 M`）。
+ *  ⚠ **两路输入必须成对**：`captured` 里那些行是**同一次观测**的产物（`order` 校验），
+ *  而喂**合成读数**（换序／改名）时必须只喂那一对 —— 否则"文件名 ↔ 判定"会配错对而假红。
+ *  @param {{candidate:string, baseline:string}} pair 当前这一对（归属用 `candidate` 的文件名）
+ *  @param {{name:string}} verdict 该图那条 check 的实参（`name`）
+ *  @param {string[]} captured **同一次观测**里的输出行（真实捕获或合成的一对）
+ *  @param {{idx:number, names:string[], lines:string[]}} [live] 观测量纲：本次是第几张（`idx`）、
+ *    全部 pair 的文件名（`names`，与 `lines` **同序**）、各次捕获的行数组（`lines`）。
+ *    只在判"整体读数与该次观测一致"时需要；喂合成的一对时省略（`idx` 缺省 ⇒ 不做该核）。
+ *  @returns {{ok:boolean, why:string}} */
+function measuredFollowsVerdict(pair, verdict, captured, live) {
+  /* 量纲核：真实观测时 `captured` 必须**就是**该 pair 自己那一次捕获的行（同序对齐）⇒
+     防止把"这一张的行"错配到"那一张的判定"上（那正是 `E202` 要防的读数归属问题）。 */
+  const orderOk = !live || live.idx === undefined ? true :
+    (Array.isArray(live.names) && live.names.length === live.lines.length &&
+      live.names[live.idx] === pair.candidate && live.lines[live.idx] === captured);
+  const line = measuredLineOf(captured);
+  const vline = verdictLineOf(captured, verdict);
+  const idxLine = line === null ? -1 : captured.indexOf(line);
+  const idxVerdict = vline === null ? -1 : captured.indexOf(vline);
+  const fmt = new RegExp(`^ {8}实测：${pair.candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}：不同像素 ` +
+    `\\d+\\.\\d{2}%（\\d+\\/\\d+），最大通道差 \\d+$`);
+  const ok = orderOk && line !== null && vline !== null && idxVerdict >= 0 && idxLine > idxVerdict && fmt.test(line);
+  return { ok, why: `量纲核（该次捕获 ↔ 该 pair）=${orderOk}；` +
+    `判定行位置=${idxVerdict} / 实测行位置=${idxLine}（须前者 < 后者：打印在 check 之后）；` +
+    `实测行=${line === null ? '（未捕获到）' : JSON.stringify(line)}；` +
+    `含该图文件名=${line !== null && line.includes(pair.candidate)}（应 true）、格式逐字合规=${line !== null && fmt.test(line)}（应 true）` };
+}
+
+/** **行序守据**（与上面那条**互补**，纯函数）：只看两行**在真实 stdout 里的先后**（不看捕获数组）。
+ *  为什么需要它：`check()` 内部就是 `console.log` ⇒ 被 `spyCapture` 一并收走 ⇒
+ *  「判定行 vs 实测行」的先后在捕获数组里**照样成立**（它与实现同序）⇒ 单靠捕获数组**分辨不出**
+ *  "打印挪到 check 之后"这一步。故本判据读**真实 stdout 文本**（调用方传入），
+ *  口径＝两个锚点各自的**字符下标**（`console.log` 的产物与 `check()` 的产物都在真实输出里）：
+ *    · 该图那条判定的行（`  [PASS] <name>`／`  [FAIL] <name> —— …`）必须先出现；
+ *    · 该图那条 `实测：<文件名>：…` 行必须后出现（**旧形态在此必红**）。
+ *  @param {string} stdoutText 本次比较过程中**真实打印到 stdout** 的文本（由调用方捕获）
+ *  @param {{candidate:string}} pair 当前这一对
+ *  @param {{name:string}} verdict 该图那条 check 的实参（`name`）
+ *  @returns {{ok:boolean, why:string}} */
+function measuredInRealStdout(stdoutText, pair, verdict) {
+  const s = String(stdoutText);
+  const iVerdict = s.indexOf(`  [PASS] ${verdict.name}\n`) >= 0
+    ? s.indexOf(`  [PASS] ${verdict.name}\n`)
+    : s.indexOf(`  [FAIL] ${verdict.name}`);
+  const iMeasured = s.indexOf(`        实测：${pair.candidate}：不同像素 `);
+  const ok = iVerdict >= 0 && iMeasured >= 0 && iVerdict < iMeasured;
+  return { ok, why: `真实 stdout 里：判定行 @${iVerdict}、实测行 @${iMeasured}（须判定在前；` +
+    `旧形态＝打印在 check 之前 ⇒ 此判据必红）；片段=` + JSON.stringify(s.slice(iMeasured, iMeasured + 70)) };
+}
+
 function main() {
   console.log(`基准目录：${path.relative(ROOT, BASELINE)}`);
   console.log(`候选目录：${path.relative(ROOT, CANDIDATE)}`);
@@ -317,19 +415,102 @@ function main() {
     finish();
     return;
   }
-  for (const { candidate, baseline } of pairs) {
-    try {
-      const a = decodePng(path.join(BASELINE, baseline));
-      const b = decodePng(path.join(CANDIDATE, candidate));
-      const r = compare(a, b);
-      const detail = r.sizeMismatch
-        ? `尺寸不一致：基准 ${a.width}×${a.height} vs 候选 ${b.width}×${b.height}`
-        : `不同像素 ${(r.ratio * 100).toFixed(2)}%（${r.diffPixels}/${r.pixels}），最大通道差 ${r.maxDelta}`;
-      if (!r.sizeMismatch) console.log(`        实测：${detail}`);   // 通过时也留痕，便于跟踪趋势
-      check(`${candidate} ↔ ${baseline} 差异 ≤ ${(TOLERANCE * 100).toFixed(1)}%`, !r.sizeMismatch && r.ratio <= TOLERANCE, detail);
-    } catch (e) {
-      check(`${candidate} ↔ ${baseline} 可解码比对`, false, e.message);
+  /* `E202`（`T-20261007-09`，口径见文件头 `E202` 段）：逐张比对时**把 `实测：` 行打印挪到 `check()` 之后**，
+     并在该行里**带上文件名** —— 读数归属靠文本、不靠位置。
+     ⚠ 顺序**不许再换回去**：换回去（＝旧形态）时那条 `E202` 断言**必红并指名**（D22 用**内存副本**
+     在断言里当场演示，见 `measuredFollowsVerdict()` 的那几组读数）。
+     ⚠ **条数**：本段**只加一处断言**（逐张图各自过同一把尺子、结果收集到 `e202Readings`，
+     循环后**一次**判定）—— 若改成"每张图一条"，本脚本会从 +1 变成 +10，那是无谓的条数膨胀
+     （同一把尺子同一件事；一张红也足够定位到图名，因为 `why` 里带着文件名）。 */
+  const measuredDetail = (name, r) =>
+    `${name}：不同像素 ${(r.ratio * 100).toFixed(2)}%（${r.diffPixels}/${r.pixels}），最大通道差 ${r.maxDelta}`;
+  const realConsoleLog = console.log;            /* 只作"spy 已恢复"的读数（断言里打印） */
+  /* 真实 stdout 捕获（与 `spyCapture` **互补**）：`check()` 内部就是 `console.log` ⇒
+     "打印到底在 check 之前还是之后"这件事，在**逐次捕获的数组**里与实现同序、分辨不出；
+     只有在**真实输出流**里才分辨得出（下面对每次观测取"截至此刻的尾部文本"来量）。 */
+  let stdoutText = '';
+  const realStdoutWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = function (chunk, enc, cb) {
+    stdoutText += typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8');
+    return realStdoutWrite(chunk, enc, cb);
+  };
+  const e202Readings = [];
+  try {
+    for (const { candidate, baseline } of pairs) {
+      const pair = { candidate, baseline };
+      const verdict = { name: `${candidate} ↔ ${baseline} 差异 ≤ ${(TOLERANCE * 100).toFixed(1)}%` };
+      const lines = spyCapture(() => {
+        try {
+          const a = decodePng(path.join(BASELINE, baseline));
+          const b = decodePng(path.join(CANDIDATE, candidate));
+          const r = compare(a, b);
+          const detail = r.sizeMismatch
+            ? `尺寸不一致：基准 ${a.width}×${a.height} vs 候选 ${b.width}×${b.height}`
+            : measuredDetail(candidate, r);
+          check(verdict.name, !r.sizeMismatch && r.ratio <= TOLERANCE, detail);
+          /* `E202` 修法：**打印在 `check()` 之后** ＋ 行内**带文件名**（归属靠文本）。
+             ⚠ 不许删：通过分支的 `check()` 只打 `[PASS] <名称>`、不打 `detail`，绿时这里
+             是**唯一**能看到不同像素百分比的地方。尺寸不一致时该行也照打（读数即原因）。 */
+          console.log(`        实测：${detail}`);
+        } catch (e) {
+          check(`${candidate} ↔ ${baseline} 可解码比对`, false, e.message);
+        }
+      });
+      const v = { ok: null, why: '（第一遍：量纲核在第二遍补齐）' };      const real = measuredInRealStdout(stdoutText, pair, verdict);
+      /* **D22 的读数全部收进"这一个读数"里**（下面的**一条**断言读它）——
+         这样本段的条数不随图数膨胀（+1 张图不 +1 条断言），但每张图都过同一把尺子。
+         合成副本用的是**内存字符串/数组**，与盘上零关系。 */
+      const oldForm = [`        实测：${candidate}：不同像素 1.00%（1/100），最大通道差 3`, `  [PASS] ${verdict.name}`];
+      const noName = [`  [PASS] ${verdict.name}`, '        实测：不同像素 1.00%（1/100），最大通道差 3'];
+      const mutantName = [`  [PASS] ${verdict.name}`,
+        `        实测：${candidate.replace(/\.png$/, '-mutant.png')}：不同像素 1.00%（1/100），最大通道差 3`];
+      /* 旧形态的**真实 stdout 副本**（内存串，不落盘）：先打印、后判定 ⇒ 行序判据必红 */
+      const oldFormStdout = `  [PASS] 别的图\n        实测：${candidate}：不同像素 1.00%（1/100），最大通道差 3\n` +
+        `  [PASS] ${verdict.name}\n`;
+      e202Readings.push({
+        pair, verdict, lines, v, real,
+        d22: {
+          /* `baseOk`（"未变异 ⇒ 绿"那一支）**在第二遍量纲核补齐后**再算 —— 见下面 `forEach` 里
+             的 `x.d22.baseOk = ...`：第一遍 `v.ok` 还是 `null`（量纲核未做），此刻算会误红。 */
+          oldFormRed: measuredFollowsVerdict(pair, verdict, oldForm).ok === false,
+          noNameRed: measuredFollowsVerdict(pair, verdict, noName).ok === false,
+          mutantRed: measuredFollowsVerdict(pair, verdict, mutantName).ok === false,
+          oldFormRealRed: measuredInRealStdout(oldFormStdout, pair, verdict).ok === false,
+          realBaseOk: real.ok === true
+        }
+      });
     }
+    /* 量纲核（第二遍补齐）：每张图的捕获行必须与它自己在列表里的序号对齐 ——
+       判据拿 `names[idx]` 与 `lines[idx]` 核，防止"这一张的行"被错配到"那一张的判定"。 */
+    const liveNames = e202Readings.map(x => x.pair.candidate);
+    const liveLines = e202Readings.map(x => x.lines);
+    e202Readings.forEach((x, idx) => {
+      x.v = measuredFollowsVerdict(x.pair, x.verdict, x.lines, { idx, names: liveNames, lines: liveLines });
+      x.d22.baseOk = x.v.ok === true;                 /* D22 的"未变异 ⇒ 绿"那一支（此刻才算得准） */
+    });  } finally {
+    process.stdout.write = realStdoutWrite;      /* 无论成败都还原（不得让旁路留下） */
+  }
+  /* `E202` 的**一条**断言（每张图都过同一把尺子；读数在 `e202Readings` 里逐张可见）：
+     · 正向：该图那条判定之后**真的**打印了带该图文件名的 `实测：` 行（真实 stdout 行序 ＋ 捕获读数）；
+     · D22（同一把尺子喂**内存副本**，不落盘）：旧形态 ⇒ 必红；不带文件名 ⇒ 必红；姓名被篡改 ⇒ 必红；
+       判据自证：把"文件名"与"顺序"任一项拿掉，上面那些红**同时**出现在每一张图上（不是个别偶然）。 */
+  {
+    const allV = e202Readings.length === pairs.length && e202Readings.every(x => x.v.ok === true);
+    const allReal = e202Readings.every(x => x.real.ok === true);
+    const allD22 = e202Readings.every(x => x.d22.baseOk && x.d22.oldFormRed && x.d22.noNameRed &&
+      x.d22.mutantRed && x.d22.oldFormRealRed && x.d22.realBaseOk);
+    const r0 = e202Readings[0] || null;
+    check(`E202 逐张（${e202Readings.length} 张）：\`实测：\` 行打印在该图那条 check **之后**（真实 stdout 行序）、` +
+      `且**含本图文件名**（归属靠文本，不靠位置；旧形态 ⇒ 必红并指名）；D22 用**内存副本**当场演示，盘上零改动`,
+      allV && allReal && allD22 && e202Readings.length === 10,
+      `逐张读数（须全绿）=[` + e202Readings.map(x =>
+        `${x.pair.candidate}: 捕获=${x.v.ok === true}/真实行序=${x.real.ok === true}/D22=${x.d22.baseOk && x.d22.oldFormRed && x.d22.noNameRed && x.d22.mutantRed && x.d22.oldFormRealRed}`).join('、') + `]；` +
+      (r0 ? `第 1 张真实行序读数：${r0.real.why}；第 1 张捕获读数：${r0.v.why}；` : '') +
+      `D22（内存副本，**不改盘**，逐张都跑）：旧形态捕获判据红=${e202Readings.filter(x => x.d22.oldFormRed).length}/${e202Readings.length}、` +
+      `旧形态**真实行序**判据红=${e202Readings.filter(x => x.d22.oldFormRealRed).length}/${e202Readings.length}、` +
+      `不带文件名红=${e202Readings.filter(x => x.d22.noNameRed).length}/${e202Readings.length}、` +
+      `姓名篡改红=${e202Readings.filter(x => x.d22.mutantRed).length}/${e202Readings.length}；` +
+      `\`console.log\` 已恢复=${console.log === realConsoleLog}、\`process.stdout.write\` 已恢复=${process.stdout.write === realStdoutWrite}`);
   }
   const compared = pairs.map(p => p.baseline);
   const notCompared = baseFiles.filter(n => !compared.includes(n));

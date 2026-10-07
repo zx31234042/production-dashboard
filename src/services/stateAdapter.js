@@ -194,6 +194,16 @@ window.StateAdapter = (function () {
     state.warnings = [];
     state.selfCheck = [];
     state.opLog = [];
+    /* `E198`（2026-10-07 追加）／**`A-3①` 负责人裁定：此处不清 `state.health`**
+       （裁定人＝项目负责人；裁定日期＝2026-10-07；本行原为 `state.health = null;`，已按裁定撤掉）。
+       为什么可以不清：`state.health`（`{frameUnitIndex, at}`）**不是快照载荷** —— 它是 `GET /health` 的
+       **运行期读数**，由 `services/selfCheckProbe.js` 的节流探测写入（`REFRESH_MS = 5000`），
+       与"服务端快照每帧整体替换 `state.stats`"（见 `applyServerStats()` 的 `state.stats = out`）
+       不是同一条通道；而该读数的**新鲜度由构造保证 ≤5 s**（探测节流上限）⇒ "清空 ⇒ 重填"这一对
+       操作在屏上留下的只是一段必然 ≤5 s 的 `warn` 抖动，**不构成"过期读数上屏"**。
+       **未改什么**：服务端模式下 `withoutIndex > 0`（红字点名）／`= 0`（不显示）／读数缺失
+       （"未取得 /health 读数"黄字）**三档行为一字不动** —— 本处只撤"清理"，不改四态语义
+       （服务端三档 ＋ 演示档；四态由 `tests\ui-check.js` 的 U11 守，本包不得改断言）。 */
     state.alarm = { active: null, queue: [], ledger: [] };
     if (state.maint) {
       /* 维保周期**参数**来自配置（`board.config.js` 的 maintenance 段，是配置真源不是演示数据），

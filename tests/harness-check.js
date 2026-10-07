@@ -172,15 +172,17 @@ function managedGuardDiff(before, after) {
         **第二长 147 行**、第三长 109 行，858 与次高之间空档 **711 行**。
         ⇒ **阈值取 `200` 行**：比"合法最大（147）"高 **36%**（不误红）、比"病灶（858）"低 **77%**（必抓）。
       · **剥后非空白字节占比**：`p01=0.1162`、`median=0.4972`；
-        **受管面（排除 `._verify\`）实测最小 0.2091**（`tests\copy-check.js`）；
+        **受管面（排除 `._verify\`）实测最小 0.1744**（`tests\copy-check.js`；
+        ⚠ 该值于 `T-20261007-04` **重测**：旧值 0.2091 —— `copy-check.js` 被正当编辑加了一段判定注释，
+        剥后非空白占比随之降低；**场地/口径一字未变**，见 `baseline.managedMinNonBlankRatioLegit` 的注释）；
         全场最小 **0**（`._verify\review\e97-doc.js`，整份被剥光 —— 那是历史取证件、不是缺陷）。
-        ⇒ **受管面地板取 `0.02`**：远低于实测最小合法值，又足以抓住"整份被剥光"。
+        ⇒ **受管面地板取 `0.02`**：远低于实测最小合法值（新读数 0.1744 下余量更大），又足以抓住"整份被剥光"。
       · **两点都写进代码常量的出处注释**，并由 `E160-④` 断言"基线 ↔ 盘上实测量"逐项一致
         （基线漂了、或有人把阈值改成能漏掉 858 行 ⇒ **当场红**）。
    ========================================================================== */
 const GROUND_THRESHOLD_E160 = {
   maxRunLines: 200,        /* 长空白段超过它 ⇒ 进入"结构配对"审查（实测：合法最大 147、病灶 858） */
-  minStripRatio: 0.02,     /* 剥后非空白占比地板（**受管面**判红；实测受管面最小 0.2091） */
+  minStripRatio: 0.02,     /* 剥后非空白占比地板（**受管面**判红；实测受管面最小 0.1744，重测于 `T-20261007-04`） */
   /* 基线的**出处**＝`tests\._verify\t2-e160\probe-e160-census.js` ＋ `probe-e160-baseline.js`
      在 2026-10-05 本工作区上的实测值（**不是手写的期望值**；命令与读数见回执）。
      ⚠ **锚点只锚"受管面"（`tests\*.js` ＋ `tests\lib\**` ＋ `tools\**`，排除 `tests\._verify\`）** ——
@@ -188,13 +190,27 @@ const GROUND_THRESHOLD_E160 = {
         "非空白占比最低的几个"**全部**来自它（`review\e97-doc.js`＝0、`eod-20261001.js`＝0.0871…），
         而那些文件**随时会被删/被换** ⇒ 若把它们当锚点，"别人清一次 scratch"就会让本判据变红、
         人就会去改锚点（`D21`／`D23` 的退化路径）。
-        受管面**不随 scratch 生灭**（实测最小 `tests\copy-check.js`＝0.2091），故锚点取它。
+        受管面**不随 scratch 生灭**（实测最小 `tests\copy-check.js`＝0.1744，重测于 `T-20261007-04`），故锚点取它。
         全场读数（含 `._verify\`）照旧**每轮打印**，只是**不参与**锚点比对。 */
   baseline: {
     /* —— 受管面（**锚点**：稳定、不被 scratch 面染动）—— */
-    managedMinNonBlankRatioLegit: 0.20912751677852348,  /* `tests\copy-check.js` */
+    /* ⚠ **本锚点已重测一次**（`T-20261007-04`，座位 4b；处置依据＝`tests\README.md` **附-2**）：
+       旧值 `0.20912751677852348` → **新值 `0.17444854999440151`**（持有者仍是 `tests\copy-check.js`）。
+       **为什么变**：`T-20261007-03` 给 `tests\copy-check.js` 加了一段判定注释（`E197`/`E198`
+       三句文案**不登记**的逐条理由 —— 那是**正当编辑**），该文件剥后非空白占比随之下降。
+       **不是**判据放宽、**不是**阈值调整：`maxRunLines`（200）／`minStripRatio`（0.02）
+       两个阈值**一字未动**，且新读数下 `105 < 200 < 858` 与 `0.02 ≤ 0.1744` 依旧成立（见 `E160-④` 的打印）。 */
+    managedMinNonBlankRatioLegit: 0.17444854999440151,  /* `tests\copy-check.js`（重测于 `T-20261007-04`） */
+    /* ⚠ **本值随行尾量纲变化**（`T-20261007-09` 补记，实测）：同一内容
+       **CRLF `0.17444854999440151` / LF `0.1780673181324647`（Δ≈3.6e-3）**，
+       因为占比是**按字符数**算的（`analyzeGroundE160`：非空白字符数 ÷ 剥后字符数）——
+       每行多一个 `\r` 就多一个"非空白字符"，分母同样变大，但比值随之抬升。
+       ⇒ ①重测本锚点前必须先确认该文件的**行尾形态**（`tests\copy-check.js` 实测**纯 CRLF**，
+       `files-check` 的 `E40-⑤/⑥` 看这个）；②`git add`／提交会按 `core.autocrlf` 规整工作区行尾
+       （本机实测 `core.autocrlf=true`）⇒ 行尾一归一，**同一份内容**的该读数就会整体平移，
+       届时按新读数重测并同步本注释（**不是**判据放宽）。 */
     managedMaxRunLines: 858,                           /* `tests\harness-check.js` 的 `String.raw` 夹具 */
-    managedMaxRunLinesExcludingOver: 105,              /* 受管面除超标外最长（`tests\browser-check.js`；147 那一段在 `._verify\`，不在受管面） */
+    managedMaxRunLinesExcludingOver: 105,              /* 受管面除超标外最长（`tests\browser-check.js`；147 那一段在 `._verify\`，不在受管面）。⚠ **本次重测后仍为 105**：`browser-check.js` 虽 +180 行，但那段连续 blank 段长度未变 ⇒ 本锚点无需改（`T-20261007-04` 实测） */
     /* ⚠ **量纲说明**（本件实测踩过）：`managedFileCount` 数的是**"受管**且被本扫描面覆盖**的 .js"** ——
        在 `harness-check` 全跑时它＝生产（`server\`／`src\`／`platform\`，60 个）＋ 测试/工具（29 个）＝ **89**；
        在**隔离复跑**（只跑 E160/E161 的探针，见 `tests\._verify\t2-e160\probe-isolated-e160e161.js`）时
@@ -544,7 +560,7 @@ function runGroundChecksE160(t, files) {
          `._verify\` 是 scratch 面，里面本来就有"整份被剥光"的历史取证件（实测
          `tests\._verify\review\e97-doc.js`：非空白 0/2086 B），那是**记录**、不是缺陷；
          把 scratch 面的取证产物当判红对象 ⇒ 判据会被别人的临时文件染红（`E145` 已经吃过这个亏）。
-      ② 受管面实测**一个都没有**低于地板（0 个；受管面最小合法占比 0.2091）⇒ 对受管面是**真零容忍**。
+      ② 受管面实测**一个都没有**低于地板（0 个；受管面最小合法占比 0.1744，重测于 `T-20261007-04`）⇒ 对受管面是**真零容忍**。
       ③ `._verify\` 面**照旧报数**（`E160-③-i`）——"不判红"是**看得见的决定**，不是沉默。 */
   const belowFloorManaged = managedRows.filter(r => r.g.nonBlankRatio < band.minStripRatio);
   const belowFloorVerify = rows.filter(r => !relManagedOf(r.file) && r.g.nonBlankRatio < band.minStripRatio);

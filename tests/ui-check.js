@@ -135,13 +135,39 @@ function pxValues(rules, selector, prop) {
 /**
  * @param {Array} out 记录数组，元素形如 { kind, id, value }
  * kind: text | html | class | style | write | listen
+ * @returns {{$:Function, setText:Function, setHTML:Function, setClass:Function,
+ *            setStyle:Function, toggleClass:Function, nodes:Map<string,object>}}
+ *
+ * `E198`（`T-20261007-03`，座位 4b）：**节点必须"按 id 缓存"且真的持有状态**。
+ * 改前每个 `$()` 都新建一个裸对象、`className` / `hidden` **不落地** —— 于是
+ * `Tests` 侧看不到 `StatsPanel` 写在 DOM 上的三件东西（`className` 的 `warn`/`err` 档、
+ * `hidden`、`dataset.noteLv`），那三样恰恰是 `E198` 四态与"两种『没有』必须分得开"的
+ * **唯一机器可读落点**。`loadUi` 的消费方拿不到 `nodes` 也白搭 ⇒ 一并作为返回值导出。
+ * ⚠ 逐字保留原有记录动作（`out.push(...)`）与各类顺序：既有断言读的是这份记录。
  */
 function makeRecorder(out) {
+  const nodes = new Map();
   const node = id => {
-    const o = { __id: id, __v: '', style: {}, dataset: {} };
+    if (nodes.has(id)) return nodes.get(id);
+    const classes = new Set();
+    const o = {
+      __id: id, __v: '', style: {}, dataset: {},
+      /* `className` 是普通可写属性（`StatsPanel` 直接整体赋值：`'tile-note' + (lv ? ' ' + lv : '')`）；
+         `hidden` 同理。两者都真实持有，供断言逐字读取。 */
+      className: '', hidden: false, disabled: false,
+      classList: {
+        add: c => classes.add(c),
+        remove: c => classes.delete(c),
+        contains: c => classes.has(c),
+        toggle: (c, on) => {
+          if (on === undefined ? !classes.has(c) : on) classes.add(c);
+          else classes.delete(c);
+        }
+      }
+    };
     Object.defineProperty(o, 'innerHTML', {
-      get() { return ''; },
-      set(v) { out.push({ kind: 'html', id: o.__id, value: String(v) }); },
+      get() { return o.__html || ''; },
+      set(v) { out.push({ kind: 'html', id: o.__id, value: String(v) }); o.__html = String(v); },
       configurable: true
     });
     Object.defineProperty(o, 'value', {
@@ -154,27 +180,28 @@ function makeRecorder(out) {
       set(v) { out.push({ kind: 'text', id: o.__id, value: String(v) }); o.__v = v; },
       configurable: true
     });
-    o.classList = { toggle() {}, add() {}, remove() {} };
     o.querySelector = sel => node(o.__id + ' ' + sel);
     o.appendChild = () => {};
     o.remove = () => {};
     o.addEventListener = () => { out.push({ kind: 'listen', id: o.__id }); };
-    o.disabled = false;
+    nodes.set(id, o);
     return o;
   };
   return {
     $: id => node(id),
-    setText: (id, v) => out.push({ kind: 'text', id, value: String(v) }),
-    setHTML: (id, v) => out.push({ kind: 'html', id, value: String(v) }),
-    setClass: (id, v) => out.push({ kind: 'class', id, value: String(v) }),
-    setStyle: (id, prop, value) => out.push({ kind: 'style', id, prop, value }),
-    toggleClass: (id, cls, on) => out.push({ kind: 'class', id, value: cls + ':' + on })
+    setText: (id, v) => { out.push({ kind: 'text', id, value: String(v) }); node(id).__v = String(v); },
+    setHTML: (id, v) => { out.push({ kind: 'html', id, value: String(v) }); node(id).__html = String(v); },
+    setClass: (id, v) => { out.push({ kind: 'class', id, value: String(v) }); node(id).className = String(v); },
+    setStyle: (id, prop, value) => { out.push({ kind: 'style', id, prop, value }); node(id).style[prop] = String(value); },
+    toggleClass: (id, cls, on) => { out.push({ kind: 'class', id, value: cls + ':' + on }); node(id).classList.toggle(cls, on); },
+    nodes
   };
 }
 
-/** 在独立上下文里加载 src（真 Format/组件，假 Dom），返回 { window, out } */
+/** 在独立上下文里加载 src（真 Format/组件，假 Dom），返回 { window, out, nodes } */
 function loadUi(componentRels) {
   const out = [];
+  const recorder = makeRecorder(out);
   const sandbox = { console };
   sandbox.window = sandbox;
   /* 组件里还有少量 document 级查询（TaskPanel 的五态流程高亮），用最小桩件顶替 */
@@ -188,7 +215,10 @@ function loadUi(componentRels) {
       }
       return [];
     },
-    getElementById: () => null,
+    /* `E198`：按 id 返回**同一个**节点（与 `Dom.$` 同源）—— 既有消费方只读 `out`，不受影响；
+       新增的 `E197`/`E198` 断言要读渲染**落地**的属性（`hidden`/`className`/`dataset.noteLv`/
+       行内 `style.display`），返回 null 就一个都读不到。 */
+    getElementById: recorder.$,
     querySelector: () => null
   };
   vm.createContext(sandbox);
@@ -197,10 +227,10 @@ function loadUi(componentRels) {
   run('src/config/board.config.js');
   run('src/config/fieldMap.js');
   run('src/utils/format.js');
-  sandbox.window.Dom = makeRecorder(out);
+  sandbox.window.Dom = recorder;
   run('src/services/mockData.js');
   componentRels.forEach(run);
-  return { w: sandbox.window, out };
+  return { w: sandbox.window, out, nodes: recorder.nodes };
 }
 
 /** 取记录里某个 id 最后一次写入的文本 */
@@ -1344,13 +1374,92 @@ async function main() {
   }
 
   {
-    /* FR-4：统计 15 项 + 需求口径 */
-    const ids = [...html.matchAll(/id="(s[A-Z]\w*)"/g)].map(m => m[1]);
-    check('FR-4.1～4.15 生产统计页渲染 15 个指标', ids.length === 15, `index.html 中 s* 指标 id 共 ${ids.length} 个`);
+    /* FR-4：统计 15 项 + 需求口径
+       ----
+       `T-20261007-03`（座位 4b）：判据**收紧为"按真实指标位计数"**，与 id 命名约定**无关**。
+       改前：`const ids = [...html.matchAll(/id="(s[A-Z]\w*)"/g)]` —— 把"生产统计页有 15 个指标位"
+       绑在 `s` + 大写字母这一命名形态上。后果有两面：①`E197`/`E198` 新增的两个承载位
+       （`c114StartedSource` / `c114FrameUnitNote`，**不是**数值指标位）只要起名 `sXxx` 就会被计入 ⇒
+       那条断言当场假红，实现侧被迫为躲断言而改名（**判据反过来规定命名**）；②反过来，把某个
+       真指标位改名成别的形态（或加一个 `sXxx` 形态的**非**指标位）就能让计数悄悄"对得上"⇒ 假绿。
+       现判据：`index.html` 生产统计页（`#panel-stats`）内 `.tile-value[id]` 这一**真实指标位形态**
+       的**显式名单**必须逐字等于 15 项（点名 + 计数），且**页面内**该名单唯一、总数恰 15
+       （`.tile-value[id]` 在设备状态/任务数据/班次/维保等页也有 ⇒ 用 id 集合归一，不把别页算进来）。
+       ⚠ 若 `E198` 那类提示位将来被改成 `.tile-value[id]`（即**真的**成了一个指标位），本判据会红
+       —— 那正是期望行为：届时须由人显式决定它是第 16 个指标位还是换个形态。
+       ⚠ **扫描面限 `#panel-stats`；别页 id 形态不由本条拦**（`A-4①`，`T-20261007-09`）：
+       `metricSetVerdict()` 只截 `id="panel-stats"` ↔ `id="panel-alarm"` 之间那一段，
+       设备状态/任务数据/班次/维保等页的 `.tile-value[id]` **既不进名单、也不进 `extra`**
+       ⇒ 别页把 id 写成什么形态（少前缀、改大小写、加同形态的非指标位…）本判据**一律看不见**，
+       那些页的 id 归属由各自页面的判据与规范 3.4 的命名表承接。 */
+    const E38_STAT_IDS_EXPECTED = ['sPlan', 'sStarted', 'sNotStarted', 'sDone', 'sDoing', 'sTodo',
+      'sQualified', 'sUnqualified', 'sRecheck', 'sFpy', 'sRunTime', 'sIdleTime', 'sAvgTime', 'sCapacity', 'sOee'];
+    const metricSetVerdict = h => {
+      /* 只读 `#panel-stats` 片段：`.tile-value[id]` 在设备状态/任务数据/班次/维保页也有，
+         直接全页扫会把别页的位（`stRunTime`/`tkDepth`/`shStart`/`mtTodayRun`…，共 15 个）一并算进来
+         ⇒ 计数恒不对。先截面板段，再按**真实指标位形态**逐 id 收录。 */
+      const seg = String(h);
+      const start = seg.indexOf('id="panel-stats"');
+      const stop = seg.indexOf('id="panel-alarm"');
+      const panel = start >= 0 ? seg.slice(start, stop > start ? stop : seg.length) : '';
+      const ids = [...panel.matchAll(/class="tile-value[^"]*"\s+id="([^"]+)"/g)].map(m => m[1]);
+      const list = ids.filter(x => E38_STAT_IDS_EXPECTED.indexOf(x) >= 0);
+      const extra = ids.filter(x => E38_STAT_IDS_EXPECTED.indexOf(x) < 0);
+      const missing = E38_STAT_IDS_EXPECTED.filter(x => list.indexOf(x) < 0);
+      return { ok: ids.length === 15 && list.length === 15 && extra.length === 0 && missing.length === 0,
+        ids, list, extra, missing, all: ids.length };
+    };
+    const metricV = metricSetVerdict(html);
+    const ids = metricV.list;
+    check('FR-4.1～4.15 生产统计页 15 个指标位**按真实指标位**逐一在位' +
+      '（`#panel-stats` 内 `.tile-value[id]` 的**显式名单**逐字相等；判据与 id 命名形态**无关**：' +
+      '改名、加同形态的非指标位、少一个、多一个都会红并点名）',
+      metricV.ok,
+      `实测 15 位名单=[${ids.join('、')}]（共 ${ids.length} 个）；` +
+      `多出=${JSON.stringify(metricV.extra)}；缺=${JSON.stringify(metricV.missing)}`);
     ui.out.length = 0;
     W.Components.StatsPanel.render(W.MockData.state);
     const notWritten = ids.filter(id => lastText(ui.out, id) === null);
     check('FR-4 15 个指标全部由 StatsPanel 写入', notWritten.length === 0, notWritten.join('、'));
+
+    /* `E197`/`E198` 承载位**不得**被计成指标位（防"用改名把计数凑回去"）：
+       两个位都在 `#panel-stats` 里、都在同一个 `.tile` 内，但都不是 `.tile-value[id]`。 */
+    check('FR-4 判据的收纳面：`E197`/`E198` 的两个承载位（`#c114StartedSource`/`#c114FrameUnitNote`）' +
+      '在 `#panel-stats` 内、却**不在**那份 15 位指标名单里（提示位 ≠ 数值指标位）',
+      html.includes('id="c114StartedSource"') && html.includes('id="c114FrameUnitNote"') &&
+      E38_STAT_IDS_EXPECTED.indexOf('c114StartedSource') < 0 &&
+      E38_STAT_IDS_EXPECTED.indexOf('c114FrameUnitNote') < 0 &&
+      metricV.extra.length === 0,
+      `两个承载位在 index.html=${html.includes('id="c114StartedSource"')}/${html.includes('id="c114FrameUnitNote"')}；` +
+      `混进指标名单=${JSON.stringify(metricV.extra)}（应为空）`);
+
+    /* `D22` 定点变异（**内存副本**，绝不落地；`index.html` 盘上字节全程未变）：
+       ① 删掉一个**真实指标位**（改前按命名约定的那种数法**照样是 15** ⇒ 旧判据对此失明）⇒ 本判据必红并点名缺谁；
+       ② 凭空**加一个** `sXxx` 形态的位（`E197`/`E198` 若不避开命名就会长成这样）⇒ 必红并点名多谁；
+       ③ 负对照＝盘上现测 ⇒ 必绿。 */
+    const METRIC_DROP_ID = 'sRecheck';
+    const METRIC_GHOST_ID = 'sGhostTmp';
+    const dropRow = new RegExp('<div class="tile"><div class="tile-label">[^<]*</div><div class="tile-value[^"]*" id="'
+      + METRIC_DROP_ID + '">[^<]*</div></div>\\s*');
+    const mutantDrop = html.replace(dropRow, '');
+    const mutantGhost = html.replace(
+      '<div class="tile"><div class="tile-label">计划测试总数</div>',
+      `<div class="tile"><div class="tile-label">凭空加的位</div><div class="tile-value mono" id="${METRIC_GHOST_ID}">0</div></div>` +
+      '<div class="tile"><div class="tile-label">计划测试总数</div>');
+    const vDrop = metricSetVerdict(mutantDrop);
+    const vGhost = metricSetVerdict(mutantGhost);
+    check('FR-4-D22 定点变异（**内存副本**，不碰 `index.html`／`src\\*`）：' +
+      '①删掉一个真实指标位（`' + METRIC_DROP_ID + '`）⇒ 必红并**指名**缺了谁；' +
+      '②凭空加一个 `sXxx` 形态的位（`' + METRIC_GHOST_ID + '`）⇒ 必红并**指名**多了谁；' +
+      '③未变异（现行盘上）⇒ 必绿',
+      metricV.ok === true && mutantDrop !== html && vDrop.ok === false &&
+      vDrop.missing.length === 1 && vDrop.missing[0] === METRIC_DROP_ID &&
+      vDrop.list.length === 14 &&
+      mutantGhost !== html && vGhost.ok === false &&
+      vGhost.extra.length === 1 && vGhost.extra[0] === METRIC_GHOST_ID && vGhost.list.length === 15,
+      `①删 ${METRIC_DROP_ID} ⇒ 名单 ${vDrop.list.length} 位、缺=${JSON.stringify(vDrop.missing)} ⇒ 判红=${vDrop.ok === false}；` +
+      `②加 ${METRIC_GHOST_ID} ⇒ 名单 ${vGhost.list.length} 位、多=${JSON.stringify(vGhost.extra)} ⇒ 判红=${vGhost.ok === false}；` +
+      `③盘上现测 ${metricV.list.length} 位 ⇒ 绿=${metricV.ok === true}`);
 
     const st = W.MockData.state.stats;
     const atNormal = { plan: st.plan, started: st.started, notStarted: st.notStarted };
@@ -5603,6 +5712,352 @@ async function main() {
         `①轨道 ${gv.T} → 变异 ${gvMut.T}（判红=${gvMut.ok === false}；下界仍 ${gvMut.rowsUsed}）｜` +
         `②仍生成盒子的页脚行 ${bvMut.fails.length} 个：${bvMut.fails.map(f => f.where).join('、') || '（无）'}` +
         `（当前源码 ${bv.fails.length} 个）｜盘上未变 css=${before.css === after.css} html=${before.html === after.html}`);
+    }
+  }
+
+  /* ===== U11 `E197`（`#sStarted` 口径标注）＋ `E198`（帧缺件序号提示位） =====
+     座位 4b（`T-20261007-03`）为座位 3 的 T-01/T-02 写**可证伪**验收断言；被测实现
+     （`src/components/StatsPanel.js` 与 `index.html` 的那一格）**一字未改**。
+     为什么在这一段做：
+       · `E197` 要"演示 ⇒ 逐字「（演示派生）」／生产 ⇒ 空串"——**两种模式的同一格**必须一起看，
+         只看演示那种会漏掉"生产模式没清空"；
+       · `E198` 的四支（演示／未取得／有缺项／零）里，**两支都不可见且文本为空**
+         （演示 vs 服务端读到 0）⇒ 只判"可见性 + 文本"**分不开它们**，
+         必须落到 `data-note-lv`（`demo` ≠ `ok`）这个机器可读标记上；
+       · `E198` 的取数（`/health` 探测）**已经**在 `selfCheckProbe.js` 里 —— 渲染函数只读 `state`
+         ⇒ 本段的 `state` 全部由夹具现场构造，**渲染前后 `fetch` 调用数不变**（不真发请求）。
+     判据一律落在**渲染产物**（节点文本 / `hidden` / `className` / `dataset.noteLv` / 行内
+     `style.display`）上，不做源码字符串匹配（ADR-0004 D23）。
+     夹具：`loadUi` —— 该夹具的节点现在**按 id 缓存且真实持有状态**（见 `makeRecorder` 注释），
+          且**不跑 `main.js`**（避免 `main.js` 的首帧与联网探测插手，保证"渲染只读 state"可判）。 ---- */
+  section('U11 `E197` 口径标注 ＋ `E198` 帧缺件序号提示位（T-20261007-03；ADR-0004 D19/D20/D21/D22/D23）');
+  {
+    const NOTE_ID = 'c114FrameUnitNote';
+    const SRC_ID = 'c114StartedSource';
+    const DEMO_NOTE = '（演示派生）';
+    const WARN_TEXT = '帧缺件序号：未取得 /health 读数（非 0，不等于"没有缺件序号"）';
+    const errText = n => `⚠ 本班 ${n} 帧未带件序号（未计入开工数；FR-4.2 按件序号去重）`;
+
+    /* D22 的"盘上字节未变"证据基准（本段所有变异一律在**内存副本**上做） */
+    const sha256 = p => require('node:crypto').createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    const watched = ['src/components/StatsPanel.js', 'index.html'];
+    const shaBefore = watched.map(rel => sha256(path.join(ROOT, rel)));
+
+    const fx = loadUi([
+      'src/services/api.js',
+      'src/services/selfCheckProbe.js',
+      'src/components/StatsPanel.js'
+    ]);
+    const runRender = s => { fx.out.length = 0; fx.w.Components.StatsPanel.render(s); };
+    /* 演示基线：先驱动**一帧**（`MockData.tick()`）把 `state.stats` 填成完整形状 ——
+       刚加载时 `state.stats` 只有 `{plan,started,notStarted}` 三个键，而 `render()` 会格式化全部
+       15 个位（`firstPass.toFixed(1)` 等）⇒ 拿"未 tick 的瘦 state"去渲染会在夹具里抛 `TypeError`，
+       那是夹具自伤，不是被测语义。注入固定时刻 ⇒ 内容确定（与 U2 段的做法一致）。 */
+    fx.w.MockData.tick(new Date('2026-09-18T14:00:00'));
+    const demoBase = JSON.parse(JSON.stringify(fx.w.MockData.state));
+    /* 两份**段级**基线（后面几条用例与 D22 变异都要用，故放在这一层而不是 `try` 里）：
+       · `demo`       —— 演示模式：`serverMode` 键**不存在** ＋ `dataSource === 'mock'`；
+       · `serverMode` —— 生产模式：`state.serverMode === true`（配置仍是 `'mock'`，见 E197-③）。 */
+    const demo = JSON.parse(JSON.stringify(demoBase));
+    delete demo.serverMode;
+    const serverMode = JSON.parse(JSON.stringify(demoBase));
+    serverMode.serverMode = true;
+    const cfgOriginalDataSource = fx.w.BoardConfig.dataSource;
+
+    /** 该提示位的"落地四态"：`hidden` 属性、文本、className、data-note-lv、行内 display */
+    const noteSnap = () => {
+      const n = fx.nodes.get(NOTE_ID);
+      return !n ? { missing: true } : {
+        missing: false, hidden: n.hidden === true, text: String(n.textContent),
+        cls: String(n.className), lv: n.dataset ? String(n.dataset.noteLv) : undefined,
+        display: n.style ? String(n.style.display) : undefined
+      };
+    };
+    /**
+     * 一次完整观察 → 与四支口径表逐字段判等。
+     * 期望值全部**逐字**给出（D21：期望来自实现行为实测 + 负责人 2026-10-07 的裁定，非推导）；
+     * `name` 上的 `mark`/`lv` 各自单独成条，便于"哪一档错了"一眼可读。
+     */
+    const runNoteCase = (label, s, exp) => {
+      runRender(s);
+      const g = noteSnap();
+      const problems = [];
+      if (g.missing) problems.push(`#${NOTE_ID} 不存在`);
+      else {
+        if (g.hidden !== exp.hidden) problems.push(`hidden=${g.hidden}（应 ${exp.hidden}）`);
+        if (g.text !== exp.text) problems.push(`text=${JSON.stringify(g.text)}（应 ${JSON.stringify(exp.text)}）`);
+        if (g.cls !== exp.cls) problems.push(`className=${JSON.stringify(g.cls)}（应 ${JSON.stringify(exp.cls)}）`);
+        if (g.lv !== exp.mark) problems.push(`data-note-lv=${JSON.stringify(g.lv)}（应 ${JSON.stringify(exp.mark)}）`);
+        if (g.display !== exp.display) problems.push(`style.display=${JSON.stringify(g.display)}（应 ${JSON.stringify(exp.display)}）`);
+      }
+      return { label, g, exp, ok: problems.length === 0, problems };
+    };
+
+    let obs = null, obsErr = null;
+    try {
+      /* ---------- `E197`：`#sStarted` 的口径标注（演示派生 / 生产不标） ---------- */
+      const srcSnap = () => {
+        const n = fx.nodes.get(SRC_ID);
+        return !n ? { missing: true } : {
+          missing: false, text: String(n.textContent), len: String(n.textContent).length,
+          hidden: n.hidden === true
+        };
+      };
+      fx.w.BoardConfig.dataSource = 'mock';
+      runRender(demo);
+      const e197Demo = srcSnap();
+
+      /* 生产模式（state.serverMode === true）：标注**清空**（实测值不加标注） */
+      runRender(serverMode);
+      const e197Server = srcSnap();
+
+      /* 反向读数（"服务端优先"口径）：配置仍是 `'mock'`、但 `state.serverMode === true`
+         ⇒ 仍按服务端 ⇒ **仍为空串**。这一条专治"只看 BoardConfig 一把尺子"的实现。 */
+      const srcFlipConfig = fx.w.BoardConfig.dataSource;
+      const flip = JSON.parse(JSON.stringify(demoBase));
+      flip.serverMode = true;
+      runRender(flip);
+      const e197ServerWins = srcSnap();
+      const srcFlipConfigUnchanged = fx.w.BoardConfig.dataSource === srcFlipConfig;
+
+      /* ---------- `E198` 四支 ---------- */
+      fx.w.BoardConfig.dataSource = 'mock';
+      const cases = [
+        runNoteCase('演示模式（state.serverMode=false 且 BoardConfig.dataSource=mock）',
+          demo, { hidden: true, text: '', cls: 'tile-note', mark: 'demo', display: 'none' }),
+        runNoteCase('服务端·未取得（state.health 缺失 ⇒ withoutIndex 非有限数）',
+          serverMode, { hidden: false, text: WARN_TEXT, cls: 'tile-note warn', mark: 'warn', display: '' }),
+        runNoteCase('服务端·有缺项（withoutIndex = 7 > 0）',
+          Object.assign(JSON.parse(JSON.stringify(serverMode)), { health: { frameUnitIndex: { withoutIndex: 7 }, at: '2026-10-07 10:00:00' } }),
+          { hidden: false, text: errText(7), cls: 'tile-note err', mark: 'err', display: '' }),
+        runNoteCase('服务端·零（withoutIndex === 0）',
+          Object.assign(JSON.parse(JSON.stringify(serverMode)), { health: { frameUnitIndex: { withoutIndex: 0 }, at: '2026-10-07 10:00:00' } }),
+          { hidden: true, text: '', cls: 'tile-note', mark: 'ok', display: 'none' })
+      ];
+      fx.w.BoardConfig.dataSource = cfgOriginalDataSource;
+
+      /* ---------- 取数链：渲染**只读 state**（不发请求）＋ 幂等 ---------- */
+      let fetchCalls = 0;
+      fx.w.__fetch = () => { fetchCalls++; return Promise.reject(new Error('U11 桩：渲染不该发请求')); };
+      fx.w.fetch = (...a) => fx.w.__fetch(...a);
+
+      /* 取数链的前置（D23：前提不成立时**不**把结论写成"已证明"）：
+         本仓真取数入口是 `SelfCheckProbe.probe()`／`ensure()`（`/health`，5 s 节流 ＋ 在途去重），
+         它打的是**同一个**桩 `fetch` ⇒ 用"它是否真的会调用 `fetch`"给本段的地面自证。
+         不能自证就说明"这里根本不会发请求"，那时"渲染前后调用数不变"是一条**空洞**断言。 */
+      let probeCalls = 0;
+      let probeErr = null;
+      let probeStarted = false;
+      fx.w.__fetch = () => { probeCalls++; return Promise.reject(new Error('U11 桩：探针自证')); };
+      fx.w.fetch = (...a) => fx.w.__fetch(...a);
+      try {
+        const scp = fx.w.SelfCheckProbe;
+        if (!scp || typeof scp.probe !== 'function') probeErr = 'window.SelfCheckProbe.probe 不可用';
+        else {
+          const p = scp.probe(new Date('2026-10-07T10:00:00'));
+          probeStarted = true;
+          /* 桩 fetch 是**同步**被调用的（`Api.httpJson` 在本次调用内就取 URL）；Promise 留给夹具自己收敛
+             （桩一律 reject，`probe()` 内部把每项失败收敛成行结论，不会冒泡成未捕获异常）。 */
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        }
+      } catch (e) { probeErr = (e && e.message) || String(e); }
+
+      fetchCalls = 0;                                /* 自证之后清零，开始量"渲染前"基线 */
+      fx.w.__fetch = () => { fetchCalls++; return Promise.reject(new Error('U11 桩：渲染不该发请求')); };
+      fx.w.fetch = (...a) => fx.w.__fetch(...a);
+
+      const beforeFetches = fetchCalls;
+      const run1 = serverMode;                       /* 服务端·未取得：三处属性都会写 */
+      runRender(run1);
+      const snapA = noteSnap();
+      const beforeOfSecond = fetchCalls;
+      runRender(run1);
+      const snapB = noteSnap();
+      const sameOnSecondRun = ['hidden', 'text', 'cls', 'lv', 'display']
+        .every(k => String(snapA[k]) === String(snapB[k]));
+      const dataSourceDemo = fx.w.BoardConfig.dataSource === 'mock';
+
+      obs = {
+        e197Demo, e197Server, e197ServerWins, srcFlipConfigUnchanged, dataSourceDemo,
+        cases, fetch: { beforeFetches, beforeOfSecond, after: fetchCalls, probeCalls, probeErr, probeStarted },
+        sameOnSecondRun, snapA, snapB
+      };
+    } catch (e) {
+      obsErr = (e && e.stack) ? e.stack : String(e);
+    }
+
+    check('U11-前提：`E197`/`E198` 两个承载位都能在假 DOM 里取到，且 `StatsPanel.render()` 可被调用' +
+      '（取不到即判红 —— 不许静默退化成"检查不了"）',
+      obsErr === null && obs !== null && obs.e197Demo.missing === false && obs.cases.every(c => c.g.missing === false),
+      obsErr ? `夹具执行异常：${obsErr}` : obs === null ? '（无观察值）'
+        : `#${SRC_ID} 取到=${!obs.e197Demo.missing}；#${NOTE_ID} 四态取到=${obs.cases.filter(c => !c.g.missing).length}/4`);
+
+    {
+      const o = obs || { e197Demo: {}, e197Server: {}, e197ServerWins: {}, srcFlipConfigUnchanged: false, cases: [] };
+      check('E197-① `#sStarted` 演示模式（`state.serverMode` 缺省 ＋ `BoardConfig.dataSource="mock"`）⇒ ' +
+        `\`#${SRC_ID}\` 的文本**逐字**「${DEMO_NOTE}」`,
+        o.e197Demo.missing === false && o.e197Demo.text === DEMO_NOTE,
+        `实测 text=${JSON.stringify(o.e197Demo.text)}（应 ${JSON.stringify(DEMO_NOTE)}）、hidden=${o.e197Demo.hidden}`);
+
+      check('E197-② `#sStarted` 生产模式（`state.serverMode === true`）⇒ 该位文本**逐字**为空串（`length === 0`）' +
+        '（实测值不加标注；只有"清空"才算过，"写别的字样"照样红）',
+        o.e197Server.missing === false && o.e197Server.text === '' && o.e197Server.len === 0,
+        `实测 text=${JSON.stringify(o.e197Server.text)}（长度 ${o.e197Server.len}，应 0）`);
+
+      check('E197-③ 反向读数（"服务端优先"口径）：`BoardConfig.dataSource` 仍为 `"mock"`、' +
+        '只把 `state.serverMode` 置 true ⇒ 该位文本**仍为空串**（证明判据吃的是"`state.serverMode` 优先、' +
+        '退配置"这一把尺子，而不是只看配置）',
+        o.srcFlipConfigUnchanged === true && o.e197ServerWins.missing === false && o.e197ServerWins.text === '',
+        `配置在本次渲染期间未变=${o.srcFlipConfigUnchanged}；实测 text=${JSON.stringify(o.e197ServerWins.text)}` +
+        `（应 "" —— 若实现只看 BoardConfig 就会写出「${DEMO_NOTE}」）`);
+
+      const bad = o.cases.filter(c => !c.ok);
+      const brief = c => `${c.label} ⇒ hidden=${c.g.hidden}、text=${JSON.stringify(c.g.text)}、` +
+        `className=${JSON.stringify(c.g.cls)}、data-note-lv=${JSON.stringify(c.g.lv)}、style.display=${JSON.stringify(c.g.display)}`;
+      check('E198-① 四态（演示／服务端·未取得／服务端·有缺项／服务端·零）**逐一**判对：' +
+        '`hidden` ＋ 文本（逐字）＋ `className`（含 `warn`/`err` 档）＋ `data-note-lv` ＋ 行内 `display` 五项全等',
+        o.cases.length === 4 && bad.length === 0,
+        bad.length ? bad.map(c => `${c.label} —— 偏差：${c.problems.join('；')}`).join(' ｜ ') : o.cases.map(brief).join(' ｜ '));
+
+      const demoCase = o.cases[0] || { g: {} };
+      const zeroCase = o.cases[3] || { g: {} };
+      check('E198-② 两种「没有」必须分得开（演示模式的"没有这个读数" vs 服务端 `withoutIndex === 0` 的' +
+        '"真的没有缺件序号"）：两者**可见性与文本完全相同**（`hidden === true`、文本 `""`），' +
+        '但 `data-note-lv` **必须不同**，且分别钉死为 `demo` / `ok`',
+        demoCase.g.hidden === true && demoCase.g.text === '' && demoCase.g.lv === 'demo' &&
+        zeroCase.g.hidden === true && zeroCase.g.text === '' && zeroCase.g.lv === 'ok' &&
+        demoCase.g.lv !== zeroCase.g.lv,
+        `演示：hidden=${demoCase.g.hidden}、text=${JSON.stringify(demoCase.g.text)}、data-note-lv=${JSON.stringify(demoCase.g.lv)}；` +
+        `服务端零：hidden=${zeroCase.g.hidden}、text=${JSON.stringify(zeroCase.g.text)}、data-note-lv=${JSON.stringify(zeroCase.g.lv)}` +
+        `（两者 ${demoCase.g.lv === zeroCase.g.lv ? '**相同** ⇒ 分不开 ⇒ 红' : '不同 ⇒ 分得开'}）`);
+
+      const f = o.fetch || {};
+      check('E198-③ 取数链（渲染**不发请求**）：同一 `state` 连渲两次 ⇒ 该位五项逐字相同（幂等）；' +
+        '且桩 `fetch` 的调用计数在渲染前后**不变**（0 次增量）—— 并给**前提自证**：' +
+        '真取数入口 `SelfCheckProbe.probe()`（同一轮 `/health` 探测）在同一个桩上**确实会调用** `fetch`',
+        o.sameOnSecondRun === true && f.beforeFetches !== undefined &&
+        f.after === f.beforeOfSecond && f.beforeOfSecond === f.beforeFetches &&
+        f.probeStarted === true && f.probeCalls > 0,
+        `两次渲染后五项相同=${o.sameOnSecondRun}；桩 fetch 调用数：渲染前 ${f.beforeFetches} → 首次渲染后 ${f.beforeOfSecond} → 再渲染后 ${f.after}` +
+        `（增量应为 0）；前提自证：SelfCheckProbe.probe() 已发起=${f.probeStarted}、调用 fetch ${f.probeCalls} 次` +
+        `${f.probeErr ? `（探针异常：${f.probeErr}）` : ''}`);
+
+      /* `E197/E198-④`：`#sStarted` 的数值口径**未变**（`noData` ⇒ 「—」，否则原样输出 `started`）。
+         ⚠ 必须用 `MockData.state.stats` 的**完整**形状做底再改两个字段：`StatsPanel.render()`
+           对 15 个位逐个格式化（`s.firstPass.toFixed(1)` 等），只给两个键的"瘦 state"会在
+          `firstPass` 上抛 `TypeError` —— 那不是"被测量语义"的问题，而是夹具自伤。 */
+      const startedCase = noDataFlag => {
+        const s = JSON.parse(JSON.stringify(fx.w.MockData.state));
+        s.stats.noData = noDataFlag;
+        s.stats.started = 43;
+        runRender(s);
+        return String((fx.nodes.get('sStarted') || {}).textContent);
+      };
+      const startedNoData = startedCase(true);
+      const startedReal = startedCase(false);
+
+      check('E197/E198-④ `#sStarted` 数值口径**未变**（防本批顺手改坏）：`stats.noData === true` ⇒ 逐字「—」；' +
+        '`noData === false` 且 `started = 43` ⇒ 逐字「43」',
+        startedNoData === '—' && startedReal === '43',
+        `noData=true,started=43 ⇒ ${JSON.stringify(startedNoData)}（应 "—"）；` +
+        `noData=false,started=43 ⇒ ${JSON.stringify(startedReal)}（应 "43"）`);
+
+      /* ---- D22 定点变异（**内存副本**；每一支都要求"必红**并指名**"） ----
+         ⚠ 变异对象是**本地实现副本**（`frameUnitIndexNote` 的四个返回支 + `isServerMode` 的判据
+         + 渲染里 `mark` 的取值），不是盘上的 `src\components\StatsPanel.js`；
+         四个函数各自内联"错实现"，与本段用同一套期望值判等 ⇒ 谁错、错在哪一档，逐条点名。
+         ⚠ 不依赖任何外部文件片段（D22 风险 2：暗桩必须内联旧实现）。 */
+      const implGood = state => {
+        const isServer = !!(state && (state.serverMode === true || ((fx.w.BoardConfig || {}).dataSource === 'server')));
+        if (!isServer) return { text: '', lv: '', show: false, mark: 'demo' };
+        const h = (state && state.health) || null;
+        const fu = h && h.frameUnitIndex && typeof h.frameUnitIndex === 'object' ? h.frameUnitIndex : null;
+        const wi = fu ? fu.withoutIndex : undefined;
+        if (typeof wi !== 'number' || !Number.isFinite(wi)) {
+          return { text: WARN_TEXT, lv: 'warn', show: true, mark: 'warn' };
+        }
+        if (wi > 0) return { text: errText(wi), lv: 'err', show: true, mark: 'err' };
+        return { text: '', lv: '', show: false, mark: 'ok' };
+      };
+      const MUT = {
+        /* ① 演示模式仍显示那一行（负责人 2026-10-07 裁定**之前**的形态） */
+        demoShows: state => Object.assign({}, implGood(state),
+          implGood(state).mark === 'demo'
+            ? { text: '帧缺件序号：无此读数（演示模式未接入服务端）', lv: 'warn', show: true } : {}),
+        /* ② 两种"没有"共用一个空（`demo` 被写成 `ok`，即隐藏时丢掉区分口径） */
+        sameMark: state => {
+          const r = implGood(state);
+          return Object.assign({}, r, { mark: r.mark === 'demo' ? 'ok' : r.mark });
+        },
+        /* ③ `withoutIndex` 未取得时写成 `0`（`E38` 同族的"把算不出来印成 0"），且 mark 退回 `ok` */
+        missingAsZero: state => {
+          const r = implGood(state);
+          return r.mark === 'warn'
+            ? { text: '', lv: '', show: false, mark: 'ok' } : r;
+        },
+        /* ④ `withoutIndex = 7` 时退回 `warn` 档（把"有缺项"降级） */
+        errAsWarn: state => {
+          const r = implGood(state);
+          return r.mark === 'err' ? Object.assign({}, r, { lv: 'warn', mark: 'warn' }) : r;
+        },
+        /* ⑤ `#sStarted` 的 `noData` 被顺手改坏：`noData` 时照原样输出数值 */
+        sStartedNoDataIgnored: () => 43
+      };
+      /* 四支各一份**新** state（不与前面几条用例共用同一对象：`render()` 会写它的键，
+         共用会让"这一支的读数"被上一支污染）。 */
+      const noteStateFor = mk => {
+        const s = JSON.parse(JSON.stringify(serverMode));
+        if (mk === 'demo') { const d = JSON.parse(JSON.stringify(demo)); delete d.serverMode; return d; }
+        if (mk === 'warn') return s;                                   /* 健康读数缺失 */
+        if (mk === 'err') s.health = { frameUnitIndex: { withoutIndex: 7 }, at: '2026-10-07 10:00:00' };
+        else s.health = { frameUnitIndex: { withoutIndex: 0 }, at: '2026-10-07 10:00:00' };
+        return s;
+      };
+      /* 反证的两面都要成立：①错实现**逐条指名**（点名到哪一支、以及**哪个字段**不符：
+         `text` / `data-note-lv` / `lv+mark`）②未变异副本 **0 偏差** */
+      const noteBadDetail = mut => ['demo', 'warn', 'err', 'ok'].filter(mk => {
+        const g = mut(noteStateFor(mk)), e = implGood(noteStateFor(mk));
+        return !(g.text === e.text && g.lv === e.lv && g.show === e.show && g.mark === e.mark);
+      }).map(mk => {
+        const g = mut(noteStateFor(mk)), e = implGood(noteStateFor(mk));
+        const fields = [];
+        if (g.text !== e.text) fields.push('text');
+        if (g.mark !== e.mark) fields.push('data-note-lv');
+        if (g.lv !== e.lv) fields.push('lv');
+        if (g.show !== e.show) fields.push('show');
+        return { mark: mk, fields };
+      });
+      const badDemoShows = noteBadDetail(MUT.demoShows);
+      const badSameMark = noteBadDetail(MUT.sameMark);
+      const badMissingZero = noteBadDetail(MUT.missingAsZero);
+      const badErrWarn = noteBadDetail(MUT.errAsWarn);
+      const goodBad = noteBadDetail(implGood);
+      /* 只命中一支、且**点名到该支与具体字段** */
+      const hitOnly = (d, mk, field) => d.length === 1 && d[0].mark === mk && d[0].fields.indexOf(field) >= 0;
+      const shaAfter = watched.map(rel => sha256(path.join(ROOT, rel)));
+      check('E197/E198-D22 定点变异（**内存副本**，不碰 `src\\components\\StatsPanel.js`）：' +
+        '①演示模式照旧显示那一行 ⇒ 必红并**指名**"演示支"；' +
+        '②两种「没有」共用一个空（`demo` 写成 `ok`）⇒ 必红并**指名** `data-note-lv`；' +
+        '③`withoutIndex` 未取得写成 `0` ⇒ 必红并**指名**"未取得支"；' +
+        '④`withoutIndex > 0` 退回 `warn` ⇒ 必红并**指名** `lv`/`mark`；' +
+        '⑤`#sStarted` 忽略 `noData` ⇒ 必红并**指名** `#sStarted`；⑥未变异副本 0 偏差（负对照）',
+        goodBad.length === 0 &&
+        hitOnly(badDemoShows, 'demo', 'text') &&
+        hitOnly(badSameMark, 'demo', 'data-note-lv') &&
+        hitOnly(badMissingZero, 'warn', 'text') &&
+        hitOnly(badErrWarn, 'err', 'lv') &&
+        MUT.sStartedNoDataIgnored() !== '—',
+        `①演示支照旧显示 ⇒ 偏差=${JSON.stringify(badDemoShows)}（应恰 1 支＝demo、字段含 text）；` +
+        `②demo 与 ok 混同 ⇒ 偏差=${JSON.stringify(badSameMark)}（应恰 1 支＝demo、字段含 data-note-lv）；` +
+        `③未取得写成 0 ⇒ 偏差=${JSON.stringify(badMissingZero)}（应恰 1 支＝warn、字段含 text）；` +
+        `④有缺项退 warn ⇒ 偏差=${JSON.stringify(badErrWarn)}（应恰 1 支＝err、字段含 lv）；` +
+        `⑤忽略 noData ⇒ 实测输出 ${JSON.stringify(MUT.sStartedNoDataIgnored())}（应 "—" ⇒ 与期望不等 ⇒ 红，指名 #sStarted）；` +
+        `⑥未变异副本偏差=${JSON.stringify(goodBad)}（应 []）`);
+
+      check('U11-D22 取证的盘上证据：`src\\components\\StatsPanel.js` 与 `index.html` 的盘上字节' +
+        '**全程未变**（本段所有变异只发生在内存副本上）',
+        shaBefore.length === 2 && shaBefore.every((h, i) => h === shaAfter[i]),
+        watched.map((rel, i) => `${rel}: ${shaBefore[i] === shaAfter[i] ? '未变' : '**被改写**'}（${shaBefore[i].slice(0, 12)}）`).join('；'));
     }
   }
 
