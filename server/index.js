@@ -776,7 +776,9 @@ async function start(options = {}) {
      启动即把口径与可读位置说清楚，避免现场把"帧没带件序号"当成"设备真没开工"。 */
   logger.info('[口径] 帧件序号：`IF-D.4 unitIndex`（落 `measure_rt.unit_index`）；' +
     '**缺件序号的帧 unit_index 写 NULL 且不计入开工件数**（FR-4.2 按件计，判定依据＝该件在 DR-04 有采样数据）；' +
-    '计数见 `GET /health` 的 `frameUnitIndex`（=`GET /ifd/status` 同源）—— "真没开工"与"帧没带件序号"是两件事。');
+    '计数见 `GET /health` 的 `frameUnitIndex`（=`GET /ifd/status` 同源）—— "真没开工"与"帧没带件序号"是两件事；' +
+    '⚠ `E64`：**同一票混用两种帧**时，件数一律按**带件序号的帧**计、缺序号帧按**帧**如实计数并可见' +
+    '（`/health` 的 `mixedTickets`／`tickets`）⇒ 该票的「已完成」只是**下界**（预警文案会如实标注）。');
 
   /* ---- 6c. W2 业务挂载：IF-A 接收（MES 派工/物料/工艺/设备；本机提供接口） ----
      依据 `server/http/router.js` 挂载位的指引（"请把注册写进对应函数体"），注册动作在
@@ -1028,6 +1030,18 @@ async function start(options = {}) {
   function doneQtyOf(procOrderNo) {
     if (!state.db || procOrderNo === undefined || procOrderNo === null || procOrderNo === '') return 0;
     return resultRepo.countDone(state.db, procOrderNo);
+  }
+
+  /** `E64`：该票的**件序号混帧**读数（真源＝`services/ingest.js` 的按票记账，本处**只读不另算**）。
+   *  为什么必须读采集侧那一份：`withIndex`／`withoutIndex` 数的是**真正落库的帧**
+   *  （`ingest.status().frameUnitIndex` 的口径），判定侧若有第二份记账必然与之漂移。
+   *  @returns {{withIndex:number, withoutIndex:number, mixed:boolean}}
+   *    未知票／采集未接线／旧实例（无该方法）⇒ 全 0 ＋ `mixed:false`（＝"无需标注"的显式取值）。 */
+  function unitIndexMixOf(procOrderNo) {
+    const zero = { withIndex: 0, withoutIndex: 0, mixed: false };
+    const inst = ifd && ifd.instance;
+    if (!inst || typeof inst.unitIndexMixOf !== 'function') return zero;
+    return inst.unitIndexMixOf(procOrderNo) || zero;
   }
 
   /** 按节拍应完成件数（FR-5.11 新判据的减数）：`节拍(件/秒) × 实际经过秒数`，
@@ -1291,6 +1305,20 @@ async function start(options = {}) {
     if (!hasUnit) state.resultWrite.skippedNoUnit++;
     const shouldDone = hasUnit ? shouldDoneOf(task, at) : undefined;
     const doneQty = hasUnit ? doneQtyOf(procOrderNo) : undefined;
+    /* `E64`（负责人 2026-10-07："同票混帧语义：**以带件序号的帧为准** ＋ 缺序号帧如实计数并可见"）：
+       本票若**既出现过带件序号的帧、又出现过缺件序号的帧** ⇒ 上面的 `doneQty` 只由带件序号的帧
+       累积 ⇒ 它只是**下界**。处置＝**照常按带件序号的帧计并发布**（不丢弃该票、也不拿缺序号帧去
+       凑件数 —— 帧与件不是同一单位，C-111），但把"这是下界"如实标注到该条预警上（可见），票级
+       计数留在 `/health.frameUnitIndex`（机器可读）。
+       ⚠ 为什么不在这里"不产生该类"：`E60①` 管的是**本帧**拿不到件序号（不固化 ＋ 该类不产生），
+         与"本票历史上有过缺件序号帧"是两件事；把后者也做成"不产生"，等于让 `Q-21` 答复之前
+         **所有混帧票永久失去落后预警**（那是另一种失真：把"测得的下界"扔成"什么都没测"）。
+       ⚠ 两个减数的**单位必须仍是"件"**：`shouldDone`＝节拍×时长（件）、`doneQty`＝`result`
+         行数（件）；缺序号帧的**帧数**只进标注，**绝不**加进任一侧（`E69` 的"件减票"就是单位混用的先例）。 */
+    const mix = hasUnit
+      ? unitIndexMixOf(procOrderNo)
+      : { withIndex: 0, withoutIndex: 0, mixed: false };
+    const doneQtyLowerBound = hasUnit && mix.mixed ? { noIndexFrames: mix.withoutIndex } : undefined;
     /* ---- 第一拍：取 `result` 去固化（**不发布**：发布权只留下面那一处） ----
        单件进度 `progress` 由 `testStatus` 按 C-98④ 导出（见 `progressOf()`）—— 它决定本次判定是
        待测试/测试中，还是可判定的 合格/不合格/待复检。此前不传该入参 ⇒ `taskResult()` 恒判
@@ -1301,7 +1329,9 @@ async function start(options = {}) {
       standard,
       progress: progressOf(frame),
       shouldDone,
-      doneQty
+      doneQty,
+      /* `E64`：混帧票的"已完成"只是下界 ⇒ 工单类文案追加说明（不给该键时输出与改前逐字相同） */
+      doneQtyLowerBound
     }, { bus, publish: false });
     /* DR-05（E58 ②）：与本帧判定**同一拍**按件 upsert 一次（`judgedAt` 仍取注入时钟，见其内注释）。
        拿不到件号 ⇒ **不固化**（不写行，也不动写入点计数 —— "没写"与"写失败"是两件事）。 */
@@ -1315,7 +1345,9 @@ async function start(options = {}) {
       standard,
       progress: progressOf(frame),
       shouldDone,
-      doneQty: persisted ? doneQtyOf(procOrderNo) : doneQty
+      doneQty: persisted ? doneQtyOf(procOrderNo) : doneQty,
+      /* `E64`：同上（两次调用的入参除件数外保持同形，避免"发布的那一次"漏标注） */
+      doneQtyLowerBound
     }, { bus });
     /* ---- DR-08（`warning` 表，技术债 `E62`）：**判定发布点同批落库**（ADR-0009 D1）----
        与上面那次发布**同一个 tick、同一帧**，紧随其后（顺序理由见 `persistWarnings()` 的 docblock：

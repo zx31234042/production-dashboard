@@ -1255,15 +1255,29 @@ async function main() {
             JSON.stringify(m.startedText) + '（应 ＝ 服务端 `/state` 的 `startedQty` ' +
             JSON.stringify(String(wantStarted)) + '）；' + m.brief
         }),
-        noteVisibleErr: (m, withoutIndex) => ({
-          ok: m.noteLv === 'err' && m.noteHiddenAttr === false && m.noteDisplay !== 'none' &&
-            m.noteVisibility !== 'hidden' && m.noteText.indexOf('帧未带件序号') >= 0 &&
-            m.noteText.indexOf('本班 ' + withoutIndex + ' 帧') >= 0,
-          why: 'dataset.noteLv=' + JSON.stringify(m.noteLv) + "（应 'err'）、hidden 属性=" + m.noteHiddenAttr +
-            '（应 false）、computed display=' + m.noteDisplay + '／visibility=' + m.noteVisibility +
-            '（应可见）、DOM 文本=' + JSON.stringify(m.noteText) + '（应含"帧未带件序号"与"本班 ' +
-            withoutIndex + ' 帧" —— 该数取自服务端 `/health` 真值）；' + m.brief
-        }),
+        noteVisibleErr: (m, withoutIndex, mixedTickets) => {
+          /* `E64`（2026-10-07 负责人"同票混帧语义：以带件序号的帧为准 ＋ 缺序号帧如实计数并可见"）：
+             `mixedTickets > 0` ⇒ 实现会在既有 err 文案**之后追加**一句下界说明；
+             `mixedTickets === 0`／键缺失 ⇒ 文案**逐字不变**。真机判据按服务端 `/health` 的**真值**分档：
+             混合票数取自 `frameUnitIndex.mixedTickets`（**不手抄**），期望后缀也由它现拼。 */
+          const mixed = (typeof mixedTickets === 'number' && Number.isFinite(mixedTickets) && mixedTickets > 0)
+            ? mixedTickets : 0;
+          const suffix = mixed > 0
+            ? '；其中 ' + mixed + ' 票为同票混帧（件数按带件序号的帧计 ⇒ 已完成只是下界）' : '';
+          const textOk = m.noteText.indexOf('帧未带件序号') >= 0 &&
+            m.noteText.indexOf('本班 ' + withoutIndex + ' 帧') >= 0;
+          return {
+            ok: m.noteLv === 'err' && m.noteHiddenAttr === false && m.noteDisplay !== 'none' &&
+              m.noteVisibility !== 'hidden' && textOk &&
+              (suffix === '' ? m.noteText.indexOf('同票混帧') < 0 : m.noteText.indexOf(suffix) >= 0),
+            why: 'dataset.noteLv=' + JSON.stringify(m.noteLv) + "（应 'err'）、hidden 属性=" + m.noteHiddenAttr +
+              '（应 false）、computed display=' + m.noteDisplay + '／visibility=' + m.noteVisibility +
+              '（应可见）、DOM 文本=' + JSON.stringify(m.noteText) + '（应含"帧未带件序号"与"本班 ' +
+              withoutIndex + ' 帧"）；`E64` 混帧档：服务端 mixedTickets=' + JSON.stringify(mixedTickets) +
+              ' ⇒ 期望' + (suffix === '' ? '**不含**"同票混帧"字样' : '含后缀 ' + JSON.stringify(suffix)) +
+              '（实测含该后缀=' + (m.noteText.indexOf('；其中 ') >= 0 && m.noteText.indexOf('同票混帧') >= 0) + '）；' + m.brief
+          };
+        },
         noteHiddenOk: m => ({
           ok: m.noteLv === 'ok' && m.noteHiddenAttr === true && m.noteDisplay === 'none' &&
             String(m.noteText) === '',
@@ -1360,10 +1374,11 @@ async function main() {
           check('B5e ' + w + '×' + h + ' 服务端档**生产口径**（真机）：`#c114StartedSource` 文本**逐字为空串**' +
             '（不标「（演示派生）」）且 `#sStarted` 数值**＝服务端 `/state` 的 `startedQty`**（真机端到端对账）',
             pf.ok, pf.why);
-          const nv = SVERD.noteVisibleErr(m, errFi.withoutIndex);
+          const nv = SVERD.noteVisibleErr(m, errFi.withoutIndex, errFi.mixedTickets);
           check('B5e ' + w + '×' + h + ' 服务端 `err` 档：`withoutIndex > 0` ⇒ 提示行**真的可见**' +
             '（`hidden` 属性 false ＋ computed `display`/`visibility` 均可见）且文案逐字含"帧未带件序号"' +
-            '与"本班 N 帧"（N 取自 `/health` 真值）',
+            '与"本班 N 帧"（N 取自 `/health` 真值）＋ `E64` 的混帧后缀（`mixedTickets > 0` ⇒ 追加' +
+            '「其中 N 票为同票混帧 … 已完成只是下界」；为 0/键缺失 ⇒ **逐字不含**该后缀）',
             nv.ok, nv.why);
           const ly = SVERD.layout(m);
           check('B5e ' + w + '×' + h + ' 服务端 `err` 档版面：**未撑破**（scroll ≤ client + 1）＋ 提示行' +
@@ -1393,17 +1408,25 @@ async function main() {
               restored: { lv: n.dataset.noteLv, attr: n.getAttribute('data-note-lv'), hidden: n.hidden,
                 display: getComputedStyle(n).display, text: n.textContent } };
           })()`);
-          d22 = { base: SVERD.noteVisibleErr(errBase, errFi.withoutIndex),
-            lv: SVERD.noteVisibleErr(lvMut, errFi.withoutIndex),
-            hidden: SVERD.noteVisibleErr(hiddenMut, errFi.withoutIndex), domMut };
+          d22 = { base: SVERD.noteVisibleErr(errBase, errFi.withoutIndex, errFi.mixedTickets),
+            lv: SVERD.noteVisibleErr(lvMut, errFi.withoutIndex, errFi.mixedTickets),
+            hidden: SVERD.noteVisibleErr(hiddenMut, errFi.withoutIndex, errFi.mixedTickets), domMut,
+            /* `E64` 第三支：把**读数副本**的 DOM 文本里的混帧后缀**逐字删掉**
+               （＝"只读 withoutIndex"的旧形态在真机上的读数）⇒ 同一判据必红并指名该后缀。 */
+            noMixedSuffix: SVERD.noteVisibleErr(
+              Object.assign({}, errBase, { noteText: String(errBase.noteText).replace(/；其中 [^）]*）/, '') }),
+              errFi.withoutIndex, errFi.mixedTickets) };
         }
         check('B5e-D22 可证伪（ADR-0004 D22）：①把**读数副本**的 `dataset.noteLv` 改成 `ok`（＝"两种没有混同"）' +
-          '②把**读数副本**改成"隐藏"（＝"提示行没显示"的错实现）⇒ **同一条 `noteVisibleErr` 判据必红**' +
-          '并在 `why` 里分别指名 `noteLv`／`hidden`；③真机 DOM 上把这两处临时改掉再**逐字还原并回读核实**' +
+          '②把**读数副本**改成"隐藏"（＝"提示行没显示"的错实现）' +
+          '③把**读数副本**文本里的 `E64` 混帧后缀**逐字删掉**（＝"只读 `withoutIndex`"的旧形态）' +
+          '⇒ **同一条 `noteVisibleErr` 判据必红**并在 `why` 里分别指名 `noteLv`／`hidden`／该后缀；' +
+          '④真机 DOM 上把前两处临时改掉再**逐字还原并回读核实**' +
           '（证明读的是活 DOM，且本段对盘上文件零写入）',
           Boolean(d22) && d22.base.ok === true &&
           d22.lv.ok === false && d22.lv.why.indexOf('noteLv') >= 0 &&
           d22.hidden.ok === false && d22.hidden.why.indexOf('hidden') >= 0 &&
+          d22.noMixedSuffix.ok === false && d22.noMixedSuffix.why.indexOf('同票混帧') >= 0 &&
           Boolean(d22.domMut) && d22.domMut.fatal === undefined &&
           d22.domMut.lvMut.lv === 'ok' && d22.domMut.hidMut.hidden === true &&
           d22.domMut.hidMut.display === 'none' &&
@@ -1417,7 +1440,31 @@ async function main() {
           JSON.stringify(String(d22 ? d22.lv.why : '').slice(0, 150)) + '；' +
           '变异②隐藏判红=' + Boolean(d22 && d22.hidden.ok === false) + '、指名=' +
           JSON.stringify(String(d22 ? d22.hidden.why : '').slice(0, 150)) + '；' +
+          '变异③删混帧后缀判红=' + Boolean(d22 && d22.noMixedSuffix.ok === false) + '、指名=' +
+          JSON.stringify(String(d22 ? d22.noMixedSuffix.why : '').slice(0, 150)) + '；' +
           '真机 DOM 变异并还原=' + JSON.stringify(d22 && d22.domMut) + '（`restored` 四项须与 `before` 逐字相等）');
+
+        /* ---- `E64`：真机混帧档（`mixedTickets > 0`）⇒ 追加句的**逐字**判据 ----
+           夹具 `err` 档灌的是 `[7, null]`（同一票一帧带件序号 ＋ 一帧不带）⇒ `/health.frameUnitIndex`
+           的 `mixedTickets` 应恰 1。本条把"追加句是否真的出现在真机文本里"钉住，且期望后缀由
+           **服务端真值现拼**（`withoutIndex`／`mixedTickets` 都取自 `/health`，不手抄）。 */
+        if (errBase) {
+          const e64Mixed = (typeof errFi.mixedTickets === 'number' && errFi.mixedTickets > 0) ? errFi.mixedTickets : 0;
+          const e64Suffix = '；其中 ' + e64Mixed + ' 票为同票混帧（件数按带件序号的帧计 ⇒ 已完成只是下界）';
+          check('B5e `E64` 真机混帧档（1920×1080）：夹具把**同一票**灌成"一帧带件序号 ＋ 一帧不带"' +
+            '⇒ `/health.frameUnitIndex.mixedTickets` 恰 **1**；真机 `#c114FrameUnitNote` 的 DOM 文本' +
+            '**逐字以**该后缀结尾（后缀由服务端两个真值现拼：`withoutIndex` ＋ `mixedTickets`），' +
+            '而 `data-note-lv` 仍是 `err`（追加的只是说明，不换档）',
+            e64Mixed === 1 && errFi.withIndex > 0 && errFi.withoutIndex > 0 &&
+            String(errBase.noteText).endsWith(e64Suffix) &&
+            String(errBase.noteText).indexOf('；其中 ') >= 0 &&
+            errBase.noteLv === 'err' && errBase.noteHiddenAttr === false,
+            `mixedTickets=${JSON.stringify(errFi.mixedTickets)}（应 1）、withIndex=${JSON.stringify(errFi.withIndex)}、` +
+            `withoutIndex=${JSON.stringify(errFi.withoutIndex)}；真机 DOM 文本=${JSON.stringify(errBase.noteText)}；` +
+            `期望后缀=${JSON.stringify(e64Suffix)}（` +
+            `${String(errBase.noteText).endsWith(e64Suffix) ? '逐字命中' : '**未命中**'}）；` +
+            `dataset.noteLv=${JSON.stringify(errBase.noteLv)}`);
+        }
 
         /* ---- `ok` 档（`withoutIndex === 0`）：提示行不可见，但 `data-note-lv` 必须是 `ok` ---- */
         const okM = await readServerCellAt(okSvc.base, 1920, 1080);

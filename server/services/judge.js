@@ -359,9 +359,14 @@ function consumableWarning(hours) {
  * ⚠ **允许落后率为负**（负＝已完成超过应完成，即超前于计划）—— 负值**绝不告警**，
  *   且不得因为"负"而抛错或取绝对值。
  *
- * @param {{shouldDone?:number, doneQty?:number}} input
+ * @param {{shouldDone?:number, doneQty?:number, lowerBound?:{noIndexFrames:number}}} input
  *   `shouldDone` 应完成件数（由调用方按节拍×经过时长算，**本函数不算时长、不读时钟**）；
  *   `doneQty` 实际已完成件数。
+ *   `lowerBound`（`E64`，**可选**）同票混帧时的**下界标注**：`noIndexFrames`＝该票已出现的
+ *     缺件序号帧数。给了它 ⇒ 文案**追加**一句"已完成为下界"（该票的 `doneQty` 只由带件序号的帧
+ *     累积）；**不给 ⇒ 输出与改前逐字相同**（默认关闭：既有调用方与既有对账断言不受影响）。
+ *     ⚠ 它**只改文案**，不改判据：`overdue`／`behindQty`／`ratio` 的算式一字未动，
+ *       也**不**把缺序号帧的帧数并进 `doneQty`（帧与件不同单位，C-111）。
  * @returns {{title,detail,lv}} 一条预警（lv ∈ ok / err）
  */
 function orderWarning(input) {
@@ -380,11 +385,23 @@ function orderWarning(input) {
   const ratio = shouldDone > 0 ? behindQty / shouldDone : 0;
   const overdue = ratio > t.orderOverdueRatio || behindQty > t.orderOverduePending;
   const pct = (ratio * 100).toFixed(1);
+  /* `E64`（负责人 2026-10-07："**以带件序号的帧为准** ＋ 缺序号帧如实计数并可见"）：同票混帧时
+     `doneQty` 只由带件序号的帧累积 ⇒ 它只是**下界**，必须**可见**（否则就是债行原文的
+     "长期低估已完成 ⇒ 误报落后"）。为什么不干脆不产生该条：那会让"真的有件没做"与
+     "帧没带件序号"混成同一个"没有预警"（`E38` 的既有纪律：拿不到不得用"什么都不显示"代言）。
+     标注只加在**文案**上；判据（`overdue`）与两个减数一字未动。 */
+  const lb = (input && typeof input === 'object' && input.lowerBound && typeof input.lowerBound === 'object')
+    ? input.lowerBound : null;
+  const lbFrames = lb && Number.isInteger(lb.noIndexFrames) && lb.noIndexFrames > 0 ? lb.noIndexFrames : 0;
+  const lbNote = lbFrames > 0
+    ? `（⚠ 本票另有 ${lbFrames} 帧未带件序号 ⇒ 实际已完成**不少于** ${doneQty} 件，` +
+      '上述"已完成"为**下界**、落后率可能偏大；口径见 /health.frameUnitIndex）'
+    : '';
   return {
     title: OTHER_TITLES.order,
-    detail: overdue
+    detail: (overdue
       ? `按节拍应完成 ${shouldDone} 件、实际已完成 ${doneQty} 件，落后 ${behindQty} 件（${pct}%，阈值 ${(t.orderOverdueRatio * 100).toFixed(0)}%），预计超班次完成`
-      : `按节拍应完成 ${shouldDone} 件、实际已完成 ${doneQty} 件，落后 ${behindQty} 件（${pct}%），按节拍推进`,
+      : `按节拍应完成 ${shouldDone} 件、实际已完成 ${doneQty} 件，落后 ${behindQty} 件（${pct}%），按节拍推进`) + lbNote,
     lv: overdue ? 'err' : 'ok'
   };
 }
@@ -410,6 +427,9 @@ function orderWarning(input) {
  *   @param {number} [input.consumableHours] 耗材（水下光源）累计点亮时长（h）；**缺 ⇒ 该类不产生**
  *   @param {number} [input.shouldDone] 按节拍应完成件数（FR-5.11 新判据）；**缺其一 ⇒ 该类不产生**
  *   @param {number} [input.doneQty] 实际已完成件数；**缺其一 ⇒ 该类不产生**
+ *   @param {{noIndexFrames:number}} [input.doneQtyLowerBound] `E64`：`doneQty` 只是**下界**
+ *     （该票出现过缺件序号的帧）时给的下界标注；给了 ⇒ 工单类文案追加说明，**判据不变**。
+ *     真源＝`services/ingest.js` 的按票记账（本文件不重算）。
  * @returns {Array<{title:string, detail:string, lv:string}>} 参数类 0～2 ＋ 维保 1 ＋（耗材/工单 各 0～1）
  */
 function buildWarnings(input = {}) {
@@ -421,7 +441,12 @@ function buildWarnings(input = {}) {
   if (isNum(input.consumableHours)) out.push(consumableWarning(input.consumableHours));
   /* 工单超时（FR-5.11 新判据）：需**两个**入参（应完成 / 已完成）才成条；缺一即整条不出（不编造） */
   if (isNum(input.shouldDone) && isNum(input.doneQty)) {
-    out.push(orderWarning({ shouldDone: input.shouldDone, doneQty: input.doneQty }));
+    out.push(orderWarning({
+      shouldDone: input.shouldDone, doneQty: input.doneQty,
+      /* `E64`：可选的下界标注（不给 ⇒ 与改前逐字相同）—— 由 `server/index.js` 按该票的
+         混帧读数决定（真源＝`services/ingest.js` 的按票计数，本文件不重算）。 */
+      lowerBound: input.doneQtyLowerBound
+    }));
   }
   return out;
 }

@@ -44,6 +44,13 @@
      `unit_index`（V1.41 / C-111）：＝`IF-D.4` 的 `unitIndex`，**采集落库时写入**；帧未带或非法
      （非整数、< 1）⇒ 写 **NULL** 并计入 `status().frameUnitIndex.withoutIndex`（**不整帧拒收**：
      实测数据本身有效）。它使 `FR-4.2` 的"开工数"能按**件**计（`FR-4.3` 的减数与被减数同单位，E69）。
+     **同一票混用两种帧**（`E64`，2026-10-07 负责人"同票混帧语义：以带件序号的帧为准 ＋ 缺序号帧
+     如实计数并可见"）：本文件按**票**再记一份 `withIndex`／`withoutIndex`，并把"**这一票两种帧
+     都出现过**"（`mixed`）如实暴露到 `status().frameUnitIndex` 与 `unitIndexMixOf()`。口径两条：
+     ① **件数只认带件序号的帧**（缺序号的帧**绝不**被冒充成某一件 —— `E60①` 的"不固化"不变）；
+     ② **缺序号帧按帧计数并可见**（全局 `withoutIndex` ＋ 按票 `tickets`／`mixedTickets`）。
+     帧与件**不是同一单位**（C-111）⇒ 两者只并列展示，**不互相折算**。本文件只**报告**这个事实，
+     "该票的完成数只是下界"要不要标注、怎么标注，由判定侧（`server/index.js` → `services/judge.js`）决定。
    依赖：`server/repo/measure.js`（SQL，唯一落库出口）、`platform/clock.js`（时间注入与格式）、
         `src/config/board.config.js`（`upper.staleMs` 等参数真源）。**零第三方依赖。**
    用法：
@@ -483,6 +490,31 @@ function createIngest(options = {}) {
     return typeof injected === 'function' ? injected() : injected;
   };
 
+  /* `E64`（2026-10-07 负责人："同票混帧语义：**以带件序号的帧为准** ＋ 缺序号帧如实计数并可见"）：
+     按票记账的容量上限（只留最近若干票；Map 插入序淘汰最旧）。为什么必须按票记：全局计数
+     （withIndex／withoutIndex）分不出"**同一票**里两种帧都出现过"，而那正是"该票已完成件数
+     只是下界"的唯一判据（债行 `E64` 的原文症状：混帧票的"已完成"被**长期低估** ⇒ 误报落后）。 */
+  const FRAME_UNIT_TICKETS_MAX = 512;
+
+  /** `E64`：按票件序号读数的**单一汇总口**（`status()` 与判定侧读同一份，不各写一套）。
+   *  · `mixed` ＝ 该票**既出现过带件序号的帧、又出现过缺件序号的帧** ⇒ 该票"已完成"只是下界；
+   *  · `list`  ＝ 出现过缺件序号帧的票（含混帧票）的逐票读数，**按首次出现序**（确定性：
+   *     `/health` 与 `/ifd/status` 两处因此逐字节相同）。
+   *  ⚠ 只报告**事实**（帧的条数），不推断"该票到底做了几件"：件数一侧只认带件序号的帧
+   *    （`E60①` 的"不固化"不变），且帧与件**不是同一单位**（C-111），不得互相折算。 */
+  function frameUnitTicketStats() {
+    const list = [];
+    let mixed = 0;
+    for (const [procOrderNo, t] of state.frameUnitIndex.tickets) {
+      const m = t.withIndex > 0 && t.withoutIndex > 0;
+      if (m) mixed++;
+      if (t.withoutIndex > 0) {
+        list.push({ procOrderNo, withIndex: t.withIndex, withoutIndex: t.withoutIndex, mixed: m });
+      }
+    }
+    return { mixed, list };
+  }
+
   /** 运行态（**唯一的真源**：断连判据与 1 s 采样去重都只看它） */
   const state = {
     receivedFrames: 0,          // 收到的帧总数（含脏帧）
@@ -507,7 +539,14 @@ function createIngest(options = {}) {
        计数口径＝**真正落库（`stored`）的那一帧**：重复帧 / 500 ms 原始帧 / 被拒收帧都不是库里的行，
        不计入 ⇒ 恒有 `withIndex + withoutIndex === counts.stored`（探针据此交叉核对，防"计数漂移"）。
        **绝不用 0 代言"拿不到"**。 */
-    frameUnitIndex: { withIndex: 0, withoutIndex: 0 }
+    frameUnitIndex: {
+      withIndex: 0,
+      withoutIndex: 0,
+      /* `E64`：**按票**的件序号混用读数（`procOrderNo -> {withIndex, withoutIndex, mixedWarned}`）。
+         容量上限＝`FRAME_UNIT_TICKETS_MAX`；被淘汰的票若再来帧就按"新票"重记（与 `pieceSpanCache`
+         同一纪律：进程内记账只是增强，`measure_rt.unit_index` 才是库内事实）。 */
+      tickets: new Map()
+    }
   };
 
   /** 判定挂钩（`onSampled`）的可观测性：回调抛错的次数与最后一次原因。
@@ -658,6 +697,35 @@ function createIngest(options = {}) {
          非法/缺失都记 `withoutIndex`，并**留一条 warn**（不静默：现场要能看出"开工数为什么是 0"）。
          为什么在落库成功之后计数而不是之前：`duplicate`/`raw-500ms` 不新增行，先计数会让两个数
          与 `counts.stored` 对不上，把"可观测位"变成"又一个会漂移的数字"。 */
+      /* `E64`：**按票**记账（与下面全局计数**同一处、同一口径**：只数真正落库的那一帧）。
+         两态都出现过的票 ⇒ 该票"已完成件数"只是**下界**（件数只由带件序号的帧累积），
+         缺序号帧按**帧**另计并可见（单位不同，不折算）。 */
+      const ticketKey = v.frame[FIELD.procOrderNo] === undefined || v.frame[FIELD.procOrderNo] === null
+        ? '' : String(v.frame[FIELD.procOrderNo]);
+      if (ticketKey) {
+        let ticket = state.frameUnitIndex.tickets.get(ticketKey);
+        if (!ticket) {
+          ticket = { withIndex: 0, withoutIndex: 0, mixedWarned: false };
+          state.frameUnitIndex.tickets.set(ticketKey, ticket);
+          if (state.frameUnitIndex.tickets.size > FRAME_UNIT_TICKETS_MAX) {
+            const oldest = state.frameUnitIndex.tickets.keys().next();
+            if (!oldest.done) state.frameUnitIndex.tickets.delete(oldest.value);
+          }
+        }
+        if (unit.ok) ticket.withIndex++;
+        else ticket.withoutIndex++;
+        /* 首次进入"混帧票"时**每票一条** warn（不逐帧刷屏 —— 与上面"每 100 帧一条"同一纪律：
+           计数逐帧、日志去重）。它回答"这一票的完成数为什么只是下界"。 */
+        if (ticket.withIndex > 0 && ticket.withoutIndex > 0 && !ticket.mixedWarned) {
+          ticket.mixedWarned = true;
+          if (logger) {
+            logger.warn(`[IF-D] 工单 ${JSON.stringify(ticketKey)} 出现**同票混帧**（E64）：带件序号 ` +
+              `${ticket.withIndex} 帧、缺件序号 ${ticket.withoutIndex} 帧 ⇒ 件数一律按**带件序号的帧**计，` +
+              '该票"已完成"只是**下界**（缺件序号的帧不计入件数、只按帧计数；' +
+              '读数见 /health.frameUnitIndex 的 mixedTickets／tickets）');
+          }
+        }
+      }
       if (unit.ok) {
         state.frameUnitIndex.withIndex++;
       } else {
@@ -756,6 +824,9 @@ function createIngest(options = {}) {
 
     /** 采集计数与去重口径快照（供 `/health` 与运维；**只报告不推断**） */
     status() {
+      /* `E64`：按票混帧读数**只算一次**（同一个返回值既进 `GET /health` 也进 `GET /ifd/status`，
+         两处因此逐字节相同 —— 与 withIndex／withoutIndex 的既有"同源"判据同一纪律）。 */
+      const ticketMix = frameUnitTicketStats();
       return {
         ingest: 'ifD',
         dedup: { primary: DEDUP.PRIMARY, fallback: DEDUP.FALLBACK },
@@ -778,7 +849,16 @@ function createIngest(options = {}) {
           withIndex: state.frameUnitIndex.withIndex,
           withoutIndex: state.frameUnitIndex.withoutIndex,
           stored: state.storedFrames,
-          note: '帧件序号（IF-D.4 unitIndex）：缺件序号的帧 unit_index 写 NULL 且不计入开工件数（FR-4.2 按件计）'
+          note: '帧件序号（IF-D.4 unitIndex）：缺件序号的帧 unit_index 写 NULL 且不计入开工件数（FR-4.2 按件计）',
+          /* `E64`（2026-10-07）：**同票混帧**的机器可读出口（"缺序号帧如实计数并可见"的读口）——
+             · `mixedTickets` ＝ 既出现过带件序号的帧、又出现过缺件序号的帧的**票数**；
+             · `tickets`      ＝ 出现过缺件序号帧的票（含混帧票）的逐票读数，按首次出现序，
+                                上限 `FRAME_UNIT_TICKETS_MAX`。
+             件数一侧只认带件序号的帧 ⇒ 混帧票的"已完成"是**下界**（判定侧据此在文案上如实标注，
+             见 `server/index.js` 的 `emitWarnings()` 与 `services/judge.js` 的 `lowerBound`）；
+             缺序号帧按**帧**计（与件不同单位、不折算 —— C-111）。 */
+          mixedTickets: ticketMix.mixed,
+          tickets: ticketMix.list
         },
         lastReject: state.lastReject,
         lastStoredKey: state.lastStoredKey,
@@ -798,6 +878,23 @@ function createIngest(options = {}) {
     /** 内存态**最新 1 s 采样帧**（形状＝`upper` 报文；W5 的 `snapshot.frame` 唯一来源）。
      *  与 `lastFrame()` 的区别：500 ms 原始帧会更新 `lastFrame()`，**不**更新这里。 */
     lastSampledFrame() { return state.lastSampledFrame; },
+
+    /** `E64`：某票的件序号混用读数（**判定侧的唯一读口** —— 它决定"已完成是否为下界"）。
+     *  与 `status().frameUnitIndex` 的 `tickets` 是**同一份记账**（本函数不另算一套）。
+     *  @param {string} procOrderNo 工单号
+     *  @returns {{withIndex:number, withoutIndex:number, mixed:boolean}}
+     *    未知票／空票号 ⇒ 全 0 ＋ `mixed:false`（**不是** null："这一票没有缺件序号的帧"本身
+     *    是一个事实，调用方据此判"无需标注"）。 */
+    unitIndexMixOf(procOrderNo) {
+      const key = procOrderNo === undefined || procOrderNo === null ? '' : String(procOrderNo);
+      const t = key ? state.frameUnitIndex.tickets.get(key) : null;
+      if (!t) return { withIndex: 0, withoutIndex: 0, mixed: false };
+      return {
+        withIndex: t.withIndex,
+        withoutIndex: t.withoutIndex,
+        mixed: t.withIndex > 0 && t.withoutIndex > 0
+      };
+    },
 
     /**
      * 链路状态变化监控（W5-①）：把 `linkState()` 的**变化**发布成 `link` 事件

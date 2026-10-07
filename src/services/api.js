@@ -34,12 +34,16 @@ window.Api = (function () {
   /* 上报失败待补传队列（浏览器侧内存态：仅用于自检与状态展示；
      持久化由服务端 server/services/uploadQueue.js 落 upload_log，见文件头 E10 说明） */
   let pending = [];
-  /* 上报流水号状态：**按日重置**的当日序号（域 1～999，永不产生 000）。
+  /* 上报流水号状态：**按日重置**的当日序号（域 1～999999，永不产生 000000）。
      口径真源是 `platform/id.js` 的 `createUploadIdGenerator()`；本文件在浏览器 file:// 下
      无 require、不能直接共用该模块，故为**逐条对齐同一规则的等价实现** —— 改任一侧必须同步另一侧。
      R26-P3-3（2026-09-26 第三轮审查）：旧实现 `(uploadSeq + 1) % 1000` 第 1000 次起产 `…000`、
      且模块生命周期内从不按日重置，与 `platform/id.js` 的 `isUploadId`（判 001～999 合法）
-     **两判相反**，使附录 2 的 uploadId 去重与回执核对（DR-13）语义漂移；已统一。 */
+     **两判相反**，使附录 2 的 uploadId 去重与回执核对（DR-13）语义漂移；已统一。
+     `E31`（2026-10-07 负责人"按建议：放宽 uploadId 序号域"）：序号段 3 位 → **6 位**
+     （域 1～999 → 1～999999），与 `platform/id.js` 的 `UPLOAD_SEQ_DIGITS`／`UPLOAD_SEQ_MAX`
+     **逐字同值** —— 单日第 1000 次回绕（与当日第 1 次同号 ⇒ 可能被误判重复而丢数）就此消掉；
+     取值依据（单日帧数上界 172800 ≤ 999999）见 `platform/id.js` 文件头。 */
   let uploadSeq = 0;
   /* 当前序号所属日期（yyyyMMdd）——与另一侧 fmtDate 同一"本地日期"边界 */
   let uploadSeqDate = null;
@@ -112,24 +116,26 @@ window.Api = (function () {
   }
 
   /**
-   * 生成上传流水号：UP + yyyyMMddHHmmss + 3 位当日序号
+   * 生成上传流水号：UP + yyyyMMddHHmmss + 6 位当日序号
    *
-   * **与 `platform/id.js` 的 `createUploadIdGenerator().next()` 同步的口径（R26-P3-3）**：
+   * **与 `platform/id.js` 的 `createUploadIdGenerator().next()` 同步的口径（R26-P3-3 ＋ E31）**：
    *   ①**按日重置** —— 日期前缀变化即序号归零（改口径前本处从不重置）；
-   *   ②**序号域 1～999** —— `(seq % 999) + 1`，**永不产生 `000`**（改口径前 `% 1000` 会产）；
-   *   ③格式同 `UP` + 14 位时间 + 3 位序号，故 `platform/id.js` 的 `isUploadId()` 判本处产物
-   *      必合法 —— 两侧对同一输入序列产出**逐字节相同**的 id（`tests/platform-check.js`
-   *      有跨界对账断言；日志与回执核对（DR-13）依赖这一点）。
+   *   ②**序号域 1～999999** —— `(seq % 999999) + 1`，**永不产生 `000000`**（改口径前
+   *      `% 1000` 会产 `…000`；`E31` 之前是 `% 999` ⇒ 当日第 1000 次即回绕成 `001`）；
+   *   ③格式同 `UP` + 14 位时间 + 6 位序号（共 **22** 字符），故 `platform/id.js` 的
+   *      `isUploadId()` 判本处产物必合法 —— 两侧对同一输入序列产出**逐字节相同**的 id
+   *      （`tests/platform-check.js` 有跨界对账断言；日志与回执核对（DR-13）依赖这一点）。
    */
   function nextUploadId(d) {
     const t = d || new Date();
     const day = dayKey(t);
     if (uploadSeqDate !== day) { uploadSeqDate = day; uploadSeq = 0; }
-    /* 序号域 1～999：(seq % 999) + 1 使 +1 后落在 001，回绕后仍不产生 000 */
-    uploadSeq = (uploadSeq % 999) + 1;
+    /* 序号域 1～999999（`E31`）：(seq % 999999) + 1 使 +1 后落在 000001，回绕后仍不产生
+       000000；回绕点由当日第 1000 次推到第 1000000 次（500 ms 节拍下单日 172800 帧上界，不可达） */
+    uploadSeq = (uploadSeq % 999999) + 1;
     return 'UP' + day +
            pad(t.getHours()) + pad(t.getMinutes()) + pad(t.getSeconds()) +
-           String(uploadSeq).padStart(3, '0');
+           String(uploadSeq).padStart(6, '0');
   }
 
   /* ---------------- IF-D：上位机报文 → 看板内部 ---------------- */

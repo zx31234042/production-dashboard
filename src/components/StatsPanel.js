@@ -86,6 +86,11 @@ window.Components.StatsPanel = (function () {
    *       （演示模式根本没有 `/health` 这个读数，也就不存在"缺件序号的帧"）。4K 截图显示该行
    *       在演示模式下常驻两行、与 `E197` 后缀重复表达同一件事（`ADR-0004 D21`：写明改了什么、为什么）。
    *     **未改**：第 ②③ 支（服务端两档）与该读数的取数链（`selfCheckProbe.js` 的投影）。
+   *  ⑤ **`E64`（2026-10-07 负责人"同票混帧语义：以带件序号的帧为准 ＋ 缺序号帧如实计数并可见"）**：
+   *     服务端在 `/health.frameUnitIndex` 上多给一个 `mixedTickets`（**同票混帧**的票数）⇒
+   *     `mixedTickets > 0` 时在既有 err 文案**之后追加**一句下界说明（混帧票的"已完成"只由带件
+   *     序号的帧累积 ⇒ 同一块屏上的"已完成"只是**下界**）。⚠ **该键缺失（旧服务端／旧夹具）或为 0
+   *     ⇒ 文案与改前逐字相同**（既有四档的措辞、显隐与 `mark` 一律不动）。
    *       ⚠ **本句 2026-10-07 按现状更新**：本句原文末句为"`stateAdapter.js` 的 `state.health = null`）
    *       在本包中**一字未动**"；该处清理**已被 `T-20261007-08` 按负责人裁定撤掉**（`A-3①`）⇒ **该投影的清理已在
    *       2026-10-07 按负责人裁定撤销**，理由与"未改什么"见 `stateAdapter.js` 的 `clearUnservedModules()`
@@ -124,9 +129,18 @@ window.Components.StatsPanel = (function () {
       return { text: '帧缺件序号：未取得 /health 读数（非 0，不等于"没有缺件序号"）', lv: 'warn', show: true, mark: 'warn' };
     }
     if (withoutIndex > 0) {
-      /* `FR-4.2` 的开工数按 `unit_index` 去重 ⇒ 这 N 帧**不计入**上方开工数，必须点名说清 */
+      /* `FR-4.2` 的开工数按 `unit_index` 去重 ⇒ 这 N 帧**不计入**上方开工数，必须点名说清。
+         `E64`（2026-10-07 负责人"同票混帧语义：以带件序号的帧为准 ＋ 缺序号帧如实计数并可见"）：
+         服务端还给出 `mixedTickets > 0`（**同票混帧**的票数）时**追加**一句下界说明 —— 混帧票的
+         "已完成"只由带件序号的帧累积 ⇒ 同一块屏上的"已完成"只是**下界**（不能让操作员把它读成
+         "真的只做了这些"）。⚠ 只在**服务端给了该键且 > 0** 时追加：旧服务端／旧夹具没有它 ⇒
+         文案与改前**逐字相同**（`tests/ui-check.js` U11 的 `errText(7)` 逐字判据不受影响）。 */
+      const mixed = typeof f.mixedTickets === 'number' && Number.isFinite(f.mixedTickets) && f.mixedTickets > 0
+        ? f.mixedTickets : 0;
+      const mixedNote = mixed > 0
+        ? '；其中 ' + mixed + ' 票为同票混帧（件数按带件序号的帧计 ⇒ 已完成只是下界）' : '';
       return {
-        text: '⚠ 本班 ' + withoutIndex + ' 帧未带件序号（未计入开工数；FR-4.2 按件序号去重）',
+        text: '⚠ 本班 ' + withoutIndex + ' 帧未带件序号（未计入开工数；FR-4.2 按件序号去重）' + mixedNote,
         lv: 'err', show: true, mark: 'err'
       };
     }

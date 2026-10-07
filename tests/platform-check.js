@@ -6,9 +6,13 @@
          就是这么漏过去的。按 ADR-0004 D19（断言即证据），"没被测过"不能靠"数字好看"掩盖。
    覆盖：①路径与三套环境隔离 ②uploadId 形状与跨日序号 ③日志分级/按日滚动/保留清理
         ④平台专有字样防线（D11）
-   R26-P3-3 追加：②段补"序号域 1～999 / 永不产 000 / 跨日重置"的生成侧断言、`isUploadId` 与
+   R26-P3-3 追加：②段补"序号域 / 永不产全零 / 跨日重置"的生成侧断言、`isUploadId` 与
         生成口径的一一对应断言，以及 **id.js ↔ api.js 的跨界对账**（api.js 真源码在 vm 里跑）；
         立案原因＝两侧曾**两判相反**（api.js `%1000` 产 `000` 且不按日重置）。
+   `E31`（2026-10-07）复写：序号段由 **3 位扩到 6 位**（域 `1～999` → `1～999999`，总长 19 → 22，
+   `UP` ＋ 14 位时间 ＋ 6 位序号、`/^UP\d{20}$/`）。本段的**位数与上界一律取自真源**（`platform/id.js`
+   导出的 `UPLOAD_SEQ_DIGITS` / `UPLOAD_SEQ_MAX`，构成性构造期望值），**不手抄 999/999999**；
+   "旧形状（3 位序号）判非法"是**刻意**的（`isUploadId` 只认新格式，运行期无调用方 —— 它是生成侧自检判据）。
    依赖：仅 Node 内置模块（跨界对账用 node:vm）。
    运行：node tests/platform-check.js
    退出码：0 = 全部通过；1 = 有断言失败。
@@ -107,71 +111,122 @@ t.section('一、路径与三套环境隔离（ADR-0002 D11 / ADR-0003 D16）');
 t.section('二、uploadId 生成与校验（附录 2 / IF-B 去重与回执核对）');
 {
   const { createUploadIdGenerator, localId, isUploadId } = require('../platform/id');
+  /* `E31`：序号段的**位数与上界**取自真源（`platform/id.js` 的导出），下面的期望值一律由它**构造性**
+     算出 —— 不手抄 6／999999。位数写错时（例如又扩到 7 位）本段会当场指名"期望由真源算得 vs 实测"。 */
+  const { UPLOAD_SEQ_DIGITS, UPLOAD_SEQ_MAX } = require('../platform/id');
+  /** 把序号格式化成"该域下的字面量"（宽度＝真源给的位数） */
+  const seqText = n => String(n).padStart(UPLOAD_SEQ_DIGITS, '0');
   const fixed = new Date('2026-09-19T10:20:30');
   const clock = { now: () => new Date(fixed.getTime()) };
   const gen = createUploadIdGenerator({ clock });
 
   const first = gen.next();
   const second = gen.next();
-  t.check('uploadId 形如 UP + yyyyMMddHHmmss + 3 位序号（总长 19）',
-    /^UP20260919102030\d{3}$/.test(first) && /^UP20260919102030\d{3}$/.test(second),
-    `实测 ${first} / ${second}（长度 ${first.length}）`);
-  t.check('同秒内连续调用靠 3 位序号区分（不重复）',
+  t.check(`uploadId 形如 UP + yyyyMMddHHmmss + ${UPLOAD_SEQ_DIGITS} 位序号（总长 ${2 + 14 + UPLOAD_SEQ_DIGITS}）`,
+    new RegExp(`^UP20260919102030\\d{${UPLOAD_SEQ_DIGITS}}$`).test(first) &&
+    new RegExp(`^UP20260919102030\\d{${UPLOAD_SEQ_DIGITS}}$`).test(second) &&
+    first.length === 2 + 14 + UPLOAD_SEQ_DIGITS,
+    `实测 ${first} / ${second}（长度 ${first.length}；期望长度 ${2 + 14 + UPLOAD_SEQ_DIGITS}）`);
+  t.check(`同秒内连续调用靠 ${UPLOAD_SEQ_DIGITS} 位序号区分（不重复）`,
     first !== second && Number(second.slice(16)) === Number(first.slice(16)) + 1,
     `序号 ${first.slice(16)} → ${second.slice(16)}`);
   t.check('isUploadId 认自己生成的 id',
     isUploadId(first).ok === true, isUploadId(first).reason);
-  t.check('isUploadId 拒绝错误形状（前缀/长度/非法时间/序号越界/非字符串）',
+  t.check('isUploadId 拒绝错误形状（前缀/长度/非法时间/序号越界/非字符串），且**边界值判合法**' +
+    '（那一位的期望由真源现算，不手抄）',
     (() => {
-      const bad = ['UP20260919102030001x', 'XX20260919102030001', 'UP2026091910203', 
-        'UP20261319102030001', 'UP20260919102030000', 'UP20260919102030999', 12345, null];
-      /* 注意 UP…999 是合法的（序号上限 999），用它验证"边界内通过"而不是当非法样本 */
-      const rejected = bad.filter(v => isUploadId(v).ok === false).length;
-      return rejected === bad.length - 1 && isUploadId('UP20260919102030999').ok === true;
-    })(), '非法样本应被拒，且序号 999 属合法边界');
+      /* 非法样本（**逐个给理由**）：①尾部多一个字符 ②前缀错 ③时间只有 13 位（长度不足）
+         ④月＝13（形状对、时间非法）⑤序号全零 ⑥**旧形状（`E31` 之前的 3 位序号，总长 19）**
+         ⑦序号＝上界＋1（由真源现算，不手抄）⑧非字符串 ×2。
+         样本里**一律不出现本域内的合法值** —— 合法边界由下面那条独立断言（`upper`／`lower`）承担，
+         这样"被拒个数"才是可证伪的（旧写法把合法边界混进 `bad` 再 `length - 1`，理由不可读）。 */
+      const zero = seqText(0);
+      const legacy = 'UP20260919102030' + '001';                       // 旧形状：3 位序号（19 字符）
+      const bad = [
+        `UP20260919102030${seqText(1)}x`,                              // 尾部多一字符
+        `XX20260919102030${seqText(1)}`,                               // 前缀错
+        'UP2026091910203',                                            // 时间不足 14 位
+        `UP20261319102030${seqText(1)}`,                               // 月份 13（时间非法）
+        `UP20260919102030${zero}`,                                     // 序号全零
+        legacy,                                                       // 旧形状（刻意判非法）
+        `UP20260919102030${seqText(UPLOAD_SEQ_MAX + 1)}`,              // 序号＝上界＋1（应被拒）
+        12345, null                                                    // 非字符串
+      ];
+      const reasonOf = v => (isUploadId(v).reason || '').slice(0, 60);
+      const rejected = bad.filter(v => isUploadId(v).ok === false);
+      const leaked = bad.filter(v => isUploadId(v).ok === true);
+      const lower = `UP20260919102030${seqText(1)}`;                   // 域下界（合法）
+      const upper = `UP20260919102030${seqText(UPLOAD_SEQ_MAX)}`;      // 域上界（合法）
+      /* 边界值必须**在域内且形状合法**（若上界的位数与真源位数不一致 ⇒ 本条当场红，不静默放过） */
+      return rejected.length === bad.length && leaked.length === 0 &&
+        isUploadId(lower).ok === true && isUploadId(upper).ok === true &&
+        legacy.length === 19 && String(UPLOAD_SEQ_MAX) === String(Number(seqText(UPLOAD_SEQ_MAX)));
+    })(), '非法样本应被拒（含旧形状 …001），且域下界/上界判合法（期望值由真源现算）');
   t.check('localId 带前缀且两次调用不重复',
     localId('probe', clock).startsWith('probe-') && localId('probe', clock) !== localId('probe', clock),
     localId('probe', clock));
 
   /* ---------------- R26-P3-3：口径统一后的守线断言 ---------------- */
-  /* 立案事实（`项目记录\审查报告-2026-09-26.md` P3-3）：id.js 按日重置、域 1～999、判 `000` 非法；
-     api.js 用 `%1000` 第 1000 次起产 `…000` 且不按日重置 ⇒ 同一系统两个生成器形状不完全互换、
-     声明"保持一致"不实。下方三条分别守住：生成侧、判定侧、跨界对账。 */
+  /* 立案事实（`项目记录\审查报告-2026-09-26.md` P3-3）：id.js 按日重置、序号域有界、判全零非法；
+     api.js 用 `%1000` 第 1000 次起产 `000` 且不按日重置 ⇒ 同一系统两个生成器形状不完全互换、
+     声明"保持一致"不实。下方三条分别守住：生成侧、判定侧、跨界对账。
+     `E31`（2026-10-07）复写：域由 `1～999` 放宽到 `1～999999`（位数取真源），"第 1000 次回绕"这一
+     形态**已不存在** ⇒ 下面的期望值随之改成"单日内**互异**"（不再是"恰 1 个重复"）。 */
 
-  /** 取 uploadId 的 3 位序号（UP + 14 位时间 = 前 16 字符） */
+  /** 取 uploadId 的序号（UP + 14 位时间 = 前 16 字符；`Number` 天然吃掉前导零） */
   const seqOf = id => Number(String(id).slice(16));
 
-  /* ① 生成侧：连跑 1000 次（跨过 999 回绕点）不出现 000、序号恒在 1～999 */
+  /* ① 生成侧：连跑 1000 次不产生全零序号、序号恒在 [1, 真源上界]。
+     为什么仍是 1000 次：①它与下面的跨界对账（id.js ↔ api.js 各 1000 次）逐位对齐，是同一批读数；
+     ②旧口径的病灶恰在"第 1000 次"（回绕成 `001`）⇒ 保留这个样本数，"回绕已不可达"才有对照物。
+     ⚠ 单日容量那条**正面判据**在下面 ④（`86400 / 0.5` 次，由 ADR-0001 D7 的 500 ms 节拍构成性算出）。 */
   const walk = createUploadIdGenerator({ clock });
   const ids = [];
   for (let i = 0; i < 1000; i++) ids.push(walk.next());
   const zeroSeq = ids.filter(id => seqOf(id) === 0);
-  const outOfDomain = ids.filter(id => !(seqOf(id) >= 1 && seqOf(id) <= 999));
-  t.info(`实测：id.js 连跑 1000 次 —— 后缀 …000 出现 ${zeroSeq.length} 次；序号越界 ${outOfDomain.length} 次；` +
-    `示例 ${ids[0]} / 第 999 次 ${ids[998]} / 第 1000 次（回绕）${ids[999]}`);
-  t.check('①id.js 连跑 1000 次不产生 000 后缀、序号恒在 1～999（含第 1000 次回绕）',
-    ids.length === 1000 && zeroSeq.length === 0 && outOfDomain.length === 0,
-    `…000 ${zeroSeq.length} 次、越界 ${outOfDomain.length} 次`);
+  const outOfDomain = ids.filter(id => !(seqOf(id) >= 1 && seqOf(id) <= UPLOAD_SEQ_MAX));
+  t.info(`实测：id.js 连跑 1000 次 —— 全零序号出现 ${zeroSeq.length} 次；序号越界 ${outOfDomain.length} 次；` +
+    `示例 ${ids[0]} / 第 1000 次 ${ids[999]}（真源上界 ${UPLOAD_SEQ_MAX}、位数 ${UPLOAD_SEQ_DIGITS}）`);
+  t.check(`①id.js 连跑 1000 次不产生全零序号、序号恒在 1～${UPLOAD_SEQ_MAX}（上界取真源）`,
+    ids.length === 1000 && zeroSeq.length === 0 && outOfDomain.length === 0 &&
+    ids.every(id => id.length === 2 + 14 + UPLOAD_SEQ_DIGITS),
+    `全零 ${zeroSeq.length} 次、越界 ${outOfDomain.length} 次、长度不等于 ${2 + 14 + UPLOAD_SEQ_DIGITS} 的 ` +
+    `${ids.filter(id => id.length !== 2 + 14 + UPLOAD_SEQ_DIGITS).length} 个`);
 
-  /* ① 跨日重置：可注入时钟直接跨过零点（不靠"等一天"） */
+  /* ① 跨日重置：可注入时钟直接跨过零点（不靠"等一天"）。
+     期望串由**真源**构造（`seqText`），故位数再变时本段不改一个字。 */
   let dayMs = new Date('2026-09-19T23:59:59').getTime();
   const dayGen = createUploadIdGenerator({ clock: { now: () => new Date(dayMs) } });
   const beforeDay = [dayGen.next(), dayGen.next()];
   dayMs = new Date('2026-09-20T00:00:00').getTime();
   const afterDay = [dayGen.next(), dayGen.next()];
-  t.check('①跨日自动重置：跨日前续号、跨日后首号回到 001（日期前缀同步换日）',
-    seqOf(beforeDay[1]) === 2 && afterDay[0] === 'UP20260920000000001' && seqOf(afterDay[1]) === 2,
+  t.check(`①跨日自动重置：跨日前续号、跨日后首号回到 ${seqText(1)}（日期前缀同步换日；期望串由真源位数构造）`,
+    seqOf(beforeDay[1]) === 2 && afterDay[0] === `UP20260920000000${seqText(1)}` && seqOf(afterDay[1]) === 2,
     `${beforeDay[1]} → ${afterDay[0]}（次号 ${afterDay[1]}）`);
 
-  /* ② 判定侧：isUploadId 与生成口径一一对应（生成的必合法；人工构造的 …000 必非法） */
+  /* ② 判定侧：isUploadId 与生成口径一一对应（生成的必合法；人工构造的全零必非法） */
   t.check('②isUploadId 与生成口径一一对应：生成的 1000 个全部判合法',
     ids.every(id => isUploadId(id).ok === true),
     `首个不合法样本：${ids.find(id => !isUploadId(id).ok) || '（无）'}`);
-  t.check('②序号域逐项核对：001～999 全部判合法、000 判非法（与"永不产生 000"同一条线）',
-    Array.from({ length: 999 }, (_, i) => String(i + 1).padStart(3, '0'))
-      .every(s => isUploadId(`UP20260919102030${s}`).ok === true) &&
-    isUploadId('UP20260919102030000').ok === false,
-    `000 的判定：${isUploadId('UP20260919102030000').reason}`);
+  /* ② 域的可证伪边界（**不遍历 999999 次**，用"域内一点 + 越界一点"代替；两点都由真源现算）：
+     这里刻意**不**遍历整个域 —— 遍历只能证明"我给的那些值判对"，而真正要钉的是**边界在哪**，
+     故取 `UPLOAD_SEQ_MAX`（必须合法）与 `UPLOAD_SEQ_MAX + 1`（必须非法），再加上域内一点。
+     ⚠ 与"位数"的分工：位数由上面第一条形状断言守；本条的越界样本在**宽度上也与真源一致**
+     （`seqText(max+1)` 的位数 ≥ 真源位数）⇒ 它被拒只可能因为"序号越界"或"形状不符"，
+     两者都是"非法"这一侧的正当理由。 */
+  const domOkSample = `UP20260919102030${seqText(UPLOAD_SEQ_MAX)}`;
+  const domOverSample = `UP20260919102030${seqText(UPLOAD_SEQ_MAX + 1)}`;
+  const endPointDetail = '域内一点 1＝' + JSON.stringify(isUploadId(`UP20260919102030${seqText(1)}`).ok) +
+    '、上界 ' + UPLOAD_SEQ_MAX + '＝' + JSON.stringify(isUploadId(domOkSample).ok) +
+    '、上界＋1＝' + JSON.stringify(isUploadId(domOverSample).ok) +
+    '（理由：' + isUploadId(domOverSample).reason + '）';
+  t.check(`②序号域边界由真源现算：域内（1 与 ${UPLOAD_SEQ_MAX}）判合法、${UPLOAD_SEQ_MAX}+1 判非法` +
+    '（与"生成侧永不产生全零"同一条线：全零由 ① 的三样本守）',
+    isUploadId(`UP20260919102030${seqText(1)}`).ok === true &&
+    isUploadId(domOkSample).ok === true &&
+    isUploadId(domOverSample).ok === false &&
+    UPLOAD_SEQ_MAX >= 1 && UPLOAD_SEQ_DIGITS >= String(UPLOAD_SEQ_MAX).length,
+    endPointDetail);
 
   /* ③ 跨界对账：把浏览器侧 api.js 的**真源码**在 vm 里跑起来（夹具见文件上方 loadBrowserApi） */
   const Api = loadBrowserApi();
@@ -180,9 +235,9 @@ t.section('二、uploadId 生成与校验（附录 2 / IF-B 去重与回执核�
     const apiIds = [];
     for (let i = 0; i < 1000; i++) apiIds.push(Api.nextUploadId(fixed));
     const apiZero = apiIds.filter(id => seqOf(id) === 0);
-    const apiOutOfDomain = apiIds.filter(id => !(seqOf(id) >= 1 && seqOf(id) <= 999));
-    t.info(`实测：api.js（vm 真源码）连跑 1000 次 —— 后缀 …000 出现 ${apiZero.length} 次；` +
-      `序号越界 ${apiOutOfDomain.length} 次；示例 ${apiIds[0]} / 第 1000 次（回绕）${apiIds[999]}`);
+    const apiOutOfDomain = apiIds.filter(id => !(seqOf(id) >= 1 && seqOf(id) <= UPLOAD_SEQ_MAX));
+    t.info(`实测：api.js（vm 真源码）连跑 1000 次 —— 全零序号出现 ${apiZero.length} 次；` +
+      `序号越界 ${apiOutOfDomain.length} 次；示例 ${apiIds[0]} / 第 1000 次 ${apiIds[999]}`);
 
     let firstDiff = -1;
     for (let i = 0; i < ids.length; i++) if (apiIds[i] !== ids[i]) { firstDiff = i; break; }
@@ -190,9 +245,9 @@ t.section('二、uploadId 生成与校验（附录 2 / IF-B 去重与回执核�
       firstDiff === -1,
       firstDiff === -1 ? `1000/1000 逐字节相同（样例 ${apiIds[0]}）`
         : `第 ${firstDiff + 1} 次不同：id.js=${ids[firstDiff]} vs api.js=${apiIds[firstDiff]}`);
-    t.check('③浏览器侧同样不产生 000、序号恒在 1～999（连跑 1000 次）',
+    t.check(`③浏览器侧同样不产生全零序号、序号恒在 1～${UPLOAD_SEQ_MAX}（连跑 1000 次）`,
       apiZero.length === 0 && apiOutOfDomain.length === 0,
-      `…000 ${apiZero.length} 次、越界 ${apiOutOfDomain.length} 次`);
+      `全零 ${apiZero.length} 次、越界 ${apiOutOfDomain.length} 次`);
 
     /* 跨日重置：另起一个全新 api.js 实例（序号状态是模块级闭包，不能与上面的 1000 次共用） */
     const ApiDay = loadBrowserApi();
@@ -200,14 +255,101 @@ t.section('二、uploadId 生成与校验（附录 2 / IF-B 去重与回执核�
       ApiDay.nextUploadId(new Date('2026-09-19T23:59:59'))];
     const apiDayAfter = [ApiDay.nextUploadId(new Date('2026-09-20T00:00:00')),
       ApiDay.nextUploadId(new Date('2026-09-20T00:00:00'))];
-    t.check('③浏览器侧按日重置：与 id.js 同一跨日边界，次日首号回到 001',
-      seqOf(apiDayBefore[1]) === 2 && apiDayAfter[0] === 'UP20260920000000001' &&
+    t.check(`③浏览器侧按日重置：与 id.js 同一跨日边界，次日首号回到 ${seqText(1)}`,
+      seqOf(apiDayBefore[1]) === 2 && apiDayAfter[0] === `UP20260920000000${seqText(1)}` &&
       seqOf(apiDayAfter[1]) === 2,
       `${apiDayBefore[1]} → ${apiDayAfter[0]}（次号 ${apiDayAfter[1]}）`);
     t.check('③浏览器侧产物全部通过 id.js 的 isUploadId（去重与回执核对同一判据）',
       apiIds.every(id => isUploadId(id).ok === true) &&
       apiDayAfter.every(id => isUploadId(id).ok === true),
       `首个不合法样本：${apiIds.find(id => !isUploadId(id).ok) || '（无）'}`);
+  }
+
+  /* ---------------- ④ `E31`：单日容量（**正面判据**）＋ 位数/上界的**构成性上界** ----------------
+     立案：`E31` 的债行原文是"单日第 1000 次生成即回绕 ⇒ 同号可能被误判重复"。放宽到 6 位之后，
+     "回绕不可达"必须有**正面**判据 —— 即"在一个自然日内按**已知最坏节拍**连发满一天，
+     号码**两两互异**且**不越界**"。这里把"一天多少次"**算出来**、不手抄：
+       · 节拍来自 **ADR-0001 D7**（500 ms 原始帧只进内存、落库只留 1 s 采样）；
+       · `uploadId` 的生成频率**不高于**帧频（它随上报发生，上报不早于落库）；
+       ⇒ 单日上界 ＝ `floor(86400 秒 / 0.5 秒)` ＝ 下面现算的 `perDayBound`。
+     **为什么上界也必须"由构成性算出"**：写成 `999999 >= 172800` 里的那个 `172800` 就是手抄魔数 ——
+     节拍一变（ADR-0001 D7 改口径）它不会跟着动。这里用 `Math.floor(86400 / 0.5)` 现算，
+     并把"上界的来历"写在 `detail` 里，日后节拍变了读数会一眼可见地跟着变。
+     D22 靶子（**内存副本**，盘上零字节改动）：把生成侧的 `(seq % UPLOAD_SEQ_MAX) + 1` 换回
+     "3 位域的 `String(seq % 999 + 1).padStart(3, '0')`"（`E31` 之前的形态）⇒ 同一判据**必红**：
+     号码在 999 处**回绕** ⇒ 互异数 < 发号数。 */
+  const perDayTicksPerSec = 1 / 0.5;                       // 由 ADR-0001 D7 的 500 ms 节拍给出（不手抄次数）
+  const perDayBound = Math.floor(86400 * perDayTicksPerSec);
+  /* 上界的**构成性**判据：位数足够表达"单日最坏发号量"（否则回绕在数学上就可能发生） */
+  t.check(`④${UPLOAD_SEQ_DIGITS} 位序号的**容量下界**（构成性）：域上界 ≥ 单日最坏发号量 ` +
+    `（＝ ADR-0001 D7 的 500 ms 节拍推出的 86400 ÷ 0.5 ＝ ${perDayBound}）` +
+    '⇒ 在已文档化的节拍下"单日回绕"不可达',
+    Number.isFinite(perDayBound) && perDayBound > 0 && UPLOAD_SEQ_MAX >= perDayBound &&
+    perDayTicksPerSec === 1 / 0.5,
+    `域上界（真源）＝${UPLOAD_SEQ_MAX}；单日最坏发号量＝floor(86400 × ${perDayTicksPerSec})＝${perDayBound}；` +
+    `余量＝${(UPLOAD_SEQ_MAX / perDayBound).toFixed(2)} 倍；位数＝${UPLOAD_SEQ_DIGITS}（≥ ${String(UPLOAD_SEQ_MAX).length} 位）`);
+
+  const boundGen = createUploadIdGenerator({ clock });
+  const bulk = [];
+  for (let i = 0; i < perDayBound; i++) bulk.push(boundGen.next());
+  const bulkSeqs = bulk.map(seqOf);
+  const bulkSet = new Set(bulkSeqs);
+  /* ⚠ 用 `reduce` 求最大/最小，**不用** `Math.max.apply(null, 172800 项)` ——
+     后者会把 17 万个实参压进调用栈 ⇒ `RangeError: Maximum call stack size exceeded`（本轮实测踩到）。 */
+  const bulkMax = bulkSeqs.reduce((a, b) => (b > a ? b : a), 0);
+  const bulkMin = bulkSeqs.reduce((a, b) => (b < a ? b : a), bulkSeqs[0]);
+  /* 这 172800 个号码**必须两两互异**（旧口径下第 1000 个就回绕 ⇒ 这里会是 999 个互异）。 */
+  const bulkOk = bulkSet.size === perDayBound &&
+    bulkSeqs.every(n => n >= 1 && n <= UPLOAD_SEQ_MAX) && bulkMax <= UPLOAD_SEQ_MAX;
+  t.info(`④单日容量读数：连发 ${bulk.length} 次 ⇒ 互异 ${bulkSet.size} 个、最大序号 ` +
+    `${bulkMax}（上界 ${UPLOAD_SEQ_MAX}）、最小 ${bulkMin}；` +
+    `越界 ${bulkSeqs.filter(n => !(n >= 1 && n <= UPLOAD_SEQ_MAX)).length} 个`);
+
+  /* D22：内存副本 ＋ `Module._compile`（先例 `db-check` 的 `E75④`／`E148`；**盘上零字节改动**）。
+     锚点＝生成侧那一行；**逐条自证恰 1 次**后才做替换（`replace(from, () => to)`，规范 9.5-7④）。 */
+  const idPath = path.join(ROOT, 'platform', 'id.js');
+  const idSrc = fs.readFileSync(idPath, 'utf8');
+  const ID_E31_ANCHOR = 'seq = (seq % UPLOAD_SEQ_MAX) + 1;';
+  const ID_E31_LEGACY = "seq = (seq % 999) + 1;";
+  const idAnchorHits = idSrc.split(ID_E31_ANCHOR).length - 1;
+  let idMut = null;
+  if (idAnchorHits === 1) {
+    const ModuleCtorId = require('node:module');
+    const idMutMod = new ModuleCtorId(idPath + '#e31-mut', null);
+    idMutMod.filename = idPath;
+    idMutMod.paths = ModuleCtorId._nodeModulePaths(path.dirname(idPath));
+    /* 回退形态＝"3 位序号 + 域 999"（`E31` 之前的真形态）：**只**换生成侧那一行，
+       判定侧 `isUploadId` 不动 ⇒ 变异体产出的号码会在 999 处回绕并重复。 */
+    const mutSrc = idSrc.replace(ID_E31_ANCHOR, ID_E31_LEGACY)
+      .replace('String(seq).padStart(UPLOAD_SEQ_DIGITS, \'0\')', "String(seq).padStart(3, '0')");
+    idMutMod._compile(mutSrc, idMutMod.filename);
+    idMut = idMutMod.exports;
+  }
+  if (t.requires('`E31`④-D22 前提：能在 `platform\\id.js` 的内存副本里把生成侧回退成"域 999 + 3 位"（锚点各恰 1 次）',
+    idAnchorHits === 1 && Boolean(idMut) && typeof idMut.createUploadIdGenerator === 'function' &&
+    idMut.UPLOAD_SEQ_MAX === UPLOAD_SEQ_MAX,
+    `生成侧锚点命中 ${idAnchorHits} 次（应 1）；副本可建生成器=${Boolean(idMut && idMut.createUploadIdGenerator)}`)) {
+    const mutGen = idMut.createUploadIdGenerator({ clock });
+    const mutSeqs = [];
+    /* 变异体的域是 999 ⇒ 只需 1000 次就能走到回绕点（不必跑满一天） */
+    for (let i = 0; i < 1000; i++) mutSeqs.push(seqOf(mutGen.next()));
+    const mutSet = new Set(mutSeqs);
+    t.check('`E31`④-D22 定点变异（**内存字节副本**，盘上 `platform\\id.js` 零字节改动）：生成侧回退成' +
+      '"域 999 + 3 位序号"（`E31` 之前的形态）⇒ 同一把尺子（互异数 === 发号数）**必红**：' +
+      '1000 次只得 999 个互异（第 1000 次回绕成 001）',
+      idAnchorHits === 1 && mutSet.size === 999 && mutSeqs.includes(1) &&
+      mutSeqs[999] === mutSeqs[0] &&
+      fs.readFileSync(idPath, 'utf8') === idSrc,
+      `变异体 1000 次互异 ${mutSet.size} 个（应 999）；末号 ${mutSeqs[999]} ＝ 首号 ${mutSeqs[0]}；` +
+      `盘上 id.js 逐字节未变=${fs.readFileSync(idPath, 'utf8') === idSrc}`);
+    t.check('`E31`④ 正面判据（**原实现**）：以上同一把尺子在原件上判绿 —— 单日最坏发号量 ' +
+      `${perDayBound} 次**两两互异**、序号恒在 [1, ${UPLOAD_SEQ_MAX}]`,
+      bulkOk && bulkSet.size === perDayBound,
+      `互异 ${bulkSet.size} / 发号 ${perDayBound}；最大序号 ${bulkMax}`);
+  } else {
+    t.check('`E31`④ 正面判据（**原实现**）：单日最坏发号量 ' + perDayBound +
+      ' 次**两两互异**、序号恒在 [1, ' + UPLOAD_SEQ_MAX + ']',
+      bulkOk, `互异 ${bulkSet.size} / 发号 ${perDayBound}；最大序号 ${bulkMax}`);
   }
 }
 

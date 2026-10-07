@@ -183,6 +183,32 @@ const STRUCTURE_UPGRADES = [
      ③ **不得**顺带改 `measure_rt` 的唯一索引 `ux_measure_rt`（DR-13 的幂等键列集固定为
         equip_code + proc_order_no + collect_time，与本题无关，动它等于换去重口径）。 */
   'ALTER TABLE measure_rt ADD COLUMN unit_index INTEGER',
+  /* `E28`（2026-10-07，负责人原文："`E28` 按建议 —— `measure_rt` 增 `cameraDepth` 列，与
+     `depth` 严格区分；同批走迁移清单与 `db-check`"）：`measure_rt` 增列 `camera_depth`
+     （**相机自身水下深度** `cameraDepth`），与 `measure_depth`（**航行器水下深度** `depth`）
+     **语义不同**（`IF-C.9` P0："`depth` 与 `cameraDepth` 语义不同、显示与上报均须严格区分"）
+     ⇒ **两列各写各的：不得合并、不得互相回填**（回填＝把两个物理量混成一个，显示与上报都会失真）。
+     ① **列名/类型以 `schema.sql` 的 DR-04 段为唯一正本**（`camera_depth REAL`，可空）；
+        与落库口 `repo/measure.js` 的 `toParams()` / `INSERT_SQL`、读口
+        `services/uploadReporter.js`（附录 2 的 `cameraDepth`）三处逐列同名同序。
+     ② **本步骤是"老库拿到该列"的唯一交付路径**：`schema.sql` 的 `CREATE TABLE IF NOT EXISTS`
+        对**已存在**的旧表是**空操作**（`E71` / `E73` / `E170` 同一形态）⇒ 只改 `schema.sql`
+        的话，新建库全绿、而结构分化的老库**没有任何门禁会红**，直到第一次真实写入才炸
+        （`table measure_rt has no column named camera_depth` ⇒ 采集链**每一帧都失败**，
+        不是"少记一个相机深度"这种可容忍的降级）。
+     ③ 列**可空** ⇒ 既有行天然合法、**无需数据回填**（一行都不 UPDATE）；"拿不到相机深度"与
+        "相机深度真的是 0"必须分得开 ⇒ **不写** `NOT NULL`、**不放** `DEFAULT`（与
+        `unit_index` 的同族理由）。
+     ④ 重复执行时报 `duplicate column name`，被下面的容错吞掉 —— **天然幂等**。
+     ⑤ **本包不改 `schema.sql`**（该列自首个 `schema.sql` 起就在）⇒ 按 9.5 第 6 条
+        **不升** `SCHEMA_VERSION`：指纹由 `schema.sql` 正文算出、正文未动（先例＝`E73`）。
+     ⑥ ⚠ **配套的 `db-check` 口径必须同批跟上**（判据在 `tests/db-check.js` 里，归座位 4b）：
+        该列当前躺在 `LEGACY_BASELINE_COLUMNS.measure_rt`（＝"老库一定有"）里，而"六之九/静态/
+        口径一致"明写**带 `ADD COLUMN` 步骤的列不得同时写在老库基线里** ⇒ 本步骤落地后，须
+        **同批**把 `camera_depth` 从那条基线里**移出**（不是删步骤）。理由：两处说法相反时，
+        要么步骤是死步骤、要么基线过宽而对该列**失明**；负责人的原话"同批走迁移清单与
+        `db-check`"指的正是这一对动作（读数与 4b 清单见本轮回执）。 */
+  'ALTER TABLE measure_rt ADD COLUMN camera_depth REAL',
   /* E73（**历史遗漏的补齐**，规范 v1.35 · 9.5 第 6 条增补③）：`upload_log` 的 `fail_reason` 与
      `updated_at` 是 2026-09-21（`349feba`）给**已存在**的表加的两列 —— 当时既没有 `STRUCTURE_UPGRADES`
      这一层，也没有任何 `ALTER TABLE` 补列动作（当时的自述是"运行时不再有 `ALTER TABLE` 补列，

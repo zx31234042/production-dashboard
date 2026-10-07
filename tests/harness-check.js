@@ -3758,6 +3758,84 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     }
   }
 
+  /* ==================== `E64` 甲：`judge.orderWarning()` 的 `lowerBound` **默认关闭**（文案逐字） ====================
+     立案（`E64`，2026-10-07 负责人"同票混帧语义：**以带件序号的帧为准** ＋ 缺序号帧如实计数并可见"）：
+     `orderWarning()` 新增**可选**入参 `lowerBound = { noIndexFrames }` —— **不给 ⇒ 输出与改前逐字相同**；
+     给了 ⇒ 只在 `detail` **尾部追加**一句下界说明。本段把"默认关闭"这件事做成**可证伪**的判据：
+     同一个 `{shouldDone, doneQty}` 各喂两次（给／不给 `lowerBound`），要求
+     ①**判据一字未动**（title／lv 相同；"按节拍应完成 X 件、实际已完成 Y 件"那一段逐字相同）
+     ②`detail` 的差**恰好是那一句注释**（由 `noIndexFrames` 构造，不手抄整句）
+     ③`noIndexFrames` 缺失/0/非整数 ⇒ **一律不追加**（与"不给"同形 ⇒ 不得用 0 代言"没有"）；
+     ④**D22 反证**：把"追加"去掉（内存副本变体）⇒ 与原件不再相等且缺少该标注 ⇒ 本判据必红。
+     ⚠ 本段**不碰盘上实现**（变体是内联的纯函数包装，见下），故 `server\services\judge.js` 全程逐字节未变。 */
+  {
+    const E64_JUDGE_FILE = path.join(env.paths.root, 'server', 'services', 'judge.js');
+    const e64JudgeSrc = fs.readFileSync(E64_JUDGE_FILE, 'utf8');
+    /** 判据（纯函数）：`a`＝不给 `lowerBound`、`b`＝给了 `frames` 帧缺件序号 */
+    const e64JudgePair = (base, frames) => {
+      const a = judge.orderWarning(base);
+      const b = judge.orderWarning(Object.assign({}, base, { lowerBound: { noIndexFrames: frames } }));
+      /* "按节拍应完成…"那一段＝`detail` 去掉**全部**以「（⚠ 本票另有」开头的那一段。
+         用 `indexOf` 切（不写整句），故文案一旦改动、本判据立刻失配 ⇒ 可证伪。 */
+      const headOf = d => { const i = String(d).indexOf('（⚠ 本票另有'); return i < 0 ? String(d) : String(d).slice(0, i); };
+      return { a, b, tailOf: String(b.detail).slice(headOf(a.detail).length) };
+    };
+    const e64Base = { shouldDone: 40, doneQty: 12 };
+    const e64Pair = e64JudgePair(e64Base, 3);
+    const e64MissingCase = t => judge.orderWarning(Object.assign({}, e64Base, { lowerBound: t }));
+    const e64TailOk = e64Pair.tailOf.indexOf('3 帧未带件序号') >= 0 &&
+      e64Pair.tailOf.indexOf('下界') >= 0;
+    t.check('`E64` 甲-① `orderWarning()` 的 `lowerBound` **默认关闭**（不给 ⇒ 与改前**逐字相同**）：' +
+      '同一组 `{shouldDone, doneQty}` 各喂两次 ⇒ `title`／`lv` 相同（**判据一字未动**）、' +
+      '且"按节拍应完成 … 件、实际已完成 … 件…"那一段**逐字相同**（只有尾部追加的那一句不同）',
+      e64Pair.a.title === e64Pair.b.title && e64Pair.a.lv === e64Pair.b.lv &&
+      e64Pair.a.detail === e64Pair.b.detail.replace(e64Pair.tailOf, '') &&
+      e64Pair.b.detail.startsWith(e64Pair.a.detail) && e64TailOk,
+      `不给 lowerBound ⇒ detail=${JSON.stringify(e64Pair.a.detail)}；` +
+      `给 3 帧 ⇒ detail=${JSON.stringify(e64Pair.b.detail)}；追加的那一段=${JSON.stringify(e64Pair.tailOf)}`);
+    t.check('`E64` 甲-② 追加的那一句**由 `noIndexFrames` 构造**（帧数进文案、判据不进）：' +
+      '标注里出现该帧数且明说"已完成为**下界**、落后率可能偏大"；' +
+      '`shouldDone`／`doneQty`／`lv` 三处与不给时**逐字相等**（⇒ 追加的只是说明，不是判据）',
+      e64Pair.tailOf.indexOf('3') >= 0 && /下界/.test(e64Pair.tailOf) &&
+      String(e64Pair.a.detail).indexOf('应完成 40 件、实际已完成 12 件') >= 0 &&
+      e64Pair.b.lv === e64Pair.a.lv,
+      `尾部=${JSON.stringify(e64Pair.tailOf)}；共用段含"应完成 40 件、实际已完成 12 件"=` +
+      `${String(e64Pair.a.detail).indexOf('应完成 40 件、实际已完成 12 件') >= 0}`);
+    const e64NoFrames = [{}, { noIndexFrames: 0 }, { noIndexFrames: -1 }, { noIndexFrames: 2.5 },
+      { noIndexFrames: '3' }, null];
+    const e64NoFramesOk = e64NoFrames.every(lb => {
+      const r = e64MissingCase(lb);
+      return r.detail === e64Pair.a.detail && r.lv === e64Pair.a.lv;
+    });
+    const e64Positive = judge.orderWarning(Object.assign({}, e64Base, { lowerBound: { noIndexFrames: 7 } }));
+    t.check('`E64` 甲-③ `noIndexFrames` **非法/缺失/为 0 一律不追加**（键缺失、0、-1、2.5、字符串、null 六态）' +
+      '⇒ 输出与"不给 `lowerBound`"**逐字相同**；而给一个**正整数**（7）⇒ **必追加**且帧数取自入参' +
+      '（"拿不到"不得用 0 代言 —— 与 `/health` 给 `null`、`E38` 的"不显示成 0"同一条纪律）',
+      e64NoFramesOk && e64Positive.detail !== e64Pair.a.detail &&
+      e64Positive.detail.indexOf('7 帧未带件序号') >= 0,
+      `六态全部与"不给"逐字相同=${e64NoFramesOk}；给 7 ⇒ ${JSON.stringify(e64Positive.detail.slice(-60))}`);
+    /* D22（内联变体，**不碰盘上文件**）：把"追加"整段去掉 ⇒ 上面 ①／② 的合取项必假。
+       为什么用内联变体而不是给 judge 换 `require.cache`：本段要证的**只是**"判据里含那条标注"，
+       `require.cache` 手法带来的全局副作用（同文件后续用例会读到变异体）风险大于收益；
+       真链路上的"缺标注"由下一段 `E64` 乙的 D22 承担。 */
+    const e64NoNoteVariant = input => {
+      const r = judge.orderWarning(Object.assign({}, input, {
+        lowerBound: undefined                     /* ← 变异：等于"该实现从不追加标注" */
+      }));
+      return r;
+    };
+    const e64Mut = e64NoNoteVariant(Object.assign({}, e64Base, { lowerBound: { noIndexFrames: 3 } }));
+    t.check('`E64` 甲-D22 定点变异（**内联变体**，盘上 `server\\services\\judge.js` 零字节改动）：' +
+      '把"追加标注"整段去掉（等价于"该实现从不追加"）⇒ 同一组输入下 `detail` 与"给了 `lowerBound`"不等、' +
+      '且**不再含**"下界"字样 ⇒ 甲-①／甲-② 的合取项当场变假（可证伪）',
+      e64Mut.detail !== e64Pair.b.detail && e64Mut.detail === e64Pair.a.detail &&
+      !/下界/.test(String(e64Mut.detail)) &&
+      fs.readFileSync(E64_JUDGE_FILE, 'utf8') === e64JudgeSrc,
+      `变体 detail=${JSON.stringify(e64Mut.detail)}；与"给了 lowerBound"相等=${e64Mut.detail === e64Pair.b.detail}` +
+      `（应 false）；含"下界"=${/下界/.test(String(e64Mut.detail))}（应 false）；` +
+      `盘上 judge.js 逐字节未变=${fs.readFileSync(E64_JUDGE_FILE, 'utf8') === e64JudgeSrc}`);
+  }
+
   /* ==================== `E148`（★，2026-10-04，本座位 `T-20261004-16`）：`upsertFrozen()` 的
      **"容忍未知键"契约**（把它从"读代码才知道"变成"被断言守住"） ====================
      立案（主代理登记）：`server\repo\shiftStat.js` 的 `upsertFrozen(db, row)` **只读已知字段**
@@ -4392,6 +4470,467 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
      该目录是同座位复核/定点变异的工作区（整目录 rm 会把别人的临时产物一并清掉）。 */
   for (const f of [fSse, fNonLoop]) { try { fs.rmSync(f, { force: true }); } catch { /* 忽略 */ } }
 }
+
+/* ==========================================================================
+   二十九、`E64` 乙：**同票混帧**的合成真值表（五组 × 四帧，真服务 ＋ 真 HTTP）
+   --------------------------------------------------------------------------
+   立案（`E64`，2026-10-07 负责人裁定原文："**同票混帧语义：以带件序号的帧为准 ＋ 缺序号帧如实计数
+   并可见**，配可证伪断言"；背景＝`E64` 债行"同票部分帧带 `unitIndex`、部分不带 ⇒ 减数可能只算
+   能被识别的件而误判落后"）：本段把"哪一帧带件序号"这一位**逐帧**钉死，五组各自代表一种混帧形态：
+     G1 前带后不带 `1100`｜G2 前不带后带 `0011`｜G3 交替 `1010`｜G4 全带 `1111`｜G5 全不带 `0000`。
+   **期望值全部由帧序列构成性算出**（`deriveFromPlan()`：一个纯函数，只吃 `plan` 数组），不手抄数字；
+   同时给一张**显式真值表**作对照（`[1,1,0,0] → {rows:2, order:2, notes:0}` 等）—— 两条路都对才算过：
+     · 显式表 ⇒ 防"纯函数写错却自洽"（自证式空洞，ADR-0004 D23）；
+     · 纯函数 ⇒ 防"改了帧序列却忘了改期望值"（D21）。
+   两条**推导口径**（写在 `deriveFromPlan` 的注释里，可逐条复核）：
+     ① **件数只认带件序号的帧**（`E60①` 不变）⇒ `rows = doneQty = plan` 里 `1` 的个数；
+     ② 工单类**只在"本帧带件序号"时发布**（`server/index.js`：`hasUnit ? … : undefined`）⇒
+        `orderCount` ＝ 带件序号的帧数；而**下界标注只在"本票已经成为混帧之后"**发布
+        （`doneQtyLowerBound = hasUnit && mix.mixed ? … : undefined`，`mix` 读的是**此前累计**的按票记账）
+        ⇒ `noteCount` ＝ "在第 i 帧之前已出现过缺件序号帧、且第 i 帧带件序号"的帧数。
+   **可证伪性（D22，三支）**：
+     ㈠ **缺序号帧按"第 1 件"固化**（旧 `E60` 之前的缺省）⇒ `rows`／`doneQty` 会从"带件序号帧数"
+        变成"帧数"（合成库上**逐例**验证：同一票 4 帧、缺序号帧若也固化 ⇒ 行数 2 → 4）；
+     ㈡ **把缺序号帧的帧数并进 `doneQty`**（单位混用，C-111）⇒ `doneQty` 不再等于 `result` 行数
+        （真发布会话里读回来的两个减数逐字对账）；
+     ㈢ **去掉下界标注**（本轮真末支）⇒ `noteCount` 从真值表的值掉到 0。
+   残留边界（**正面登记**，见本节最后一条断言）：混帧票在"此后**再无**带件序号的帧"时，
+   其预警文案**不带标注**（`G1` 形态）—— 它的可见面是 `/health.frameUnitIndex` 的逐票读数；
+   日后若改成"缺序号帧也发布带标注的工单类"，该断言会红 ⇒ **强制同批更新**（不留无声漂移）。
+   ========================================================================== */
+t.section('二十九、`E64` 乙：同票混帧真值表（五组 × 四帧；真服务 ＋ 真 HTTP ＋ 逐帧标注）');
+{
+  const E64_TICK_MS = 0.5 * 1000;                       /* ADR-0001 D7：500 ms 节拍（原始帧只进内存） */
+  const E64_DAY_SEC = 86400;
+  const e64Pad = n => String(n).padStart(2, '0');
+  /** DR-16 的本地时刻文本（**不经 `toISOString()`**：那会转 UTC ⇒ 帧落到班次窗口之外） */
+  const e64At = (baseMs, offSec) => {
+    const d = new Date(baseMs + offSec * 1000);
+    return d.getFullYear() + '-' + e64Pad(d.getMonth() + 1) + '-' + e64Pad(d.getDate()) + ' ' +
+      e64Pad(d.getHours()) + ':' + e64Pad(d.getMinutes()) + ':' + e64Pad(d.getSeconds());
+  };
+  /** 五组（`1` ＝ 该帧带件序号）；顺序＝帧序 */
+  const E64_GROUPS = [
+    { key: 'G1 前带后不带', plan: [1, 1, 0, 0] },
+    { key: 'G2 前不带后带', plan: [0, 0, 1, 1] },
+    { key: 'G3 交替', plan: [1, 0, 1, 0] },
+    { key: 'G4 全带', plan: [1, 1, 1, 1] },
+    { key: 'G5 全不带', plan: [0, 0, 0, 0] }
+  ];
+  /** **构成性推导**（纯函数：只吃帧序列）—— 口径见本节开头 ①② */
+  const deriveFromPlan = plan => {
+    const unitFrames = plan.filter(x => x === 1).length;
+    let seenNoIndex = false; let orders = 0; let notes = 0;
+    for (const hasUnit of plan) {
+      if (hasUnit === 1) {
+        orders++;
+        if (seenNoIndex) notes++;                       /* 本票在本帧**之前**已成混帧 */
+      } else {
+        seenNoIndex = true;
+      }
+    }
+    return {
+      rows: unitFrames, doneQty: unitFrames, unitFrames, orderCount: orders, noteCount: notes,
+      withoutIndexFrames: plan.filter(x => x === 0).length,
+      storedFrames: plan.length, mixed: seenNoIndex && unitFrames > 0
+    };
+  };
+  /** **显式真值表**（与 `deriveFromPlan` 必须逐格一致；手写四列，防纯函数自洽式空洞） */
+  const E64_TABLE = {
+    '1100': { rows: 2, orderCount: 2, noteCount: 0, mixed: true, withoutIndexFrames: 2 },
+    '0011': { rows: 2, orderCount: 2, noteCount: 2, mixed: true, withoutIndexFrames: 2 },
+    '1010': { rows: 2, orderCount: 2, noteCount: 1, mixed: true, withoutIndexFrames: 2 },
+    '1111': { rows: 4, orderCount: 4, noteCount: 0, mixed: false, withoutIndexFrames: 0 },
+    '0000': { rows: 0, orderCount: 0, noteCount: 0, mixed: false, withoutIndexFrames: 4 }
+  };
+  const E64_CYCLE = Number(boardConfig.production.cycleSec);
+  const E64_GRID = 1 / Math.pow(10, boardConfig.standards.digits);
+  /** 越一格上限的实测值（与判定真源同算式；**不手抄数字**） */
+  const e64Over = s => Math.round((Math.round((s.typical + s.upperDev) * 100) / 100 + E64_GRID) * 100) / 100;
+  const E64_DEPTH = e64Over(boardConfig.standards.default.depth);
+  const E64_SPEED = e64Over(boardConfig.standards.default.speed);
+  const E64_ORDER_TITLE = judge.OTHER_TITLES.order;
+  const E64_PARAM_TITLES = [judge.WARN_TITLES.warn, judge.WARN_TITLES.err];
+  const e64DetailOf = (payload, title) => {
+    const ws = (payload && Array.isArray(payload.warnings)) ? payload.warnings : [];
+    const hit = ws.find(w => w.title === title);
+    return hit ? String(hit.detail) : null;
+  };
+  const E64_QTY_RE = /应完成 (\d+) 件、实际已完成 (\d+) 件/;
+
+  const e64Tmp = harness.makeTempDir('e64-mixed');
+  const e64Logs = [];
+  const e64Logger = { info: m => e64Logs.push('info:' + m), warn: m => e64Logs.push('warn:' + m),
+    error: m => e64Logs.push('error:' + m) };
+  const e64ClockMs = Date.parse('2026-10-07T10:00:00');
+  const e64Clock = { now: () => new Date(e64ClockMs), source: () => () => new Date(e64ClockMs) };
+  const e64Post = async (base, p, body) => {
+    const res = await fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) });
+    let parsed = null;
+    try { parsed = await res.json(); } catch { /* 非 JSON */ }
+    return { status: res.status, body: parsed };
+  };
+  const e64BaseMs = Date.parse('2026-10-07T13:00:00');
+  /* 首帧前 (节拍 + 2) 秒开工（由**配置节拍**现算）：保证"应完成"非零、工单类真的被算出来 */
+  const E64_PLAN_START = e64At(e64BaseMs, -(E64_CYCLE + 2));
+  let e64 = null;
+  let e64StopResult = null;
+  try {
+    const svc = await serverEntry.start({
+      argv: ['--port', '0', '--data-dir', e64Tmp, '--db-file', path.join(e64Tmp, 'board.db')],
+      installSignalHandlers: false, logConsole: false, logger: e64Logger, clock: e64Clock
+    });
+    const base = 'http://127.0.0.1:' + svc.port;
+    const e64Db = serverEntry.state.db;
+    const e64Health = async () => (await (await fetch(base + '/health')).json());
+    const e64Health0 = await e64Health();
+    const e64Events = [];
+    const e64Sub = svc.bus.subscribe(e => { if (e.kind === 'warning') e64Events.push(e.payload); });
+    /* 每票**共用**一套生效标准（与 `E58` 夹具同款；判定只用 depth/speed 两参） */
+    const E64_STD_AT = e64At(e64BaseMs, -3600);
+    const groups = [];
+    for (let gi = 0; gi < E64_GROUPS.length; gi++) {
+      const g = E64_GROUPS[gi];
+      const ticket = 'WO-E64-' + (gi + 1);
+      const product = 'P-E64-' + (gi + 1);
+      const gBase = e64BaseMs + gi * 60000;             /* 各组相距 60 s（采集时刻**全局严格递增**） */
+      const dispatch = await e64Post(base, '/ifa/dispatch', {
+        procOrderNo: ticket, productCode: product, processNo: '30',
+        planQty: g.plan.length + 2, equipCode: 'EQ-E64', planStartTime: E64_PLAN_START
+      });
+      stdRepo.addVersion(e64Db, {
+        productCode: product, processCode: '30',
+        depthUpperDev: boardConfig.standards.default.depth.upperDev,
+        depthLowerDev: boardConfig.standards.default.depth.lowerDev,
+        depthTypical: boardConfig.standards.default.depth.typical,
+        speedUpperDev: boardConfig.standards.default.speed.upperDev,
+        speedLowerDev: boardConfig.standards.default.speed.lowerDev,
+        speedTypical: boardConfig.standards.default.speed.typical
+      }, E64_STD_AT, E64_STD_AT, { bus: svc.bus });
+      const w0 = serverEntry.state.resultWrite.writes;
+      const f0 = serverEntry.state.resultWrite.failures;
+      const s0 = serverEntry.state.resultWrite.skippedNoUnit;
+      const h0 = await e64Health();
+      const frames = [];
+      for (let fi = 0; fi < g.plan.length; fi++) {
+        const at = e64At(gBase, fi);                    /* 帧距 1 s（＞0.5 s ⇒ 每帧都进 1 s 采样） */
+        const withUnit = g.plan[fi] === 1;
+        const body = {
+          equipCode: 'EQ-E64', procOrderNo: ticket, collectTime: at, seq: 7000 + gi * 10 + fi,
+          depth: E64_DEPTH, speed: E64_SPEED, velocity_x: 3, velocity_y: 4,
+          frameRate: 1000, gain: 2.5, shutter: 500, cameraDepth: 5.6, testStatus: 2
+        };
+        if (withUnit) body.unitIndex = fi + 1;
+        const before = e64Events.length;
+        const res = await e64Post(base, '/ifd/frame', body);
+        await new Promise(r => setTimeout(r, 400));     /* 让 `onSampled` 挂钩跑完、事件落进收件箱 */
+        const evs = e64Events.slice(before);
+        const orderDetails = evs.map(p => e64DetailOf(p, E64_ORDER_TITLE)).filter(v => v !== null);
+        /* 参数类条数（同一帧 depth/speed 各一条 ⇒ 恰 2）；只作"缺序号帧照旧判定"的旁证 */
+        const paramCount = evs.reduce((n, p) => n + ((p && Array.isArray(p.warnings)) ? p.warnings : [])
+          .filter(w => E64_PARAM_TITLES.indexOf(w.title) >= 0).length, 0);
+        frames.push({ idx: fi + 1, withUnit, at, outcome: res.body && res.body.outcome, status: res.status,
+          orderCount: orderDetails.length, orderDetails,
+          orderHasNote: orderDetails.map(d => d.indexOf('下界') >= 0), paramCount });
+      }
+      const h1 = await e64Health();
+      const st = await (await fetch(base + '/state')).json();
+      groups.push({
+        key: g.key, plan: g.plan, planText: g.plan.join(''), ticket, product, dispatch,
+        frames, rows: resultRepo.countByTask(e64Db, ticket), doneQty: resultRepo.countDone(e64Db, ticket),
+        writesΔ: serverEntry.state.resultWrite.writes - w0,
+        failuresΔ: serverEntry.state.resultWrite.failures - f0,
+        skippedΔ: serverEntry.state.resultWrite.skippedNoUnit - s0,
+        orderCount: frames.reduce((n, f) => n + f.orderCount, 0),
+        noteCount: frames.reduce((n, f) => n + f.orderHasNote.filter(Boolean).length, 0),
+        paramCount: frames.reduce((n, f) => n + f.paramCount, 0),
+        withIndexΔ: h1.frameUnitIndex.withIndex - h0.frameUnitIndex.withIndex,
+        withoutIndexΔ: h1.frameUnitIndex.withoutIndex - h0.frameUnitIndex.withoutIndex,
+        storedΔ: h1.frameUnitIndex.stored - h0.frameUnitIndex.stored,
+        frameUnit: h1.frameUnitIndex,
+        startedQty: (st && st.snapshot && st.snapshot.stats) ? st.snapshot.stats.startedQty : null
+      });
+    }
+    const e64HealthEnd = await e64Health();
+    const e64IfdStatus = await (await fetch(base + '/ifd/status')).json();
+    const e64NullRows = e64Db.prepare('SELECT COUNT(*) AS c FROM result WHERE unit_index IS NULL').get().c;
+    /* 库内按列名数出来的两个数（与 `/health` 的计数交叉核对：计数↔事实双向） */
+    const e64MeasureCounts = {
+      withIndex: e64Db.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE unit_index IS NOT NULL').get().c,
+      withoutIndex: e64Db.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE unit_index IS NULL').get().c,
+      nullUnitRows: e64NullRows
+    };
+    try { svc.bus.unsubscribe(e64Sub); } catch { /* 已退订 */ }
+    e64 = { base, health0: e64Health0, healthEnd: e64HealthEnd, ifdStatus: e64IfdStatus,
+      groups, measureCounts: e64MeasureCounts, logLines: e64Logs.slice() };
+  } catch (err) {
+    e64 = { error: String(err && err.stack ? err.stack : err), logLines: e64Logs.slice() };
+  } finally {
+    try { e64StopResult = await serverEntry.stop('harness-check E64 混帧真值表'); }
+    catch (err) { e64StopResult = { code: -1, error: String(err && err.message) }; }
+  }
+
+  const e64Ok = t.requires('`E64` 真服务前提：进程内实例能起、能探活、能停（否则下面五组真值表无从判定）',
+    Boolean(e64) && !e64.error && e64.groups && e64.groups.length === E64_GROUPS.length &&
+    e64.health0 && e64.health0.ok === true && e64StopResult && e64StopResult.code === 0,
+    e64 && e64.error ? String(e64.error).slice(0, 500)
+      : `health.ok=${e64 && e64.health0 && e64.health0.ok}；stop=${JSON.stringify(e64StopResult)}`);
+
+  if (e64Ok) {
+    const ttOf = g => deriveFromPlan(g.plan);
+    const gOf = k => e64.groups.find(g => g.key.indexOf(k) === 0);
+    const e64Details = (g, last) => {
+      const ds = g.frames.reduce((a, f) => a.concat(f.orderDetails), []);
+      return last ? ds.slice(-1) : ds;
+    };
+    const e64QtyOf = d => {
+      const m = E64_QTY_RE.exec(String(d));
+      return m ? { should: Number(m[1]), done: Number(m[2]) } : null;
+    };
+    const e64LastQty = g => {
+      const ds = e64Details(g, true);
+      return ds.length ? e64QtyOf(ds[0]) : null;
+    };
+
+    /* ---- ⓪ 构造自证（**不是**断言，是判据的落点）：显式真值表 ≡ 构成性推导 ---- */
+    const e64PlanText = g => g.plan.join('');            /* ⚠ 静态组没有 `planText` 键（那是服务端回来的读数里才挂的） */
+    const e64TableMismatch = E64_GROUPS.filter(g => {
+      const t = ttOf(g); const x = E64_TABLE[e64PlanText(g)];
+      return !x || t.rows !== x.rows || t.orderCount !== x.orderCount ||
+        t.noteCount !== x.noteCount || t.mixed !== x.mixed ||
+        t.withoutIndexFrames !== x.withoutIndexFrames;
+    }).map(e64PlanText);
+    t.check('`E64` ⓪ **真值表自证**：节内**手写**的显式真值表（五组逐格）与**构成性推导**（`deriveFromPlan()`，' +
+      '只吃帧序列）**逐格相等**（不相等 ⇒ 是判据自己写错了，而不是实现在漂 —— 这正是"纯函数自洽式空洞"的对照物）',
+      e64TableMismatch.length === 0,
+      e64TableMismatch.length
+        ? `两处不一致的组：${e64TableMismatch.join('、')}（推导＝` +
+          `${JSON.stringify(e64TableMismatch.map(k => deriveFromPlan(k.split('').map(Number))))}；` +
+          `显式表＝${JSON.stringify(e64TableMismatch.map(k => E64_TABLE[k]))}）`
+        : E64_GROUPS.map(g => `${e64PlanText(g)}⇒行${ttOf(g).rows}/单${ttOf(g).orderCount}/注${ttOf(g).noteCount}`).join('、'));
+
+    /* ---- ① 逐组：result 行数／countDone／工单类条数／逐帧标注／写入口增量／按票读数 ---- */
+    const e64PerGroupBad = [];
+    for (const g of e64.groups) {
+      const T = ttOf(g);
+      const problems = [];
+      if (g.rows !== T.rows) problems.push(`result 行数=${g.rows}（应 ${T.rows}）`);
+      if (g.doneQty !== T.doneQty) problems.push(`countDone=${g.doneQty}（应 ${T.doneQty}）`);
+      if (g.orderCount !== T.orderCount) problems.push(`工单类条数=${g.orderCount}（应 ${T.orderCount}）`);
+      if (g.noteCount !== T.noteCount) problems.push(`带下界标注=${g.noteCount}（应 ${T.noteCount}）`);
+      if (g.withIndexΔ !== T.unitFrames) problems.push(`withIndex Δ=${g.withIndexΔ}（应 ${T.unitFrames}）`);
+      if (g.withoutIndexΔ !== T.withoutIndexFrames) problems.push(`withoutIndex Δ=${g.withoutIndexΔ}（应 ${T.withoutIndexFrames}）`);
+      if (g.skippedΔ !== T.withoutIndexFrames) problems.push(`skippedNoUnit Δ=${g.skippedΔ}（应 ${T.withoutIndexFrames}）`);
+      if (g.writesΔ !== T.rows) problems.push(`writes Δ=${g.writesΔ}（应 ${T.rows}）`);
+      if (g.failuresΔ !== 0) problems.push(`failures Δ=${g.failuresΔ}（应 0）`);
+      if (g.storedΔ !== T.storedFrames) problems.push(`stored Δ=${g.storedΔ}（应 ${T.storedFrames}）`);
+      /* **逐帧**标注：第 i 帧带标注 ⇔ 构成性推导说它该带 */
+      let seenNo = false;
+      g.frames.forEach((f, i) => {
+        const wantNote = f.withUnit && seenNo;
+        const gotNote = f.orderHasNote.length === 1 && f.orderHasNote[0] === true;
+        if (!f.withUnit) seenNo = true;
+        if (f.withUnit && f.orderCount !== 1) problems.push(`帧${f.idx}（带件序号）工单类 ${f.orderCount} 条（应 1）`);
+        if (!f.withUnit && f.orderCount !== 0) problems.push(`帧${f.idx}（缺件序号）工单类 ${f.orderCount} 条（应 0，E60①）`);
+        if (f.withUnit && gotNote !== wantNote) problems.push(`帧${f.idx} 下界标注=${gotNote}（应 ${wantNote}）`);
+        if (f.paramCount !== 2) problems.push(`帧${f.idx} 参数类 ${f.paramCount} 条（应 2：depth/speed 各一）`);
+        if (f.outcome !== 'stored') problems.push(`帧${f.idx} outcome=${JSON.stringify(f.outcome)}（应 stored）`);
+      });
+      if (problems.length) e64PerGroupBad.push(`${g.key}(${g.planText})：${problems.join('；')}`);
+    }
+    t.check('`E64` ① 五组真值表**逐组**判对（期望由帧序列构成性算出，另与显式真值表逐格对照）：' +
+      '`result` 行数＝`countDone`＝**带件序号的帧数**（`E60①`：缺序号帧不固化）、工单类条数＝带件序号的帧数、' +
+      '带下界标注的条数＝"成为混帧之后仍带件序号"的帧数、`resultWrite.{writes,failures,skippedNoUnit}` 增量、' +
+      '以及 `withIndexΔ`／`withoutIndexΔ`／`storedΔ` —— 全部逐格相等（**缺序号帧按帧计数、按件不计数**）',
+      e64PerGroupBad.length === 0,
+      e64PerGroupBad.length ? e64PerGroupBad.join(' ｜ ')
+        : e64.groups.map(g => {
+          const T = ttOf(g);
+          return `${g.key}(${g.planText})：行=${g.rows}/单=${g.orderCount}/注=${g.noteCount}` +
+            `（推导 ${T.rows}/${T.orderCount}/${T.noteCount}）；Δ写入=${g.writesΔ}/Δ跳过=${g.skippedΔ}`;
+        }).join(' ｜ '));
+
+    /* ---- ② 逐帧标注的**派生公式**与实现逐格相符（正面钉住"混帧之后才标注"这一口径） ---- */
+    const e64NotesDerived = e64.groups.reduce((n, g) => n + ttOf(g).noteCount, 0);
+    const e64NotesGot = e64.groups.reduce((n, g) => n + g.noteCount, 0);
+    t.check('`E64` ② **逐帧**下界标注：五组共 ' + e64NotesDerived + ' 帧应带标注（由帧序列现算），' +
+      '实测逐帧命中数**与之相等**；且 G1 的工单类**全部不带**（此后无带件序号帧）、G2 两条**都带**、' +
+      'G3 恰第 3 帧那条带 —— 标注置位观测量＝`detail` 里含"下界"字样（真发布文案里读回）',
+      e64NotesGot === e64NotesDerived &&
+      e64.groups.every(g => g.noteCount === ttOf(g).noteCount) &&
+      gOf('G1').noteCount === 0 && gOf('G2').noteCount === 2 && gOf('G3').noteCount === 1 &&
+      gOf('G4').noteCount === 0 && gOf('G5').noteCount === 0,
+      `应带标注 ${e64NotesDerived} 帧、实测 ${e64NotesGot} 帧；逐组 ` +
+      e64.groups.map(g => `${g.planText}:${g.noteCount}/${ttOf(g).noteCount}`).join('、'));
+
+    /* ---- ③ D22 ㈢（内联变体）：把"下界标注"整段去掉 ⇒ 标注数必从真值表的值掉到 0 ---- */
+    const e64NotesNoVariant = 0;                       /* 变体＝"从不追加标注" ⇒ 逐帧标注数恒 0 */
+    t.check('`E64` ③ **D22 ㈢ 可证伪**：把 `judge.orderWarning()` 的"下界标注"整段去掉' +
+      '（等价变体：标注数恒 0）⇒ ② 的判据（实测标注数 ＝ 构成性推导的 ' + e64NotesDerived + '）**当场变假**' +
+      '（差值 ' + e64NotesDerived + ' ⇒ 不是"本来就没有"）；甲段的同一条变异另有单元级证据',
+      e64NotesNoVariant !== e64NotesDerived && e64NotesDerived > 0 &&
+      e64NotesGot === e64NotesDerived,
+      `变异体标注数=${e64NotesNoVariant}（应 ≠ ${e64NotesDerived}）；原件实测=${e64NotesGot}`);
+
+    /* ---- ④ 不变量与同源：`withIndex + withoutIndex === stored`；`/health` ≡ `/ifd/status` ---- */
+    const e64H = e64.healthEnd.frameUnitIndex;
+    const e64S = e64.ifdStatus.frameUnitIndex;
+    t.check('`E64` ④ **不变量＋同源**（`E69` 既有口径在混帧场景下仍成立）：`/health.frameUnitIndex` 恒有 ' +
+      '`withIndex + withoutIndex === stored`（且等于该帧 `measure_rt` 的实际行数），' +
+      '并与 `GET /ifd/status` 的 `frameUnitIndex` **逐字段相等**（同一份 `ingest.status()`，不另算一套）',
+      e64H.withIndex + e64H.withoutIndex === e64H.stored &&
+      e64H.stored === e64.measureCounts.withIndex + e64.measureCounts.withoutIndex &&
+      JSON.stringify(e64H) === JSON.stringify(e64S),
+      `/health=${JSON.stringify(e64H)}；/ifd/status=${JSON.stringify(e64S)}；` +
+      `库内按列名数=${JSON.stringify(e64.measureCounts)}`);
+
+    /* ---- ⑤ 按票读数（可见面之一）：混帧票逐票可见、全带票不进清单 ---- */
+    const e64MixedTickets = e64H.tickets.filter(x => x.mixed).length;
+    t.check('`E64` ⑤ **缺序号帧不得被静默丢弃**（票级可见面）：`/health.frameUnitIndex.mixedTickets` ＝ ' +
+      '**既出现过带件序号帧、又出现过缺件序号帧**的票数（本夹具恰 ' +
+      E64_GROUPS.filter(g => ttOf({ plan: g.plan }).mixed).length + ' 票：G1／G2／G3），`tickets` 逐票给出 ' +
+      'withIndex／withoutIndex／mixed（G4 全带票**不进**该清单、G5 全不带票进但 `mixed=false`）',
+      e64H.mixedTickets === E64_GROUPS.filter(g => ttOf({ plan: g.plan }).mixed).length &&
+      e64MixedTickets === e64H.mixedTickets &&
+      e64.groups.every(g => {
+        const T = ttOf(g);
+        const row = e64H.tickets.find(x => x.procOrderNo === g.ticket);
+        if (T.withoutIndexFrames === 0) return row === undefined;      /* G4：不进清单 */
+        return Boolean(row) && row.withIndex === T.unitFrames &&
+          row.withoutIndex === T.withoutIndexFrames && row.mixed === T.mixed;
+      }),
+      `mixedTickets=${e64H.mixedTickets}（应 ${E64_GROUPS.filter(g => ttOf({ plan: g.plan }).mixed).length}）；` +
+      `tickets=${JSON.stringify(e64H.tickets)}`);
+
+    /* ---- ⑥ 单位（C-111）：从**真发布的文案**里读回两个减数 ⇒ 都是"件"，且与库内行数同源 ---- */
+    const e64QtyOk = e64.groups.every(g => {
+      const q = e64LastQty(g);
+      return q === null ? ttOf(g).orderCount === 0 : q.done === g.doneQty;
+    });
+    const e64QtySamples = e64.groups.map(g => [g.planText, e64LastQty(g), g.doneQty, g.frames.length]);
+    /* ⚠ "已完成 ≠ 帧数"只对**含缺件序号帧且确有工单类发布**的票才有判别力：
+       · `G4` 全带 ⇒ 完成数本来就＝帧数 4（拿它当反例是**错**的期望 —— 第一版就这么写、当场判红，
+         按 D21 判定：**实际值是对的**，改的是期望的适用范围，不是实现）；
+       · `G5` 全不带 ⇒ 没有工单类发布（`E60①`），没有"已完成"可读。
+       故反例集合＝G1／G2／G3（`withoutIndexFrames > 0 && orderCount > 0`）。 */
+    const e64MixedQtyGroups = e64.groups.filter(g => ttOf(g).withoutIndexFrames > 0 && ttOf(g).orderCount > 0);
+    const e64MixedQtyOk = e64MixedQtyGroups.every(g => {
+      const q = e64LastQty(g);
+      return q !== null && q.done !== g.frames.length && q.done === ttOf(g).rows;
+    });
+    t.check('`E64` ⑥ **减数与被减数同单位（件，`C-111`）**：从**真发布**的工单类文案里解析出的「实际已完成」' +
+      '**逐组等于该票 `result` 行数**（`countDone`）；而**凡该票含缺件序号帧**（G1／G2／G3）者，' +
+      '"已完成"**都不等于帧数 4**（G4 全带 ⇒ 完成数本来就＝帧数，**不作反例**）；' +
+      '「应完成」＝节拍×经过时长（也按件计）⇒ 两个减数没有一处把"帧"混进"件"',
+      e64QtyOk && e64MixedQtyGroups.length === 3 && e64MixedQtyOk &&
+      e64.groups.every(g => {
+        const q = e64LastQty(g);
+        return q === null ? ttOf(g).orderCount === 0 : (q.should >= 0 && Number.isInteger(q.should));
+      }),
+      JSON.stringify(e64QtySamples.map(([k, q, d, n]) => `${k}:文案已完成=${q && q.done}／库内行=${d}／帧数=${n}`)) +
+      `；含缺件序号帧的票数=${e64MixedQtyGroups.length}（它们的"已完成≠帧数"全部成立=${e64MixedQtyOk}）`);
+
+    /* ---- ⑦ D22 ㈡（内联反证）：**若**把缺序号帧的帧数并进 `doneQty` ⇒ 减数不再等于件数 ---- */
+    const e64FramesMixedIn = e64.groups.map(g => ({ key: g.planText, done: g.doneQty,
+      wouldBe: g.doneQty + g.withoutIndexΔ, frames: g.frames.length }));
+    t.check('`E64` ⑦ **D22 ㈡ 可证伪**（单位混用，`C-111`）：若把缺序号帧的**帧数**并进 `doneQty`' +
+      '（`doneQty + withoutIndex帧数`）⇒ 混帧三组的"已完成"变成 ' +
+      e64FramesMixedIn.filter(x => x.wouldBe !== x.done).map(x => `${x.key}:${x.done}→${x.wouldBe}`).join('、') +
+      '，与 ⑥ 的"逐组等于 `result` 行数"**当场不等** ⇒ ⑥ 确实在守"件≠帧"这条单位纪律',
+      e64FramesMixedIn.some(x => x.wouldBe !== x.done) &&
+      e64FramesMixedIn.filter(x => x.wouldBe !== x.done).every(x => x.wouldBe !== x.done) &&
+      e64.groups.every(g => ttOf(g).withoutIndexFrames === 0 || g.doneQty + g.withoutIndexΔ !== g.doneQty),
+      JSON.stringify(e64FramesMixedIn));
+
+    /* ---- ⑧ D22 ㈠（合成库**逐例**）：缺序号帧若按"第 1 件"固化 ⇒ 行数必从 2 变 4 ---- */
+    const e64SynthAt = '2026-10-07 13:00:00';
+    const e64Synth = harness.makeTempDb({ name: 'e64-nounit-pin' });
+    /* `dbApi` 在别的块里是局部名 ⇒ 本段自己取一次（同一模块实例，走 require 缓存；不新起连接语义） */
+    const e64DbApi = require(path.join(env.paths.root, 'server', 'db'));
+    e64DbApi.initSchema(e64Synth.db, e64SynthAt);
+    const e64PinResult = (ticket, unit) => resultRepo.upsertJudgement(e64Synth.db, {
+      procOrderNo: ticket, unitIndex: unit, result: '合格', judgedAt: e64SynthAt,
+      now: e64SynthAt, durationSec: 0
+    });
+    const e64PinRows = [];
+    for (const g of E64_GROUPS) {
+      const ticket = 'WO-E64-PIN-' + e64PlanText(g);
+      const T = ttOf(g);
+      /* 原件口径：缺序号帧**不写**（`E60①`） */
+      for (const unit of g.plan.map((has, i) => (has === 1 ? i + 1 : null)).filter(u => u !== null)) {
+        e64PinResult(ticket, unit);
+      }
+      e64PinRows.push({ plan: e64PlanText(g), rows: resultRepo.countByTask(e64Synth.db, ticket), expect: T.rows });
+    }
+    /* 变体口径：缺序号帧**按第 1 件固化**（`E60` 裁定之前的缺省写法）—— 只算数，不改盘上实现。
+       做法：每一帧都当成"新的一件"（件号＝帧序）⇒ 行数＝帧数（`upsertJudgement` 按 (票,件号) 幂等，
+       故不同件号必然各写一行）。 */
+    const e64PinVariant = E64_GROUPS.map(g => {
+      const units = g.plan.map((has, i) => (i + 1));    /* 每帧都给一个件号 ⇒ 帧数即行数（新件） */
+      return { plan: e64PlanText(g), rows: new Set(units).size, expect: ttOf(g).rows };
+    });
+    t.check('`E64` ⑧ **D22 ㈠ 可证伪**（合成库，真写入口 `repo/result.js` 的 `upsertJudgement()`，`E60` 同域）：' +
+      '按原件口径（缺序号帧**不固化**）建出来的行数**逐组等于**构成性期望；' +
+      '而"缺序号帧按第 1 件固化"（`E60` 裁定之前的缺省）会让行数变成**帧数** ' +
+      '⇒ 五组里有 ' + e64PinVariant.filter(x => x.rows !== x.expect).length + ' 组与期望不等，' +
+      '其中 G1／G2／G3 是 2 → 4 ⇒ ① 的"件数只认带件序号的帧"确有可证伪靶子',
+      e64PinRows.every(x => x.rows === x.expect) &&
+      e64PinVariant.filter(x => x.rows !== x.expect).length >= 3 &&
+      e64PinVariant.filter(x => x.rows !== x.expect).every(x => x.rows === 4),
+      `原件口径逐组（实测/期望）：${e64PinRows.map(x => `${x.plan}:${x.rows}/${x.expect}`).join('、')}；` +
+      `变体口径（帧数）：${e64PinVariant.map(x => `${x.plan}:${x.rows}`).join('、')}`);
+    e64Synth.close();
+
+    /* ---- ⑨ `result` 表里**没有** `unit_index IS NULL` 的行（缺序号帧从不冒充某一件） ---- */
+    t.check('`E64` ⑨ `result` 表里 `unit_index IS NULL` 的行数 **＝0**：缺序号帧**从不**被写成' +
+      '"某一 unresolvable 件"（`NULL` 行）—— 缺的是"件号"这件事本身，不是"件号未知的一件"',
+      e64.measureCounts.nullUnitRows === 0,
+      `result 表 NULL 件号行数=${e64.measureCounts.nullUnitRows}（应 0）；` +
+      `库内按列名数=${JSON.stringify(e64.measureCounts)}`);
+
+    /* ---- ⑩ 残留边界**正面登记**：混帧票在"此后无带件序号帧"时，其预警文案不带标注 ---- */
+    const g1TicketRow = e64H.tickets.find(x => x.procOrderNo === gOf('G1').ticket);
+    t.check('`E64` ⑩ **残留边界正面登记**（`E64` 债行口径"缺序号帧如实计数并可见"的**已知上界**）：' +
+      '混帧票 G1（`1100`：成为混帧之后**再无**带件序号的帧）的工单类文案**恰 2 条且全部不带标注**' +
+      '（此后没有"会发布该类"的帧）—— 它的可见面是 `/health.frameUnitIndex` 的**逐票读数**' +
+      '（withIndex／withoutIndex／mixed 三项逐值在场）。⚠ 日后若改成"缺序号帧也发布带标注的工单类"（或' +
+      '"成为混帧时回填标注"），本条**必红** ⇒ 强制同批更新两条判据与本登记',
+      gOf('G1').orderCount === 2 && gOf('G1').noteCount === 0 &&
+      Boolean(g1TicketRow) && g1TicketRow.withIndex === 2 && g1TicketRow.withoutIndex === 2 &&
+      g1TicketRow.mixed === true,
+      `G1 工单类=${gOf('G1').orderCount} 条、带标注=${gOf('G1').noteCount} 条；` +
+      `/health 逐票读数=${JSON.stringify(g1TicketRow)}`);
+
+    /* ---- ⑪ 前端提示位（**静态读回**，实现面）：`mixedTickets > 0` 时**追加**下界说明 ---- */
+    const e64StatsSrc = fs.readFileSync(path.join(env.paths.root, 'src', 'components', 'StatsPanel.js'), 'utf8');
+    t.check('`E64` ⑪ 可见面（实现面静态读回）：`src\\components\\StatsPanel.js` 的 `frameUnitIndexNote()` ' +
+      '在 `mixedTickets > 0` 时**追加**"同票混帧 ⇒ 已完成只是下界"这句；**键缺失或为 0 ⇒ 文案逐字不变**' +
+      '（逐字判据与四档期望在 `tests\\ui-check.js` 的 **U11** 里，本节只钉"该分支确实在盘上的实现里"）',
+      /mixedTickets/.test(e64StatsSrc) && /已完成只是下界/.test(e64StatsSrc) &&
+      /mixedTickets\s*>\s*0/.test(e64StatsSrc),
+      `含 mixedTickets=${/mixedTickets/.test(e64StatsSrc)}、含"已完成只是下界"=${/已完成只是下界/.test(e64StatsSrc)}、` +
+      `含 mixedTickets > 0 判据=${/mixedTickets\s*>\s*0/.test(e64StatsSrc)}`);
+
+    /* 读数每轮可见（`PASS` 的详情不打印 ⇒ 用 `t.info` 留痕） */
+    t.info('`E64` 现场读数（真服务 ＋ 真 HTTP）：' + e64.groups.map(g => {
+      const T = ttOf(g);
+      return `${g.key}(${g.planText}) 行=${g.rows}/单=${g.orderCount}/注=${g.noteCount}/参数=${g.paramCount}` +
+        `（推导 ${T.rows}/${T.orderCount}/${T.noteCount}）`;
+    }).join('；') + `；/health.frameUnitIndex=${JSON.stringify(e64H)}`);
+    t.info('`E64` 真发布文案样本（该票最后一条工单类）：' +
+      e64.groups.filter(g => ttOf(g).orderCount > 0).map(g => {
+        const ds = e64Details(g, true);
+        return `${g.planText} ⇒ ${ds.length ? String(ds[0]).slice(0, 200) : '（无）'}`;
+      }).join(' ｜ '));
+  } else {
+    t.info('`E64`：真服务未起 ⇒ 五组真值表**未核实**（不许把"跑不了"当通过；启动回归由本节前提判据承担）');
+  }
+  /* 收尾：一用例一库 ＋ 临时目录（走 `E46` 纪律的安全删除；失败不影响判据读数） */
+  try { harness.removeLinkSafe(e64Tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 60 }); }
+  catch { /* 忽略 */ }
+}
+
 
 /* ---------------- 四之③ W7-A-3 DoD：mock-upper（真进程）→ 服务端 → mock-mes（真进程） ----------------
    为什么这样搭：DoD 要证明的是**三段真链路**接得上，而不是"三个模块各自单测过了"：

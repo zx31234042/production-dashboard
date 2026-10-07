@@ -253,8 +253,17 @@ const LEGACY_BASELINE_COLUMNS = {
   /* DR-04（需求 V1.41 / C-111）：老库（V1.41 之前的库）**没有** `unit_index`，
      它由 `STRUCTURE_UPGRADES` 的 `ALTER TABLE measure_rt ADD COLUMN unit_index INTEGER` 交付
      ⇒ 故意不列在这里（列在这里＝本门禁对"删掉那条 ALTER"失明）。 */
+  /* `E28`（2026-10-07，负责人"`measure_rt` 增 `cameraDepth` 列、与 `depth` 严格区分、同批走迁移清单
+     与 `db-check`"）：`camera_depth` **本行已移除**。它自引入 `schema.sql` 那一笔起就在正文里，
+     却**从没有过**老库补列步骤（`E73` 同族：旧版本给既有表加列、迁移清单里没有对应动作）
+     ⇒ 本包在 `STRUCTURE_UPGRADES` 补上 `ALTER TABLE measure_rt ADD COLUMN camera_depth REAL`。
+     ⚠ 为什么必须**移出**基线（而不是"反正老库大概率有"就留着）：留着＝向六之九的判据**声明
+     "老库不缺它"** ⇒ ①**正方向**（"基线之外的列必须有同表同列 `ADD COLUMN` 步骤"）对该列**立刻失明**：
+     删掉那条 `ALTER` 也不会红；②与 §六之九/**口径一致**那条**自相矛盾**（同一件事两处说法相反：
+     步骤说"要补"，基线说"本来就有"）⇒ 要么步骤是死步骤、要么基线过宽。实测证据在本文件八之六之②
+     （真临时库 `DROP COLUMN camera_depth` ＋ 只跑 `schema.sql` 补不上 ＋ 跑 `initSchema()` 才补上）。 */
   measure_rt: ['id', 'equip_code', 'proc_order_no', 'measure_depth', 'speed', 'velocity_x',
-    'velocity_y', 'frame_rate', 'gain', 'shutter', 'camera_depth', 'test_status', 'collect_time',
+    'velocity_y', 'frame_rate', 'gain', 'shutter', 'test_status', 'collect_time',
     'created_at'],
   result: ['id', 'proc_order_no', 'unit_index', 'result', 'judged_at', 'retest_count',
     'duration_sec', 'created_at', 'updated_at'],
@@ -3357,28 +3366,282 @@ t.section('六之八之②、`E75④` 缺列形态的**运行期**覆盖（真�
     built1.standardVersionNo === null,
     JSON.stringify(built1.body.paramDataList));
 
-  /* ---- ② uploadId 复用真源（platform/id.js 的形状与序号域） ---- */
+  /* ---- ②之②  `E28`：`measure_rt.camera_depth`（相机自身水下深度）与 `measure_depth`（航行器深度）
+     **各写各的** —— 这一段是六之九/口径一致那条**静态**判据的**运行期**对照（静态判据只能证明
+     "清单里有这么一条步骤"，证明不了"写入口真的把两个物理量分开"）。
+     立案（`E28`，2026-10-07 负责人"`measure_rt` 增 `cameraDepth` 列、与 `depth` 严格区分、
+     同批走迁移清单与 `db-check`"）：`IF-C.9`（P0）要求两列"显示与上报均须**严格区分**"，
+     而"区分"落地只有两处可判：①**落库口**（`repo/measure.js` 的 `toParams()`／`INSERT_SQL`）
+     ②**读口**（`services/uploadReporter.js` 的 `cameraDepth ← camera_depth`）。
+     本段的四类样本各自钉一件事，**互不代偿**：
+       · `WO-E28-BOTH`  两列都给 ⇒ 各落各的（**列序错位**会在本条当场显形）；
+       · `WO-E28-NOCAM` 只给航行器深度 ⇒ `camera_depth` 必须是 **NULL**（**不得**拿 `measure_depth` 回填）；
+       · `WO-E28-NODEP` 只给相机深度 ⇒ `measure_depth` 必须是 **NULL**（反方向同理）；
+       · `WO-E28-ZERO`  相机深度**真的是 0** ⇒ 落 **0**（既不是 NULL、也不是另一个列的值 ——
+         "拿不到"与"量到 0"必须分得开，`E38` 同一条纪律）。
+     D22（**内存字节副本**，盘上零字节改动）：把 `repo/measure.js` 的 `row.cameraDepth` 换成 `row.depth`
+     （＝两列混用）⇒ 上述样本**必红并指名 `camera_depth`**。 */
+  t.section('八之六之②、`E28`：`measure_rt.camera_depth` 与 `measure_depth` **各写各的**（落库口 ＋ 读口 ＋ 旧库补列）');
+  {
+    /* `E28` 的四个**互异**取值（全部落在 `board.config.standards.range.depth` 的 [4, 6] 内
+       ⇒ 不会引出"量程之外"的噪声读数）。**互异性本身是判据的一部分**：两列混用/抄错列时，
+       期望值与实测值必然不等（若两列取同一个数，那几条断言就退化成恒真）。 */
+    const W4_DEPTH_OLD = 4.10, W4_CAM_OLD = 5.90;
+    const W4_DEPTH_NEW = 4.80, W4_CAM_NEW = 5.70;
+    const e28 = makeTempDb({ name: 'e28-camera-depth' });
+    db.initSchema(e28.db, W4_T0);
+    const e28Cols = () => db.listColumns(e28.db, 'measure_rt');
+    /** 插一帧（**按列名**写，不依赖 `repo` 的参数次序）：只给显式存在的列赋值 ⇒ 其余列天生 NULL */
+    const e28Frame = (po, at, depth, camDepth) => {
+      const cols = ['equip_code', 'proc_order_no', 'collect_time', 'created_at'];
+      const vals = ['EQ-E28', po, at, W4_T0];
+      if (depth !== undefined) { cols.push('measure_depth'); vals.push(depth); }
+      if (camDepth !== undefined) { cols.push('camera_depth'); vals.push(camDepth); }
+      e28.db.prepare(`INSERT INTO measure_rt(${cols.join(', ')}) VALUES(${cols.map(() => '?').join(', ')})`)
+        .run(...vals);
+    };
+    const e28Row = po => e28.db.prepare(
+      'SELECT measure_depth AS d, camera_depth AS cd FROM measure_rt WHERE proc_order_no = ?').get(po);
+    /** 走**生产写入口**（`repo/measure.js` 的 `insertFrame`）—— 判据要落在真落库口上 */
+    const e28Repo = (po, at, row) => measureRepo.insertFrame(e28.db, Object.assign({
+      equipCode: 'EQ-E28', procOrderNo: po, collectTime: at, unitIndex: 1,
+      speed: 5, velocity_x: 1, velocity_y: 0, frameRate: 1000, gain: 2.5, shutter: 500, testStatus: 2
+    }, row), W4_T0);
+
+    /* 样本 A／D 走**生产写入口**（`repo/measure.js`）；B／C 走"只给一列"的直插 —— 两者分工：
+       A／D 证明**入参两个键被分别写进两列**（这才是 `repo` 的责任）；
+       B／C 证明**没有的那一列不会被另一列顶替**（直插把"repo 有没有回填"这件事隔离开：
+       若 `repo` 内部做了回填，A／B／D 三条会同时红）。 */
+    if (t.requires('`E28` 前提：临时库的 `measure_rt` 同时含 `measure_depth` 与 `camera_depth` 两列' +
+      '（否则本段无从判定"两列不互填"）',
+      e28Cols().includes('measure_depth') && e28Cols().includes('camera_depth') &&
+      db.STRUCTURE_UPGRADES.some(s => /ALTER\s+TABLE\s+measure_rt\s+ADD\s+COLUMN\s+camera_depth/i.test(String(s))),
+      `列=[${e28Cols().join(', ')}]`)) {
+      const e28RepoBoth = e28Repo('WO-E28-BOTH', '2026-09-28 08:00:01', { depth: W4_DEPTH_NEW, cameraDepth: W4_CAM_NEW });
+      const e28RowBoth = e28Row('WO-E28-BOTH');
+      e28Frame('WO-E28-NOCAM', '2026-09-28 08:00:02', 4.44);
+      e28Frame('WO-E28-NODEP', '2026-09-28 08:00:03', undefined, 2.22);
+      const e28RepoZero = e28Repo('WO-E28-ZERO', '2026-09-28 08:00:04', { depth: W4_DEPTH_NEW, cameraDepth: 0 });
+      const e28RowZero = e28Row('WO-E28-ZERO');
+      t.check('`E28`-① 两列**各写各的**（走**生产写入口** `repo/measure.js` 的 `insertFrame()`）：' +
+        '同时给 `depth` 与 `cameraDepth` ⇒ `measure_depth`／`camera_depth` 分别等于入参各自的值' +
+        '（列序错位或两列混用会在本条当场显形；两个期望值都是**互异**的，故"抄错列"必红）',
+        e28RepoBoth.inserted === true && Boolean(e28RowBoth) &&
+        e28RowBoth.d === W4_DEPTH_NEW && e28RowBoth.cd === W4_CAM_NEW &&
+        e28RowBoth.d !== e28RowBoth.cd,
+        `写入返回=${JSON.stringify(e28RepoBoth)}；回读=${JSON.stringify(e28RowBoth)}` +
+        `（期望 measure_depth=${W4_DEPTH_NEW}、camera_depth=${W4_CAM_NEW}）`);
+      t.check('`E28`-② **不互相回填**（缺 `cameraDepth`）：`camera_depth` 必须是 `NULL`，' +
+        '**不得**拿 `measure_depth` 顶替（两列是两个物理量：相机自身下放深度 vs 航行器水下深度，`IF-C.9` P0）',
+        (() => { const r = e28Row('WO-E28-NOCAM'); return r && r.d === 4.44 && r.cd === null; })(),
+        `回读=${JSON.stringify(e28Row('WO-E28-NOCAM'))}（期望 measure_depth=4.44、camera_depth=null）`);
+      t.check('`E28`-③ **不互相回填**（缺 `depth`，反方向）：`measure_depth` 必须是 `NULL`，' +
+        '**不得**拿 `camera_depth` 顶替',
+        (() => { const r = e28Row('WO-E28-NODEP'); return r && r.d === null && r.cd === 2.22; })(),
+        `回读=${JSON.stringify(e28Row('WO-E28-NODEP'))}（期望 measure_depth=null、camera_depth=2.22）`);
+      t.check('`E28`-④ "相机深度**真的是 0**"不被当成缺值、也不被 `measure_depth` 顶替 ⇒ `camera_depth` 落 **0**' +
+        '（`null`（拿不到）／`0`（量到 0）／`measure_depth` 的值 三者互不代言 —— `E38` 同一条纪律）',
+        e28RepoZero.inserted === true && Boolean(e28RowZero) &&
+        e28RowZero.d === W4_DEPTH_NEW && e28RowZero.cd === 0 && e28RowZero.cd !== null,
+        `写入返回=${JSON.stringify(e28RepoZero)}；回读=${JSON.stringify(e28RowZero)}` +
+        `（期望 measure_depth=${W4_DEPTH_NEW}、camera_depth=0）`);
+
+      /* ---- 读口（附录 2 报文）：两列**值不相等**的一帧上，两个字段各取各的 ----
+         为什么必须要"值不相等"的帧：W4 的 `expect13` 夹具那一帧**两列都是 null** ⇒ 对"reporter 里
+         两行对调"**零判别力**（换过来照样全绿）。这里插一帧两个值**互异**且都在量程内的帧，
+         报文里 `depth`／`cameraDepth` 必须分别等于**各自列**的值。 */
+      e28Frame('WO-E28-READ', '2026-09-28 08:00:05', W4_DEPTH_NEW, W4_CAM_NEW);
+      e28.db.prepare(
+        `INSERT INTO device(equip_code, equip_name, model, location, mes_base_url, camera_count, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?)`).run('EQ-E28', 'E28 台架', 'UC-19CAM', '水池', '', 19, W4_T0);
+      e28.db.prepare(
+        `INSERT INTO task(proc_order_no, batch_no, product_code, product_name, drawing_no, plan_qty,
+                          plan_start_time, plan_end_time, process_no, process_name, status, created_at, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run('WO-E28-READ', 'B-E28', 'PRD-E28', 'E28 件', 'D-E28', 6, '2026-09-28 08:00:00',
+          '2026-09-28 16:00:00', '30', '水下高速摄像检验', '测试中', W4_T0, W4_T0);
+      const e28Reporter = createUploadReporter({
+        db: e28.db, logger: w4Logger, now: w4Now, config: w4Config,
+        fetch: () => { throw new Error('本用例只组装、不发送'); }, timeoutMs: 2000
+      });
+      const e28Built = e28Reporter.buildReport({ procOrderNo: 'WO-E28-READ' });
+      t.check('`E28`-⑤ **读路径的判别力**（附录 2 的 `cameraDepth` ← `camera_depth`、`depth` ← `measure_depth`）：' +
+        '在一帧"两列值互异"的数据上，报文两字段**各取各的**（把 `uploadReporter.js` 里那两行对调 ⇒ 本条必红；' +
+        'W4 的 `expect13` 夹具两列都为 null，对这件事**零判别力** —— 这正是本条的立案理由）',
+        e28Built.ok === true && e28Built.body.depth === W4_DEPTH_NEW &&
+        e28Built.body.cameraDepth === W4_CAM_NEW &&
+        e28Built.body.depth !== e28Built.body.cameraDepth,
+        e28Built.ok ? `报文 depth=${JSON.stringify(e28Built.body.depth)}（应 ${W4_DEPTH_NEW}）、` +
+          `cameraDepth=${JSON.stringify(e28Built.body.cameraDepth)}（应 ${W4_CAM_NEW}）`
+          : `组装失败：${JSON.stringify(e28Built)}`);
+
+      /* ---- 变体①：**老库真交付**（`E73`／`E71`／`E170` 同族形态的可复跑复现） ----
+         造法：先按**当前**结构建库并写一行 ⇒ `ALTER TABLE measure_rt DROP COLUMN camera_depth`
+         （＝现场老库"从没补上这一列"的库内形态）⇒ 只跑 `schema.sql` **补不上**（`CREATE TABLE
+         IF NOT EXISTS` 对已存在的表是空操作）且**写入当场抛错并指名列名** ⇒ 再跑 `initSchema()`
+         （＝迁移清单）才补上、写入成功、**既有行一字未丢且新列是 NULL**（零回填）。 */
+      const e28Legacy = makeTempDb({ name: 'e28-legacy-camera-depth' });
+      db.initSchema(e28Legacy.db, W4_T0);
+      e28Legacy.db.prepare(
+        `INSERT INTO measure_rt(equip_code, proc_order_no, measure_depth, camera_depth, speed, collect_time, created_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?)`)
+        .run('EQ-E28L', 'WO-E28L', W4_DEPTH_OLD, W4_CAM_OLD, 5.0, '2026-09-20 08:00:00', W4_T0);
+      e28Legacy.db.exec('ALTER TABLE measure_rt DROP COLUMN camera_depth');
+      const e28LegacyCols = db.listColumns(e28Legacy.db, 'measure_rt');
+      /* 只改正本这一路：把 `schema.sql` 正文再执行一遍（老库上它是空操作） */
+      e28Legacy.db.exec(fs.readFileSync(path.join(__dirname, '..', 'server', 'db', 'schema.sql'), 'utf8'));
+      const e28AfterSchemaOnly = db.listColumns(e28Legacy.db, 'measure_rt');
+      let e28WriteWithoutCol = null;
+      try {
+        measureRepo.insertFrame(e28Legacy.db, {
+          equipCode: 'EQ-E28L', procOrderNo: 'WO-E28L-NEW', collectTime: '2026-09-20 08:00:01',
+          unitIndex: 1, depth: W4_DEPTH_NEW, cameraDepth: W4_CAM_NEW, speed: 5, testStatus: 2
+        }, W4_T0);
+      } catch (err) { e28WriteWithoutCol = String((err && err.message) || err); }
+      if (t.requires('`E28` 老库前提：`DROP COLUMN camera_depth` 之后该列确实不在（且 `schema.sql` 的重放补不上它）',
+        !e28LegacyCols.includes('camera_depth') && !e28AfterSchemaOnly.includes('camera_depth'),
+        `DROP 后列=[${e28LegacyCols.join(', ')}]；重放 schema.sql 后含 camera_depth=` +
+        `${e28AfterSchemaOnly.includes('camera_depth')}`)) {
+        t.check('`E28`-⑥ **老库真交付**（只跑 `schema.sql` 补不上）：缺列形态下真生产写入口 ' +
+          '`repo/measure.js` 的 `insertFrame()` **必抛**且错误文案**指名 `measure_rt.camera_depth`**' +
+          '（＝"开发机新建库全绿、现场老库每帧落库失败"这条链在本节内有可复跑复现）',
+          e28WriteWithoutCol !== null && /camera_depth/.test(e28WriteWithoutCol) &&
+          /no column named|has no column/i.test(e28WriteWithoutCol),
+          e28WriteWithoutCol ? `抛出：${e28WriteWithoutCol}` : '**没有抛错**（缺列形态没被抓住）');
+
+        const e28Init = db.initSchema(e28Legacy.db, W4_T0);
+        const e28ColsAfter = db.listColumns(e28Legacy.db, 'measure_rt');
+        const e28OldRow = e28Legacy.db.prepare(
+          'SELECT measure_depth AS d, camera_depth AS cd FROM measure_rt WHERE proc_order_no = ?').get('WO-E28L');
+        let e28WriteErr = null;
+        try {
+          measureRepo.insertFrame(e28Legacy.db, {
+            equipCode: 'EQ-E28L', procOrderNo: 'WO-E28L-NEW', collectTime: '2026-09-20 08:00:01',
+            unitIndex: 1, depth: W4_DEPTH_NEW, cameraDepth: W4_CAM_NEW, speed: 5, testStatus: 2
+          }, W4_T0);
+        } catch (err) { e28WriteErr = String((err && err.message) || err); }
+        const e28NewRow = e28Legacy.db.prepare(
+          'SELECT measure_depth AS d, camera_depth AS cd FROM measure_rt WHERE proc_order_no = ?').get('WO-E28L-NEW');
+        t.check('`E28`-⑦ **迁移清单能补上**：`initSchema()` 之后该列在、补列后**同一写入口成功**' +
+          '（新行两列各落各的）、**既有行一行不丢且旧值原样**、该列在旧行上是 `NULL`（**零回填**）',
+          e28ColsAfter.includes('camera_depth') && e28WriteErr === null &&
+          Boolean(e28NewRow) && e28NewRow.d === W4_DEPTH_NEW && e28NewRow.cd === W4_CAM_NEW &&
+          Boolean(e28OldRow) && e28OldRow.d === W4_DEPTH_OLD && e28OldRow.cd === null &&
+          db.getSchemaVersion(e28Legacy.db) === SCHEMA_VERSION,
+          `补列后列=[${e28ColsAfter.join(', ')}]；写入=${e28WriteErr === null ? '成功' : `**仍抛** ${e28WriteErr}`}；` +
+          `新行=${JSON.stringify(e28NewRow)}；旧行=${JSON.stringify(e28OldRow)}（camera_depth 应为 null）；` +
+          `库内版本=${db.getSchemaVersion(e28Legacy.db)}`);
+
+        /* ---- 变体② + 反证：**内存字节副本**删掉迁移清单里 `camera_depth` 那一条 ----
+           正方向（§六之九/正方向）在**静态**面已经会红；这里跑**运行期**的那一半：
+           用 `Module._compile` 造一份"没有这条步骤"的 `server/db/index.js` 副本，
+           在**已分化**的库上跑 `initSchema()` ⇒ 库**最终仍缺该列**、写入口**必炸并指名列名**。
+           ⚠ 两种收场都认（与 `E75④` 同款）：`measure_rt` 的两条索引**不依赖** `camera_depth`
+           ⇒ 预期是**静默"成功"**（版本升上去、一致性仍 ok:true、列却永远补不上）。 */
+        const e28DbPath = path.join(__dirname, '..', 'server', 'db', 'index.js');
+        const e28DbSrc = fs.readFileSync(e28DbPath, 'utf8');
+        const E28_STEP_ANCHOR = "  'ALTER TABLE measure_rt ADD COLUMN camera_depth REAL',";
+        const e28AnchorHits = e28DbSrc.split(E28_STEP_ANCHOR).length - 1;
+        let e28MutDb = null;
+        if (e28AnchorHits === 1) {
+          const ModuleCtorE28 = require('node:module');
+          const e28MutMod = new ModuleCtorE28(e28DbPath + '#e28-mut', null);
+          e28MutMod.filename = e28DbPath;
+          e28MutMod.paths = ModuleCtorE28._nodeModulePaths(path.dirname(e28DbPath));
+          e28MutMod._compile(e28DbSrc.replace(E28_STEP_ANCHOR, '  /* D22：该步骤被删（缺步骤形态） */'),
+            e28MutMod.filename);
+          e28MutDb = e28MutMod.exports;
+        }
+        if (t.requires('`E28`-D22 前提：能在 `server\\db\\index.js` 的内存副本里删掉 `camera_depth` 的补列步骤' +
+          '（锚点逐条自证恰 1 次）',
+          e28AnchorHits === 1 && Boolean(e28MutDb) && typeof e28MutDb.initSchema === 'function' &&
+          e28MutDb.STRUCTURE_UPGRADES.length === db.STRUCTURE_UPGRADES.length - 1,
+          `锚点命中 ${e28AnchorHits} 次（应 1）；原件步骤 ${db.STRUCTURE_UPGRADES.length} 条` +
+          `${e28MutDb ? ` ⇒ 副本 ${e28MutDb.STRUCTURE_UPGRADES.length} 条` : ''}`)) {
+          const e28MutTmp = makeTempDb({ name: 'e28-legacy-d22' });
+          db.initSchema(e28MutTmp.db, W4_T0);
+          e28MutTmp.db.exec('ALTER TABLE measure_rt DROP COLUMN camera_depth');
+          let e28MutInitErr = null; let e28MutInitRes = null;
+          try { e28MutInitRes = e28MutDb.initSchema(e28MutTmp.db, W4_T0); }
+          catch (err) { e28MutInitErr = err; }
+          const e28MutCols = db.listColumns(e28MutTmp.db, 'measure_rt');
+          const e28MutConsist = db.verifySchemaConsistency(e28MutTmp.db);
+          let e28MutWriteErr = null;
+          try {
+            measureRepo.insertFrame(e28MutTmp.db, {
+              equipCode: 'EQ-E28L', procOrderNo: 'WO-E28L-D22', collectTime: '2026-09-20 08:00:02',
+              unitIndex: 1, depth: W4_DEPTH_NEW, cameraDepth: W4_CAM_NEW, speed: 5, testStatus: 2
+            }, W4_T0);
+          } catch (err) { e28MutWriteErr = err; }
+          t.check('`E28`-D22 定点变异（**内存字节副本 ＋ `Module._compile`**，盘上零字节改动）：' +
+            '删掉迁移清单里 `camera_depth` 那条 `ADD COLUMN` ⇒ 无论升级是抛错还是**静默"成功"**，' +
+            '**库最终都缺那一列**，且真生产写入口**必抛并指名 `camera_depth`** ⇒ ' +
+            '"清单少一条 ⇒ 老库永久缺列 ⇒ 每帧落库失败"这条链有可复跑靶子',
+            e28AnchorHits === 1 && (e28MutInitErr !== null || e28MutInitRes !== null) &&
+            !e28MutCols.includes('camera_depth') &&
+            e28MutWriteErr !== null && /camera_depth/.test(String(e28MutWriteErr.message)) &&
+            /no column named|has no column/i.test(String(e28MutWriteErr.message)) &&
+            db.STRUCTURE_UPGRADES.length === e28MutDb.STRUCTURE_UPGRADES.length + 1 &&
+            fs.readFileSync(e28DbPath, 'utf8') === e28DbSrc,
+            `锚点命中 ${e28AnchorHits}/1；副本步骤 ${e28MutDb.STRUCTURE_UPGRADES.length} 条（原件 ${db.STRUCTURE_UPGRADES.length}）；` +
+            `升级=${e28MutInitErr ? `抛 ${e28MutInitErr.name}: ${e28MutInitErr.message}` :
+              `静默"成功"（版本=${db.getSchemaVersion(e28MutTmp.db)}、一致性=${e28MutConsist.ok === true ? 'ok:true' : 'ok:false'}）`}；` +
+            `列=[${e28MutCols.join(', ')}]；写入=${e28MutWriteErr ? `抛出 ${e28MutWriteErr.name}: ${e28MutWriteErr.message}` : '**没有抛错**'}；` +
+            `盘上 index.js 逐字节未变=${fs.readFileSync(e28DbPath, 'utf8') === e28DbSrc}`);
+          e28MutTmp.close();
+        }
+      }
+      e28Legacy.close();
+    }
+    e28.close();
+  }
+
+  /* ---- ② uploadId 复用真源（platform/id.js 的形状与序号域） ----
+     `E31`（2026-10-07）复写：序号由 **3 位扩到 6 位**（总长 19 → 22；`/^UP\d{20}$/`），域 `1～999999`。
+     ⚠ 下面这条由"恰好覆盖 001～999 一轮、其中 1 个重复"改成"**1000 个互异、域 [1, 1000]**"：
+     旧期望是**把回绕当成期望值写死**（债行 `E31` 的症状），放宽域之后它必须变成"不回绕"。
+     另：`!endsWith('000')` 这种写法在 6 位域下会**假红**（`…001000` 合法却以 `000` 结尾）
+     ⇒ 改成按**数值**判域：`Number(seq) >= 1`。 */
   const idCheck = platformId.isUploadId(built1.body.uploadId);
   const idSeq = Number(String(built1.body.uploadId).slice(16));
-  t.check('W4/DR-13＋E31：`uploadId` 由**真源** `platform/id.js` 生成 —— 形状 `UP+14 位时间+3 位序号`、' +
-    '序号域 1～999、**永不产生 000**；时间部分＝注入时钟（`' + W4_T0 + '` ⇒ 20260928080000），序号从 001 起',
-    idCheck.ok === true && String(built1.body.uploadId).startsWith('UP20260928080000') &&
-    idSeq === 1 && !String(built1.body.uploadId).endsWith('000'),
-    `uploadId=${built1.body.uploadId}；isUploadId=${JSON.stringify(idCheck)}`);
+  /* 期望值由**真源导出**构造（`UPLOAD_SEQ_DIGITS`／`UPLOAD_SEQ_MAX`），不手抄 6／999999 */
+  const idShape = new RegExp('^UP\\d' + '{' + (14 + platformId.UPLOAD_SEQ_DIGITS) + '}$');
+  t.check('W4/DR-13＋E31：`uploadId` 由**真源** `platform/id.js` 生成 —— 形状 `UP+14 位时间+' +
+    platformId.UPLOAD_SEQ_DIGITS + ' 位序号`、序号域 1～' + platformId.UPLOAD_SEQ_MAX +
+    '、**永不产生全零序号**；时间部分＝注入时钟（`' + W4_T0 + '` ⇒ 20260928080000），序号从 ' +
+    String(1).padStart(platformId.UPLOAD_SEQ_DIGITS, '0') + ' 起',
+    idCheck.ok === true && idShape.test(String(built1.body.uploadId)) &&
+    String(built1.body.uploadId).startsWith('UP20260928080000') &&
+    idSeq === 1 && Number.isFinite(idSeq) &&
+    String(built1.body.uploadId).length === 2 + 14 + platformId.UPLOAD_SEQ_DIGITS,
+    `uploadId=${built1.body.uploadId}（长度 ${String(built1.body.uploadId).length}，期望 ` +
+    `${2 + 14 + platformId.UPLOAD_SEQ_DIGITS}）；isUploadId=${JSON.stringify(idCheck)}；` +
+    `真源位数=${platformId.UPLOAD_SEQ_DIGITS}、上界=${platformId.UPLOAD_SEQ_MAX}`);
 
   const sameSec = [];
   for (let i = 0; i < 1000; i++) sameSec.push(w4Reporter.buildReport({}).body.uploadId);
   const sameSecSeqs = sameSec.map(v => Number(v.slice(16)));
   const uniqSeq = [...new Set(sameSecSeqs)].sort((a, b) => a - b);
-  t.check('W4/E31：同一秒内连出 1000 个 `uploadId` ⇒ 序号**恰好覆盖 001～999 一轮**（不重不漏），' +
-    '且**永不产生 000**（含 000 即回绕成了 `…000`，与 `isUploadId` 的"001～999 合法"两判相反 —— ' +
-    '那正是 R26-P3-3 修掉的缺陷）；1000 个里恰好有 1 个重复（＝第二次回到起点）',
-    uniqSeq.length === 999 && uniqSeq[0] === 1 && uniqSeq[998] === 999 &&
-    sameSecSeqs.every(v => v >= 1 && v <= 999) &&
-    new Set(sameSec).size === 999 &&
-    sameSec.every(v => platformId.isUploadId(v).ok === true),
-    `序号域 = [${uniqSeq[0]} .. ${uniqSeq[998]}]（互异 ${uniqSeq.length} 个）；` +
-    `含 000=${sameSecSeqs.includes(0)}；首尾序列：[${sameSecSeqs.slice(0, 3).join(',')} … ${sameSecSeqs.slice(-3).join(',')}]`);
+  /* 期望值**由上文已有读数现算**（`built1` 那次组装已经取走第 `idSeq` 号，故本批从 `idSeq + 1` 起）：
+     把"1000 个互异"写成一条**连续区间**判据 `[start .. start+999]`，比"只是互异"更强 ——
+     它同时钉死"单调 +1 无跳号"与"没有回绕"（回绕会在区间外产生重复值 ⇒ 互异数 < 1000）。 */
+  const runStart = idSeq + 1;
+  const runEnd = runStart + 999;
+  const runOk = uniqSeq.length === 1000 && uniqSeq[0] === runStart && uniqSeq[999] === runEnd &&
+    uniqSeq.every((v, i) => v === runStart + i);
+  t.check('W4/E31：同一秒内连出 1000 个 `uploadId` ⇒ 序号构成**连续区间** ' +
+    `[${runStart}, ${runEnd}]` + '（1000 个互异、单调 +1、无跳号），且**全部落在域内** —— ' +
+    '旧口径（域 `1～999`）下这里只有 999 个互异（第 1000 次回绕成 `…001`，与 `R26-P3-3` 修掉的' +
+    '那类同号重复同形）；域上界足够大 ⇒ **单日回绕不可达**（构成性上界见 `platform-check` 的 `E31`④）',
+    runOk && uniqSeq.every(v => v >= 1 && v <= platformId.UPLOAD_SEQ_MAX) &&
+    new Set(sameSec).size === 1000 &&
+    sameSec.every(v => platformId.isUploadId(v).ok === true) &&
+    /* ⚠ 这两条是**反回绕**的正面判据：域里装得下这 1000 个序号、且上界确实 ≥ 区间末端 */
+    platformId.UPLOAD_SEQ_MAX >= runEnd && new Set(sameSecSeqs).size === sameSecSeqs.length,
+    `序号域 = [${uniqSeq[0]} .. ${uniqSeq[uniqSeq.length - 1]}]（互异 ${uniqSeq.length} 个，期望 1000，` +
+    `期望区间 [${runStart}, ${runEnd}]）；含 0 序号=${sameSecSeqs.includes(0)}（应 false）；` +
+    `同秒产物互异=${new Set(sameSec).size}（应 1000）；` +
+    `首尾序列：[${sameSecSeqs.slice(0, 3).join(',')} … ${sameSecSeqs.slice(-3).join(',')}]`);
 
   /* ---- ③ 失败路径：留存 + 告警 + 待补传条数；且**不自动重试** ---- */
   mockHttp.ok = false;                     // 让假 MES 回"异常回执"（status:0）

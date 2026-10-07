@@ -708,9 +708,9 @@ async function main() {
     diffSets(reportFields, APPENDIX2)
   );
   check(
-    'uploadId 形如 UP + yyyyMMddHHmmss + 3 位序号',
-    /^UP\d{17}$/.test(String(report.uploadId)),
-    `uploadId=${report.uploadId}`
+    'uploadId 形如 UP + yyyyMMddHHmmss + 6 位序号（总长 22；`E31` 2026-10-07 由 3 位/19 字符放宽）',
+    /^UP\d{20}$/.test(String(report.uploadId)) && String(report.uploadId).length === 22,
+    `uploadId=${report.uploadId}（长度 ${String(report.uploadId).length}）`
   );
   check(
     'collectTime 格式为 yyyy-MM-dd HH:mm:ss',

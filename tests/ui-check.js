@@ -5737,6 +5737,39 @@ async function main() {
     const DEMO_NOTE = '（演示派生）';
     const WARN_TEXT = '帧缺件序号：未取得 /health 读数（非 0，不等于"没有缺件序号"）';
     const errText = n => `⚠ 本班 ${n} 帧未带件序号（未计入开工数；FR-4.2 按件序号去重）`;
+    /* `E64`（2026-10-07 负责人"同票混帧语义：以带件序号的帧为准 ＋ 缺序号帧如实计数并可见"）：
+     `mixedTickets > 0` 时在既有 err 文案**之后追加**的一句（**逐字**；帧数与票数都由 state 现取）。
+     ⚠ 键缺失/为 0 ⇒ 这一句**不出现** ⇒ 既有 `errText(n)` 的逐字判据**不受影响**。 */
+    const mixedText = (n, tickets) => errText(n) +
+      `；其中 ${tickets} 票为同票混帧（件数按带件序号的帧计 ⇒ 已完成只是下界）`;
+
+    /** `E64` 的实现副本（**内存**，只用于给下面五档构造期望值；盘上实现一字未动）：
+     *  · `implBase`  —— 只读 `withoutIndex`（`E64` **之前**的形态）；
+     *  · `implMixed` —— 现行形态（`mixedTickets > 0` 时追加下界说明）。
+     *  两者**共用同一段前四档逻辑**（演示／未取得／有缺项／零），故"两副本只差那一句"是可复核的。 */
+    const implBase = state => {
+      const isServer = !!(state && (state.serverMode === true ||
+        ((fx.w.BoardConfig || {}).dataSource === 'server')));
+      if (!isServer) return { text: '', lv: '', show: false, mark: 'demo' };
+      const h = (state && state.health) || null;
+      const fu = h && h.frameUnitIndex && typeof h.frameUnitIndex === 'object' ? h.frameUnitIndex : null;
+      const wi = fu ? fu.withoutIndex : undefined;
+      if (typeof wi !== 'number' || !Number.isFinite(wi)) {
+        return { text: WARN_TEXT, lv: 'warn', show: true, mark: 'warn' };
+      }
+      if (wi > 0) return { text: errText(wi), lv: 'err', show: true, mark: 'err' };
+      return { text: '', lv: '', show: false, mark: 'ok' };
+    };
+    const implMixed = state => {
+      const r = implBase(state);
+      if (r.mark !== 'err') return r;
+      const fu = state.health.frameUnitIndex;
+      const mixed = (typeof fu.mixedTickets === 'number' && Number.isFinite(fu.mixedTickets) &&
+        fu.mixedTickets > 0) ? fu.mixedTickets : 0;
+      return mixed > 0 ? Object.assign({}, r, { text: mixedText(fu.withoutIndex, mixed) }) : r;
+    };
+    /** 本段五档一律用**现行**副本构造期望值（与 `render()` 读同一份 state） */
+    const implGood = state => implMixed(state);
 
     /* D22 的"盘上字节未变"证据基准（本段所有变异一律在**内存副本**上做） */
     const sha256 = p => require('node:crypto').createHash('sha256').update(fs.readFileSync(p)).digest('hex');
@@ -5774,23 +5807,39 @@ async function main() {
       };
     };
     /**
-     * 一次完整观察 → 与四支口径表逐字段判等。
+     * 一次完整观察 → 与口径表逐字段判等。
      * 期望值全部**逐字**给出（D21：期望来自实现行为实测 + 负责人 2026-10-07 的裁定，非推导）；
      * `name` 上的 `mark`/`lv` 各自单独成条，便于"哪一档错了"一眼可读。
+     * `variant` 缺省 ⇒ 与**现行实现副本**（`implGood`）比；给了 ⇒ 与那一支算出的期望比
+     * （用于 `E64` 的"只读 `withoutIndex`"反证，不改盘上实现）。
      */
-    const runNoteCase = (label, s, exp) => {
+    const runNoteCase = (label, s, exp, variant) => {
       runRender(s);
       const g = noteSnap();
+      const want = variant ? variant(s) : implGood(s);
       const problems = [];
       if (g.missing) problems.push(`#${NOTE_ID} 不存在`);
       else {
-        if (g.hidden !== exp.hidden) problems.push(`hidden=${g.hidden}（应 ${exp.hidden}）`);
-        if (g.text !== exp.text) problems.push(`text=${JSON.stringify(g.text)}（应 ${JSON.stringify(exp.text)}）`);
-        if (g.cls !== exp.cls) problems.push(`className=${JSON.stringify(g.cls)}（应 ${JSON.stringify(exp.cls)}）`);
-        if (g.lv !== exp.mark) problems.push(`data-note-lv=${JSON.stringify(g.lv)}（应 ${JSON.stringify(exp.mark)}）`);
-        if (g.display !== exp.display) problems.push(`style.display=${JSON.stringify(g.display)}（应 ${JSON.stringify(exp.display)}）`);
+        if (g.hidden !== !want.show) problems.push(`hidden=${g.hidden}（应 ${!want.show}）`);
+        if (g.text !== want.text) problems.push(`text=${JSON.stringify(g.text)}（应 ${JSON.stringify(want.text)}）`);
+        if (g.cls !== ('tile-note' + (want.lv ? ' ' + want.lv : ''))) {
+          problems.push(`className=${JSON.stringify(g.cls)}（应 ${JSON.stringify('tile-note' + (want.lv ? ' ' + want.lv : ''))}）`);
+        }
+        if (g.lv !== want.mark) problems.push(`data-note-lv=${JSON.stringify(g.lv)}（应 ${JSON.stringify(want.mark)}）`);
+        if (g.display !== (want.show ? '' : 'none')) {
+          problems.push(`style.display=${JSON.stringify(g.display)}（应 ${JSON.stringify(want.show ? '' : 'none')}）`);
+        }
+        /* `exp`（逐字常量表）与 `want`（实现副本）**两条路都要对上** —— 前者防"副本跟着实现漂"、
+           后者防"常量表写错"（ADR-0004 D23：两条不同来源的期望互为对照）。 */
+        if (exp) {
+          if (g.hidden !== exp.hidden) problems.push(`[常量表] hidden=${g.hidden}（应 ${exp.hidden}）`);
+          if (g.text !== exp.text) problems.push(`[常量表] text=${JSON.stringify(g.text)}（应 ${JSON.stringify(exp.text)}）`);
+          if (g.cls !== exp.cls) problems.push(`[常量表] className=${JSON.stringify(g.cls)}（应 ${JSON.stringify(exp.cls)}）`);
+          if (g.lv !== exp.mark) problems.push(`[常量表] data-note-lv=${JSON.stringify(g.lv)}（应 ${JSON.stringify(exp.mark)}）`);
+          if (g.display !== exp.display) problems.push(`[常量表] style.display=${JSON.stringify(g.display)}（应 ${JSON.stringify(exp.display)}）`);
+        }
       }
-      return { label, g, exp, ok: problems.length === 0, problems };
+      return { label, g, want, exp, ok: problems.length === 0, problems };
     };
 
     let obs = null, obsErr = null;
@@ -5820,19 +5869,32 @@ async function main() {
       const e197ServerWins = srcSnap();
       const srcFlipConfigUnchanged = fx.w.BoardConfig.dataSource === srcFlipConfig;
 
-      /* ---------- `E198` 四支 ---------- */
+      /* ---------- `E198` 五支（原四支 ＋ `E64` 的混帧支） ---------- */
       fx.w.BoardConfig.dataSource = 'mock';
+      /** 服务端·有缺项（`withoutIndex = 7`）；`extra` 可再挂 `mixedTickets` 等键 */
+      const errState = extra => Object.assign(JSON.parse(JSON.stringify(serverMode)), {
+        health: { frameUnitIndex: Object.assign({ withoutIndex: 7 }, extra || {}), at: '2026-10-07 10:00:00' }
+      });
       const cases = [
         runNoteCase('演示模式（state.serverMode=false 且 BoardConfig.dataSource=mock）',
           demo, { hidden: true, text: '', cls: 'tile-note', mark: 'demo', display: 'none' }),
         runNoteCase('服务端·未取得（state.health 缺失 ⇒ withoutIndex 非有限数）',
           serverMode, { hidden: false, text: WARN_TEXT, cls: 'tile-note warn', mark: 'warn', display: '' }),
-        runNoteCase('服务端·有缺项（withoutIndex = 7 > 0）',
-          Object.assign(JSON.parse(JSON.stringify(serverMode)), { health: { frameUnitIndex: { withoutIndex: 7 }, at: '2026-10-07 10:00:00' } }),
+        runNoteCase('服务端·有缺项（withoutIndex = 7 > 0，**无** `mixedTickets` 键）',
+          errState(),
           { hidden: false, text: errText(7), cls: 'tile-note err', mark: 'err', display: '' }),
         runNoteCase('服务端·零（withoutIndex === 0）',
           Object.assign(JSON.parse(JSON.stringify(serverMode)), { health: { frameUnitIndex: { withoutIndex: 0 }, at: '2026-10-07 10:00:00' } }),
-          { hidden: true, text: '', cls: 'tile-note', mark: 'ok', display: 'none' })
+          { hidden: true, text: '', cls: 'tile-note', mark: 'ok', display: 'none' }),
+        /* `E64` 新增档：`mixedTickets > 0` ⇒ 在既有 err 文案**之后追加**下界说明。
+           期望**逐字**给（`mixedText(7, 3)` ＝ 旧文案 ＋ 追加句）—— 帧数/票数都取 state 真值。 */
+        runNoteCase('服务端·有缺项 ＋ **同票混帧**（withoutIndex = 7、mixedTickets = 3）⇒ 追加下界说明',
+          errState({ mixedTickets: 3 }),
+          { hidden: false, text: mixedText(7, 3), cls: 'tile-note err', mark: 'err', display: '' }),
+        /* `E64` 反证支：同一份 state 喂给"只读 `withoutIndex`"的实现副本（`E64` 之前的形态）
+           ⇒ 它算出的期望**不含**追加句 ⇒ 与盘上实现的实际文本**不等**（本条必红）。 */
+        runNoteCase('服务端·同票混帧的反证（只读 withoutIndex 的实现 ⇒ 期望里没有追加句 ⇒ 与实测不等）',
+          errState({ mixedTickets: 3 }), null, implBase)
       ];
       fx.w.BoardConfig.dataSource = cfgOriginalDataSource;
 
@@ -5911,13 +5973,37 @@ async function main() {
         `配置在本次渲染期间未变=${o.srcFlipConfigUnchanged}；实测 text=${JSON.stringify(o.e197ServerWins.text)}` +
         `（应 "" —— 若实现只看 BoardConfig 就会写出「${DEMO_NOTE}」）`);
 
-      const bad = o.cases.filter(c => !c.ok);
+      const expCases = o.cases.slice(0, 5);              /* 前五档＝**期望**用例（含 `E64` 的混帧档） */
+      const antiCase = o.cases[5] || null;               /* 第六项＝`E64` 的**反证**项（期望故意与实测不等） */
+      const bad = expCases.filter(c => !c.ok);
       const brief = c => `${c.label} ⇒ hidden=${c.g.hidden}、text=${JSON.stringify(c.g.text)}、` +
         `className=${JSON.stringify(c.g.cls)}、data-note-lv=${JSON.stringify(c.g.lv)}、style.display=${JSON.stringify(c.g.display)}`;
-      check('E198-① 四态（演示／服务端·未取得／服务端·有缺项／服务端·零）**逐一**判对：' +
-        '`hidden` ＋ 文本（逐字）＋ `className`（含 `warn`/`err` 档）＋ `data-note-lv` ＋ 行内 `display` 五项全等',
-        o.cases.length === 4 && bad.length === 0,
-        bad.length ? bad.map(c => `${c.label} —— 偏差：${c.problems.join('；')}`).join(' ｜ ') : o.cases.map(brief).join(' ｜ '));
+      check('E198-① 五档（演示／服务端·未取得／服务端·有缺项／服务端·零／**`E64` 同票混帧**）**逐一**判对：' +
+        '`hidden` ＋ 文本（逐字）＋ `className`（含 `warn`/`err` 档）＋ `data-note-lv` ＋ 行内 `display` 五项全等；' +
+        '且每档的期望**同时**对上两处独立来源（逐字常量表 ＋ 内存实现副本，互为对照）',
+        o.cases.length === 6 && expCases.length === 5 && bad.length === 0,
+        bad.length ? bad.map(c => `${c.label} —— 偏差：${c.problems.join('；')}`).join(' ｜ ') : expCases.map(brief).join(' ｜ '));
+
+      /* `E64`（`T-20261007-22`）：混帧档的**逐字**判据 ＋ "只读 `withoutIndex`"的反证项。
+         反证项**故意**与实测不等（期望里没有追加句）⇒ 它的 `ok` 必须为 `false`，
+         且判红理由必须**指名 `text`** —— 这就是"把追加句去掉 ⇒ 必红"的定点变异读数。 */
+      const mixedCase = o.cases[4] || { g: {}, want: {} };
+      check('`E64` 混帧档（`withoutIndex = 7` ＋ `mixedTickets = 3`）：文案**逐字**＝旧文案 ＋ ' +
+        '「；其中 3 票为同票混帧（件数按带件序号的帧计 ⇒ 已完成只是下界）」；`mark`／`lv` 仍是 `err`／`err`' +
+        '（追加的只是说明，不换档、不改可见性）；而"只读 `withoutIndex`"的反证项在同一份 state 上**必红**' +
+        '并**指名 `text`**（⇒ 该追加句确实被本档判着）',
+        mixedCase.g.hidden === false && mixedCase.g.text === mixedText(7, 3) &&
+        mixedCase.g.cls === 'tile-note err' && mixedCase.g.lv === 'err' &&
+        mixedCase.ok === true &&
+        Boolean(antiCase) && antiCase.ok === false &&
+        antiCase.problems.some(x => x.indexOf('text=') >= 0) &&
+        antiCase.g.text === mixedText(7, 3) &&
+        antiCase.want.text === errText(7),
+        `混帧档：hidden=${mixedCase.g.hidden}、text=${JSON.stringify(mixedCase.g.text)}、` +
+        `className=${JSON.stringify(mixedCase.g.cls)}、data-note-lv=${JSON.stringify(mixedCase.g.lv)}；` +
+        `反证项：ok=${antiCase && antiCase.ok}（应 false）、实测 text=${JSON.stringify(antiCase && antiCase.g.text)}、` +
+        `副本期望 text=${JSON.stringify(antiCase && antiCase.want.text)}、` +
+        `偏差=${JSON.stringify(antiCase && antiCase.problems)}`);
 
       const demoCase = o.cases[0] || { g: {} };
       const zeroCase = o.cases[3] || { g: {} };
@@ -5963,22 +6049,10 @@ async function main() {
         `noData=false,started=43 ⇒ ${JSON.stringify(startedReal)}（应 "43"）`);
 
       /* ---- D22 定点变异（**内存副本**；每一支都要求"必红**并指名**"） ----
-         ⚠ 变异对象是**本地实现副本**（`frameUnitIndexNote` 的四个返回支 + `isServerMode` 的判据
-         + 渲染里 `mark` 的取值），不是盘上的 `src\components\StatsPanel.js`；
-         四个函数各自内联"错实现"，与本段用同一套期望值判等 ⇒ 谁错、错在哪一档，逐条点名。
+         ⚠ 变异对象是**本地实现副本**（本段开头那一对 `implBase`／`implMixed` ＋ 下面三支），
+         不是盘上的 `src\components\StatsPanel.js`；
+         各支内联"错实现"，与本段用同一套期望值判等 ⇒ 谁错、错在哪一档，逐条点名。
          ⚠ 不依赖任何外部文件片段（D22 风险 2：暗桩必须内联旧实现）。 */
-      const implGood = state => {
-        const isServer = !!(state && (state.serverMode === true || ((fx.w.BoardConfig || {}).dataSource === 'server')));
-        if (!isServer) return { text: '', lv: '', show: false, mark: 'demo' };
-        const h = (state && state.health) || null;
-        const fu = h && h.frameUnitIndex && typeof h.frameUnitIndex === 'object' ? h.frameUnitIndex : null;
-        const wi = fu ? fu.withoutIndex : undefined;
-        if (typeof wi !== 'number' || !Number.isFinite(wi)) {
-          return { text: WARN_TEXT, lv: 'warn', show: true, mark: 'warn' };
-        }
-        if (wi > 0) return { text: errText(wi), lv: 'err', show: true, mark: 'err' };
-        return { text: '', lv: '', show: false, mark: 'ok' };
-      };
       const MUT = {
         /* ① 演示模式仍显示那一行（负责人 2026-10-07 裁定**之前**的形态） */
         demoShows: state => Object.assign({}, implGood(state),
@@ -6001,58 +6075,100 @@ async function main() {
           return r.mark === 'err' ? Object.assign({}, r, { lv: 'warn', mark: 'warn' }) : r;
         },
         /* ⑤ `#sStarted` 的 `noData` 被顺手改坏：`noData` 时照原样输出数值 */
-        sStartedNoDataIgnored: () => 43
+        sStartedNoDataIgnored: () => 43,
+        /* ⑥ `E64`：**只读 `withoutIndex`**（`E64` 之前的形态）⇒ 混帧档不再追加下界说明 */
+        noNote: implBase
       };
-      /* 四支各一份**新** state（不与前面几条用例共用同一对象：`render()` 会写它的键，
-         共用会让"这一支的读数"被上一支污染）。 */
+      /* 五支各一份**新** state（不与前面几条用例共用同一对象：`render()` 会写它的键，
+         共用会让"这一支的读数"被上一支污染）。
+         `mixed`（`E64`）：服务端·有缺项 ＋ `mixedTickets > 0` —— 现行实现应在文本尾部**追加**
+         下界说明，而"只读 `withoutIndex`"那一支**不追加**（⇒ 两支在这一档上必然分道）。 */
       const noteStateFor = mk => {
         const s = JSON.parse(JSON.stringify(serverMode));
         if (mk === 'demo') { const d = JSON.parse(JSON.stringify(demo)); delete d.serverMode; return d; }
         if (mk === 'warn') return s;                                   /* 健康读数缺失 */
         if (mk === 'err') s.health = { frameUnitIndex: { withoutIndex: 7 }, at: '2026-10-07 10:00:00' };
+        else if (mk === 'mixed') s.health = { frameUnitIndex: { withoutIndex: 7, mixedTickets: 3 }, at: '2026-10-07 10:00:00' };
         else s.health = { frameUnitIndex: { withoutIndex: 0 }, at: '2026-10-07 10:00:00' };
         return s;
       };
       /* 反证的两面都要成立：①错实现**逐条指名**（点名到哪一支、以及**哪个字段**不符：
-         `text` / `data-note-lv` / `lv+mark`）②未变异副本 **0 偏差** */
-      const noteBadDetail = mut => ['demo', 'warn', 'err', 'ok'].filter(mk => {
+         `text` / `data-note-lv` / `lv+mark` / `hidden`）②未变异副本 **0 偏差**。
+         ⚠ 比较用 `shown`（＝`!hidden`）而不是只比 `hidden`：本段的读数面是**五档**（含 `E64` 的
+         `mixed` 档），"可见性"在 `noteSnap()` 里就是 `hidden`。 */
+      const noteBadDetail = mut => ['demo', 'warn', 'err', 'ok', 'mixed'].filter(mk => {
         const g = mut(noteStateFor(mk)), e = implGood(noteStateFor(mk));
-        return !(g.text === e.text && g.lv === e.lv && g.show === e.show && g.mark === e.mark);
+        return !(g.text === e.text && g.lv === e.lv && !g.hidden === !e.hidden && g.mark === e.mark);
       }).map(mk => {
         const g = mut(noteStateFor(mk)), e = implGood(noteStateFor(mk));
         const fields = [];
         if (g.text !== e.text) fields.push('text');
         if (g.mark !== e.mark) fields.push('data-note-lv');
         if (g.lv !== e.lv) fields.push('lv');
-        if (g.show !== e.show) fields.push('show');
+        if (!g.hidden !== !e.hidden) fields.push('hidden');
         return { mark: mk, fields };
       });
       const badDemoShows = noteBadDetail(MUT.demoShows);
       const badSameMark = noteBadDetail(MUT.sameMark);
       const badMissingZero = noteBadDetail(MUT.missingAsZero);
       const badErrWarn = noteBadDetail(MUT.errAsWarn);
+      const badNoNote = noteBadDetail(MUT.noNote);            /* `E64`③：只读 withoutIndex */
       const goodBad = noteBadDetail(implGood);
-      /* 只命中一支、且**点名到该支与具体字段** */
-      const hitOnly = (d, mk, field) => d.length === 1 && d[0].mark === mk && d[0].fields.indexOf(field) >= 0;
+      /* 命中判据：①**必含**目标档（且该档偏差里含指定字段）②**必不含**"没被这支影响"的档。
+         ⚠ 不再要求"恰 1 档"：`E64` 引入 `mixed` 档之后，凡按 `withoutIndex` 触发的变异（如"退 warn"）
+         会**同时**命中 `err` 与 `mixed` 两档（两档的 `withoutIndex` 都是 7）—— 那是**正确**的读数，
+         不是"判据变宽"：真正要守的是"目标档被指名"＋"无关档不被误伤"。 */
+      const hitAt = (d, mk, field) => {
+        const row = d.find(x => x.mark === mk);
+        return Boolean(row) && row.fields.indexOf(field) >= 0;
+      };
+      const untouched = (d, mks) => mks.every(mk => !d.some(x => x.mark === mk));
       const shaAfter = watched.map(rel => sha256(path.join(ROOT, rel)));
       check('E197/E198-D22 定点变异（**内存副本**，不碰 `src\\components\\StatsPanel.js`）：' +
         '①演示模式照旧显示那一行 ⇒ 必红并**指名**"演示支"；' +
         '②两种「没有」共用一个空（`demo` 写成 `ok`）⇒ 必红并**指名** `data-note-lv`；' +
         '③`withoutIndex` 未取得写成 `0` ⇒ 必红并**指名**"未取得支"；' +
         '④`withoutIndex > 0` 退回 `warn` ⇒ 必红并**指名** `lv`/`mark`；' +
-        '⑤`#sStarted` 忽略 `noData` ⇒ 必红并**指名** `#sStarted`；⑥未变异副本 0 偏差（负对照）',
+        '⑤`#sStarted` 忽略 `noData` ⇒ 必红并**指名** `#sStarted`；⑥未变异副本 0 偏差（负对照）；' +
+        '⑦每支都**不误伤**与它无关的档（`mixed` 档纳入后，"退 warn"这支同时命中 err／mixed 两档是**正确**读数）',
         goodBad.length === 0 &&
-        hitOnly(badDemoShows, 'demo', 'text') &&
-        hitOnly(badSameMark, 'demo', 'data-note-lv') &&
-        hitOnly(badMissingZero, 'warn', 'text') &&
-        hitOnly(badErrWarn, 'err', 'lv') &&
+        hitAt(badDemoShows, 'demo', 'text') && untouched(badDemoShows, ['err', 'mixed', 'ok', 'warn']) &&
+        hitAt(badSameMark, 'demo', 'data-note-lv') && untouched(badSameMark, ['err', 'mixed', 'ok', 'warn']) &&
+        hitAt(badMissingZero, 'warn', 'text') && untouched(badMissingZero, ['err', 'mixed', 'ok', 'demo']) &&
+        hitAt(badErrWarn, 'err', 'lv') && hitAt(badErrWarn, 'mixed', 'lv') &&
+        untouched(badErrWarn, ['warn', 'ok', 'demo']) &&
         MUT.sStartedNoDataIgnored() !== '—',
-        `①演示支照旧显示 ⇒ 偏差=${JSON.stringify(badDemoShows)}（应恰 1 支＝demo、字段含 text）；` +
-        `②demo 与 ok 混同 ⇒ 偏差=${JSON.stringify(badSameMark)}（应恰 1 支＝demo、字段含 data-note-lv）；` +
-        `③未取得写成 0 ⇒ 偏差=${JSON.stringify(badMissingZero)}（应恰 1 支＝warn、字段含 text）；` +
-        `④有缺项退 warn ⇒ 偏差=${JSON.stringify(badErrWarn)}（应恰 1 支＝err、字段含 lv）；` +
+        `①演示支照旧显示 ⇒ 偏差=${JSON.stringify(badDemoShows)}（须含 demo/text）；` +
+        `②demo 与 ok 混同 ⇒ 偏差=${JSON.stringify(badSameMark)}（须含 demo/data-note-lv）；` +
+        `③未取得写成 0 ⇒ 偏差=${JSON.stringify(badMissingZero)}（须含 warn/text）；` +
+        `④有缺项退 warn ⇒ 偏差=${JSON.stringify(badErrWarn)}（须含 err/lv 与 mixed/lv —— 两档的 withoutIndex 都是 7）；` +
         `⑤忽略 noData ⇒ 实测输出 ${JSON.stringify(MUT.sStartedNoDataIgnored())}（应 "—" ⇒ 与期望不等 ⇒ 红，指名 #sStarted）；` +
         `⑥未变异副本偏差=${JSON.stringify(goodBad)}（应 []）`);
+
+      /* ---- `E64`（`T-20261007-22`）：混帧支的三条可证伪判据 ----
+         被测实现＝`src\components\StatsPanel.js` 的 `frameUnitIndexNote()`（本批**只加不改既有档**）。
+         三条各自的靶子：
+           ①（上面那条 `cases` 的第 6 项）混帧档**逐字**等于"旧文案 ＋ 追加句" ⇒ 把追加去掉必红；
+           ②（`badNoNote`）"只读 `withoutIndex`"的副本在 `mixed` 档上**必红并指名 text**
+             ⇒ 证明本档真的在判追加句，而不是"碰巧也过"；
+           ③ `mixedTickets` 键**缺失或为 0** 时，现行实现输出与"只读 `withoutIndex`"的副本**逐字相同**
+             ⇒ "键缺失/为 0 ⇒ 文案逐字不变"这条口径有正面判据（不是靠"没测到"）。 */
+      const e64NoKeySame = ['err', 'warn', 'ok', 'demo'].every(mk => {
+        const a = implGood(noteStateFor(mk)); const b = MUT.noNote(noteStateFor(mk));
+        return a.text === b.text && a.lv === b.lv && a.mark === b.mark && !a.hidden === !b.hidden;
+      });
+      const e64MixedShown = implGood(noteStateFor('mixed'));
+      const e64NoNoteShown = MUT.noNote(noteStateFor('mixed'));
+      check('`E64`-D22 定点变异（**内存副本**）：①把"混帧 ⇒ 追加下界说明"整段去掉' +
+        '（＝只读 `withoutIndex` 的旧形态）⇒ 在 `mixed` 档上**必红并指名 `text`**（恰 1 支）；' +
+        '②`mixedTickets` **键缺失**（`err` 档）与**为 0**（`ok` 档）时，现行实现与旧形态**逐字相同**' +
+        '⇒ "键缺失/为 0 ⇒ 文案逐字不变"是**实测**出来的，不是靠"没测到"',
+        hitAt(badNoNote, 'mixed', 'text') && badNoNote.length === 1 &&
+        e64MixedShown.text === mixedText(7, 3) && e64NoNoteShown.text === errText(7) &&
+        e64MixedShown.text !== e64NoNoteShown.text && e64NoKeySame,
+        `①只读 withoutIndex ⇒ 偏差=${JSON.stringify(badNoNote)}（应恰 1 支＝mixed、字段含 text）；` +
+        `②mixed 档：现行=${JSON.stringify(e64MixedShown.text)}、旧形态=${JSON.stringify(e64NoNoteShown.text)}` +
+        `（应不等）；键缺失/为 0 的四档两支逐字相同=${e64NoKeySame}`);
 
       check('U11-D22 取证的盘上证据：`src\\components\\StatsPanel.js` 与 `index.html` 的盘上字节' +
         '**全程未变**（本段所有变异只发生在内存副本上）',
