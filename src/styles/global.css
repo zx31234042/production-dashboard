@@ -792,6 +792,75 @@ textarea.form-input { resize: none; }
 .auto-lock-tip .tip-text { color: var(--text); }
 
 /* ==========================================================================
+   报警弹窗（FR-5.5 高亮弹窗预警 / FR-5.7 停留时长·自动收起·手动确认）
+   --------------------------------------------------------------------------
+   需求依据（`需求文档\…-V1.44.md`）：
+     · `FR-5.5`（P0，`:510`）「故障发生**高亮弹窗**预警，且**不阻塞头部与关键状态显示**」；
+     · `FR-5.7`（P1，`:512`）「**弹窗停留时长**、**自动收起**、**手动确认**规则**可配置**」；
+     · `UI-18`（P2，`:613`）「**避免长时间大面积纯色停留**，配合防烧屏策略；**不使用重度 GPU 特效**」。
+   本节点**不在 `index.html`** 里，而是由 `src\components\AlarmPanel.js` 的 `popupRoot()` 按需创建
+   并挂到 `#stage`（任务包硬要求①限定写范围为 `src\`／`server\`／`platform\`；规范 9.5-4 的口径
+   本就是"`index.html` 只保留骨架，具体内容由组件渲染"）。节点契约见 `AlarmPanel.js` 的弹窗注释块。
+
+   三条样式口径，逐条对着上面三句需求写：
+     ① **无遮罩层 ＋ 根节点 `pointer-events:none`**（只有「确认知悉」按钮收 `pointer-events:auto`）
+        —— `FR-5.5` 的「**不阻塞**」：页面任何位置仍可点、仍可见；也避免 `UI-18` 说的"大面积纯色停留"。
+     ② **挂点在 `#board-header` 之下**：`top: 272px` ＝ `#stage` 内距 22 ＋ 头部 230 ＋ 行距 20
+        （与 `.degraded-banner` 的 `bottom: 210px` 同一套算术：22＋页脚 168＋行距 20）
+        —— `FR-5.5` 的「不阻塞**头部**」；高度由下面四条 `nowrap` 钉在一行读数量级
+        （≈150 px），不去盖住各页的数值读数。
+        ⚠ 绝对定位的偏移量相对 `#stage` 的 padding box，而 `#stage` 无边框 ⇒ `left/right:22px`
+          正好对齐内容区；本节点随 4K 舞台整体等比缩放（与 `.degraded-banner`／`.auto-lock-tip` 同）。
+     ③ **不做动画、不做过渡**（显示/收起是硬切换）—— `UI-18` 的「不使用重度 GPU 特效」；
+        路线图 `E2` 的"弹窗**动画**／醒目度增强"属 ★★ 可选项，本波**刻意不做**（取舍写明：
+        现场醒目度靠"高对比配色 ＋ 大字报警代码"取得，不靠动效）。
+     ④ **与既有浮层的叠放**（如实登记，不假装没有）：`z-index:40` 高于 `.auto-lock-tip`(30) 与
+        `.degraded-banner`(20) ⇒ 极少数情况下（5 分钟自动锁定那一瞬恰好又来一条新报警）
+        本弹窗会盖住那 2 s 的自动锁定提示。取舍依据：`FR-5.5` 是 **P0**、且"已锁定"另有可见落点
+        （设置页 `#setLockDot`／`#entryMsg`）⇒ 不让 P0 报警提示被一条 2 s 提示吃掉。
+        该残余已列入给 4b／座位 5 的复核清单。
+
+   显隐口径与既有 `#autoLockTip` **逐字同形**：`hidden` 属性 ＋ class `show` 同步切换
+   （`[hidden]` 的全局兜底见本文件末尾 `E127①` 那条 `!important` 规则 ⇒ 缺 `show` 时必不生成盒子）。 */
+.alarm-popup {
+  position: absolute;
+  left: 22px; right: 22px;      /* 铺满舞台可用宽（#stage 内距 22px） */
+  top: 272px;                   /* 头屏之下（见上②）：与 #board-header 不相交 */
+  z-index: 40;                  /* 高于 .auto-lock-tip(30) 与 .degraded-banner(20) */
+  display: none;                /* 默认不显示；显示由 .show 打开（与 #autoLockTip 同一形态） */
+  align-items: center;
+  gap: 36px;
+  padding: 22px 40px;
+  border-radius: 18px;
+  border: 4px solid var(--err);
+  background: linear-gradient(180deg, #4A1620 0%, #33131A 100%);
+  box-shadow: 0 10px 40px rgba(0,0,0,.55);
+  pointer-events: none;         /* FR-5.5「不阻塞」：不遮挡页面交互（只有确认按钮可点） */
+}
+.alarm-popup.show { display: flex; }
+.alarm-popup-head { display: flex; align-items: baseline; gap: 26px; flex: none; }
+.alarm-popup-tag {
+  font-size: 44px; font-weight: 700; color: #FFFFFF; padding: 4px 22px; border-radius: 10px;
+  background: var(--err);
+}
+.alarm-popup-code { font-size: 76px; font-weight: 700; color: var(--err); letter-spacing: 2px; }
+.alarm-popup-type { font-size: 52px; font-weight: 700; color: var(--text); }
+/* 正文两列两行：既把高度压到"一行读数"量级，也让"排队情况"与"停留口径"各占一格 */
+.alarm-popup-body { display: grid; grid-template-columns: 1.15fr 1fr; gap: 6px 32px; flex: 1; min-width: 0; }
+/* 四条 `nowrap` ＋ 省略号：目的是**钉死高度**（不许文案长短改变遮挡面积）。
+   本仓在这两栏宽度下的实际文案远短于栏宽 ⇒ 现场不会出现被截断的读数；真被截断时
+   完整文案仍在报警卡（`#alDetail`）与当班台账里，信息不丢。 */
+.alarm-popup-desc { font-size: 44px; color: var(--text); }
+.alarm-popup-meta, .alarm-popup-queue, .alarm-popup-note { font-size: 36px; color: var(--muted); }
+.alarm-popup-note { color: var(--warn); }
+.alarm-popup-desc, .alarm-popup-meta, .alarm-popup-queue, .alarm-popup-note {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+/* 确认按钮：根节点 `pointer-events:none` 的唯一例外 —— 它要能点（FR-5.7「手动确认」）。
+   样式沿用既有 `.btn.primary`，不另造按钮外观。 */
+.alarm-popup-btn { pointer-events: auto; flex: none; }
+
+/* ==========================================================================
    `hidden` 兜底（`E127`，2026-10-05）：作者样式**不得**盖掉 `[hidden]`
    --------------------------------------------------------------------------
    现场（`E127` 立案）：`#upCard`（`.card`）带 `hidden`，而作者样式 `.card{display:flex}`
