@@ -146,7 +146,22 @@ const MAP = [
      2026-09-19（P2-9～12）：这批证据原为"无故障时占位文案"（**断言的是反面**）与"现状快照/常量集中化"
      （与条款无关）。已在 ui-check 的 U3b 段补**有故障、有台账**的真实断言，证据改指它们。 */
   ['FR-5.1,FR-5.2,FR-5.3,FR-5.4', 'covered-direct', 'ui-check.js', 'FR-5.1 报警卡显示报警编号与类型'],
-  ['FR-5.5,FR-5.7', 'declared-gap', '', 'README 已知限制 3：报警以卡片+横幅呈现，未实现弹窗动画'],
+  /* `T-20261007-26`（座位 4b）**改判**：`FR-5.5,FR-5.7` 由 `declared-gap` 升 **covered-direct**。
+     立案事实：本行原写 `README 已知限制 3：报警以卡片+横幅呈现，未实现弹窗动画` —— `E2` 真模态报警弹窗
+     已落盘（提交 `b6ac171`：`src\components\AlarmPanel.js` 的弹窗段 ＋ `board.config.js` 的 `alarmPopup`
+     段；`FR-5.7`"可配置"的唯一真源），故该"已声明缺口"的归属**已变假**。
+     为什么升 `covered-direct`（而不是 `covered-indirect`）：两条的判据都**指名条款编号且正对题** ——
+       · `FR-5.5`（P0「故障发生高亮弹窗预警，且不阻塞头部与关键状态显示」，需求 `:510`）：ui-check 的
+         **A1.1 挂点与三态** ＋ **A2 触发** 逐字含 `FR-5.5`，且直证"新报警 ⇒ 弹窗显示、六项文案齐备"；
+         "不阻塞"另由 **browser-check 的 B9**（真机 `pointer-events`／rect 不相交／点击穿过）承接。
+       · `FR-5.7`（P1「弹窗停留时长、自动收起、手动确认规则可配置」，需求 `:512`）：ui-check 的
+         **A4 自动收起**（停留时长取自 `BoardConfig.alarmPopup.dwellMs`，构成性断言、不写死 8000）与
+         **A8 可配置（手动确认规则）** 逐字含 `FR-5.7`；三项配置规则各有断言（`FR-5.7` 需要三项可配，
+         其中第三项即 A8 的 `manualConfirm`）。
+     ⚠ 本行**不冒领**"动画"：`E2` 的取舍是**刻意不做**弹窗动效（见 `global.css` 弹窗段注释④附近的取舍说明：
+     现场醒目度靠高对比配色 ＋ 大字报警代码），故"动效/闪烁"一项仍归 `UI-09,UI-18` 的 `subjective`，
+     不在本行内。 */
+  ['FR-5.5,FR-5.7', 'covered-direct', 'ui-check.js', 'A2 触发（`FR-5.5`）：新报警发生 ⇒ 弹窗显示（`state="shown"` ＋ `hidden=false` ＋ class 含 `show` **三处同步**）；'],
   ['FR-5.6', 'covered-direct', 'ui-check.js', 'FR-5.6 多条并发报警时排队说明与队列列表都渲染'],
   /* V1.34（C-88）改判（FR-5.8 细分）：参数类预防性预警由**一条**细分为**两条具名** ——
      「参数阈值临近预警」（黄，实测落入临近带）与「参数超范围预警」（红，实测越过上/下限）；
@@ -258,7 +273,24 @@ const MAP = [
   ['UI-10', 'covered-direct', 'browser-check.js', '?link=off 进入降级态'],
   ['UI-11', 'covered-indirect', 'ui-check.js', 'UI-11 无公告/无提示/无待办时应给出占位文案'],
   ['UI-12', 'manual', '', '字体规范（思源黑体/微软雅黑 + 等宽）需人工核对，暂无断言'],
-  ['UI-13', 'declared-gap', '', 'README 已知限制 3：报警弹窗未实现'],
+  /* `T-20261007-26`（座位 4b）**改判**：`UI-13` 由 `declared-gap` 改判 **covered-indirect**。
+     立案事实：本行原写 `README 已知限制 3：报警弹窗未实现` —— 该"已声明缺口"随 `E2` 落地（提交 `b6ac171`）
+     已变假：弹窗机制**在**（ui-check 的 A1.1 直证"`bind()` 期按需创建 `#alPopup`"、7 个子节点齐备）；
+     browser-check 的 **B9** 把"**固定挂点**"这半句量化到真机（`#alPopup` 与 `#board-header` 的 rect 不相交、
+     并逐点核 `elementFromPoint`）⇒ **不是"没有这个机制"，是"机制有了、另有量纲没验"**。
+     为什么只记 `covered-indirect`（**不冒领** `covered-direct`）：`UI-13` 的判据是
+     「固定位置，面积 ≤屏宽 40%，字号 ≥60 px」——后两个**尺寸量纲在机器上没有判据**：
+     本行与 ui-check 的 U12 段（12 条）都**不量**弹窗尺寸与字号；全仓 `tests\` 里对
+     `#alPopup` 的宽高/字号也没有断言（该三处只在 `src\styles\global.css` 的 `.alarm-popup*` 里以声明形态存在）。
+     ⚠ 因此"面积 ≤ 屏宽 40% / 字号 ≥ 60 px"这半句**至今未验**，要升 `covered-direct` 必须先有真机量测断言
+     （落在 browser-check 的 `#alPopup` 宽高与字号读数上）；在此之前**不得**据本行读成"UI-13 已全部验到"。
+     ⚠ 另如实登记：本行证据脚本是 `browser-check.js` ⇒ 它进**"依赖需浏览器权限的脚本"**那一档（非离线可复跑）。
+     第 5 列里的 `${size.join('×')}` 是**逐字**取自该断言名的模板串（B9 的断言名在源码里就是
+     `B9 ${size.join('×')} 前提：…`，两种分辨率各出一次）—— 不换写成"1920×1080"，
+     否则该串在源码里查不到（本文件第二节的判据就是"整串必须是目标脚本里的逐字子串"）。
+     同段 `ui-check.js` 的 A1.1（挂点与三态）可作**离线**备核（逐字取自该脚本）：
+       · `A1.1 挂点与三态（`FR-5.5`）：`bind()` 期创建 `#alPopup` —— **创建前不存在**、创建后存在；` */
+  ['UI-13', 'covered-indirect', 'browser-check.js', 'B9 ${size.join(\'×\')} 前提：绕开首帧口径'],
   ['UI-14', 'covered-indirect', 'ui-check.js', 'UI-04 字号：'],
   ['UI-15', 'covered-indirect', 'browser-check.js', '?curve=none 显示空态且不画曲线'],
   ['UI-16', 'manual', '', '界面语言为简体中文，需人工核对'],
