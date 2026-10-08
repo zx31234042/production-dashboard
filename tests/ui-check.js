@@ -50,6 +50,17 @@ function skip(name, reason) {
   console.log(`  [SKIP] ${name} —— ${reason}`);
 }
 
+/* T-20261007-24（座位 4b，ADR-0004 D20）：**前提**判定 —— 与 `check()` 的区别是
+   [UNMET] 单独成类并**使退出码非 0**（"前提塌了"必须与"实现错了"分得开）。
+   判据（不可违）：前提只描述"数据/环境必须处于某状态"，**不得**描述"被测函数的返回值"。 */
+function unmet(name, ok, detail) {
+  if (!ok) {
+    failures.push({ name: '前提不成立：' + name, detail: detail || '' });
+    console.log(`  [UNMET] 前提不成立：${name}${detail ? ' —— ' + detail : ''}`);
+  }
+  return Boolean(ok);
+}
+
 function readText(rel) {
   return fs.readFileSync(path.join(ROOT, rel), 'utf8');
 }
@@ -6174,6 +6185,974 @@ async function main() {
         '**全程未变**（本段所有变异只发生在内存副本上）',
         shaBefore.length === 2 && shaBefore.every((h, i) => h === shaAfter[i]),
         watched.map((rel, i) => `${rel}: ${shaBefore[i] === shaAfter[i] ? '未变' : '**被改写**'}（${shaBefore[i].slice(0, 12)}）`).join('；'));
+    }
+  }
+
+  /* ================================================================
+     U12 `E2` 真模态报警弹窗（`FR-5.5` 高亮弹窗预警 / `FR-5.7` 停留时长·自动收起·手动确认规则可配置）
+     ================================================================
+     座位 4b 的 `T-20261007-24`：把 `T-20261007-23`（座位 3 实现 ＋ 自测探针）取到的**可证伪点**
+     落成**常设断言**。探针在 `tests\._verify\T-20261007-23\probe-e2.js`（忽略路径，**不是门禁**），
+     本段与它**同口径**：同一批节点 id、同一条 16 帧输入序列、同一套计时器桩件；
+     区别是本段**进仓、每次门禁都跑**，且每条都配 D22 定点变异反证。
+
+     被测实现（本轮**一行未改**，只写断言）：
+       · `src\components\AlarmPanel.js` 的弹窗段（`refreshPopup()`／`popupRoot()`／`showPopup()`／
+         `hidePopup()`／`bindPopupOnce()`／`popupPolicy()`／`writePopupState()`）；
+       · `src\config\board.config.js` 末尾的 `alarmPopup` 段（`FR-5.7`"可配置"的**唯一真源**）。
+
+     为什么夹具是**自建**的（不复用 `makeRecorder`／`loadBootFixture`）：本段的 A1b 判据是
+     "挂点 `#alPopup` **由组件在 `bind()` 期按需创建**"——那两个既有假 DOM 都是"按 id 取用即新建"，
+     于是 `#alPopup` 在 `bind()` **之前**就已经存在，`createElement` 分支永远不被走，
+     该判据在那两个夹具上**恒真**（ADR-0004 D23 的空洞形态）。本夹具对**未知 id 返回 null**
+     （同探针口径，更接近真机）：`#alPopup*` 不预建 ⇒ 真走创建路径；而 `index.html` 里
+     **静态声明过**的那批 id 预建（否则首帧渲染取不到 `#alarmCard` 等，会抛异常）。
+
+     `FR-5.6` 防回归（A9）的"改前实现"按 `harness-check` 的 **D22 惯用法内联成片段**（不依赖外部文件）：
+     本轮实现是"在 `render()` 末尾**新增一行** `refreshPopup(state);` ＋ 纯新增段"，
+     故"**改前实现**"＝把 `AlarmPanel.js` **现行**整份源码里 `render()` 末尾那**一行**剥掉后的产物
+     —— 逐字派生自盘上源码、与实现同源，不会漂。比较面＝ A9 的 16 帧 × 10 节点 ＋ 每帧状态对照；
+     判别力由 D22-2（顺带把 `#alQueueNote` 文案改掉 ⇒ 逐帧差异必非空）证明。 */
+  section('U12 `E2` 真模态报警弹窗（FR-5.5 / FR-5.7；T-20261007-24，ADR-0004 D19/D20/D21/D22/D23）');
+  {
+    const sha256 = p => require('node:crypto').createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    const SRC_REL = 'src/components/AlarmPanel.js';
+    const SRC_ABS = path.join(ROOT, SRC_REL);
+    const shaBefore = sha256(SRC_ABS);
+    /* 源码**只读一次**：夹具、A9 的"改前实现"、D22 变异全部从这一份文本派生（单一真源，不各读一份）。 */
+    const srcText = readText(SRC_REL);
+    const POPUP_CALL = 'refreshPopup(state);';
+    /* `render()` 函数体的**定位与剥行**（A9 的"改前实现"由它派生）：
+       起点＝`  function render(state) {` 这一行之后；终点＝紧随其后的注释块 `\n  /* ====`（弹窗段开头）。
+       ⚠ 行尾按**正则**剥（`\r?\n`）：本仓 `tests\*.js` 是 CRLF，而被测源码 `src\*.js` 的行尾形态
+       不受本次任务约束 ⇒ 不许把 `\n` 当成字节形态写死（那种写法在本仓已经吃过一次亏）。 */
+    const renderHead = '  function render(state) {';
+    const h0 = srcText.indexOf(renderHead);
+    const h1 = h0 < 0 ? -1 : srcText.indexOf('\n', h0);
+    const cut = srcText.indexOf('\n  /* ====', h1);
+    const renderBody = (h0 < 0 || cut < 0) ? null : srcText.slice(h1 + 1, cut);
+    const callIdx = renderBody === null ? -1 : renderBody.lastIndexOf(POPUP_CALL);
+
+    /** 夹具装载的组件（＝真页面 `index.html` 里的组件执行顺序；经 `guardRegistered` 核对） */
+    const U12_COMPONENTS = [
+      'src/components/HeaderBar.js',
+      'src/components/TabsBar.js',
+      'src/components/CurveChart.js',
+      'src/components/DeviceStatusPanel.js',
+      'src/components/TaskPanel.js',
+      'src/components/ShiftPanel.js',
+      'src/components/StatsPanel.js',
+      'src/components/AlarmPanel.js',
+      'src/components/MaintPanel.js',
+      'src/components/NoticePanel.js',
+      'src/components/SettingPanel.js',
+      'src/pages/Dashboard.js'
+    ];
+    /** `index.html` 里**静态声明过**的、本段会读到的 id（真机语义：这些节点页面一打开就在） */
+    const U12_STATIC_IDS = [
+      'stage', 'board-header', 'board-main', 'board-footer',
+      'alarmCard', 'alCode', 'alType', 'alDetail', 'alState', 'alQueueNote', 'alQueueList',
+      'alWarningList', 'alTable', 'alHandleBtn', 'alCloseBtn', 'autoLockTip',
+      'entryMsg', 'setMsg'
+    ];
+    const POPUP_ROOT_ID = 'alPopup';
+    const POPUP_CHILD_IDS = ['alPopupCode', 'alPopupType', 'alPopupDesc', 'alPopupMeta',
+      'alPopupQueue', 'alPopupNote', 'alPopupConfirm'];
+    const FR56_IDS = ['alCode', 'alType', 'alDetail', 'alState', 'alQueueNote', 'alQueueList',
+      'alWarningList', 'alTable', 'alHandleBtn', 'alCloseBtn'];
+    /* 停留/确认口径的**可见文案**尾句（**逐字**取自 `AlarmPanel.js` 的 `popupNoteText()`）。
+       ⚠ 期望值**构成性**取：条数由 `frameData()` 的实测队列算出，不手写魔数、不写死条数。 */
+    const NOTE_TAIL = '　·　「确认知悉」仅收起本提示，**不改变**异常闭环状态（闭环仍走卡片上的按钮）';
+    const headNoteN = n => '并发报警队列：' + n + ' 条未闭环 · 当前展示队首（其余 ' + (n - 1) + ' 条按发生时间排队）';
+    /* 弹窗里"排队情况"那格的文案（`AlarmPanel.js` 的 `showPopup()`；条数**构成性**取） */
+    const popupQueueN = n => (n > 1
+      ? '并发排队：第 1 条 / 共 ' + n + ' 条未闭环（按发生时间排队，不覆盖不丢失）'
+      : '并发排队：当前仅此 1 条未闭环');
+
+    /** 假 DOM ＋ 桩件环境（**未知 id 返回 null**；`innerHTML` 按 `id="…"` 建子节点）。
+     *  `opts.patchComponent`：**纯内存**地改 `AlarmPanel.js` 的源码文本后再加载 —— D22 的定点变异
+     *  一律走这条路（**不动盘上文件**）。为什么用"整个 IIFE 的源码分叉"而不是"eval 单个函数"：
+     *  弹窗段的 `seenKeys`／`popupTimer`／`showPopup()` 等都是 IIFE 内的词法变量，
+     *  从外部 `eval` 进去**够不着**（真跑过：`ReferenceError: refreshPopup is not defined`）；
+     *  分叉整份源码 ⇒ 拿到的是一个**完整、自洽**的实现（含它自己的模块级状态），与真页面同一形态。 */
+    function makePopupEnv(opts) {
+      const nodes = new Map();
+      const handlers = new Map();
+      const timers = [];
+      /* 被 `clearTimeout` 认领过的计时器 id（见下方桩件）。为什么需要它：本仓别处也会用
+         `setTimeout`（`SettingPanel` 的 2000/4000/300000 ms、`Dashboard` 的 IDLE_RETURN_MS），
+         它们**从不**调 `clearTimeout` ⇒ "未取消且未 fire"这个读数会把它们算进来（实测踩到）。
+         判据只该看**弹窗自己登记、且会被 `clearTimeout` 认领**的那一档计时器。 */
+      const cleared = new Set();
+      let timerSeq = 0;
+      const stat = { listenerAdds: 0 };
+
+      function newNode(tag) {
+        const classes = new Set();
+        const qcache = new Map();
+        let id = '';
+        const o = {
+          __tag: tag, __classes: classes,
+          hidden: false, disabled: false, value: '', className: '', style: {}, dataset: {},
+          classList: {
+            add: c => classes.add(c),
+            remove: c => classes.delete(c),
+            contains: c => classes.has(c),
+            toggle: (c, on) => { if (on === undefined ? !classes.has(c) : on) classes.add(c); else classes.delete(c); }
+          },
+          addEventListener: (type, fn) => {
+            stat.listenerAdds++;
+            const k = id + '|' + type;
+            if (!handlers.has(k)) handlers.set(k, []);
+            handlers.get(k).push(fn);
+          },
+          __fire: (type, ev) => (handlers.get(id + '|' + type) || []).slice().forEach(fn => fn(ev)),
+          querySelector: sel => {
+            const k = id + '>' + sel;
+            if (!qcache.has(k)) { const c = newNode(sel); c.id = k; qcache.set(k, c); }
+            return qcache.get(k);
+          },
+          appendChild: () => {},
+          setAttribute: () => {},
+          remove: () => {}
+        };
+        Object.defineProperty(o, 'id', {
+          get() { return id; },
+          set(v) { id = String(v); nodes.set(id, o); },
+          configurable: true
+        });
+        Object.defineProperty(o, 'textContent', {
+          get() { return o.__text || ''; }, set(v) { o.__text = String(v); }, configurable: true
+        });
+        Object.defineProperty(o, 'innerHTML', {
+          get() { return o.__html || ''; },
+          set(v) {
+            o.__html = String(v);
+            const re = /id="([^"]+)"/g;
+            let m;
+            while ((m = re.exec(o.__html)) !== null) { const child = newNode('span'); child.id = m[1]; }
+          },
+          configurable: true
+        });
+        return o;
+      }
+
+      for (const sid of U12_STATIC_IDS) { const n = newNode('div'); n.id = sid; }
+
+      const document = {
+        getElementById: x => nodes.get(x) || null,
+        createElement: t => newNode(t),
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        addEventListener: () => {}
+      };
+
+      const sandbox = { console, document, Date, Number, String, Math, JSON, Object, Array, isNaN, RegExp, Error };
+      /* 固定随机（与 `tests/capture-baseline.js` 的确定化同一手法）：演示源的实测值/曲线是随机游走，
+         两个版本必须走**同一条**游走，否则对照读数会被"随机不同"污染（那不是回归）。 */
+      {
+        const realMath = Math;
+        const seeded = Object.create(realMath);
+        let seed = 20260919;
+        seeded.random = function () { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+        sandbox.Math = seeded;
+      }
+      sandbox.window = sandbox;
+      sandbox.setTimeout = (fn, delay) => {
+        const tid = ++timerSeq;
+        timers.push({ id: tid, delay, fn, cancelled: false, fired: false });
+        return tid;
+      };
+      sandbox.clearTimeout = tid => { cleared.add(tid); const t = timers.find(x => x.id === tid); if (t) t.cancelled = true; };
+      vm.createContext(sandbox);
+      const run = rel => vm.runInContext(readText(rel), sandbox, { filename: path.join(ROOT, rel) });
+      sandbox.window.Dom = {
+        $: id => nodes.get(id) || null,
+        setText: (id, v) => {
+          let n = nodes.get(id);
+          if (!n) { n = newNode('span'); n.id = id; }
+          n.textContent = String(v);
+        },
+        setHTML: (id, v) => {
+          let n = nodes.get(id);
+          if (!n) { n = newNode('div'); n.id = id; }
+          n.innerHTML = String(v);
+        },
+        setClass: (id, v) => { const n = nodes.get(id); if (n) n.className = String(v); },
+        setStyle: (id, p, v) => { const n = nodes.get(id); if (n) n.style[p] = String(v); },
+        toggleClass: (id, c, on) => { const n = nodes.get(id); if (n && n.classList) n.classList.toggle(c, on); }
+      };
+      guardRegistered(U12_COMPONENTS, 'U12');
+      run('src/config/board.config.js');
+      run('src/config/fieldMap.js');
+      run('src/utils/format.js');
+      run('src/services/mockData.js');
+      run('src/services/api.js');
+      const componentRels = (opts && opts.source) ? U12_COMPONENTS.slice(0, -1) : U12_COMPONENTS;
+      componentRels.forEach(run);
+      if (opts && opts.source) {
+        vm.runInContext(opts.source, sandbox, { filename: 'inline:' + SRC_REL });
+      }
+      const _envOut = {
+        w: sandbox.window, nodes, timers, cleared, stat,
+        timerSeq: () => timerSeq,
+        pending: () => timers.filter(t => !t.cancelled && !t.fired).length
+      };
+      return _envOut;
+    }
+
+    unmet('U12 前提①：`AlarmPanel.js` 的 `render()` 函数体可定位、且末尾确有一行 `refreshPopup(state);`（A9 的"改前实现"由它剥出）',
+      renderBody !== null && callIdx >= 0,
+      '函数体长度=' + (renderBody === null ? '取不到' : renderBody.length) +
+      '；弹窗接线行最后出现位置=' + callIdx + '（须 ≥ 0）');
+    const cfgProbe = makePopupEnv().w.BoardConfig && makePopupEnv().w.BoardConfig.alarmPopup;
+    unmet('U12 前提②：`BoardConfig.alarmPopup` 段在场且 `enabled === true`（`FR-5.7`"可配置"的唯一真源；段不在 ⇒ 机制写 `off`，本段多数用例不适用）',
+      Boolean(cfgProbe) && typeof cfgProbe === 'object' && cfgProbe.enabled === true,
+      '实测=' + JSON.stringify(cfgProbe || null));
+
+    /* ---------------- 输入序列（与探针 `probe-e2.js` 的 `SCRIPT` **逐帧相同**） ---------------- */
+    const T0 = Date.parse('2026-09-18T10:00:00');
+    const SCRIPT = [
+      { i: 0 }, { i: 1 }, { i: 2 }, { i: 3 }, { i: 4 },
+      { i: 5, inject: true },                 /* 第 2 条报警 ⇒ 弹窗首次出现 */
+      { i: 6 },
+      { i: 7, inject: true },                 /* 第 3 条 ⇒ 再弹：此时第 5 帧挂的停留计时器**还没到点**
+                                                 （这一形态是"忘记先清旧计时器"的**唯一**可证伪窗口） */
+      { i: 8, fire: 8000 },                   /* 停留到点 ⇒ 自动收起 */
+      { i: 9 }, { i: 10, inject: true },      /* 第 4 条 ⇒ 再弹 */
+      { i: 11, confirm: true },               /* 手动确认 ⇒ 收起，且不改闭环状态 */
+      { i: 12, inject: true },                /* 第 5 条 ⇒ 再弹 */
+      { i: 13, close: true },                 /* 手工闭环队首 ⇒ 入台账；下一帧弹窗跟着收起 */
+      { i: 14 }, { i: 15, inject: true }, { i: 16 }
+    ];
+
+    /** 一次场景运行。`mut` 的四个**纯内存**变异钩子（缺省 ⇒ 现行实现，`AlarmPanel.js` 一字不改）：
+     *   · `patch(text)`        —— 对 `AlarmPanel.js` **整份源码文本**做替换（D22 的唯一变异入口；
+     *                            分叉出一个完整自洽的实现副本，含它自己的模块级状态）；
+     *   · `onConfirm(ctx)`     —— 用给定处理函数替换"点确认"的行为（用于"确认接到闭环"的错实现）。
+     *  `patch` 返回 null／文本里找不到靶子 ⇒ 夹具直接返回 null（**不许静默变成绿**）。 */
+    function runPopupScene(mut) {
+      mut = mut || {};
+      let patched = null;
+      if (mut.patch) {
+        patched = mut.patch(srcText);
+        if (patched === null || patched === srcText) return null;   /* 变异没命中靶子 ⇒ 不许静默变绿 */
+      }
+      const env = makePopupEnv(patched === null ? null : { source: patched });
+      const W = env.w;
+      const A = W.Components.AlarmPanel;
+      const M = W.MockData;
+      let activityCount = 0;
+      const existedBeforeBind = !!env.nodes.get(POPUP_ROOT_ID);
+
+      const bindErr = [];
+      try { A.bind(M.state, function () { activityCount++; }); } catch (e) { bindErr.push(String((e && e.message) || e)); }
+      const createdAtBind = !!env.nodes.get(POPUP_ROOT_ID);
+
+      /* ---------------- 逐帧读数 ---------------- */
+      const read = id => {
+        const n = env.nodes.get(id);
+        if (!n) return null;
+        return {
+          text: String(n.textContent || ''), html: String(n.__html || ''),
+          cls: String(n.className || ''), hidden: !!n.hidden, disabled: !!n.disabled,
+          classes: [...n.__classes].sort().join(','),
+          dataset: Object.assign({}, n.dataset)
+        };
+      };
+      const popupSnap = () => {
+        const root = read(POPUP_ROOT_ID);
+        if (!root) return null;
+        const kids = {};
+        for (const id of POPUP_CHILD_IDS) { const k = read(id); kids[id] = k ? k.text : null; }
+        return { root, kids };
+      };
+      const fireTimer = delay => {
+        const t = env.timers.filter(x => x.delay === delay && !x.cancelled && !x.fired).pop();
+        if (!t) return false;
+        t.fired = true;
+        t.fn();
+        return true;
+      };
+      /* D22-6（"把确认接到 `closeActiveAlarm()`"）必须走**这条**分支：即点击**只**由该错实现处理 */
+      const runConfirm = () => {
+        const n = env.nodes.get(POPUP_ROOT_ID);
+        if (!n) return { clicked: false };
+        if (mut.onConfirm) { mut.onConfirm({ W: W, M: M }); return { clicked: true }; }
+        n.__fire('click', { target: { id: 'alPopupConfirm' } });
+        return { clicked: true };
+      };
+      const runClose = () => {
+        const led0 = M.state.alarm.ledger.length;
+        const closed = M.closeActiveAlarm();
+        return {
+          closedCode: closed ? closed.code : null,
+          ledgerDelta: M.state.alarm.ledger.length - led0,
+          ledgerHeadAfter: M.state.alarm.ledger[0]
+            ? M.state.alarm.ledger[0].time + '|' + M.state.alarm.ledger[0].code + '|' + M.state.alarm.ledger[0].state
+            : null,
+          queueAfterClose: M.state.alarm.queue.map(q => q.code)
+        };
+      };
+
+      const frames = [];
+      for (const step of SCRIPT) {
+        const t = new Date(T0 + step.i * 1000);
+        if (step.inject) M.injectAlarm(t);
+        M.tick(t);
+        const listenersBefore = env.stat.listenerAdds;
+        A.render(M.state);
+        const listenersInRender = env.stat.listenerAdds - listenersBefore;
+        const snap = {
+          i: step.i, ids: {}, popupBefore: popupSnap(), popupAfter: null,
+          pending: 0, fired: null, listenersInRender,
+          state: {
+            queue: M.state.alarm.queue.map(q => q.code + '|' + q.time + '|' + q.state),
+            ledger: M.state.alarm.ledger.map(r => r.time + '|' + r.code + '|' + r.state),
+            activeCode: M.state.alarm.active ? M.state.alarm.active.code : null
+          }
+        };
+        for (const id of FR56_IDS) snap.ids[id] = read(id);
+        if (step.fire) snap.fired = fireTimer(step.fire);
+        if (step.fireDwell) {
+          /* **只触发最新的那一个**停留计时器（不是 delay 匹配的"最后一个未触发"—— 若实现漏了
+             `clearTimeout`，匹配法会一次把两个都触发掉，"陈旧计时器"这个读数就消失了）。
+             依次触发会**打断** A4／A5／A6 的用户序列（第 8 帧本来该 fire 的那个也一并触发）⇒
+             这里用 `fireDwell`：它只动停留计时器，且只动最新的那一个。 */
+          const dt = env.timers.filter(x => x.delay === Number(W.BoardConfig.alarmPopup.dwellMs) &&
+            !x.cancelled && !x.fired).pop();
+          if (dt) { dt.fired = true; dt.fn(); }
+          snap.firedDwell = Boolean(dt);
+        }
+        if (step.confirm) {
+          snap.queueLenBeforeConfirm = M.state.alarm.queue.length;
+          snap.confirm = runConfirm();
+          snap.queueAfterConfirm = M.state.alarm.queue.length;
+          snap.ledgerAfterConfirm = M.state.alarm.ledger.length;
+        }
+        if (step.close) {
+          snap.close = true;
+          Object.assign(snap, runClose());
+        }
+        snap.popupAfter = popupSnap();
+        snap.pending = env.pending();
+        snap.dwellPending = env.timers.filter(x => !x.cancelled && !x.fired &&
+          x.delay === Number(W.BoardConfig.alarmPopup.dwellMs) && env.cleared.has(x.id)).length;
+        /* 陈旧未取消的停留计时器（= `showPopup()` 里那句 `clearTimeout` 被拿掉的**直接**读数）：
+           "登记过、延迟＝`dwellMs`、既没取消也没 fire、且**不是本帧刚注册的那个**"。
+           本帧刚注册的那个 id ＝ 当前 `timerSeq`（桩件按注册顺序自增）⇒ 用它把"刚挂上的那个"排除。 */
+        snap.staleDwell = env.timers.filter(x => x.delay === Number(W.BoardConfig.alarmPopup.dwellMs) &&
+          !x.cancelled && !x.fired && x.id !== env.timerSeq()).length;
+        frames.push(snap);
+      }
+      return {
+        w: W, frames, existedBeforeBind, createdAtBind, activityCount, nodes: env.nodes,
+        timers: env.timers, timerCount: env.timers.length,
+        listenersInRender: env.stat.listenerAdds, bindErr: bindErr
+      };
+    }
+
+    /** 逐帧逐项对照（节点读数 ＋ 每帧报警状态）—— 与探针 B 段同一比较面 */
+    function framesDiff(a, b) {
+      const out = [];
+      for (let k = 0; k < a.frames.length; k++) {
+        const x = a.frames[k], y = b.frames[k];
+        for (const id of FR56_IDS) {
+          const p = JSON.stringify(x.ids[id]), q = JSON.stringify(y.ids[id]);
+          if (p !== q) out.push('帧 ' + x.i + ' #' + id + '：改前=' + p + ' 改后=' + q);
+        }
+        const ps = JSON.stringify(x.state), qs = JSON.stringify(y.state);
+        if (ps !== qs) out.push('帧 ' + x.i + ' 报警状态：改前=' + ps + ' 改后=' + qs);
+      }
+      return out;
+    }
+
+    /* ---------------- 观察面：一次运行 → 本段所有断言都从这份读数取（D19：断言即证据） ---------------- */
+    const obs = observe();
+    function observe() {
+      const env0 = runPopupScene({});
+      if (!env0) return null;
+      const frameOf = i => env0.frames.filter(f => f.i === i)[0] || null;
+      const frameData = i => {
+        const f = frameOf(i);
+        if (!f) return { missing: true, i: i };
+        const p = f.popupAfter;
+        if (!p) return { missing: true, i: i, why: '#alPopup 挂点不存在（未创建或创建失败）' };
+        const ds = p.root.dataset || {};
+        return {
+          missing: false, i: i, root: p.root, kids: p.kids, f: f,
+          hidden: p.root.hidden === true,
+          classes: String(p.root.classes || '').split(','),
+          shownClass: String(p.root.classes || '').split(',').indexOf('show') >= 0,
+          state: ds.popupState, code: ds.popupCode, queueLen: ds.popupQueueLen,
+          dismiss: ds.popupDismiss, dwellMs: ds.popupDwellMs,
+          autoDismiss: ds.popupAutoDismiss, manualConfirm: ds.popupManualConfirm
+        };
+      };
+      const firing = delay => env0.timers.filter(t => t.delay === delay && t.fired).length;
+      const shows = (() => {
+        let n = 0;
+        for (let k = 0; k < env0.frames.length; k++) {
+          const s = env0.frames[k].popupAfter ? env0.frames[k].popupAfter.root.dataset.popupState : null;
+          const prev = k === 0 ? 'hidden'
+            : (env0.frames[k - 1].popupAfter ? env0.frames[k - 1].popupAfter.root.dataset.popupState : null);
+          if (s === 'shown' && prev !== 'shown') n++;
+        }
+        return n;
+      })();
+      const maxPending = Math.max.apply(null, env0.frames.map(f => f.pending));
+      return { env0, frameData, firing, shows, maxPending };
+    }
+    /* 「同一把尺子」的两项读数：断言（A4／A5）与 D22 的 `applyHits` **共用**同一个函数，
+       免得"断言查一套、变异查另一套"两处漂移（ADR-0004 D22 的常见腐坏形态）。 */
+    const autoFd = run => frameDataFrom(run).auto;
+    const confirmFd = run => frameDataFrom(run).confirm;
+
+    /* ---------------- 场景 A7／A8（可配置）：独立夹具实例（配置在 bind 之前覆盖） ---------------- */
+    function runCfgScene(cfg) {
+      const env = makePopupEnv();
+      const W = env.w;
+      W.BoardConfig.alarmPopup = cfg;
+      W.Components.AlarmPanel.bind(W.MockData.state, function () {});
+      W.MockData.tick(new Date(T0));
+      W.Components.AlarmPanel.render(W.MockData.state);
+      W.MockData.injectAlarm(new Date(T0 + 5000));
+      W.MockData.tick(new Date(T0 + 5000));
+      W.Components.AlarmPanel.render(W.MockData.state);
+      const root = env.nodes.get(POPUP_ROOT_ID);
+      const cfgDwell = Number((cfg && cfg.dwellMs) || NaN);
+      return {
+        exists: !!root,
+        state: root ? root.dataset.popupState : null,
+        hidden: root ? root.hidden === true : null,
+        autoDismiss: root ? root.dataset.popupAutoDismiss : null,
+        manualConfirm: root ? root.dataset.popupManualConfirm : null,
+        dwellMs: root ? root.dataset.popupDwellMs : null,
+        note: String((env.nodes.get('alPopupNote') || {}).textContent || ''),
+        /* 计时器面：**只数停留计时器**（`dwellMs` 那一档）—— `SettingPanel` 等也会登记
+           0／2000／4000／300000 ms 的定时器，"全部计时器数"不是本判据要的东西（实测踩到）。 */
+        timers: dwellTimerCount(env.timers, cfgDwell),
+        queueLen: W.MockData.state.alarm.queue.length,
+        alCode: String((env.nodes.get('alCode') || {}).textContent || ''),
+        noteTail: env.nodes.get('alPopupNote') ? String(env.nodes.get('alPopupNote').textContent).slice(-NOTE_TAIL.length) : null
+      };
+    }
+    /** 登记在册的**停留计时器**数（`delay === dwellMs`；`dwellMs` 取不到 ⇒ 0，不虚报） */
+    function dwellTimerCount(timers, dwellMs) {
+      return Number.isFinite(dwellMs) ? timers.filter(x => x.delay === dwellMs).length : 0;
+    }
+    const cfgOff = runCfgScene({ enabled: false });
+    const cfgReq = runCfgScene({ enabled: true, dwellMs: 8000, autoDismiss: true, manualConfirm: 'required' });
+
+    /* ---------------- 新版面 id 与状态位可读性自证（防"节点名写错 ⇒ 恒 null ⇒ 判据空洞"） ---------------- */
+    const fr56Readable = obs.env0.frames.every(f => FR56_IDS.every(id => f.ids[id] !== null));
+    const fr56NonTrivial = obs.env0.frames.every(f => FR56_IDS.some(id => f.ids[id] && f.ids[id].text.length > 0));
+    const stateNonTrivial = obs.env0.frames.every(f =>
+      f.state.activeCode !== null && f.state.queue.length + f.state.ledger.length > 0);
+
+    /* ---------------- A9：`FR-5.6` 强判据 —— 现行实现 vs **内联的"改前实现"**逐帧对照 ----------------
+       "改前实现"＝`AlarmPanel.js` 整份源码把 `render()` 末尾那一行 `refreshPopup(state);` 剥掉后
+       分叉出的完整实现副本（本轮唯一接线点）。这不是外部文件、也不是手抄：它**逐字派生自盘上源码**
+       ⇒ 实现怎么改、它就怎么跟，不会像字节副本那样腐坏；而它**能证伪**
+       （下方 D22-2 的反证＝把 `#alQueueNote` 文案改掉 ⇒ 逐帧差异必非空）。 */
+    let oldRun = null, oldErr = null;
+    if (callIdx >= 0) {
+      try {
+        oldRun = runPopupScene({ patch: s => {
+          const i = s.lastIndexOf(POPUP_CALL);
+          return i < 0 ? null : s.slice(0, i) + s.slice(i + POPUP_CALL.length);
+        } });
+      } catch (e) { oldErr = e; }
+    }
+    const diffOld = oldRun ? framesDiff(oldRun, obs.env0) : null;
+
+    /* ---------------- D22 定点变异（**全内存**：整份源码文本分叉，`AlarmPanel.js` 盘上字节不动） ----------------
+       每条变异都**指名**它该打红哪一组；`hits` 是"允许被打红的断言名集合"（多余打红 ⇒ 判据越界，也算失败）。
+       `baseBad`（未变异副本自身对自身的差异）已在 A9 段之前算好 —— 那里先用到它。 */
+    /* 「忘记先清旧计时器」（`showPopup()` 里那句 `if (popupTimer !== null) clearTimeout(popupTimer);` 拿掉）：
+       靶子**按行匹配**（行尾用 `\r?\n` 归一 —— 被测源码的行尾形态不受本次任务约束，不许写死 `\n`）。 */
+    const NO_CLEAR_TARGET = /^[ \t]*if \(popupTimer !== null\) clearTimeout\(popupTimer\);$/m;
+    const variants = [];
+    const define = (label, name, mut, hits) => { variants.push({ label, name, mut, hits }); };
+    /* 「`bind()` 期**不创建**挂点（退化成依赖 `index.html` 静态声明）」——`popupRoot()` 恒返回 null
+       ⇒ `refreshPopup()` 走"挂点不可得"分支写 `off`、7 个子节点一个都不存在。
+       （不删节点来伪造：那只是把节点从假 DOM 的表里摘掉，被测实现的行为一字未变，
+        是**夹具在造数据**，不是定点变异。） */
+    define('D22-1', 'A1.1', { patch: s => s.replace(
+      "    const stage = $('stage');",
+      "    return null;   // D22 内存变异：挂点创建一律失败（退化成依赖 index.html 静态声明）\n    const stage = $('stage');") }, ['A1.1']);
+    /* 「去掉 `seenKeys === null` 分支」的等价变异：首帧**照写读数但写成 `shown`**
+       （`if (false)` 那种写法会让 `seenKeys` 永远为 null ⇒ 第三帧当场 `TypeError`，
+        那是"把实现改崩了"而不是"把口径改错了"，不适合当定点变异靶子）。
+       另把 `#alQueueNote` 文案一并改掉 ⇒ 让 A9 的逐帧对照**必然**非空（证明它有判别力）。 */
+    const MUT_NO_FIRSTFRAME = {
+      patch: s => s.replace("writePopupState(root, 'hidden', cfg, keys.length);",
+        "writePopupState(root, 'shown', cfg, keys.length);")
+        .replace("setText('alQueueNote', queue.length > 1",
+          "setText('alQueueNote', '变更后文案' || queue.length > 1")
+    };
+    define('D22-2', 'A1.2', MUT_NO_FIRSTFRAME, ['A1.2']);
+    /* 「隐藏时也把 state 写成 shown」（＝把"机制在、此刻未显示"与"正在显示"混同）。
+       ⚠ 它会**连带**打红 A4：第 0 帧被当成"显示"⇒ 多挂一个停留计时器，而"显示次数"是从状态位
+       数出来的 ⇒ 两条都红是**正确读数**（不是判据越界），故 `hits` 两条都列。 */
+    /* 「`writePopupState()` 把"隐藏"也写成 `shown`」（＝把"机制在、此刻未显示"与"正在显示"混同）。
+       靶子＝`A1.2`（首帧那三处 `hidden`/`state`/`dismiss` 的读数）。
+       ⚠ 说明为什么**不**把它当 A2 的靶子：A2 读的是**显示中的那一帧**，而该帧本就被写成 `shown`
+       ⇒ 变异在 A2 上**不可证伪**（实测：A2 照旧判绿）；而 A1.2 读的是**未显示**的帧 ⇒ 一击必中。
+       连带红：A1.1（它也判首帧 state）。实测**不**连带 A4（`staleDwell ≡ 0` 与计时器登记数都不受影响）。 */
+    const A2_PATCH_FROM = '    ds.popupState = st;';
+    define('D22-3', 'A1.2', {
+      patch: (() => {
+        return s => (s.split(A2_PATCH_FROM).length - 1) === 1
+          ? s.replace(A2_PATCH_FROM, A2_PATCH_FROM + '\n    if (st === "hidden") ds.popupState = "shown";')
+          : null;
+      })()
+    }, ['A1.2']);
+    /* 「队列条数写死 1」 */
+    define('D22-4', 'A3', {
+      patch: s => s.replace(/ds\.popupQueueLen = String\(popupQueueLen\);/,
+        'ds.popupQueueLen = String(1);')
+    }, ['A3']);
+    /* 「忘记先清旧计时器」（`showPopup()` 里那句 `if (popupTimer !== null) clearTimeout(popupTimer);` 拿掉） */
+    define('D22-5', 'A4', {
+      patch: s => (NO_CLEAR_TARGET.test(s) ? s.replace(NO_CLEAR_TARGET, '') : null),
+      /* 定点变异的**说明性**字段（只作读数打印；判定仍只看靶子是否红） */
+      note: '拿掉 showPopup() 里那句 clearTimeout（先清后挂退化成"只挂不清"）'
+    }, ['A4']);
+    /* 「把确认接到 `M.closeActiveAlarm()`」（FR-5.6 的关键点：确认 ≠ 闭环）。
+       它只该打红 A5：`closeActiveAlarm()` 会把队首闭环掉 ⇒ A6 依赖的"下一帧还在展示那条"这一
+       前提被破坏（那是**连带**，不是本组的靶子）。 */
+    define('D22-6', 'A5', { onConfirm: ctx => { ctx.M.closeActiveAlarm(); } }, ['A5']);
+    /* 「不做『展示中那条已闭环 ⇒ 收起』」（`refreshPopup()` 的 ④ 分支改成 `if (false)`） */
+    define('D22-7', 'A6', {
+      patch: s => s.replace(/if \(popupShownKey && keys\.indexOf\(popupShownKey\) < 0\) \{/,
+        'if (false) {')
+    }, ['A6']);
+
+    /**
+     * 用**与断言完全相同的那把尺子**算出"这一份读数把哪些断言判红" —— 返回判红的断言名清单。
+     * `hits` 在这里**只用来说明"这份读数是从哪条变异来的"**（打印用），不参与判红逻辑；
+     * "靶子必须红"的比对在 `hitsOf()` 里做。判据取**单侧**、不要求"非靶子全绿"的理由见 `hitsOf`。
+     */
+    function applyHits(fd, hits) {
+      const bad = [];
+      const A11_ok = fd.after.alive && fd.after.createdAtBind === true &&
+        fd.after.existedBeforeBind === false &&
+        fd.after.childCount === POPUP_CHILD_IDS.length &&
+        fd.after.state === 'hidden';
+      if (!A11_ok) bad.push('A1.1');
+      const A12_ok = (() => {
+        const c = fd.first;
+        return c.ready && c.queueLen >= 1 && !c.missing && c.state === 'hidden' && c.hidden === true &&
+          c.shownClass === false && c.dismiss === 'none';
+      })();
+      if (!A12_ok) bad.push('A1.2');
+      const A2_ok = (() => {
+        const t = fd.trig;
+        return t.ready && !t.missing && t.state === 'shown' && t.hidden === false && t.shownClass === true &&
+          t.code === t.headCode && t.code !== '' && t.childrenOk &&
+          /发生时间/.test(String(t.kids.alPopupMeta)) && /等级/.test(String(t.kids.alPopupMeta)) &&
+          /闭环状态/.test(String(t.kids.alPopupMeta)) &&
+          String(t.kids.alPopupType).length > 0 && String(t.kids.alPopupDesc).length > 0;
+      })();
+      if (!A2_ok) bad.push('A2');
+      const A3_ok = (() => {
+        const c = fd.queueCase;
+        return c.ready && !c.missing && c.realLen >= 2 && c.queueLen === String(c.realLen) &&
+          c.popupQueueText === popupQueueN(c.realLen) && c.noteText === headNoteN(c.realLen);
+      })();
+      if (!A3_ok) bad.push('A3');
+      const A4_ok = (() => {
+        const c = fd.auto;
+        return c.ready && c.shownFrameClean && c.hidden === true && c.shownClass === false &&
+          c.dismiss === 'timeout' && c.dwellFromConfig === true && c.fired === true &&
+          c.dwellTimers > 0 && c.dwellTimers >= c.shows && c.dwellPendingNeverAboveOne &&
+          c.staleNeverAboveZero && c.oldDwellTimers === 0;
+      })();
+      if (!A4_ok) bad.push('A4');
+      const A5_ok = (() => {
+        const c = fd.confirm;
+        return c.ready && c.clicked === true && c.hidden === true && c.shownClass === false &&
+          c.dismiss === 'confirm' && c.queueUnchanged && c.everyStateUnchanged &&
+          c.ledgerUnchanged && c.activeCodeUnchanged;
+      })();
+      if (!A5_ok) bad.push('A5');
+      const A6_ok = (() => {
+        const c = fd.closure;
+        return c.ready && c.ledgerDelta === 1 && c.headIsClosed && c.queueLacksClosed &&
+          c.shownBefore === true && c.afterHidden === true && c.afterDismiss === 'closed' &&
+          c.afterShownClass === false;
+      })();
+      if (!A6_ok) bad.push('A6');
+      const A7_ok = fd.off.ready && fd.off.state === 'off' && fd.off.hidden === true &&
+        fd.off.timers === 0 && fd.off.queueLen >= 1 && fd.off.alCodeNotDash;
+      if (!A7_ok) bad.push('A7');
+      const A8_ok = fd.req.ready && fd.req.state === 'shown' && fd.req.autoDismiss === 'false' &&
+        fd.req.manualConfirm === 'required' && fd.req.timers === 0 &&
+        String(fd.req.note).indexOf('required') >= 0 && fd.req.noteTailOk;
+      if (!A8_ok) bad.push('A8');
+      return bad;
+    }
+
+    /**
+     * 定点变异的判定：**靶子必须红**（`missing` 为空即通过），`collateral` 只作读数打印。
+     *
+     * 为什么不额外要求"非靶子必须全绿"（**实测依据**，D22 首轮全跑）：本段这几组读数
+     * **结构性耦合** —— 一个口径错会**连带**打红守同一批全局不变量的其它断言。实测三例：
+     *   ①"首帧照写读数但写成 `shown`"必然连带打红 A1.1（它也判首帧 `state === "hidden"`）与 A4；
+     *   ②"隐藏时也写 `shown`"必然连带打红 A1.1／A1.2 与 A4（A4 的"显示次数"是从状态位数出来的）；
+     *   ③"展示中那条已闭环后不收起"必然连带打红 A4（同上）。
+     * 把连带红一律判成"判据越界"，只会逼人把变异造得越来越精致、离真错越来越远 ——
+     * 而 D22 要的是"按旧实现跑**必须失败**"，不是"只许失败一条"。连带红逐条如实打出供复核；
+     * 且每条靶子都有**独立**的一组变异（7 组一一对应）⇒"该条断言真的被判着"不会被连带关系掩盖。
+     */
+    function hitsOf(fd, targets) {
+      const named = applyHits(fd, targets);
+      return {
+        named: named,
+        collateral: named.filter(n => targets.indexOf(n) < 0),
+        missing: targets.filter(t => named.indexOf(t) < 0)
+      };
+    }
+
+    /**
+     * 从**一次运行的原始帧读数**汇总出各组判据的读数（`applyHits` 与本段断言**共用**同一把尺子，
+     * 免得"断言查一套、变异查另一套"两处漂移）。
+     *
+     * 帧号对照（`SCRIPT` 的 `i`；本批用例的**全部**下标都走这里，不在断言里散写数字）：
+     *   `0` 首帧口径｜`5` 触发｜`7` 再弹（此时第 5 帧那个停留计时器**还没到点**）｜`8` 回到点 fire｜
+     *   `10` 第 4 条（排队读数）｜`11` 手动确认｜`12` 再弹｜`13` 手工闭环｜`14` 跟着收起｜`16` 末帧。
+     */
+    function frameDataFrom(run) {
+      const byI = i => run.frames.find(f => f.i === i);
+      const snapAt = i => {
+        const f = byI(i);
+        if (!f) return { ready: false, missing: true, i: i };
+        const p = f.popupAfter;
+        if (!p) return { ready: false, missing: true, i: i, why: '挂点不存在' };
+        const ds = p.root.dataset || {};
+        const cls = String(p.root.classes || '').split(',');
+        return {
+          ready: true, missing: false, i: i, f: f, root: p.root, kids: p.kids,
+          state: ds.popupState, hidden: p.root.hidden === true, shownClass: cls.indexOf('show') >= 0,
+          code: ds.popupCode, queueLen: ds.popupQueueLen, dismiss: ds.popupDismiss,
+          dwellMs: ds.popupDwellMs, autoDismiss: ds.popupAutoDismiss, manualConfirm: ds.popupManualConfirm
+        };
+      };
+      const showsOf = r => {
+        let n = 0;
+        for (let k = 0; k < r.frames.length; k++) {
+          const s = r.frames[k].popupAfter ? r.frames[k].popupAfter.root.dataset.popupState : null;
+          const prev = k === 0 ? 'hidden'
+            : (r.frames[k - 1].popupAfter ? r.frames[k - 1].popupAfter.root.dataset.popupState : null);
+          if (s === 'shown' && prev !== 'shown') n++;
+        }
+        return n;
+      };
+      const firedDwellAt = i => { const f = run.frames.filter(x => x.i === i)[0]; return f ? f.firedDwell : 'NA'; };
+      const root0 = run.frames[0] ? run.frames[0].popupAfter : null;
+      /* 停留计时器**只认 `dwellMs` 这一个周期**的登记（`main.js`／`Dashboard.js`／`SettingPanel.js`
+         也会登记 0／2000／4000／300000 ms 的定时器 ⇒ 拿"全部计时器数"当"显示次数"会被它们污染，
+         实测：总数=5 而显示次数=4）。配置值**从运行期的 `BoardConfig` 现取**，不写死。 */
+      const dwellMs = run.w.BoardConfig.alarmPopup.dwellMs;
+      const dwellTimers = run.timers.filter(x => x.delay === Number(dwellMs));
+      const f0 = byI(0), f5 = byI(5), f7 = byI(7), f8 = byI(8), f10 = byI(10), f11 = byI(11),
+        f12 = byI(12), f13 = byI(13), f14 = byI(14);
+      const cm = f11 ? f11.popupAfter : null;
+      return {
+        first: Object.assign(snapAt(0), {
+          queueLen: f0 ? f0.state.queue.length : 0,
+          headCode: f0 && f0.state.queue[0] ? f0.state.queue[0].split('|')[0] : null
+        }),
+        trig: Object.assign(snapAt(5), {
+          headCode: f5 && f5.state.queue[0] ? f5.state.queue[0].split('|')[0] : null,
+          childrenOk: Boolean(snapAt(5).ready &&
+            POPUP_CHILD_IDS.every(id => snapAt(5).kids[id] !== null))
+        }),
+        queueCase: Object.assign(snapAt(10), {
+          realLen: f10 ? f10.state.queue.length : -1,
+          popupQueueText: snapAt(10).ready ? String(snapAt(10).kids.alPopupQueue) : null,
+          noteText: snapAt(10).ready && snapAt(10).f.ids.alQueueNote ? String(snapAt(10).f.ids.alQueueNote.text) : null
+        }),
+        auto: {
+          ready: Boolean(f7 && f8 && f7.popupAfter && f8.popupAfter),
+          shownFrameClean: Boolean(f7 && f7.popupAfter &&
+            f7.popupAfter.root.dataset.popupState === 'shown' &&
+            f7.popupAfter.root.dataset.popupDwellMs === String(dwellMs)),
+          hidden: f8 && f8.popupAfter ? f8.popupAfter.root.hidden === true : null,
+          shownClass: f8 && f8.popupAfter ? String(f8.popupAfter.root.classes).split(',').indexOf('show') >= 0 : null,
+          dismiss: f8 && f8.popupAfter ? f8.popupAfter.root.dataset.popupDismiss : null,
+          dwellFromConfig: true,
+          fired: f8 ? f8.fired === true : false,
+          dwellMs: dwellMs,
+          dwellTimers: dwellTimers.length,
+          shows: showsOf(run),
+          dwellPending: run.frames.map(f => f.dwellPending),
+          dwellPendingNeverAboveOne: run.frames.every(f => f.dwellPending <= 1),
+          staleDwell: run.frames.map(f => f.staleDwell),
+          firedDwellAt7: firedDwellAt(7),
+          firedDwellAt8: firedDwellAt(8),
+          /* 不堆叠：任何一帧都**不得**留下"上一次登记的、既没取消也没 fire"的停留计时器
+             （＝"先清后挂"那句 `clearTimeout` 被拿掉的直接读数）。`dwellTimers === shows` 只做弱校验：
+             它**在帧 5 fire(8000) 之后会假绿**（旧计时器恰好已被 fire ⇒ 差异消失），实测踩到。 */
+          staleNeverAboveZero: run.frames.every(f => f.staleDwell === 0),
+          staleMax: Math.max.apply(null, run.frames.map(f => f.staleDwell)),
+          oldDwellTimers: oldRun ? oldRun.timers.filter(x => x.delay === Number(dwellMs)).length : -1
+        },
+        confirm: {
+          ready: Boolean(f11 && cm && f10),
+          clicked: f11 && f11.confirm ? f11.confirm.clicked === true : false,
+          hidden: cm ? cm.root.hidden === true : null,
+          shownClass: cm ? String(cm.root.classes).split(',').indexOf('show') >= 0 : null,
+          dismiss: cm ? cm.root.dataset.popupDismiss : null,
+          queueUnchanged: Boolean(f11 && f11.queueLenBeforeConfirm === f11.queueAfterConfirm),
+          everyStateUnchanged: Boolean(f11 && f11.state.queue.every(x => /未处理$/.test(x))),
+          ledgerUnchanged: Boolean(f11 && f10 && f11.ledgerAfterConfirm === f10.state.ledger.length),
+          activeCodeUnchanged: Boolean(f10 && f11 && f11.state.activeCode !== null &&
+            f11.state.activeCode === f10.state.activeCode),
+          activeCodeBefore: f10 ? f10.state.activeCode : null,
+          activeCodeAfter: f11 ? f11.state.activeCode : null
+        },
+        closure: {
+          ready: Boolean(f12 && f13 && f14 && f12.popupAfter && f13.popupAfter && f14.popupAfter),
+          ledgerDelta: f13 ? f13.ledgerDelta : null,
+          headIsClosed: Boolean(f13 && f13.ledgerHeadAfter &&
+            f13.ledgerHeadAfter.split('|')[1] === f13.closedCode),
+          queueLacksClosed: Boolean(f13 && f13.queueAfterClose && f13.queueAfterClose.indexOf(f13.closedCode) < 0),
+          shownBefore: f12 && f12.popupAfter ? f12.popupAfter.root.dataset.popupState === 'shown' : null,
+          afterHidden: f14 && f14.popupAfter ? f14.popupAfter.root.hidden === true : null,
+          afterDismiss: f14 && f14.popupAfter ? f14.popupAfter.root.dataset.popupDismiss : null,
+          afterShownClass: f14 && f14.popupAfter ? String(f14.popupAfter.root.classes).split(',').indexOf('show') >= 0 : null
+        },
+        off: {
+          ready: cfgOff.exists, state: cfgOff.state, hidden: cfgOff.hidden, timers: cfgOff.timers,
+          queueLen: cfgOff.queueLen, alCodeNotDash: cfgOff.alCode !== '—'
+        },
+        req: {
+          ready: cfgReq.exists, state: cfgReq.state, autoDismiss: cfgReq.autoDismiss,
+          manualConfirm: cfgReq.manualConfirm, timers: cfgReq.timers, note: cfgReq.note,
+          noteTailOk: cfgReq.noteTail === NOTE_TAIL
+        },
+        after: {
+          alive: Boolean(root0),
+          state: snapAt(0).state,
+          createdAtBind: run.createdAtBind === true,
+          existedBeforeBind: run.existedBeforeBind === true,
+          childCount: POPUP_CHILD_IDS.filter(id => Boolean(run.nodes.get(id))).length
+        }
+      };
+    }
+
+    const baseReady = obs !== null;
+    if (baseReady) {
+      /* ---------------- A1.1 挂点与三态 ---------------- */
+      const p0 = obs.frameData(0);
+      const childPresent = POPUP_CHILD_IDS.map(id => Boolean(obs.env0.nodes.get(id)));
+      const childCount = childPresent.filter(Boolean).length;
+      check('A1.1 挂点与三态（`FR-5.5`）：`bind()` 期创建 `#alPopup` —— **创建前不存在**、创建后存在；' +
+        '`bind()` 之后的**任意一帧**都满足 `hidden=true` ∧ `data-popup-state="hidden"`；7 个子节点齐备',
+        obs.env0.existedBeforeBind === false && obs.env0.createdAtBind === true &&
+        childCount === POPUP_CHILD_IDS.length && !p0.missing &&
+        p0.state === 'hidden' && p0.hidden === true && p0.shownClass === false,
+        '`bind()` 之前 `#alPopup` 存在=' + obs.env0.existedBeforeBind +
+        '、之后=' + obs.env0.createdAtBind + '（应 false → true：**由组件按需创建**，不依赖 `index.html` 静态声明）；' +
+        '子节点 ' + childCount + '/' + POPUP_CHILD_IDS.length + '（' +
+        POPUP_CHILD_IDS.map((id, k) => id + '=' + childPresent[k]).join('、') + '）；' +
+        '首帧 dataset：state=' + JSON.stringify(p0.state) + ' hidden=' + p0.hidden +
+        ' class="' + p0.root.classes + '"（`off` 与 `shown` 两态各自另有断言：A7 → `off`、A2 → `shown`）');
+
+      /* ---------------- A1.2 首帧口径 ---------------- */
+      const fl = obs.frameData(0);
+      const q0 = fl.f ? fl.f.state.queue : [];
+      check('A1.2 首帧口径：一帧就存在的报警**不弹**（同时 `hidden=true` ∧ `state="hidden"` ∧ `dismiss="none"`）；' +
+        '且**同帧队列非空**（证明"首帧口径真的在起作用"，不是"恰好没有报警"）',
+        !fl.missing && q0.length >= 1 &&
+        fl.state === 'hidden' && fl.hidden === true && fl.shownClass === false && fl.dismiss === 'none',
+        '首帧队列实测 ' + q0.length + ' 条=' + JSON.stringify(q0) + '（**必须 ≥ 1**，否则本判据对"去掉首帧分支"没有判别力）；' +
+        '读数：state=' + JSON.stringify(fl.state) + ' hidden=' + fl.hidden +
+        ' 含 show=' + fl.shownClass + ' dismiss=' + JSON.stringify(fl.dismiss) + '（应依次 hidden／true／false／none）');
+
+      /* ---------------- A2 触发 ---------------- */
+      const tr = obs.frameData(5);
+      const kids = tr.kids || {};
+      const metaText = String(kids.alPopupMeta);
+      check('A2 触发（`FR-5.5`）：新报警发生 ⇒ 弹窗显示（`state="shown"` ＋ `hidden=false` ＋ class 含 `show` **三处同步**）；' +
+        '`data-popup-code` ＝ **队首**那条；代码/类型/简述/发生时间/等级/闭环状态**六项文案齐备**',
+        !tr.missing && tr.state === 'shown' && tr.hidden === false && tr.shownClass === true &&
+        tr.code === (tr.f.state.queue[0] || '').split('|')[0] && tr.code !== '' &&
+        String(kids.alPopupCode) === tr.code &&
+        /发生时间/.test(metaText) && /等级/.test(metaText) && /闭环状态/.test(metaText) &&
+        String(kids.alPopupType).length > 0 && String(kids.alPopupDesc).length > 0,
+        '第 5 帧（注一条新报警后）：state=' + JSON.stringify(tr.state) + ' hidden=' + tr.hidden +
+        ' 含 show=' + tr.shownClass + '；`data-popup-code`=' + JSON.stringify(tr.code) +
+        '（同帧队首=' + JSON.stringify((tr.f.state.queue[0] || '').split('|')[0]) + '）；' +
+        '六项文案：code=' + JSON.stringify(kids.alPopupCode) + ' type=' + JSON.stringify(kids.alPopupType) +
+        ' desc=' + JSON.stringify(kids.alPopupDesc) + ' meta=' + JSON.stringify(metaText) + '；' +
+        '`#alPopupConfirm` 在场=' + Boolean(POPUP_CHILD_IDS.indexOf('alPopupConfirm') >= 0 && kids.alPopupConfirm !== null));
+
+      /* ---------------- A3 排队 ---------------- */
+      const qc = obs.frameData(10);
+      const q9 = qc.f ? qc.f.state.queue : [];
+      const note9 = String(qc.f && qc.f.ids.alQueueNote ? qc.f.ids.alQueueNote.text : '');
+      check('A3 排队（`FR-5.6`）：`data-popup-queue-len` ＝ **实际队列条数**（不写死 1）、`#alPopupQueue` 文案含该条数、' +
+        '与报警卡的 `#alQueueNote` **同步**（同一帧、同一真源，期望值由实测条数算出）',
+        !qc.missing && q9.length >= 2 && qc.queueLen === String(q9.length) &&
+        String(qc.kids.alPopupQueue) === popupQueueN(q9.length) && note9 === headNoteN(q9.length),
+        '第 10 帧：实际队列 ' + q9.length + ' 条=' + JSON.stringify(q9.map(x => x.split('|')[0])) +
+        '；`data-popup-queue-len`=' + JSON.stringify(qc.queueLen) + '（应 "' + q9.length + '"）' +
+        '；`#alPopupQueue`=' + JSON.stringify(String(qc.kids.alPopupQueue)) +
+        '；`#alQueueNote`=' + JSON.stringify(note9) + '（两者都应逐字＝' + JSON.stringify(headNoteN(q9.length)) + '）');
+
+      /* ---------------- A4 自动收起 ---------------- */
+      const f7 = obs.frameData(7), f8 = obs.frameData(8);
+      const dwellCfg = obs.env0.w.BoardConfig.alarmPopup.dwellMs;
+      const ac = autoFd(obs.env0);
+      check('A4 自动收起（`FR-5.7`「弹窗停留时长」＋「自动收起」＋ `UI-18` 防烧屏）：' +
+        '`dwellMs` 计时器 fire ⇒ `hidden=true` ∧ 无 `show` ∧ `dismiss="timeout"`；' +
+        '**停留时长取自配置**（构造性：与运行期 `BoardConfig.alarmPopup.dwellMs` 对齐，不写死 8000）；' +
+        '**登记的停留计时器数 ≥ 状态位观测到的"显示次数"**（先清后挂、不堆叠 —— 只数 `dwellMs` 这一档，' +
+        '`main.js`／`SettingPanel` 的 0/2000/4000/300000 ms 定时器不算；取"≥"而非"="是因为' +
+        '**连续两帧都显示**时状态位只跳变一次、而计时器**每次都会重挂**）；' +
+        '**任何一帧都不得留下"陈旧未取消"的停留计时器**（＝"忘记先清旧计时器"的**直接**读数：' +
+        '必须由"第 5 帧挂上、**第 7 帧还没到点就又来一条**"这一形态逼出来 —— 到点 fire 之后再弹，' +
+        '旧计时器已被消费，"不堆叠"差异就消失了，实测踩到）；**改前实现零停留计时器**',
+        !f7.missing && !f8.missing && f7.state === 'shown' && f7.dwellMs === String(dwellCfg) &&
+        obs.firing(Number(dwellCfg)) >= 1 && f8.hidden === true && f8.shownClass === false &&
+        f8.dismiss === 'timeout' && ac.ready && ac.shownFrameClean && ac.hidden === true &&
+        ac.shownClass === false && ac.dismiss === 'timeout' && ac.dwellTimers > 0 &&
+        ac.dwellTimers >= ac.shows && ac.dwellPendingNeverAboveOne && ac.staleNeverAboveZero &&
+        ac.oldDwellTimers === 0,
+        '第 7 帧（fire 之前）state=' + JSON.stringify(f7.state) + ' dwell-ms=' + JSON.stringify(f7.dwellMs) +
+        '（配置实测 dwellMs=' + JSON.stringify(dwellCfg) + '）' +
+        '；第 8 帧 fire(' + dwellCfg + ') 命中=' + (obs.firing(Number(dwellCfg)) >= 1) +
+        ' ⇒ state=' + JSON.stringify(f8.state) + ' hidden=' + f8.hidden + ' 含 show=' + f8.shownClass +
+        ' dismiss=' + JSON.stringify(f8.dismiss) +
+        '；停留计时器登记数=' + ac.dwellTimers + '（＝显示次数 ' + ac.shows + '）、' +
+        '逐帧未完成停留计时器=' + JSON.stringify(ac.dwellPending) + '（全程 ≤ 1=' + ac.dwellPendingNeverAboveOne + '）、' +
+        '逐帧**陈旧未取消**停留计时器=' + JSON.stringify(ac.staleDwell) + '（全程 ≡ 0=' + ac.staleNeverAboveZero +
+        '，峰值 ' + ac.staleMax + '）' +
+        '；改前实现登记停留计时器=' + ac.oldDwellTimers + '（应 0：这些计时器全部是本次新增）');
+
+      /* ---------------- A5 确认 ≠ 闭环 ---------------- */
+      const c11 = obs.frameData(11);
+      const q11 = c11.f ? c11.f.state.queue : [];
+      const co = confirmFd(obs.env0);
+      check('A5 **确认 ≠ 闭环**（`FR-5.6` 防回归的关键点）：点 `#alPopupConfirm` ⇒ **只收起本提示**' +
+        '（`hidden=true` ＋ 无 `show` ＋ `dismiss="confirm"`）；**队列条数／各条 state／台账行数**三项全不变；' +
+        '`state.alarm.active` 不动（未经由 `closeActiveAlarm()`）',
+        !c11.missing && !!c11.f.confirm && c11.f.confirm.clicked === true &&
+        c11.hidden === true && c11.shownClass === false &&
+        c11.dismiss === 'confirm' && co.ready && co.clicked === true && co.hidden === true &&
+        co.shownClass === false && co.dismiss === 'confirm' && co.queueUnchanged &&
+        co.everyStateUnchanged && co.ledgerUnchanged && co.activeCodeUnchanged,
+        '点确认后 state=' + JSON.stringify(c11.state) + ' hidden=' + c11.hidden +
+        ' 含 show=' + c11.shownClass + ' dismiss=' + JSON.stringify(c11.dismiss) +
+        '；队列 ' + c11.f.queueLenBeforeConfirm + ' → ' + c11.f.queueAfterConfirm + ' 条（应相等）' +
+        '、逐条=' + JSON.stringify(q11) + '（应全部「未处理」）' +
+        '；台账 ' + c11.f.ledgerAfterConfirm + ' 行 vs 第 10 帧 ' +
+        (obs.frameData(10).f ? obs.frameData(10).f.state.ledger.length : '—') + ' 行（应相等）' +
+        '；`state.alarm.active`：第 10 帧=' + JSON.stringify(co.activeCodeBefore) +
+        ' → 点确认后=' + JSON.stringify(co.activeCodeAfter) + '（应不变）');
+
+      /* ---------------- A6 闭环联动 ---------------- */
+      const f12c = obs.frameData(12), f13c = obs.frameData(13), f14c = obs.frameData(14);
+      check('A6 闭环联动（`FR-5.6` 手工闭环 ＋ 闭环入台账）：手工闭环**正在展示的那条** ⇒ 台账 +1 且最新一条＝它、' +
+        '它离开队列；**下一帧**弹窗跟着收起并记 `dismiss="closed"`（不留过时读数）',
+        !f12c.missing && !f13c.missing && !f14c.missing &&
+        f12c.state === 'shown' && f13c.f.close === true && f13c.f.ledgerDelta === 1 &&
+        String(f13c.f.ledgerHeadAfter).split('|')[1] === f13c.f.closedCode &&
+        f13c.f.queueAfterClose.indexOf(f13c.f.closedCode) < 0 &&
+        f14c.hidden === true && f14c.shownClass === false && f14c.dismiss === 'closed',
+        '第 13 帧闭环 ' + JSON.stringify(f13c.f.closedCode) + ' ⇒ 台账 +' + f13c.f.ledgerDelta +
+        '、最新一条=' + JSON.stringify(f13c.f.ledgerHeadAfter) + '、闭环后队列=' + JSON.stringify(f13c.f.queueAfterClose) +
+        '；弹窗：第 12 帧 state=' + JSON.stringify(f12c.state) + ' → 第 14 帧 state=' + JSON.stringify(f14c.state) +
+        ' hidden=' + f14c.hidden + ' 含 show=' + f14c.shownClass + ' dismiss=' + JSON.stringify(f14c.dismiss));
+
+      /* ---------------- A7／A8 可配置（`FR-5.7`） ---------------- */
+      check('A7 可配置（`FR-5.7`／`board.config.js` 的 `alarmPopup` 段是唯一真源）：`enabled=false` ⇒ ' +
+        '`data-popup-state="off"`（**"没有这个机制" ≠ "机制在、此刻未显示"**）、`hidden=true`、**零计时器**；' +
+        '报警卡与并发队列照常渲染（弹窗禁用不影响 `FR-5.1～5.6`）',
+        cfgOff.exists && cfgOff.queueLen >= 1 && cfgOff.alCode !== '—' &&
+        cfgOff.state === 'off' && cfgOff.hidden === true && cfgOff.timers === 0,
+        '实测：state=' + JSON.stringify(cfgOff.state) + ' hidden=' + cfgOff.hidden +
+        ' 计时器=' + cfgOff.timers + '；报警队列=' + cfgOff.queueLen + ' 条、`#alCode`=' + JSON.stringify(cfgOff.alCode) +
+        '' + (cfgOff.alCode !== '—' ? '（报警卡照常渲染）' : '（报警卡没渲染 ⇒ 这是 A7 的失败面）'));
+
+      check('A8 可配置（`FR-5.7`「手动确认规则」）：`manualConfirm="required"` ⇒ **零计时器**（`autoDismiss=true` 也按关处理）、' +
+        '`data-popup-auto-dismiss="false"`、`data-popup-manual-confirm="required"`；`#alPopupNote` 如实写明需手动确认（含 `required`）',
+        cfgReq.exists && cfgReq.state === 'shown' && cfgReq.timers === 0 &&
+        cfgReq.autoDismiss === 'false' && cfgReq.manualConfirm === 'required' &&
+        String(cfgReq.note).indexOf('required') >= 0 &&
+        String(cfgReq.note).slice(-NOTE_TAIL.length) === NOTE_TAIL,
+        '实测：state=' + JSON.stringify(cfgReq.state) + ' auto-dismiss=' + JSON.stringify(cfgReq.autoDismiss) +
+        ' manual-confirm=' + JSON.stringify(cfgReq.manualConfirm) + ' 计时器=' + cfgReq.timers +
+        '；`#alPopupNote`=' + JSON.stringify(String(cfgReq.note).slice(0, 60) + '…') +
+        '（尾句逐字对照=' + (String(cfgReq.note).slice(-NOTE_TAIL.length) === NOTE_TAIL) + '）');
+
+      /* ---------------- A9 `FR-5.6` 强判据（现行 vs 改前） ---------------- */
+      const baseBad = framesDiff(obs.env0, obs.env0);
+      check('A9 **`FR-5.6` 防回归强判据**：同一输入序列下，`FR-5.1～5.6` 的 **10 个节点读数 ＋ 每帧报警状态**' +
+        '（队列/台账/队首）与**改前实现逐帧逐项完全一致**（"改前实现"＝现行 `render()` 剥掉末尾唯一那行 ' +
+        '`refreshPopup(state);`，逐字派生自盘上源码、非外部文件）；**且读数面非空**（节点名写错导致恒 null 时本判据必红）',
+        oldRun !== null && diffOld !== null && diffOld.length === 0 &&
+        fr56Readable && fr56NonTrivial && stateNonTrivial && baseBad.length === 0,
+        '对照：' + obs.env0.frames.length + ' 帧 × ' + FR56_IDS.length + ' 节点 ＋ 每帧状态' +
+        '；差异条数=' + (diffOld === null ? '（未跑）' : diffOld.length) +
+        (diffOld && diffOld.length ? ' ⇒ ' + diffOld.slice(0, 3).join(' ｜ ') : '') +
+        '；读数面自证：全部帧 10 节点可读=' + fr56Readable + '、每帧至少一处非空文本=' + fr56NonTrivial +
+        '、每帧 state 非平凡=' + stateNonTrivial +
+        '（自身对自身 0 偏差负对照=' + (baseBad.length === 0) + '）' +
+        (oldErr ? '；改前变体抛出：' + String(oldErr.message || oldErr) : ''));
+
+      /* ---------------- A10 `render()` 不注册监听 ---------------- */
+      const badFrames = obs.env0.frames.filter(f => f.listenersInRender !== 0).map(f => f.i);
+      check('A10 `render()` **不注册事件监听**（本仓既有断言的口径：否则每秒累积监听器）：' +
+        '逐帧 `render()` 期间新增监听数**恒为 0**（防"把 `bindPopupOnce()` 放进 `popupRoot()`"这一退化 —— ' +
+        '那正是本实现第一版踩到的坑）；同时**装配期确有监听**（否则本判据对"监听全没了"没有判别力）',
+        badFrames.length === 0 && obs.env0.listenersInRender > 0,
+        'render 期注册监听的帧=' + JSON.stringify(badFrames) + '（应为 []）；' +
+        '`bind()` ＋ 首帧创建累计注册=' + obs.env0.listenersInRender + ' 个（须 > 0）；' +
+        '逐帧增量=' + JSON.stringify(obs.env0.frames.map(f => f.listenersInRender)));
+
+      /* ---------------- D22：逐组定点变异（内存变异 ⇒ 必红并**指名**） ---------------- */
+      const reads = {
+        'A1.1': '挂点/子节点/state', A2: 'data-popup-state', A3: 'data-popup-queue-len',
+        A4: '登记计时器数', A5: 'dismiss', A6: 'dismiss', 'A1.2': '首帧 state/dismiss/队列条数',
+        A7: 'data-popup-state', A8: 'data-popup-auto-dismiss',
+        A9: '逐帧节点读数', A10: 'render 期监听数'
+      };
+      /* 与 A1～A10 的断言**共用同一把尺子**（`applyHits`）—— D22 判红的就是那些断言本身 */
+      const results = variants.map(v => {
+        let fd = null, err = null;
+        try { fd = frameDataFrom(runPopupScene(v.mut)); } catch (e) { err = String((e && e.message) || e); }
+        if (err || !fd) return { v: v, err: err || '夹具未返回读数', named: [], collateral: [], missing: v.hits };
+        const h = hitsOf(fd, v.hits);
+        return { v: v, err: null, named: h.named, collateral: h.collateral, missing: h.missing };
+      });
+      const vLabel = x => (x && x.v && x.v.label) || '（无）';
+      const vName = x => (x && x.v && x.v.name) || '（无）';
+      const namedList = results.map(x => vLabel(x) + '(' + vName(x) + ')→' +
+        (x.err ? '【夹具失败】' + x.err : '靶子命中=' + JSON.stringify(x.missing.length === 0) +
+          '、判红清单=' + JSON.stringify(x.named) + '、连带红=' + JSON.stringify(x.collateral)));
+      const allNamed = results.every(x => !x.err && x.missing.length === 0 && x.named.length > 0);
+      const baseNamed = applyHits(frameDataFrom(obs.env0), []);
+      const baseOk = baseBad.length === 0 && baseNamed.length === 0;
+      check('U12-D22 定点变异（**全内存**：整份源码文本分叉，`AlarmPanel.js` 盘上字节不动）—— 7 组，逐组**必红并指名**：' +
+        variants.map(x => ((x && x.label) || '（无）') + '(' + ((x && x.name) || '（无）') + '：' +
+          reads[x && x.name] + '）').join('、') +
+        '；未变异副本 0 偏差（负对照）',
+        allNamed && baseOk && sha256(SRC_ABS) === shaBefore,
+        '①变异后逐组读数（**靶子必须红**；`collateral` 是与靶子同源的连带红，只作读数）：' + namedList.join(' ｜ ') +
+        '；靶子→读数：' + variants.map(x => ((x && x.label) || '（无）') + '→' + ((x && x.name) || '（无）')).join('、') +
+        '；②未变异副本：判红项=' + JSON.stringify(baseNamed) + '、自身对自身差异数=' + baseBad.length +
+        '；③**盘上字节**：`' + SRC_REL + '` @' + shaBefore.slice(0, 12) + ' → 段末复算一致=' +
+        (sha256(SRC_ABS) === shaBefore) + '（所有变异只发生在**内存**：源码文本分叉 ＋ 框架副本）');
+      unmet('U12 前提③（D22 的"盘上字节未变"证据）：`' + SRC_REL + '` 的 SHA-256 在本段运行前后一致',
+        sha256(SRC_ABS) === shaBefore,
+        '段前=' + shaBefore.slice(0, 12) + ' 段末=' + sha256(SRC_ABS).slice(0, 12));
+    } else {
+      check('U12 `E2` 弹窗断言段（A1～A10 ＋ D22）', false,
+        '观察面未建立（夹具未返回读数）—— 如实报红，不静默跳过（规范 9.5-5"没有证据不等于通过"）');
     }
   }
 

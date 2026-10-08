@@ -1487,6 +1487,256 @@ async function main() {
     await cdp.send('Emulation.clearDeviceMetricsOverride');
   }
 
+  /* ===== B8／B9 `E2` 真模态报警弹窗（`FR-5.5` 高亮弹窗预警 ／ `FR-5.7` 停留·自动收起·手动确认可配）=====
+     座位 4b 的 `T-20261007-24`：假 DOM 面（`ui-check` 的 U12 段：四路径读数 ＋ 7 组 D22）已覆盖**行为**；
+     本段只补两件**只能在真机上看**的事 —— 它们正是"基准图与 4K 交付图要不要重拍"的机器证据：
+       B8 **抓图口径钉住**：抓图口径（`tests\capture-baseline.js` 的 SHIM：固定时钟 ＋ 种子随机 ＋
+          **冻结定时器**）下，10 个入口（`?tab=` 全套 ＋ `?curve=none` ＋ `?link=off`）在**两种分辨率**下
+          `#alPopup` 都必须满足：`getComputedStyle().display === 'none'` ∧ `getBoundingClientRect()` 为
+          **0×0** ∧ `data-popup-state === 'hidden'`。⇒ 弹窗**必然不进图** ⇒ 10 张基准图与 10 张 4K
+          交付图都**不需要重拍**（不是"看起来没出现"，是三条可量测的读数同时成立）。
+       B9 **真机"不阻塞"**（`FR-5.5` 的后半句）：绕开首帧口径把弹窗**真的弹出来**，然后量
+          `#alPopup` 的 computed `pointer-events === 'none'` ∧ `#alPopupConfirm` 为 `auto` ∧
+          弹窗 rect 与 `#board-header` rect **不相交** ∧ 弹窗**空白处**的 `elementFromPoint` **不是**
+          `#alPopup`（＝点击穿过弹窗落到下层）。没有这一条，"不阻塞"就只是注释里的声明。
+     ⚠ `B8` 的 SHIM 只在本段插入、**段末立刻摘掉**（B6 的虚拟时间快进与 B7 的 `cliScreenshot`
+        不能被冻结定时器影响）；B9 另插一支"`setTimeout` 空转"的 SHIM（模拟退化成 8000 ms 的实际形态），
+        段末一并摘掉。 */
+  section('B8 `E2` 弹窗的**抓图口径**真机读数（基准图与 4K 交付图是否需重拍＝机器证据）');
+  {
+    /* 抓图口径的 SHIM —— **逐字照抄** `tests\capture-baseline.js` 的 SHIM */
+    const CAPTURE_SHIM = [
+      '(() => {',
+      "  const FIXED = Date.parse('2026-09-18T10:00:00');",
+      '  const RealDate = Date;',
+      '  function FakeDate(...a) { return a.length ? new RealDate(...a) : new RealDate(FIXED); }',
+      '  FakeDate.prototype = RealDate.prototype;',
+      '  FakeDate.now = () => FIXED;',
+      '  FakeDate.parse = RealDate.parse;',
+      '  FakeDate.UTC = RealDate.UTC;',
+      '  window.Date = FakeDate;',
+      '  let seed = 20260919;',
+      '  Math.random = function () { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };',
+      '  window.setInterval = function () { return 0; };',
+      '  window.setTimeout = function () { return 0; };',
+      '})();'
+    ].join('\n');
+    /* 10 个入口 —— **逐字照抄** `tests\capture-baseline.js` 的 SHOTS（顺序也一致） */
+    const CAPTURE_SHOTS = [
+      ['01-设备状态-任务曲线', ''],
+      ['02-任务数据', '?tab=1'],
+      ['03-班次信息', '?tab=2'],
+      ['04-生产统计', '?tab=3'],
+      ['05-设备异常', '?tab=4'],
+      ['06-维保台账', '?tab=5'],
+      ['07-公告备注', '?tab=6'],
+      ['08-操作设置', '?tab=7'],
+      ['09-曲线初始空态', '?curve=none'],
+      ['10-上位机断连降级', '?link=off']
+    ];
+    const readCapturePopup = () => evaluate(`(() => {
+      const el = document.getElementById('alPopup');
+      if (!el) return { exists: false, fatal: '未找到 #alPopup 挂点（组件未创建）' };
+      const cs = getComputedStyle(el);
+      const b = el.getBoundingClientRect();
+      const ds = el.dataset || {};
+      const alarm = (() => {
+        try {
+          const a = window.MockData.state.alarm;
+          return { queueLen: (a.queue || []).length, ledgerLen: (a.ledger || []).length };
+        } catch (e) { return { error: String((e && e.message) || e) }; }
+      })();
+      return {
+        exists: true, hidden: el.hidden === true, display: cs.display, visibility: cs.visibility,
+        pointerEvents: cs.pointerEvents,
+        rect: { x: +b.x.toFixed(1), y: +b.y.toFixed(1), w: +b.width.toFixed(1), h: +b.height.toFixed(1) },
+        state: (ds.popupState === undefined) ? null : ds.popupState,
+        stateAttr: el.getAttribute('data-popup-state'),
+        queueLen: (ds.popupQueueLen === undefined) ? null : ds.popupQueueLen,
+        dismiss: (ds.popupDismiss === undefined) ? null : ds.popupDismiss,
+        className: String(el.className || ''),
+        alarm: alarm
+      };
+    })()`);
+    /* 判据抽成**纯函数**，供断言与 D22 的"内存读数副本"共用同一把尺子 */
+    const captureVerdict = m => {
+      const bad = [];
+      if (!m || !m.exists) return { ok: false, why: '（读不到 #alPopup）' + JSON.stringify(m) };
+      if (m.display !== 'none') bad.push('display=' + JSON.stringify(m.display) + '（应 "none"）');
+      if (!(m.rect.w === 0 && m.rect.h === 0)) bad.push('rect=' + m.rect.w + '×' + m.rect.h + '（应 0×0）');
+      if (m.state !== 'hidden') bad.push('data-popup-state=' + JSON.stringify(m.state) + '（应 "hidden"）');
+      return { ok: bad.length === 0, why: bad.join('；') };
+    };
+
+    const scriptId = (await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: CAPTURE_SHIM })).identifier;
+    const rows = [];
+    for (const size of [[3840, 2160], [1920, 1080]]) {
+      await setViewport(size[0], size[1]);
+      for (const [name, q] of CAPTURE_SHOTS) {
+        await openPage(q, 900);
+        const m = await readCapturePopup();
+        rows.push({ size: size.join('×'), name: name, q: q, m: m, v: captureVerdict(m) });
+      }
+    }
+    const bad = rows.filter(r => !r.v.ok);
+    check('B8 抓图口径（固定时钟＋种子随机＋**冻结定时器**）× 2 分辨率 × 10 入口 = ' + rows.length +
+      ' 次真机读取：每一次都满足 `display==="none"` ∧ `rect 0×0` ∧ `data-popup-state==="hidden"` ' +
+      '⇒ 弹窗**必然不进图**（基准图与 4K 交付图都不需重拍）',
+      rows.length === 20 && bad.length === 0,
+      '不合格读数=' + bad.length + ' 次' + (bad.length ? '：' +
+        bad.slice(0, 4).map(r => `${r.size} ${r.name}: ${r.v.why}`).join(' ｜ ') : '') +
+      '；抽样（4K 首张）：display=' + JSON.stringify((rows[0] || {}).m ? rows[0].m.display : null) +
+      '、rect=' + JSON.stringify((rows[0] || {}).m ? rows[0].m.rect : null) +
+      '、state=' + JSON.stringify((rows[0] || {}).m ? rows[0].m.state : null) +
+      '、hidden=' + JSON.stringify((rows[0] || {}).m ? rows[0].m.hidden : null) +
+      '、报警队列条数=' + JSON.stringify((rows[0] || {}).m && rows[0].m.alarm ? rows[0].m.alarm.queueLen : null) +
+      '（> 0 ⇒ 本判据不是"恰好没有报警"的假绿）');
+
+    /* D22（**内存读数副本**，不改盘上任何文件）：把某一次真机读数的 `data-popup-state` 改成 `'shown'`
+       （＝"弹窗其实显示了"的错实现）⇒ 同一条 `captureVerdict` **必红并指名** `data-popup-state`；
+       未变异副本必绿。随后不做任何"还原"动作 —— 变异只发生在 Node 侧的对象副本上，页面与盘上都没变。 */
+    const base0 = rows[0] ? rows[0].m : null;
+    const baseV = base0 ? captureVerdict(base0) : { ok: false, why: '（无基线读数）' };
+    const mutated = base0 ? Object.assign({}, base0, { state: 'shown' }) : null;
+    const mutV = mutated ? captureVerdict(mutated) : { ok: false, why: '（无变异副本）' };
+    check('B8-D22 可证伪（ADR-0004 D22）：把**真机读数副本**的 `data-popup-state` 改成 `\'shown\'` ' +
+      '（＝"抓图口径下弹窗其实弹出来了"）⇒ 同一条 `captureVerdict` **必红并指名** `data-popup-state`；' +
+      '未变异副本必绿（变异只发生在内存副本上，页面与盘上都不动）',
+      baseV.ok === true && mutV.ok === false && String(mutV.why).indexOf('data-popup-state') >= 0,
+      '未变异副本判绿=' + baseV.ok + '；改成 `shown` 后判红=' + (mutV.ok === false) +
+      '、红时指名=' + JSON.stringify(mutV.why));
+
+    /* 摘掉抓图口径的 SHIM：后面的 B6（虚拟时间快进）／B7（`cliScreenshot`）不能被冻结定时器影响 */
+    try { await cdp.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId }); }
+    catch (e) { check('B8 抓图口径 SHIM 已摘除（否则会污染 B6／B7）', false, String(e && e.message || e)); }
+  }
+
+  section('B9 `E2` 弹窗的**真机"不阻塞"**判据（`FR-5.5` 后半句：不阻塞头部与关键状态显示）');
+  {
+    /* 只让 `setTimeout` 空转（`#alPopupConfirm` 的停留计时**不自动收起**，弹窗留在屏上可供量测）；
+       `setInterval` 保持真身 ⇒ 页面按真实节拍渲染（`ui-check` 的假 DOM 面已覆盖计时行为，
+       本段要的是"弹窗真的在屏上时的几何与命中"）。 */
+    const NO_DWELL_SHIM = [
+      '(() => { window.setTimeout = function () { return 0; }; })();'
+    ].join('\n');
+    const HIT_EXPR = `(() => {
+      const M = window.MockData;
+      const injected = M.injectAlarm(new Date());
+      window.Pages.Dashboard.renderAll(M.state);
+      const root = document.getElementById('alPopup');
+      const btn = document.getElementById('alPopupConfirm');
+      const code = document.getElementById('alPopupCode');
+      const header = document.getElementById('board-header');
+      if (!root || !btn || !code || !header) {
+        return { fatal: '缺节点：' + JSON.stringify({ root: !!root, btn: !!btn, code: !!code, header: !!header }) };
+      }
+      const cs = el => { const c = getComputedStyle(el); return { pointerEvents: c.pointerEvents, display: c.display, cursor: c.cursor }; };
+      const rc = el => { const b = el.getBoundingClientRect(); return { x: +b.x.toFixed(1), y: +b.y.toFixed(1), w: +b.width.toFixed(1), h: +b.height.toFixed(1) }; };
+      const br = rc(btn), cr = rc(code), hr = rc(header), rr = rc(root);
+      const atBtn = document.elementFromPoint(br.x + br.w / 2, br.y + br.h / 2);
+      const atBody = document.elementFromPoint(cr.x + Math.min(8, cr.w / 2), cr.y + cr.h / 2);
+      const idOf = el => (el ? (el.id || (el.tagName + (el.className ? '.' + String(el.className).split(' ')[0] : ''))) : null);
+      const ds = root.dataset || {};
+      return {
+        injected: injected ? injected.code : null,
+        root: Object.assign({ hidden: root.hidden === true, rect: rr, state: (ds.popupState === undefined) ? null : ds.popupState }, cs(root)),
+        btn: Object.assign({ id: btn.id, text: String(btn.textContent || ''), rect: br }, cs(btn)),
+        code: Object.assign({ rect: cr }, cs(code)),
+        header: rc(header),
+        hitAtButtonCenter: idOf(atBtn),
+        hitAtPopupBlank: idOf(atBody)
+      };
+    })()`;
+    /* 判据抽成纯函数（断言与 D22 的内存副本共用） */
+    const hitVerdict = {
+      passThrough: (m, label) => {
+        const bad = [];
+        if (m.hitAtPopupBlank === 'alPopup') bad.push('弹窗空白处的 elementFromPoint 命中 #alPopup（应**穿过**它）');
+        if (m.hitAtPopupBlank === null) bad.push('弹窗空白处的 elementFromPoint 为 null（取不到下层元素）');
+        return { ok: bad.length === 0, why: label + ' 命中=' + JSON.stringify(m.hitAtPopupBlank) + '：' + bad.join('；') };
+      },
+      btnReachable: m => {
+        const bad = [];
+        if (m.hitAtButtonCenter !== 'alPopupConfirm') {
+          bad.push('#alPopupConfirm 中心点命中=' + JSON.stringify(m.hitAtButtonCenter) + '（应 "alPopupConfirm"）');
+        }
+        return { ok: bad.length === 0, why: bad.join('；') };
+      },
+      rootNone: m => (m.root.pointerEvents === 'none'
+        ? { ok: true, why: 'computed pointer-events=' + JSON.stringify(m.root.pointerEvents) }
+        : { ok: false, why: 'computed pointer-events=' + JSON.stringify(m.root.pointerEvents) + '（应 "none"）' }),
+      btnAuto: m => (m.btn.pointerEvents === 'auto'
+        ? { ok: true, why: 'computed pointer-events=' + JSON.stringify(m.btn.pointerEvents) }
+        : { ok: false, why: 'computed pointer-events=' + JSON.stringify(m.btn.pointerEvents) + '（应 "auto"）' }),
+      headerClear: m => {
+        const a = m.root.rect, b = m.header;
+        const ix = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+        const iy = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+        return { ok: !(ix > 0 && iy > 0),
+          why: '相交面积=' + (ix * iy).toFixed(1) + ' px²（相交宽 ' + ix.toFixed(1) + ' × 高 ' + iy.toFixed(1) +
+            '）；弹窗 rect=' + a.w + '×' + a.h + '@(' + a.x + ',' + a.y + ')、#board-header rect=' +
+            b.w + '×' + b.h + '@(' + b.x + ',' + b.y + ')' };
+      }
+    };
+
+    const scriptId = (await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: NO_DWELL_SHIM })).identifier;
+    const hitRows = [];
+    for (const size of [[1920, 1080], [3840, 2160]]) {
+      await setViewport(size[0], size[1]);
+      await openPage('', 1500);
+      const m = await evaluate(HIT_EXPR);
+      if (!m || m.fatal) {
+        check('B9 ' + size.join('×') + ' 弹窗可在真机上量测（绕开首帧口径弹出后 #alPopup／#alPopupConfirm／' +
+          '#alPopupCode／#board-header 齐备）', false, (m && m.fatal) || 'evaluate 未返回结果');
+        continue;
+      }
+      hitRows.push({ size: size.join('×'), m: m });
+      const brief = `${size.join('×')}：弹窗 state=${JSON.stringify(m.root.state)} hidden=${m.root.hidden} ` +
+        `display=${m.root.display} rect=${JSON.stringify(m.root.rect)}；注入=${JSON.stringify(m.injected)}；` +
+        `按钮 pointer-events=${JSON.stringify(m.btn.pointerEvents)} rect=${JSON.stringify(m.btn.rect)}`;
+      check(`B9 ${size.join('×')} 前提：绕开首帧口径（` + '`injectAlarm()` ＋ 重绘一帧' +
+        '）后弹窗**真的显示中**（`data-popup-state === \'shown\'` ∧ `hidden === false`）—— ' +
+        '否则下面的"不阻塞"读数是在一个没显示的节点上量的，等于没量',
+        m.root.state === 'shown' && m.root.hidden === false,
+        brief);
+      check(`B9 ${size.join('×')} 真机"不阻塞"①：` + '`getComputedStyle(#alPopup).pointerEvents === \'none\'` ' +
+        '∧ `getComputedStyle(#alPopupConfirm).pointerEvents === \'auto\'`（根不吃事件、只有确认按钮可点）' +
+        ' ∧ `#alPopup` 与 `#board-header` 的 rect **不相交**',
+        hitVerdict.rootNone(m).ok && hitVerdict.btnAuto(m).ok && hitVerdict.headerClear(m).ok,
+        'root：' + hitVerdict.rootNone(m).why + '；按钮：' + hitVerdict.btnAuto(m).why +
+        '；' + hitVerdict.headerClear(m).why + '；' + brief);
+      check(`B9 ${size.join('×')} 真机"不阻塞"②：弹窗**空白处**（报警代码上）的 ` +
+        '`document.elementFromPoint()` **不是** `#alPopup`（点击**穿过**弹窗落到下层），' +
+        '而确认按钮**中心**必须命中 `#alPopupConfirm`（按钮真的可点）',
+        hitVerdict.passThrough(m, size.join('×')).ok && hitVerdict.btnReachable(m).ok,
+        hitVerdict.passThrough(m, size.join('×')).why + '；' + hitVerdict.btnReachable(m).why +
+        '；按钮文案=' + JSON.stringify(m.btn.text) + '；' + brief);
+    }
+
+    /* D22（**内存读数副本**）：①把"空白处命中"改成 `'alPopup'`（＝弹窗把页面挡住了）⇒ 必红并指名；
+       ②把根节点的 `pointerEvents` 改成 `'auto'` ⇒ 必红并指名。页面与盘上都不动。 */
+    const hb = hitRows[0] ? hitRows[0].m : null;
+    const mutPass = hb ? Object.assign({}, hb, { hitAtPopupBlank: 'alPopup' }) : null;
+    const mutPe = hb ? Object.assign({}, hb, { root: Object.assign({}, hb.root, { pointerEvents: 'auto' }) }) : null;
+    const pv = mutPass ? hitVerdict.passThrough(mutPass, '变异') : { ok: false, why: '（无副本）' };
+    const ev = mutPe ? hitVerdict.rootNone(mutPe) : { ok: false, why: '（无副本）' };
+    check('B9-D22 可证伪（ADR-0004 D22）：把**真机读数副本**的"空白处命中"改成 `\'alPopup\'` ⇒ ' +
+      '`passThrough` **必红并指名**；把根节点的 `pointerEvents` 改成 `\'auto\'` ⇒ `rootNone` **必红并指名**；' +
+      '未变异副本两项都绿（变异只发生在内存副本上）',
+      hb !== null && hitVerdict.passThrough(hb, '真机').ok && hitVerdict.rootNone(hb).ok &&
+      pv.ok === false && String(pv.why).indexOf('alPopup') >= 0 &&
+      ev.ok === false && String(ev.why).indexOf('pointer-events') >= 0,
+      '未变异：空白处=' + JSON.stringify(hb ? hb.hitAtPopupBlank : null) +
+      '、root pointer-events=' + JSON.stringify(hb ? hb.root.pointerEvents : null) +
+      '（两项都绿=' + Boolean(hb && hitVerdict.passThrough(hb, '真机').ok && hitVerdict.rootNone(hb).ok) + '）' +
+      '；变异①判红=' + (pv.ok === false) + '、指名=' + JSON.stringify(pv.why) +
+      '；变异②判红=' + (ev.ok === false) + '、指名=' + JSON.stringify(ev.why));
+
+    try { await cdp.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: scriptId }); }
+    catch (e) { check('B9 SHIM 已摘除（否则会污染 B6／B7）', false, String(e && e.message || e)); }
+    await cdp.send('Emulation.clearDeviceMetricsOverride');
+  }
+
   section('B6 无操作 5 分 10 秒自动返回首页（FR-9.4）');
   try {
     await openPage('', 2200);
