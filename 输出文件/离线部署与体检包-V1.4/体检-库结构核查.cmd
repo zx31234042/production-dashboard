@@ -22,7 +22,7 @@ rem  SAFE: the check opens every database read-only. The only file it writes is
 rem  its own report .txt inside the "._env-report" subfolder.
 rem
 rem  USAGE: double-click, or drag a folder onto this file, or run:
-rem     the .cmd sitting next to db-schema-check.js  "D:\path\to\dashboard-app"
+rem     the .cmd sitting next to db-schema-check.js:  db-schema-check.js "D:\path\to\dashboard-app"
 rem  It checks COLUMNS and INDEXES separately - they are NOT the same
 rem  severity: a missing column breaks writing, a missing index only makes
 rem  one query scan the whole table.

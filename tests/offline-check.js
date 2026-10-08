@@ -5,7 +5,7 @@
    **为什么要有它**（`E9` 原文）：零依赖是本项目的**核心决策**（`ADR-0002` D9/D13、
    `NFR-25` 前端资源本地化不依赖任何外网资源、`AC-09` 无外网访问、需求 §12 网络为隔离局域网），
    但此前**只有 `docs-cross-check` 的静态扫描** —— 它扫的是**源码/文档里的外链与依赖**，
-   属于"**仓库**这一层"；**"交付包形态"这一层（`输出文件\离线部署与体检包-V1.3\`）无人断言**。
+   属于"**仓库**这一层"；**"交付包形态"这一层（`输出文件\离线部署与体检包-V1.4\`）无人断言**。
    于是存在一条静默通道：源码全绿，但**打包时**把某个依赖、某个外链、某个自带 node_modules 的
    便携运行时塞进了包 ⇒ 到了无网现场才发现。本脚本把"零依赖"从**约定**变成**可验证**。
    --------------------------------------------------------------------------
@@ -57,13 +57,13 @@ const ROOT = env.paths.root;
 /* ==========================================================================
    包根定位
    --------------------------------------------------------------------------
-   `E9` 盯的是"**交付包形态**"。包根＝`输出文件\离线部署与体检包-V1.3\`
+   `E9` 盯的是"**交付包形态**"。包根＝`输出文件\离线部署与体检包-V1.4\`
    （含便携 Node、`.cmd` 双击入口、体检脚本、说明文档）。
    `DSH_OFFLINE_PKG` 可覆盖（供外层探针指向别的包，例如下一版 `V1.3`）。
    **包不存在 ⇒ 显式跳过**（退 3），绝不静默通过：包还没打出来时本门禁"没证据"，
    而"没证据"不得写成"通过"（规范 9.5-5 第 6 条、`ADR-0004` D20）。
    ========================================================================== */
-const PKG_DIR_NAME = '离线部署与体检包-V1.3';
+const PKG_DIR_NAME = '离线部署与体检包-V1.4';
 const PKG_ROOT = process.env.DSH_OFFLINE_PKG
   ? path.resolve(process.env.DSH_OFFLINE_PKG)
   : path.join(ROOT, '输出文件', PKG_DIR_NAME);
@@ -261,7 +261,7 @@ const urlAllowCount = () => URL_ALLOWLIST.reduce((n, a) => n + a.urls.length, 0)
  * URL 白名单（**每一条都必须给理由**；`E9` 原文要求）。
  * 形状 `{ file, line, urls: [...], reason }`：`file` 是包根相对路径（`\` 分隔）、`line` 是 1 起行号、
  * `urls` 是该行上**逐条登记**的外链片段（对不上 ⇒ 判"白名单腐烂"并**指名是哪一条**）。
- * ⚠ 为什么是"**一行可登记多条**"（**第一版的实测教训**）：真包 README 的**第 127 行同时含两条**外链
+ * ⚠ 为什么是"**一行可登记多条**"（**第一版的实测教训**）：真包 README 的**同一行同时含两条**外链（V1.4 实测＝**第 131 行**）
  * （`www.microsoft.com/edge/business/download` 与 `edgeupdates.microsoft.com/api/products`）。
  * 本脚本**第一版把白名单写成"一行一条"**（`{file, line, url}`，一条只装一个 URL），于是：
  * 第 127 行只能匹配到**先登记的那一条**，第二条永远对不上 ⇒ 白名单腐烂判据把**两条都报成"未使用"**、
@@ -281,14 +281,14 @@ const urlAllowCount = () => URL_ALLOWLIST.reduce((n, a) => n + a.urls.length, 0)
  */
 const URL_ALLOWLIST = [
   {
-    file: 'README-离线部署与体检.md', line: 129,
+    file: 'README-离线部署与体检.md', line: 130,
     urls: ['https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/78f7562d-5160-419f-b64b-b9dc3da74bd7/MicrosoftEdgeEnterpriseX64.msi'],
     reason: '离线升级件的**官方直链**，出自原文「供复核/重下：直链 …」。该 MSI 已随包分发'
       + '（`._edge\\MicrosoftEdgeEnterpriseX64-154.0.4258.37.msi`），故现场无网也能装，不构成运行时外链；'
       + '留着的价值＝出包后人工复核"包里那个 MSI 是不是这一版"。依据＝`E54`（2026-09-29 负责人裁定走离线升级）。'
   },
   {
-    file: 'README-离线部署与体检.md', line: 130,
+    file: 'README-离线部署与体检.md', line: 131,
     urls: [
       'https://www.microsoft.com/edge/business/download',
       'https://edgeupdates.microsoft.com/api/products?view=enterprise'

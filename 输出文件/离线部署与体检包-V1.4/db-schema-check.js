@@ -5,33 +5,60 @@
  * 查什么：每个看板库文件（board.db / *.sqlite）里，"后来加给既有表"的结构到底在不在。
  *   检查面 ＝ 现行迁移清单 `server\db\index.js` 的 `STRUCTURE_UPGRADES` **全量**
  *   （2026-10-07 按 `E201` 逐条对照后补齐；此前只查 3 列、且**一个索引都不查**）：
- *     【列面 6 列】
+ *     【列面 7 列】**顺序＝ `STRUCTURE_UPGRADES` 里的出现顺序**（逐列对得上，便于人眼对账）
  *       ① op_log.team_code         —— DR-12（V1.33）班组留痕
  *       ② measure_rt.unit_index    —— E71／DR-04 件序号（FR-4.2「开工数按件计」依赖它）
- *       ③ upload_log.fail_reason   —— E73 MES 补传队列写入依赖它
- *       ④ upload_log.updated_at    —— E73 同上
- *       ⑤ shift_stat.run_sec_day1  —— E83 自然日投影（FR-6.4/6.5/6.6 跨零点切段）
- *       ⑥ shift_stat.run_sec_day2  —— E83 同上
+ *       ③ measure_rt.camera_depth  —— E28（2026-10-07）相机自身水下深度（IF-C.9 P0：
+ *                                     与 measure_depth 语义不同、显示与上报均须严格区分）
+ *       ④ upload_log.fail_reason   —— E73 MES 补传队列写入依赖它
+ *       ⑤ upload_log.updated_at    —— E73 同上
+ *       ⑥ shift_stat.run_sec_day1  —— E83 自然日投影（FR-6.4/6.5/6.6 跨零点切段）
+ *       ⑦ shift_stat.run_sec_day2  —— E83 同上
  *     【索引面 2 个】
  *       ⑦ ix_op_log_team             ON op_log(team_code, op_time)
  *       ⑧ ix_measure_rt_collect_time ON measure_rt(collect_time) —— E170
  *   ⚠ **覆盖面口径（E201 的教训）**：**少查一项 ⇒ 本工具会对老库给出一个看起来正常的 `[OK]`**
  *     —— 正是 E71／E73／E201 要消灭的形态。故检查面**必须等于** `STRUCTURE_UPGRADES`：
- *     ① `--self-test` 把 8 项**逐一摘掉**各跑一遍（每项都必须**红并指名**；不摘 ⇒ 绿）；
+ *     ① `--self-test` 把 9 项**逐一摘掉**各跑一遍（每项都必须**红并指名**；不摘 ⇒ 绿）；
  *     ② 正常跑时若能在本机定位到仓库，会把 `STRUCTURE_UPGRADES` 的步骤**逐条解析**出来与检查面
- *        对账（不一致 ⇒ 报告里显式打「覆盖面不一致」并逐项指名；`--self-test` 下判红）。
+ *        对账（不一致 ⇒ 报告里显式打「覆盖面不一致」并逐项指名；`--self-test` 下判红）；
+ *     ③ `--self-test` 再跑两行「**判别可证伪**」：拿一个**真库**与一个**非本产品库**各走一次
+ *        真实判别路径（`isProductDb()` ＋ `judgeDatabase()`）⇒ 读数必须分别是"本产品库、进列面核查"
+ *        与"非本产品库，跳过"，即**证明新增的"是否本产品库"判别不是恒真／恒假式**。
+ *   ⚠ **覆盖面自证现在没钉死清单，但也还没做到"永远自动跟上"**（`E210-①` 实测，如实声明）：
+ *     `NEED` 仍是**本文件里的一份硬编码清单**，`STRUCTURE_UPGRADES` 的唯一真源在
+ *     `server\db\index.js`；本工具的判据是"**拿真源来对账**"（上方 ②），**不是**"清单自动生成"。
+ *     · **能自动跟上的一半**：单项清单（`SYNTH_ITEMS`）、合成库的表／索引（`SYNTH_TABLES`／
+ *       `SYNTH_INDEXES`）与自证行数**全部由 `NEED` 现推** ⇒ 不会再出现"`NEED` 加了、自证没加"
+ *       这种**静默失明**（旧版 `SYNTH_ITEMS` 与 `NEED` 是两份手抄清单，两处都能单独落后）。
+ *     · **不能自动跟上的那一半（＝长期义务）**：`NEED` 本身要**人**去补。`server\db\index.js`
+ *       每加一条迁移步骤 ⇒ **必须同批**把对应项写进 `NEED`（否则 ② 会红并逐条指名 —— 这是
+ *       fail-closed，不会静默放过）；**并且 ② 只在"能定位到仓库"时才跑得起来**：现场包里**没有**
+ *       `server\db\index.js` ⇒ 现场那份报告会如实打「**未对账**」而**不是**「一致」。
+ *     · **故本工具的长期做法有两条，缺一不可**：㈠**定位到仓库时**（开发机／带仓库的现场）靠 ②
+ *       机器对账；㈡**定位不到时**（裸包现场）按**"每轮人工复核"**：出包前后各跑一次
+ *       `--self-test`（②＋③ 两行都在 `[PASS]`）—— **出包前必须为 `一致`**，否则这一包不许发。
  *
  * 判读（**列面与索引面不是同一严重度 —— 措辞必须分开**，`E201` 明令）：
  *   [OK]     列齐 且 索引齐 ⇒ 无需动作。
  *   [缺列]   该库缺列 ⇒ **只要用"修复后的构建"启动一次看板服务就会自动补上**（`initSchema()`
  *            会无条件逐条执行 `STRUCTURE_UPGRADES`；既有行零回填，不丢数据、不改既有列）。
  *            ⇒ **结案口径：复查必须为「缺列 0」**。
+ *            ⚠ **"缺列 N 项"只对"本产品库"报**（下方 `[跳过]` 那一档）：现场若看到某个库被报缺列，
+ *            先按本工具读出的**项名**逐条对（**项名现报，不写死数字**），**别把它当成"我们的库全缺"**。
  *   [缺索引] **不影响正确性** —— 只影响"按该列取范围"那类查询的扫描成本（无该索引时走全表扫，
  *            `EXPLAIN QUERY PLAN` ＝ `SCAN <表>`）。同一次服务启动也会把它补上
  *            （`CREATE INDEX IF NOT EXISTS`）；**但它不构成结案闸门**，与缺列**不是**同一档。
  *   [索引形态不符] 索引**名字在、列集不符** ⇒ 判据按"**名字 ＋ 列集**"双核
  *            （只认名字会漏掉"被人改过形"的索引）。
- *   [SKIP]   打不开（正被服务独占、或不是 SQLite）⇒ 记下来人工看，**别当通过**。
+ *   [SKIP]   打不开（正被服务独占、或是坏文件）⇒ 记下来人工看，**别当通过**。
+ *   [跳过]   **非本产品库**（`E210-②`）⇒ 报告为「非本产品库，跳过」，**不按缺列报**。
+ *            判别（**与"打不开"是两回事**）：该文件是**结构完好的 SQLite**，但既没有 `schema_meta`、
+ *            也没有 `measure_rt`／`upload_log` 两张本产品业务表 ⇒ 它**不是看板的库**，缺不缺列
+ *            与看板无关。**触发＝现场实测的假读数**：`C:\ProgramData\USOPrivate\UpdateStore\store.db`
+ *            （Windows 更新存储库）曾被按「**缺列 6 项**」报出 ⇒ 现场会以为"是我们的库缺列"。
+ *            **跳过 ≠ 通过**：它既不计入"列齐"，也不计入"缺列"，汇总里**单列一行**且明细逐条可查。
+ *            与"判别可证伪"配套：`--self-test` 拿一个真库与一个非本产品库各跑一次（读数必须相反）。
  *
  * 版本口径：库里的结构版本一律**从 `schema_meta.schema_version` 现读**（本文件**不写死**任何
  *   版本串）；能定位到仓库时再打印"现行"值及其出处（`server\db\index.js` 的 `SCHEMA_VERSION`）
@@ -50,7 +77,7 @@
  *   node db-schema-check.js                     // 自动找：本目录、上一级、桌面/文档、各盘一级子目录
  *   node db-schema-check.js "D:\看板"           // 指定看板程序目录（递归找 data\**\*.db 与 backup\**）
  *   node db-schema-check.js "D:\看板\data\prod\board.db"   // 也可直接指定单个库文件
- *   node db-schema-check.js --self-test         // **自证**：8 项逐一摘掉（内存库）＋ 覆盖面对账
+ *   node db-schema-check.js --self-test         // **自证**：9 项逐一摘掉（内存库）＋ 覆盖面对账 ＋ 判别可证伪
  *   选项：--report-dir <目录>（默认本目录下 ._env-report\）｜--no-report（只打印，不落文件）
  *         --no-auto（不用自动候选，只用命令行给的路径）
  *
@@ -72,10 +99,23 @@ try {
   process.exit(2);
 }
 
-/* ---------- 检查面：＝ server\db\index.js 的 STRUCTURE_UPGRADES 全量（唯一真源在那里） ---------- */
+/* ---------- 检查面：＝ server\db\index.js 的 STRUCTURE_UPGRADES 全量（唯一真源在那里） ----------
+ * ⚠ **性质声明（`E210` 要求说清，不许含糊）**：`NEED` 是**本文件里的一份硬编码清单** ——
+ *   · 它**不是**从 `STRUCTURE_UPGRADES` **生成**的（本工具零依赖、且现场包里没有仓库源码，
+ *     生成不成立）；它靠 `compareCoverage()` **拿真源来对账**（不一致 ⇒ 红并逐项指名）。
+ *   · 因此"检查面跟得上现行清单"靠的是**两条**：㈠`--self-test`／正常跑的**机器对账**（能定位到
+ *     仓库时）；㈡**人工义务** —— `STRUCTURE_UPGRADES` 每加一步，**同批**在 `NEED` 补一项。
+ *   · 单项清单、合成库、自证行数**全部从 `NEED` 现推**（见下方 `synthItems()`），故"加了 `NEED`
+ *     却忘了加自证"这种静默失明已不可能发生；剩下唯一的落后形态由对账当场指名。
+ * `depends`：该列缺失时**连带建不出来**的索引名（合成库与自证用；`judgeDatabase` 不读它）。
+ */
 const NEED_COLUMNS = [
-  { table: 'op_log', column: 'team_code', debt: 'DR-12（V1.33）' },
+  { table: 'op_log', column: 'team_code', debt: 'DR-12（V1.33）', depends: ['ix_op_log_team'] },
   { table: 'measure_rt', column: 'unit_index', debt: 'E71／DR-04' },
+  /* `E28`（2026-10-07 才进 `STRUCTURE_UPGRADES`）：相机自身水下深度，与 `measure_depth`
+     （航行器水下深度）语义不同（`IF-C.9` P0）。⚠ `E210-①` 的根因就是这一项 —— 包做得比仓库早一步，
+     于是本工具**不查它**、却对老库照打 `[OK]`。它与 `unit_index` **不是同一件事**：不得合并、不得互推。 */
+  { table: 'measure_rt', column: 'camera_depth', debt: 'E28' },
   { table: 'upload_log', column: 'fail_reason', debt: 'E73' },
   { table: 'upload_log', column: 'updated_at', debt: 'E73' },
   { table: 'shift_stat', column: 'run_sec_day1', debt: 'E83' },
@@ -91,6 +131,41 @@ const SKIP_DIRS = new Set(['node_modules', '.git', '._node', '._edge', '._env-re
 
 const colKey = (t, c) => String(t).toLowerCase() + '.' + String(c).toLowerCase();
 const csvL = arr => arr.map(x => String(x).toLowerCase()).join(',');
+
+/* ==========================================================================
+   零、**"是否本产品库"判别**（`E210-②`，纯函数：同样只喂 reader）
+   --------------------------------------------------------------------------
+   **为什么要有这一步**：旧版对"凡是叫 `*.db` 的文件"都按本产品的检查面判，于是把
+   `C:\ProgramData\USOPrivate\UpdateStore\store.db`（Windows 更新存储库，连 `schema_meta` 都没有）
+   读成"**我们的库缺列 6 项**" ⇒ 现场会以为是我们库的问题（与 `E205` 同族：取数面过宽 ⇒ 误导性读数）。
+   **判据**（全仓既有口径，不新造）：该文件是**结构完好的 SQLite**，且满足下面任一条即"本产品库" ——
+     ① 有 `schema_meta` 表（本产品每个库都由 `initSchema()` 写它）；或
+     ② 有 `measure_rt` 表；或 ③ 有 `upload_log` 表。
+   **三条都不满足 ⇒ 判「非本产品库，跳过」**：不按缺列报、不计入"列齐"、**汇总里单列一行**。
+   ⚠ 别把判别写成"有 `schema_meta` 才算"：
+     旧库／半迁移库可能整表缺失，只认它会把真库误判成"非本产品库"（滑向"跳过＝静默放过"）。
+   ⚠ 与"打不开"分开：坏文件 / 非 SQLite 文件走 `[SKIP]`（打不开），**不进**本判别的"跳过"计数。
+   ========================================================================== */
+/**
+ * @param {{hasTable:(t:string)=>?boolean, hasAnySchema:()=>?boolean}} reader
+ * @returns {{judged:boolean, product:boolean, why:string}}
+ *   `judged:false` ⇒ **判不出来**（文件里连 `sqlite_master` 都读不出来）⇒ 调用方按"打不开/坏文件"处置。
+ */
+function isProductDb(reader, hints) {
+  const h = hints || {};
+  const names = (h.tables || ['schema_meta', 'measure_rt', 'upload_log']).slice();
+  const anySchema = reader.hasAnySchema();
+  if (anySchema === null) return { judged: false, product: false, why: '读不出 sqlite_master（坏文件或不是 SQLite）' };
+  const found = [];
+  for (const n of names) { if (reader.hasTable(n) === true) found.push(n); }
+  if (found.length) {
+    return { judged: true, product: true, why: '命中本产品表：' + found.join('、') };
+  }
+  return {
+    judged: true, product: false,
+    why: '无 ' + names.join('／') + ' 中任何一张（' + (anySchema ? '该文件有表，但不是看板的表' : '该文件里一张表都没有') + '）'
+  };
+}
 
 /* ==========================================================================
    一、判定本体（**纯函数**：只喂 reader，不碰文件系统 —— 故可在合成样本上定点变异，D22）
@@ -133,7 +208,7 @@ function verdictOf(j) {
 /** 逐库结论的**措辞**（列面／索引面分开；两处共用一份，口径不会分叉） */
 const WORDING = Object.freeze({
   columnFix: '列面处置：用**修复后的构建**启动一次看板服务即可补上（initSchema() 无条件逐条执行迁移；既有行零回填）'
-    + '；**结案口径＝复查列面必须「缺列 0」**',
+    + '；**结案口径＝复查列面必须「缺列 0」**（非本产品库跳过；跳过 ≠ 通过）',
   indexNote: '索引面说明：**缺索引不影响正确性**，只影响"按该列取范围"那类查询的扫描成本（无索引时走全表扫）'
     + '；同一次服务启动也会补上（CREATE INDEX IF NOT EXISTS）——**它不构成结案闸门**'
 });
@@ -225,15 +300,58 @@ function readSchemaVersion(code) {
   return { value: m[1], line: String(code).slice(0, m.index).split('\n').length };
 }
 
-/** 找仓库里的 `server\db\index.js`（找不到 ⇒ null：**不假装一致**，调用方按"未对账"处理） */
+/**
+ * 从**本文件自己的注释**里现推仓库根候选（`E210` 实测的坑：包在开发机放在
+ * `<仓库>\输出文件\离线部署与体检包-V1.x\`，**比旧候选的深度多一级** ⇒ 旧版连开发机都定位不到）。
+ * 认的形态＝注释里那些带 `server\db\index.js` 的**反引号路径**（doc-hint）：
+ *   · 开发机把包放在 `<仓库>\输出文件\离线部署与体检包-V1.x\` ⇒ 取它**上面两级**（输出文件 → 仓库根）；
+ *   · 其它以 `…\server\db\index.js` 结尾的写法 ⇒ 取它**上面三级**。
+ * 为什么用"从注释现推"：它随本文件一起走，**不需要现场改命令行**；⚠ 它**不是**"清单自动生成"
+ * —— `NEED` 仍要人补（见头注的长期义务），这里只是把"仓库在哪儿"这个**环境事实**变得可自述。
+ * @returns {string[]} 候选目录（去重、只保留盘上真有的）
+ */
+function repoHintCandidates() {
+  const out = [];
+  const nrm = p => String(p).replace(/[\/]+/g, '\\');
+  const push = p => { if (p && out.indexOf(p) < 0) out.push(p); };
+  for (const m of String(fs.readFileSync(__filename, 'utf8')).matchAll(/`([^`]*?server\\db\\index\.js)`/g)) {
+    const raw = nrm(m[1]);
+    const i = raw.toLowerCase().lastIndexOf('server\\db\\index.js');
+    let base = raw.slice(0, i);
+    if (/离线部署与体检包-V[\d.]+\\$/i.test(base)) base = base.replace(/离线部署与体检包-V[\d.]+\\$/i, '');
+    if (/输出文件\\$/i.test(base)) base = base.replace(/输出文件\\$/i, '');
+    push(base.replace(/\\+$/, ''));
+  }
+  return out.filter(b => { try { return fs.existsSync(b); } catch (e) { return false; } });
+}
+
+/**
+ * 找仓库里的 `server\db\index.js`（找不到 ⇒ null：**不假装一致**，调用方按"未对账"处理）。
+ * 候选顺序（**先近后远**；每一条都是"把该目录当仓库根"来试）：
+ *   ①`__dirname`（工具就在仓库根时）与它的**父目录链**（逐级上找，覆盖"包在 `输出文件\` 深处"）；
+ *   ②`path.dirname(__dirname)\production-dashboard`（包与仓库**并列**摆放的推荐布局，见 README §1）；
+ *   ③`process.cwd()`；④上方每条**命令行给的路径**及其父目录；⑤源码注释里的仓库路径提示（doc-hint）。
+ */
 function findRepoIndexJs(roots) {
   const cands = [];
   const add = p => { if (p) cands.push(path.join(p, 'server', 'db', 'index.js')); };
-  add(__dirname);
-  add(path.dirname(__dirname));
+  /* ① 本目录 ＋ 沿父目录链逐级上找（深度 4；`<仓库>\输出文件\<包>\` 这种布局要 3 级才够） */
+  let cur = __dirname;
+  add(cur);
+  for (let i = 0; i < 4; i++) {
+    const up = path.dirname(cur);
+    if (!up || up === cur) break;
+    cur = up;
+    add(cur);
+  }
+  /* ② 包与仓库并列（推荐布局：`D:\production-dashboard\` ＋ `D:\离线部署与体检包-V1.x\`） */
   add(path.join(path.dirname(__dirname), 'production-dashboard'));
+  /* ③ 当前工作目录 */
   add(process.cwd());
+  /* ④ 命令行给的看板目录／库文件路径，及其父目录 */
   for (const r of (roots || []).slice(0, 40)) { add(r); add(path.dirname(r)); }
+  /* ⑤ 源码注释里的仓库路径提示（doc-hint；见 `repoHintCandidates()`） */
+  for (const h of repoHintCandidates()) add(h);
   for (const c of cands) {
     try { if (fs.existsSync(c)) return c; } catch (e) { /* 逐个试下一个 */ }
   }
@@ -246,6 +364,17 @@ function findRepoIndexJs(roots) {
 function sqliteReader(db) {
   const q = sql => { try { return db.prepare(sql).all(); } catch (e) { return null; } };
   return {
+    /** 表是否**真的存在**：`PRAGMA table_info(<不存在的表>)` 会返回**空集**（不是 null），
+        故"表在不在"必须问 sqlite_master，不能拿 `columnsOf()` 反推（那会把空表读成不存在）。 */
+    hasTable(name) {
+      const r = q("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND lower(name)=lower('" + String(name) + "')");
+      return r ? r.length > 0 : null;
+    },
+    /** 该文件里**有没有任何表**（读不出来 ⇒ null ⇒ 调用方按"坏文件"处置，不按"非本产品库"处置） */
+    hasAnySchema() {
+      const r = q("SELECT 1 AS ok FROM sqlite_master WHERE type='table'");
+      return r ? r.length > 0 : null;
+    },
     columnsOf(table) {
       const info = q('PRAGMA table_info(' + table + ')');
       return info ? info.map(c => String(c.name)) : null;
@@ -263,39 +392,66 @@ function sqliteReader(db) {
 }
 
 /* ==========================================================================
-   四、合成库 + `--self-test`（D22：8 项**逐一摘掉** ⇒ 必红并指名；不摘 ⇒ 绿）
+   四、合成库 + `--self-test`（D22：检查面**逐项摘掉** ⇒ 必红并指名；不摘 ⇒ 绿）
+   —— 项数＝`NEED.columns.length + NEED.indexes.length`（**现推**，见 `synthItems()`）。
    --------------------------------------------------------------------------
    · 全部建在**纯内存库**（`:memory:`）上 ⇒ 不落一个文件、不碰任何真实库（现场只读口径不破）；
    · 每个用例从**同一份模板**建库，只摘掉目标项（及其依赖的索引）⇒ "摘掉哪一项"是唯一变量。
    ========================================================================== */
-const SYNTH_TABLES = [
-  { name: 'op_log', columns: ['team_code TEXT', 'op_time TEXT'] },
-  { name: 'measure_rt', columns: ['unit_index INTEGER', 'collect_time TEXT', 'equip_code TEXT'] },
-  { name: 'upload_log', columns: ['fail_reason TEXT', 'updated_at TEXT', 'state TEXT'] },
-  { name: 'shift_stat', columns: ['run_sec_day1 INTEGER', 'run_sec_day2 INTEGER', 'run_sec INTEGER'] },
-  { name: 'schema_meta', columns: ['key TEXT PRIMARY KEY', 'value TEXT'] }
-];
-const SYNTH_INDEXES = [
-  { name: 'ix_op_log_team', table: 'op_log', columns: ['team_code', 'op_time'] },
-  { name: 'ix_measure_rt_collect_time', table: 'measure_rt', columns: ['collect_time'] }
-];
-/** 8 个"应查项"的清单（＝检查面的逐项展开；`depends` 用于"列没建则依赖它的索引也建不出来"） */
-const SYNTH_ITEMS = [
-  { key: 'op_log.team_code', kind: 'column', table: 'op_log', name: 'team_code', depends: ['ix_op_log_team'] },
-  { key: 'measure_rt.unit_index', kind: 'column', table: 'measure_rt', name: 'unit_index', depends: [] },
-  { key: 'upload_log.fail_reason', kind: 'column', table: 'upload_log', name: 'fail_reason', depends: [] },
-  { key: 'upload_log.updated_at', kind: 'column', table: 'upload_log', name: 'updated_at', depends: [] },
-  { key: 'shift_stat.run_sec_day1', kind: 'column', table: 'shift_stat', name: 'run_sec_day1', depends: [] },
-  { key: 'shift_stat.run_sec_day2', kind: 'column', table: 'shift_stat', name: 'run_sec_day2', depends: [] },
-  { key: 'ix_op_log_team', kind: 'index', table: 'op_log', name: 'ix_op_log_team', depends: [] },
-  { key: 'ix_measure_rt_collect_time', kind: 'index', table: 'measure_rt', name: 'ix_measure_rt_collect_time', depends: [] }
-];
+/* ⚠ **下面三份"合成库清单"全部从 `NEED` 现推**（`E210` 的整改点之一）：旧版把 `SYNTH_TABLES`／
+   `SYNTH_INDEXES`／`SYNTH_ITEMS` 与 `NEED` **各写一份**（三处独立列举）⇒ `NEED` 补了一项而这三处
+   没跟，`--self-test` 会**照样全绿**，而新那一项**一次也没被摘掉过** —— 与 `E201` 同形的静默失明。
+   现在单一真源＝`NEED`：`NEED` 加一项 ⇒ 合成库、逐项摘除自证、行数**同批自动跟上**，无第二处可落后。 */
+/** 合成库里"列名 → 列类型"（`judgeDatabase` 只读列名，类型仅为形态真实；缺类型时按 TEXT 兜底） */
+const SYNTH_COLUMN_TYPES = { camera_depth: 'REAL', unit_index: 'INTEGER', run_sec_day1: 'INTEGER',
+  run_sec_day2: 'INTEGER', collect_time: 'TEXT', op_time: 'TEXT', equip_code: 'TEXT',
+  fail_reason: 'TEXT', updated_at: 'TEXT', state: 'TEXT', run_sec: 'INTEGER' };
+/** 合成库里非检查项的"陪衬列"（只为让表形态像真库；不进检查面、不被摘除） */
+const SYNTH_EXTRA_COLUMNS = { measure_rt: ['equip_code'], upload_log: ['state'],
+  shift_stat: ['run_sec'] };   /* `op_time`／`collect_time` 由上面的索引列覆盖，不再重复手抄 */
+/** 检查面里的索引：列集与 `depends` 都从 `NEED` 取（**没有手抄副本**） */
+const SYNTH_INDEXES = NEED_INDEXES.map(i => ({ name: i.name, table: i.table, columns: i.columns.slice() }));
+/** 合成库的建表清单：检查列（来自 `NEED`）＋ 陪衬列；`schema_meta` 供"本产品库"判别与版本现读 */
+function synthTables() {
+  const byTable = new Map();
+  for (const c of NEED_COLUMNS) {
+    const arr = byTable.get(c.table) || [];
+    arr.push(c.column + ' ' + (SYNTH_COLUMN_TYPES[c.column] || 'TEXT'));
+    byTable.set(c.table, arr);
+  }
+  /* ⚠ **索引列也必须建出来**：`ix_op_log_team` 的第二列是 `op_time`，它不是检查项（不在 `NEED` 里），
+     旧版手抄清单把它写死在 `SYNTH_TABLES` 里；改成"从 `NEED` 现推"后必须**显式把索引覆盖的列也建上**，
+     否则 `CREATE INDEX` 会撞 `no such column: op_time`（本轮实测踩到）。 */
+  for (const ix of SYNTH_INDEXES) {
+    const arr = byTable.get(ix.table) || [];
+    for (const c of ix.columns) if (!arr.some(x => x.split(' ')[0] === c)) arr.push(c + ' ' + (SYNTH_COLUMN_TYPES[c] || 'TEXT'));
+    byTable.set(ix.table, arr);
+  }
+  for (const [t, extra] of Object.entries(SYNTH_EXTRA_COLUMNS)) {
+    const arr = byTable.get(t) || [];
+    for (const c of extra) if (!arr.some(x => x.split(' ')[0] === c)) arr.push(c + ' ' + (SYNTH_COLUMN_TYPES[c] || 'TEXT'));
+    byTable.set(t, arr);
+  }
+  for (const t of Object.keys(SYNTH_EXTRA_COLUMNS)) if (!byTable.has(t)) byTable.set(t, []);
+  /* `schema_meta` **永远在**：它由 `initSchema()` 写（`SCHEMA_VERSION` ＋ 指纹），不是"后来补的列"，
+     故**不属检查面、也不参与逐项摘除**；自证里每个内存库都要有它（否则连版本都读不出来）。 */
+  byTable.set('schema_meta', ['key TEXT PRIMARY KEY', 'value TEXT']);
+  return [...byTable.entries()].map(([name, cols]) => ({ name, columns: cols }));
+}
+/** 9 个"应查项"（＝检查面的逐项展开）——**由 `NEED` 现推**，加一项即自动多一行自证 */
+function synthItems() {
+  return NEED_COLUMNS.filter(c => c.index !== false).map(c => ({
+    key: colKey(c.table, c.column), kind: 'column', table: c.table, name: c.column, depends: c.depends || []
+  })).concat(NEED_INDEXES.map(i => ({
+    key: i.name, kind: 'index', table: i.table, name: i.name, depends: []
+  })));
+}
 
 /** 建一份合成库（`omit` ＝ 要摘掉的项 key 集合）；返回 reader */
 function buildSyntheticReader(omit) {
   const drop = new Set((omit || []).map(x => String(x)));
   const db = new DatabaseSync(':memory:');
-  for (const t of SYNTH_TABLES) {
+  for (const t of synthTables()) {
     const cols = t.columns.filter(c => !drop.has(colKey(t.name, c.split(' ')[0])));
     if (!cols.length) continue;                       /* 极端情形：整表列都被摘掉 ⇒ 该表不建 */
     db.exec('CREATE TABLE ' + t.name + ' (' + cols.join(', ') + ')');
@@ -310,24 +466,45 @@ function buildSyntheticReader(omit) {
 }
 
 /**
+ * 一个**非本产品库**样本（内存库）：形如 `C:\ProgramData\USOPrivate\UpdateStore\store.db`
+ * —— **结构完好的 SQLite、有表**，但没有 `schema_meta`、也没有 `measure_rt`／`upload_log`。
+ * 它是 `E210-②` 的**负对照**：没做判别时本工具会对它报"缺列 N 项"（误导现场），做了判别则"跳过"。
+ * @returns {{reader:object, close:()=>void}}
+ */
+function buildForeignReader() {
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE UpdateStore (UpdateID TEXT PRIMARY KEY, RevisionNumber INTEGER, IsHidden INTEGER)');
+  db.exec('CREATE TABLE UpdateHistory (UpdateID TEXT, EventType INTEGER, EventTime TEXT)');
+  db.exec('CREATE INDEX ix_store_rev ON UpdateStore(RevisionNumber)');
+  return { reader: sqliteReader(db), close: () => { try { db.close(); } catch (e) { /* 已关 */ } } };
+}
+
+/**
  * `--self-test`：**判据的可证伪性自证**（ADR-0004 D22 在本工具上的落点）。
- * 10 行 = 1 行绿基线 ＋ 8 行"逐一摘掉"（每行都必须红并指名）＋ 1 行覆盖面对账。
+ * 行数**全部由 `NEED` 现推**，不写死：1 行"自证台账 ↔ 检查面" ＋ 1 行绿基线 ＋ N 行"逐一摘掉"
+ * （N ＝ 列数 ＋ 索引数，每行都必须红并指名）＋ 1 行覆盖面对账 ＋ 2 行"判别可证伪"。
  * @returns {{rows:Array<{name:string,pass:boolean,detail:string}>, failed:number}}
  */
 function runSelfTest() {
   const rows = [];
   const add = (name, pass, detail) => rows.push({ name, pass: Boolean(pass), detail: String(detail) });
+  const synthItemsList = synthItems();          /* 行数与项名**都从 NEED 现推**，不写死 8／9 */
+  const DECLARED = NEED.columns.length + NEED.indexes.length;
+  add('自证台账 ↔ 检查面（`NEED` 加项而自证没跟 ⇒ 本行当场红）',
+    synthItemsList.length === DECLARED,
+    '检查面声明 ' + NEED.columns.length + ' 列 ＋ ' + NEED.indexes.length + ' 索引 ＝ ' + DECLARED
+    + ' 项 ↔ 逐一摘除自证 ' + synthItemsList.length + ' 项（\u2265 必须相等；少一项＝那一项**从未被摘掉过**）');
 
   const base = buildSyntheticReader([]);
   const baseJudge = judgeDatabase(base.reader);
   base.close();
   const baseVerdict = verdictOf(baseJudge);
-  add('基线：8 项全在（未变异）', baseJudge.missingColumns.length === 0
+  add('基线：' + DECLARED + ' 项全在（未变异）', baseJudge.missingColumns.length === 0
     && baseJudge.missingIndexes.length === 0 && baseJudge.wrongIndexes.length === 0 && baseVerdict === 0,
     '列面缺 ' + baseJudge.missingColumns.length + '／索引面缺 ' + baseJudge.missingIndexes.length
     + '／形态不符 ' + baseJudge.wrongIndexes.length + ' ⇒ 退出码 ' + baseVerdict + '（期望 0）');
 
-  for (const item of SYNTH_ITEMS) {
+  for (const item of synthItemsList) {
     const omit = [item.key].concat(item.depends || []);
     const fx = buildSyntheticReader(omit);
     const j = judgeDatabase(fx.reader);
@@ -372,9 +549,35 @@ function runSelfTest() {
     }
   }
 
+  /* `E210-②` 的**可证伪自证**：拿一个**真库**与一个**非本产品库**各走一次**真实判别路径**
+     （`sqliteReader()` ＋ `isProductDb()` ＋ `judgeDatabase()`，与主流程逐行同源）⇒ 两行读数必须**相反**：
+     真库＝"本产品库、进列面核查"，非本产品库＝"非本产品库，跳过"。
+     判据若被写成恒真式（例如"永远判 product"）⇒ 第二行当场红；写成恒假 ⇒ 第一行当场红。 */
+  {
+    const real = buildSyntheticReader([]);            /* 真库：9 项齐 ＋ schema_meta ＋ 业务表 */
+    const probe = isProductDb(real.reader);
+    const j = judgeDatabase(real.reader);
+    real.close();
+    add('判别可证伪①：**真库** ⇒ 判本产品库并进列面核查',
+      probe.judged && probe.product === true && j.missingColumns.length === 0,
+      '判别＝' + (probe.judged ? (probe.product ? '本产品库' : '非本产品库') : '判不出来')
+      + '（' + probe.why + '）⇒ 列面缺 ' + j.missingColumns.length + ' 项（期望 0）');
+  }
+  {
+    const foreignDbCount = buildForeignReader();             /* 非本产品库：有表、但没有一张是本产品的表 */
+    const probe = isProductDb(foreignDbCount.reader);
+    const j = judgeDatabase(foreignDbCount.reader);
+    foreignDbCount.close();
+    add('判别可证伪②：**非本产品库** ⇒ 判跳过、**不按缺列报**',
+      probe.judged && probe.product === false && j.missingColumns.length === NEED.columns.length,
+      '判别＝' + (probe.judged ? (probe.product ? '本产品库' : '非本产品库') : '判不出来')
+      + '（' + probe.why + '）⇒ 若不做判别会被误报"缺列 ' + j.missingColumns.length + ' 项"（本工具=跳过）');
+  }
+
   const failed = rows.filter(r => !r.pass && !r.skipped).length;
-  console.log('===== --self-test：检查面 8 项逐一摘掉（D22：必红并指名）＋ 覆盖面自证 =====');
+  console.log('===== --self-test：检查面 ' + DECLARED + ' 项逐一摘掉（D22：必红并指名）＋ 覆盖面自证 =====');
   console.log('内存库（:memory:）：不落文件、不碰任何真实库；每行都从同一份模板重建，只摘掉目标项。');
+  console.log('检查面 ' + DECLARED + ' 项（' + NEED.columns.length + ' 列 ＋ ' + NEED.indexes.length + ' 索引；行数由 `NEED` 现推）');
   rows.forEach((r, i) => {
     const tag = r.skipped ? '[SKIP]' : (r.pass ? '[PASS]' : '[FAIL]');
     console.log('[' + (i + 1) + '/' + rows.length + '] ' + tag + ' ' + r.name + '\n        ' + r.detail);
@@ -479,6 +682,8 @@ W('扫描范围  ：' + roots.join(' ｜ '));
 W('命中库文件：' + uniq.length + ' 个');
 W('检查列    ：' + NEED_COLUMNS.map(c => c.table + '.' + c.column + '(' + c.debt + ')').join('、'));
 W('检查索引  ：' + NEED_INDEXES.map(i => i.name + '(' + i.table + '(' + i.columns.join(',') + ')，' + i.debt + ')').join('、'));
+W('本产品库判别：有 schema_meta ／ measure_rt ／ upload_log 中任一 ⇒ 本产品库（进上面这份检查面）；'
+  + '三者皆无 ⇒ **非本产品库，跳过**（**不按缺列报**；跳过 = 单列一行读数，**不等于通过**）');
 if (currentVer) {
   W('现行结构版本：' + currentVer.value + '（现读 ' + indexJsPath + ':' + currentVer.line + ' 的 SCHEMA_VERSION；库里的值逐库现读）');
 } else {
@@ -498,17 +703,44 @@ if (coverage && coverage.ok) {
 W('');
 
 let missingCol = 0, missIdx = 0, wrongIdx = 0, ok = 0, skipped = 0;
+let foreignDbCount = 0;                                   /* **非本产品库**（`E210-②`）：跳过、不按缺列报 */
 const idxBadSet = new Set();
 const badCol = [];
 const badIdx = [];
+const foreignList = [];
 for (const f of uniq) {
   let db;
   try { db = new DatabaseSync(f, { readOnly: true }); }
   catch (e) { skipped++; W('[SKIP] ' + f); W('        打不开（可能正被服务独占或不是 SQLite）：' + e.message); W(''); continue; }
   const reader = sqliteReader(db);
+
+  /* ---- `E210-②`：**先判"是不是本产品的库"**，再谈缺列 ----
+     不是本产品的库（例如 `C:\ProgramData\USOPrivate\UpdateStore\store.db`）**不按缺列报**：
+     它对"看板库缺不缺列"零信息量，报出来只会让现场以为是我们库的问题（`E205` 同族）。
+     ⚠ **跳过 ≠ 通过**：它不进 `ok`、不进 `missingCol`，汇总里**单列一行**、明细逐条可查。 */
+  const probe = isProductDb(reader);
+  if (!probe.judged) {
+    skipped++;
+    W('[SKIP] ' + f);
+    W('        打不开（读不出 sqlite_master ⇒ 坏文件或不是 SQLite）：' + probe.why + '（**别当通过**）');
+    W('');
+    continue;
+  }
+  if (!probe.product) {
+    foreignDbCount++;
+    const kindForeign = /[\/]backup[\/]/i.test(f) ? '备份库' : (/data[\/]/i.test(f) ? '数据目录库' : '其它位置');
+    foreignList.push({ f, why: probe.why, kind: kindForeign });
+    W('[跳过] ' + f);
+    W('        **非本产品库，跳过**（' + probe.why + '；类型=' + kindForeign + '）');
+    W('        ⇒ 它与"看板库缺不缺列"无关，**不按缺列报**；**跳过 ≠ 通过**（不计入"列齐"）');
+    W('');
+    continue;
+  }
   const verRow = reader.run("SELECT value FROM schema_meta WHERE key='schema_version'");
   const ver = verRow ? verRow.value : '(无 schema_meta)';
-  const pend = reader.run("SELECT COUNT(*) AS n FROM upload_log WHERE state='待补传'");
+  /* 老库可能整张 `upload_log` 都没有 ⇒ 这一行查询会抛；**它只是附加读数**，不许炸掉整库结论 */
+  let pend = null;
+  try { pend = reader.run("SELECT COUNT(*) AS n FROM upload_log WHERE state='待补传'"); } catch (e) { pend = null; }
   const kind = /[\\/]backup[\\/]/i.test(f) ? '备份库' : (/data[\\/]/i.test(f) ? '数据目录库' : '其它位置');
   const j = judgeDatabase(reader);
   const v = verdictOf(j);
@@ -565,11 +797,13 @@ for (const f of uniq) {
   W('');
 }
 W('===== 汇总 =====');
-W('列面：扫描 ' + uniq.length + ' 个库文件：列齐 ' + (uniq.length - skipped - missingCol) + ' 个，缺列 ' + missingCol
-  + ' 个，打不开 ' + skipped + ' 个（**结案口径：期望「缺列 0」**，本轮实测 ' + missingCol + '）');
-W('索引面：索引齐 ' + (uniq.length - skipped - idxBadSet.size) + ' 个，缺索引 ' + missIdx + ' 个，索引形态不符 '
+W('列面：扫描 ' + uniq.length + ' 个库文件：列齐 ' + (uniq.length - skipped - foreignDbCount - missingCol) + ' 个，缺列 ' + missingCol
+  + ' 个，打不开 ' + skipped + ' 个，**非本产品库跳过 ' + foreignDbCount + ' 个**（**结案口径：期望「缺列 0」**，本轮实测 ' + missingCol + '）');
+W('跳过面：**非本产品库 ' + foreignDbCount + ' 个**（判别＝无 schema_meta 且无 measure_rt／upload_log）'
+  + '——它们**不是本产品读数**：既不算"缺列"，也**不算"通过"**；明细见下方"跳过清单"');
+W('索引面：索引齐 ' + (uniq.length - skipped - foreignDbCount - idxBadSet.size) + ' 个，缺索引 ' + missIdx + ' 个，索引形态不符 '
   + wrongIdx + ' 个（**不影响正确性**；期望 0，本轮实测 ' + idxBadSet.size + ' 个库有差异）');
-W('两面全齐（[OK]）的库：' + ok + ' 个');
+W('两面全齐（[OK]）的库：' + ok + ' 个（**不含**打不开与跳过的）');
 W('结论：退出码 ' + (missingCol ? 1 : ((missIdx || wrongIdx) ? 4 : 0))
   + (missingCol ? '（列面有缺 ⇒ **结案口径未闭合**：启动一次修复构建后复查）'
     : ((missIdx || wrongIdx) ? '（列面已闭合；只余索引面差异 ⇒ 性能面待登记）' : '（列齐且索引齐）')));
@@ -577,6 +811,12 @@ if (missingCol) {
   W('');
   W('缺列清单（带回开发机即可按此登记并追踪）：');
   for (const b of badCol) W('  · ' + b.f + '   结构版本=' + b.ver + '   缺=' + b.miss + '   待补传行=' + b.pend);
+}
+if (foreignDbCount) {
+  W('');
+  W('跳过清单（**非本产品库 ' + foreignDbCount + ' 个**：不是看板的库 ⇒ 它的「缺列」与看板无关；'
+    + '**跳过 ≠ 通过**，若其中本该有看板的库，请用路径参数把看板程序目录指给本工具）：');
+  for (const b of foreignList) W('  · ' + b.f + '   类型=' + b.kind + '   判别=' + b.why);
 }
 if (missIdx || wrongIdx) {
   W('');
@@ -586,6 +826,7 @@ if (missIdx || wrongIdx) {
 W('');
 W('提醒：缺列不等于数据丢失；恢复旧备份后也必须启动一次服务。本工具只读，不改任何库。');
 W('提醒：想自证"检查面没漏项"，跑 `node db-schema-check.js --self-test`（内存库，不碰真实库）。');
+W('提醒："非本产品库跳过"是**判别结果、不是通过**：要让它进检查面，请用路径参数指定看板程序目录。');
 
 /* ---------- 落报告（UTF-8 带 BOM，记事本可直接看） ---------- */
 if (writeReport) {
