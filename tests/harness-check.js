@@ -16623,6 +16623,579 @@ t.section('二十八、`E194` 文件头可执行示例：真跑（甲）＋ 引�
   harness.removeLinkSafe(e194Tmp, { recursive: true, force: true });
 }
 
+/* ==================================================================================================
+   三十、`E207` 台账自洽性：**ID 区间内缺号 = 0** ＋ **「当前开口」块 ↔ 债行状态一致**
+   --------------------------------------------------------------------------------------------------
+   【立案（`E207`，2026-10-07）】`E187③` 只查"行末终态标记 ↔ A/B/C 清单"与"清单里无对应债行"，
+   **不查 ID 连续性** ⇒ `E81` 缺号这类空洞可以长期存在而无人知（生成器当时打印"总登记行数 = 205
+   （`E1` … `E206`）"，**行数与区间标号自相差 1**）。
+   【追加段（2026-10-09，**同族的第二个实例**）】快照「当前开口」块（**仓内唯一的 A/B/C 开口清单**，
+   且快照自己让下一轮"开工先读它"）**停在 10-07**：声明 201／178／23，而债行行末标记与仓外权威口径
+   都是 **209／194／15**（A 组仍列 `E197`／`E198`／`E200`／`E201` —— 四行早已【已闭合】；真正开口的
+   `E207`／`E208`／`E209` 反而**缺席**）。**根因同一个**：台账的机器可读自洽性**没有任何守据**
+   （§二十五 `E183` 只守**转义/结构**、§二十三 `E164` 只守**结构不变量**）⇒ 本批判据一次覆盖两个症状。
+   【口径（三半，各自**双向 fail-closed**）】
+     ① **缺号 ＋ 识别面完整性**：债行 ID 区间 `[min..max]` 内未出现的号必须**恰等于**显式白名单
+        （现为 `E81`）：多一个 ⇒ 红并**指名新增缺号**；少一个 ⇒ 红并报"**名单陈旧**"（名单只能缩小）。
+        另加**识别面普查**：路线图里**含 `【终态：` 的行必须**全部**是债行** —— 否则就是 `E196` 那种
+        "行根本没被看见"（识别式静默漏认），逐行号指名判红。
+     ② **块头三元 ＋ D 组 ↔ 债行行末终态标记**：块头声明的 `总登记／已闭合／开口／区间` 与债行**行末**
+        终态标记的计数**逐项相等**（并核声明自洽 ＋ 无"无标记"债行 ＋ 区间一致）；**D 组（"已闭合"清单）
+        自己那份 `（N 项）` 声明**必须等于行末【已闭合】的行数，且 **D 组项集**（区间展开后）必须**恰等于**
+        已闭合行集合、未识别令牌判红。⚠ **这一半是 2026-10-09 座位 4b 独立复核实测补上的**：初稿只核块头
+        ⇒ 把 D 组 `195 项` 改成 `1 项`、或把 D 组里的 `E210` 换成 `E5`（计数不变），**初稿一律判绿**
+        （"该守的没守"）。
+     ③ **块 A/B/C 项集**必须**恰等于**行内标"开口"的债行集合 —— 行内开口却不在清单 ⇒ 指名；
+        清单里列着但行内已非开口 ⇒ 指名；并核每组"（N 项）"声明与实列条数一致。**组头计数**取
+        "组头区间（行首 → 第一个 `**：`）里**最后**一处 `（…N 项）`"：初稿的宽松式（整行**第一处**）
+        在组名里再出现一个完整 `（N 项）` 时会被**抢先命中** ⇒ 假红并逼人改文案（`D21` 同族）；
+        本版把它钉住，并配 D22㈦ 做**防误红**对照；组头缺 `**：`（形态不可解析）⇒ 判红，不猜。
+   【识别面（与仓外唯一实现 `e187-marker-lib.js` **同口径**）】`ROW_RE`＝首格 `E<数字>`，**粗细体都认**；
+   `MARKER_RE`＝`【终态：开口|已闭合…】`，**只认行末那一处**（其后只允许空白 ＋ 表格收尾 `|`）；
+   `DEBT_MIN = 1` **真过滤**（与仓外实现同名同值；被排除的行逐条打印，让"排除"可见）。
+   ⚠ **两处已登记的实现分叉**（都不许长期存在第二把尺子，冻结解除后收敛）：
+     ① **仓外**那份唯一实现（本仓 `tests\lib\**` 在 **7 天泡机冻结面**内 ⇒ 本轮一个字节都不许动，
+        故本节**就地实现**同口径）；
+     ② **本文件内**：§二十五（`E183`）另有一份「当前开口」块定位（`snapshotLines.findIndex(l =>
+        l.indexOf('**当前开口') >= 0)` 起、到下一个非 `>` 非空行为止，口径比本节松）—— 两处当前都定位到
+        同一块（第 330 行）、结论一致，但"同一口径两处实现"本身违反 9.5-7；本节**不动** `E183` 段
+        （不是本债的判据），在此**如实登记**，冻结解除后合并。
+   【fail-closed】块头**必须唯一**（`> **当前开口（` 出现 ≠ 1 处 ⇒ 判红并列出全部行号 —— 不许"取第一处"
+     了事：第二处若在真块**之后**且更陈旧，旧写法会**假绿**，见 D22㈧）／块不可定位／债行识别为空／
+     A/B/C 任一组缺失／组头缺 `**：`／D 组缺失或含未识别令牌 ⇒ **一律判红**（不静默跳过）。
+   【D22（**十八支**，全部**内存变异**、不落盘；负对照＝盘上现行；并自证盘上两份台账逐字节未变）】
+     ㈠开口→已闭合／㈠b已闭合→开口（**反向**）／㈠c集合对调（**②的头三元计数不变 ⇒ ③ 与 D 组那半能抓**）⇒ 必红并指名；
+     ㈡块内摘掉一个开口项／㈡b只改"（N 项）"声明数／㈡c塞一个已闭合项 ⇒ 必红并指名；
+     ㈢中段行→白名单号 ⇒ ①必红并指名原号 ＋"**名单陈旧**"那半同时显形／㈢b只触发"名单陈旧"（合成补齐
+       区间）⇒ 该半支**单独可证伪**（初稿只在话术里提到它，`ok` 谓词并不看它）／㈢c中段行→已在册号
+       ⇒ 前提（`requires`）必**不成立**（不许静默跳过）；
+     ㈣某行 ID 去粗体 ⇒ 新识别面**不变**、粗体专用旧识别面**少一行**、且**整把尺子的读数**也不变；
+     ㈤a锚改坏／㈤b缺 A 组整行／㈤c头行不可解析／㈤d行末标记删掉 ⇒ 判红并指名（初稿三支全无）；
+     ㈥a D 组声明数改坏／㈥b D 组项集换一个（计数不变）⇒ 必红并指名（**初稿两支都假绿**）；
+     ㈦组头再插一个 `（5 项）` ⇒ **必须仍判绿且计数仍 = 11**（防误红对照）；
+     ㈧真块**之后**再插一条同形陈旧块 ⇒ 必红并指名"两处块头"（**旧写法假绿**）。
+      ⚠ **本批变异的一处设计教训**（2026-10-09 实测踩到）：文内字面量变异**必须按"已定位到的那一行"做**
+        （`e207Rep1(块行, …)`／按行号 `e207SetLine`），**不许**拿整份文本 `replace(needle,'')` ——
+        `｜\`E25\`` 在全快照里**先命中"今日完成的事"里那条 dated 记录**（第 120 行附近）⇒ "摘项"没落在块上，
+        该支当场报"**没抓住**"（判红 —— 本轮就是这样被自己的读数抓出来的）。**反过来说**：若把某支的 `ok`
+        写松成"违规 ≥ 0 条"，同一处就会变成"**变异没生效的假绿**"。这条同样适用于将来的台账变异。
+   【已知边界（**如实登记，不冒充**）】
+     ① **不判组间分类语义**：把一项从 B 挪到 A（两边"（N 项）"同步改）、或同一号在两个组里重复列出 ——
+        集合口径看不见（`Set` 去重后仍与行内开口集合相等）。本节只守"**项集**恰等于行内开口集合"＋
+        "每组声明数 = 该组实列条数"；"哪一项该进哪个组"是人工裁定，不是机器可判的自洽性。
+     ② **不判"债行标记本身是不是真值"**：本节只守"块 ↔ 行"一致 —— 行的终态标记若被整批改错，本节照样绿。
+     ③ **快照里同一事实的其它声明点不在本节范围**：`当前状态快照.md` 的**历史 dated 段**里也写着同一
+        三元组（如 2026-10-07 段的"台账终态"行、第 631 行补注）—— 那是**按硬纪律 10 不改写的"当时值"**，
+        本节**故意**只看「当前开口」块（与 `docs-cross-check` §15 的"当前值区"锚点同款理由：整份扫描会命中
+        早期阶段行 ⇒ 那是**误红**，不是漏守）。
+   ================================================================================================== */
+t.section('三十、`E207` 台账自洽性（ID 区间内缺号 = 0 ＋ 开口块 ↔ 债行状态一致）');
+{
+  const E207_RM = path.join(env.paths.root, '项目记录\\后续路线图.md');
+  const E207_SNAP = path.join(env.paths.root, '项目记录\\当前状态快照.md');
+  const crypto30 = require('node:crypto');
+  const e207Read = (p) => REAL_READ.call(fs, p).toString('utf8');
+  const e207Sha256 = (s) => crypto30.createHash('sha256').update(s, 'utf8').digest('hex');
+  const e207Sha12 = (s) => e207Sha256(s).slice(0, 12);
+  const rmText = e207Read(E207_RM);
+  const snapText = e207Read(E207_SNAP);
+
+  /* 识别面（**与仓外唯一实现 `e187-marker-lib.js` 逐条同口径**，本仓就地实现） */
+  const E207_DEBT_MIN = 1;
+  const E207_ROW_RE = /^\|\s*\*{0,2}(E(\d+))\*{0,2}\s*\|/;
+  const E207_BOLD_RE = /^\| \*\*(E\d+)\*\* \|/;
+  const E207_MARKER_RE = /【终态：(开口|已闭合)([^】]*)】/g;
+  const E207_ANCHOR = '> **当前开口（';
+  const E207_BLOCK_HEAD_RE = /总登记 (\d+) 项（`E(\d+)`–`E(\d+)`）＝ 已闭合 (\d+) ＋ 开口 (\d+)/;
+  const e207Split = (text) => text.split(/\r?\n/);
+  /** 债行扫描：返回 `{rows, excluded}`（`excluded` ＝ 编号 < `DEBT_MIN` 而被排除的行，只用于打印） */
+  const e207Scan = (text) => {
+    const rows = []; const excluded = [];
+    e207Split(text).forEach((l, i) => {
+      const m = E207_ROW_RE.exec(l);
+      if (!m) return;
+      const no = Number(m[2]);
+      if (no < E207_DEBT_MIN) { excluded.push({ id: m[1], line: i + 1 }); return; }
+      rows.push({ id: m[1], no, line: i + 1, text: l, bold: E207_BOLD_RE.test(l) });
+    });
+    return { rows, excluded };
+  };
+  const e207Rows = (text) => e207Scan(text).rows;
+  const e207BoldOnlyRows = (text) => e207Split(text).filter((l) => E207_BOLD_RE.test(l)).length;
+  /** 行末终态标记（只认**行末那一处**；其后只允许空白 ＋ 表格收尾 `|`，否则不算标记） */
+  const e207Tail = (line) => {
+    const ms = [...line.matchAll(E207_MARKER_RE)];
+    const tail = ms.length ? ms[ms.length - 1] : null;
+    if (!tail) return null;
+    const atEnd = line.slice(tail.index + tail[0].length).replace(/\s*\|\s*$/, '').trim() === '';
+    return atEnd ? { kind: tail[1], index: tail.index, len: tail[0].length } : null;
+  };
+  const e207Marker = (line) => { const m = e207Tail(line); return m ? m.kind : null; };
+  /* 「当前开口」块：锚 = 行首 `> **当前开口（`；块 = 锚行起到**下一个非 `>` 行**止；块头**必须唯一** */
+  const e207Block = (text) => {
+    const lines = e207Split(text);
+    const anchors = [];
+    lines.forEach((l, i) => { if (l.startsWith(E207_ANCHOR)) anchors.push(i); });
+    if (!anchors.length) return null;
+    const i = anchors[0];
+    let j = i + 1;
+    while (j < lines.length && lines[j].startsWith('>')) j++;
+    const block = lines.slice(i, j);
+    const headLine = block.find((l) => l.indexOf('总登记') >= 0) || '';
+    const head = E207_BLOCK_HEAD_RE.exec(headLine);
+    /** 组头区间（行首 → 第一个 `**：`）；缺 `**：` ⇒ 返回 null（fail-closed，不去猜整行） */
+    const headerSpan = (l) => { const k = l.indexOf('**：'); return k < 0 ? null : l.slice(0, k); };
+    /** 组声明数：取组头区间里**最后**一处 `（…N 项）`（防"组名里另有一个完整 `（N 项）`"抢先命中） */
+    const countIn = (l) => {
+      const span = headerSpan(l);
+      if (span === null) return null;
+      const ms = [...span.matchAll(/（[^（）]*?(\d+)\s*项）/g)];
+      return ms.length ? Number(ms[ms.length - 1][1]) : null;
+    };
+    const group = (key) => {
+      const l = block.find((x) => x.startsWith('> **' + key + '.'));
+      if (!l) return null;
+      const ids = l.split('｜').map((seg) => {
+        const m = /E(\d+)/.exec(seg);
+        return m ? 'E' + m[1] : null;
+      }).filter(Boolean);
+      return { line: l, headerOk: headerSpan(l) !== null, count: countIn(l), ids };
+    };
+    /** D 组（已闭合清单）：`（N 项` 声明（不要求紧跟 `）`，如"（195 项，备查不再跟踪）"）＋ 项集（区间展开） */
+    const dRaw = block.find((x) => x.startsWith('> **D.'));
+    let D = null;
+    if (dRaw) {
+      const span = headerSpan(dRaw);
+      const dm = span === null ? null : /（\s*(\d+)\s*项/.exec(span);
+      const body = dRaw.replace(/^> \*\*D\.[^：]*\*\*：/, '').replace(/[。\s]+$/, '');
+      const ids = []; const unknown = [];
+      body.split(/[｜／]/).map((s) => s.trim()).filter(Boolean).forEach((tk) => {
+        const clean = tk.replace(/[`*]/g, '');
+        const rng = /^(E\d+)\s*[–—-]\s*(E\d+)$/.exec(clean);
+        if (rng) {
+          const a = Number(rng[1].slice(1)); const b = Number(rng[2].slice(1));
+          if (b < a) { unknown.push(tk); return; }
+          for (let n = a; n <= b; n++) ids.push('E' + n);
+          return;
+        }
+        const one = /^(E\d+)$/.exec(clean);
+        if (one) { ids.push(one[1]); return; }
+        unknown.push(tk);
+      });
+      D = { line: dRaw, headerOk: span !== null, count: dm ? Number(dm[1]) : null, ids, unknown };
+    }
+    return {
+      lines: block, startLine: i + 1, anchorCount: anchors.length, anchorLines: anchors.map((x) => x + 1),
+      headLine, head, A: group('A'), B: group('B'), C: group('C'), D
+    };
+  };
+  /** 显式白名单：区间内**唯一**允许缺的号（双向 fail-closed：多缺 ⇒ 红；名单里那个不缺了 ⇒ 红"名单陈旧"）。 */
+  const E207_MISSING_WHITELIST = [81];
+  /** **同一把尺子**：主判据与十八支 D22 共用（`D19`／`9.5-7`）。 */
+  const e207Audit = (rmSrc, snapSrc) => {
+    const scanned = e207Scan(rmSrc);
+    const rows = scanned.rows;
+    const nos = rows.map((r) => r.no);
+    const uniq = [...new Set(nos)].sort((a, b) => a - b);
+    const dupIds = [...new Set(nos.filter((n) => nos.filter((x) => x === n).length > 1))].map((n) => 'E' + n);
+    const lo = uniq.length ? uniq[0] : null;
+    const hi = uniq.length ? uniq[uniq.length - 1] : null;
+    const missing = [];
+    for (let n = (lo === null ? 1 : lo); n <= (hi === null ? 0 : hi); n++) if (!uniq.includes(n)) missing.push(n);
+    const openRows = rows.filter((r) => e207Marker(r.text) === '开口').map((r) => r.id);
+    const closedRows = rows.filter((r) => e207Marker(r.text) === '已闭合').map((r) => r.id);
+    const noMarker = rows.filter((r) => e207Marker(r.text) === null).map((r) => r.id + '(行' + r.line + ')');
+    /* 识别面完整性：含 `【终态：` 的行**必须**是债行（`E196` 的"行根本没被看见"） */
+    const rowLineNo = new Set(rows.map((r) => r.line));
+    const strayMarker = [];
+    e207Split(rmSrc).forEach((l, i) => {
+      if (l.indexOf('【终态：') >= 0 && !rowLineNo.has(i + 1)) strayMarker.push('行' + (i + 1) + '（' + l.slice(0, 48) + '…）');
+    });
+    const blk = e207Block(snapSrc);
+    const inBlock = blk ? [...(blk.A ? blk.A.ids : []), ...(blk.B ? blk.B.ids : []), ...(blk.C ? blk.C.ids : [])] : [];
+    const declaredTotal = blk && blk.head ? Number(blk.head[1]) : null;
+    const declaredRange = blk && blk.head ? ['E' + blk.head[2], 'E' + blk.head[3]] : null;
+    const declaredClosed = blk && blk.head ? Number(blk.head[4]) : null;
+    const declaredOpen = blk && blk.head ? Number(blk.head[5]) : null;
+    /* ① 缺号 ＋ 识别面完整性 */
+    const missingBad = [];
+    if (lo === null) missingBad.push('债行识别面为空（判不了就判红）');
+    else {
+      const extra = missing.filter((n) => !E207_MISSING_WHITELIST.includes(n));
+      const stale = E207_MISSING_WHITELIST.filter((n) => !missing.includes(n));
+      if (extra.length) missingBad.push('区间内**新增缺号** ' + extra.map((n) => 'E' + n).join('、') + '（白名单外）');
+      if (stale.length) missingBad.push('白名单里的 ' + stale.map((n) => 'E' + n).join('、') + ' **已不再缺号**（名单陈旧 ⇒ 只能缩小）');
+    }
+    if (strayMarker.length) {
+      missingBad.push('识别面漏认 ' + strayMarker.length + ' 行（含 `【终态：` 却不是债行 ⇒ `E196` 同型）' + strayMarker.slice(0, 6).join('、'));
+    }
+    /* ② 块头三元 ＋ D 组 ↔ 债行标记 */
+    const countBad = [];
+    if (!blk) countBad.push('「当前开口」块不可定位（锚 `' + E207_ANCHOR + '` 命中 0 处）');
+    else if (blk.anchorCount !== 1) {
+      countBad.push('快照里有 ' + blk.anchorCount + ' 处块头 `' + E207_ANCHOR + '`（行 ' + blk.anchorLines.join('、')
+        + '）⇒ 不敢断定哪一处是权威（fail-closed；"取第一处"会把更陈旧的第二处放过去）');
+    }
+    if (!blk || !blk.head) countBad.push('「当前开口」块"总登记 … ＝ 已闭合 … ＋ 开口 …"头行不可解析');
+    else {
+      if (declaredTotal !== uniq.length) countBad.push('总登记 声明 ' + declaredTotal + ' ≠ 债行 ' + uniq.length);
+      if (declaredOpen !== openRows.length) countBad.push('开口 声明 ' + declaredOpen + ' ≠ 行末标【终态：开口】的 ' + openRows.length + ' 行');
+      if (declaredClosed !== closedRows.length) countBad.push('已闭合 声明 ' + declaredClosed + ' ≠ 行末标【终态：已闭合】的 ' + closedRows.length + ' 行');
+      if (declaredClosed + declaredOpen !== declaredTotal) {
+        countBad.push('声明自洽：已闭合 ' + declaredClosed + ' ＋ 开口 ' + declaredOpen + ' ≠ 总登记 ' + declaredTotal);
+      }
+      if (declaredRange && lo !== null && (declaredRange[0] !== 'E' + lo || declaredRange[1] !== 'E' + hi)) {
+        countBad.push('区间 声明 ' + declaredRange.join('–') + ' ≠ 债行区间 E' + lo + '–E' + hi);
+      }
+      if (noMarker.length) countBad.push('无行末终态标记的债行 ' + noMarker.length + ' 行：' + noMarker.slice(0, 12).join('、'));
+    }
+    /* ② 的 D 组那半：D 组声明的 已闭合 数 / 项集 也要与债行对账（D22㈥ 就是这两支） */
+    if (blk && !blk.D) countBad.push('块里没有 D 组（"已闭合"清单）⇒ 已闭合项集无处对账');
+    else if (blk && blk.D) {
+      if (blk.D.count === null) countBad.push('D 组"（N 项）"声明不可解析（组头缺 `**：` 或计数形态变了）');
+      else if (blk.D.count !== closedRows.length) {
+        countBad.push('D 组（已闭合）声明 ' + blk.D.count + ' 项 ≠ 行末【终态：已闭合】的 ' + closedRows.length + ' 行');
+      }
+      if (blk.D.unknown.length) countBad.push('D 组含**未识别令牌** ' + blk.D.unknown.slice(0, 6).join('、') + '（区间/编号形态必须显式可解析，不许静默丢）');
+      const dSet = new Set(blk.D.ids);
+      const cSet = new Set(closedRows);
+      const dOnly = [...dSet].filter((x) => !cSet.has(x));
+      const cOnly = [...cSet].filter((x) => !dSet.has(x));
+      if (dOnly.length) countBad.push('D 组列着但行内**非已闭合**：' + dOnly.join('、'));
+      if (cOnly.length) countBad.push('行内已闭合却**不在 D 组**：' + cOnly.slice(0, 12).join('、') + (cOnly.length > 12 ? ' 等 ' + cOnly.length + ' 项' : ''));
+    }
+    /* ③ 块 A/B/C 项集 ↔ 行内开口 */
+    const memberBad = [];
+    if (!blk || !blk.A || !blk.B || !blk.C) memberBad.push('「当前开口」块缺 A/B/C 任一组（成员无处对账）');
+    else {
+      const decl = new Set(inBlock);
+      const actual = new Set(openRows);
+      const notListed = [...actual].filter((x) => !decl.has(x));
+      const stale = [...decl].filter((x) => !actual.has(x));
+      if (notListed.length) memberBad.push('行内标"开口"却**不在 A/B/C**：' + notListed.join('、'));
+      if (stale.length) memberBad.push('A/B/C 里列着但行内**已非开口**：' + stale.join('、'));
+      for (const g of [['A', blk.A], ['B', blk.B], ['C', blk.C]]) {
+        if (!g[1].headerOk) memberBad.push(g[0] + ' 组头缺 `**：`（"（N 项）"声明形态不可解析）');
+        else if (g[1].count === null) memberBad.push(g[0] + ' 组头里找不到"（N 项）"声明');
+        else if (g[1].count !== g[1].ids.length) memberBad.push(g[0] + ' 组声明 ' + g[1].count + ' 项 ≠ 实列 ' + g[1].ids.length + ' 项');
+      }
+    }
+    return {
+      rows, uniq, dupIds, lo, hi, missing, openRows, closedRows, noMarker, blk, inBlock,
+      declaredTotal, declaredRange, declaredClosed, declaredOpen, missingBad, countBad, memberBad,
+      boldOnly: e207BoldOnlyRows(rmSrc), excluded: scanned.excluded, strayMarker,
+      dCount: blk && blk.D ? blk.D.count : null, dIds: blk && blk.D ? blk.D.ids : [],
+      anchorCount: blk ? blk.anchorCount : 0
+    };
+  };
+
+  const pre = e207Audit(rmText, snapText);
+  const e207Ready = t.requires('`E207` 前提：债行可识别（非空、ID 无重复）且快照「当前开口」块可定位',
+    pre.rows.length > 0 && pre.dupIds.length === 0 && Boolean(pre.blk),
+    '债行 ' + pre.rows.length + ' 行／唯一 ID ' + pre.uniq.length + ' 个／重复 ID '
+      + (pre.dupIds.length ? pre.dupIds.join('、') : '无') + '／块起始行 ' + (pre.blk ? pre.blk.startLine : '（不可定位）')
+      + '／块头 ' + pre.anchorCount + ' 处／被 `DEBT_MIN` 排除的行 ' + pre.excluded.length + ' 行');
+
+  if (e207Ready) {
+    t.check('`E207`-① **区间内缺号 = 0**（白名单双向 fail-closed）＋ **识别面完整性**：债行 ID 区间内未出现的号必须**恰等于**'
+      + '显式白名单 ' + JSON.stringify(E207_MISSING_WHITELIST.map((n) => 'E' + n)) + '（多一个 ⇒ 红并**指名新增缺号**；'
+      + '少一个 ⇒ 红并报"**名单陈旧**"）；且路线图里**含 `【终态：` 的行必须全部是债行**（`E196` 型"行根本没被看见"⇒ 逐行号指名）',
+      pre.missingBad.length === 0,
+      '债行 ' + pre.rows.length + ' 行（唯一 ID ' + pre.uniq.length + ' 个）／区间 E' + pre.lo + '–E' + pre.hi
+        + '／区间内实际缺号 ' + (pre.missing.length ? pre.missing.map((n) => 'E' + n).join('、') : '（无）')
+        + '／白名单 ' + E207_MISSING_WHITELIST.map((n) => 'E' + n).join('、')
+        + '／识别面漏认行 ' + pre.strayMarker.length + ' 行'
+        + (pre.missingBad.length ? ' ⇒ ' + pre.missingBad.join('；') : ' ⇒ 与白名单**逐号一致**、无漏认行'));
+
+    t.check('`E207`-② **块头三元 ＋ D 组 ↔ 债行行末终态标记**：总登记／已闭合／开口／区间 四个声明与债行标记计数**逐项相等**'
+      + '（＋声明自洽＋无"无标记"债行）；**D 组（已闭合清单）**自己那份"（N 项）"声明须等于行末【已闭合】行数，'
+      + '**D 组项集**（区间展开）须**恰等于**已闭合行集合、未识别令牌判红；**块头必须唯一**（≠1 处 ⇒ 判红并列出全部行号）',
+      pre.countBad.length === 0,
+      '声明：总登记 ' + pre.declaredTotal + '／已闭合 ' + pre.declaredClosed + '／开口 ' + pre.declaredOpen
+        + '／区间 ' + (pre.declaredRange ? pre.declaredRange.join('–') : '（无）')
+        + '；实测：债行 ' + pre.uniq.length + '／行末【已闭合】' + pre.closedRows.length + '／行末【开口】' + pre.openRows.length
+        + '／无标记 ' + pre.noMarker.length + '；块头 ' + pre.anchorCount + ' 处／D 组声明 ' + pre.dCount
+        + ' 项、展开 ' + pre.dIds.length + ' 个 ID'
+        + (pre.countBad.length ? ' ⇒ ' + pre.countBad.join('；') : ' ⇒ 逐项相等（含 D 组项集两向零差）'));
+
+    t.check('`E207`-③ **块 A/B/C 项集 ↔ 行内标"开口"的债行集合**（两个方向都指名）：行内开口却不在清单 ⇒ 指名；'
+      + '清单里列着但行内已非开口 ⇒ 指名；并核每组"（N 项）"声明与实列条数一致（**组头区间内最后一处**计数，'
+      + '组头缺 `**：` 即判红）',
+      pre.memberBad.length === 0,
+      'A/B/C 声明 ' + [pre.blk.A, pre.blk.B, pre.blk.C].map((g) => (g && g.count !== null ? g.count : '?')).join('／')
+        + '；实列 ' + [pre.blk.A, pre.blk.B, pre.blk.C].map((g) => (g ? g.ids.length : '?')).join('／')
+        + '；块内项集 ' + (pre.inBlock.length ? pre.inBlock.join('、') : '（空）')
+        + '；行内开口 ' + (pre.openRows.length ? pre.openRows.join('、') : '（无）')
+        + (pre.memberBad.length ? ' ⇒ ' + pre.memberBad.join('；') : ' ⇒ 两向零差'));
+
+    /* ---- D22（十八支，全部**内存变异**；负对照＝盘上现行；末尾自证盘上两份台账逐字节未变） ---- */
+    const e207Lines = e207Split(rmText);
+    const e207SnapLines = e207Split(snapText);
+    const e207FindRow = (id) => pre.rows.find((r) => r.id === id);
+    const e207Rep1 = (line, from, to, label) => {
+      const n = line.split(from).length - 1;
+      if (n !== 1) throw new Error((label || '变异') + '锚点命中 ' + n + ' 次（须 1）：' + JSON.stringify(from.slice(0, 40)));
+      return line.split(from).join(to);
+    };
+    const e207SetLine = (lines, ln, fn) => {
+      const out = lines.slice();
+      const before = out[ln - 1];
+      const after = fn(before);
+      if (after === before) throw new Error('第 ' + ln + ' 行变异未生效');
+      out[ln - 1] = after;
+      return out;
+    };
+    /** 精确翻转**行末**那一处终态标记（行文里引用的示例不算 —— `E187` 口径） */
+    const e207Flip = (line, to) => {
+      const m = e207Tail(line);
+      if (!m) throw new Error('该行没有行末终态标记（不能按"行末标记"变异）');
+      const head = '【终态：';
+      const inner = line.substr(m.index + head.length, m.kind.length);
+      if (inner !== m.kind) throw new Error('标记形态与解析不一致：' + JSON.stringify(inner));
+      return line.slice(0, m.index + head.length) + to + line.slice(m.index + head.length + m.kind.length);
+    };
+    /** 往组行**末尾**追加一个项（组行以 `。` 收尾） */
+    const e207AppendItem = (line, id) => (line.endsWith('。') ? line.slice(0, -1) + '｜`' + id + '`。' : line + '｜`' + id + '`');
+    /** 组头区间里把 `（…N 项）` 里的 N 改写成别的（只动**组头**，不动注记；`lenient` 供 D 组"（195 项，…）"形态） */
+    const e207BumpCount = (line, n, to, lenient) => {
+      const k = line.indexOf('**：');
+      if (k < 0) throw new Error('组头缺 `**：`');
+      const span = line.slice(0, k);
+      const ms = [...span.matchAll(lenient ? /（\s*(\d+)\s*项/g : /（[^（）]*?(\d+)\s*项）/g)];
+      if (!ms.length) throw new Error('组头里找不到"（N 项）"声明');
+      const last = ms[ms.length - 1];
+      if (Number(last[1]) !== n) throw new Error('组头计数与预期不符：' + last[1] + ' ≠ ' + n);
+      const at = last.index + last[0].indexOf(last[1]);
+      return span.slice(0, at) + to + span.slice(at + last[1].length) + line.slice(k);
+    };
+    const e207D22 = [];
+    const e207Case = (name, fn) => {
+      try { e207D22.push(Object.assign({ name }, fn())); }
+      catch (err) { e207D22.push({ name, ok: false, reading: '变异执行抛错：' + ((err && err.message) || String(err)) }); }
+    };
+    const e207Join = (arr) => arr.join('\n');
+    /** ② 里"**头三元/区间/无标记**"那半的违规（把 D 组那半剔掉）：㈠c 用它证明"计数不变时 ③ 仍在守" */
+    const e207HeadCountBad = (a) => a.countBad.filter((s) => s.indexOf('D 组') !== 0 && s.indexOf('行内已闭合却') !== 0);
+    const e207Open = pre.openRows[0];
+    /* 取**粗体**的中段已闭合行（下面几支要按 `| **E…** |` 做字面量变异） */
+    const e207ClosedBold = pre.closedRows.map((i) => e207FindRow(i)).filter((r) => r.bold);
+    const e207Closed = e207ClosedBold.length ? e207ClosedBold[Math.floor(e207ClosedBold.length / 2)].id : null;
+    const e207GroupPick = ['A', 'B', 'C'].map((k) => [k, pre.blk[k]]).filter((x) => x[1] && x[1].ids.length)
+      .sort((x, y) => y[1].ids.length - x[1].ids.length)[0];
+    const e207GKey = e207GroupPick ? e207GroupPick[0] : null;
+    const e207GIds = e207GroupPick ? e207GroupPick[1].ids : [];
+    const e207GMid = e207GIds.length > 1 ? e207GIds[Math.floor(e207GIds.length / 2)] : null;
+    const e207BKey = ['A', 'B', 'C'].find((k) => pre.blk[k] && pre.blk[k].count !== null && pre.blk[k].ids.length > 0);
+    const e207ClosedNotListed = pre.closedRows.find((x) => pre.inBlock.indexOf(x) < 0);
+
+    /* ㈠ 标记 开口 → 已闭合 */
+    e207Case('㈠开口→已闭合', () => {
+      const r = e207FindRow(e207Open);
+      const a = e207Audit(e207Join(e207SetLine(e207Lines, r.line, (l) => e207Flip(l, '已闭合'))), snapText);
+      const hit = a.countBad.find((s) => s.indexOf('开口 声明') === 0) || '';
+      return { ok: a.countBad.length > 0 && Boolean(hit), reading: e207Open + ' ⇒ 「' + (hit || '没抓住') + '」' };
+    });
+    /* ㈠b 反向：已闭合 → 开口（初稿没有这一向） */
+    e207Case('㈠b已闭合→开口', () => {
+      if (!e207Closed) return { ok: false, reading: '找不到粗体已闭合债行' };
+      const r = e207FindRow(e207Closed);
+      const a = e207Audit(e207Join(e207SetLine(e207Lines, r.line, (l) => e207Flip(l, '开口'))), snapText);
+      const named = a.memberBad.join('｜').indexOf(e207Closed) >= 0;
+      return { ok: a.countBad.some((s) => s.indexOf('开口 声明') === 0) && named,
+        reading: e207Closed + ' ⇒ ②' + a.countBad.length + ' 条／③指名=' + named };
+    });
+    /* ㈠c 集合对调（**②的头三元计数全不变**）⇒ ③ 与 ②的 D 组那半能抓 */
+    e207Case('㈠c集合对调', () => {
+      if (!e207Closed) return { ok: false, reading: '找不到粗体已闭合债行' };
+      const ro = e207FindRow(e207Open); const rc = e207FindRow(e207Closed);
+      let mut = e207SetLine(e207Lines, ro.line, (l) => e207Flip(l, '已闭合'));
+      mut = e207SetLine(mut, rc.line, (l) => e207Flip(l, '开口'));
+      const a = e207Audit(e207Join(mut), snapText);
+      const msg = a.memberBad.join('｜');
+      return { ok: e207HeadCountBad(a).length === 0 && a.missingBad.length === 0 && msg.indexOf(e207Open) >= 0 && msg.indexOf(e207Closed) >= 0,
+        reading: '②头三元 ' + e207HeadCountBad(a).length + ' 条／①' + a.missingBad.length + ' 条（都须 0；②的 D 组那半另有 '
+          + (a.countBad.length - e207HeadCountBad(a).length) + ' 条）／③' + a.memberBad.length
+          + ' 条 ⇒ 指名 ' + e207Open + '=' + (msg.indexOf(e207Open) >= 0) + '、' + e207Closed + '=' + (msg.indexOf(e207Closed) >= 0) };
+    });
+    /* ㈡ 块内摘掉一个开口项（取项数最多的那一组的**中间**项）
+       ⚠ 变异必须**按块行做字面量**（`e207Rep1(组行, …)`），不许拿整份 `snapText.replace(needle,'')` ——
+       2026-10-09 实测：`｜\`E25\`` 在全快照里**先命中"今日完成的事"里那条历史记录**（第 120 行附近），
+       于是"摘项"根本没落在块上、判据照样绿（**变异没生效的假绿**）。 */
+    e207Case('㈡摘块内项', () => {
+      if (!e207GMid) return { ok: false, reading: '块内没有可摘的开口项' };
+      const gl = pre.blk[e207GKey].line;
+      const mutLine = e207Rep1(gl, '｜`' + e207GMid + '`', '', '摘项');
+      const a = e207Audit(rmText, e207SnapLines.map((l) => (l === gl ? mutLine : l)).join('\n'));
+      return { ok: a.memberBad.length > 0 && a.memberBad.join('｜').indexOf(e207GMid) >= 0 && a.memberBad.join('｜').indexOf(e207GKey + ' 组声明') >= 0,
+        reading: e207GKey + ' 组摘掉 ' + e207GMid + ' ⇒ ③' + a.memberBad.length + ' 条：「' + (a.memberBad[0] || '没抓住') + '」' };
+    });
+    /* ㈡b 只改"（N 项）"声明数 */
+    e207Case('㈡b改声明数', () => {
+      if (!e207BKey) return { ok: false, reading: '找不到可改声明数的组' };
+      const g = pre.blk[e207BKey];
+      const a = e207Audit(rmText, e207SnapLines.map((l) => (l.startsWith('> **' + e207BKey + '.') ? e207BumpCount(l, g.count, g.count + 1) : l)).join('\n'));
+      const want = e207BKey + ' 组声明 ' + (g.count + 1) + ' 项 ≠ 实列 ' + g.ids.length + ' 项';
+      return { ok: a.memberBad.indexOf(want) >= 0, reading: '「' + (a.memberBad[0] || '没抓住') + '」' };
+    });
+    /* ㈡c 往块里塞一个**已闭合**的项（计数与项集同时显形） */
+    e207Case('㈡c塞已闭合项', () => {
+      if (!e207ClosedNotListed) return { ok: false, reading: '没有"不在块内"的已闭合行可塞' };
+      const a = e207Audit(rmText, e207SnapLines.map((l) => (l.startsWith('> **' + e207BKey + '.')
+        ? e207AppendItem(l, e207ClosedNotListed) : l)).join('\n'));
+      return { ok: a.memberBad.join('｜').indexOf(e207ClosedNotListed) >= 0, reading: '塞 ' + e207ClosedNotListed + ' ⇒ 「' + (a.memberBad[0] || '没抓住') + '」' };
+    });
+    /* ㈢ 区间中段某行 ID 改成白名单号 ⇒ 新缺号 ＋ 名单陈旧同时显形 */
+    e207Case('㈢中段→E81', () => {
+      if (!e207Closed) return { ok: false, reading: '找不到粗体已闭合债行' };
+      const r = e207FindRow(e207Closed);
+      const a = e207Audit(e207Join(e207SetLine(e207Lines, r.line, (l) => e207Rep1(l, '| **' + e207Closed + '** |', '| **E' + E207_MISSING_WHITELIST[0] + '** |', '中段号'))), snapText);
+      const msg = a.missingBad.join('｜');
+      return { ok: msg.indexOf(e207Closed) >= 0 && msg.indexOf('E' + E207_MISSING_WHITELIST[0]) >= 0,
+        reading: e207Closed + '→E' + E207_MISSING_WHITELIST[0] + ' ⇒ 「' + (a.missingBad[0] || '没抓住') + '」＋「名单陈旧那半=' + (msg.indexOf('名单陈旧') >= 0) + '」' };
+    });
+    /* ㈢b **只触发"名单陈旧"那半**（合成补齐区间 ⇒ 区间内无缺号） */
+    e207Case('㈢b名单陈旧', () => {
+      if (!e207Closed) return { ok: false, reading: '找不到粗体已闭合债行' };
+      const r = e207FindRow(e207Closed);
+      let mut = e207SetLine(e207Lines, r.line, (l) => e207Rep1(l, '| **' + e207Closed + '** |', '| **E' + E207_MISSING_WHITELIST[0] + '** |', '中段号'));
+      const mutText = e207Join(mut) + '\n| **' + e207Closed + '** | 座位 4b D22 合成行（内存变异，不落盘） | 【终态：已闭合（D22 合成）】 |';
+      const a = e207Audit(mutText, snapText);
+      const msg = a.missingBad.join('｜');
+      return { ok: a.missing.length === 0 && msg.indexOf('E' + E207_MISSING_WHITELIST[0]) >= 0 && msg.indexOf('名单陈旧') >= 0,
+        reading: '区间缺号 ' + a.missing.length + ' 个 ⇒ 「' + (a.missingBad[0] || '没抓住') + '」' };
+    });
+    /* ㈢c 中段行 ID 改成**已在册的号** ⇒ 前提（requires）必不成立 */
+    e207Case('㈢c重复号', () => {
+      if (!e207Closed) return { ok: false, reading: '找不到粗体已闭合债行' };
+      const r = e207FindRow(e207Closed);
+      const other = pre.rows[pre.rows.length - 1].id;
+      const a = e207Audit(e207Join(e207SetLine(e207Lines, r.line, (l) => e207Rep1(l, '| **' + e207Closed + '** |', '| **' + other + '** |', '重复号'))), snapText);
+      const ready = a.rows.length > 0 && a.dupIds.length === 0 && Boolean(a.blk);
+      return { ok: a.dupIds.length > 0 && !ready, reading: e207Closed + '→' + other + ' ⇒ 重复 ID ' + a.dupIds.join('、') + '／前提成立=' + ready };
+    });
+    /* ㈣ 去粗体：新识别面不变、旧面 −1，且**整把尺子的读数**不变 */
+    e207Case('㈣去粗体', () => {
+      const boldOpen = pre.openRows.map((i) => e207FindRow(i)).find((r) => r.bold);
+      const tgt = boldOpen || [...pre.rows].reverse().find((r) => r.bold);
+      if (!tgt) return { ok: false, reading: '找不到粗体债行' };
+      const a = e207Audit(e207Join(e207SetLine(e207Lines, tgt.line, (l) => e207Rep1(l, '| **' + tgt.id + '** |', '| ' + tgt.id + ' |', '去粗体'))), snapText);
+      const same = a.missingBad.length + a.countBad.length + a.memberBad.length === 0
+        && JSON.stringify(a.openRows) === JSON.stringify(pre.openRows);
+      return { ok: a.rows.length === pre.rows.length && a.boldOnly === pre.boldOnly - 1 && same,
+        reading: tgt.id + ' 去粗体 ⇒ 新面 ' + pre.rows.length + '→' + a.rows.length + '（须不变）／旧面 '
+          + pre.boldOnly + '→' + a.boldOnly + '（须 −1）／整把尺子读数不变=' + same };
+    });
+    /* ㈤a 锚改坏 ⇒ 判红（块不可定位） */
+    e207Case('㈤a锚坏', () => {
+      const mut = snapText.split(E207_ANCHOR).join('> **当前开口[');
+      const a = e207Audit(rmText, mut);
+      const ready = a.rows.length > 0 && a.dupIds.length === 0 && Boolean(a.blk);
+      return { ok: a.blk === null && a.countBad.join('｜').indexOf('不可定位') >= 0 && !ready,
+        reading: '「' + (a.countBad[0] || '没抓住') + '」／前提成立=' + ready };
+    });
+    /* ㈤b 删掉 A 组整行 */
+    e207Case('㈤b缺A组', () => {
+      const a = e207Audit(rmText, e207SnapLines.filter((l) => !l.startsWith('> **A. ')).join('\n'));
+      return { ok: Boolean(a.blk) && a.blk.A === null && a.memberBad.join('｜').indexOf('缺 A/B/C') >= 0,
+        reading: '「' + (a.memberBad[0] || '没抓住') + '」' };
+    });
+    /* ㈤c 头行不可解析 */
+    e207Case('㈤c头行坏', () => {
+      const a = e207Audit(rmText, e207SnapLines.map((l) => (/总登记 \d+ 项/.test(l) ? l.replace(/总登记 \d+ 项/, '总登记 ### 项') : l)).join('\n'));
+      return { ok: a.blk && a.blk.head === null && a.countBad.join('｜').indexOf('不可解析') >= 0,
+        reading: '「' + (a.countBad[0] || '没抓住') + '」' };
+    });
+    /* ㈤d 行末标记整段删掉 */
+    e207Case('㈤d标记删', () => {
+      if (!e207Closed) return { ok: false, reading: '找不到粗体已闭合债行' };
+      const r = e207FindRow(e207Closed);
+      const a = e207Audit(e207Join(e207SetLine(e207Lines, r.line, (l) => l.replace(/【终态：已闭合[^】]*】/, ''))), snapText);
+      return { ok: a.noMarker.length === 1 && a.noMarker[0].indexOf(e207Closed) === 0 && a.countBad.join('｜').indexOf('无行末终态标记') >= 0,
+        reading: e207Closed + ' ⇒ 「' + (a.countBad.find((s) => s.indexOf('无行末终态标记') === 0) || '没抓住') + '」' };
+    });
+    /* ㈥a D 组声明数改坏（＋1） */
+    e207Case('㈥a D数坏', () => {
+      if (!pre.blk.D || pre.blk.D.count === null) return { ok: false, reading: 'D 组声明数不可解析' };
+      const n = pre.blk.D.count;
+      const a = e207Audit(rmText, e207SnapLines.map((l) => (l.startsWith('> **D.') ? e207BumpCount(l, n, n + 1, true) : l)).join('\n'));
+      return { ok: a.countBad.join('｜').indexOf('D 组（已闭合）声明 ' + (n + 1) + ' 项') >= 0,
+        reading: 'D 声明 ' + n + '→' + (n + 1) + ' ⇒ 「' + (a.countBad.find((s) => s.indexOf('D 组') === 0) || '没抓住') + '」' };
+    });
+    /* ㈥b D 组项集换掉一个（计数不变） */
+    e207Case('㈥b D集坏', () => {
+      const victim = pre.openRows.find((x) => pre.dIds.indexOf(x) < 0);
+      if (!victim || !pre.blk.D) return { ok: false, reading: '找不到"开口且不在 D 组"的号' };
+      const dl = pre.blk.D.line;
+      const ms = [...dl.matchAll(/E\d+/g)];
+      const last = ms[ms.length - 1];
+      const newD = dl.slice(0, last.index) + victim + dl.slice(last.index + last[0].length);
+      const a = e207Audit(rmText, e207SnapLines.map((l) => (l === dl ? newD : l)).join('\n'));
+      const msg = a.countBad.join('｜');
+      return { ok: a.countBad.length > 0 && msg.indexOf(victim) >= 0 && msg.indexOf(last[0]) >= 0,
+        reading: 'D 组 ' + last[0] + '→' + victim + '（计数不变）⇒ 「' + (a.countBad.find((s) => s.indexOf('D 组列着') === 0 || s.indexOf('行内已闭合却') === 0) || '没抓住') + '」' };
+    });
+    /* ㈦ 组头再插一个完整 `（5 项）` ⇒ **必须仍判绿且解析出真计数**（防误红对照） */
+    e207Case('㈦组名插(N项)', () => {
+      const key = e207BKey || 'C';
+      const g = pre.blk[key];
+      const probe = '（5 项）';
+      const a = e207Audit(rmText, e207SnapLines.map((l) => {
+        if (!l.startsWith('> **' + key + '.')) return l;
+        const k = l.indexOf('**：');
+        const p = l.lastIndexOf('（', k);
+        return p < 0 ? l : l.slice(0, p) + probe + l.slice(p);
+      }).join('\n'));
+      const got = a.blk && a.blk[key] ? a.blk[key].count : null;
+      return { ok: got === g.count && a.memberBad.length === 0,
+        reading: key + ' 组头插 ' + probe + ' ⇒ 解析出的声明数 ' + got + '（须 = ' + g.count + '）／③' + a.memberBad.length + ' 条（须 0）' };
+    });
+    /* ㈧ 真块**之后**再插一条同形**陈旧**块 ⇒ 必红并指名"两处块头"（旧写法在此**假绿**） */
+    e207Case('㈧双锚', () => {
+      const endIdx = pre.blk.startLine - 1 + pre.blk.lines.length;
+      const stale = ['', '> **当前开口（探针：陈旧副本）**：', '>',
+        '> **总登记 201 项（`E1`–`E202`）＝ 已闭合 178 ＋ 开口 23**。', '>',
+        '> **A. 探针（0 项）**：**（空）**。', '> **B. 探针（0 项）**：**（空）**。', '> **C. 探针（0 项）**：**（空）**。', '>',
+        '> **D. 已闭合（178 项，备查不再跟踪）**：E2。'];
+      const mut = e207SnapLines.slice(0, endIdx).concat(stale, e207SnapLines.slice(endIdx));
+      const a = e207Audit(rmText, e207Join(mut));
+      const msg = a.countBad.join('｜');
+      const named = a.blk ? a.blk.anchorLines.join('、') : '';
+      return { ok: a.anchorCount === 2 && msg.indexOf('2 处块头') >= 0 && named.length > 0 && msg.indexOf(named) >= 0,
+        reading: '真块后再插一条陈旧块 ⇒ 块头 ' + a.anchorCount + ' 处／「' + (a.countBad.find((s) => s.indexOf('处块头') >= 0) || '没抓住') + '」' };
+    });
+
+    const e207D22Ok = e207D22.length === 18 && e207D22.every((c) => c.ok);
+    const e207DiskSame = e207Sha256(e207Read(E207_RM)) === e207Sha256(rmText)
+      && e207Sha256(e207Read(E207_SNAP)) === e207Sha256(snapText);
+    t.check('`E207` D22（**十八支内存变异 ＋ 负对照 ＋ 盘上逐字节未变**）：'
+      + '㈠开口→已闭合 ／ ㈠b已闭合→开口（反向）／ ㈠c集合对调（**②的头三元计数不变** ⇒ ③ 与 D 组那半能抓）／ '
+      + '㈡摘块内项／㈡b只改声明数／㈡c塞已闭合项／ ㈢中段→白名单号（①必红并指名原号＋"名单陈旧"半）／'
+      + '㈢b**只触发"名单陈旧"**（合成补齐区间 ⇒ 该半支单独可证伪）／㈢c中段→已在册号（前提必不成立）／ '
+      + '㈣去粗体（新面不变＋旧面−1＋整把尺子读数不变）／ ㈤a锚坏／㈤b缺 A 组／㈤c头行坏／㈤d标记删（四支 fail-closed）／ '
+      + '㈥a D 组声明数坏／㈥b D 组项集坏（计数不变）⇒ 必红并指名（**初稿这两支都假绿**）／ '
+      + '㈦组头插 `（5 项）` ⇒ **必须仍判绿且计数仍 = ' + (pre.blk[e207BKey || 'C'] ? pre.blk[e207BKey || 'C'].count : '?') + '**（防误红对照）／ '
+      + '㈧真块之后再插陈旧同形块 ⇒ 必红并指名"两处块头"（**旧写法假绿**）',
+      e207D22Ok && pre.countBad.length === 0 && pre.memberBad.length === 0
+        && pre.missingBad.length === 0 && e207DiskSame,
+      (e207D22.length === 18 ? '' : '**支数不是 18（' + e207D22.length + '）**；')
+        + e207D22.map((c) => c.name + ' ⇒ ' + (c.ok ? '符合' : '**没抓住**') + '（' + c.reading + '）').join('；')
+        + '；负对照（盘上现行）①' + pre.missingBad.length + '／②' + pre.countBad.length + '／③' + pre.memberBad.length
+        + ' 条违规（须 0）；盘上两份台账逐字节未变=' + e207DiskSame
+        + '（后续路线图 sha12=' + e207Sha12(rmText) + '／快照 sha12=' + e207Sha12(snapText) + '）');
+
+    t.info('`E207` 读数（每轮可见）：债行 ' + pre.rows.length + ' 行／唯一 ID ' + pre.uniq.length + ' 个／区间 E' + pre.lo + '–E' + pre.hi
+      + '／缺号 ' + (pre.missing.length ? pre.missing.map((n) => 'E' + n).join('、') : '（无）')
+      + '／**未加粗 ID 债行 ' + (pre.rows.length - pre.boldOnly) + ' 行**（新旧识别面本就不同：新 ' + pre.rows.length + ' ↔ 旧 ' + pre.boldOnly + '）'
+      + '／被 `DEBT_MIN` 排除的行 ' + pre.excluded.length + ' 行／识别面漏认行 ' + pre.strayMarker.length + ' 行'
+      + '；块：起始行 ' + pre.blk.startLine + '、块头 ' + pre.anchorCount + ' 处、A/B/C 实列 '
+      + [pre.blk.A, pre.blk.B, pre.blk.C].map((g) => (g ? g.ids.length : '?')).join('／')
+      + '、总登记 ' + pre.declaredTotal + '（＝债行 ' + pre.uniq.length + '）、D 组声明 ' + pre.dCount + ' 项（＝展开 ' + pre.dIds.length + ' 个 ID）'
+      + '；D22 十八支：' + e207D22.map((c) => c.name + (c.ok ? '✔' : '✘')).join(' ')
+      + '；本节的**两处已知实现分叉**（仓外 `e187-marker-lib.js` ＋ 同文件 §二十五 `E183` 的块定位）：'
+      + '`tests\\lib\\**` 在 7 天泡机冻结面内 ⇒ 解析就地实现（冻结解除后收敛到单一实现）。');
+  }
+}
+
 main().catch(err => {
   console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
   process.exit(2);
