@@ -178,6 +178,36 @@ const NA = why => ({ ok: false, why });
 const T = value => ({ ok: true, value });
 
 /**
+ * `E211`（2026-10-09）：账本**干不干净** —— `--apply` 的**前置闸**。
+ *
+ * 立案事实（本轮实测踩中，白花两轮全量）：本工具在"**坏轮**"上会写出**错误声明** ——
+ *   ① **自指脚本** `docs-cross-check` 在坏轮里 `failed>0`，权威区该声明的是它的**断言总数**
+ *      （`passed ＋ failed`），而按 `passed` 写＝把"坏轮那一轮的通过数"钉进权威区 ⇒
+ *      **下一轮它自己因此判红**（自我实现式假红）；
+ *   ② **聚合三元的失败轴**同样会被按坏轮写（干净轮只有**已登记偏差**那几条）。
+ * ⇒ 判据：除"在册且失败数**恰等于**登记条数"者以外，任何 suite `failed>0` ⇒ 本轮账**脏**：
+ *    `--apply` **整体拒写**并指名；`--check` 把它**显式报成前提不成立**（与 `D20` 同族：
+ *    "**本轮不可比**" ≠ "漂移"）。
+ */
+function ledgerDirty(led) {
+  const reg = runAll.REGISTERED_DEVIATIONS || {};
+  const bad = []; const tolerated = [];
+  if (!led.ok) return { dirty: true, bad: ['账本不可读：' + led.why], tolerated };
+  for (const s of SUITES) {
+    const e = led.entries[s.name];
+    if (!e) continue;
+    const f = Number(e.failed) || 0;
+    if (f <= 0) continue;
+    const r = reg[s.name];
+    if (r && Number(r.failedAssertions) === f) tolerated.push(`${s.name}(${f} 条＝已登记偏差)`);
+    else {
+      bad.push(`${s.name}（${f} 条失败${r ? '，而已登记偏差只登记 ' + r.failedAssertions + ' 条' : '，且**不在** `REGISTERED_DEVIATIONS` 里'}）`);
+    }
+  }
+  return { dirty: bad.length > 0, bad, tolerated };
+}
+
+/**
  * 实跑 `files-check` 并解析它自报的**扫描文本文件数**与**`.js` 数**。
  *
  * 为什么要探针：README 脚本表里那两处是**现状声明**（`docs-cross-check` §10 会把"扫描 N 个文本文件"
@@ -224,8 +254,12 @@ function computeTruth(led, filesProbe, selfDecl) {
 
   /* 自指脚本那一项：取**账本值**（＝它上一轮跑完的终值）；口径说明见脚本抬头。
      ⚠ 取账本值而不是"权威区自述值"，是为了让 `--apply` **一趟**写出自洽的文件：
-       否则"自述值错了 ⇒ 和值也跟着按错的算 ⇒ 和值写对了却与实跑不符"。 */
-  const selfTerm = e(SELF) ? T(e(SELF).passed) : NA(`账本里没有自指脚本 \`${SELF}\` 的条目`);
+       否则"自述值错了 ⇒ 和值也跟着按错的算 ⇒ 和值写对了却与实跑不符"。
+     `E211`（2026-10-09）：取的是**断言总数**（`passed ＋ failed`），不是那一轮的 `passed`；
+       脏轮由 `--apply` 前置拒写、由 `--check` 报"本轮不可比"（`ledgerDirty()`）。 */
+  const selfTerm = e(SELF)
+    ? T((Number(e(SELF).passed) || 0) + (Number(e(SELF).failed) || 0))
+    : NA(`账本里没有自指脚本 \`${SELF}\` 的条目`);
   const sumParts = OFFLINE.filter(n => n !== SELF).map(n => ({ n, v: field(n, 'passed') }));
   const sumMissing = sumParts.filter(p => !p.v.ok).map(p => p.n);
   const sum = (sumMissing.length === 0 && selfTerm.ok)
@@ -813,6 +847,17 @@ function runCheck() {
     led.ok && truth.missing.length === 0,
     led.ok ? `账本缺：${truth.missing.join('、') || '（无）'}` : `账本不可读：${led.why}`);
 
+  /* 前提（`E211`）：账本必须来自**干净轮** —— 脏轮的读数**不可比**（不是"漂移"）。
+     fail-closed：脏轮一律判红并指名，绝不把坏轮值当"一致"读过去。 */
+  const dirty = ledgerDirty(led);
+  t.requires('`E211` 前提：账本来自**干净轮**（除在册偏差外无失败 suite）—— 脏轮的声明点读数**不可比**，本工具拒绝拿它判"一致/漂移"',
+    !dirty.dirty,
+    dirty.dirty
+      ? `**本轮账目不干净** ⇒ 声明点读数不可比：${dirty.bad.join('、')}`
+        + (dirty.tolerated.length ? `；容忍的在册偏差：${dirty.tolerated.join('、')}` : '')
+        + '（先修好这一轮或跑一次干净的全量轮，再同步）'
+      : `干净（容忍的在册偏差：${dirty.tolerated.join('、') || '无'}）`);
+
   const byFile = new Map();
   for (const p of points) {
     if (!byFile.has(p.file)) byFile.set(p.file, []);
@@ -927,6 +972,16 @@ function runApply() {
   console.log(`真源：账本${led.ok ? '可读' : '**不可读：' + led.why + '**'}｜离线 ${OFFLINE.length} / 浏览器 ${BROWSER.length} / suite ${SUITES.length}` +
     `｜\`tests\\*.js\` ${truth.js.ok ? truth.js.value : '-'} 个｜和值 ${truth.sum.ok ? truth.sum.value : '（不可比）'}` +
     `｜合计 ${truth.totalPassed.ok ? truth.totalPassed.value : '（不可比）'} 通过 / ${truth.totalFailed.ok ? truth.totalFailed.value : '-'} 失败 / ${truth.totalSkipped.ok ? truth.totalSkipped.value : '-'} 跳过`);
+
+  /* `E211` 前置闸：坏轮的账**整体拒写**（否则会把坏轮值钉进权威区，下一轮自指脚本自证式判红）。 */
+  const dirty = ledgerDirty(led);
+  if (dirty.dirty) {
+    console.log(`\n[拒写] **本轮账目不干净**（\`E211\` 前置闸）：${dirty.bad.join('、')}`);
+    if (dirty.tolerated.length) console.log(`   （容忍的在册偏差：${dirty.tolerated.join('、')}）`);
+    console.log('   ⇒ 先把这一轮修干净（或跑一次干净的全量轮），再同步。**本次未写任何文件。**');
+    process.exit(3);
+  }
+  console.log(`[前置闸] 账目干净（容忍的在册偏差：${dirty.tolerated.join('、') || '无'}）`);
 
   const byFile = new Map();
   for (const p of points) {
@@ -1049,10 +1104,52 @@ function runList() {
 }
 
 /**
+ * `E211` D22（**可证伪、纯内存、不写盘**）：合成账本逐支核对 `ledgerDirty()` 与"自指项取断言总数"。
+ * 用法：`node tests\sync-authority.js --self-test`（退 0＝各支相符；退 1＝有支不成立）。
+ */
+function runSelfTest() {
+  const base = () => Object.fromEntries(SUITES.map(s => [s.name, { passed: 1, failed: 0, skipped: 0, status: 'passed' }]));
+  const mk = entries => ({ ok: true, why: '', entries, ranSuites: [], meta: {} });
+  const regName = Object.keys(runAll.REGISTERED_DEVIATIONS || {})[0];
+  const regN = regName ? Number(runAll.REGISTERED_DEVIATIONS[regName].failedAssertions) : 0;
+  const cases = [];
+  const push = (label, got, want) => cases.push({ label, got, want, ok: JSON.stringify(got) === JSON.stringify(want) });
+
+  push('㈠a 干净账本 ⇒ 不脏', ledgerDirty(mk(base())).dirty, false);
+  const t1 = base(); t1[regName] = { passed: 5, failed: regN, skipped: 0, status: 'failed' };
+  push(`㈠b 在册偏差条数相符（\`${regName}\` ${regN} 条）⇒ 不脏`, ledgerDirty(mk(t1)).dirty, false);
+  const t2 = base(); t2[regName] = { passed: 5, failed: regN + 1, skipped: 0, status: 'failed' };
+  const d2 = ledgerDirty(mk(t2));
+  push(`㈠c 在册偏差**多一条** ⇒ 脏并指名 \`${regName}\``, d2.dirty && d2.bad.join().includes(regName), true);
+
+  const t3 = base(); t3[SELF] = { passed: 81, failed: 5, skipped: 0, status: 'failed' };
+  const d3 = ledgerDirty(mk(t3));
+  push(`㈡ \`E211①\` 自指脚本 \`${SELF}\` failed>0 ⇒ 脏并**指名它**`, d3.dirty && d3.bad.join().includes(SELF), true);
+
+  const tr = computeTruth(mk(t3), { ok: false, why: '自检（不跑探针）' }, T(0));
+  const others = OFFLINE.filter(n => n !== SELF).length;
+  push(`㈢ \`E211①\` 自指项取**断言总数** 81＋5＝86（和值 ＝ 其余 ${others} 个各 1 ＋ 86）`,
+    tr.sum.ok ? tr.sum.value : NaN, others + 86);
+
+  const tri = ledgerDirty({ ok: false, why: '自检', entries: {}, ranSuites: [] });
+  push('㈣ 账本不可读 ⇒ 脏（fail-closed）', tri.dirty, true);
+
+  let ok = 0;
+  console.log('\n=== sync-authority --self-test（`E211` D22：纯内存、不写盘） ===');
+  for (const c of cases) {
+    console.log(`  [${c.ok ? 'PASS' : 'FAIL'}] ${c.label} —— 实测 ${JSON.stringify(c.got)}（期望 ${JSON.stringify(c.want)}）`);
+    if (c.ok) ok++;
+  }
+  console.log(`汇总：${ok}/${cases.length} 相符${ok === cases.length ? '' : ' ⇒ **有支不成立**'}`);
+  process.exit(ok === cases.length ? 0 : 1);
+}
+
+/**
  * 入口（同步 `main()` ＋ 顶层 `try`/`catch` 退 2 —— 与 `docs-cross-check.js` 同形态，
  * 由 `harness-check` 第十六节静态守住）。
  */
 function main() {
+  if (hasFlag('--self-test')) return runSelfTest();
   if (hasFlag('--apply')) return runApply();
   if (hasFlag('--list')) return runList();
   return runCheck();
