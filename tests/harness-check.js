@@ -56,6 +56,12 @@ const resultRepo = require('../server/repo/result.js');
    作用于生产链路，不必改被测实现）。 */
 const shiftStatRepo = require('../server/repo/shiftStat.js');
 const warningRepo = require('../server/repo/warning.js');
+/* 第三十一节（`E193`-D3，`ADR-0010` D4 ／ `ADR-0011` D4「D3 先行」）：输入面登记表的**单一真源**。
+   `require('./input-face')` 不跑门禁、不写盘（该文件末尾是 `if (require.main === module)` 守卫，与
+   `run-all` 同款）—— 本节只读它的导出（`FACE`／`faceOf`／`validateFace`／`suiteNames`／`faceStats`／
+   `WIDTH_RATIO_MAX`／`SURFACE_WIDE_BY_DESIGN`／`expandEntry`／`globToRegExp`／`managedSurface`），
+   **不重写第二份校验算路**（否则与它必然漂移，9.5-7）。 */
+const inputFace = require('./input-face');
 
 env.assertRuntime();
 const t = createRunner('夹具自检（harness-check）');
@@ -9267,10 +9273,19 @@ t.section('十五之②、E88⒝／E99 的定点回归（E109：纯函数真值�
        · `EXACT_SYNC`  8 → **9**；`EXACT_ASYNC` **13 不动**（新脚本是同步入口）。
      **实测口径（独立复算，不是推算）**：按 `detectMainDecl()` 的同一套识别规则遍历
      `tests\*.js` ＋ `tests\lib\*.js` ＋ `server/index.js`（29 个 `.js`）⇒
-     `total=22／async=13／sync=9`；本批新增前为 `21／13／8`（＝本注释上两段记的值，逐字对上）。 */
-  const FLOOR_TOTAL = 22;
+      `total=22／async=13／sync=9`；本批新增前为 `21／13／8`（＝本注释上两段记的值，逐字对上）。 */
+  const FLOOR_TOTAL = 23;
+  /* 另：`T-20261009-30`（座位 3，`E193` 同批修正件，2026-10-09）新增 `tests\input-face.js`
+      （`ADR-0010` D4 的输入面登记表**单一真源**；`function main()` sync ＋ 顶层 `try`/`catch` 退 2）
+      ⇒ 它是扫描面里的**第 10 个 sync 入口**，三个常数一并改为 **`23 / 13 / 10`**：
+        · `FLOOR_TOTAL` 22 → **23**（`total ≡ async ＋ sync`，故它随两维走）；
+        · `EXACT_SYNC`  9 → **10**；`EXACT_ASYNC` **13 不动**（新脚本是同步入口）。
+      **依据（本批改前 §16-A 的实测 FAIL 行，逐字引）**：`判红：**未成立的子条件 1 项** ——
+      sync 维度精确 = 9（实测 sync=10）；普查 23 个（async 13／sync 10）`；
+      同轮 `t.info` 行：`§16 入口形态普查：23 个含 main() 的入口（async 13／sync 10／缺陷形态 0）`
+      —— 即 `total=23／async=13／sync=10`（三项满足 `total ≡ async ＋ sync`）；本批新增前为 `22／13／9`。 */
   const EXACT_ASYNC = 13;
-  const EXACT_SYNC = 9;
+  const EXACT_SYNC = 10;
   t.info(`§16 入口形态普查：${real.counts.total} 个含 \`main()\` 的入口（async ${real.counts.async}／sync ${real.counts.sync}／缺陷形态 ${real.offenders.length}）`);
   t.info(`§16 E79：退出证据只取异常路径**自身**的区间（注释/字符串/模板串/正则已剥；接线到文件尾的余量上限＝${ENTRY_TAIL_MAX} 字符）；`
     + `常量退码真源＝tests\\env.js（${[...EXIT_CONSTS].map(([k, v]) => k + '=' + v).join('／') || '**读不到真源**'}）`);
@@ -17196,6 +17211,326 @@ t.section('三十、`E207` 台账自洽性（ID 区间内缺号 = 0 ＋ 开口�
   }
 }
 
+
+/* ==================================================================================================
+   三十一、`E193`-D3：门禁**输入面登记表**的守卫断言（`ADR-0010` D4 ／ `ADR-0011` D4「**D3 先行**」）
+   --------------------------------------------------------------------------------------------------
+   【本节的定位（为什么这条断言必须存在）】`ADR-0010` D4 要求"每个门禁脚本登记自己的输入面，
+   登记表是**单一真源**、并由门禁守"；`ADR-0011` D4 把这一批定为 **D3 先行**：本批**只做**
+   「登记表 ＋ 守卫断言」，**不做**缓存读写／失效。⇒ **没有本节这条门禁，那张表就是一份没人核对的
+   普通文档** —— 新增脚本、删掉脚本、路径改名、把面缩窄、删掉 `why`，**一律不会被发现**，
+   而 D3 缓存一旦上线就会拿它当"可缓存"的依据（`ADR-0004` D23：交付了却从未被验证 ＝ 空转风险）。
+   【被测对象（座位 3 的实现件，**本节一个字节都不改它**）】
+     · 单一真源：`tests\input-face.js` 导出的 `FACE`（`{ '<脚本名>': [{rel, why, kind}] }`，
+       `kind ∈ file|dir|glob|dynamic`）／`faceOf(name)`（未登记 ⇒ `null`，**不抛错**）／
+       `validateFace(face)`（纯函数 ＋ 真枚举，返回 `{missing, phantom, badPath, tooWide}`）／
+       `suiteNames()`／`faceStats()`／`WIDTH_RATIO_MAX`／`SURFACE_WIDE_BY_DESIGN`／`expandEntry()`。
+     · **口径只有一份**：本节**不重写**任何一条校验算路（不自己 walk 受管面、不自己拼 glob、
+       不自己算宽度）—— 全部读 `input-face.js` 的导出；重写第二份就会漂移（`ADR-0004` D21／9.5-7）。
+     · `require('./input-face')` **不会写盘、不会跑门禁**（该文件末尾是 `if (require.main === module)`
+      守卫，与 `run-all` 同款写法）⇒ 本节可安全 require；它的入口形态（`main()` 声明与异常收口）**不在本节判据内**。
+       它的入口形态**已由座位 3 的同批修正件收口**（`main()` ＋ 顶层 `try`/`catch` 退 2；详见本节末的
+       「已关闭的交叉债务」info 行）—— 本节只 `require` 它的导出，入口形态由 §十六 判，两者不重叠。
+   【判据（八条 check ＋ 五条前提；每条**双向或逐条指名**，不许"静默跳过"）】
+     ①  **双向零差**：`SUITES`（名单真源）↔ `FACE`（登记表）键集**两向**零差 ——
+         缺登记逐条指名（新增脚本忘了登记）；凭空键逐条指名（脚本已退役／登记写错名）；
+         两边都与 `validateFace` 的 `missing`／`phantom` **对账**（判据与实现不许两把尺子）。
+     ②  **真枚举**：每个登记项在盘上**真的存在或真的匹配到文件** —— `file` ⇒ 盘上同名**文件**
+         （不是目录）；`dir` ⇒ 盘上同名**目录**且在受管面里**至少展开出 1 个**文件；`glob` ⇒
+         真的匹配到 ≥ 1 个文件。**`kind` 与盘上实际形态必须一致**（把目录登记成 `file` 也判红）；
+         `dynamic` 无静态面 ⇒ **只登记不枚举**（口径由座位 3 定，见 `input-face.js` 头部口径①②）。
+     ③  **宽度 ＋ "按设计整面"双向自证**：`tooWide` 为空；**且**被 `SURFACE_WIDE_BY_DESIGN`
+         豁免的每一个脚本**必须确实宽**（实展开 > `WIDTH_RATIO_MAX` ⇒ 现读数 > 85/170）；
+         否则报"**伪整面声明**"。这一条是 D3 里"**这几个永远别建缓存**"那句结论的**可证伪前置**：
+         面被悄悄缩窄之后，声明还在，D3 就会继续把 `harness-check` 当"整面"而白跑一遍全门禁。
+     ④  **依据齐备**：每条登记都有非空 `why` 且长度 ≥ 8（**最小长度常量**，杜绝 `why:'-'` 这类
+         形态性敷衍），且每个脚本**至少 1 条**输入面；另**普查登记表里没有键的 SUITES 脚本** ——
+         "整条登记被删掉"在 ① 里已经指名，这里防的是"脚本在名单里、但表里那条是空数组"。
+     ⑤  **`dynamic` 必须可见**：如实打印 `dynamic` 条数 ＋ 每条清单（**读数 ≠ 阈值**）——
+         它是"缓存档必须真跑"的输入（未登记 ⇒ `uncached:no-input-face` 的同族）；
+         本节不设"dynamic 不得超过 N"这类阈值（那会逼人把不可静态界定的面硬登记成静态面）。
+     ⑥  **D22（九支定点变异，全部内存变异、不落盘）**：删一条登记 ⇒ `missing` 指名／凭空键 ⇒
+         `phantom` 指名／`file` 登记不存在的路径 ⇒ `badPath` 指名／`dir` 登记不存在的目录 ⇒
+         `badPath` 指名／裸 `**` ⇒ `tooWide` 指名／仓库根 `.` ⇒ `tooWide` 指名／把某豁免脚本的
+         面**缩窄**后仍挂豁免 ⇒ 报"伪整面"并指名该脚本／删掉某条的 `why` ⇒ 判红并指名／
+         `faceOf(未登记)` ⇒ **`null` 且不抛错**（消费方按 fail-closed 处理）。
+         **负对照**＝盘上现行登记表必须**四类全空**（否则"变异必红"只是把一切都判红，没有证据力）。
+          **`Buffer.compare` 逐字节相同 ＋ sha256 相同** ⇒ 上面的九支变异**确实只在内存里**，
+          没有把变异体写回盘（`E70` 家族那次"改真文件没还原"的事故不许重演）。
+    【已关闭的交叉债务（**如实登记**）】`tests\input-face.js` 起初有 CLI 入口却没有 `main()` 声明
+      ⇒ §16-L 入口覆盖普查当场红并指名它。**该债务已由座位 3 的同批修正件关闭**：现在它是
+      `function main()`（sync）＋ 顶层 `try`/`catch` 退 **2** 的形态，`--self-test` 仍是四类全空退 **0**
+      （`SUITES 17／已登记 17／受管面文本文件 170／missing 0／phantom 0／badPath 0／tooWide 0`）。
+      本节不依赖那个形态（只 `require` 它的导出），此处登记只为"§16-L 的红不再复现"留痕。
+    ================================================================================================== */
+t.section('三十一、`E193`-D3：门禁输入面登记表的守卫断言（登记表是真源 ＋ 门禁守 ＋ D22 九支）');
+{
+  const E193_FACE_FILE = path.join(env.paths.tests, 'input-face.js');
+  const e193Crypto = require('node:crypto');
+  const e193Sha = (buf) => e193Crypto.createHash('sha256').update(buf).digest('hex');
+  /* 模块**加载时**就抓住盘上基线（此后所有变异一律只在内存副本上做）—— §七十一 `REAL_READ` 同款理由 */
+  const e193DiskBase = REAL_READ.call(fs, E193_FACE_FILE);
+
+  let e193Impl = null;
+  let e193LoadErr = '';                       /* ← 必须先声明：catch 里给它赋值，绝不能隐式建全局 */
+  try { e193Impl = require('./input-face'); } catch (err) { e193Impl = null; e193LoadErr = String(err && err.message); }
+  const e193Face = e193Impl && e193Impl.FACE;
+  const e193Suites = e193Impl && typeof e193Impl.suiteNames === 'function' ? e193Impl.suiteNames() : [];
+  const e193Ok = t.requires('`tests\\input-face.js` 可加载且导出登记表 `FACE`／`validateFace`／`SUITES` 名单',
+    Boolean(e193Impl) && Boolean(e193Face) && typeof e193Impl.validateFace === 'function'
+    && typeof e193Impl.expandEntry === 'function' && Array.isArray(e193Suites) && e193Suites.length > 0
+    && typeof e193Impl.WIDTH_RATIO_MAX === 'number' && Boolean(e193Impl.SURFACE_WIDE_BY_DESIGN),
+    e193Impl ? `FACE 键 ${e193Face ? Object.keys(e193Face).length : 0} 个／SUITES 名单 ${e193Suites.length} 个`
+      : `require 失败：${e193LoadErr || '(未取到实现)'}`);
+
+  if (!e193Ok) {
+    /* 取不到就判红 —— 前提不成立已经使退出码非 0（assert.js：`unmet.length` ⇒ 退 1），
+       **不许**静默跳过：这一节守的是 D3 缓存的全部前提，前提塌了就没有任何读数可作证。 */
+    t.check('`E193`-D3：输入面登记表可加载（前提不成立 ⇒ 本段判红，**不静默跳过**）', false,
+      `require('./input-face') 失败／导出缺失：${e193LoadErr || '实现件导出与约定不符'}`);
+  } else {
+    const width = e193Impl.WIDTH_RATIO_MAX;
+    const wide = e193Impl.SURFACE_WIDE_BY_DESIGN;
+    const surface = e193Impl.managedSurface();
+    const limit = surface.length * width;
+    const stats = e193Impl.faceStats(e193Face);
+    const pre = e193Impl.validateFace(e193Face);                     /* 负对照：盘上现行登记表 */
+    const statOf = (n) => stats.find(s => s.name === n) || { points: 0, dynamic: 0, width: 0, ratio: 0 };
+    /* 变异用纯工具（都在内存里，不碰盘） */
+    const clone = (v) => (Array.isArray(v) ? v.map(clone)
+      : (v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, clone(x)])) : v));
+    const hitOf = (arr, name, needle) => arr.find(x => String(x).indexOf(name) === 0
+      && String(x).indexOf(needle) >= 0) || null;
+    const kindCount = (k) => stats.reduce((a, s) => a + (e193Face[s.name].filter(x => x.kind === k).length), 0);
+    const dynamicEntries = [];
+    for (const n of Object.keys(e193Face)) for (const x of e193Face[n]) if (x.kind === 'dynamic') dynamicEntries.push(`${n}：${x.rel}`);
+
+    /* ---------------- ① 双向零差 ---------------- */
+    const missingByKeys = e193Suites.filter(n => !Object.prototype.hasOwnProperty.call(e193Face, n));
+    const phantomByKeys = Object.keys(e193Face).filter(k => !e193Suites.includes(k));
+    t.check('① 双向零差：`SUITES` ↔ `FACE` 键集**两向**零差（缺登记／凭空键**逐条指名**）＋ 与 `validateFace` 的 '
+      + '`missing`／`phantom` 读数**对账**（判据与实现不许两把尺子）',
+      missingByKeys.length === 0 && phantomByKeys.length === 0
+        && pre.missing.length === 0 && pre.phantom.length === 0
+        && pre.missing.length === missingByKeys.length && pre.phantom.length === phantomByKeys.length,
+      `SUITES ${e193Suites.length} 个 ↔ FACE ${Object.keys(e193Face).length} 个；缺登记 ${missingByKeys.length} 条`
+        + `${missingByKeys.length ? '（**逐条指名**：' + missingByKeys.join('、') + '）' : ''}；`
+        + `凭空键 ${phantomByKeys.length} 条${phantomByKeys.length ? '（**逐条指名**：' + phantomByKeys.join('、') + '）' : ''}；`
+        + `实现读数 missing ${pre.missing.length}／phantom ${pre.phantom.length}（须与上面两数逐个相等）`);
+
+    /* ---------------- ② badPath：真枚举，且 kind 与盘上形态一致 ---------------- */
+    const e193KindBad = [];
+    const e193DynBad = [];
+    for (const n of Object.keys(e193Face)) {
+      for (const e of (Array.isArray(e193Face[n]) ? e193Face[n] : [])) {
+        const rel = String(e && e.rel == null ? '' : e.rel);
+        if (!e || typeof e !== 'object') { e193KindBad.push(`${n}：条目不是对象`); continue; }
+        const ex = e193Impl.expandEntry(e);
+        if (e.kind === 'dynamic') {
+          if (rel.trim() === '') e193DynBad.push(`${n}：dynamic 条目的 rel 为空`);
+          continue;
+        }
+        if (!ex.exists || ex.matched.length === 0) { e193KindBad.push(`${n}：${e.kind} 「${rel}」盘上不存在或无匹配`); continue; }
+        /* 登记写法 `dir('src/**')` 的"路径位"是**目录 `src`**（`input-face.js` 的 `entryTarget()` 已归一；
+           这里按同一口径剥掉尾部的 `/**`、`/*`、`/` 去真 `statSync` —— 只借形态，不抄它的算路）。 */
+        const dirTarget = String(e.rel).replace(/^\.\//, '').replace(/\/\*+$/, '').replace(/\/+$/, '');
+        const abs = path.join(env.paths.root, rel.split('/').join(path.sep));
+        const absDir = path.join(env.paths.root, dirTarget.split('/').join(path.sep));
+        let st = null;
+        let stDir = null;
+        try { st = fs.statSync(abs); } catch { st = null; }
+        try { stDir = fs.statSync(absDir); } catch { stDir = null; }
+        if (e.kind === 'file' && !(st && st.isFile())) e193KindBad.push(`${n}：登记成 file 但盘上不是文件（${rel}）`);
+        if (e.kind === 'dir' && !(stDir && stDir.isDirectory())) e193KindBad.push(`${n}：登记成 dir 但盘上不是目录（${rel} ⇒ 归一后 ${dirTarget}）`);
+        if (e.kind === 'glob') {
+          /* glob 的"形态位"＝**第一个通配符之前的目录前缀**必须真的存在（登记 `输出文件` 底下那份 glob ⇒ 锚点
+             `输出文件`；登记 `tests/screenshots-baseline` 底下那份 ⇒ 锚点 `tests/screenshots-baseline`）；
+             正则自身由 `globToRegExp` 现编一次（编不出来 ⇒ 当场抛错 ⇒ 这一条判红），
+             再核"枚举出来的每个命中都在盘上真的是文件"。 */
+          const pure = String(e.rel).replace(/^\.\//, '');
+          const anchor = pure.split('*')[0].split('?')[0].replace(/\/+$/, '');
+          let anchorOk = true;
+          try { anchorOk = anchor === '' || fs.statSync(path.join(env.paths.root, anchor.split('/').join(path.sep))).isDirectory(); }
+          catch { anchorOk = false; }
+          e193Impl.globToRegExp(pure);
+          const notFile = ex.matched.filter(m => {
+            try { return !fs.statSync(path.join(env.paths.root, m.split('/').join(path.sep))).isFile(); } catch { return true; }
+          });
+          if (!anchorOk) e193KindBad.push(`${n}：glob 的目录锚点「${anchor}」在盘上不是目录（${rel}）`);
+          if (notFile.length) e193KindBad.push(`${n}：glob 「${rel}」枚举出非文件条目 ${notFile.slice(0, 3).join('、')}`);
+        }
+      }
+    }
+    t.check('② `badPath` **真枚举**：每个登记项在盘上真的存在或真的匹配到文件（`file` ＝ 真文件／`dir` ＝ 真目录且受管面展开 ≥ 1 个／'
+      + '`glob` ＝ 真匹配 ≥ 1 个），**且 `kind` 与盘上实际形态一致**（把目录登记成 `file` 也判红）—— 不许只看字符串形态',
+      pre.badPath.length === 0 && e193KindBad.length === 0 && e193DynBad.length === 0,
+      `已登记条目 ${stats.reduce((a, s) => a + s.points, 0)} 条（file ${kindCount('file')}／dir ${kindCount('dir')}／`
+        + `glob ${kindCount('glob')}／dynamic ${kindCount('dynamic')}）；实现 \`validateFace\` 的 badPath ${pre.badPath.length} 条`
+        + `${pre.badPath.length ? '（**逐条指名**：' + pre.badPath.join('；') + '）' : ''}；`
+        + `本节**独立复算**（真 \`statSync\` 形态 ＋ \`expandEntry\` 枚举）违规 ${e193KindBad.length + e193DynBad.length} 条`
+        + `${e193KindBad.length + e193DynBad.length ? '（**逐条指名**：' + e193KindBad.concat(e193DynBad).join('；') + '）' : ''}`);
+
+    /* ---------------- ③ 宽度 ＋ 按设计整面（双向自证） ---------------- */
+    const e193NarrowFake = stats.filter(s => Object.prototype.hasOwnProperty.call(wide, s.name) && !(s.width > limit))
+      .map(s => `${s.name}（展开 ${s.width}/${surface.length} = ${(s.ratio * 100).toFixed(1)}%，未过半）`);
+    const e193WideHit = pre.tooWide.filter(x => String(x).indexOf('伪整面') >= 0);
+    t.check('③ 宽度与"按设计整面"**双向自证**：`tooWide` 为空 **且** 被 `SURFACE_WIDE_BY_DESIGN` 豁免的每一个脚本**必须确实宽**'
+      + '（实展开 > ' + width + ' ⇒ 现读数 > ' + limit + '/' + surface.length + '）—— 否则报"伪整面声明"',
+      pre.tooWide.filter(x => String(x).indexOf('伪整面') < 0).length === 0
+        && e193NarrowFake.length === 0 && e193WideHit.length === 0,
+      `宽度上限：WIDTH_RATIO_MAX = ${width} ⇒ 单脚本展开后 > ${limit} 个受管文件即超限；`
+        + `受管面 ${surface.length} 个文本文件；实现 tooWide ${pre.tooWide.length} 条`
+        + `${pre.tooWide.length ? '（' + pre.tooWide.join('；') + '）' : ''}；`
+        + `豁免声明 ${Object.keys(wide).length} 个：`
+        + Object.keys(wide).map(k => `${k} ${statOf(k).width}/${surface.length}（${(statOf(k).ratio * 100).toFixed(1)}%）`).join('、')
+        + ` ⇒ **这几个永远别建缓存**（D3 消费方一律真跑）；伪整面声明 ${e193NarrowFake.length + e193WideHit.length} 个（须 0）`);
+
+    /* ---------------- ④ 依据齐备 ＋ 至少 1 条 ---------------- */
+    const E193_WHY_MIN = 8;
+    const e193WhyShort = [];
+    const e193EmptyFace = [];
+    for (const n of Object.keys(e193Face)) {
+      const arr = Array.isArray(e193Face[n]) ? e193Face[n] : [];
+      if (arr.length === 0) e193EmptyFace.push(n);
+      for (const e of arr) {
+        const why = String(e && e.why == null ? '' : e.why).trim();
+        if (why.length < E193_WHY_MIN) e193WhyShort.push(`${n}／${String(e && e.rel)}：why 长度 ${why.length} < ${E193_WHY_MIN}`);
+      }
+    }
+    t.check('④ 依据齐备：每条登记都有非空 `why` 且长度 ≥ ' + E193_WHY_MIN + '（**最小长度常量**，杜绝 `why:\'-\'` 这类敷衍），'
+      + '且每个脚本**至少 1 条**输入面（空数组也判红）',
+      e193WhyShort.length === 0 && e193EmptyFace.length === 0 && missingByKeys.length === 0,
+      `逐条 why 长度最小 ${Math.min(...stats.map(s => Math.min(...e193Face[s.name].map(e => String(e.why || '').trim().length))))}`
+        + `（阈值 ${E193_WHY_MIN}）；过短 ${e193WhyShort.length} 条／空面脚本 ${e193EmptyFace.length} 个／未登记脚本 ${missingByKeys.length} 个`
+        + `（三类**逐条指名**：${e193WhyShort.concat(e193EmptyFace, missingByKeys).join('；') || '（无）'}）`);
+
+    /* ---------------- ⑤ dynamic 可见（读数 ≠ 阈值） ---------------- */
+    t.check('⑤ `dynamic` 必须可见：**如实打印**条数 ＋ 清单（**读数 ≠ 阈值**）—— 它是"缓存档必须真跑"的输入'
+      + '（本节**不设**"dynamic 不得超过 N"的阈值：那会逼人把不可静态界定的面硬登记成静态面 ⇒ 假缓存）',
+      dynamicEntries.length > 0 && dynamicEntries.length === kindCount('dynamic') && dynamicEntries.every(s => s.indexOf('：') > 0),
+      `dynamic 条目 ${dynamicEntries.length} 条（＝登记表里 kind==='dynamic' 的条目数，逐个有脚本名与面名）：`
+        + dynamicEntries.join(' ｜ '));
+
+    /* ---------------- ⑥ D22：九支内存变异 ＋ 负对照 ---------------- */
+    const e193Case = (name, fn) => {
+      let r;
+      try { r = fn(); } catch (err) { r = { ok: false, reading: '抛错：' + String(err && err.message) }; }
+      return { name, ok: Boolean(r && r.ok), reading: String((r && r.reading) || '') };
+    };
+    const e193D22 = [];
+    /* ㈠ 删一条脚本登记 ⇒ missing 必须**指名**该脚本 */
+    e193D22.push(e193Case('㈠删登记', () => {
+      const f = clone(e193Face); delete f['db-check'];
+      const v = e193Impl.validateFace(f);
+      const hit = hitOf(v.missing, 'db-check', 'db-check');
+      return { ok: v.missing.length === 1 && Boolean(hit), reading: 'missing ' + v.missing.length + ' 条 ⇒ 「' + (hit || '没抓住') + '」' };
+    }));
+    /* ㈡ 凭空键 ⇒ phantom 必须**指名**该键 */
+    e193D22.push(e193Case('㈡凭空键', () => {
+      const f = clone(e193Face);
+      f['__e193_phantom__'] = [{ rel: 'tests/env.js', why: '凭空键探针（只为触发 phantom）', kind: 'file' }];
+      const v = e193Impl.validateFace(f);
+      const hit = hitOf(v.phantom, '__e193_phantom__', '__e193_phantom__');
+      return { ok: v.phantom.length === 1 && Boolean(hit), reading: 'phantom ' + v.phantom.length + ' 条 ⇒ 「' + (hit || '没抓住') + '」' };
+    }));
+    /* ㈢ file 登记一条不存在的路径 ⇒ badPath 必须**指名** */
+    e193D22.push(e193Case('㈢file不存在', () => {
+      const f = clone(e193Face);
+      f['db-check'].push({ rel: 'tests/._verify/__e193_不存在__.js', why: 'D22 探针：登记一条盘上不存在的 file', kind: 'file' });
+      const v = e193Impl.validateFace(f);
+      const hit = hitOf(v.badPath, 'db-check', '__e193_不存在__');
+      return { ok: v.badPath.length === 1 && Boolean(hit), reading: 'badPath ' + v.badPath.length + ' 条 ⇒ 「' + (hit || '没抓住') + '」' };
+    }));
+    /* ㈣ dir 登记一个不存在的目录 ⇒ badPath 必须**指名**（真枚举后 0 命中） */
+    e193D22.push(e193Case('㈣dir不存在', () => {
+      const f = clone(e193Face);
+      f['db-check'].push({ rel: 'src/__e193_不存在__/', why: 'D22 探针：登记一个盘上不存在的 dir', kind: 'dir' });
+      const v = e193Impl.validateFace(f);
+      const hit = hitOf(v.badPath, 'db-check', '__e193_不存在__');
+      return { ok: v.badPath.length === 1 && Boolean(hit), reading: 'badPath ' + v.badPath.length + ' 条 ⇒ 「' + (hit || '没抓住') + '」' };
+    }));
+    /* ㈤ 登记裸 `**` ⇒ tooWide 必须**指名**（退化宽条目＝等于没登记） */
+    e193D22.push(e193Case('㈤裸**', () => {
+      const f = clone(e193Face);
+      f['db-check'].push({ rel: '**', why: 'D22 探针：裸 ** 退化条目', kind: 'glob' });
+      const v = e193Impl.validateFace(f);
+      const hit = hitOf(v.tooWide, 'db-check', '"**"');
+      return { ok: v.tooWide.length === 1 && Boolean(hit), reading: 'tooWide ' + v.tooWide.length + ' 条 ⇒ 「' + (hit || '没抓住') + '」' };
+    }));
+    /* ㈥ 登记仓库根 `.` ⇒ tooWide 必须**指名** */
+    e193D22.push(e193Case('㈥仓库根.', () => {
+      const f = clone(e193Face);
+      f['db-check'].push({ rel: '.', why: 'D22 探针：仓库根退化条目', kind: 'dir' });
+      const v = e193Impl.validateFace(f);
+      const hit = hitOf(v.tooWide, 'db-check', '"."');
+      return { ok: v.tooWide.length === 1 && Boolean(hit), reading: 'tooWide ' + v.tooWide.length + ' 条 ⇒ 「' + (hit || '没抓住') + '」' };
+    }));
+    /* ㈦ 把某豁免脚本的**面缩窄**后仍挂豁免 ⇒ 报"伪整面声明"并**指名该脚本** */
+    e193D22.push(e193Case('㈦伪整面', () => {
+      const wideNames = Object.keys(wide);
+      const victim = wideNames.filter(n => statOf(n).width > limit).sort((a, b) => statOf(b).width - statOf(a).width)[0];
+      if (!victim) return { ok: false, reading: '被豁免的脚本里没有一个真的过半（声明本身就伪）' };
+      const before = statOf(victim).width;
+      const f = clone(e193Face);
+      f[victim] = [{ rel: 'tests/env.js', why: 'D22 探针：把整面脚本缩成单文件（声明仍挂着）', kind: 'file' }];
+      const v = e193Impl.validateFace(f);
+      const hit = hitOf(v.tooWide, victim, '伪整面');
+      return { ok: v.tooWide.length === 1 && Boolean(hit),
+        reading: victim + ' 面 ' + before + ' → 1 个受管文件（仍挂豁免）⇒ 「' + (hit || '没抓住') + '」' };
+    }));
+    /* ㈧ 删掉某条的 why ⇒ 判红并**指名** */
+    e193D22.push(e193Case('㈧删why', () => {
+      const f = clone(e193Face);
+      const victim = f['db-check'][0];
+      const victimRel = String(victim && victim.rel);
+      delete victim.why;
+      const v = e193Impl.validateFace(f);
+      const hit = hitOf(v.badPath, 'db-check', '缺 why');
+      return { ok: v.badPath.length === 1 && Boolean(hit), reading: 'badPath ' + v.badPath.length + ' 条 ⇒ 「' + (hit || '没抓住') + '」（条目 ' + victimRel + '）' };
+    }));
+    /* ㈨ 负对照（接口口径）：`faceOf(未登记)` ⇒ **null 且不抛错**（消费方据此走 uncached:no-input-face） */
+    e193D22.push(e193Case('㈨未登记=null', () => {
+      let threw = false; let got = 'unset';
+      try { got = e193Impl.faceOf('__e193_未登记__'); } catch { threw = true; }
+      const known = e193Impl.faceOf('db-check');
+      return { ok: !threw && got === null && Array.isArray(known),
+        reading: 'faceOf(未登记) ⇒ ' + String(got) + '（抛错 ' + threw + '）／faceOf(db-check) 是数组 ' + Array.isArray(known) };
+    }));
+
+    const e193DiskAfter = REAL_READ.call(fs, E193_FACE_FILE);
+    const e193ByteSame = Buffer.compare(e193DiskBase, e193DiskAfter) === 0;
+    const e193ShaSame = e193Sha(e193DiskBase) === e193Sha(e193DiskAfter);
+    const e193D22Ok = e193D22.length === 9 && e193D22.every(c => c.ok);
+    t.check('⑥ `E193`-D3 D22（**九支定点内存变异 ＋ 负对照 ＋ 盘上逐字节未变**）：'
+      + '㈠删一条登记 ⇒ `missing` 指名 ／ ㈡凭空键 ⇒ `phantom` 指名 ／ ㈢`file` 登记不存在路径 ⇒ `badPath` 指名 ／ '
+      + '㈣`dir` 登记不存在目录 ⇒ `badPath` 指名 ／ ㈤裸 `**` ⇒ `tooWide` 指名 ／ ㈥仓库根 `.` ⇒ `tooWide` 指名 ／ '
+      + '㈦豁免脚本的面**缩窄**后仍挂豁免 ⇒ 报"伪整面"并指名 ／ ㈧删 `why` ⇒ 判红并指名 ／ ㈨`faceOf(未登记)` ⇒ `null` 不抛错；'
+      + '**负对照**＝盘上现行登记表四类全空；并自证盘上 `tests\\input-face.js` **逐字节未变**（`Buffer.compare` ＋ sha256）',
+      e193D22Ok && pre.missing.length === 0 && pre.phantom.length === 0 && pre.badPath.length === 0
+        && pre.tooWide.length === 0 && e193ByteSame && e193ShaSame,
+      (e193D22.length === 9 ? '' : `**支数不是 9（${e193D22.length}）**；`)
+        + e193D22.map(c => c.name + ' ⇒ ' + (c.ok ? '符合' : '**没抓住**') + '（' + c.reading + '）').join('；')
+        + `；负对照（盘上现行）missing ${pre.missing.length}／phantom ${pre.phantom.length}／badPath ${pre.badPath.length}／`
+        + `tooWide ${pre.tooWide.length} 条（须全 0）；盘上 input-face.js 逐字节未变=${e193ByteSame}（sha256 相同=${e193ShaSame}，`
+        + `sha12=${e193Sha(e193DiskAfter).slice(0, 12)}）`);
+
+    /* ---------------- ⑦ 每轮可见读数（`t.info`）：17 个脚本的输入面条数逐行列出 ---------------- */
+    t.info('`E193`-D3 读数（每轮可见）：SUITES ' + e193Suites.length + ' 个脚本／已登记 '
+      + e193Suites.filter(n => e193Impl.faceOf(n) !== null).length + ' 个／受管面文本文件 ' + surface.length
+      + ' 个（宽度分母，口径＝`files-check` 第一节 walk ＋ TEXT_EXT ＋ SKIP_DIRS）／宽度阈值 '
+      + width + '（> ' + limit + ' 判超限）／登记条目合计 ' + stats.reduce((a, s) => a + s.points, 0)
+      + ' 条（file ' + kindCount('file') + '／dir ' + kindCount('dir') + '／glob ' + kindCount('glob') + '／dynamic ' + kindCount('dynamic') + '）。');
+    t.info('`E193`-D3 逐脚本输入面条数（条目数／展开后受管文件数／dynamic 条目数）：'
+      + stats.map(s => `${s.name} ${s.points}/${surface.length ? s.width : 0}(${(s.ratio * 100).toFixed(1)}%)/${s.dynamic}`).join('　'));
+    t.info('`E193`-D3 `dynamic` 清单（' + dynamicEntries.length + ' 条 —— 运行时才知道读哪些文件 ⇒ D3 缓存对它**一律真跑**）：'
+      + dynamicEntries.join(' ｜ '));
+    t.info('`E193`-D3 已关闭的交叉债务（**如实登记**）：`tests\\input-face.js` 起初有 CLI 入口'
+      + '（`if (require.main === module)`）却**没有 `main()` 声明** ⇒ §16-L 入口覆盖普查曾当场红并指名它；'
+      + '**该债务已由座位 3 的同批修正件关闭**（形态＝`function main()`（sync）＋ 顶层 `try`/`catch` 退 2；'
+      + '`--self-test` 四类全空退 0）⇒ §16-L 现为 PASS（与 §十六 `FLOOR_TOTAL/EXACT_SYNC` 的同批更新配套）。'
+      + '更细的双向对账：输入面**登记表 ↔ SUITES／盘面**由本节 ①–⑥ 自证，本节**不**代它判入口形态。');
+  }
+}
 main().catch(err => {
   console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
   process.exit(2);

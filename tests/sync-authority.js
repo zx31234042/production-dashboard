@@ -255,12 +255,34 @@ function computeTruth(led, filesProbe, selfDecl) {
   /* 自指脚本那一项：取**账本值**（＝它上一轮跑完的终值）；口径说明见脚本抬头。
      ⚠ 取账本值而不是"权威区自述值"，是为了让 `--apply` **一趟**写出自洽的文件：
        否则"自述值错了 ⇒ 和值也跟着按错的算 ⇒ 和值写对了却与实跑不符"。
-     `E211`（2026-10-09）：取的是**断言总数**（`passed ＋ failed`），不是那一轮的 `passed`；
-       脏轮由 `--apply` 前置拒写、由 `--check` 报"本轮不可比"（`ledgerDirty()`）。 */
+     ── `E211`（2026-10-09；**口径经当日实测修正，照录反例**）────────────────────
+     权威声明描述的是"**干净轮**"（除在册偏差外无失败 suite）。若账本来自**脏轮**
+     （权威漂移轮／临时红），把原始读数直接写进权威区就会**把坏轮值钉死** —— 当日实测两处：
+     ① 自指脚本 `docs-cross-check` 被写成坏轮的 `passed`（81，真值 86）；② 聚合**失败轴**被写成坏轮的 8。
+     **正确口径 ＝ 干净轮投影**：
+       ① 每个 suite 的"通过轴"贡献 ＝ `passed ＋ 该 suite **未登记**的失败数`
+          （未登记的失败 ＝ **修好即通过**；**在册偏差**的失败不计入通过轴）；
+       ② 自指脚本的贡献 ＝ `passed ＋ failed`（＝它的**断言总数**，与轮次无关）；
+       ③ "失败轴" ＝ **在册偏差的失败条数之和**（**定义**，不是某一轮的读数）；
+       ④ "跳过轴" ＝ 各 suite `skipped` 之和（跳过与干净与否无关）。
+     ⇒ 于是 `--apply` **从漂移轮同步也是安全的**（写进去的是干净轮投影，不是坏轮读数）；
+       `--check`／`--apply` 都**显式打印**"本轮为脏轮"与"原始读数 ↔ 投影值"。
+     ⚠ **反例（当日被自己的实现打回过一次，照录）**：最初写成"脏轮 ⇒ `--apply` **整体拒写**"，
+       结果**堵死了它自己的核心用例** —— 漂移轮里 `docs-cross-check` 必然是红的、账本必然"脏"，
+       于是永远拒写（当日 `harness 535→541` 这次同步就被自己挡住了）。 */
+  const regOf = n => {
+    const r = (runAll.REGISTERED_DEVIATIONS || {})[n];
+    return r ? Number(r.failedAssertions) || 0 : 0;
+  };
+  const rawFailed = n => (e(n) ? Number(e(n).failed) || 0 : 0);
+  const unregisteredFail = n => Math.max(0, rawFailed(n) - regOf(n));
+  /** 干净轮投影：某 suite 在"通过轴"上应有的条数（账本无该条目 ⇒ `null`） */
+  const projectedPass = n => (e(n) ? (Number(e(n).passed) || 0) + unregisteredFail(n) : null);
+
   const selfTerm = e(SELF)
     ? T((Number(e(SELF).passed) || 0) + (Number(e(SELF).failed) || 0))
     : NA(`账本里没有自指脚本 \`${SELF}\` 的条目`);
-  const sumParts = OFFLINE.filter(n => n !== SELF).map(n => ({ n, v: field(n, 'passed') }));
+  const sumParts = OFFLINE.filter(n => n !== SELF).map(n => ({ n, v: projectedPass(n) === null ? NA(`账本里没有 \`${n}\` 的条目`) : T(projectedPass(n)) }));
   const sumMissing = sumParts.filter(p => !p.v.ok).map(p => p.n);
   const sum = (sumMissing.length === 0 && selfTerm.ok)
     ? T(sumParts.reduce((a, p) => a + p.v.value, 0) + selfTerm.value)
@@ -268,14 +290,17 @@ function computeTruth(led, filesProbe, selfDecl) {
       ? `和值真源里这些脚本本轮取不到实跑值：${sumMissing.join('、')}`
       : selfTerm.why);
 
-  const browserParts = BROWSER.map(n => ({ n, v: field(n, 'passed') }));
+  const browserParts = BROWSER.map(n => ({ n, v: projectedPass(n) === null ? NA(`账本里没有 \`${n}\` 的条目`) : T(projectedPass(n)) }));
   const browserMissing = browserParts.filter(p => !p.v.ok).map(p => p.n);
   const totalPassed = (sum.ok && browserMissing.length === 0)
     ? T(sum.value + browserParts.reduce((a, p) => a + p.v.value, 0))
     : NA(sum.ok ? `合计里这些浏览器/长跑脚本本轮取不到实跑值：${browserMissing.join('、')}` : sum.why);
-  const failedParts = SUITES.map(s => field(s.name, 'failed'));
+  /* 失败轴＝**在册偏差条数之和**（定义）；另留"本轮原始失败合计"作对照读数（只报不改）。 */
+  const totalFailed = SUITES.every(s => e(s.name))
+    ? T(SUITES.reduce((a, s) => a + regOf(s.name), 0))
+    : NA('账本条目不全，在册偏差条数取不到');
+  const rawFailedTotal = SUITES.every(s => e(s.name)) ? SUITES.reduce((a, s) => a + rawFailed(s.name), 0) : null;
   const skippedParts = SUITES.map(s => field(s.name, 'skipped'));
-  const totalFailed = failedParts.every(v => v.ok) ? T(failedParts.reduce((a, v) => a + v.value, 0)) : NA('账本条目不全，合计失败数取不到');
   const totalSkipped = skippedParts.every(v => v.ok) ? T(skippedParts.reduce((a, v) => a + v.value, 0)) : NA('账本条目不全，合计跳过数取不到');
 
   /* README 权威行里"现为 **6** ＝ ui-check 1 ＋ stress-check 3 ＋ harness-check 2"这一处：
@@ -287,14 +312,31 @@ function computeTruth(led, filesProbe, selfDecl) {
 
   return {
     led, filesProbe, missing, sum, totalPassed, totalFailed, totalSkipped,
+    rawFailedTotal, projectedPass, unregisteredFail, regOf,
     js: T(fs.readdirSync(path.join(ROOT, 'tests')).filter(n => n.endsWith('.js')).length),
     gates: T(OFFLINE.length),
     browserCount: T(BROWSER.length),
     suiteCount: T(SUITES.length),
-    pass: n => field(n, 'passed'),
-    fail: n => field(n, 'failed'),
+    /* ⚠ `E211`（2026-10-09）：`pass()` 也必须走**干净轮投影**，不能返回坏轮的 raw `passed` ——
+       否则**权威区里自指脚本那一格会被写成坏轮值**（当日实测：写成 80），
+       进而把 `和值`/`③b`/`⑥` 三处的"真源"也算歪（真源 1780 ≠ 正确 1786），
+       形成"改了也回不去绿"的自指死循环。 */
+    pass: n => {
+      const v = projectedPass(n);
+      return v === null ? NA(`账本里没有 \`${n}\` 的条目（--fast 子集轮／本轮未入账）`) : T(v);
+    },
+    /* ⚠ `E211`：**失败位**同样按**干净轮投影** —— 权威区只登记**在册偏差**那几条；
+       未登记的失败＝修好即通过，**不得**写进声明（否则坏轮会把"`docs-cross-check` 86/2"这种临时红钉死）。 */
+    fail: n => (e(n) ? T(regOf(n)) : NA(`账本里没有 \`${n}\` 的条目（--fast 子集轮／本轮未入账）`)),
     skip: n => field(n, 'skipped'),
-    selfDecl,
+    /* `E211`：区分两个"自指值" ——
+       · `selfDecl`（供 `③b`／`⑥` 当**真源**）＝ **账本投影**（`passed ＋ failed` ＝ 断言总数）；
+         若用"从 README 读到的旧声明"，则 README 一旦陈旧，`--apply` 会反过来把陈旧值写进那两行
+         （当日实测：写成 80）。
+       · `selfDeclRead`（供 §三 的**对账**）＝ 从 README 读到的**旧声明**，用来发现"声明陈旧"。
+       账本取不到（子集轮）时 `selfDecl` 回落到 README 读值，保持旧行为。 */
+    selfDecl: selfTerm.ok ? selfTerm : selfDecl,
+    selfDeclRead: selfDecl,
     filesScan: filesProbe && filesProbe.ok ? T(filesProbe.scan) : NA((filesProbe && filesProbe.why) || '未取 files-check 探针'),
     filesJs: filesProbe && filesProbe.ok ? T(filesProbe.js) : NA((filesProbe && filesProbe.why) || '未取 files-check 探针'),
     skipEnum: skipEnumOk ? T(true) : NA(`实跑有跳过项的脚本集合＝[${skippedNow.join('、') || '空'}] ≠ 声明形态里写死的 [${SKIP_ENUM.join('、')}] ⇒ 枚举文字需人工改写（本工具不代笔）`),
@@ -847,16 +889,20 @@ function runCheck() {
     led.ok && truth.missing.length === 0,
     led.ok ? `账本缺：${truth.missing.join('、') || '（无）'}` : `账本不可读：${led.why}`);
 
-  /* 前提（`E211`）：账本必须来自**干净轮** —— 脏轮的读数**不可比**（不是"漂移"）。
-     fail-closed：脏轮一律判红并指名，绝不把坏轮值当"一致"读过去。 */
+  /* `E211`：账本来自**脏轮**时，声明点按**干净轮投影**比对（口径见 `computeTruth` 抬头）。
+     脏轮**不判红** —— 漂移轮恰恰是本工具的正当输入；但必须**显式打印**，
+     并把"原始读数 → 投影值"的逐脚本对照一并打印，让人一眼看出写进去的不是坏轮值。 */
   const dirty = ledgerDirty(led);
-  t.requires('`E211` 前提：账本来自**干净轮**（除在册偏差外无失败 suite）—— 脏轮的声明点读数**不可比**，本工具拒绝拿它判"一致/漂移"',
-    !dirty.dirty,
-    dirty.dirty
-      ? `**本轮账目不干净** ⇒ 声明点读数不可比：${dirty.bad.join('、')}`
-        + (dirty.tolerated.length ? `；容忍的在册偏差：${dirty.tolerated.join('、')}` : '')
-        + '（先修好这一轮或跑一次干净的全量轮，再同步）'
-      : `干净（容忍的在册偏差：${dirty.tolerated.join('、') || '无'}）`);
+  t.info(`账本干净度（\`E211\`）：${dirty.dirty
+    ? '**脏轮**（除在册偏差外还有失败：' + dirty.bad.join('、') + '）⇒ 本工具按**干净轮投影**比对；'
+      + `本轮**原始失败合计 ${truth.rawFailedTotal === null ? '（取不到）' : truth.rawFailedTotal}**、失败轴（定义＝在册偏差条数）**${truth.totalFailed.ok ? truth.totalFailed.value : '（不可比）'}**`
+    : '干净'}｜容忍的在册偏差：${dirty.tolerated.join('、') || '无'}｜逐脚本通过轴（原始→投影，未变者不标）：`
+    + SUITES.map(s => {
+      const en = led.entries[s.name];
+      const raw = en ? Number(en.passed) || 0 : null;
+      const pr = truth.projectedPass(s.name);
+      return raw === null ? `${s.name}=（无）` : `${s.name}=${raw}${pr !== null && pr !== raw ? '→' + pr : ''}`;
+    }).join('、'));
 
   const byFile = new Map();
   for (const p of points) {
@@ -912,11 +958,20 @@ function runCheck() {
   }
 
   t.section('三、与既有实现互证（`D21`：不另写一套口径）');
-  const selfOk = truth.selfDecl && truth.selfDecl.ok;
-  t.check('自指脚本 `docs-cross-check` 的账本值与权威区声明一致（自指项：第十一节本级无法自证，此处显式比对）',
-    selfOk && truth.pass(SELF).ok ? truth.selfDecl.value === truth.pass(SELF).value : false,
-    `权威区声明 ${selfOk ? truth.selfDecl.value : '（解析不到）'}；账本 ${truth.pass(SELF).ok ? truth.pass(SELF).value : '（取不到）'}` +
-    '（两值不等 ⇒ 和值/合计也会跟着漂；本工具按账本值现算 ⇒ `--apply` 一趟即可自洽）');
+  const selfOk = truth.selfDeclRead && truth.selfDeclRead.ok;
+  /* `E211`（2026-10-09）：这里比的必须是**自指脚本的断言总数**（`passed ＋ failed` ＝ `computeTruth` 的
+     `selfTerm` 口径），**不是**那一轮的 `passed` —— 否则漂移轮里会出现"权威区声明 86 vs 账本 80"这种
+     **自我实现式假红**（本工具正是要修它，而不是被它挡住）。
+     另一侧：`selfDeclRead` 是**从 README 读到的旧声明**（`selfDecl` 已被改成"账本投影"），
+     所以这条恰好就是"**声明陈旧**"的探测器。 */
+  const selfRaw = led.entries[SELF]
+    ? (Number(led.entries[SELF].passed) || 0) + (Number(led.entries[SELF].failed) || 0)
+    : null;
+  t.check('自指脚本 `docs-cross-check` 的**断言总数**（`passed ＋ failed`）与权威区声明一致（自指项：第十一节本级无法自证，此处显式比对）',
+    selfOk && selfRaw !== null ? truth.selfDeclRead.value === selfRaw : false,
+    `权威区声明 ${selfOk ? truth.selfDeclRead.value : '（解析不到）'}；账本**断言总数** ${selfRaw === null ? '（取不到）' : selfRaw}`
+    + `（＝ passed ${led.entries[SELF] ? led.entries[SELF].passed : '-'} ＋ failed ${led.entries[SELF] ? led.entries[SELF].failed : '-'}）`
+    + '（两值不等 ⇒ 和值/合计也会跟着漂；本工具按**干净轮投影**现算 ⇒ `--apply` 一趟即可自洽）');
   if (OVERRIDDEN_ROOT) {
     t.info('互证（`run-all.verifyAuthorityTotals`）**跳过**：本次由 `DSH_SA_ROOT` 指向临时副本，' +
       '而该函数读的是真 `tests\\README.md`（无覆盖口，属既有实现，本脚本不改它）。');
@@ -973,15 +1028,12 @@ function runApply() {
     `｜\`tests\\*.js\` ${truth.js.ok ? truth.js.value : '-'} 个｜和值 ${truth.sum.ok ? truth.sum.value : '（不可比）'}` +
     `｜合计 ${truth.totalPassed.ok ? truth.totalPassed.value : '（不可比）'} 通过 / ${truth.totalFailed.ok ? truth.totalFailed.value : '-'} 失败 / ${truth.totalSkipped.ok ? truth.totalSkipped.value : '-'} 跳过`);
 
-  /* `E211` 前置闸：坏轮的账**整体拒写**（否则会把坏轮值钉进权威区，下一轮自指脚本自证式判红）。 */
+  /* `E211`：脏轮**照样同步**（写进去的是**干净轮投影**，不是坏轮读数）—— 但必须显式打印。
+     ⚠ 当日反例：最初写成"脏轮 ⇒ 整体拒写"，**堵死了本工具的核心用例**（漂移轮必然是脏轮）。 */
   const dirty = ledgerDirty(led);
-  if (dirty.dirty) {
-    console.log(`\n[拒写] **本轮账目不干净**（\`E211\` 前置闸）：${dirty.bad.join('、')}`);
-    if (dirty.tolerated.length) console.log(`   （容忍的在册偏差：${dirty.tolerated.join('、')}）`);
-    console.log('   ⇒ 先把这一轮修干净（或跑一次干净的全量轮），再同步。**本次未写任何文件。**');
-    process.exit(3);
-  }
-  console.log(`[前置闸] 账目干净（容忍的在册偏差：${dirty.tolerated.join('、') || '无'}）`);
+  console.log(dirty.dirty
+    ? `[投影] 本轮为**脏轮**（${dirty.bad.join('、')}）⇒ 写入的是**干净轮投影**：原始失败合计 ${truth.rawFailedTotal}／失败轴（在册偏差条数）${truth.totalFailed.ok ? truth.totalFailed.value : '（不可比）'}；容忍的在册偏差：${dirty.tolerated.join('、') || '无'}`
+    : `[前置闸] 账目干净（容忍的在册偏差：${dirty.tolerated.join('、') || '无'}）`);
 
   const byFile = new Map();
   for (const p of points) {
@@ -1133,6 +1185,25 @@ function runSelfTest() {
 
   const tri = ledgerDirty({ ok: false, why: '自检', entries: {}, ranSuites: [] });
   push('㈣ 账本不可读 ⇒ 脏（fail-closed）', tri.dirty, true);
+
+  /* ── ㈤ 干净轮投影（`E211` 修正后的**主口径**）──────────────────────────────
+     脏轮的账本必须也能算出"**干净轮投影**"：未登记的失败按"修好即通过"计入通过轴、
+     失败轴恒等于在册偏差条数；**并且不许有"脏轮 ⇒ 拒写"这种把核心用例堵死的分支**。 */
+  const t4 = base(); t4[regName] = { passed: 5, failed: regN, skipped: 0, status: 'failed' };
+  t4[SELF] = { passed: 81, failed: 5, skipped: 0, status: 'failed' };          /* 自指：断言总数 86 */
+  t4['files-check'] = { passed: 25, failed: 6, skipped: 0, status: 'failed' };  /* 未登记失败 6 */
+  const tr4 = computeTruth(mk(t4), { ok: false, why: '自检（不跑探针）' }, T(0));
+  push(`㈤a 脏轮也能算出投影（不拒写）：\`${SELF}\` 通过轴投影 ${81 + 5}（不是 81）；\`files-check\` 投影 ${25 + 6}（不是 25）`,
+    [tr4.projectedPass(SELF), tr4.projectedPass('files-check')], [86, 31]);
+  push(`㈤b 失败轴＝**在册偏差条数**（定义）＝ ${regN}，而本轮原始失败合计＝ ${regN + 5 + 6}`,
+    [tr4.totalFailed.ok ? tr4.totalFailed.value : null, tr4.rawFailedTotal], [regN, regN + 5 + 6]);
+  push('㈤c 投影后的合计通过（＝ Σ 各 suite 投影）＋ 和值都可算（不是 NA）',
+    [tr4.sum.ok, tr4.totalPassed.ok], [true, true]);
+  const others4 = OFFLINE.filter(n => n !== SELF).length;
+  const expectSum4 = OFFLINE.filter(n => n !== SELF)
+    .reduce((a, n) => a + (n === 'files-check' ? (25 + 6) : (n === regName ? 5 : 1)), 0) + 86;
+  push(`㈤d 和值投影 ＝ Σ 各 suite 投影（${others4} 个：\`files-check\` 计 ${25 + 6}、\`${regName}\` 计 5、其余各 1）＋ 自指 86`,
+    tr4.sum.ok ? tr4.sum.value : NaN, expectSum4);
 
   let ok = 0;
   console.log('\n=== sync-authority --self-test（`E211` D22：纯内存、不写盘） ===');
