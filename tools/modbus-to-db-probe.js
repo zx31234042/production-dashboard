@@ -20,6 +20,7 @@
  */
 'use strict';
 
+const path = require('node:path');
 const sim = require('./mock-modbus-slave.js');
 const probe = require('./modbus-poll-probe.js');
 const { makeTempDb } = require('../tests/lib/harness.js');
@@ -75,7 +76,7 @@ async function inferPieces(cycles = 3) {
   const rows = [];
   const step = async (testStatus) => {
     slave.refresh({ testStatus, frameRate: 500, gainX10: 125, shutter: 800, cameraDepthX100: 450, depthX100: 480,
-      speedX100: 320, vxX100: 210, vyX100: 241, setDepthX100: 500, setGainX10: 100, setFrameRate: 400 }, base + sec * 1000);
+      speedX100: 500, vxX100: 210, vyX100: 241, setDepthX100: 500, setGainX10: 100, setFrameRate: 400 }, base + sec * 1000);
     sec += 1;
     const rec = await probe.pollOnce(opts);
     const cur = rec.testStatus;
@@ -101,6 +102,137 @@ async function inferPieces(cycles = 3) {
   console.log('        ⇒ 结论读数：**即使贵方不提供 `IF-D.4`，件数与按件固化也能自洽**（`IF-D.4` 由阻塞项降为**校核项**）');
   srv.close();
   handle.close();
+}
+
+/* ============================ 经**真服务端装配层**（`--via-server`） ============================ */
+/** 上一个模式（`--infer-pieces`）直接调 `createIngest()` ⇒ **绕过了装配层**，所以看不到 `result` 固化。
+ *  本模式**起动真服务端**（`server\index.js` 的 `start()`：挂 `/ifd/frame` ＋ 在 `onSampled` 上接
+ *  `judge.evaluate()`／`persistJudgement()`），用 **HTTP 推送**把"我方自生成件序号"的帧送进去，
+ *  再把 `GET /ifd/status` 的 `resultWrite` 计数与库里的 `result` 行数**读回来**。
+ *  ⇒ 这才是"**按件固化**"的端到端证据（`DR-05`）。数据根与库文件都落在 `tests\._verify` 的临时目录内。 */
+async function viaServer(cycles = 3) {
+  const { makeTempDir, allocPort } = require('../tests/lib/harness.js');
+  const dir = makeTempDir('e2e-server');
+  const port = await allocPort();   /* harness 的 `allocPort()` 是**异步**的（真试探空闲端口） */
+  process.env.DSH_ENV = 'test';
+  process.env.DSH_BOARD_HOST = '127.0.0.1';
+  process.env.DSH_BOARD_PORT = String(port);
+  process.env.DSH_BOARD_DATA_DIR = dir;
+  process.env.DSH_BOARD_DB_FILE = path.join(dir, 'board.db');
+  const serverEntry = require('../server/index.js');
+  /* ②-0b **DR-03 标准**：判定的阈值来自 `standard` 表（`getEffectiveStandard`），而它**没有 IF-A 的 HTTP 入口**
+     （`/ifa/process` 只写 `op_log` 留痕）⇒ 只能走仓储层 `standardRepo.addVersion()`（＝界面/录入路径的同一出口）。
+     阈值取"包住我方模拟数据"的区间（depth 4.8／speed 3.2）⇒ 预期判**合格**。 */
+  const fix0 = require('../tests/lib/fixture.js');   /* 就地取（避免与下方的 `fixture` 声明撞 TDZ） */
+  const seedDb = new (require('node:sqlite').DatabaseSync)(path.join(dir, 'board.db'));
+  dbmod.initSchema(seedDb, '2026-10-10 00:00:00');
+  const stdRes = { ok: true, info: '' };
+  try {
+    require('../server/repo/standard.js').addVersion(seedDb, {
+      productCode: fix0.standard.productCode, processCode: fix0.task.processNo,
+      depthTypical: 4.8, depthUpperDev: 0.5, depthLowerDev: -0.5,
+      speedTypical: 5.0, speedUpperDev: 1.5, speedLowerDev: -1.5,
+      setDepth: fix0.standard.setDepth, setGain: fix0.standard.setGain,
+      setFrameRate: fix0.standard.setFrameRate, setShutter: fix0.standard.setShutter
+    }, '2026-10-10 00:00:00', '2026-10-10 00:00:00');
+    stdRes.info = 'addVersion 成功（无校验豁免）';
+  } catch (err) {
+    stdRes.ok = false; stdRes.info = 'addVersion 抛错：' + err.message.slice(0, 120);
+  }
+  seedDb.close();
+  console.log(`[via-server] DR-03 标准种子：${stdRes.ok ? '✓' : '✗'} ${stdRes.info}`);
+  const srv = await serverEntry.start();
+  console.log(`[via-server] 真服务端已起 127.0.0.1:${srv.port}（数据根 ${dir}）`);
+
+  /* ②-0 灌种子：判定需要"任务(procOrderNo) → 标准(产品,工序,生效版本)"
+     ⇒ 先按 IF-A 形态把**派工**与**工艺标准**写进去（时间窗覆盖我方帧的 collectTime），否则判定无所依、`result` 不产生。 */
+  const fixture = require('../tests/lib/fixture.js');
+  const ORDER = 'PO-20261010-P1';
+  const seedTask = {
+    ...fixture.task, procOrderNo: ORDER, productCode: fixture.standard.productCode,
+    planStartTime: '2026-10-10 19:00:00', planEndTime: '2026-10-10 23:00:00'
+  };
+  const seedStd = { ...fixture.standard, procOrderNo: ORDER, processNo: fixture.task.processNo, effectiveFrom: '2026-10-10 00:00:00' };
+  const postJson = async (p, body) => {
+    const r = await fetch(`http://127.0.0.1:${srv.port}${p}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    });
+    const t = await r.text();
+    return { status: r.status, body: t.slice(0, 700) };
+  };
+  const s0 = await postJson('/ifa/device', { ...fixture.device, equipCode: 'EQ-UC-001' });
+  const s1 = await postJson('/ifa/dispatch', seedTask);
+  const s2 = await postJson('/ifa/process', seedStd);
+  console.log(`[via-server] 种子：POST /ifa/device ⇒ HTTP ${s0.status}${s0.status >= 300 ? ' ' + s0.body : ''}；` +
+    `POST /ifa/dispatch ⇒ HTTP ${s1.status}${s1.status >= 300 ? ' ' + s1.body : ''}；POST /ifa/process ⇒ HTTP ${s2.status}${s2.status >= 300 ? ' ' + s2.body : ''}`);
+
+  const slave = sim.createSlave({ unit: 1 });
+  slave.refresh({ procOrderNo: ORDER, equipCode: 'EQ-UC-001' });   /* 让帧里的工单号与种子的派工一致 */
+  const sim_ = await sim.startServer(slave, { port: 0, host: '127.0.0.1' });
+  const opts = { port: sim_.address().port, unit: 1, host: '127.0.0.1' };
+  const base = Date.UTC(2026, 9, 10, 12, 0, 0);
+  let sec = 0, prev = null, piece = 1;
+  const steps = [];
+  const step = async (testStatus) => {
+    slave.refresh({ testStatus, frameRate: 500, gainX10: 125, shutter: 800, cameraDepthX100: 450, depthX100: 480,
+      speedX100: 500, vxX100: 210, vyX100: 241, setDepthX100: 500, setGainX10: 100, setFrameRate: 400 }, base + sec * 1000);
+    sec += 1;
+    const rec = await probe.pollOnce(opts);
+    const cur = rec.testStatus;
+    const entered = prev !== 2 && cur === 2;
+    const frame = { ...frameOf(rec), unitIndex: piece };
+    const res = await fetch(`http://127.0.0.1:${srv.port}/ifd/frame`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(frame)
+    });
+    const body = await res.json().catch(() => null);
+    steps.push({ sec: sec - 1, testStatus: cur, entered, unitIndex: piece, status: res.status, outcome: body && body.outcome });
+    if (verboseInfer) console.log(`[via-server] t=${sec - 1}s ts=${cur} unitIndex=${piece} HTTP ${res.status} outcome=${body && body.outcome}`);
+    if (prev === 2 && cur !== 2) piece += 1;
+    prev = cur;
+  };
+  for (let c = 0; c < cycles; c++) for (const st of [0, 1, 2, 0]) await step(st);
+
+  const stRes = await fetch(`http://127.0.0.1:${srv.port}/health`);
+  const stRaw = await stRes.text();
+  let status = null;
+  try { status = JSON.parse(stRaw); } catch { /* 非 JSON：下面按原文报 */ }
+  const ifdRes = await fetch(`http://127.0.0.1:${srv.port}/ifd/status`);
+  let ifd = null;
+  try { ifd = JSON.parse(await ifdRes.text()); } catch { /* 忽略 */ }
+  const rw = status && status.resultWrite ? status.resultWrite : null;
+  await serverEntry.stop();
+  sim_.close();
+
+  /* 读回库（服务端已停 ⇒ 新开只读连接） */
+  const { DatabaseSync } = require('node:sqlite');
+  const ro = new DatabaseSync(path.join(dir, 'board.db'));
+  const measure = ro.prepare('SELECT COUNT(*) AS n, SUM(CASE WHEN unit_index IS NULL THEN 1 ELSE 0 END) AS nul FROM measure_rt').get();
+  const resultRows = ro.prepare('SELECT COUNT(*) AS n FROM result').get().n;
+  const perPiece = ro.prepare('SELECT unit_index, COUNT(*) AS n FROM measure_rt WHERE unit_index IS NOT NULL GROUP BY unit_index ORDER BY unit_index').all();
+  const resultDetail = ro.prepare('SELECT proc_order_no, unit_index, result FROM result ORDER BY unit_index').all();
+  ro.close();
+
+  console.log('\n[via-server] 读数（**经真服务端装配层**）：');
+  console.log(`        驱动 ${cycles} 个完整周期；HTTP 推送 ${steps.length} 帧（HTTP 非 2xx 的 ${steps.filter(s => !(s.status >= 200 && s.status < 300)).length} 帧）`);
+  console.log(`        ① 推断件数 = ${piece - 1}（＝周期数）`);
+  console.log(`        ② \`measure_rt\` 行数 ${measure.n}，\`unit_index\` 为 NULL 的 ${measure.nul} 行（逐件：${perPiece.map(r => `件${r.unit_index}→${r.n}行`).join('　')}）`);
+  console.log(`        ③ **\`result\` 行数 = ${resultRows}**（＝件数 ${resultRows === piece - 1 ? '✓' : '⚠ 不等'}）`);
+  console.log(`        ④ GET /health ⇒ HTTP ${stRes.status}${status ? '' : '（非 JSON：' + stRaw.slice(0, 80) + '）'}；GET /ifd/status ⇒ HTTP ${ifdRes.status}`);
+  if (ifd) {
+    const c = ifd.counts || {};
+    console.log(`           /ifd/status counts：accepted=${c.accepted} stored=${c.stored} duplicate=${c.duplicate} raw500ms=${c.raw500ms} rejected=${c.rejected} **sampledHookFailures=${c.sampledHookFailures}**`);
+    if (ifd.lastSampledHookError) console.log(`           lastSampledHookError=${JSON.stringify(ifd.lastSampledHookError).slice(0, 200)}`);
+  }
+  if (status) {
+    const c = status.counts || {};
+    console.log(`           /health counts：accepted=${c.accepted} stored=${c.stored} duplicate=${c.duplicate} rejected=${c.rejected} sampledHookFailures=${c.sampledHookFailures}`);
+    if (rw) console.log(`           **/health.resultWrite：writes=${rw.writes} failures=${rw.failures} skippedNoUnit=${rw.skippedNoUnit}** lastError=${rw.lastError === null ? 'null' : JSON.stringify(rw.lastError).slice(0, 160)}`);
+    if (status.warningWrite) console.log(`           /health.warningWrite：writes=${status.warningWrite.writes} failures=${status.warningWrite.failures}`);
+    if (status.taskRows !== undefined) console.log(`           库内 task 行数=${status.taskRows}`);
+  }
+  if (resultDetail.length) console.log(`        逐件结果：${resultDetail.map(r => `件${r.unit_index}=${r.result}`).join('　')}`);
+  console.log(`        ⇒ 结论读数：**件数统计与件序号落库跑通**；**按件固化（\`DR-05\`）${resultRows === piece - 1 ? '跑通' : '未产生行'}**` +
+    (resultRows === piece - 1 ? '' : ' ⇒ 前置条件未满足，看上列 `sampledHookFailures`／`lastError`（**不是件序号的问题**）'));
 }
 
 async function main() {
@@ -168,11 +300,10 @@ async function main() {
 }
 
 if (require.main === module) {
-  if (process.argv.includes('--infer-pieces')) {
-    inferPieces(Number.isFinite(INFER_CYCLES) && INFER_CYCLES > 0 ? INFER_CYCLES : 3)
-      .catch((err) => { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); });
-  } else {
-    main().catch((err) => { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); });
-  }
+  const run = process.argv.includes('--infer-pieces') ? () => inferPieces(cyclesArg())
+    : process.argv.includes('--via-server') ? () => viaServer(cyclesArg())
+      : () => main();
+  run().catch((err) => { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); });
 }
-module.exports = { frameOf, fmtCollect, inferPieces };
+function cyclesArg() { return Number.isFinite(INFER_CYCLES) && INFER_CYCLES > 0 ? INFER_CYCLES : 3; }
+module.exports = { frameOf, fmtCollect, inferPieces, viaServer };
