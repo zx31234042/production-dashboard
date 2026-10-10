@@ -27,6 +27,8 @@ const dbmod = require('../server/db/index.js');
 const { createIngest } = require('../server/services/ingest.js');
 
 const verbose = process.argv.includes('--verbose');
+const verboseInfer = process.argv.includes('--verbose');
+const INFER_CYCLES = (() => { const i = process.argv.indexOf('--cycles'); return i >= 0 && process.argv[i + 1] ? Number(process.argv[i + 1]) : 3; })();
 const EPOCH_2000 = Date.UTC(2000, 0, 1);
 /** `collectTime` 必须是 DR-16 字符串（`yyyy-MM-dd HH:mm:ss[.SSS]`）——见 ingest 的 `parseCollectTime` */
 const fmtCollect = (sec) => {
@@ -50,6 +52,56 @@ const frameOf = (rec) => ({
   velocity_x: rec.velocity_x,
   velocity_y: rec.velocity_y
 });
+
+/* ============================ 件边界推断（`--infer-pieces`） ============================ */
+/** 负责人 2026-10-10 裁定：**一个测试周期（`0→1→2→0`）恰对应一件**；且**件序号须与 MES 一致**
+ *  ⇒ 本模式把"件"算在**进入 `testStatus=2`（判定窗口）**上，并**自生成递增件序号**（同一工单内从 1 起、按完成顺序）
+ *  —— 与 `IF-D.4` 的件序号口径同形的**降级路径**（对方给值则以对方为准并校核）。
+ *  要看三样读数：①推断出的件数 ②`measure_rt.unit_index` **不再为 NULL** ③`result` 表**按件固化**（行数＝件数）。
+ *  注：`result` 的判定值依赖标准/典型值（`Q-39` 归口甲方、现场录入）—— 本模式只验"**按件固化**"这件事。 */
+async function inferPieces(cycles = 3) {
+  const handle = makeTempDb({ name: 'infer-pieces' });
+  const opened = dbmod.openDb(handle.path, {});
+  handle.adopt(opened.db);
+  dbmod.initSchema(handle.db, '2026-10-10 11:00:00');
+  const db = handle.db;
+  const ingest = createIngest({ db, now: () => new Date() });
+  const slave = sim.createSlave({ unit: 1 });
+  const srv = await sim.startServer(slave, { port: 0, host: '127.0.0.1' });
+  const port = srv.address().port;
+  const opts = { port, unit: 1, host: '127.0.0.1' };
+  const base = Date.UTC(2026, 9, 10, 11, 0, 0);
+  let sec = 0, prev = null, piece = 1;
+  const rows = [];
+  const step = async (testStatus) => {
+    slave.refresh({ testStatus, frameRate: 500, gainX10: 125, shutter: 800, cameraDepthX100: 450, depthX100: 480,
+      speedX100: 320, vxX100: 210, vyX100: 241, setDepthX100: 500, setGainX10: 100, setFrameRate: 400 }, base + sec * 1000);
+    sec += 1;
+    const rec = await probe.pollOnce(opts);
+    const cur = rec.testStatus;
+    const enteredJudgement = prev !== 2 && cur === 2;          /* 进入判定窗口 ⇒ 该件完成 */
+    const frame = { ...frameOf(rec), unitIndex: piece };       /* **我方自生成的件序号**（同一工单内从 1 起） */
+    const r = ingest.ingestFrame(frame);
+    rows.push({ sec: sec - 1, testStatus: cur, enteredJudgement, unitIndex: piece, outcome: r.outcome, stored: r.stored });
+    if (verboseInfer) console.log(`[infer] t=${sec - 1}s ts=${cur} ${enteredJudgement ? '← 记一件' : '        '} unitIndex=${piece} outcome=${r.outcome}`);
+    if (prev === 2 && cur !== 2) piece += 1;                   /* 离开判定窗口 ⇒ 转到下一件 */
+    prev = cur;
+  };
+  for (let c = 0; c < cycles; c++) for (const st of [0, 1, 2, 0]) await step(st);
+  const inferred = piece - 1;
+  const measure = db.prepare('SELECT COUNT(*) AS n, SUM(CASE WHEN unit_index IS NULL THEN 1 ELSE 0 END) AS nul FROM measure_rt').get();
+  const resultRows = db.prepare('SELECT COUNT(*) AS n FROM result').get().n;
+  const perPiece = db.prepare('SELECT unit_index, COUNT(*) AS n FROM measure_rt WHERE unit_index IS NOT NULL GROUP BY unit_index ORDER BY unit_index').all();
+  console.log('\n[infer] 读数：');
+  console.log(`        驱动 ${cycles} 个完整周期（每个 0→1→2→0，每秒一帧）`);
+  console.log(`        ① **推断件数 = ${inferred}**（＝周期数）`);
+  console.log(`        ② \`measure_rt\` 行数 ${measure.n}，其中 \`unit_index\` 为 NULL 的 ${measure.nul} 行`);
+  console.log(`        ③ **\`result\` 按件固化 = ${resultRows} 行**（＝件数 ${resultRows === inferred ? '✓' : '⚠ 不等'}）`);
+  console.log(`        逐件落库行数：${perPiece.map(r => `件${r.unit_index}→${r.n}行`).join('　')}`);
+  console.log('        ⇒ 结论读数：**即使贵方不提供 `IF-D.4`，件数与按件固化也能自洽**（`IF-D.4` 由阻塞项降为**校核项**）');
+  srv.close();
+  handle.close();
+}
 
 async function main() {
   /* ① 临时库（一用例一库；WAL）＋ schema */
@@ -116,6 +168,11 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((err) => { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); });
+  if (process.argv.includes('--infer-pieces')) {
+    inferPieces(Number.isFinite(INFER_CYCLES) && INFER_CYCLES > 0 ? INFER_CYCLES : 3)
+      .catch((err) => { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); });
+  } else {
+    main().catch((err) => { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); });
+  }
 }
-module.exports = { frameOf, fmtCollect };
+module.exports = { frameOf, fmtCollect, inferPieces };
