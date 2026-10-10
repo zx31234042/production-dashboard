@@ -329,4 +329,13 @@ function main() {
   }).then(() => { /* 常驻：不主动退出 */ });
 }
 
-try { main(); } catch (err) { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); }
+/* 导出：供其它工具（如 `tools\modbus-poll-probe.js`）**在同进程内**起从站、直接驱动场景 ——
+   **被 require 时一行都不跑**（与 `tests\run-all.js` 同款守卫；`E78` 一族的口径）。 */
+module.exports = {
+  createSlave, startServer, CYCLE, crc16, withCrc, hex,
+  N, NUM_BASE, NUM_LEN, STR_BASE, STR_LEN, EPOCH_2000, secondsSince2000
+};
+
+if (require.main === module) {
+  try { main(); } catch (err) { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); }
+}
