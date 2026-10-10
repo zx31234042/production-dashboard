@@ -1034,8 +1034,19 @@ async function main() {
         if (!e.isFile()) continue;
         const key = `${r.dir}/${e.name}`;
         const mut = muts[key];
-        fs.writeFileSync(path.join(dstDir, e.name),
-          mut === undefined ? fs.readFileSync(path.join(srcDir, e.name)) : Buffer.from(mut, 'utf8'));
+        const srcAbs = path.join(srcDir, e.name);
+        const dstAbs = path.join(dstDir, e.name);
+        const st = fs.statSync(srcAbs);
+        fs.writeFileSync(dstAbs,
+          mut === undefined ? fs.readFileSync(srcAbs) : Buffer.from(mut, 'utf8'));
+        /* ⚠ 副本的 mtime **必须还原成原文件的**：`writeFileSync` 会把副本 mtime 设成**复制时刻**，
+           而 `readdirSync` 的顺序**不是** mtime 顺序（实测：`上位机方` 的 readdir 顺序是
+           第三批 → 第二批 ⇒ 副本里"最新那份函件"变成**第二批**，与真实树相反）⇒ `newestIn`
+           会挑到**另一份**函件、`D22①` 的变异打在"没被读到的那份"上 ⇒ 变异"看起来没生效"（假红）。
+           传**数值秒**（`*Ms / 1000`）而不用 `Date`：`Date` 只有整毫秒精度（实测副本 mtime 与真实
+           mtime 最大偏差 0.47ms），数值秒能保到 100ns 量级（实测偏差 <0.001ms）⇒ "副本里的最新"
+           ＝ "真实树里的最新"；**选择语义不变**（仍是"每个收件方目录里 mtime 最新的那份函件"）。 */
+        fs.utimesSync(dstAbs, st.atimeMs / 1000, st.mtimeMs / 1000);
       }
     }
     process.env.DSH_DC_EXT_BASE_OVERRIDE = copyBase;
