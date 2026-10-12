@@ -255,14 +255,11 @@ async function noOrder(cycles = 3) {
   const base = Date.UTC(2026, 9, 12, 9, 0, 0);
   /* 本机两张"权威表"（现场分别来自 IF-A 派工 与 设备台账；此处按现场口径写死做夹具） */
   const LOCAL_ACTIVE_ORDER = 'PO-20261012-A';          /* ＝ 本机当前派工（IF-A 权威；FR-3.1） */
-  const LOCAL_DEVICE_BY_UNIT = { 1: 'EQ-UC-001' };     /* ＝ 从站地址 → 设备台账映射 */
-  const frameOfNoIds = (rec) => {                       /* 帧里**不含** procOrderNo / equipCode */
-    const f = frameOf(rec); delete f.procOrderNo; delete f.equipCode; return f;
+  const LOCAL_DEVICE_BY_UNIT = { 1: 'EQ-UC-001' };     /* ＝ 从站地址 → 设备台账映射（**仅对账备用**：equipCode 过渡期照收上位机方自定值） */
+  const frameOfNoIds = (rec) => {                       /* 帧里**不含** procOrderNo（**equipCode 由上位机方带来，保留**） */
+    const f = frameOf(rec); delete f.procOrderNo; return f;
   };
-  const inject = (f) => Object.assign({}, f, {
-    procOrderNo: LOCAL_ACTIVE_ORDER,
-    equipCode: LOCAL_DEVICE_BY_UNIT[opts.unit]
-  });
+  const inject = (f) => Object.assign({}, f, { procOrderNo: LOCAL_ACTIVE_ORDER });   /* 只注入工单号 */
   let prev = null, piece = 1, sec = 0;
   const step = async (testStatus, { withInject, noRefresh = false }) => {
     if (!noRefresh) {
@@ -299,12 +296,12 @@ async function noOrder(cycles = 3) {
   }
   const n = db.prepare('SELECT COUNT(*) AS n, SUM(CASE WHEN unit_index IS NULL THEN 1 ELSE 0 END) AS nul FROM measure_rt').get();
   const kinds = rows.reduce((a, r) => (a[r.outcome] = (a[r.outcome] || 0) + 1, a), {});
-  console.log('\n[no-order] ㈡ **可行性**（本机注入 工单号＝当前派工／设备编号＝从站地址→台账 之后）：');
+  console.log('\n[no-order] ㈡ **可行性**（本机注入 **工单号＝当前派工**〔IF-A 权威〕之后；`equipCode` 由帧带来）：');
   console.log(`        送帧 ${rows.length} ⇒ ` + Object.entries(kinds).map(([k, v]) => `${k} ${v}`).join('｜'));
   console.log(`        \`measure_rt\` 行数 ${n.n}（\`unit_index\` 为 NULL 的 ${n.nul} 行）｜件数推断 ${piece - 1}`);
-  console.log(`        ⇒ 结论读数：**落库/去重/件序号行为与带值帧一致 ⇒ 归口我方注入 = 可行**（` +
-    `工单号来源＝IF-A 权威〔FR-3.1〕；设备编号可从**从站地址**推出）`);
-  console.log('        ⚠ 待裁两点：①**跨工单切换瞬间**按什么规则归属（建议以**派工时间窗**为准、窗口外不落库＋告警）②**无派工就开测**时是否兜底（建议**不兜底**：宁可不落库并告警，不编造工单号）');
+  console.log('        ⇒ 结论读数：**落库/去重/件序号行为与带值帧一致 ⇒ 工单号归口我方注入 = 可行**（来源＝IF-A 权威〔FR-3.1〕）');
+  console.log('        ⚠ 更正（负责人 2026-10-12）：**`equipCode` 不归我方注入** —— 过渡期**照收上位机方自定值**（MES 口径定了再对齐；『从站地址→台账』仅作对账备用）');
+  console.log('        ⚠ 已裁（负责人 2026-10-12「按建议」）：①**跨工单切换瞬间**以 **IF-A 派工生效时间窗**为准，**窗口外不落库＋计数＋告警**②**无派工就开测** ⇒ **不兜底**（不落库＋告警，不编造工单号）');
   srv.close();
   handle.close();
 }
