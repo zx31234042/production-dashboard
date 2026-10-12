@@ -235,6 +235,80 @@ async function viaServer(cycles = 3) {
     (resultRows === piece - 1 ? '' : ' ⇒ 前置条件未满足，看上列 `sampledHookFailures`／`lastError`（**不是件序号的问题**）'));
 }
 
+/* ============================ 帧不带工单号/设备编号 ⇒ 由本机注入（`--no-order`） ============================ */
+/** 负责人 2026-10-12 问："`procOrderNo` 工单编号仅限我方和 MES 方，不再涉及上位机方的通讯了。是否可行"。
+ *  本模式把它变成**两段读数**：
+ *   ㈠ **必要性**：帧里**不带** `procOrderNo` 时，`ingestFrame()` 必以 `MISSING_FIELD` **拒收**（`REQUIRED_FIELDS` 三条之一）；
+ *   ㈡ **可行性**：由本机**注入**（工单号＝本机当前派工〔此处模拟 IF-A 来源〕；设备编号＝**从站地址 → 设备台账**映射）
+ *      之后，落库／去重／（`unit_index`）行为**与带值帧完全一致**。
+ *  ⇒ 结论：**可行**，但**"注入"这一步必须真的做**（不改 `ingest` 的必填口径）。 */
+async function noOrder(cycles = 3) {
+  const handle = makeTempDb({ name: 'no-order' });
+  const opened = dbmod.openDb(handle.path, {});
+  handle.adopt(opened.db);
+  dbmod.initSchema(handle.db, '2026-10-10 11:00:00');
+  const db = handle.db;
+  const ingest = createIngest({ db, now: () => new Date() });
+  const slave = sim.createSlave({ unit: 1 });
+  const srv = await sim.startServer(slave, { port: 0, host: '127.0.0.1' });
+  const opts = { port: srv.address().port, unit: 1, host: '127.0.0.1' };
+  const base = Date.UTC(2026, 9, 12, 9, 0, 0);
+  /* 本机两张"权威表"（现场分别来自 IF-A 派工 与 设备台账；此处按现场口径写死做夹具） */
+  const LOCAL_ACTIVE_ORDER = 'PO-20261012-A';          /* ＝ 本机当前派工（IF-A 权威；FR-3.1） */
+  const LOCAL_DEVICE_BY_UNIT = { 1: 'EQ-UC-001' };     /* ＝ 从站地址 → 设备台账映射 */
+  const frameOfNoIds = (rec) => {                       /* 帧里**不含** procOrderNo / equipCode */
+    const f = frameOf(rec); delete f.procOrderNo; delete f.equipCode; return f;
+  };
+  const inject = (f) => Object.assign({}, f, {
+    procOrderNo: LOCAL_ACTIVE_ORDER,
+    equipCode: LOCAL_DEVICE_BY_UNIT[opts.unit]
+  });
+  let prev = null, piece = 1, sec = 0;
+  const step = async (testStatus, { withInject, noRefresh = false }) => {
+    if (!noRefresh) {
+      slave.refresh({ testStatus, frameRate: 500, gainX10: 125, shutter: 800, cameraDepthX100: 450, depthX100: 480,
+        speedX100: 500, vxX100: 210, vyX100: 241, setDepthX100: 500, setGainX10: 100, setFrameRate: 400 }, base + sec * 1000);
+      sec += 1;
+    }
+    const rec = await probe.pollOnce(opts);
+    const bare = frameOfNoIds(rec);
+    const frame = withInject ? inject(bare) : bare;
+    if (withInject) frame.unitIndex = piece;
+    const cur = rec.testStatus;
+    const r = ingest.ingestFrame(frame);
+    if (prev === 2 && cur !== 2) piece += 1;
+    prev = cur;
+    return r;
+  };
+
+  /* ㈠ 必要性：不带工单号 ⇒ 必被拒收 */
+  const bare = await step(1, { withInject: false });
+  console.log('\n[no-order] ㈠ **必要性**（帧里不带 `procOrderNo`）：');
+  console.log(`        outcome=${bare.outcome}｜stored=${bare.stored}｜reason=${JSON.stringify(bare.reason || bare.error || bare.rejection || null).slice(0, 160)}`);
+  console.log(`        ⇒ 与 ` + '`REQUIRED_FIELDS = [equipCode, procOrderNo, collectTime]`' + ` 一致：**注入这一步不能省**`);
+
+  /* ㈡ 可行性：注入后跑 3 个周期（含同刷新重复送与同秒两次刷新） */
+  prev = null; piece = 1;
+  const rows = [];
+  for (let c = 0; c < cycles; c++) {
+    rows.push(await step(0, { withInject: true }));
+    rows.push(await step(1, { withInject: true }));
+    rows.push(await step(2, { withInject: true }));
+    rows.push(await step(2, { withInject: true, noRefresh: true }));   /* **不刷新**再送一次 ⇒ 同键 ⇒ 应判 duplicate */
+    rows.push(await step(0, { withInject: true }));
+  }
+  const n = db.prepare('SELECT COUNT(*) AS n, SUM(CASE WHEN unit_index IS NULL THEN 1 ELSE 0 END) AS nul FROM measure_rt').get();
+  const kinds = rows.reduce((a, r) => (a[r.outcome] = (a[r.outcome] || 0) + 1, a), {});
+  console.log('\n[no-order] ㈡ **可行性**（本机注入 工单号＝当前派工／设备编号＝从站地址→台账 之后）：');
+  console.log(`        送帧 ${rows.length} ⇒ ` + Object.entries(kinds).map(([k, v]) => `${k} ${v}`).join('｜'));
+  console.log(`        \`measure_rt\` 行数 ${n.n}（\`unit_index\` 为 NULL 的 ${n.nul} 行）｜件数推断 ${piece - 1}`);
+  console.log(`        ⇒ 结论读数：**落库/去重/件序号行为与带值帧一致 ⇒ 归口我方注入 = 可行**（` +
+    `工单号来源＝IF-A 权威〔FR-3.1〕；设备编号可从**从站地址**推出）`);
+  console.log('        ⚠ 待裁两点：①**跨工单切换瞬间**按什么规则归属（建议以**派工时间窗**为准、窗口外不落库＋告警）②**无派工就开测**时是否兜底（建议**不兜底**：宁可不落库并告警，不编造工单号）');
+  srv.close();
+  handle.close();
+}
+
 async function main() {
   /* ① 临时库（一用例一库；WAL）＋ schema */
   const handle = makeTempDb({ name: 'modbus-to-db' });
@@ -302,7 +376,8 @@ async function main() {
 if (require.main === module) {
   const run = process.argv.includes('--infer-pieces') ? () => inferPieces(cyclesArg())
     : process.argv.includes('--via-server') ? () => viaServer(cyclesArg())
-      : () => main();
+      : process.argv.includes('--no-order') ? () => noOrder(cyclesArg())
+        : () => main();
   run().catch((err) => { console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err)); process.exit(2); });
 }
 function cyclesArg() { return Number.isFinite(INFER_CYCLES) && INFER_CYCLES > 0 ? INFER_CYCLES : 3; }
