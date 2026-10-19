@@ -1190,7 +1190,7 @@ async function main() {
         return t.getFullYear() + '-' + pad2(t.getMonth() + 1) + '-' + pad2(t.getDate()) + ' ' +
           pad2(t.getHours()) + ':' + pad2(t.getMinutes()) + ':' + pad2(t.getSeconds());
       };
-      /** 起一个**真服务端**并灌帧：`unitIndexes` 里的 `null` ＝ **缺件序号**帧（`unit_index` 写 NULL）。
+      /** 起一个**真服务端**并灌帧：`unitIndexes` 里的 `null` ＝ **缺件序号**帧（`testStatus` 取 0（待机）⇒ P0-4 不推断件序号、`unit_index` 仍 NULL）。
        *  夹具**延迟加载**（放在函数内）：万一 `tests\lib\harness.js` 在本环境载入即抛
        *  （临时区语义校验不过等），它会被上面的 try 收成"环境不满足 ⇒ 显式跳过"，而不是把
        *  整脚本打成异常退出（规范 9.5-5：跑不了要说跑不了，跳过 ≠ 通过）。 */
@@ -1206,7 +1206,7 @@ async function main() {
         const posted = [];
         for (let i = 0; i < n; i++) {
           const f = Object.assign({}, sampleFrame, { collectTime: stampOf(now, -2 * (n - i)) });
-          if (unitIndexes[i] === null) delete f.unitIndex; else f.unitIndex = unitIndexes[i];
+          if (unitIndexes[i] === null) { delete f.unitIndex; f.testStatus = 0; } else f.unitIndex = unitIndexes[i];
           const r = await fetch(base + '/ifd/frame', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json;charset=UTF-8' },

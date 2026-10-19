@@ -4627,7 +4627,7 @@ t.section('二十九、`E64` 乙：同票混帧真值表（五组 × 四帧；�
           depth: E64_DEPTH, speed: E64_SPEED, velocity_x: 3, velocity_y: 4,
           frameRate: 1000, gain: 2.5, shutter: 500, cameraDepth: 5.6, testStatus: 2
         };
-        if (withUnit) body.unitIndex = fi + 1;
+        if (withUnit) body.unitIndex = fi + 1; else body.testStatus = 0;   /* P0-4：缺件序号帧取待机(0) ⇒ 不推断件序号、unit_index 仍 NULL */
         const before = e64Events.length;
         const res = await e64Post(base, '/ifd/frame', body);
         await new Promise(r => setTimeout(r, 400));     /* 让 `onSampled` 挂钩跑完、事件落进收件箱 */
