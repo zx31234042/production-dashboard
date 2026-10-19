@@ -1487,6 +1487,159 @@ async function main() {
     await cdp.send('Emulation.clearDeviceMetricsOverride');
   }
 
+  /* ===== B5f P1-1b 按端点链路状态（FR-2.6）真机判据 =====
+     立案：`FR-2.6` 要求「联网状态」按**端点**显示，且**单点掉线不得报成整套离线**；
+     假 DOM 面（`ui-check` 的 P1-1b 五条）已覆盖渲染与取数归一，本段只补**真机**证据：
+       ① 起真服务端 ⇒ 先灌 `EP-OFF` 一帧、**真等 > staleMs**、再灌 `EP-ON` 一帧
+          （端点链路按**服务端接受时刻**计时，故必须真等，不能靠 collectTime 伪造成旧帧）；
+       ② `GET /ifd/endpoints` 自证前提：恰 1 在线 / 1 离线、`allOffline === false`；
+       ③ `?source=server` 真机读 `#stLinkText` 与 `#stLinkNote .link-ep`：
+          断的行 `data-online="false"` ＋「离线断连」、连的行 `data-online="true"` ＋「在线正常」，
+          汇总含 `1/2` 且**不出现**「整套离线」/「上位机断连」；
+       ④ 再真等到**所有端点都过期** ⇒ `allOffline === true` ⇒ 汇总显示「整套离线」。
+     ⚠ 依赖能起 Node 子进程与真浏览器；起不来 ⇒ **显式跳过（跳过 ≠ 通过）**。 */
+  section('B5f P1-1b 按端点链路真机判据（`?source=server` ⇒ 逐端点行；单点掉线 ≠ 整套离线）');
+  {
+    const sampleFrame = (() => {
+      const sb = { console };
+      sb.window = sb;
+      vm.createContext(sb);
+      const rel = path.join('src', 'config', 'fieldMap.js');
+      vm.runInContext(fs.readFileSync(path.join(ROOT, rel), 'utf8'), sb, { filename: path.join(ROOT, rel) });
+      return Object.assign({}, sb.window.FieldMap.samplePayload);
+    })();
+    const pad2 = n => String(n).padStart(2, '0');
+    const stampOf = d => d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' +
+      pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+
+    /** 真机读设备状态页「联网状态」块（只读数、不改 DOM） */
+    const readLinkPanel = () => evaluate(`(() => {
+      const note = document.getElementById('stLinkNote');
+      const rows = note ? [...note.querySelectorAll('.link-ep')].map(el => ({
+        ep: el.getAttribute('data-ep'),
+        online: el.getAttribute('data-online'),
+        text: String(el.textContent || '')
+      })) : [];
+      const st = (window.MockData && window.MockData.state) || {};
+      const el = st.endpointLink || null;
+      return {
+        fatal: note ? undefined : '未找到 #stLinkNote',
+        serverMode: st.serverMode === true,
+        summary: String((document.getElementById('stLinkText') || {}).textContent || ''),
+        noteText: note ? String(note.textContent || '') : '',
+        rows: rows,
+        banner: !!document.querySelector('.degraded-banner'),
+        endpointLink: el ? {
+          staleMs: el.staleMs, total: el.total, onlineCount: el.onlineCount,
+          offlineCount: el.offlineCount, allOffline: el.allOffline,
+          endpoints: (el.endpoints || []).map(e => ({ id: e.endpointId, online: e.online, ageMs: e.ageMs }))
+        } : null
+      };
+    })()`);
+
+    /** 轮询真机读数直到满足 `pred`（返回最后一次读数；超时也返回，供断言报实测值） */
+    async function waitLinkPanel(pred, timeoutMs) {
+      const end = Date.now() + timeoutMs;
+      let last = null;
+      while (Date.now() < end) {
+        last = await readLinkPanel();
+        if (last && pred(last)) return last;
+        await sleep(250);
+      }
+      return last;
+    }
+
+    let svc = null;
+    let infra = null;
+    try {
+      const harnessLib = require('./lib/harness');
+      svc = await harnessLib.startService({
+        script: 'server/index.js', args: ['--data-dir', harnessLib.makeTempDir('b5f-data')],
+        readyPath: '/health', timeoutMs: 30000
+      });
+    } catch (e) { infra = e; }
+
+    if (infra) {
+      skip('B5f P1-1b 按端点链路真机判据', '本地服务端起不来 ⇒ 本用例环境不满足（**跳过 ≠ 通过**）：' + infra.message);
+    } else {
+      try {
+        const base = 'http://127.0.0.1:' + svc.port;
+        const postFrame = async endpointId => {
+          const f = Object.assign({}, sampleFrame, { endpointId: endpointId, collectTime: stampOf(new Date()) });
+          const r = await fetch(base + '/ifd/frame', {
+            method: 'POST', headers: { 'Content-Type': 'application/json;charset=UTF-8' }, body: JSON.stringify(f)
+          });
+          return { status: r.status, body: await r.json() };
+        };
+        const endpointsOf = async () => (await (await fetch(base + '/ifd/endpoints')).json());
+
+        const offPost = await postFrame('EP-OFF');
+        /* 端点链路按**服务端接受时刻**算 age ⇒ 必须真等 > staleMs（5000 ms），不能拿 collectTime 伪造 */
+        await sleep(5600);
+        const onPost = await postFrame('EP-ON');
+        const pre = await endpointsOf();
+        check('B5f 前提：真服务端两端口各收 1 帧（EP-OFF 先、EP-ON 后，**真等 > staleMs**）⇒ ' +
+          '`GET /ifd/endpoints` 为 `onlineCount=1 / offlineCount=1 / allOffline=false`（**单点掉线 ≠ 整套离线**）',
+          offPost.status === 200 && onPost.status === 200 && pre.ok === true &&
+          pre.total === 2 && pre.onlineCount === 1 && pre.offlineCount === 1 && pre.allOffline === false &&
+          pre.endpoints.length === 2 &&
+          pre.endpoints.some(e => e.endpointId === 'EP-OFF' && e.online === false) &&
+          pre.endpoints.some(e => e.endpointId === 'EP-ON' && e.online === true),
+          `灌帧：EP-OFF ${offPost.status}/${offPost.body && offPost.body.outcome}、EP-ON ` +
+          `${onPost.status}/${onPost.body && onPost.body.outcome}；/ifd/endpoints=` +
+          JSON.stringify({ total: pre.total, onlineCount: pre.onlineCount, offlineCount: pre.offlineCount,
+            allOffline: pre.allOffline, endpoints: pre.endpoints }));
+
+        await setViewport(1920, 1080);
+        await openUrl(base + '/?source=server', 1200);
+        const pm = await waitLinkPanel(m => m && m.rows.length === 2 && /1\/2/.test(m.summary), 15000);
+        const pOff = pm && pm.rows.find(r => r.ep === 'EP-OFF');
+        const pOn = pm && pm.rows.find(r => r.ep === 'EP-ON');
+        const pAllText = pm ? pm.summary + ' ' + pm.noteText : '';
+        check('B5f P1-1b **单点掉线**真机判据（1920×1080、`?source=server`）：逐端点行中「EP-OFF」' +
+          '`data-online="false"` ＋「离线断连」、「EP-ON」`data-online="true"` ＋「在线正常」；' +
+          '汇总含 `1/2` 且**不出现**「整套离线」/「上位机断连」、链路降级横幅不出现',
+          pm !== null && pm.serverMode === true && pm.rows.length === 2 &&
+          pOff && pOff.online === 'false' && /离线|断连/.test(pOff.text) &&
+          pOn && pOn.online === 'true' && /在线正常/.test(pOn.text) &&
+          /1\/2/.test(pm.summary) &&
+          !/整套离线/.test(pAllText) && !/上位机断连/.test(pAllText) && pm.banner === false,
+          pm === null ? '（未读到 #stLinkNote）' :
+            'serverMode=' + pm.serverMode + '；summary=' + JSON.stringify(pm.summary) +
+            '；rows=' + JSON.stringify(pm.rows) +
+            '；横幅=' + pm.banner + '；state.endpointLink=' + JSON.stringify(pm.endpointLink));
+
+        /* 等到**所有端点**都过期：轮询服务端 `/ifd/endpoints` 直到 `allOffline === true` */
+        let preAll = null;
+        const allDeadline = Date.now() + 15000;
+        while (Date.now() < allDeadline) {
+          preAll = await endpointsOf();
+          if (preAll && preAll.allOffline === true) break;
+          await sleep(500);
+        }
+        const am = await waitLinkPanel(m => m && m.endpointLink && m.endpointLink.allOffline === true &&
+          /整套离线/.test(m.summary), 15000);
+        check('B5f P1-1b `allOffline=true` 真机判据：服务端所有端点都过期后再读页面 ⇒ 汇总**显示「整套离线」**' +
+          '（`0/2`），且逐端点行仍逐个 `data-online="false"`（不以汇总代替明细）',
+          preAll && preAll.allOffline === true && preAll.onlineCount === 0 &&
+          am !== null && am.endpointLink && am.endpointLink.allOffline === true &&
+          /整套离线/.test(am.summary) && /0\/2/.test(am.summary) &&
+          am.rows.length === 2 && am.rows.every(r => r.online === 'false'),
+          '服务端 /ifd/endpoints=' + JSON.stringify(preAll && {
+            total: preAll.total, onlineCount: preAll.onlineCount, allOffline: preAll.allOffline,
+            endpoints: preAll.endpoints }) +
+          '；页面 summary=' + JSON.stringify(am && am.summary) +
+          '；rows=' + JSON.stringify(am && am.rows) +
+          '；state.endpointLink=' + JSON.stringify(am && am.endpointLink));
+      } catch (e) {
+        check('B5f P1-1b 按端点链路真机判据（本段自身执行）', false, '夹具/真机读数异常：' + e.message);
+      } finally {
+        if (svc) await svc.stop();
+        await cdp.send('Emulation.clearDeviceMetricsOverride').catch(() => {});
+      }
+    }
+  }
+
   /* ===== B8／B9 `E2` 真模态报警弹窗（`FR-5.5` 高亮弹窗预警 ／ `FR-5.7` 停留·自动收起·手动确认可配）=====
      座位 4b 的 `T-20261007-24`：假 DOM 面（`ui-check` 的 U12 段：四路径读数 ＋ 7 组 D22）已覆盖**行为**；
      本段只补两件**只能在真机上看**的事 —— 它们正是"基准图与 4K 交付图要不要重拍"的机器证据：

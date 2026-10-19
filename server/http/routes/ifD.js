@@ -186,6 +186,9 @@ function mountIfD(router, deps = {}) {
 
   /* ---- 查询：GET /ifd/status（断连状态 + 计数 + source 启用情况） ---- */
   router.get('/ifd/status', (req, res) => router.json(res, 200, statusBody(ingest)));
+  /* ---- 查询：GET /ifd/endpoints（P1-1b：**按端点**链路状态；只读、加法式，供前端逐端点渲染） ---- */
+  router.get('/ifd/endpoints', (req, res) => router.json(res, 200,
+    Object.assign({ ok: true, mount: 'ifD' }, endpointLinkTracker.snapshot())));
   /* ---- 查询：GET /ifd/health（IF-D 子集，独立探针） ---- */
   router.get('/ifd/health', (req, res) => {
     const link = ingest.linkState();
@@ -199,7 +202,7 @@ function mountIfD(router, deps = {}) {
     mount: 'ifD',
     mounted: true,
     by: 'W1',
-    routes: ['POST /ifd/frame', 'GET /ifd/status', 'GET /ifd/health'],
+    routes: ['POST /ifd/frame', 'GET /ifd/status', 'GET /ifd/health', 'GET /ifd/endpoints'],
     instance: ingest,
     /** 供 `/health` 或启动日志聚合（**不改 SSE、不改前端**） */
     status: () => statusBody(ingest),

@@ -392,6 +392,18 @@ html, body {
 .link-text { font-size: 54px; font-weight: 700; }
 .link-note { font-size: 40px; color: var(--muted); margin-top: 8px; }
 
+/* P1-1b（FR-2.6 按端点）：设备状态页「联网状态」的逐端点行。
+   字号沿用 U-1 的 40 px（行文）/ 36 px（次要信息）区间，不新增 4K 字号口径 */
+.link-eps-head { font-size: 36px; color: var(--muted); opacity: .9; }
+.link-eps { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.link-ep {
+  display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  font-size: 40px; color: var(--muted); min-width: 0;
+}
+.link-ep-dot { width: 20px; height: 20px; border-radius: 50%; background: var(--idle); flex: none; align-self: center; }
+.link-ep-id { font-family: var(--mono); font-size: 40px; color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.link-ep-state { font-weight: 700; flex: none; }
+.link-ep-meta { font-size: 36px; color: var(--muted); }
 .legend {
   margin-top: 18px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
 }

@@ -2734,11 +2734,13 @@ t.section('六之八之②、`E75④` 缺列形态的**运行期**覆盖（真�
       `status.link=${e2eStatus.link && e2eStatus.link.state}；poller.enabled=${e2eStatus.sources.poller.enabled}；` +
       `/ifd/nope ⇒ ${e2eNoPath.status}`);
 
-    t.check('IF-D 装配显式性：`mountIfD()` 返回 `mounted:true` 与已注册路由清单，且**不抛**（接线成功），' +
+    t.check('IF-D 装配显式性：`mountIfD()` 返回 `mounted:true` 与已注册路由清单（**含 P1-1b 的只读端点**），且**不抛**（接线成功），' +
       '与 W6 空壳 `router.mountIfD()` 的 `mounted:false` 形成可核查对照（D23 反静默空转）',
-      ifdMount.mounted === true && ifdMount.by === 'W1' && ifdMount.routes.length === 3 &&
+      ifdMount.mounted === true && ifdMount.by === 'W1' && ifdMount.routes.length === 4 &&
+      ifdMount.routes.indexOf('GET /ifd/endpoints') >= 0 &&
       httpRouter.list().includes('POST /ifd/frame') &&
-      httpRouter.list().includes('GET /ifd/status'),
+      httpRouter.list().includes('GET /ifd/status') &&
+      httpRouter.list().includes('GET /ifd/endpoints'),
       `mounted=${ifdMount.mounted}；routes=${ifdMount.routes.join(' , ')}`);
 
     /* 轮询形态：**已实现、默认未启用**（形态不确定性 U-0.1 的留位）。不启定时器、不接线，

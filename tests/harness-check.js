@@ -4245,11 +4245,11 @@ const SAVE = () => fs.writeFileSync(process.env.DSH_W5_RESULT, JSON.stringify(OU
     `首页=${s.site && s.site.root && s.site.root.status}（内容相等=${Boolean(s.site && s.site.root && s.site.root.text === idxText)}）；` +
     `main.js=${s.site && s.site.js && s.site.js.status}/${s.site && s.site.js && s.site.js.contentType}；` +
     `nope.js=${s.site && s.site.denied && s.site.denied['/src/nope.js'] && s.site.denied['/src/nope.js'].status}`);
-  t.check('静态/W7-C③：favicon **在静态兜底层**处理，不是新注册一条路由 —— 路由清单仍 21 条（冻结基线随 `T-20261002-08` 的 `POST /notice` 由 20 → 21，**favicon 一条都没加**）；且它**不进白名单**（`resolvePath` 仍拒），而静态层计数 `served.favicon` 确实 +1（被 204 分支接住、没落 404）',
-    (s.site && s.site.routesCountAfterFavicon) === 21 &&
+  t.check('静态/W7-C③：favicon **在静态兜底层**处理，不是新注册一条路由 —— 路由清单仍**只多出 P1-1b 的一条只读端点**（22 条：冻结基线随 `T-20261002-08` 的 `POST /notice` 20 → 21，`P1-1b` 的 `GET /ifd/endpoints` 21 → 22；**favicon 一条都没加**）；且它**不进白名单**（`resolvePath` 仍拒），而静态层计数 `served.favicon` 确实 +1（被 204 分支接住、没落 404）',
+    (s.site && s.site.routesCountAfterFavicon) === 22 &&
     (s.site && s.site.faviconNotWhitelisted && s.site.faviconNotWhitelisted.ok === false) &&
     (s.site && s.site.faviconServed && s.site.faviconServed.favicon === 1),
-    `路由条数=${s.site && s.site.routesCountAfterFavicon}（冻结基线 21）；resolvePath('/favicon.ico')=${JSON.stringify(s.site && s.site.faviconNotWhitelisted)}；` +
+    `路由条数=${s.site && s.site.routesCountAfterFavicon}（冻结基线 22）；resolvePath('/favicon.ico')=${JSON.stringify(s.site && s.site.faviconNotWhitelisted)}；` +
     `served=${JSON.stringify(s.site && s.site.faviconServed)}`);
 
   t.check('静态⑧：白名单外路径（server / tests / tools / .git / data / 项目记录 / 需求文档 / 未知路径）一律 404＋JSON 形状，且响应体**不含**被禁文件内容（按真实文件的 40 字符指纹逐条比对）',
@@ -5375,15 +5375,17 @@ t.section('四之③、W7-A-3 DoD：mock-upper（真进程）→ 服务端 → m
     side.seqAfter === side.seqBefore,
     `measure_rt ${side.rowsBefore}→${side.rowsAfter}；upload_log ${side.logsBefore}→${side.logsAfter}；总线 seq ${side.seqBefore}→${side.seqAfter}`);
   t.check('§1 endpoint 矩阵④：路由清单与**冻结基线**逐条一致（本项目阶段一暴露的端点集合；增/删端点即红 —— 矩阵③的"无副作用"才有对象）。' +
-    '基线 **21 条**：`T-20261002-08`（`FR-7.12`，P0）新增 `POST /notice` 一条，其余 20 条逐字不动',
+    '基线 **22 条**：`T-20261002-08`（`FR-7.12`，P0）新增 `POST /notice`（20→21），' +
+    '`P1-1b`（`FR-2.6` 按端点）新增只读 `GET /ifd/endpoints`（21→22）；其余 20 条逐字不动',
     JSON.stringify(mx.routes) === JSON.stringify([
-      'GET /auth/status', 'GET /events', 'GET /health', 'GET /ifa/status', 'GET /ifd/health', 'GET /ifd/status',
+      'GET /auth/status', 'GET /events', 'GET /health', 'GET /ifa/status', 'GET /ifd/endpoints',
+      'GET /ifd/health', 'GET /ifd/status',
       'GET /state', 'GET /upload/last', 'GET /upload/pending', 'GET /upload/status',
       'POST /auth/change', 'POST /auth/init', 'POST /auth/login', 'POST /auth/logout',
       'POST /ifa/device', 'POST /ifa/dispatch', 'POST /ifa/material', 'POST /ifa/process',
       'POST /ifd/frame', 'POST /notice', 'POST /upload/retry'
     ]),
-    `实际清单（${mx.routes ? mx.routes.length : 0} 条，冻结基线 21）=${JSON.stringify(mx.routes)}`);
+    `实际清单（${mx.routes ? mx.routes.length : 0} 条，冻结基线 22）=${JSON.stringify(mx.routes)}`);
 
   try { harness.removeLinkSafe(w7Tmp, { recursive: true, force: true }); } catch { /* 忽略 */ }
   try { fs.rmSync(w7File, { force: true }); } catch { /* 忽略 */ }

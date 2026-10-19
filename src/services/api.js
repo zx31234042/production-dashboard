@@ -542,6 +542,48 @@ window.Api = (function () {
   }
 
   /**
+   * 取 IF-D **按端点**链路状态（`GET /ifd/endpoints`，P1-1b）—— 设备状态页「联网状态」逐端点行的真源。
+   * 响应口径（`server/http/routes/ifD.js` 的路由）：`{ok, mount:'ifD', staleMs, total, onlineCount,
+   * offlineCount, allOffline, unknownFrames, endpoints:[{endpointId, online, lastAcceptedAt, ageMs, frames}]}`
+   * 语义**只搬运、不重判**（ADR-0008 D3 / PROJECT_RULES 9.6）：`online` 是服务端按
+   * `board.config.upper.staleMs` 算好的结论，前端**不拿 ageMs 再比一次阈值**；
+   * `allOffline` **只表示"所有端点都掉线"**（单点掉线 ≠ 整套离线）—— 故这里原样保留，
+   * 不派生任何"整套断连"措辞。
+   * 成功判据＝`ok === true` **且** `endpoints` 是数组（只判 HTTP 200 会把"200 包着失败"误当成功）。
+   * @returns {Promise<{ok:boolean, staleMs?:number|null, total?:number, onlineCount?:number,
+   *                    offlineCount?:number, allOffline?:boolean, unknownFrames?:number,
+   *                    endpoints?:Array<object>, url:string, error?:string, failReason?:string,
+   *                    responseCode?:string}>}
+   */
+  function fetchIfdEndpoints() {
+    return httpJson('/ifd/endpoints').then(r => {
+      if (!r.ok) return { ok: false, url: r.url, error: r.error, failReason: r.failReason, responseCode: r.responseCode };
+      const b = r.body;
+      if (!b || b.ok !== true || !Array.isArray(b.endpoints)) {
+        const why = (b && b.err && b.err.message) || '响应体缺少 endpoints（ok!==true）';
+        return { ok: false, url: r.url, error: String(why), failReason: String(why), responseCode: String(r.status) };
+      }
+      const num = v => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+      return {
+        ok: true, url: r.url,
+        staleMs: num(b.staleMs),
+        total: num(b.total),
+        onlineCount: num(b.onlineCount),
+        offlineCount: num(b.offlineCount),
+        allOffline: b.allOffline === true,
+        unknownFrames: num(b.unknownFrames),
+        endpoints: b.endpoints.map(e => ({
+          endpointId: e && e.endpointId !== undefined && e.endpointId !== null ? String(e.endpointId) : '',
+          online: !!(e && e.online === true),
+          lastAcceptedAt: e && e.lastAcceptedAt !== undefined ? e.lastAcceptedAt : null,
+          ageMs: num(e && e.ageMs),
+          frames: num(e && e.frames)
+        }))
+      };
+    });
+  }
+
+  /**
    * 取 IF-A（接收 MES 派工/物料/工艺）状态（`GET /ifa/status`）—— 自检「看板主机网络」行的
    * 权威侧/鉴权信息真源。响应口径＝`server/services/dispatch.js` 的 `status()`：
    * `{ok, mount:'ifA', mounted, kinds, counts, last, auth:{enabled,degraded,warning,…}, authority:{…}}`
@@ -1246,6 +1288,8 @@ window.Api = (function () {
     authStatus, authLogin, authLogout, authChange, authInit,
     /* W7-B（FR-8.5 / NFR-26）：自检页真实探测所需的**只读**端点（新增，不改既有函数语义） */
     fetchHealth, fetchIfdStatus, fetchIfaStatus, fetchHealthWithDate,
+    /* P1-1b（FR-2.6 按端点）：设备状态页逐端点链路状态的**只读**取数口（只搬运服务端结论） */
+    fetchIfdEndpoints,
     serverBase, serverTimeout,
     /* IF-B */
     buildReportPayload, buildUrl, uploadReport, nextUploadId, isReceiptOk, receiptReason,

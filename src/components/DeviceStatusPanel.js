@@ -49,8 +49,152 @@ window.Components.DeviceStatusPanel = (function () {
   ];
   const MODE_COLOR = MODES.reduce((m, x) => (m[x.name] = x.color, m), {});
 
+  /* ---------------- 联网状态（FR-2.6）· P1-1b 按端点 ----------------
+     服务端模式：逐端点行 ＋ 汇总（`onlineCount/total`；`allOffline` 才说"整套离线"）；
+     演示/上位机模式：保持改前单条文案与写入顺序**逐字节不变**（`?link=off` 的判据依赖它）。 */
+
+  /** 是否服务端模式（`state.serverMode` 优先，退 `BoardConfig.dataSource`；与 BoardSource/SelfCheckProbe 同一口径） */
+  function isServerMode(state) {
+    if (state && state.serverMode === true) return true;
+    const cfg = window.BoardConfig;
+    return !!(cfg && cfg.dataSource === 'server');
+  }
+
+  /** 三态文案取自 `fieldMap` 的 `status.online` 映射（FR-2.6 的文案真源）；取不到才用同值兜底 */
+  function linkTextOf(online) {
+    const spec = window.FieldMap && window.FieldMap.upperToBoard
+      ? window.FieldMap.upperToBoard['status.online'] : null;
+    const map = spec && spec.map ? spec.map : null;
+    const key = online === true ? 'online' : 'offline';
+    return (map && map[key]) || (online === true ? '在线正常' : '离线断连');
+  }
+
+  /** 距最近接受的时长文本（**只格式化服务端给的 ageMs**，不拿本地时钟重算阈值） */
+  function ageText(ms) {
+    if (typeof ms !== 'number' || !Number.isFinite(ms)) return NO_DATA;
+    if (ms < 1000) return '刚接受';
+    if (ms < 60000) return (Math.round(ms / 100) / 10) + ' s 前';
+    if (ms < 3600000) return (Math.round(ms / 6000) / 10) + ' min 前';
+    return (Math.round(ms / 360000) / 10) + ' h 前';
+  }
+
+  /** ISO 时刻 → 本地 HH:MM:SS（取不到时返回空串，由调用方走占位） */
+  function clockOf(iso) {
+    if (!iso) return '';
+    const t = new Date(iso);
+    if (!t || Number.isNaN(t.getTime())) return '';
+    const pad = n => String(n).padStart(2, '0');
+    return pad(t.getHours()) + ':' + pad(t.getMinutes()) + ':' + pad(t.getSeconds());
+  }
+
+  /** 逐端点行 HTML。`data-online` 是机器可读落点（真机与假 DOM 判据都读它，不靠抠文案）。 */
+  function endpointRowsHtml(list) {
+    const esc = (window.Format && typeof window.Format.esc === 'function')
+      ? window.Format.esc : v => String(v === null || v === undefined ? '' : v);
+    return '<div class="link-eps">' + list.map(e => {
+      const online = !!(e && e.online === true);
+      const color = online ? 'var(--ok)' : 'var(--err)';
+      const id = esc(e && e.endpointId !== undefined && e.endpointId !== null ? e.endpointId : '(unknown)');
+      const at = clockOf(e && e.lastAcceptedAt);
+      const frames = (e && typeof e.frames === 'number' && Number.isFinite(e.frames)) ? e.frames : null;
+      const meta = '最近接受 ' + (at || NO_DATA) + ' · ' + ageText(e && e.ageMs) +
+        (frames === null ? '' : ' · 累计 ' + frames + ' 帧');
+      return '<div class="link-ep" data-ep="' + id + '" data-online="' + online + '">' +
+        '<span class="link-ep-dot" style="background:' + color + '"></span>' +
+        '<span class="link-ep-id" title="' + id + '">' + id + '</span>' +
+        '<span class="link-ep-state" style="color:' + color + '">' + esc(linkTextOf(online)) + '</span>' +
+        '<span class="link-ep-meta">' + esc(meta) + '</span></div>';
+    }).join('') + '</div>';
+  }
+
+  /**
+   * 联网状态渲染（分支边界只在这里）。
+   * · 演示/上位机模式 ⇒ 改前的 5 次写入原样保留（`stLinkDot` 2 次、`stLinkText` 2 次、`stLinkNote` 1 次）；
+   * · 服务端模式 ⇒ 汇总写 `#stLinkText`、逐端点行写 `#stLinkNote` 的 innerHTML。
+   *   读数未到/服务端 0 端点 ⇒ **显式"读取中/尚无端点数据"**，绝不写成"整套离线"或"在线正常"。
+   */
+  function renderLink(state) {
+    if (!isServerMode(state)) {
+      const online = state.device.link === 'online';
+      setStyle('stLinkDot', 'background', online ? 'var(--ok)' : 'var(--err)');
+      setStyle('stLinkDot', 'boxShadow', online ? '0 0 0 8px rgba(0,176,80,.18)' : '0 0 0 8px rgba(255,0,0,.18)');
+      setText('stLinkText', online ? '在线正常' : '离线断连');
+      setStyle('stLinkText', 'color', online ? 'var(--ok)' : 'var(--err)');
+      setText('stLinkNote', online
+        ? '上位机心跳正常 · 数据延迟 0.4 s'
+        : '数据已冻结 · 最后更新 ' + state.lastRefresh);
+      return;
+    }
+
+    const el = state.endpointLink && typeof state.endpointLink === 'object' ? state.endpointLink : null;
+    const errNote = state.endpointLinkError ? '（读数失败：' + String(state.endpointLinkError) + '）' : '';
+    if (!el) {
+      /* 服务端模式但还没取到读数：显式"读取中"，不伪造在线/离线 */
+      setStyle('stLinkDot', 'background', 'var(--idle)');
+      setStyle('stLinkDot', 'boxShadow', '0 0 0 8px rgba(128,128,128,.18)');
+      setText('stLinkText', '端点链路读取中');
+      setStyle('stLinkText', 'color', 'var(--muted)');
+      setHTML('stLinkNote', '<div class="link-eps-head">按端点链路状态 · 正在读取 /ifd/endpoints' +
+        escText(errNote) + '</div>');
+      return;
+    }
+
+    const list = Array.isArray(el.endpoints) ? el.endpoints : [];
+    const total = (typeof el.total === 'number' && Number.isFinite(el.total)) ? el.total : list.length;
+    const onlineCount = (typeof el.onlineCount === 'number' && Number.isFinite(el.onlineCount))
+      ? el.onlineCount : list.filter(e => e && e.online === true).length;
+    const staleMs = (typeof el.staleMs === 'number' && Number.isFinite(el.staleMs)) ? el.staleMs : null;
+    const unknownFrames = (typeof el.unknownFrames === 'number' && Number.isFinite(el.unknownFrames))
+      ? el.unknownFrames : 0;
+    const allOffline = el.allOffline === true && total > 0;
+
+    let color;
+    let summary;
+    if (total <= 0) {
+      /* 服务端确实 0 个端点（≠ 所有端点掉线）：既不是"在线正常"也不是"整套离线" */
+      color = 'var(--idle)';
+      summary = '尚无端点数据';
+    } else if (allOffline) {
+      color = 'var(--err)';
+      summary = '整套离线';
+    } else if (onlineCount >= total) {
+      color = 'var(--ok)';
+      summary = '在线正常';
+    } else {
+      /* 单点掉线：只陈述"部分"，**不得**出现"整套离线" */
+      color = 'var(--warn)';
+      summary = '部分端点离线';
+    }
+    const counts = total > 0 ? ' · ' + onlineCount + '/' + total + ' 端点' : '';
+
+    setStyle('stLinkDot', 'background', color);
+    setStyle('stLinkDot', 'boxShadow', color === 'var(--ok)' ? '0 0 0 8px rgba(0,176,80,.18)'
+      : (color === 'var(--err)' ? '0 0 0 8px rgba(255,0,0,.18)' : '0 0 0 8px rgba(255,192,0,.18)'));
+    setText('stLinkText', summary + counts);
+    setStyle('stLinkText', 'color', color);
+    setHTML('stLinkNote',
+      '<div class="link-eps-head">按端点链路状态 · 阈值 ' + (staleMs === null ? NO_DATA : staleMs + ' ms') +
+      (unknownFrames > 0 ? ' · 其中 ' + unknownFrames + ' 帧未带端点标识' : '') + escText(errNote) + '</div>' +
+      endpointRowsHtml(list));
+  }
+
+  /** 文本转义（失败原因等也进 innerHTML，统一走 Format.esc） */
+  function escText(v) {
+    const esc = (window.Format && typeof window.Format.esc === 'function')
+      ? window.Format.esc : x => String(x === null || x === undefined ? '' : x);
+    return esc(v);
+  }
+
   function render(state) {
     const s = state.status, t = state.task;
+
+    /* P1-1b（FR-2.6 按端点）：按既有渲染节拍**触发**按端点链路的节流取数入口。
+       取数本身在 `EndpointLinkProbe` 内（5 s 节流 ＋ 在途去重，**不新起定时器**）；
+       演示模式立即返回（不发请求、不写 state）⇒ 演示行为不变。
+       本函数只读 `state.endpointLink` 渲染（渲染层不直接 `fetch`）。 */
+    if (window.EndpointLinkProbe && typeof window.EndpointLinkProbe.ensure === 'function') {
+      window.EndpointLinkProbe.ensure(state, new Date());
+    }
 
     /* 运行模式与阶段 */
     const color = MODE_COLOR[s.mode] || 'var(--idle)';
@@ -77,15 +221,8 @@ window.Components.DeviceStatusPanel = (function () {
     setText('stShutter', fixedOrNoData(t.real.shutter, 0));
     setText('stCamDepth', fixedOrNoData(t.real.cameraDepth, 2));
 
-    /* 联网状态（FR-2.6） */
-    const online = state.device.link === 'online';
-    setStyle('stLinkDot', 'background', online ? 'var(--ok)' : 'var(--err)');
-    setStyle('stLinkDot', 'boxShadow', online ? '0 0 0 8px rgba(0,176,80,.18)' : '0 0 0 8px rgba(255,0,0,.18)');
-    setText('stLinkText', online ? '在线正常' : '离线断连');
-    setStyle('stLinkText', 'color', online ? 'var(--ok)' : 'var(--err)');
-    setText('stLinkNote', online
-      ? '上位机心跳正常 · 数据延迟 0.4 s'
-      : '数据已冻结 · 最后更新 ' + state.lastRefresh);
+    /* 联网状态（FR-2.6 / P1-1b）：服务端模式逐端点行＋汇总；演示/上位机模式保持改前文案 */
+    renderLink(state);
 
     /* 5 种运行模式与色标，当前模式高亮 */
     setHTML('stLegend', MODES.map(m =>

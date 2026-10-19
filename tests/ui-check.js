@@ -1521,6 +1521,164 @@ async function main() {
   }
 
   {
+    /* P1-1b（FR-2.6 按端点）—— 假 DOM 面（真 `DeviceStatusPanel.render()`，不另写渲染逻辑）。
+       判据钉住三件事：
+         ① **单点掉线不得报整套离线**：两端口一断一连 ⇒ 断的行 `data-online="false"` ＋「离线断连」，
+            连的行 `data-online="true"` ＋「在线正常」，汇总含 `1/2` 且**不含**「整套离线」「上位机断连」；
+         ② `allOffline=true` ⇒ 汇总**显示「整套离线」**（服务端明示"所有端点都掉线"才允许这么说）；
+         ③ 服务端 0 端点（`total:0` 且 `allOffline:false`）⇒ 既不"在线正常"也不"整套离线"（缺值口径）；
+         ④ **成对**：演示模式（`serverMode` 非真、`dataSource` 非 server）⇒ 单条文案与改前**逐字相同**。
+       `data-online` 是机器可读落点：判据不靠抠「在线/离线」字面量去猜行归属。 */
+    const D = W.Components.DeviceStatusPanel;
+    const baseState = JSON.parse(JSON.stringify(W.MockData.state));
+    const mkLink = eps => ({
+      at: '2026-09-18T14:00:00.000Z', staleMs: 5000,
+      total: eps.length,
+      onlineCount: eps.filter(e => e.online === true).length,
+      offlineCount: eps.filter(e => e.online !== true).length,
+      allOffline: eps.length > 0 && eps.every(e => e.online !== true),
+      unknownFrames: 0, endpoints: eps
+    });
+    const rowsOf = htmlText => [...String(htmlText || '').matchAll(
+      /<div class="link-ep" data-ep="([^"]*)" data-online="(true|false)">([\s\S]*?)<\/div>/g)]
+      .map(m => ({ id: m[1], online: m[2] === 'true', text: m[3].replace(/<[^>]*>/g, '') }));
+    const stateWith = link => {
+      const s = JSON.parse(JSON.stringify(baseState));
+      s.serverMode = true;
+      s.endpointLink = link;
+      return s;
+    };
+
+    /* ① 单点掉线 */
+    const partial = stateWith(mkLink([
+      { endpointId: 'PLC-A', online: true, lastAcceptedAt: '2026-09-18T14:00:00.000Z', ageMs: 800, frames: 12 },
+      { endpointId: 'PLC-B', online: false, lastAcceptedAt: '2026-09-18T13:59:20.000Z', ageMs: 40800, frames: 7 }
+    ]));
+    partial.device.link = 'online';
+    ui.out.length = 0;
+    D.render(partial);
+    const pRows = rowsOf(lastHtml(ui.out, 'stLinkNote'));
+    const pSummary = String(lastText(ui.out, 'stLinkText') || '');
+    const pNoteText = String(lastHtml(ui.out, 'stLinkNote') || '').replace(/<[^>]*>/g, '');
+    const pA = pRows.find(r => r.id === 'PLC-A') || null;
+    const pB = pRows.find(r => r.id === 'PLC-B') || null;
+    check('P1-1b（FR-2.6）**单点掉线**：两端口一断一连 ⇒ 断的端点行显示「离线断连」' +
+      '（`data-online="false"`）、连的端点行仍「在线正常」（`data-online="true"`）；汇总为 `1/2` 且' +
+      '**不出现「整套离线」/「上位机断连」**',
+      pRows.length === 2 && pA !== null && pA.online === true && /在线正常/.test(pA.text) &&
+      pB !== null && pB.online === false && /离线断连/.test(pB.text) &&
+      /1\/2/.test(pSummary) && !/整套离线/.test(pSummary + pNoteText) &&
+      !/上位机断连/.test(pSummary + pNoteText),
+      '逐端点行=' + JSON.stringify(pRows.map(r => ({ id: r.id, online: r.online, text: r.text.slice(0, 20) }))) +
+      '；汇总=' + JSON.stringify(pSummary) + '；note=' + JSON.stringify(pNoteText.slice(0, 100)));
+
+    /* ② allOffline ⇒ 整套离线 */
+    const allOff = stateWith(mkLink([
+      { endpointId: 'PLC-A', online: false, lastAcceptedAt: '2026-09-18T13:59:20.000Z', ageMs: 40800, frames: 12 },
+      { endpointId: 'PLC-B', online: false, lastAcceptedAt: '2026-09-18T13:59:10.000Z', ageMs: 50800, frames: 7 }
+    ]));
+    allOff.device.link = 'offline';
+    ui.out.length = 0;
+    D.render(allOff);
+    const oRows = rowsOf(lastHtml(ui.out, 'stLinkNote'));
+    const oSummary = String(lastText(ui.out, 'stLinkText') || '');
+    check('P1-1b（FR-2.6）`allOffline=true`（服务端明示所有端点都掉线）⇒ 汇总显示「整套离线」，' +
+      '且逐端点行仍**逐个点名离线**（不以汇总代替明细）',
+      /整套离线/.test(oSummary) && /0\/2/.test(oSummary) &&
+      oRows.length === 2 && oRows.every(r => r.online === false && /离线断连/.test(r.text)),
+      '汇总=' + JSON.stringify(oSummary) + '；行=' +
+      JSON.stringify(oRows.map(r => ({ id: r.id, online: r.online }))));
+
+    /* ③ 服务端 0 端点：既非在线正常、也非整套离线 */
+    const emptyLink = stateWith(mkLink([]));
+    ui.out.length = 0;
+    D.render(emptyLink);
+    const eSummary = String(lastText(ui.out, 'stLinkText') || '');
+    const eRows = rowsOf(lastHtml(ui.out, 'stLinkNote'));
+    check('P1-1b（FR-2.6）服务端 **0 端点**（`total:0` 且 `allOffline:false`）⇒ 汇总既不写「在线正常」' +
+      '也不写「整套离线」（"没有端点数据" ≠ "所有端点掉线"；W4 缺值口径）',
+      /尚无端点数据/.test(eSummary) && !/在线正常/.test(eSummary) && !/整套离线/.test(eSummary) &&
+      eRows.length === 0,
+      '汇总=' + JSON.stringify(eSummary) + '；行数=' + eRows.length);
+
+    /* ④ 成对：演示模式单条文案逐字不变（`?link=off` 的既有判据依赖它） */
+    const demoOn = JSON.parse(JSON.stringify(baseState));
+    demoOn.device.link = 'online';
+    ui.out.length = 0;
+    D.render(demoOn);
+    const dOnText = String(lastText(ui.out, 'stLinkText') || '');
+    const dOnNote = String(lastText(ui.out, 'stLinkNote') || '');
+    const dOnRows = String(lastHtml(ui.out, 'stLinkNote') || '');
+    const demoOff = JSON.parse(JSON.stringify(baseState));
+    demoOff.device.link = 'offline';
+    demoOff.lastRefresh = '14:00:00';
+    ui.out.length = 0;
+    D.render(demoOff);
+    const dOffText = String(lastText(ui.out, 'stLinkText') || '');
+    const dOffNote = String(lastText(ui.out, 'stLinkNote') || '');
+    const dOffRows = String(lastHtml(ui.out, 'stLinkNote') || '');
+    check('P1-1b **成对**：演示模式（`serverMode` 非真、`dataSource` 非 server）仍走改前**单条文案**，' +
+      '不渲染端点行（`#stLinkNote` 仍是纯文本、不含 `.link-ep`）',
+      dOnText === '在线正常' && dOnNote === '上位机心跳正常 · 数据延迟 0.4 s' && !/link-ep/.test(dOnRows) &&
+      dOffText === '离线断连' && dOffNote === '数据已冻结 · 最后更新 14:00:00' && !/link-ep/.test(dOffRows),
+      '演示在线：summary=' + JSON.stringify(dOnText) + ' note=' + JSON.stringify(dOnNote) +
+      '；演示离线：summary=' + JSON.stringify(dOffText) + ' note=' + JSON.stringify(dOffNote));
+
+    /* 数据源：`Api.fetchIfdEndpoints()` 走的是 `/ifd/endpoints` 且只搬运服务端结论。
+       用独立最小 vm（只装 config/fieldMap/api）＋ 桩 fetch（与 F18 同一手法：行为判据，不读源码字符串）。 */
+    const E = { err: null, good: null, bad: null, urls: [] };
+    asyncChecks.push((async () => {
+      try {
+        const sb = { location: { search: '', protocol: 'http:' }, URLSearchParams };
+        sb.window = sb;
+        sb.console = { log: () => {}, warn: () => {}, error: () => {} };
+        sb.__body = null;
+        sb.__urls = [];
+        sb.fetch = (...a) => {
+          sb.__urls.push(String(a[0]));
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(sb.__body)) });
+        };
+        sb.AbortSignal = { timeout: () => ({}) };
+        vm.createContext(sb);
+        const runSb = rel => vm.runInContext(readText(rel), sb, { filename: path.join(ROOT, rel) });
+        runSb('src/config/board.config.js');
+        runSb('src/config/fieldMap.js');
+        runSb('src/services/api.js');
+        sb.BoardConfig.board.baseUrl = '';
+        sb.__body = {
+          ok: true, mount: 'ifD', staleMs: 5000, total: 2, onlineCount: 1, offlineCount: 1,
+          allOffline: false, unknownFrames: 0,
+          endpoints: [
+            { endpointId: 'PLC-A', online: true, lastAcceptedAt: '2026-09-18T06:00:00.000Z', ageMs: 900, frames: 12 },
+            { endpointId: 'PLC-B', online: false, lastAcceptedAt: '2026-09-18T05:59:20.000Z', ageMs: 40900, frames: 7 }
+          ]
+        };
+        E.good = await sb.Api.fetchIfdEndpoints();
+        sb.__body = { ok: false, err: { message: 'IF-D 未接线' } };
+        E.bad = await sb.Api.fetchIfdEndpoints();
+        E.urls = sb.__urls;
+      } catch (e) { E.err = e.message; }
+      check('P1-1b 数据源：`Api.fetchIfdEndpoints()` 请求的 URL **恰为** `/ifd/endpoints`，' +
+        '并原样搬运 `allOffline/onlineCount/endpoints`（**不拿 ageMs 重算阈值**：`online=false` 的端点' +
+        'ageMs=40900 仍按服务端结论）；`ok:false` 的 200 响应 ⇒ 判失败（不把"200 包着失败"当成功）',
+        E.err === null && E.good !== null && E.urls.length === 2 &&
+        E.urls[0] === '/ifd/endpoints' && E.urls[1] === '/ifd/endpoints' &&
+        E.good.ok === true && E.good.total === 2 && E.good.onlineCount === 1 &&
+        E.good.offlineCount === 1 && E.good.allOffline === false && E.good.endpoints.length === 2 &&
+        E.good.endpoints[0].endpointId === 'PLC-A' && E.good.endpoints[0].online === true &&
+        E.good.endpoints[1].endpointId === 'PLC-B' && E.good.endpoints[1].online === false &&
+        E.good.endpoints[1].ageMs === 40900 &&
+        E.bad !== null && E.bad.ok === false && /IF-D 未接线/.test(String(E.bad.failReason)),
+        E.err ? '夹具执行异常：' + E.err : E.good === null ? '（无观察值）' :
+          '请求 URL=' + JSON.stringify(E.urls) +
+          '；good=' + JSON.stringify({ ok: E.good.ok, total: E.good.total, onlineCount: E.good.onlineCount,
+            allOffline: E.good.allOffline, eps: E.good.endpoints.length }) +
+          '；bad.ok=' + (E.bad && E.bad.ok) + '、failReason=' + JSON.stringify(E.bad && E.bad.failReason)
+      );
+    })());
+  }
+
+  {
     /* FR-3.14 / FR-3.16（V1.33 改判）：原判据是"设备参数对比表里帧率超标、增益临近"——
        V1.33 把相机参数移出任务数据页主体（改由二级菜单只含参数名+设定值），
        这条判据的载体（`#tkCompareTable` 的实测值/偏差/状态列）**已被移走**，故按新口径改判：
