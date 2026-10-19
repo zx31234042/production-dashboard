@@ -32,6 +32,9 @@ const orderResolver = require('../../services/orderResolver');
 /* P0-4（V1.45 第 6 处 / `DR-04`）：上位机方**不提供** `unitIndex` ⇒ 由看板按 `testStatus` 的
    **测试周期边沿**生成件序号（同工单从 1 起；帧自带则放行；待机/异常帧不构成一件）。 */
 const unitIndexInfer = require('../../services/unitIndexInfer');
+/* P0-3（V1.45 第 7 处）：缺值映射 —— 哨兵 `0xFFFF`／空值 ⇒ `null`（看板显示「—」）；
+   **0 是合法值、绝不当缺值**；对方明确给出缺失字段名时按名置 null（**不猜位图位序**）。 */
+const missingValue = require('../../services/missingValue');
 
 /** 入站形态登记表（**只报告事实**：实现与否 / 启用与否）—— 形态待 U-0.1 答复 */
 const SOURCES = Object.freeze({
@@ -102,6 +105,9 @@ function mountIfD(router, deps = {}) {
   const unitInferEnabled = deps.unitIndexInference !== false;
   const unitInfer = unitIndexInfer.createUnitIndexInferrer({ db: deps.db || null, now: orderAt });
   const unitCounts = { inferred: 0, 'frame-carried': 0, none: 0 };
+  /* ---- P0-3 缺值映射（默认启用；`deps.missingValueMapping === false` 可关） ---- */
+  const missingEnabled = deps.missingValueMapping !== false;
+  const missingStats = missingValue.createStats(orderAt);
 
   /* ---- 推送：POST /ifd/frame（固定路径；路由表未扩展，精确匹配即够） ---- */
   router.post('/ifd/frame', async (req, res) => {
@@ -134,6 +140,12 @@ function mountIfD(router, deps = {}) {
       if (ui.unitIndex !== null && (body.unitIndex === undefined || body.unitIndex === null || body.unitIndex === '')) {
         body = Object.assign({}, body, { unitIndex: ui.unitIndex });
       }
+    }
+    /* P0-3：缺值映射（哨兵/空值 ⇒ null；0 保留）—— 在落库之前归一 */
+    if (missingEnabled && body && typeof body === 'object') {
+      const mv = missingValue.mapMissingValues(body);
+      missingStats.bump(mv);
+      body = mv.frame;
     }
     const result = push.handle(body);
     if (result.outcome === OUTCOME.REJECTED) {
@@ -182,7 +194,9 @@ function mountIfD(router, deps = {}) {
     /** P0-1：`procOrderNo` 注入的计数（`injected`／`passthrough`／三类拒收 ＋ `lastReject`） */
     orderInjection: () => orderStats.snapshot(),
     /** P0-4：件序号推断的计数（`inferred`／`frame-carried`／`none`）＋ 边沿跟踪快照 */
-    unitIndexInference: () => Object.assign({ counts: Object.assign({}, unitCounts) }, unitInfer.snapshot())
+    unitIndexInference: () => Object.assign({ counts: Object.assign({}, unitCounts) }, unitInfer.snapshot()),
+    /** P0-3：缺值映射的计数（帧数／含缺值帧数／置空字段数／哨兵·空值·显式三类命中） */
+    missingValueMapping: () => missingStats.snapshot()
   };
 }
 
