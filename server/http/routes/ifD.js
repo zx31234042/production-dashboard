@@ -35,6 +35,9 @@ const unitIndexInfer = require('../../services/unitIndexInfer');
 /* P0-3（V1.45 第 7 处）：缺值映射 —— 哨兵 `0xFFFF`／空值 ⇒ `null`（看板显示「—」）；
    **0 是合法值、绝不当缺值**；对方明确给出缺失字段名时按名置 null（**不猜位图位序**）。 */
 const missingValue = require('../../services/missingValue');
+/* P1-1（服务端）：按端点链路状态（`FR-2.6`；单点掉线不报整套离线）。阈值真源＝`board.config.upper.staleMs`。 */
+const endpointLink = require('../../services/endpointLink');
+const boardConfig = require('../../../src/config/board.config');
 
 /** 入站形态登记表（**只报告事实**：实现与否 / 启用与否）—— 形态待 U-0.1 答复 */
 const SOURCES = Object.freeze({
@@ -108,6 +111,11 @@ function mountIfD(router, deps = {}) {
   /* ---- P0-3 缺值映射（默认启用；`deps.missingValueMapping === false` 可关） ---- */
   const missingEnabled = deps.missingValueMapping !== false;
   const missingStats = missingValue.createStats(orderAt);
+  /* ---- P1-1 端点链路跟踪（内存态；阈值沿用配置真源，缺省 5000 ms） ---- */
+  const linkStaleMs = (deps.staleMs !== undefined && deps.staleMs !== null)
+    ? deps.staleMs
+    : (boardConfig.upper ? boardConfig.upper.staleMs : undefined);
+  const endpointLinkTracker = endpointLink.createEndpointLinkTracker({ now: orderAt, staleMs: linkStaleMs });
 
   /* ---- 推送：POST /ifd/frame（固定路径；路由表未扩展，精确匹配即够） ---- */
   router.post('/ifd/frame', async (req, res) => {
@@ -148,6 +156,10 @@ function mountIfD(router, deps = {}) {
       body = mv.frame;
     }
     const result = push.handle(body);
+    /* P1-1：只有**被接受**的帧（stored／duplicate／raw-500ms）才算链路证据；拒收帧不算 */
+    if (result.outcome !== OUTCOME.REJECTED) {
+      endpointLinkTracker.record(body, orderAt());
+    }
     if (result.outcome === OUTCOME.REJECTED) {
       const status = result.error.code === 'NO_DB' ? 503 : 400;
       /* 复用 router 统一错误体形状（`{ok:false, err:{code,httpStatus,message}}`），
@@ -196,7 +208,9 @@ function mountIfD(router, deps = {}) {
     /** P0-4：件序号推断的计数（`inferred`／`frame-carried`／`none`）＋ 边沿跟踪快照 */
     unitIndexInference: () => Object.assign({ counts: Object.assign({}, unitCounts) }, unitInfer.snapshot()),
     /** P0-3：缺值映射的计数（帧数／含缺值帧数／置空字段数／哨兵·空值·显式三类命中） */
-    missingValueMapping: () => missingStats.snapshot()
+    missingValueMapping: () => missingStats.snapshot(),
+    /** P1-1：按端点的链路状态（`FR-2.6`；`allOffline` 只表示"所有端点都掉线"） */
+    endpointLink: () => endpointLinkTracker.snapshot()
   };
 }
 
