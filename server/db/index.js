@@ -56,7 +56,7 @@ const path = require('node:path');
  *    ③`schema.sql` 的新建库路径加同一句索引。三处缺一不可。
  *    另：**本次不涉及任何列**（只建索引）⇒ `tests/db-check.js` 的 `LEGACY_BASELINE_COLUMNS` 维护纪律
  *    不受影响（那份基线只声明"列"，新索引不进基线、也不需要进）。 */
-const SCHEMA_VERSION = '8';
+const SCHEMA_VERSION = '9';
 
 /** 建表脚本位置（与本文件同目录） */
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
@@ -183,6 +183,16 @@ const STRUCTURE_UPGRADES = [
      ③ **不得**顺带改 `measure_rt` 的唯一索引 `ux_measure_rt`（DR-13 的幂等键列集固定为
         equip_code + proc_order_no + collect_time，与本题无关，动它等于换去重口径）。 */
   'ALTER TABLE measure_rt ADD COLUMN unit_index INTEGER',
+  /* `DR-13`（V1.45 第 11 处，2026-10-19）：`measure_rt` 增列 `endpoint`（端点标识）并**进唯一键**。
+     ① **列追加在表尾**（`schema.sql` 的 measure_rt 末尾）⇒ 前 13 列列序不变，`repo/measure.js` 的
+        按位置绑定与 `logic-check` 的列序断言照旧；`repo/measure.js` 的 `toParams()` / `INSERT_SQL`
+        把 `endpoint` 放在**末位**。
+     ② **本步骤只补列**；**索引重建**（三列 → 四列）与**旧行回填**（`endpoint = equip_code`）由
+        `migrateMeasureRtEndpoint()` 在 `initSchema()` 尾部完成（`STRUCTURE_UPGRADES` 只接受
+        `ADD COLUMN` / `CREATE INDEX` 两种形态，见下方形态白名单）。
+     ③ 列可空、重复执行报 `duplicate column name` 被容错吞掉 ⇒ 天然幂等；`schema.sql` 已同步该列 ⇒
+        `SCHEMA_VERSION` 升 `'8' → '9'`。 */
+  'ALTER TABLE measure_rt ADD COLUMN endpoint TEXT',
   /* `E28`（2026-10-07，负责人原文："`E28` 按建议 —— `measure_rt` 增 `cameraDepth` 列，与
      `depth` 严格区分；同批走迁移清单与 `db-check`"）：`measure_rt` 增列 `camera_depth`
      （**相机自身水下深度** `cameraDepth`），与 `measure_depth`（**航行器水下深度** `depth`）
@@ -749,6 +759,46 @@ function openDb(dbPath, options = {}) {
  *    无迁移时 `migrated=false`。
  *    `preMigrationBackup` 为本次迁移前备份的结果：`{needed, ok, path, name, dir, bytes, engine,
  *    reason, at, audit, auditDegraded}`；`needed=false` 时 `path=null`（**没有产出备份**，这是幂等的可核查证据）。 */
+/**
+ * `DR-13`（V1.45 第 11 处）迁移：把 `measure_rt` 的**去重键加上端点标识**。
+ *
+ * 三步（幂等、事务）：
+ *   A. `ALTER TABLE measure_rt ADD COLUMN endpoint TEXT`（仅当列不存在）
+ *   B. 回填 `endpoint = equip_code`（仅当有 NULL）—— **不留 NULL**：SQLite 唯一索引里 NULL 互不相等，
+ *      留 NULL 会让"升级前的行"与"升级后同帧"判不成重复 ⇒ 多插一行。回填值＝`services/endpointLink.js`
+ *      的 `resolveEndpointId()` 回退链的默认值。
+ *   C. 唯一索引重建为四列（仅当索引列不符）—— **只加列不重建索引＝去重口径没变**。
+ *
+ * 失败 ⇒ 事务回滚并**抛出**（调用方拒绝启动，不静默带病运行）。
+ *
+ * @returns {{addedColumn:boolean, backfilled:number, rebuiltIndex:boolean}}
+ */
+function migrateMeasureRtEndpoint(db) {
+  db.exec('BEGIN');
+  try {
+    const cols = db.prepare('PRAGMA table_info(measure_rt)').all().map(c => c.name);
+    const addedColumn = !cols.includes('endpoint');
+    if (addedColumn) db.exec('ALTER TABLE measure_rt ADD COLUMN endpoint TEXT');
+
+    const nullRows = db.prepare('SELECT COUNT(*) AS c FROM measure_rt WHERE endpoint IS NULL').get().c;
+    if (nullRows > 0) db.exec('UPDATE measure_rt SET endpoint = equip_code WHERE endpoint IS NULL');
+
+    const want = ['equip_code', 'proc_order_no', 'endpoint', 'collect_time'];
+    const hasIdx = db.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='index' AND name='ux_measure_rt'").get().c;
+    const cur = hasIdx ? db.prepare('PRAGMA index_info(ux_measure_rt)').all().map(c => c.name) : [];
+    const rebuiltIndex = JSON.stringify(cur) !== JSON.stringify(want);
+    if (rebuiltIndex) {
+      db.exec('DROP INDEX IF EXISTS ux_measure_rt');
+      db.exec('CREATE UNIQUE INDEX ux_measure_rt ON measure_rt(equip_code, proc_order_no, endpoint, collect_time)');
+    }
+    db.exec('COMMIT');
+    return { addedColumn, backfilled: nullRows, rebuiltIndex };
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* 已回滚 */ }
+    throw new Error(`migrateMeasureRtEndpoint 失败（已回滚，拒绝带病运行）：${e.message}`);
+  }
+}
+
 function initSchema(db, now, options = {}) {
   if (options.skipBackup || options.skipPreMigrationBackup) {
     /* 不提供"跳过"开关：旧库迁移会 DROP 旧表，跳过备份 = 不可恢复。显式拒绝优于"悄悄支持"。 */
@@ -808,9 +858,12 @@ function initSchema(db, now, options = {}) {
     preMigrationBackup.backfillAudit = backfill;
   }
 
+  /* `DR-13`（V1.45 第 11 处）：把 `measure_rt` 去重键加上端点标识（幂等；失败即抛 ⇒ 调用方拒绝启动） */
+  const endpointMigration = migrateMeasureRtEndpoint(db);
+
   return {
     schemaVersion: SCHEMA_VERSION, fingerprint: schemaFingerprint(), appliedAt: at,
-    migration, preMigrationBackup, migrationPlan: plan
+    migration, preMigrationBackup, migrationPlan: plan, endpointMigration
   };
 }
 
@@ -936,6 +989,7 @@ module.exports = {
   loadSqlite,
   openDb,
   initSchema,
+  migrateMeasureRtEndpoint,
   migrateLegacyStandard,
   legacyStandardState,
   planMigration,

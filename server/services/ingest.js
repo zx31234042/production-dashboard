@@ -72,6 +72,8 @@ const measureRepo = require('../repo/measure');
 const platformClock = require('../../platform/clock');
 const boardConfig = require('../../src/config/board.config.js');
 const { KIND: EVENT_KIND } = require('./eventBus');
+/* 端点标识的唯一口径（V1.45 第 11 处 / `DR-13`）：会话链路状态与落库去重键**共用**这一处回退链 */
+const { resolveEndpointId } = require('./endpointLink');
 
 /* ---------------- 一、契约常量（全部可从配置/需求原文追到出处） ---------------- */
 
@@ -665,6 +667,9 @@ function createIngest(options = {}) {
       const row = {
         equipCode: v.frame[FIELD.equipCode],
         procOrderNo: v.frame[FIELD.procOrderNo],
+        /* 端点标识（V1.45 第 11 处 / `DR-13`）：与会话链路状态**同一取值**（`services/endpointLink.js`
+           的 `resolveEndpointId()`，回退链 `endpointId→endpoint→unitId→equipCode`）—— 不另造第二套口径。 */
+        endpoint: resolveEndpointId(v.frame),
         collectTime: v.collectTimeSec,          // **截断到秒**（DR-16：落库维持秒级）
         unitIndex: unit.ok ? unit.value : null, // 缺 / 非法 ⇒ NULL（＝"这一帧没有件序号"）
         depth: v.frame[FIELD.depth],

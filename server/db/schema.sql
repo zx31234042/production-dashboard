@@ -126,10 +126,16 @@ CREATE TABLE IF NOT EXISTS measure_rt (
   camera_depth  REAL,                            -- 相机自身水下深度 cameraDepth
   test_status   INTEGER,                         -- 0 待机 / 1 测试中 / 2 测试完成 / 3 设备异常
   collect_time  TEXT NOT NULL,
-  created_at    TEXT NOT NULL
+  created_at    TEXT NOT NULL,
+  endpoint      TEXT                             -- 端点标识（V1.45 第 11 处 / DR-13：**进唯一键**）。**追加在表尾**，
+                                                 --   以保住 `repo/measure.js` 的"按位置绑定"与前 13 列的列序
+                                                 --   （`logic-check` 有列序断言）；旧库由 STRUCTURE_UPGRADES 补列 ＋
+                                                 --   `migrateMeasureRtEndpoint()` 回填＝equip_code 并重建四列唯一索引
 );
--- DR-13：以 equipCode + procOrderNo + collectTime 为去重键
-CREATE UNIQUE INDEX IF NOT EXISTS ux_measure_rt ON measure_rt(equip_code, proc_order_no, collect_time);
+-- DR-13：以 equipCode + procOrderNo + **endpoint** + collectTime 为去重键（V1.45 第 11 处，2026-10-19：
+--   现场多端点（多 PLC）下同秒两端口各一帧不得互相判重；旧库的三列索引由 db/index.js 的
+--   migrateMeasureRtEndpoint() 幂等重建为四列）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_measure_rt ON measure_rt(equip_code, proc_order_no, endpoint, collect_time);
 CREATE INDEX IF NOT EXISTS ix_measure_rt_task_time ON measure_rt(proc_order_no, collect_time);
 /* `E170`（2026-10-05，实现 `E166` 的首选修法）：按**采集时刻**取窗口的索引。
    上面两个索引的**首列都不是 `collect_time`** ⇒ 服务不了"只按 `collect_time` 取半开区间"的那条查询

@@ -64,17 +64,24 @@ function toParams(row, nowIso) {
     row.cameraDepth === undefined ? null : row.cameraDepth,
     row.testStatus === undefined ? null : row.testStatus,
     assertCollectTime(row.collectTime),
-    nowIso
+    nowIso,
+    /* 端点标识（V1.45 第 11 处 / `DR-13`）：**追加在参数表尾**（与 `schema.sql` 的表尾列、`INSERT_SQL` 的末位一致）。
+       未提供 ⇒ 记为该设备的**默认端点**（＝`equipCode`），与 `services\endpointLink.js` 的
+       `resolveEndpointId()` 回退链同口径 —— 旧调用方无需改动，且**不会**因 NULL
+       （SQLite 唯一索引里 NULL 互不相等）而使去重失效。 */
+    (row.endpoint === undefined || row.endpoint === null || String(row.endpoint).trim() === '')
+      ? row.equipCode : String(row.endpoint).trim()
   ];
 }
 
-/* 列清单＝`server/db/schema.sql` 的 measure_rt 声明次序（unit_index 第 3 位，紧邻 proc_order_no）。
-   ⚠ 幂等键 `ux_measure_rt(equip_code, proc_order_no, collect_time)`（DR-13）**未动** —— 加列不改去重口径。 */
+/* 列清单＝`server/db/schema.sql` 的 measure_rt 声明次序（`endpoint` **追加在表尾**，与前 13 列的列序解耦）。
+   ⚠ 幂等键 `ux_measure_rt(equip_code, proc_order_no, endpoint, collect_time)`（`DR-13`，V1.45 第 11 处）
+   —— 2026-10-19 起**端点标识已入键**（此前为三列、无 endpoint）。 */
 const INSERT_SQL =
   `INSERT OR IGNORE INTO measure_rt(
      equip_code, proc_order_no, unit_index, measure_depth, speed, velocity_x, velocity_y,
-     frame_rate, gain, shutter, camera_depth, test_status, collect_time, created_at)
-   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+     frame_rate, gain, shutter, camera_depth, test_status, collect_time, created_at, endpoint)
+   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 /**
  * 插入一帧（按 DR-13 去重）。
