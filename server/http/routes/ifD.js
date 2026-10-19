@@ -26,6 +26,9 @@
 
 const { createIngest, OUTCOME } = require('../../services/ingest');
 const { errorBody } = require('../router');
+/* P0-1（V1.45 第 8 处 / `C-115`）：`procOrderNo` **不由上位机方提供** ⇒ 在落库前由接收侧按
+   `IF-A`（`task` 表）的**派工生效时间窗**注入；窗口外／无派工**不落库＋计数＋告警**（不兜底、不编造）。 */
+const orderResolver = require('../../services/orderResolver');
 
 /** 入站形态登记表（**只报告事实**：实现与否 / 启用与否）—— 形态待 U-0.1 答复 */
 const SOURCES = Object.freeze({
@@ -87,10 +90,36 @@ function mountIfD(router, deps = {}) {
   }
   const ingest = resolveIngest(deps);
   const push = ingest.createPushHandler({ path: '/ifd/frame' });
+  /* ---- P0-1 注入器（默认启用；`deps.orderInjection === false` 可关，供需要"原样透传"的测试用） ---- */
+  const orderInjectionEnabled = deps.orderInjection !== false;
+  const orderAt = () => (typeof deps.now === 'function' ? deps.now() : new Date());
+  /* `now` 是**时钟注入出口**（ADR-0003 D17）：`deps.now` 缺省时才退到 `new Date()`，与 ingest 同口径 */
+  const orderStats = orderResolver.createStats(orderAt);
 
   /* ---- 推送：POST /ifd/frame（固定路径；路由表未扩展，精确匹配即够） ---- */
   router.post('/ifd/frame', async (req, res) => {
-    const body = await router.readJson(req);          // 坏 JSON ⇒ 400、超限 ⇒ 413（router 统一口径）
+    const raw = await router.readJson(req);          // 坏 JSON ⇒ 400、超限 ⇒ 413（router 统一口径）
+    /* 归一：兼容 `{frame:{…}}` 包装形态（`push.handle` 两种都收，注入只需要平面帧） */
+    const flat = raw && typeof raw === 'object' && raw.frame && typeof raw.frame === 'object' && !Array.isArray(raw.frame)
+      ? raw.frame : raw;
+    let body = raw;
+    if (orderInjectionEnabled) {
+      const inj = orderResolver.injectOrderIntoFrame(deps.db || null, flat, { at: orderAt() });
+      if (!inj.ok) {
+        /* 不落库 ＋ 计数 ＋ 告警（口径：V1.45 第 8 处；不兜底、不编造工单号） */
+        orderStats.bump(inj.code, { event: 'POST /ifd/frame', at: inj.at, reason: inj.reason });
+        if (deps.logger && typeof deps.logger.warn === 'function') {
+          deps.logger.warn(`[ifD] 帧被拒：无法确定当前工单（${inj.code}）—— ${inj.reason}`);
+        }
+        return router.json(res, 400, Object.assign(errorBody(inj.code, inj.reason, 400), {
+          ok: false, mount: 'ifD', outcome: 'rejected-no-order', at: inj.at,
+          err: Object.assign(errorBody(inj.code, inj.reason, 400).err, { field: 'procOrderNo', reason: inj.reason }),
+          orderInjection: orderStats.snapshot()
+        }));
+      }
+      orderStats.bump(inj.source === 'injected' ? 'injected' : 'passthrough');
+      body = inj.frame;
+    }
     const result = push.handle(body);
     if (result.outcome === OUTCOME.REJECTED) {
       const status = result.error.code === 'NO_DB' ? 503 : 400;
@@ -134,7 +163,9 @@ function mountIfD(router, deps = {}) {
     routes: ['POST /ifd/frame', 'GET /ifd/status', 'GET /ifd/health'],
     instance: ingest,
     /** 供 `/health` 或启动日志聚合（**不改 SSE、不改前端**） */
-    status: () => statusBody(ingest)
+    status: () => statusBody(ingest),
+    /** P0-1：`procOrderNo` 注入的计数（`injected`／`passthrough`／三类拒收 ＋ `lastReject`） */
+    orderInjection: () => orderStats.snapshot()
   };
 }
 
