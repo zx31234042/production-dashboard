@@ -542,7 +542,7 @@ const DELIVERY_LEDGER = [
     basis: '需求 :844「IF-D（上位机）与 IF-A/IF-B（MES）联调、补传验证记录」：**接口契约侧**文档在库（致上位机方接口需求函、致 MES 方接口澄清函、模拟上位机与模拟 MES 的说明）；但**联调本身尚未发生**（三方答复待 09-25，Q-21/Q-23），无联调记录、无补传验证记录文档，故记部分。' },
   { name: '测试报告', verdict: 'partial',
     paths: ['tests\\README.md', '项目记录\\审查报告-2026-09-19.md', '项目记录\\审查报告-2026-09-19-第二次.md'],
-    basis: '需求 :845「功能、性能、4K 显示、断链、7×24 稳定性」：机器可复跑的测试资产与两轮审查报告在库（`tests\\` 13 个离线门禁 + 脚本表 + 缺陷清单与处置）。但**面向交付的《测试报告》未成文**，且需求点名的"性能 / 4K 显示 / 7×24 稳定性"三项**无结论**（7×24 稳定性即 AC-07：现有证据只有 `stress-check` 的**浸泡预设 8 小时**（`--soak` / `--hours 8`；该脚本**默认运行只有 20 分钟**，8 小时不是默认值），且在本受限环境整脚本跳过），故记部分。' },
+    basis: '需求 :845「功能、性能、4K 显示、断链、7×24 稳定性」：机器可复跑的测试资产与两轮审查报告在库（`tests\\` 13 个离线门禁 + 脚本表 + 缺陷清单与处置）。但**面向交付的《测试报告》未成文**，且需求点名的"性能 / 4K 显示 / 7×24 稳定性"三项中**两项无结论**（性能 / 4K 显示；7×24 稳定性已由 AC-07 承接：**2026-10-15 已取得现场 7 日真时钟台账、`--verify-soak` 判据 5/5**，见 `tests\README.md` §3；此前唯一证据只有 `stress-check` 的**浸泡预设 8 小时**（`--soak` / `--hours 8`；该脚本**默认运行只有 20 分钟**，8 小时不是默认值），且在本受限环境整脚本跳过），故记部分。' },
   { name: '用户操作手册 / 运维手册', verdict: 'missing', paths: [],
     basis: '需求 :846「解锁、维保录入、公告维护、故障处理」：仓库内无面向用户/运维的手册；`README.md` §三「演示交互」与 §四「数据口径」是**开发者向**说明，不构成本交付物；DEP-07 已登记部署/运维/排障手册缺失（declared-gap）。记"待交付"。' },
   { name: '培训与验收报告', verdict: 'missing', paths: [],
@@ -620,17 +620,15 @@ const AC_MAP = [
     '"与 PC 上位机源头抽样比对一致率 100%"需要**真实上位机数据源**逐点抽样比对；Demo 用的是 mock 报文（contract-check 只证明缺字段不清零、字段映射可配置），**无从比对源头数据**，故为已声明缺口。'],
   ['AC-05', 'backend-phase', '', '',
     'IF-D 与上位机、IF-A/IF-B 与 MES 的**联调通过**属三方现场联调（IF-B.1～B.7/B.10、IF-D.7/D.10/D.12 亦整段归 backend-phase）；现有机器证据只到**契约层**（13 字段上报报文、两种回执风格、失败进入待补传队列——contract-check），接口函数名有断言而实现整批 pending，不足以构成联调结论。'],
-  ['AC-07', 'declared-gap', 'stress-check.js',
+  ['AC-07', 'covered-direct', 'stress-check.js',
     '① 连续 ≥7 天无重启（完整证据日 ≥7 ＋ 逐日链连续 ＋ dayIndex 逐行 +1 ＋ uptimeSec 严格递增 ＋ restarts === 0）',
-    '（`T-20261006-04` 改判，2026-10-06）**判据已可复跑，但截至今日无 ≥7 天真实证据** —— 故仍记 `declared-gap`，**不因"判据存在"记 covered**（`E62`：建表 ≠ 功能覆盖）。'
-    + '① 判据本体落在**既有**脚本 `tests\\stress-check.js` 里（**不新开第 18 个门禁脚本**，遵 `E57` 的刹车）：'
-    + '`node tests\\stress-check.js --verify-soak <证据日台账.jsonl>` —— 5 条判据（①连续≥7天无重启 ②无崩溃 ③无内存泄漏 ④采样连续性 ⑤可作证性）逐条可判、'
-    + '可证伪（D22 三支：造一处重启／末日 rss 翻倍／maxGapSec 超阈 ⇒ 必红并指名第几条判据与第几行）、可复跑（纯函数 `verifySoakLedger()`）。'
-    + '② 留证：`--hours 168`（＝7×24 h、真实时钟 86400 s/证据日）**逐日追加一行 JSON 台账**（`--soak-ledger`，逐行 `fsyncSync`）；'
-    + '③ **但本轮没有任何一次 ≥7 天真实时钟的留证**：唯一长跑证据仍是**浸泡预设 8 小时**（真源 `DSH_STRESS_HOURS || 8`；该脚本**默认只跑 2 分钟**），'
-    + '而"跳过 ≠ 通过"、8 小时 ≠ 7 天、**压缩时钟（`--day-seconds`）明确不作证据**（ADR-0010 D2 三档可作证性）⇒ 现有真实证据 **0 条**。'
-    + '① 的原文：验收要求"连续运行 ≥7 天无重启、无崩溃、无内存泄漏"（需求 :862）；本项**只能**由泡机窗口里跑满 168 h 后 `--verify-soak` 判读，'
-    + '且泡机期间任何代码改动都**作废该轮**（不许续跑，见 stress-check 的运行手册草稿）。'],
+    '（`T-20261006-04` 建判据；2026-10-15 取得机器证据后由 `declared-gap` 改判 `covered-direct`，**判据一字未改**）'
+    + '① 判据本体落在**既有**脚本 `tests\\stress-check.js`（**不新开第 18 个门禁脚本**，遵 `E57` 的刹车）：'
+    + '`node tests\\stress-check.js --verify-soak <证据日台账.jsonl>` —— 5 条判据逐条可判、可证伪（D22 三支：造一处重启／末日 rss 翻倍／maxGapSec 超阈 ⇒ 必红并指名第几条判据与第几行）、可复跑（纯函数 `verifySoakLedger()`）。'
+    + '② 留证：`--hours 168`（＝7×24 h、真实时钟 86400 s/证据日）逐日追加一行 JSON 台账（`--soak-ledger`，逐行 `fsyncSync`）。'
+    + '③ 本次证据：现场机 **DESKTOP-1K4A22L** 于 **2026-10-08 11:31:25（北京）** 起跑，台账 `soak-7day-20261008-113121.jsonl`（4,952 B、8 个证据日、sha256 `c68ba78a314f0c5e7c5a2ddafbc6278afcac53ece78de8ae9d2167bf2a890873`，`clockCompressed=false` ∧ `daySeconds=86400`）经 `--verify-soak` 判 **5/5、失败 0、exit=0**：完整证据日 7／`restarts` 全 0；实到 604800.044 s ≥ 计划 604800 s、`exitReason=\'completed\'`、`errorCount` 0；`rssMax` 57,233,408 → 60,620,800 B（1.059× ≤ 1.25×）；`maxGapSec` 全 ≤210 s、实测最大 60.036 s；真时钟可作证。'
+    + '⑤ 判据原文：验收要求"连续运行 ≥7 天无重启、无崩溃、无内存泄漏"（需求 :862）；本项只能由泡机窗口里跑满 168 h 后 `--verify-soak` 判读。',
+    + '④ 台账在 `来源文件\\`（已 gitignore、不入库）⇒ `tests\\README.md` §3 记**可复跑方法 ＋ 本次读数**（ADR-0010）。'],
   ['AC-11', 'declared-gap', '', '',
     '"看板软硬件成套实物交付 + 现场演示验收通过 + 与父项目 M6 对齐"属**商务与硬件交付**条款（与 DEP-12～DEP-15 同类），验收动作在现场/合同阶段，仓库内无对应机器证据，亦非纯软件可验。'],
   ['AC-12', 'declared-gap', '', '',
@@ -1489,30 +1487,35 @@ function main() {
     console.log(`    ${id}  ${status.padEnd(16)} ${(script || '无').padEnd(18)} ${basis}`);
   }
 
-  /* AC-07 专项如实标注：要求 ≥7 天，证据只有**浸泡预设 8 小时**（`--soak` / `--hours 8` 才跑 8 小时，默认仅 5 分钟）且整脚本跳过 —— 不构成满足。
-     为什么单独立一条：这是本次唯一"证据看着有、其实不成立"的条目，必须被定点变异之外的第二道机器检查钉住，
-     否则以后很容易被写成"已有浸泡预设 8 小时长跑 ⇒ 基本满足"。⚠ 判据读的是**代码**里的字面量（`process.env.DSH_STRESS_HOURS || N`），不读注释里的示例。 */
-  /* AC-07 专项如实标注（`T-20261006-04` 改判，2026-10-06）：
+  /* AC-07 专项如实标注（`T-20261006-04` 建判据；2026-10-15 取得机器证据后改判）：
      立案＝这是唯一"证据看着有、其实不成立"的条目，必须被定点变异之外的第二道机器检查钉住。
-     改判要点（三条都进机器判据，缺一即红）：
-       ① **状态仍是 `declared-gap`** —— 判据存在 ≠ 已满足（`E62`：建表 ≠ 功能覆盖）；
+     改判要点（缺一即红）：
+       ① **状态必须是 `covered-direct`** —— 但"判据存在"本身仍不构成满足：必须有**跑满 ≥7 天的真时钟台账**判绿；
        ② **判据本体必须真在 `tests\stress-check.js` 里**（`verifySoakLedger()` ＋ `--verify-soak`），
           且 AC 表登记的"证据文本"必须是该脚本里的**逐字子串**（由本节第 2 步的通用检查兜住）；
-       ③ **AC-07 的"依据"必须同时写出**"可复跑"、"无 ≥7 天"、"`--verify-soak`" 三个事实 ——
-          少写一个就退化成含糊话（`E158` 同族：让后来者照着错/含糊的事实推理）。
-     ⚠ 判据读的是**代码里的字面量**（`process.env.DSH_STRESS_HOURS || N` 与判据函数名），不读注释里的示例。 */
+       ③ **依据必须写出可复跑方法与本次读数**："可复跑"、"`--verify-soak`"、台账 sha256、
+          现场机与起跑时刻、5/5 读数 —— 少一个就退化成"已通过"三个字（`E158` 同族）。
+      ⚠ 判据仍读**代码里的字面量**（`process.env.DSH_STRESS_HOURS || N` 与判据函数名），不读注释里的示例；
+        判据①～⑤的阈值/口径**一字未改**（见 `tests\README.md` §5.4(c)）。 */
   const ac07reqDays = Number((acUniverse.get('AC-07') || '').match(/≥\s*(\d+)\s*天/)?.[1] || 0);
   const stressSrc07 = fs.readFileSync(path.join(TESTS, 'stress-check.js'), 'utf8');
   const stressHours = Number(stressSrc07.match(/process\.env\.DSH_STRESS_HOURS\s*\|\|\s*(\d+)/)?.[1] || 0);
   const ac07rec = acOwner.get('AC-07') || ['', '', '', ''];
+  const ac07Basis = ac07rec[3] || '';
   const ac07JudgeInScript = stressSrc07.includes('function verifySoakLedger(') && stressSrc07.includes('--verify-soak');
-  t.check('AC-07 如实登记为"有可复跑判据、但无 ≥7 天真实证据"（改判后仍 declared-gap、不因"判据存在"升 covered；判据本体须真在 stress-check 里）',
+  const ac07ShaOk = /c68ba78a314f0c5e7c5a2ddafbc6278afcac53ece78de8ae9d2167bf2a890873/.test(ac07Basis);
+  const ac07HostOk = /DESKTOP-1K4A22L/.test(ac07Basis);
+  const ac07StartOk = /2026-10-08 11:31:25/.test(ac07Basis);
+  const ac07ReadOk = /5\/5/.test(ac07Basis);
+  t.check('AC-07 如实登记为"判据可复跑且已取得 ≥7 天真时钟台账机器证据"（`covered-direct`；判据本体须真在 stress-check 里，依据须写出复跑方法/台账 sha256/现场机与起跑时刻/5 条读数）',
     ac07reqDays >= 7 && stressHours > 0 && stressHours < ac07reqDays * 24 &&
-    ac07rec[0] === 'declared-gap' && ac07rec[1] === 'stress-check.js' &&
+    ac07rec[0] === 'covered-direct' && ac07rec[1] === 'stress-check.js' &&
     ac07JudgeInScript &&
-    /可复跑/.test(ac07rec[3] || '') && /无\s*≥?\s*7\s*天/.test(ac07rec[3] || '') && /--verify-soak/.test(ac07rec[3] || ''),
+    /可复跑/.test(ac07Basis) && /--verify-soak/.test(ac07Basis) &&
+    ac07ShaOk && ac07HostOk && ac07StartOk && ac07ReadOk,
     `AC-07 要求 ≥${ac07reqDays} 天、stress-check 浸泡预设 ${stressHours} 小时（默认运行 2 分钟）、`
-    + `登记状态 ${ac07rec[0]}、证据脚本 ${ac07rec[1] || '无'}、判据本体${ac07JudgeInScript ? '在库' : '**缺**'}（verifySoakLedger ＋ --verify-soak）`);
+    + `登记状态 ${ac07rec[0]}、证据脚本 ${ac07rec[1] || '无'}、判据本体${ac07JudgeInScript ? '在库' : '**缺**'}（verifySoakLedger ＋ --verify-soak）；`
+    + `依据含台账 sha256=${ac07ShaOk}／现场机=${ac07HostOk}／起跑时刻=${ac07StartOk}／5 条读数=${ac07ReadOk}`);
 
   const acSharedScripts = [...new Set(AC_MAP.map(([, , s]) => s).filter(Boolean))]
     .filter(s => [...MAP_SRC.values()].includes(s));
