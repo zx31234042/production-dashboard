@@ -204,7 +204,7 @@ const SURFACE_WIDE_BY_DESIGN = Object.freeze({
 });
 
 /* ==========================================================================
-   四、登记表本体（17 个脚本；`why` 即依据）
+   四、登记表本体（22 个脚本；`why` 即依据）
    --------------------------------------------------------------------------
    写法约定：`dir('src/**')` 表示"该目录下**全部**文件"（对缓存是保守方向）；仓内路径一律
    posix 风格（`/`）；`dynamic` 见头部口径①。
@@ -437,6 +437,38 @@ const FACE = {
     dyn('tests/._verify/**（浸泡台账 .jsonl、截图与日志）', '台账由本轮长跑**边跑边追加**，内容运行时才知道'),
     dyn('本脚本自身字节（sha256 写进台账）与 Edge 可执行体', '台账记 scriptSha256 以自证"哪一版脚本跑的"；'
       + 'Edge／MSEDGE_PATH 是外部依赖'),
+  ],
+  /* 5 支“自证探针”（座位 4b，2026-10-19 从 `tools\` 收编进 `run-all`）：它们只读**被测服务端的接入口径**
+     （require 闭包：db／services／http 路由）＋ 测试夹具，不读 `src\**`／文档 ⇒ 面与 `db-check` 同族、可缓存。 */
+  'order-inject-probe': [
+    dir('server/**', 'require 闭包：server/db/index.js、services/{ingest,orderResolver}.js、http/routes/ifD.js、http/router.js'),
+    dir('platform/**', 'server/** 的传递 require：platform/{paths,log,clock,id}.js'),
+    file('tests/env.js', WHY_ENV),
+    file('tests/lib/harness.js', WHY_HARNESS_LIB + '：makeTempDb（一用例一库）'),
+  ],
+  'unit-index-probe': [
+    dir('server/**', 'require 闭包：server/db/index.js、services/{ingest,unitIndexInfer}.js、http/routes/ifD.js、http/router.js'),
+    dir('platform/**', 'server/** 的传递 require：platform/{paths,log,clock,id}.js'),
+    file('tests/env.js', WHY_ENV),
+    file('tests/lib/harness.js', WHY_HARNESS_LIB + '：makeTempDb（一用例一库）'),
+  ],
+  'missing-value-probe': [
+    dir('server/**', 'require 闭包：server/db/index.js、services/{ingest,missingValue}.js、http/routes/ifD.js、http/router.js'),
+    dir('platform/**', 'server/** 的传递 require：platform/{paths,log,clock,id}.js'),
+    file('tests/env.js', WHY_ENV),
+    file('tests/lib/harness.js', WHY_HARNESS_LIB + '：makeTempDb（一用例一库）'),
+  ],
+  'endpoint-link-probe': [
+    dir('server/**', 'require 闭包：server/db/index.js、services/{endpointLink,ingest}.js、http/routes/ifD.js、http/router.js'),
+    dir('platform/**', 'server/** 的传递 require：platform/{paths,log,clock,id}.js'),
+    file('tests/env.js', WHY_ENV),
+    file('tests/lib/harness.js', WHY_HARNESS_LIB + '：makeTempDb（一用例一库）'),
+  ],
+  'p02-endpoint-dedup-probe': [
+    dir('server/**', 'require 闭包：server/db/index.js（migrateMeasureRtEndpoint）、services/ingest.js、http/routes/ifD.js、http/router.js'),
+    dir('platform/**', 'server/** 的传递 require：platform/{paths,log,clock,id}.js'),
+    file('tests/env.js', WHY_ENV),
+    file('tests/lib/harness.js', WHY_HARNESS_LIB + '：makeTempDb（一用例一库）'),
   ],
 };
 

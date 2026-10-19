@@ -9276,7 +9276,9 @@ t.section('十五之②、E88⒝／E99 的定点回归（E109：纯函数真值�
      **实测口径（独立复算，不是推算）**：按 `detectMainDecl()` 的同一套识别规则遍历
      `tests\*.js` ＋ `tests\lib\*.js` ＋ `server/index.js`（29 个 `.js`）⇒
       `total=22／async=13／sync=9`；本批新增前为 `21／13／8`（＝本注释上两段记的值，逐字对上）。 */
-  const FLOOR_TOTAL = 23;
+  /* 2026-10-19（座位 4b）：5 支自证探针从 `tools\` 收编进 `tests\`（sync 入口：`function main()` ＋ 顶层 try/catch 退 2）
+     ⇒ 扫描面 total 23 → 28／sync 10 → 15（async 13 不动）。新增入口必须**同批**改本节（`E78` 已显式作废"新增不必改"）。 */
+  const FLOOR_TOTAL = 28;
   /* 另：`T-20261009-30`（座位 3，`E193` 同批修正件，2026-10-09）新增 `tests\input-face.js`
       （`ADR-0010` D4 的输入面登记表**单一真源**；`function main()` sync ＋ 顶层 `try`/`catch` 退 2）
       ⇒ 它是扫描面里的**第 10 个 sync 入口**，三个常数一并改为 **`23 / 13 / 10`**：
@@ -9287,7 +9289,7 @@ t.section('十五之②、E88⒝／E99 的定点回归（E109：纯函数真值�
       同轮 `t.info` 行：`§16 入口形态普查：23 个含 main() 的入口（async 13／sync 10／缺陷形态 0）`
       —— 即 `total=23／async=13／sync=10`（三项满足 `total ≡ async ＋ sync`）；本批新增前为 `22／13／9`。 */
   const EXACT_ASYNC = 13;
-  const EXACT_SYNC = 10;
+  const EXACT_SYNC = 15;
   t.info(`§16 入口形态普查：${real.counts.total} 个含 \`main()\` 的入口（async ${real.counts.async}／sync ${real.counts.sync}／缺陷形态 ${real.offenders.length}）`);
   t.info(`§16 E79：退出证据只取异常路径**自身**的区间（注释/字符串/模板串/正则已剥；接线到文件尾的余量上限＝${ENTRY_TAIL_MAX} 字符）；`
     + `常量退码真源＝tests\\env.js（${[...EXIT_CONSTS].map(([k, v]) => k + '=' + v).join('／') || '**读不到真源**'}）`);

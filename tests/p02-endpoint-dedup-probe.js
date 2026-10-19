@@ -9,12 +9,13 @@
  *   5 **旧库迁移**：手工造一个"三列索引 + 无 endpoint 列"的旧库形态 ⇒ 迁移后列有、行已回填、索引四列
  *   6 真 HTTP：两个端点各一帧 ⇒ 200/200 且库里 2 行
  *
- * 运行：node tools\p02-endpoint-dedup-probe.js ／ 退出 0 全过、1 有失败
+ * 运行：node tests\p02-endpoint-dedup-probe.js ／ 退出 0 全过、1 有失败
  */
 'use strict';
+require('./env').assertRuntime();          /* tests\*.js 入口必须自校验（files-check 第八节） */
 
 const http = require('node:http');
-const { makeTempDb } = require('../tests/lib/harness.js');
+const { makeTempDb } = require('./lib/harness.js');
 const dbmod = require('../server/db/index.js');
 const { createIngest } = require('../server/services/ingest.js');
 const { mountIfD } = require('../server/http/routes/ifD.js');
@@ -116,5 +117,9 @@ function main() {
     });
   }
 }
-
-main();
+try {
+  main();
+} catch (err) {
+  console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
+  process.exit(2);
+}

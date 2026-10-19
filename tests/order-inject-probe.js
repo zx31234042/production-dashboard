@@ -10,14 +10,15 @@
  *   ⑥HTTP 面（`mountIfD` + 真 `http` 路由）：带 `task` 时不带 `procOrderNo` 的帧 ⇒ **200 + injected**；
  *      窗口外 ⇒ **400 + `OUT_OF_WINDOW`**
  *
- * 运行：node tools\order-inject-probe.js
+ * 运行：node tests\order-inject-probe.js
  * 退出：0 全过／1 有失败
  */
 'use strict';
+require('./env').assertRuntime();          /* tests\*.js 入口必须自校验（files-check 第八节） */
 
 const path = require('node:path');
 const http = require('node:http');
-const { makeTempDb } = require('../tests/lib/harness.js');
+const { makeTempDb } = require('./lib/harness.js');
 const dbmod = require('../server/db/index.js');
 const { createIngest } = require('../server/services/ingest.js');
 const { mountIfD } = require('../server/http/routes/ifD.js');
@@ -154,5 +155,9 @@ function main() {
     });
   }
 }
-
-main();
+try {
+  main();
+} catch (err) {
+  console.error('\n[脚本异常] 脚本异常终止：' + (err && err.stack ? err.stack : err));
+  process.exit(2);
+}

@@ -240,6 +240,14 @@ const SUITES = [
   { name: 'harness-check', desc: '夹具自检（时钟/样本/注入/服务启停）', needBrowser: false, slow: false },
   { name: 'logic-check', desc: '当班统计与班次边界（FR-4 / DR-17）', needBrowser: false, slow: false },
   { name: 'db-check', desc: '本地库结构与仓储层', needBrowser: false, slow: false },
+  /* 5 支“自证探针”（座位 4b，2026-10-19 从 `tools\` 收编进 `run-all` 门禁套件）：P0-1／P0-4／P0-3／P1-1／P0-2
+     的接收侧自证，零依赖、毫秒级、只用临时库（含进程内真 HTTP）⇒ 属“离线可跑”，`--fast` 下**要跑**；
+     输出沿用同一条 `通过 N 项，失败 M 项` 汇总行（runner 按此解析，不另立口径）。 */
+  { name: 'order-inject-probe', desc: 'P0-1 procOrderNo 接收侧注入（含真 HTTP）', needBrowser: false, slow: false },
+  { name: 'unit-index-probe', desc: 'P0-4 件序号按测试周期生成', needBrowser: false, slow: false },
+  { name: 'missing-value-probe', desc: 'P0-3 缺值映射（哨兵→null、0 保留）', needBrowser: false, slow: false },
+  { name: 'endpoint-link-probe', desc: 'P1-1 按端点链路状态（含真 HTTP）', needBrowser: false, slow: false },
+  { name: 'p02-endpoint-dedup-probe', desc: 'P0-2 端点标识入去重键（含迁移幂等／旧库迁移）', needBrowser: false, slow: false },
   { name: 'platform-check', desc: '平台适配层（路径/ID/日志）', needBrowser: false, slow: false },
   { name: 'trace-check', desc: '需求追溯', needBrowser: false, slow: false },
   { name: 'copy-check', desc: '界面文案与需求条款对照', needBrowser: false, slow: false },
@@ -1033,7 +1041,7 @@ function verifyAuthorityTotals(agg, results, opts = {}) {
   /* 顺带校验：**权威区覆盖的每个门禁脚本**都必须在权威行里被逐个点名（新增脚本别忘登记）。
      集合口径同前（E50）：对全量判定，不用 `!needBrowser` 子集。 */
   const named = [...new Set([...line.matchAll(/`([a-z0-9-]+)`/g)].map(m => m[1])
-    .filter(n => n.endsWith('-check') || n === 'screenshot-diff'))];
+    .filter(n => n.endsWith('-check') || n.endsWith('-probe') || n === 'screenshot-diff'))];
   /* 命名提醒（2026-10-01 由 `notListed` 改名，T-20260930-32）：这个局部量落到 `kind='broken'`，
      而 **`broken` 被三因共用** —— 读不到 `tests\README.md`（本函数开头那处）、权威行里找不到
      "合计 N 通过"（紧随其后那处）、以及**这里**"漏列点名" —— 三者返回的 `kind` 完全一样，
