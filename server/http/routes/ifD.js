@@ -29,6 +29,9 @@ const { errorBody } = require('../router');
 /* P0-1（V1.45 第 8 处 / `C-115`）：`procOrderNo` **不由上位机方提供** ⇒ 在落库前由接收侧按
    `IF-A`（`task` 表）的**派工生效时间窗**注入；窗口外／无派工**不落库＋计数＋告警**（不兜底、不编造）。 */
 const orderResolver = require('../../services/orderResolver');
+/* P0-4（V1.45 第 6 处 / `DR-04`）：上位机方**不提供** `unitIndex` ⇒ 由看板按 `testStatus` 的
+   **测试周期边沿**生成件序号（同工单从 1 起；帧自带则放行；待机/异常帧不构成一件）。 */
+const unitIndexInfer = require('../../services/unitIndexInfer');
 
 /** 入站形态登记表（**只报告事实**：实现与否 / 启用与否）—— 形态待 U-0.1 答复 */
 const SOURCES = Object.freeze({
@@ -95,6 +98,10 @@ function mountIfD(router, deps = {}) {
   const orderAt = () => (typeof deps.now === 'function' ? deps.now() : new Date());
   /* `now` 是**时钟注入出口**（ADR-0003 D17）：`deps.now` 缺省时才退到 `new Date()`，与 ingest 同口径 */
   const orderStats = orderResolver.createStats(orderAt);
+  /* ---- P0-4 件序号推断器（默认启用；`deps.unitIndexInference === false` 可关） ---- */
+  const unitInferEnabled = deps.unitIndexInference !== false;
+  const unitInfer = unitIndexInfer.createUnitIndexInferrer({ db: deps.db || null, now: orderAt });
+  const unitCounts = { inferred: 0, 'frame-carried': 0, none: 0 };
 
   /* ---- 推送：POST /ifd/frame（固定路径；路由表未扩展，精确匹配即够） ---- */
   router.post('/ifd/frame', async (req, res) => {
@@ -119,6 +126,14 @@ function mountIfD(router, deps = {}) {
       }
       orderStats.bump(inj.source === 'injected' ? 'injected' : 'passthrough');
       body = inj.frame;
+    }
+    /* P0-4：件序号按测试周期生成（帧自带则放行；推断不出 ⇒ 不加字段，`ingest` 照常写 NULL） */
+    if (unitInferEnabled && body && typeof body === 'object') {
+      const ui = unitInfer.infer(body);
+      unitCounts[ui.source === 'frame' ? 'frame-carried' : (ui.unitIndex === null ? 'none' : 'inferred')] += 1;
+      if (ui.unitIndex !== null && (body.unitIndex === undefined || body.unitIndex === null || body.unitIndex === '')) {
+        body = Object.assign({}, body, { unitIndex: ui.unitIndex });
+      }
     }
     const result = push.handle(body);
     if (result.outcome === OUTCOME.REJECTED) {
@@ -165,7 +180,9 @@ function mountIfD(router, deps = {}) {
     /** 供 `/health` 或启动日志聚合（**不改 SSE、不改前端**） */
     status: () => statusBody(ingest),
     /** P0-1：`procOrderNo` 注入的计数（`injected`／`passthrough`／三类拒收 ＋ `lastReject`） */
-    orderInjection: () => orderStats.snapshot()
+    orderInjection: () => orderStats.snapshot(),
+    /** P0-4：件序号推断的计数（`inferred`／`frame-carried`／`none`）＋ 边沿跟踪快照 */
+    unitIndexInference: () => Object.assign({ counts: Object.assign({}, unitCounts) }, unitInfer.snapshot())
   };
 }
 
