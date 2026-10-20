@@ -310,7 +310,7 @@ async function main() {
     `active=${tabState.id} 标签序号=${tabState.idx}`);
 
   /* ---- ?curve=none：**任何 load 相位**都要求空态（`E203` 收紧后重述，2026-10-07） ----
-     `?curve=none` 的语义是"**初始**空态"（README.md §三、需求清单 V1.45 §…、甲方 Demo 说明同一措辞）：
+     `?curve=none` 的语义是"**初始**空态"（README.md §三、需求清单 V1.46 §…、甲方 Demo 说明同一措辞）：
      `src/main.js:116` 在 `start()` 里执行一次 `M.clearCurve()`，**只清预置曲线**。
      · **改前**：`src/services/mockData.js` 的节拍边界固化判据只有"缓冲长度 > 1" ⇒ load 恰落在边界前
        1～2 s 时，边界那一帧会把 2～3 帧残缓冲固化并**覆盖**空态 ⇒ 本用例随机变红（相位全扫 1～2/160）；
