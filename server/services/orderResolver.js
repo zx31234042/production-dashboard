@@ -89,6 +89,22 @@ function resolveActiveOrder(db, opts = {}) {
       taskCount: rows.length
     };
   }
+  /* ⓕ2（V1.46）：**事后入库**模式 —— 文件链的数据在**测试完成后**才到，派工窗口可能已过。
+     **仅在显式 `allowLate:true` 时启用**（文件通道用）；实时通道（默认）行为一字不变 ✓。
+     选哪个：取**窗口已结束且计划结束时间最晚**的那一条（＝最可能产出这份结果的那一单）；
+     若所有单子都还没开始（`plan_start_time > at`）⇒ 仍判 `OUT_OF_WINDOW`（无候选，不猜）。 */
+  if (opts.allowLate === true) {
+    const past = withWindow
+      .filter(r => String(r.plan_end_time) < at)
+      .sort((a, b) => String(b.plan_end_time).localeCompare(String(a.plan_end_time)))[0];
+    if (past) {
+      return {
+        ok: true, procOrderNo: String(past.proc_order_no),
+        planStartTime: String(past.plan_start_time), planEndTime: String(past.plan_end_time),
+        source: 'late', late: true, taskCount: rows.length
+      };
+    }
+  }
   return { ok: false, code: INJECT_REJECT.OUT_OF_WINDOW, reason: `${rows.length} 条 task 行均不在 ${at} 的生效窗口内`, at, taskCount: rows.length };
 }
 

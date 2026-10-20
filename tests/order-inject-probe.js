@@ -104,6 +104,23 @@ function main() {
     h.close();
   }
 
+  /* ⑦ 事后入库（V1.46 ⓕ2）：窗口已过 + allowLate ⇒ 命中"最晚结束的那一单"；默认模式不变；全未开始仍拒 */
+  {
+    const h = dbWithTasks([
+      { procOrderNo: 'PO-OLD', planStartTime: '2026-10-19 08:00:00', planEndTime: '2026-10-19 10:00:00' },
+      { procOrderNo: 'PO-MID', planStartTime: '2026-10-19 10:00:00', planEndTime: '2026-10-19 12:00:00' }
+    ]);
+    const late = orderResolver.injectOrderIntoFrame(h.db, frameOf(), { at: '2026-10-19 14:00:00', allowLate: true });
+    const lateResolve = orderResolver.resolveActiveOrder(h.db, { at: '2026-10-19 14:00:00', allowLate: true });
+    ok('⑦a 事后入库：窗口已过 ⇒ 命中 PO-MID（最晚结束）', late.ok && late.procOrderNo === 'PO-MID' && lateResolve.ok && lateResolve.source === 'late',
+      `ok=${late.ok}｜source=${late.source || '-'}｜procOrderNo=${late.procOrderNo || '-'}`);
+    const normal = orderResolver.injectOrderIntoFrame(h.db, frameOf(), { at: '2026-10-19 14:00:00' });
+    ok('⑦b 默认模式（实时）行为不变 ⇒ 仍 OUT_OF_WINDOW', !normal.ok && normal.code === 'OUT_OF_WINDOW', `code=${normal.code || '-'}`);
+    const h2 = dbWithTasks([{ procOrderNo: 'PO-FUT', planStartTime: '2026-10-20 08:00:00', planEndTime: '2026-10-20 10:00:00' }]);
+    const none = orderResolver.injectOrderIntoFrame(h2.db, frameOf(), { at: '2026-10-19 14:00:00', allowLate: true });
+    ok('⑦c 全未开始 ⇒ 无候可选，仍拒（不猜）', !none.ok && none.code === 'OUT_OF_WINDOW', `code=${none.code || '-'}`);
+    h.close(); h2.close();
+  }
   /* ⑥ HTTP 面（进程内临时端口；范式照 tests\db-check.js 的既有做法）：
         A 挂载（now=09:00 在窗口内）⇒ 不带 procOrderNo 的帧 **200 + stored（已注入）**；
         B 挂载（now=12:00 在窗口外）⇒ **400 + OUT_OF_WINDOW**；计数按**每个挂载**各自累积。 */
