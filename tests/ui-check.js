@@ -4469,6 +4469,76 @@ async function main() {
         `服务端：depth=${JSON.stringify(T.r.serverLim.depth)} speed=${JSON.stringify(T.r.serverLim.speed)}（应均 null）；` +
         `演示：depth=${JSON.stringify(T.r.demoLim.depth)} speed=${JSON.stringify(T.r.demoLim.speed)}`
     );
+
+    /* (D) F15-4（A3 数据层收口）：服务端模式下 `mockData.js` 的**演示种子**必须由
+       `StateAdapter` 的**数据装配层**清空（不只靠渲染层按 server 传 null 兜底）；
+       **成对**：演示模式仍保留这些种子（防"清理过狠"）。
+       立案：A3 包只在渲染层兜住 `state.curve`，数据层仍留 `seedCurve()` 的演示曲线；
+       同类种子还有 `status.mode/stage/online`、`task.std.*`、`task.lastResult`、`task.fpsRaw/…`。 */
+    const Z = { err: null, r: null };
+    try {
+      const demoFx = loadFrameFixture(F15_COMPONENTS);
+      const ds = demoFx.w.MockData.state;
+      const demo = {
+        curve: !!(ds.curve && ds.curve.depth && Array.isArray(ds.curve.depth.values) &&
+          ds.curve.depth.values.length > 1 && ds.curve.speed && Array.isArray(ds.curve.speed.values)),
+        statusMode: typeof ds.status.mode === 'string' && ds.status.mode !== '',
+        statusStage: typeof ds.status.stage === 'string' && ds.status.stage !== '',
+        stdDepth: typeof ds.task.std.depth === 'number',
+        lastResult: typeof ds.task.lastResult === 'string' && ds.task.lastResult !== '',
+        raw: typeof ds.task.fpsRaw === 'number' && typeof ds.task.gainRaw === 'number'
+      };
+
+      const srvFx = loadFrameFixture(F15_COMPONENTS);
+      const ss = srvFx.w.MockData.state;
+      const seedBefore = {
+        curve: !!(ss.curve && ss.curve.depth && ss.curve.speed),
+        status: typeof ss.status.mode === 'string' && ss.status.mode !== '',
+        stdDepth: ss.task.std.depth === 12.5,
+        lastResult: ss.task.lastResult === '合格'
+      };
+      srvFx.w.StateAdapter.snapshotToState(ss, {
+        link: null, task: null, device: null, frame: null,
+        stats: { planQty: 180, shift: null }, standard: null, upload: null, notices: null
+      }, new Date('2026-10-02T09:30:00'));
+      const cleared = {
+        curveNull: !!(ss.curve && ss.curve.depth === null && ss.curve.speed === null),
+        curveTickEmpty: !!(ss.curveTick && ss.curveTick.unitIndex === -1 &&
+          Array.isArray(ss.curveTick.depth) && ss.curveTick.depth.length === 0 &&
+          Array.isArray(ss.curveTick.speed) && ss.curveTick.speed.length === 0),
+        statusNull: ss.status.mode === null && ss.status.stage === null && ss.status.online === null,
+        stdNull: ['depth', 'gain', 'fps', 'shutter'].every(k => ss.task.std[k] === null),
+        lastResultNull: ss.task.lastResult === null,
+        rawNull: ss.task.fpsRaw === null && ss.task.gainRaw === null && ss.task.shutterRaw === null,
+        realNull: ['depth', 'speed', 'vx', 'vy'].every(k => ss.task.real[k] === null),
+        serverMode: ss.serverMode === true
+      };
+      srvFx.w.Pages.Dashboard.renderAll(ss);
+      const dom = {
+        stMode: String(srvFx.node('stMode').textContent || ''),
+        stStage: String(srvFx.node('stStage').textContent || '')
+      };
+      Z.r = { demo, seedBefore, cleared, dom };
+    } catch (e) { Z.err = e.message; }
+    check(
+      'F15-4（A3 数据层收口）服务端快照落地后，`mockData.js` 的演示种子由 `StateAdapter` **数据装配层**清空：' +
+      '`state.curve.depth/speed` 均 `null`、`curveTick` 为空缓冲、`status.mode/stage/online` 均 `null`、' +
+      '`task.std.*` / `task.lastResult` / `task.fpsRaw…` 均不保留演示值；渲染层 A3 兜底仍在且不把 `null` 写成 "null"；' +
+      '**成对**：演示模式仍保留 `seedCurve()` 曲线、运行阶段与相机设定值（防"清理过狠"）',
+      Z.err === null && Z.r !== null &&
+      Z.r.demo.curve && Z.r.demo.statusMode && Z.r.demo.statusStage &&
+      Z.r.demo.stdDepth && Z.r.demo.lastResult && Z.r.demo.raw &&
+      Z.r.seedBefore.curve && Z.r.seedBefore.status && Z.r.seedBefore.stdDepth && Z.r.seedBefore.lastResult &&
+      Z.r.cleared.curveNull && Z.r.cleared.curveTickEmpty && Z.r.cleared.statusNull &&
+      Z.r.cleared.stdNull && Z.r.cleared.lastResultNull && Z.r.cleared.rawNull &&
+      Z.r.cleared.realNull && Z.r.cleared.serverMode &&
+      Z.r.dom.stMode !== 'null' && Z.r.dom.stStage !== 'null',
+      Z.err ? `夹具执行异常：${Z.err}` : Z.r === null ? '（无观察值）' :
+        `演示模式：curve=${Z.r.demo.curve} status=${Z.r.demo.statusMode}/${Z.r.demo.statusStage} ` +
+        `stdDepth=${Z.r.demo.stdDepth} lastResult=${Z.r.demo.lastResult} raw=${Z.r.demo.raw}；` +
+        `服务端快照前种子=${JSON.stringify(Z.r.seedBefore)}；清空后=${JSON.stringify(Z.r.cleared)}；` +
+        `渲染后 stMode=${JSON.stringify(Z.r.dom.stMode)} stStage=${JSON.stringify(Z.r.dom.stStage)}`
+    );
   }
 
   /* ---------------- 汇总 ---------------- */

@@ -226,12 +226,15 @@ window.Components.DeviceStatusPanel = (function () {
       window.EndpointLinkProbe.ensure(state, new Date());
     }
 
-    /* 运行模式与阶段 */
-    const color = MODE_COLOR[s.mode] || 'var(--idle)';
-    setText('stMode', s.mode);
+    /* 运行模式与阶段（W5-④ 数据层收口）：服务端快照不带 `stage`/`linkStatus`，且 `mode` 只在
+       收到帧（`testStatus`）时才由 `applyServerFrame()` 写回 ⇒ 未取得即 `null`：显式「—」，
+       不显示 `mockData.js` 的演示种子「测试运行 / 准备」。演示模式两项恒为字符串，行为不变。 */
+    const mode = s.mode === null || s.mode === undefined || s.mode === '' ? NO_DATA : s.mode;
+    const color = MODE_COLOR[mode] || 'var(--idle)';
+    setText('stMode', mode);
     setStyle('stMode', 'color', color);
     setStyle('stModeBand', 'background', color);
-    setText('stStage', s.stage);
+    setText('stStage', s.stage === null || s.stage === undefined || s.stage === '' ? NO_DATA : s.stage);
 
     /* 主要实测数据：航行器深度 + 航行速度（FR-3.9～3.11 / C-31、C-32）
        ⚠ 缺失值守卫（W4 / ADR-0008 D3）：`depth/speed/vx/vy` 可能是 `null`（服务端缺测帧），

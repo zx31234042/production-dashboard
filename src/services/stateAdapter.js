@@ -216,6 +216,46 @@ window.StateAdapter = (function () {
     }
   }
 
+  /* ---------------- 演示种子（服务端模式下**必须**清空，ADR-0008 D3） ----------------
+     `mockData.js` 在**加载期**就写入了一批演示种子（`seedCurve()` 的"上一次已完成任务"曲线、
+     `status.mode/stage/online`、`task.std.*` 相机设定值、`task.lastResult` 与 `task.fpsRaw/…`
+     演示游走计数）。A3 包只在**渲染层**按 server 传 `null` 兜住曲线（`DeviceStatusPanel`/
+     `TaskPanel`），数据层仍留着这些值 —— 一旦有新的渲染点漏读状态位，就会把演示值当成真实值。
+     故服务端快照落地时（`snapshotToState()`）先在**数据装配层**清空，再由报文把真实存在的字段
+     写回（顺序与 `resetRealtimeFields()` 同一纪律：先清空 ⇒ 再应用 ⇒ 缺测字段最终仍为空）。
+     **只影响服务端快照路径**：演示模式不调用本函数，`seedCurve()` 等行为一字不变。
+     @param {object} state 看板状态
+     @returns {object|null} 同一 state（便于链式调用/自检）
+    */
+  function clearDemoSeeds(state) {
+    if (!state || typeof state !== 'object') return null;
+    /* ① 任务曲线：`seedCurve()` 预置的"上一次已完成任务"整段曲线是演示数据；服务端快照不含
+       `curve`（曲线由文件通道/`DR-18` 落库另侧提供，当前未接入）⇒ 空态，不画假曲线。
+       `curveTick` 是演示侧"当前任务逐秒缓冲"，服务端模式下本机不采样 ⇒ 空缓冲。 */
+    state.curve = { depth: null, speed: null };
+    state.curveTick = { unitIndex: -1, depth: [], speed: [] };
+    /* ② 运行模式/阶段/联网文案：服务端帧只给 `testStatus`（映射到 `status.mode`），
+       `stage` 与 `linkStatus` 不在 `FRAME_FIELDS` 里 ⇒ 置 `null`，由渲染层显示「—」；
+       若帧里真的带了这些键，`applyServerFrame()` 会在本函数之后写回。 */
+    if (state.status && typeof state.status === 'object') {
+      state.status.mode = null;
+      state.status.stage = null;
+      state.status.online = null;
+    }
+    /* ③ 相机设定值（`task.std.*`）与单任务"上一件判定结果"、演示游走内部计数：服务端快照均
+       不提供 ⇒ 逐项置 `null`（保留 `task.std` 对象本身，渲染层按"缺值＝—"显示，不落到空态分支）。 */
+    const task = state.task;
+    if (task && typeof task === 'object') {
+      if (task.std && typeof task.std === 'object') {
+        ['depth', 'gain', 'fps', 'shutter'].forEach(k => { task.std[k] = null; });
+      }
+      task.lastResult = null;
+      task.fpsRaw = null;
+      task.gainRaw = null;
+      task.shutterRaw = null;
+    }
+    return state;
+  }
   /* ---------------- task / standard / device ---------------- */
 
   /**
@@ -443,8 +483,6 @@ window.StateAdapter = (function () {
 
   /**
    * 把**来自报文的实测侧字段**逐键归 `null`（= 本机没有这个值）。
-   *
-   * ⚠ 为什么必须独立成函数、且在**帧分支之外**无条件调用（F15-2，2026-09-28 复核实测的真缺陷）：
    *   `applyUpperPayload()` 的既定语义是"**字段缺失就保留看板原值**"（演示期为了避免大屏闪 0）。
    *   但服务端模式下 `state.task.real` 的初值是 `mockData.js` 的**演示种子值**
    *   （`depth 5.00 / speed 5.00 / vx 5.00 / fps 400 …`）。改前"归零"写在 `applyServerFrame()`
@@ -456,7 +494,7 @@ window.StateAdapter = (function () {
    *   帧存在 ⇒ 随后由报文把真实存在的字段写回，缺测字段仍为 `null`。
    *
    * 只归零**来自报文的实测侧字段**（`fieldMap.upperToBoard` 的 `task.real.*` 取值键），
-   * 不碰其它 state；`task.std.*`（相机设定值）不在报文里，由配置/上位机侧提供，**不归零**。
+   * 不碰其它 state；`task.std.*`（相机设定值）不在报文里，服务端模式下由 `clearDemoSeeds()` 清空（不在本函数处理）。
    */
   function resetRealtimeFields(state) {
     const api = window.Api;
@@ -485,6 +523,9 @@ window.StateAdapter = (function () {
 
     /* ① 未接入模块先清空（ADR-0008 D3：不得残留演示值） */
     clearUnservedModules(state);
+    /* ①-b 演示种子（曲线/运行模式/相机设定值等）同样在数据装配层清空；随后各 apply* 再用
+       服务端真正给出的字段覆盖。演示模式不走本函数 ⇒ `seedCurve()` 等行为一字不变。 */
+    clearDemoSeeds(state);
 
     /* ② 链路（决定 `device.link`，也是"数据是否冻结"的判据） */
     applyServerLink(state, s.link);
@@ -621,6 +662,7 @@ window.StateAdapter = (function () {
     applyServerNotices,
     applyServerFrame,
     clearUnservedModules,
+    clearDemoSeeds,
     /* 键名映射表（**只读**；便于自检断言"只此一份"） */
     STATS_KEY_MAP
   };

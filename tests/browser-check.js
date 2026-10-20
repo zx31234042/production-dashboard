@@ -1651,7 +1651,8 @@ async function main() {
             polylines: document.querySelectorAll('#stDepthChart polyline, #stSpeedChart polyline').length,
             chartHasData: depthWrap ? depthWrap.classList.contains('has-data') : null,
             curveTexts: [...document.querySelectorAll('#panel-status .chart-card')].map(c => String(c.textContent || '')),
-            demoSeedCurveInState: !!(st.curve && st.curve.depth)
+            demoSeedCurveInState: !!(st.curve && (st.curve.depth || st.curve.speed)),
+            curveNull: !!(st.curve && st.curve.depth === null && st.curve.speed === null)
           };
         })()`);
         check('A3（V1.46 / C-116，`FR-2.6`＋`FR-3.9～3.11`）真机（1920×1080、`?source=server`）：' +
@@ -1682,12 +1683,21 @@ async function main() {
             '；任务说明=' + JSON.stringify([a3.tkDepthNote, a3.tkSpeedNote]) +
             '；说明行在 DOM=' + a3.noteInDom + '，盒=' + JSON.stringify(a3.noteBox) +
             '；曲线 polyline=' + a3.polylines + '、has-data=' + a3.chartHasData +
-            '（state 内仍残留演示种子曲线=' + a3.demoSeedCurveInState + '，**不得**被绘制）' +
+            '（state 内演示种子曲线残留=' + a3.demoSeedCurveInState + '，应为 false —— 数据层已清、渲染层兜底仍在）' +
             '；任务标题=' + JSON.stringify(a3.taskTitle) +
             '；设备区含"实时"=' + (a3.deviceArea.indexOf('实时') >= 0) +
             '、任务值区含"实时"=' + (a3.taskGrid.indexOf('实时') >= 0) +
             '、曲线卡含"实时"=' + JSON.stringify(a3.curveTexts.map(t => t.indexOf('实时') >= 0)));
         await clickTab(0);                    /* 切回设备状态页：后续 allOffline 判据仍读 #stLinkText */
+        check('A3-b（A3 数据层收口）真机（1920×1080、`?source=server`）：`state.curve` **为空**' +
+          '（`depth`/`speed` 均 `null` —— 不只靠渲染层传 null 兜底，数据层也已清），页面同时 **0 条 polyline、`has-data=false`**；' +
+          '即"演示种子曲线不冒充真实曲线"在数据层与渲染层两处都成立',
+          a3 !== null && a3.curveNull === true && a3.demoSeedCurveInState === false &&
+          a3.polylines === 0 && a3.chartHasData === false,
+          a3 === null ? '（evaluate 未返回读数）' : 'serverMode=' + a3.serverMode +
+            '；state.curve 为空=' + a3.curveNull + '（应 true）' +
+            '、仍有演示种子=' + a3.demoSeedCurveInState + '（应 false）' +
+            '；polyline=' + a3.polylines + '（应 0）、has-data=' + a3.chartHasData + '（应 false）');
         await sleep(300);
 
         /* 等到**所有端点**都过期：轮询服务端 `/ifd/endpoints` 直到 `allOffline === true` */
