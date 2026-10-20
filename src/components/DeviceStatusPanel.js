@@ -2,6 +2,9 @@
    组件：设备状态页（components/DeviceStatusPanel.js）
    需求：FR-2 设备实时运行状态（运行模式、色标、深度与速度、设备参数、联网状态）
          FR-3.9～3.11 实测主参数；FR-3.15 两条任务曲线；FR-3.16 设备参数次要展示
+         FR-2.6 / FR-3.9～3.11（V1.46 / C-116）：深度/速度＝**文件通道**（坐标 Excel 于
+         **测试完成后**生成）⇒ 实时阶段标「待测试完成后更新」、**不得按实时值展示**；
+         `testStatus` 与相机参数（帧率/增益/快门/相机水下深度）**仍实时**（PLC 链）。
    ========================================================================== */
 window.Components = window.Components || {};
 window.Components.DeviceStatusPanel = (function () {
@@ -19,6 +22,33 @@ window.Components.DeviceStatusPanel = (function () {
      `noData === true` ⇒ 输出"—"（该页既有占位风格，见 `#stCamDepth` 与统计页 15 位）。
      自愈后 `tick()` 重新写入带 `noData:false` 的真实统计 ⇒ 本分支自动退出、回到真实时长。 */
   const NO_DATA = '—';
+
+  /* ==========================================================================
+     `FR-2.6`（V1.46 / C-116 追注）＋ `FR-3.9～3.11`：**深度/速度改由文件通道提供** ——
+     坐标 Excel 于**测试完成后**生成（参考约 30 min，**非硬性**），实时阶段**没有值**。
+     故服务端模式下本页必须：
+       · `depth`/`speed`/`vx`/`vy` 四个值位一律显式「—」（沿用 W4「缺失值＝—」口径；
+         **不得**拿 0、演示种子值或上一帧冒充 —— FR-2.6「不得按实时值展示」）；
+       · 两个说明位 `#stDepthNote`/`#stSpeedNote` **逐字**标「待测试完成后更新」；
+       · 两条任务曲线在**尚无已完成件**时，图下说明位也标该文案（不画假曲线、不写 0）。
+     `testStatus` 与相机参数（帧率/增益/快门/相机水下深度）**仍实时**（PLC 链）⇒ 本段只动深度/速度四项。
+     ⚠ **演示模式保持改前行为**（数值照旧、说明位原文、不出现该标注 —— 以免误导）。
+     ⚠ 文件通道尚未接入 ⇒ 服务端模式下本区**始终**是"待更新"；将来接入后应把判据改为
+       "文件数据是否到位"，而不是仅看 `dataSource === 'server'`。
+     ========================================================================== */
+  const PENDING = '待测试完成后更新';
+
+  /**
+   * 是否"深度/速度＝文件通道、测试完成后才有值"（V1.46 / C-116）。
+   * 判据与各组件"服务端模式"同一把尺子（`state.serverMode` 优先、退配置），并额外排除
+   * "已回退演示源"（`state.sourceFallback === true` ⇒ 板面是演示值，不得再标"待更新"）。
+   */
+  function fileChannelPending(state) {
+    if (state && state.sourceFallback === true) return false;
+    if (state && state.serverMode === true) return true;
+    const cfg = window.BoardConfig;
+    return !!(cfg && cfg.dataSource === 'server');
+  }
 
   /**
    * 缺失值口径（W4 / ADR-0008 D3，2026-09-28 收口）：数值缺失一律显示**显式无数据 `—`**，
@@ -205,14 +235,26 @@ window.Components.DeviceStatusPanel = (function () {
 
     /* 主要实测数据：航行器深度 + 航行速度（FR-3.9～3.11 / C-31、C-32）
        ⚠ 缺失值守卫（W4 / ADR-0008 D3）：`depth/speed/vx/vy` 可能是 `null`（服务端缺测帧），
-         一律经 `fixedOrNoData()` 显示 `—`，**不得**直接 `.toFixed()`（null 上没有该方法 ⇒ TypeError）。 */
-    setText('stDepth', fixedOrNoData(t.real.depth, 2));
-    setText('stSpeed', fixedOrNoData(t.real.speed, 2));
-    setText('stVx', fixedOrNoData(t.real.vx, 2));
-    setText('stVy', fixedOrNoData(t.real.vy, 2));
+         一律经 `fixedOrNoData()` 显示 `—`，**不得**直接 `.toFixed()`（null 上没有该方法 ⇒ TypeError）。
+       V1.46 / C-116：服务端模式下四个值位**不是实时值**（文件通道测试完成后才生成）⇒ 一律「—」，
+         说明位标「待测试完成后更新」；演示/上位机模式逐字保持改前行为。 */
+    const pending = fileChannelPending(state);
+    if (pending) {
+      setText('stDepth', NO_DATA);
+      setText('stSpeed', NO_DATA);
+      setText('stVx', NO_DATA);
+      setText('stVy', NO_DATA);
+      setText('stDepthNote', PENDING);
+      setText('stSpeedNote', PENDING);
+    } else {
+      setText('stDepth', fixedOrNoData(t.real.depth, 2));
+      setText('stSpeed', fixedOrNoData(t.real.speed, 2));
+      setText('stVx', fixedOrNoData(t.real.vx, 2));
+      setText('stVy', fixedOrNoData(t.real.vy, 2));
+      setText('stDepthNote', '水下深度实测值 · 上位机整合后提供');
+      setText('stSpeedNote', 'X-Y 平面合成速度 · vx / vy 为分速度');
+    }
     setText('stRunTime', state.stats.noData === true ? NO_DATA : window.Format.clock(state.stats.runSec || 0));
-    setText('stDepthNote', '水下深度实测值 · 上位机整合后提供');
-    setText('stSpeedNote', 'X-Y 平面合成速度 · vx / vy 为分速度');
 
     /* 设备参数：次要展示（FR-3.16）
        `fps`/`shutter` 是整型量（无小数位），同样必须过守卫；`gain`/`cameraDepth` 为小数位量。 */
@@ -229,9 +271,19 @@ window.Components.DeviceStatusPanel = (function () {
       `<div class="legend-item${m.name === s.mode ? ' on' : ''}">` +
       `<span class="legend-dot" style="background:${m.color}"></span>${m.name}</div>`).join(''));
 
-    /* 任务曲线：仅在任务完成后重绘整段曲线（不做秒级刷新） */
-    curve().render('stDepthChart', 'stDepthTask', 'stDepthRange', state.curve.depth, 'var(--accent)', 'gDepth', 'm');
-    curve().render('stSpeedChart', 'stSpeedTask', 'stSpeedRange', state.curve.speed, 'var(--ok)', 'gSpeed', 'm/s');
+    /* 任务曲线：仅在任务完成后重绘整段曲线（不做秒级刷新）
+       V1.46 / C-116：服务端模式下文件通道未接入 ⇒ 深度/速度曲线**本来就没有**：
+       `mockData.js` 启动时预置的"上一次已完成任务"曲线是**演示种子**，不得在服务端模式冒充真实曲线
+       （ADR-0008 D3「不得用演示值顶替」）⇒ 传 null 走空态，图下说明位标「待测试完成后更新」
+       （不画假曲线、不写 0）。将来文件链接入后，改为传 `state.curve.*` 并把判据改为"文件数据是否到位"。 */
+    const cv = state.curve || {};
+    const shown = pending ? { depth: null, speed: null } : cv;
+    curve().render('stDepthChart', 'stDepthTask', 'stDepthRange', shown.depth, 'var(--accent)', 'gDepth', 'm');
+    curve().render('stSpeedChart', 'stSpeedTask', 'stSpeedRange', shown.speed, 'var(--ok)', 'gSpeed', 'm/s');
+    if (pending) {
+      setText('stDepthTask', PENDING);
+      setText('stSpeedTask', PENDING);
+    }
   }
 
   return { render };

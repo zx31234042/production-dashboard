@@ -7314,6 +7314,99 @@ async function main() {
     }
   }
 
+  /* ===== A3（V1.46 / C-116）：服务端模式深度/速度＝「待测试完成后更新」 =====
+     依据：`FR-2.6` 追注（文件链时效另计：Excel 于**测试完成后**生成，界面须标「待测试完成后更新」，
+     **不得按实时值展示**）＋ `FR-3.9～3.11`（深度/速度**测试完成后展示**；实时阶段显示该文案）。
+     判据（行为级：假 DOM 里跑**真实** `render()`，不读源码字符串 —— ADR-0004 D23）：
+       ① 服务端模式：`#stDepthNote`/`#stSpeedNote`/`#tkDepthNote`/`#tkSpeedNote` **逐字**
+          「待测试完成后更新」；深度/速度/vx/vy 四个值位一律「—」（state 里的演示种子值 5.00
+          **不得**被当实时值显示）；两条曲线（尚无已完成件）图下说明位也是该文案。
+       ② **成对**演示模式：`#stDepthNote`/`#stSpeedNote` 回到改前原文、任务页**不写**该标注、
+          值位仍是数值（改前行为逐字保持）。
+       ③ 服务端**空态**（无在测工单）：标注**仍然可见**（`renderWaiting()` 也要写 —— 空态同样
+          没有文件链数据，不能让人以为"等一秒就有实时值"）。
+     ⚠ 任务页的说明行是运行时追加的 `.tile-note`（index.html 的静态文案本包不改，只改 src/** 与
+       tests/**），故假 DOM 只读 `#tkDepthNote` 的**写入文本**；"真的插进 DOM 且可见"由
+       `browser-check` 的 B5f 真机判据负责。 */
+  {
+    const A3_COMPONENTS = [
+      'src/components/CurveChart.js',
+      'src/components/DeviceStatusPanel.js',
+      'src/components/TaskPanel.js'
+    ];
+    const PENDING = '待测试完成后更新';
+    const A = { err: null, server: null, demo: null, waiting: null };
+    try {
+      /* --- 服务端：`dataSource='server'`（与 `?source=server` 同一真源），state 先放演示种子值 --- */
+      const s = loadUi(A3_COMPONENTS);
+      s.w.BoardConfig.dataSource = 'server';
+      const st = s.w.MockData.state;
+      st.task.real.depth = 5.00; st.task.real.speed = 5.00; st.task.real.vx = 5.00; st.task.real.vy = 0.10;
+      s.w.Components.DeviceStatusPanel.render(st);
+      s.w.Components.TaskPanel.render(st);
+      A.server = {
+        stDepth: lastText(s.out, 'stDepth'), stSpeed: lastText(s.out, 'stSpeed'),
+        stVx: lastText(s.out, 'stVx'), stVy: lastText(s.out, 'stVy'),
+        stDepthNote: lastText(s.out, 'stDepthNote'), stSpeedNote: lastText(s.out, 'stSpeedNote'),
+        stDepthTask: lastText(s.out, 'stDepthTask'), stSpeedTask: lastText(s.out, 'stSpeedTask'),
+        tkDepth: lastText(s.out, 'tkDepth'), tkSpeed: lastText(s.out, 'tkSpeed'),
+        tkVx: lastText(s.out, 'tkVx'), tkVy: lastText(s.out, 'tkVy'),
+        tkDepthNote: lastText(s.out, 'tkDepthNote'), tkSpeedNote: lastText(s.out, 'tkSpeedNote')
+      };
+      /* --- 服务端空态：清掉在测工单 ⇒ `renderWaiting()` 分支 --- */
+      const before = s.out.length;
+      st.task.procOrderNo = null;
+      s.w.Components.TaskPanel.render(st);
+      const waitingOut = s.out.slice(before);
+      A.waiting = {
+        tkDepth: lastText(waitingOut, 'tkDepth'),
+        tkDepthNote: lastText(waitingOut, 'tkDepthNote'),
+        tkSpeedNote: lastText(waitingOut, 'tkSpeedNote')
+      };
+      /* --- 演示：默认 dataSource（mock）⇒ 改前行为 --- */
+      const d = loadUi(A3_COMPONENTS);
+      const dst = d.w.MockData.state;
+      d.w.Components.DeviceStatusPanel.render(dst);
+      d.w.Components.TaskPanel.render(dst);
+      A.demo = {
+        stDepth: lastText(d.out, 'stDepth'), stDepthNote: lastText(d.out, 'stDepthNote'),
+        stSpeedNote: lastText(d.out, 'stSpeedNote'),
+        tkDepth: lastText(d.out, 'tkDepth'), tkDepthNote: lastText(d.out, 'tkDepthNote'),
+        tkSpeedNote: lastText(d.out, 'tkSpeedNote')
+      };
+    } catch (e) { A.err = (e && e.message) || String(e); }
+    check(
+      'A3（V1.46 / C-116，`FR-2.6`＋`FR-3.9～3.11`）服务端模式（`dataSource=\'server\'`）：深度/速度区' +
+      '**逐字**标「待测试完成后更新」（`#stDepthNote`/`#stSpeedNote`/`#tkDepthNote`/`#tkSpeedNote`），' +
+      '四个值位一律「—」（演示种子值 5.00 不得被当实时值显示），两条曲线图下说明位同样标该文案，' +
+      '任务页说明行在**空态**下仍可见；**成对**：演示模式 `#stDepthNote`/`#stSpeedNote` 保持改前原文、' +
+      '任务页不写该标注、值位仍为数值',
+      A.err === null && A.server !== null && A.demo !== null && A.waiting !== null &&
+      A.server.stDepth === '—' && A.server.stSpeed === '—' &&
+      A.server.stVx === '—' && A.server.stVy === '—' &&
+      A.server.stDepthNote === PENDING && A.server.stSpeedNote === PENDING &&
+      A.server.stDepthTask === PENDING && A.server.stSpeedTask === PENDING &&
+      A.server.tkDepth === '—' && A.server.tkSpeed === '—' &&
+      A.server.tkVx === '—' && A.server.tkVy === '—' &&
+      A.server.tkDepthNote === PENDING && A.server.tkSpeedNote === PENDING &&
+      A.waiting.tkDepth === '—' && A.waiting.tkDepthNote === PENDING &&
+      A.waiting.tkSpeedNote === PENDING &&
+      /^\d+\.\d{2}$/.test(String(A.demo.stDepth)) && /^\d+\.\d{2}$/.test(String(A.demo.tkDepth)) &&
+      A.demo.stDepthNote !== PENDING && A.demo.stSpeedNote !== PENDING &&
+      A.demo.tkDepthNote === null && A.demo.tkSpeedNote === null,
+      A.err ? '夹具执行异常：' + A.err :
+        '服务端：值位=' + JSON.stringify([A.server.stDepth, A.server.stSpeed, A.server.stVx, A.server.stVy]) +
+        '、设备页说明=' + JSON.stringify([A.server.stDepthNote, A.server.stSpeedNote]) +
+        '、图下说明=' + JSON.stringify([A.server.stDepthTask, A.server.stSpeedTask]) +
+        '、任务页值位=' + JSON.stringify([A.server.tkDepth, A.server.tkSpeed, A.server.tkVx, A.server.tkVy]) +
+        '、任务页说明=' + JSON.stringify([A.server.tkDepthNote, A.server.tkSpeedNote]) +
+        '；空态值位/说明=' + JSON.stringify([A.waiting.tkDepth, A.waiting.tkDepthNote, A.waiting.tkSpeedNote]) +
+        '；演示：值位=' + JSON.stringify([A.demo.stDepth, A.demo.tkDepth]) +
+        '、说明=' + JSON.stringify([A.demo.stDepthNote, A.demo.stSpeedNote]) +
+        '、任务页说明=' + JSON.stringify([A.demo.tkDepthNote, A.demo.tkSpeedNote])
+    );
+  }
+
   console.log('\n=== 汇总 ===');
   console.log(`通过 ${passed} 项，失败 ${failures.length} 项，跳过 ${skipped} 项`);
   if (failures.length) {

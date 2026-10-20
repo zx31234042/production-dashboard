@@ -6,6 +6,8 @@
               下偏差三格可录入」，删去导出公式长句与尾部 meta（班组/生效时间/版本）；
               V1.35 / C-90 + C-91 起「显示与录入对象」＝典型值 / 上偏差 / 下偏差，上限/下限为导出值）
    需求：FR-3 工单信息、实时实测数据、测试进度与结果
+         FR-2.6 / FR-3.9～3.11（V1.46 / C-116）：深度/速度于**测试完成后展示**（文件通道）；
+         实时阶段本页深度/速度区标「待测试完成后更新」、**不得按实时值展示**（演示模式保持改前行为）。
          FR-3.16 任务数据页右下角为**测试标准区**（深度/速度的典型值、上偏差、下偏差）；
                          相机参数移入**二级菜单**，菜单项**只含参数名 + 设定值**
                          （不做状态判定、不显示实测值/偏差）
@@ -98,6 +100,98 @@ window.Components.TaskPanel = (function () {
   let lastErr = null;      // 最近一次非法录入的提醒文案（由 render 显示）
   let lastInfo = null;     // 最近一次成功注入的回执文案（由 render 显示）
   let booted = false;      // 交互是否已装配（装配只在浏览器里做一次）
+
+  /* ==========================================================================
+     V1.46 / C-116（`FR-2.6`、`FR-3.9～3.11`）：**深度/速度改由文件通道提供** —— 坐标 Excel 于
+     **测试完成后**生成（参考约 30 min，**非硬性**），实时阶段**没有值**。故服务端模式下本页：
+       · 值位 `#tkDepth/#tkSpeed/#tkVx/#tkVy` 一律显式「—」（沿用 W4「缺失值＝—」口径；
+         **不得**拿 0、演示种子值或上一帧冒充 —— FR-2.6「不得按实时值展示」）；
+       · 深度、速度两格主展示格下各补一行 `.tile-note`：**逐字**「待测试完成后更新」；
+       · 卡片标题「实时实测数据」不得再以"实时"口吻出现 —— index.html 的静态文案**不动**
+         （本包只改 `src/**` 与 `tests/**`），故在运行时按 DOM 结构定位后替换为
+         「实测数据（待测试完成后更新）」；演示模式（以及从服务端回退演示之后）**逐字复原**。
+     ⚠ **演示模式保持改前行为**：`fileChannelPending()` 为假时本段一位都不写（不建节点、
+       不改标题、不覆盖数值），10 张截图基准与既有断言不受影响。
+     ⚠ 标注**始终可见**（含"无在测工单"空态 —— 那时同样没有文件链数据，不能让人以为
+       "等一秒就会有实时值"）；文件通道尚未接入 ⇒ 服务端模式下本区始终是"待更新"。
+     ========================================================================== */
+  const PENDING_TEXT = '待测试完成后更新';
+  const PENDING_TITLE_HTML = '实测数据（待测试完成后更新）<span class="title-note">文件通道</span>';
+  let titleOriginal = null;     // 首次改写标题前的 index.html 原文（回退演示时逐字复原）
+  let titlePatched = false;
+
+  /** 是否"深度/速度＝文件通道、测试完成后才有值"（判据与 DeviceStatusPanel 同一把尺子） */
+  function fileChannelPending(state) {
+    if (state && state.sourceFallback === true) return false;
+    if (state && state.serverMode === true) return true;
+    const cfg = window.BoardConfig || BC;
+    return !!(cfg && cfg.dataSource === 'server');
+  }
+
+  /** 找到"实时实测数据"卡片的标题节点：从 #tkDepth 沿父链上溯到 `.card`，再取其 `.card-title`。
+   *  真实 DOM 里层级固定（span → .tile-value → .tile → .tile-grid → .card）；
+   *  假 DOM（无 parentNode/querySelector）取不到 ⇒ 返回 null（夹具直接读写入文本判据）。 */
+  function depthCardTitle() {
+    if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return null;
+    let el = document.getElementById('tkDepth');
+    for (let i = 0; el && i < 6; i++) {
+      if (el.classList && el.classList.contains('card')) {
+        return typeof el.querySelector === 'function' ? el.querySelector('.card-title') : null;
+      }
+      el = el.parentNode;
+    }
+    return null;
+  }
+
+  /** 确保深度/速度格下的说明行存在（幂等）：`valueId` → `.tile-value` → `.tile`，把 `.tile-note` 追加进去 */
+  function ensureTileNote(noteId, valueId) {
+    if (typeof document === 'undefined' || typeof document.getElementById !== 'function') return null;
+    const exist = document.getElementById(noteId);
+    if (exist) return exist;
+    if (typeof document.createElement !== 'function') return null;
+    const value = document.getElementById(valueId);
+    const tile = value && value.parentNode && value.parentNode.parentNode;
+    if (!tile || typeof tile.appendChild !== 'function') return null;
+    const el = document.createElement('div');
+    el.className = 'tile-note';
+    el.id = noteId;
+    tile.appendChild(el);
+    return el;
+  }
+
+  /**
+   * 服务端模式：标注「待测试完成后更新」并去掉"实时"口吻；演示模式：撤销本段写过的一切。
+   * 值位由调用方按模式分别写（本函数只管**说明位与标题**，避免两处重复判断）。
+   */
+  function renderFileChannelNote(state) {
+    const pending = fileChannelPending(state);
+    [['tkDepthNote', 'tkDepth'], ['tkSpeedNote', 'tkSpeed']].forEach(pair => {
+      const noteId = pair[0];
+      const note = pending
+        ? ensureTileNote(noteId, pair[1])
+        : (typeof document !== 'undefined' && typeof document.getElementById === 'function'
+          ? document.getElementById(noteId) : null);
+      if (pending) {
+        if (note) setText(noteId, PENDING_TEXT);
+      } else if (note && note.parentNode && typeof note.parentNode.removeChild === 'function') {
+        note.parentNode.removeChild(note);      // 演示模式不得出现该标注（服务端→演示的回退也复原）
+      }
+    });
+
+    const title = depthCardTitle();
+    if (!title) return;
+    if (pending) {
+      if (!titlePatched) {
+        if (titleOriginal === null) titleOriginal = title.innerHTML;
+        title.innerHTML = PENDING_TITLE_HTML;
+        titlePatched = true;
+      }
+    } else if (titlePatched) {
+      title.innerHTML = titleOriginal === null ? '' : titleOriginal;
+      titlePatched = false;
+      titleOriginal = null;
+    }
+  }
 
   const isNum = v => typeof v === 'number' && Number.isFinite(v);
 
@@ -702,11 +796,14 @@ window.Components.TaskPanel = (function () {
     }).join('');
   }
 
-  /** FR-3.17：无在测工单时的空态（业务数值留空，但测试标准区与相机菜单仍可见 —— FR-3.16～3.19） */
+  /** FR-3.17：无在测工单时的空态（业务数值留空，但测试标准区与相机菜单仍可见 —— FR-3.16～3.19）
+   *  V1.46 / C-116：服务端模式下深度/速度区**始终**标「待测试完成后更新」（空态也没有文件链数据，
+   *  不能让人以为"等一秒就会有实时值"）—— 故空态分支同样调用 `renderFileChannelNote()`。 */
   function renderWaiting(state) {
     setHTML('tkOrderList', '<div class="kv-row is-empty"><span class="k">工单</span>' +
       '<span class="v empty-note">等待工单（上位机尚未派工）</span></div>');
     ['tkDepth', 'tkSpeed', 'tkVx', 'tkVy'].forEach(id => setText(id, '—'));
+    renderFileChannelNote(state);
     setText('tkProgressPct', '0.0%');
     setStyle('tkProgressBar', 'width', '0%');
     setHTML('tkProgressText', '等待工单：当前无在测工单，收到派工后自动刷新');
@@ -753,16 +850,26 @@ window.Components.TaskPanel = (function () {
     ].map(([k, v]) => `<div class="kv-row"><span class="k">${k}</span><span class="v mono">${v}</span></div>`).join(''));
 
     /* 主要实测数据：航行器深度与航行速度（FR-3.9～3.11 / C-31、C-32）
-       三态着色只用于深度与速度（FR-3.14 判定对象改写 / FR-3.18）：超范围红、临近黄 */
-    setText('tkDepth', isNum(t.real.depth) ? t.real.depth.toFixed(2) : '—');
-    setText('tkSpeed', isNum(t.real.speed) ? t.real.speed.toFixed(2) : '—');
-    setStyle('tkDepth', 'color', styleOfLevel(levelOf(t.real.depth, ensureRow(state, 'depth')).lv));
-    setStyle('tkSpeed', 'color', styleOfLevel(levelOf(t.real.speed, ensureRow(state, 'speed')).lv));
-    /* 分速度 vx / vy：与同段 `depth`/`speed` **同款守卫**（W4 / ADR-0008 D3）。
-       改前这里直接 `t.real.vx.toFixed(2)`：服务端缺测帧里 `velocity_x` 缺省 ⇒ `null`
-       ⇒ 抛 `TypeError`（整块任务页被 `renderAll` 的 catch 跳过、界面停在上一帧）。 */
-    setText('tkVx', isNum(t.real.vx) ? t.real.vx.toFixed(2) : '—');
-    setText('tkVy', isNum(t.real.vy) ? t.real.vy.toFixed(2) : '—');
+       三态着色只用于深度与速度（FR-3.14 判定对象改写 / FR-3.18）：超范围红、临近黄。
+       V1.46 / C-116：服务端模式（文件通道）下深度/速度**测试完成后才有值** ⇒ 值位显式「—」、
+       不参与三态着色（没有值就没有"超范围/临近"可判）；演示/上位机模式行为不变。 */
+    if (fileChannelPending(state)) {
+      ['tkDepth', 'tkSpeed', 'tkVx', 'tkVy'].forEach(id => setText(id, NO_DATA));
+      setStyle('tkDepth', 'color', '');
+      setStyle('tkSpeed', 'color', '');
+    } else {
+      setText('tkDepth', isNum(t.real.depth) ? t.real.depth.toFixed(2) : '—');
+      setText('tkSpeed', isNum(t.real.speed) ? t.real.speed.toFixed(2) : '—');
+      setStyle('tkDepth', 'color', styleOfLevel(levelOf(t.real.depth, ensureRow(state, 'depth')).lv));
+      setStyle('tkSpeed', 'color', styleOfLevel(levelOf(t.real.speed, ensureRow(state, 'speed')).lv));
+      /* 分速度 vx / vy：与同段 `depth`/`speed` **同款守卫**（W4 / ADR-0008 D3）。
+         改前这里直接 `t.real.vx.toFixed(2)`：服务端缺测帧里 `velocity_x` 缺省 ⇒ `null`
+         ⇒ 抛 `TypeError`（整块任务页被 `renderAll` 的 catch 跳过、界面停在上一帧）。 */
+      setText('tkVx', isNum(t.real.vx) ? t.real.vx.toFixed(2) : '—');
+      setText('tkVy', isNum(t.real.vy) ? t.real.vy.toFixed(2) : '—');
+    }
+    /* 服务端模式：「待测试完成后更新」说明行（深度/速度两格各一行）＋ 标题去掉"实时"口吻 */
+    renderFileChannelNote(state);
 
     /* 测试标准区（FR-3.16 改写 / FR-3.18）＋相机参数二级菜单（FR-3.16 改写） */
     renderStandards(state);

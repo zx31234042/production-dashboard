@@ -1609,6 +1609,87 @@ async function main() {
             '；rows=' + JSON.stringify(pm.rows) +
             '；横幅=' + pm.banner + '；state.endpointLink=' + JSON.stringify(pm.endpointLink));
 
+        /* ===== A3（V1.46 / C-116）：服务端模式深度/速度＝「待测试完成后更新」 =====
+           依据：`FR-2.6` 追注（文件链时效另计：Excel 于**测试完成后**生成，界面须标
+           「待测试完成后更新」、**不得按实时值展示**）＋ `FR-3.9～3.11`（深度/速度测试完成后展示）。
+           本段只补**一条**真机判据（不放松既有 B5f 断言）：在真服务端页 `?source=server` 上切到
+           任务数据页，同时读三块屏 ——
+             ① 设备状态页「实测主参数」主展示格（四个值位 ＋ 两个说明位）；
+             ② 任务数据页「实时实测数据」卡（四个值位 ＋ 运行时补的两行说明 ＋ 卡片标题）；
+             ③ 两条任务曲线（文件链未接入 ⇒ 必须空态，不得拿 `mockData.js` 的演示种子曲线冒充）。
+           **强判据**：上述深度/速度区域的文本**不含"实时"字样**（不得按实时值展示）＋ 值位一律「—」
+           ＋ 说明行**真的插进 DOM** 且可见（`getBoundingClientRect().height > 0`）。
+           ⚠ 只读 DOM 与 `state.serverMode`；改完立刻切回设备状态页，不影响后面的 allOffline 判据。 */
+        await clickTab(1);
+        await sleep(700);
+        const a3 = await evaluate(`(() => {
+          const PENDING = '待测试完成后更新';
+          const txt = id => String((document.getElementById(id) || {}).textContent || '');
+          const st = (window.MockData && window.MockData.state) || {};
+          const grid = document.querySelector('#panel-status .params-card .tile-grid.primary');
+          const taskGrid = document.querySelector('#panel-task .tile-grid.primary');
+          const taskCard = taskGrid ? taskGrid.closest('.card') : null;
+          const taskTitle = taskCard ? taskCard.querySelector('.card-title') : null;
+          const depthSvg = document.getElementById('stDepthChart');
+          const depthWrap = depthSvg ? depthSvg.parentElement : null;
+          const note = document.getElementById('tkDepthNote');
+          const noteRect = note ? note.getBoundingClientRect() : null;
+          const noteStyle = note ? getComputedStyle(note) : null;
+          return {
+            serverMode: st.serverMode === true,
+            stDepth: txt('stDepth'), stSpeed: txt('stSpeed'), stVx: txt('stVx'), stVy: txt('stVy'),
+            stDepthNote: txt('stDepthNote'), stSpeedNote: txt('stSpeedNote'),
+            stDepthTask: txt('stDepthTask'), stSpeedTask: txt('stSpeedTask'),
+            tkDepth: txt('tkDepth'), tkSpeed: txt('tkSpeed'), tkVx: txt('tkVx'), tkVy: txt('tkVy'),
+            tkDepthNote: txt('tkDepthNote'), tkSpeedNote: txt('tkSpeedNote'),
+            deviceArea: grid ? String(grid.textContent || '') : '',
+            taskGrid: taskGrid ? String(taskGrid.textContent || '') : '',
+            taskTitle: taskTitle ? String(taskTitle.textContent || '') : '',
+            noteInDom: !!(note && note.parentElement),
+            noteBox: noteRect ? { w: +noteRect.width.toFixed(1), h: +noteRect.height.toFixed(1),
+              display: noteStyle ? noteStyle.display : null, visibility: noteStyle ? noteStyle.visibility : null } : null,
+            polylines: document.querySelectorAll('#stDepthChart polyline, #stSpeedChart polyline').length,
+            chartHasData: depthWrap ? depthWrap.classList.contains('has-data') : null,
+            curveTexts: [...document.querySelectorAll('#panel-status .chart-card')].map(c => String(c.textContent || '')),
+            demoSeedCurveInState: !!(st.curve && st.curve.depth)
+          };
+        })()`);
+        check('A3（V1.46 / C-116，`FR-2.6`＋`FR-3.9～3.11`）真机（1920×1080、`?source=server`）：' +
+          '深度/速度区**逐字**给出「待测试完成后更新」（设备状态页两个说明位 ＋ 任务数据页两行说明 ＋ ' +
+          '两条曲线图下说明），两处四个值位一律「—」（不拿演示种子值/0 冒充）；说明行**真的插进 DOM** ' +
+          '且可见（`#tkDepthNote` 有父元素、高度 > 0）；两条曲线**空态**（0 条 polyline、无 has-data —— ' +
+          '不拿 `mockData.js` 的演示种子曲线冒充）；且这些区域**不含"实时"字样**' +
+          '（任务页卡片标题同步改为「实测数据（待测试完成后更新）」）—— 即「不得按实时值展示」',
+          a3 !== null && a3.serverMode === true &&
+          a3.stDepth === '—' && a3.stSpeed === '—' && a3.stVx === '—' && a3.stVy === '—' &&
+          a3.stDepthNote === '待测试完成后更新' && a3.stSpeedNote === '待测试完成后更新' &&
+          a3.stDepthTask === '待测试完成后更新' && a3.stSpeedTask === '待测试完成后更新' &&
+          a3.tkDepth === '—' && a3.tkSpeed === '—' && a3.tkVx === '—' && a3.tkVy === '—' &&
+          a3.tkDepthNote === '待测试完成后更新' && a3.tkSpeedNote === '待测试完成后更新' &&
+          a3.noteInDom === true && a3.noteBox !== null &&
+          a3.noteBox.h > 0 && a3.noteBox.display !== 'none' && a3.noteBox.visibility !== 'hidden' &&
+          a3.polylines === 0 && a3.chartHasData === false &&
+          a3.deviceArea.indexOf('实时') < 0 &&
+          a3.taskGrid.indexOf('实时') < 0 &&
+          a3.taskTitle.indexOf('实时') < 0 && a3.taskTitle.indexOf('待测试完成后更新') >= 0 &&
+          a3.curveTexts.length === 2 &&
+          a3.curveTexts.every(t => t.indexOf('实时') < 0 && t.indexOf('待测试完成后更新') >= 0),
+          a3 === null ? '（evaluate 未返回读数）' : 'serverMode=' + a3.serverMode +
+            '；设备值位=' + JSON.stringify([a3.stDepth, a3.stSpeed, a3.stVx, a3.stVy]) +
+            '；设备说明=' + JSON.stringify([a3.stDepthNote, a3.stSpeedNote]) +
+            '；图下说明=' + JSON.stringify([a3.stDepthTask, a3.stSpeedTask]) +
+            '；任务值位=' + JSON.stringify([a3.tkDepth, a3.tkSpeed, a3.tkVx, a3.tkVy]) +
+            '；任务说明=' + JSON.stringify([a3.tkDepthNote, a3.tkSpeedNote]) +
+            '；说明行在 DOM=' + a3.noteInDom + '，盒=' + JSON.stringify(a3.noteBox) +
+            '；曲线 polyline=' + a3.polylines + '、has-data=' + a3.chartHasData +
+            '（state 内仍残留演示种子曲线=' + a3.demoSeedCurveInState + '，**不得**被绘制）' +
+            '；任务标题=' + JSON.stringify(a3.taskTitle) +
+            '；设备区含"实时"=' + (a3.deviceArea.indexOf('实时') >= 0) +
+            '、任务值区含"实时"=' + (a3.taskGrid.indexOf('实时') >= 0) +
+            '、曲线卡含"实时"=' + JSON.stringify(a3.curveTexts.map(t => t.indexOf('实时') >= 0)));
+        await clickTab(0);                    /* 切回设备状态页：后续 allOffline 判据仍读 #stLinkText */
+        await sleep(300);
+
         /* 等到**所有端点**都过期：轮询服务端 `/ifd/endpoints` 直到 `allOffline === true` */
         let preAll = null;
         const allDeadline = Date.now() + 15000;
