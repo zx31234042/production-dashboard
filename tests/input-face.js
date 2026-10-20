@@ -204,7 +204,7 @@ const SURFACE_WIDE_BY_DESIGN = Object.freeze({
 });
 
 /* ==========================================================================
-   四、登记表本体（22 个脚本；`why` 即依据）
+   四、登记表本体（23 个脚本；`why` 即依据）
    --------------------------------------------------------------------------
    写法约定：`dir('src/**')` 表示"该目录下**全部**文件"（对缓存是保守方向）；仓内路径一律
    posix 风格（`/`）；`dynamic` 见头部口径①。
@@ -438,8 +438,9 @@ const FACE = {
     dyn('本脚本自身字节（sha256 写进台账）与 Edge 可执行体', '台账记 scriptSha256 以自证"哪一版脚本跑的"；'
       + 'Edge／MSEDGE_PATH 是外部依赖'),
   ],
-  /* 5 支“自证探针”（座位 4b，2026-10-19 从 `tools\` 收编进 `run-all`）：它们只读**被测服务端的接入口径**
-     （require 闭包：db／services／http 路由）＋ 测试夹具，不读 `src\**`／文档 ⇒ 面与 `db-check` 同族、可缓存。 */
+  /* 6 支“自证探针”（座位 4b；2026-10-19 起前 5 支从 `tools\` 收编进 `run-all`）：它们只读**被测服务端的接入口径**
+     （require 闭包：db／services／http 路由）＋ 测试夹具，不读 `src\**`／文档 ⇒ 面与 `db-check` 同族、可缓存。
+     第 6 支 `mes-client-probe`（2026-10-20）只读 `server/services/mesClient.js`（零 require）＋ `tests/env.js`。 */
   'order-inject-probe': [
     dir('server/**', 'require 闭包：server/db/index.js、services/{ingest,orderResolver}.js、http/routes/ifD.js、http/router.js'),
     dir('platform/**', 'server/** 的传递 require：platform/{paths,log,clock,id}.js'),
@@ -469,6 +470,12 @@ const FACE = {
     dir('platform/**', 'server/** 的传递 require：platform/{paths,log,clock,id}.js'),
     file('tests/env.js', WHY_ENV),
     file('tests/lib/harness.js', WHY_HARNESS_LIB + '：makeTempDb（一用例一库）'),
+  ],
+  /* 第 6 支（2026-10-20，A4 收编）：**只读传输层自身 ＋ 测试环境常量** —— `server/services/mesClient.js`
+     零 `require`（纯函数 ＋ 全局 `fetch`／可注入 `fetchImpl`），故没有 `server/**`／`platform/**` 传递闭包。 */
+  'mes-client-probe': [
+    file('server/services/mesClient.js', '被测对象：MES 接口传输层（URL 模板／形态归一／不可识别判失败／超时）'),
+    file('tests/env.js', WHY_ENV),
   ],
 };
 
