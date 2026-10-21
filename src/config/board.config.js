@@ -161,7 +161,26 @@ const BOARD_CONFIG = (function () {
       auth: { type: 'none', token: '' },
       timeoutMs: 3000,
       /* 字段名与取值映射见 config/fieldMap.js；此处只放连接与频率参数 */
-      staleMs: 5000             // 超过该时长未收到数据即判定"数据已冻结"（FR-2.6）
+      staleMs: 5000,            // 超过该时长未收到数据即判定"数据已冻结"（FR-2.6）
+
+      /* **端点清单**（2026-10-21 依据上位机方 10.21 回件的附表一填写；`DR-13` 的"端点标识"取这里的 `id`）。
+         ⚠ 现状与缺口（写在这里，避免看代码的人误以为已齐）：
+           ① 6 个 IP:502 来自对方的**附表一**（PLC1–PLC5 ＋ PLC6 备用），但**"从站地址(unit id)"整列空白** ⇒
+              下面 `unitId` 一律留 `null`，**待对方补**；在补之前不得据此做 Modbus 读取（unit id 未知 ⇒ 读不到）。
+           ② 该附表只覆盖 **PLC1 的 4 台**深度（`通讯.xlsx`），**PLC2–PLC5 的寄存器分配表未给** ⇒ `depth` 地址表未齐。
+           ③ 本清单是**声明**：消费者是未来的 Modbus 轮询器（`IF-D` 的 poll 形态，现默认未启用）；在轮询器建成前，
+              `services/endpointLink.js` 的端点标识仍从帧字段解析（`endpointId→endpoint→unitId→equipCode`）。
+           ④ 用途：一口现场网、一口独立用途（双网口，网卡已装现场机；拓扑待对方给）。 */
+      endpoints: [
+        { id: 'PLC1', host: '192.168.10.12', port: 502, unitId: null, note: '附表一；对应升降机 1–4（深度 VW1006/1020/1034/1048）' },
+        { id: 'PLC2', host: '192.168.10.13', port: 502, unitId: null, note: '附表一；寄存器分配表未给' },
+        { id: 'PLC3', host: '192.168.10.14', port: 502, unitId: null, note: '附表一；寄存器分配表未给' },
+        { id: 'PLC4', host: '192.168.10.15', port: 502, unitId: null, note: '附表一；寄存器分配表未给' },
+        { id: 'PLC5', host: '192.168.10.16', port: 502, unitId: null, note: '附表一；只带 2 台（4+4+4+4+2＝18）' },
+        { id: 'PLC6', host: '192.168.10.17', port: 502, unitId: null, note: '附表一；**备用**（不参与采集）' }
+      ],
+      /* 端点清单的就绪度（**由上面的事实推导，不要手改**）：未拿到 unit id 前 collectionReady=false */
+      get endpointsReady() { return this.endpoints.every(e => e.unitId !== null && e.unitId !== undefined); }
     },
 
     /* ---------------- MES 接口（Q-23 答复后填写此处） ---------------- */
