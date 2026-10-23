@@ -3,7 +3,7 @@
  *
  * 1 正常构造：字段名/必填齐全（含 MES 文档的 12 个请求参数中的 11 个 ＋ perfRate 默认不传）
  * 2 perfRate 三种策略：omit（默认，不传）／null（显式 null）／zero（按给定值）
- * 3 statsDate 两种形态：date（YYYY-MM-DD）／shift（date-班次）
+ * 3 statsDate 两种形态：**默认 shift**（`YYYY-MM-DD-A`；MES 2026-10-23 明确 statsDate 填班次标识）／显式 date（`YYYY-MM-DD`）
  * 4 状态→时长桶：0 待机→stopTimes｜1/2→productTimes｜3 异常→shutdownTimes｜未知→null
  * 5 时长累计：三类分别累加，未知状态单列 unknown（不混算）
  * 6 必填缺失／非数值／模式非法／日期非法 ⇒ 明确报错（不静默）
@@ -36,7 +36,7 @@ function main() {
     const r = p.buildOeePayload(base());
     const keys = Object.keys(r.payload || {});
     ok('1 正常构造：11 个字段齐全且 perfRate 默认不传',
-      r.ok && keys.length === 11 && !keys.includes('perfRate') && r.payload.statsDate === '2026-10-20',
+      r.ok && keys.length === 11 && !keys.includes('perfRate') && r.payload.statsDate === '2026-10-20-A',
       `keys=${keys.length}｜statsDate=${r.payload && r.payload.statsDate}｜notes=${(r.notes || []).length}`);
     const missing = p.FIELDS.filter(k => !keys.includes(k));
     ok('1b MES 必填/核心字段无缺（仅 perfRate 按策略可缺）', missing.length === 0, `缺=${JSON.stringify(missing)}`);

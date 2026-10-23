@@ -240,12 +240,13 @@ const SUITES = [
   { name: 'harness-check', desc: '夹具自检（时钟/样本/注入/服务启停）', needBrowser: false, slow: false },
   { name: 'logic-check', desc: '当班统计与班次边界（FR-4 / DR-17）', needBrowser: false, slow: false },
   { name: 'db-check', desc: '本地库结构与仓储层', needBrowser: false, slow: false },
-  /* 8 支“自证探针”（座位 4b；2026-10-19 起前 5 支从 `tools\` 收编进 `run-all` 门禁套件）：P0-1／P0-4／P0-3／P1-1／P0-2
+  /* 9 支“自证探针”（座位 4b；2026-10-19 起前 5 支从 `tools\` 收编进 `run-all` 门禁套件）：P0-1／P0-4／P0-3／P1-1／P0-2
      的接收侧自证，零依赖、毫秒级、只用临时库（含进程内真 HTTP）⇒ 属“离线可跑”，`--fast` 下**要跑**；
      输出沿用同一条 `通过 N 项，失败 M 项` 汇总行（runner 按此解析，不另立口径）。
      第 6 支 `mes-client-probe`（2026-10-20，A4 收编）：MES 接口传输层自证（本地假 MES，不连真实环境）。
      第 7 支 `mes-oee-payload-probe`（2026-10-21，`S_ME_MG_0006` 收编）：OEE 载荷映射自证（纯函数；不臆造 perfRate）。
-     第 8 支 `camera-depth-agg-probe`（2026-10-21，`cameraDepth` 18→1 整合收编）：有效值平均自证（纯函数；哨兵/空值排除、分母＝有效台数、全无效→`null`、`0` 有效）。 */
+     第 8 支 `camera-depth-agg-probe`（2026-10-21，`cameraDepth` 18→1 整合收编）：有效值平均自证（纯函数；哨兵/空值排除、分母＝有效台数、全无效→`null`、`0` 有效）。
+     第 9 支 `mes-param-payload-probe`（2026-10-23，`S_ME_MG_0005` 收编）：关键运行参数载荷自证（纯函数；斜杠时间／中文标签／`IsPass` 字符串／缺值 0）。 */
   { name: 'order-inject-probe', desc: 'P0-1 procOrderNo 接收侧注入（含真 HTTP）', needBrowser: false, slow: false },
   { name: 'unit-index-probe', desc: 'P0-4 件序号按测试周期生成', needBrowser: false, slow: false },
   { name: 'missing-value-probe', desc: 'P0-3 缺值映射（哨兵→null、0 保留）', needBrowser: false, slow: false },
@@ -254,6 +255,7 @@ const SUITES = [
   { name: 'mes-client-probe', desc: '自证探针：MES 接口传输层（响应形态容错/超时/坏响应判失败）', needBrowser: false, slow: false },
   { name: 'mes-oee-payload-probe', desc: '自证探针：S_ME_MG_0006 OEE 载荷映射（perfRate 三策略/statsDate 两形态/状态→时长）', needBrowser: false, slow: false },
   { name: 'camera-depth-agg-probe', desc: '自证探针：cameraDepth 18→1 整合（有效值平均/哨兵与空值排除/全无效→null/0 有效）', needBrowser: false, slow: false },
+  { name: 'mes-param-payload-probe', desc: '自证探针：S_ME_MG_0005 关键运行参数载荷（斜杠时间/中文标签/IsPass 字符串/缺值 0）', needBrowser: false, slow: false },
   { name: 'platform-check', desc: '平台适配层（路径/ID/日志）', needBrowser: false, slow: false },
   { name: 'trace-check', desc: '需求追溯', needBrowser: false, slow: false },
   { name: 'copy-check', desc: '界面文案与需求条款对照', needBrowser: false, slow: false },

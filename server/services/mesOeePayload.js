@@ -11,7 +11,7 @@
  * 关键设计（为什么这样）
  *   ① **`perfRate` 策略可配**（`omit` 默认／`null`／`zero`）—— 我方**拿不到理论节拍/标准产能**，
  *      **不臆造**：默认**不传**；等 MES 答复再切换。**绝不默认填 0**（0 会被当成"性能效率真的是 0"）。
- *   ② **`statsDate` 两种形态**（`date` 默认 `YYYY-MM-DD`；`shift` 允许 `<date>-<班次>`）—— 等 MES 答复后定，
+ *   ② **`statsDate` 两种形态**（**默认 `shift`＝`<date>-<班次>`**，依 MES 2026-10-23 答复；`date` 形态仍支持）
  *      两种都支持，切换只是一个参数。
  *   ③ **纯函数**：不读库、不取时间（`ADR-0003` D17 精神）；数字由调用方算好传入。
  *   ④ **不做单位换算**：MES 的 `decimal` 是 **0..1 还是 0..100** 未定 ⇒ 原样透传调用方的值并**记录口径**，
@@ -76,7 +76,8 @@ function buildOeePayload(input) {
   }
   const mode = input.perfRateMode || PERF_RATE_MODE.OMIT;
   if (!Object.values(PERF_RATE_MODE).includes(mode)) return { ok: false, code: 'BAD_MODE', reason: `perfRateMode 非法：${mode}` };
-  const sdMode = input.statsDateMode || STATS_DATE_MODE.DATE;
+  /* MES 2026-10-23 明确 statsDate 填班次标识（如 2026-10-20-A）⇒ 默认走班次形态 */
+  const sdMode = input.statsDateMode || STATS_DATE_MODE.SHIFT;
   if (!Object.values(STATS_DATE_MODE).includes(sdMode)) return { ok: false, code: 'BAD_MODE', reason: `statsDateMode 非法：${sdMode}` };
 
   const d = fmtDate(input.statsDate);
